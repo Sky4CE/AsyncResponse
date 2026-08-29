@@ -286,7 +286,12 @@ public sealed class MongoDbFlowStateStore : IFlowStateStore, IDisposable
 
     private async Task EnsureCreatedAsync(CancellationToken cancellationToken)
     {
-        if (_created || (!_options.AutoCreateIndexes && !_options.UseOwnershipLedger))
+        // No AutoCreateIndexes/UseOwnershipLedger fast-path here: with both disabled there is no
+        // DDL and no ledger claim, but the TTL-reaper VERIFICATION below must still run once — an
+        // early-out on the flag pair skipped it for exactly the locked-down deployment
+        // (operator-provisioned indexes, no ledger writes) it exists to protect, and the
+        // collection grew without bound with no error and no log line.
+        if (_created)
             return;
 
         await _ensureGate.WaitAsync(cancellationToken).ConfigureAwait(false);

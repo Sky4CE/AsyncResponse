@@ -118,6 +118,46 @@ public sealed class SqsDispatcherTests
     }
 
     [Fact]
+    public void ValidateOptions_AckAfterEnqueue_CountsShutdownTimeoutAgainstTheHostBudget()
+    {
+        // Regression (round 31): only the drain was validated against the host budget, on the
+        // premise that SQS spends nothing else at shutdown — but the visibility-renewal join on
+        // the final batch waits out ShutdownTimeout too (its own doc says "at shutdown it counts
+        // against the host's budget"). A raised ShutdownTimeout then blew the real budget and the
+        // host force-terminated mid-join, redelivering handled-but-undeleted work.
+        var ex = Assert.Throws<InvalidOperationException>(() =>
+            SqsMessageDispatcher.ValidateOptions(
+                new SqsAsyncResponseOptions
+                {
+                    HostShutdownTimeout = TimeSpan.FromSeconds(30),
+                    ShutdownTimeout = TimeSpan.FromSeconds(15)
+                },
+                new SqsSubscriberOptions().UseAckAfterEnqueue(1, 8, TimeSpan.FromSeconds(20)),
+                SqsSubscriberRole.Worker));
+
+        Assert.Contains(nameof(SqsAsyncResponseOptions.ShutdownTimeout), ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void ValidateOptions_AckAfterHandlerCompletes_CountsShutdownTimeoutAgainstTheHostBudget()
+    {
+        // Same rule without a background drain: the renewal join spends ShutdownTimeout in the
+        // awaiting mode too.
+        var ex = Assert.Throws<InvalidOperationException>(() =>
+            SqsMessageDispatcher.ValidateOptions(
+                new SqsAsyncResponseOptions { ShutdownTimeout = TimeSpan.FromMinutes(2) },
+                new SqsSubscriberOptions(),
+                SqsSubscriberRole.Worker));
+        Assert.Contains(nameof(SqsAsyncResponseOptions.ShutdownTimeout), ex.Message, StringComparison.Ordinal);
+
+        // The stock 5s default fits the stock 30s host budget.
+        SqsMessageDispatcher.ValidateOptions(
+            new SqsAsyncResponseOptions(),
+            new SqsSubscriberOptions(),
+            SqsSubscriberRole.Worker);
+    }
+
+    [Fact]
     public void ValidateOptions_DocumentedEarlyAckDefaults_Pass()
     {
         // Regression: the documented two-arg early-ACK opt-in with stock defaults
@@ -562,6 +602,77 @@ public sealed class SqsDispatcherTests
                 VisibilityRenewalInterval = TimeSpan.FromSeconds(10)
             },
             SqsSubscriberRole.Worker);
+    }
+
+    [Fact]
+    public async Task AckAfterEnqueue_AfterTheDrainBudgetLapses_DoesNotStartFreshWork_AndSurfacesIt()
+    {
+        // Regression (round 31): the drain token cannot stop the REAL handler — it is
+        // _ingress.HandleWorkerMessageAsync(payload), whose target takes no CancellationToken — so
+        // the loop kept dequeuing and EXECUTING past the budget, and whatever was still queued at
+        // process exit vanished with no record: those messages were deleted at enqueue, so the
+        // redrive policy never sees them again. No DLQ write is possible for a deleted message;
+        // OnBackgroundFailure is the record (DB/Redis/Pub-Sub parity).
+        var first = new SettlementCalls();
+        var second = new SettlementCalls();
+        var firstStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseFirst = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var handlerRuns = 0;
+        var failures = new List<SqsBackgroundFailureContext>();
+        var dispatcher = SqsMessageDispatcher.Create(
+            async (_, _) =>
+            {
+                // Deliberately ignores the token, exactly like the ingress handler in production.
+                if (Interlocked.Increment(ref handlerRuns) == 1)
+                {
+                    firstStarted.TrySetResult();
+                    await releaseFirst.Task.ConfigureAwait(false);
+                }
+            },
+            new SqsAsyncResponseOptions(),
+            new SqsSubscriberOptions
+            {
+                OnBackgroundFailure = context =>
+                {
+                    lock (failures)
+                    {
+                        failures.Add(context);
+                    }
+
+                    return ValueTask.CompletedTask;
+                }
+            }.UseAckAfterEnqueue(1, 8, TimeSpan.FromMilliseconds(100)),
+            NullLogger.Instance,
+            "workers",
+            SqsSubscriberRole.Worker);
+
+        await dispatcher.HandleAsync(Delivery(first), CancellationToken.None);
+        await firstStarted.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        await dispatcher.HandleAsync(Delivery(second), CancellationToken.None); // deleted, waiting in queue
+
+        await dispatcher.DisposeAsync(); // the 100ms drain budget lapses while the first handler blocks
+        releaseFirst.TrySetResult();      // ...and only now can the loop reach the queued entry
+
+        var guard = TimeProvider.System.GetUtcNow() + TimeSpan.FromSeconds(10);
+        while (true)
+        {
+            lock (failures)
+            {
+                if (failures.Count == 1)
+                    break;
+            }
+
+            Assert.True(TimeProvider.System.GetUtcNow() < guard, "the undrained message was never surfaced");
+            await Task.Delay(TimeSpan.FromMilliseconds(5));
+        }
+
+        lock (failures)
+        {
+            Assert.IsAssignableFrom<OperationCanceledException>(Assert.Single(failures).Exception);
+        }
+
+        // The queued message was NOT executed after the budget lapsed.
+        Assert.Equal(1, Volatile.Read(ref handlerRuns));
     }
 
     [Fact]

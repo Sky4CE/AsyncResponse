@@ -14,9 +14,35 @@ namespace AsyncResponse.Tests;
 /// </summary>
 internal static class MongoTestCounters
 {
+    /// <summary>
+    /// Stubs the driver's fluent <c>WithReadPreference</c> to return the mock itself. The channel
+    /// store pins <c>ReadPreference.Primary</c> on every collection handle at construction, so a
+    /// loose mock returning null there would replace the test's stubbed collection with null.
+    /// </summary>
+    public static Mock<IMongoCollection<T>> SelfPinning<T>(this Mock<IMongoCollection<T>> collection)
+    {
+        collection
+            .Setup(c => c.WithReadPreference(It.IsAny<ReadPreference>()))
+            .Returns(collection.Object);
+        return collection;
+    }
+
+    /// <summary>
+    /// Stubs <c>GetCollection&lt;T&gt;</c> with a fresh self-pinning loose mock and returns that
+    /// mock, for collections the store constructor touches but the test never exercises.
+    /// </summary>
+    public static Mock<IMongoCollection<T>> WithLooseCollection<T>(this Mock<IMongoDatabase> database)
+    {
+        var collection = new Mock<IMongoCollection<T>>(MockBehavior.Loose).SelfPinning();
+        database
+            .Setup(db => db.GetCollection<T>(It.IsAny<string>(), It.IsAny<MongoCollectionSettings>()))
+            .Returns(collection.Object);
+        return collection;
+    }
+
     public static IMongoCollection<BsonDocument> Collection()
     {
-        var counters = new Mock<IMongoCollection<BsonDocument>>(MockBehavior.Loose);
+        var counters = new Mock<IMongoCollection<BsonDocument>>(MockBehavior.Loose).SelfPinning();
         var seq = 0L;
         counters
             .Setup(c => c.FindOneAndUpdateAsync(

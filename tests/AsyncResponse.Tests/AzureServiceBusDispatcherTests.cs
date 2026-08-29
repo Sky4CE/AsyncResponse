@@ -164,6 +164,77 @@ public sealed class AzureServiceBusDispatcherTests
     }
 
     [Fact]
+    public async Task AckAfterEnqueue_AfterTheDrainBudgetLapses_DoesNotStartFreshWork_AndSurfacesIt()
+    {
+        // Regression (round 31): the drain token cannot stop the REAL handler — it is
+        // _ingress.HandleWorkerMessageAsync(payload), whose target takes no CancellationToken — so
+        // the loop kept dequeuing and EXECUTING past the budget, and whatever was still queued at
+        // process exit vanished with no record: those messages were completed at enqueue, so the
+        // broker never redelivers them. The settled lock rules out a DLQ write;
+        // OnBackgroundFailure is the record (DB/Redis/Pub-Sub parity).
+        var first = new SettlementCalls();
+        var second = new SettlementCalls();
+        var firstStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseFirst = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var handlerRuns = 0;
+        var failures = new List<AzureServiceBusBackgroundFailureContext>();
+        var dispatcher = AzureServiceBusMessageDispatcher.Create(
+            async (_, _) =>
+            {
+                // Deliberately ignores the token, exactly like the ingress handler in production.
+                if (Interlocked.Increment(ref handlerRuns) == 1)
+                {
+                    firstStarted.TrySetResult();
+                    await releaseFirst.Task.ConfigureAwait(false);
+                }
+            },
+            new AzureServiceBusAsyncResponseOptions(),
+            new AzureServiceBusSubscriberOptions
+            {
+                OnBackgroundFailure = context =>
+                {
+                    lock (failures)
+                    {
+                        failures.Add(context);
+                    }
+
+                    return ValueTask.CompletedTask;
+                }
+            }.UseAckAfterEnqueue(1, 8, TimeSpan.FromMilliseconds(100)),
+            NullLogger.Instance,
+            "workers",
+            AzureServiceBusSubscriberRole.Worker);
+
+        await dispatcher.HandleAsync(Delivery(first), CancellationToken.None);
+        await firstStarted.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        await dispatcher.HandleAsync(Delivery(second), CancellationToken.None); // completed, waiting in queue
+
+        await dispatcher.DisposeAsync(); // the 100ms drain budget lapses while the first handler blocks
+        releaseFirst.TrySetResult();      // ...and only now can the loop reach the queued entry
+
+        var guard = TimeProvider.System.GetUtcNow() + TimeSpan.FromSeconds(10);
+        while (true)
+        {
+            lock (failures)
+            {
+                if (failures.Count == 1)
+                    break;
+            }
+
+            Assert.True(TimeProvider.System.GetUtcNow() < guard, "the undrained message was never surfaced");
+            await Task.Delay(TimeSpan.FromMilliseconds(5));
+        }
+
+        lock (failures)
+        {
+            Assert.IsAssignableFrom<OperationCanceledException>(Assert.Single(failures).Exception);
+        }
+
+        // The queued message was NOT executed after the budget lapsed.
+        Assert.Equal(1, Volatile.Read(ref handlerRuns));
+    }
+
+    [Fact]
     public async Task AckAfterHandlerCompletes_CompletesOnlyAfterSuccessfulHandler()
     {
         var calls = new SettlementCalls();

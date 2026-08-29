@@ -110,10 +110,13 @@ internal static class NatsTransportOptionsValidator
         EnsureDistinct(schema.WorkerStream, schema.DeadLetterStream, "stream", nameof(options.WorkerStream), nameof(options.DeadLetterStream));
         EnsureDistinct(schema.ResponseStream, schema.DeadLetterStream, "stream", nameof(options.ResponseStream), nameof(options.DeadLetterStream));
 
-        // AckWait is a server-side JetStream consumer deadline carried as nanoseconds on the wire
-        // (persistence bound keeps it representable); the retry delays arm in-process Task.Delay
-        // timers (timer ceiling).
-        AsyncResponseChannelOptions.EnsurePersistedTtl(options.AckWait, nameof(NatsAsyncResponseTransportOptions), nameof(options.AckWait));
+        // AckWait is a server-side JetStream consumer deadline carried as nanoseconds on the wire,
+        // but it ALSO arms the in-process ack-extension heartbeat's Task.Delay at one third of its
+        // value, so its real sink is the timer ceiling — under the persistence bound a legal
+        // multi-month value passed validation and then killed every batch with
+        // ArgumentOutOfRangeException from the heartbeat's delay. The retry delays arm in-process
+        // Task.Delay timers too (timer ceiling).
+        AsyncResponseChannelOptions.EnsureTimerBacked(options.AckWait, nameof(NatsAsyncResponseTransportOptions), nameof(options.AckWait));
         AsyncResponseChannelOptions.EnsureTimerBacked(options.PublishRetryBaseDelay, nameof(NatsAsyncResponseTransportOptions), nameof(options.PublishRetryBaseDelay));
         AsyncResponseChannelOptions.EnsureTimerBacked(options.PublishRetryMaxDelay, nameof(NatsAsyncResponseTransportOptions), nameof(options.PublishRetryMaxDelay));
         AsyncResponseChannelOptions.EnsureTimerBacked(options.SubscriberRetryBaseDelay, nameof(NatsAsyncResponseTransportOptions), nameof(options.SubscriberRetryBaseDelay));

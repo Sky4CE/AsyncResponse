@@ -66,13 +66,23 @@ internal sealed class MongoDbChannelStore : IDisposable
         MongoNamespaceRegistry.ValidateEffectiveNamespace(database, _options.SubscriberCollection, nameof(_options.SubscriberCollection));
         MongoNamespaceRegistry.ValidateEffectiveNamespace(database, CountersCollectionName(_options.MessageCollection), "the derived ack-counter collection");
 
-        _recovery = database.GetCollection<MongoRecoveryStateDocument>(_options.RecoveryStateCollection);
-        _messages = database.GetCollection<MongoChannelMessageDocument>(_options.MessageCollection);
-        _subscribers = database.GetCollection<MongoChannelSubscriberDocument>(_options.SubscriberCollection);
+        // Primary reads override whatever the host-registered client/connection string configured:
+        // a secondaryPreferred connection routed the liveness probe, recovery-state read and message
+        // load to a lagging secondary, so a publisher racing a fresh registration saw 0 subscribers
+        // AND 0 recovery states and dropped the response while reporting success. It also keeps
+        // reads on the same authority whose $$NOW the expiry filters evaluate against (same
+        // reasoning as the MongoDB durable-flow store's pin).
+        _recovery = database.GetCollection<MongoRecoveryStateDocument>(_options.RecoveryStateCollection)
+            .WithReadPreference(ReadPreference.Primary);
+        _messages = database.GetCollection<MongoChannelMessageDocument>(_options.MessageCollection)
+            .WithReadPreference(ReadPreference.Primary);
+        _subscribers = database.GetCollection<MongoChannelSubscriberDocument>(_options.SubscriberCollection)
+            .WithReadPreference(ReadPreference.Primary);
         // The monotonic ack sequence: delivery claims and subscription registrations draw from
         // this ONE counter, giving acked_seq and a subscription's start position a total order no
         // pair of same-tick timestamps has. Created on first upsert; no index needed (_id only).
-        _counters = database.GetCollection<BsonDocument>(CountersCollectionName(_options.MessageCollection));
+        _counters = database.GetCollection<BsonDocument>(CountersCollectionName(_options.MessageCollection))
+            .WithReadPreference(ReadPreference.Primary);
         _ownedClient = ownedClient;
     }
 
@@ -516,9 +526,12 @@ internal sealed class MongoDbChannelStore : IDisposable
     /// <summary>Returns the server's current UTC time, used as a clock-safe delivery watermark.</summary>
     public async Task<DateTimeOffset> GetServerTimeUtcAsync(CancellationToken cancellationToken)
     {
+        // Primary, explicitly: the watermark must come from the clock whose $$NOW stamps the rows
+        // it bounds — a secondary's localTime can lag or skew from the primary's.
         var reply = await _database.RunCommandAsync<BsonDocument>(
             new BsonDocument("hello", 1),
-            cancellationToken: cancellationToken).ConfigureAwait(false);
+            ReadPreference.Primary,
+            cancellationToken).ConfigureAwait(false);
         return reply.TryGetValue("localTime", out var localTime) && localTime is BsonDateTime serverTime
             ? new DateTimeOffset(serverTime.ToUniversalTime(), TimeSpan.Zero)
             : DateTimeOffset.UtcNow;

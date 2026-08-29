@@ -492,7 +492,7 @@ public class KafkaDispatcherTests
     }
 
     [Fact]
-    public async Task Awaiting_DeadLetterPublishFailsPermanently_PropagatesWithoutStoringOffset()
+    public async Task Awaiting_DeadLetterPublishFailsPermanently_SwallowsWithoutStoringOffset()
     {
         var consumer = new FakeKafkaConsumerClient();
         var producer = new FakeKafkaProducerClient { PublishException = new InvalidOperationException("broker gone") };
@@ -502,10 +502,14 @@ public class KafkaDispatcherTests
             consumer: consumer,
             producer: producer);
 
-        await Assert.ThrowsAsync<InvalidOperationException>(() =>
-            dispatcher.HandleAsync(KafkaTestData.Delivery(Topic, offset: 1), CancellationToken.None));
+        // A failed burial must NOT escape: this call runs inside the poll loop, and a propagated
+        // throw faulted the whole subscriber with the offset unstored — the supervisor rebuilt
+        // the consumer, re-consumed the message, and re-executed the failing handler
+        // MaxDeliveryAttempts more times per restart, forever.
+        await dispatcher.HandleAsync(KafkaTestData.Delivery(Topic, offset: 1), CancellationToken.None);
 
-        // The offset stays unstored so the subscriber restart redelivers the message.
+        // The offset stays unstored so a restart or rebalance redelivers the message and the
+        // burial is retried.
         Assert.Empty(consumer.StoredOffsets);
     }
 
@@ -869,6 +873,74 @@ public class KafkaDispatcherTests
         }
     }
 
+    [Fact]
+    public async Task Queued_AfterTheDrainBudgetLapses_DoesNotStartFreshWork_DeadLettersAndSurfacesIt()
+    {
+        // Regression (round 31): the drain token cannot stop the REAL handler — it is
+        // _ingress.HandleWorkerMessageAsync(payload), whose target takes no CancellationToken — so
+        // the sibling fact above only passes because its handler honors the token. With a handler
+        // that ignores it (as the ingress does), the loop kept dequeuing and EXECUTING past the
+        // budget, and whatever was still queued at process exit vanished with no record: those
+        // offsets were stored at enqueue, so Kafka never redelivers them (DB/Redis/Pub-Sub parity).
+        var producer = new FakeKafkaProducerClient();
+        var firstStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseFirst = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var handlerRuns = 0;
+        var failures = new List<KafkaBackgroundFailureContext>();
+        var subscriberOptions = new KafkaSubscriberOptions
+        {
+            OnBackgroundFailure = context =>
+            {
+                lock (failures)
+                {
+                    failures.Add(context);
+                }
+
+                return ValueTask.CompletedTask;
+            }
+        }.UseAckAfterEnqueue(1, 8, TimeSpan.FromMilliseconds(100));
+        var dispatcher = CreateDispatcher(
+            async (_, _) =>
+            {
+                // Deliberately ignores the token, exactly like the ingress handler in production.
+                if (Interlocked.Increment(ref handlerRuns) == 1)
+                {
+                    firstStarted.TrySetResult();
+                    await releaseFirst.Task.ConfigureAwait(false);
+                }
+            },
+            subscriberOptions,
+            producer: producer);
+
+        await dispatcher.HandleAsync(KafkaTestData.Delivery(Topic, offset: 1), CancellationToken.None);
+        await firstStarted.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        await dispatcher.HandleAsync(KafkaTestData.Delivery(Topic, offset: 2), CancellationToken.None); // committed, waiting in queue
+
+        await dispatcher.DisposeAsync(); // the 100ms drain budget lapses while the first handler blocks
+        releaseFirst.TrySetResult();      // ...and only now can the loop reach the queued entry
+
+        await WaitUntilAsync(() =>
+        {
+            lock (failures)
+            {
+                return failures.Count == 1;
+            }
+        });
+        lock (failures)
+        {
+            var dropped = Assert.Single(failures);
+            Assert.Equal(2L, dropped.Offset);
+            Assert.IsAssignableFrom<OperationCanceledException>(dropped.Exception);
+        }
+
+        // The queued entry was NOT executed after the budget lapsed — and, unlike the in-handler
+        // interruption, it was written to the dead-letter topic: it was committed at enqueue, so
+        // nothing else can ever record it.
+        Assert.Equal(1, Volatile.Read(ref handlerRuns));
+        var buried = Assert.Single(producer.Publishes);
+        Assert.Equal($"{Topic}.deadletter", buried.Topic);
+    }
+
     private static async Task WaitUntilAsync(Func<bool> condition)
     {
         using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
@@ -904,6 +976,33 @@ public class KafkaDispatcherTests
         Assert.Equal("corr-x", dead.Key);
         var stored = Assert.Single(consumer.StoredOffsets);
         Assert.Equal(4, stored.Offset);
+    }
+
+    [Fact]
+    public async Task DiscardUnprocessable_WhenTheDeadLetterPublishFailsPermanently_DoesNotFaultThePollLoop()
+    {
+        // Regression (round 31): the burial itself was unguarded on this path (only the offset
+        // store was wrapped), and this call originates inside the poll loop's own catch arm — a
+        // permanently failing dead-letter topic burned the publish retries, rethrew, faulted the
+        // subscriber with the offset unstored, and the restart re-ran the same discard forever.
+        var consumer = new FakeKafkaConsumerClient();
+        var producer = new FakeKafkaProducerClient { PublishException = new InvalidOperationException("broker gone") };
+        await using var dispatcher = CreateDispatcher(
+            (_, _) => Task.CompletedTask,
+            new KafkaSubscriberOptions(),
+            consumer: consumer,
+            producer: producer);
+
+        var message = KafkaTestData.Message(Topic, offset: 4, payload: "", ("correlationId", "corr-x"));
+
+        await dispatcher.DiscardUnprocessableAsync(
+            message,
+            new InvalidDataException("no payload"),
+            CancellationToken.None);
+
+        // No burial and no commit: the offset stays unstored so a restart or rebalance retries
+        // the burial instead of dropping the message with no record.
+        Assert.Empty(consumer.StoredOffsets);
     }
 
     [Fact]

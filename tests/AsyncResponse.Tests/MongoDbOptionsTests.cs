@@ -65,6 +65,10 @@ public sealed class MongoDbOptionsTests
             database
                 .Setup(d => d.GetCollection<MongoFlowStateDocument>(It.IsAny<string>(), It.IsAny<MongoCollectionSettings>()))
                 .Returns(flowCollection.Object);
+            // The channel store also derives primary-read views of its collections at construction.
+            database.WithLooseCollection<MongoRecoveryStateDocument>();
+            database.WithLooseCollection<MongoChannelMessageDocument>();
+            database.WithLooseCollection<MongoChannelSubscriberDocument>();
 
             var services = new ServiceCollection();
             services.AddSingleton(typeof(ILogger<>), typeof(NullLogger<>));
@@ -105,6 +109,9 @@ public sealed class MongoDbOptionsTests
         okDatabase
             .Setup(d => d.GetCollection<MongoFlowStateDocument>(It.IsAny<string>(), It.IsAny<MongoCollectionSettings>()))
             .Returns(okFlowCollection.Object);
+        okDatabase.WithLooseCollection<MongoRecoveryStateDocument>();
+        okDatabase.WithLooseCollection<MongoChannelMessageDocument>();
+        okDatabase.WithLooseCollection<MongoChannelSubscriberDocument>();
         var okServices = new ServiceCollection();
         okServices.AddSingleton(typeof(ILogger<>), typeof(NullLogger<>));
         okServices.AddSingleton(okDatabase.Object);
@@ -132,6 +139,10 @@ public sealed class MongoDbOptionsTests
         client.SetupGet(c => c.Settings).Returns(MongoClientSettings.FromConnectionString("mongodb://localhost:27017"));
         var database = new Mock<IMongoDatabase>().WithTestNamespace();
         database.SetupGet(d => d.Client).Returns(client.Object);
+        // The channel store derives primary-read views of its collections at construction.
+        database.WithLooseCollection<MongoRecoveryStateDocument>();
+        database.WithLooseCollection<MongoChannelMessageDocument>();
+        database.WithLooseCollection<MongoChannelSubscriberDocument>();
 
         var services = new ServiceCollection();
         services.AddSingleton(typeof(ILogger<>), typeof(NullLogger<>));

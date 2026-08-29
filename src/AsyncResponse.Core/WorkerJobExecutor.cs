@@ -117,8 +117,15 @@ internal sealed class WorkerJobExecutor(
                 // the skew beats never executing — but only after consecutive stalls prove the
                 // skew is persistent, so a single anomalous early delivery cannot fire the job
                 // arbitrarily ahead of its due time.
-                var stalled = job.LastRedelayRemaining is { } lastRemaining && remaining >= lastRemaining - RedelayProgressEpsilon;
-                job.RedelayStallCount = stalled ? job.RedelayStallCount + 1 : 0;
+                // Both stall fields are wire values a foreign producer controls. The library only
+                // ever stamps a strictly positive remainder, so a negative LastRedelayRemaining is
+                // invalid (and TimeSpan.MinValue would overflow the checked subtraction below);
+                // clamping the counter into [0, threshold] keeps a hostile int.MaxValue from
+                // wrapping negative and disarming the stall fallback forever.
+                var stalled = job.LastRedelayRemaining is { } lastRemaining
+                    && lastRemaining >= TimeSpan.Zero
+                    && remaining >= lastRemaining - RedelayProgressEpsilon;
+                job.RedelayStallCount = stalled ? Math.Clamp(job.RedelayStallCount, 0, RedelayStallExecuteThreshold) + 1 : 0;
 
                 if (stalled && job.RedelayStallCount >= RedelayStallExecuteThreshold)
                 {

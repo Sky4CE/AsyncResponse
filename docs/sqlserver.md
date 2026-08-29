@@ -154,6 +154,13 @@ otherwise answer a query for `worker`; the explicit collation is there because a
 case-insensitive server default would otherwise answer with `WORKER`. The plain comparison is kept
 as the driver so the claim index is still seeked.
 
+The channel does the same: with `AutoCreateSchema = false` it runs its full relation verification
+(tables, columns, indexes, and the binary-collation requirement on identity columns such as
+`correlation_id`) at first use, not just the migration probe below — an operator-provisioned
+column under a case-insensitive collation is rejected with the fix instead of silently
+cross-routing responses at runtime (SQL Server `=` also pads trailing spaces under any non-binary
+collation).
+
 ### Upgrading a manually managed schema
 
 1.0.0 added a monotonic ack sequence to the channel message table. With `AutoCreateSchema = false`

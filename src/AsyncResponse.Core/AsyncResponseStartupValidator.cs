@@ -139,7 +139,8 @@ internal sealed class AsyncResponseStartupValidator(
     IOptions<AsyncResponseOptions> _options,
     IEnumerable<DurableFlowOptions>? _flowOptions = null,
     ILogger<AsyncResponseStartupValidator>? _logger = null,
-    DurableFlowObserverLifetimeAudit? _observerAudit = null) : IHostedService
+    DurableFlowObserverLifetimeAudit? _observerAudit = null,
+    IServiceProvider? _serviceProvider = null) : IHostedService
 {
     /// <summary>Starts this service.</summary>
     public Task StartAsync(CancellationToken cancellationToken)
@@ -196,6 +197,18 @@ internal sealed class AsyncResponseStartupValidator(
 
         ValidateEarlyAckDeclarations();
         ValidateAwaitedStepLedgerCoverage();
+
+        // Construct the flow store once, here: every provider store validates its options in its
+        // constructor, but the store is otherwise resolved only inside per-execution scopes — so a
+        // misconfigured table name (or any other store option) previously passed startup and first
+        // threw inside the worker transport's retry loop, burning a real production run to the
+        // delivery cap. Constructors do no I/O by convention; the scope disposes what it built.
+        // (Null only in unit tests that construct the validator directly; DI always supplies it.)
+        if (_serviceProvider is not null)
+        {
+            using var scope = _serviceProvider.CreateScope();
+            _ = scope.ServiceProvider.GetRequiredService<IFlowStateStore>();
+        }
 
         return Task.CompletedTask;
     }

@@ -29,7 +29,13 @@ internal static class ReflectionExtensions
 {
     private delegate ValueTask AsyncMethodInvoker(object service, object?[] args);
 
-    private static readonly ConcurrentDictionary<string, Type> ServiceTypes = new(StringComparer.Ordinal);
+    // Entries carry the resolver-registry generation observed before the scan that produced them,
+    // mirroring the negative cache's stamp: a plain clear-on-unregister has a race — an in-flight
+    // resolution that got its answer from the departing resolver can insert AFTER the clear,
+    // permanently re-poisoning the name with the revoked type. A stale stamp makes the entry a
+    // non-hit, so the next lookup rescans against the current resolver set.
+    private static readonly ConcurrentDictionary<string, (Type Type, int Generation)> ServiceTypes = new(StringComparer.Ordinal);
+    private static int _resolvedServiceTypeGeneration;
 
     /// <summary>
     /// Invalidates the shared negative type-resolution cache (a new resolver or assembly may
@@ -48,6 +54,9 @@ internal static class ReflectionExtensions
     /// </summary>
     internal static void InvalidateResolvedServiceTypes()
     {
+        // Bump BEFORE clearing: the bump is what fences in-flight scans (their pre-scan stamp goes
+        // stale); the clear just reclaims memory.
+        Interlocked.Increment(ref _resolvedServiceTypeGeneration);
         ServiceTypes.Clear();
         UnresolvableTypeNames.Invalidate();
     }
@@ -178,9 +187,10 @@ internal static class ReflectionExtensions
         // active could outlive a later assembly load that makes the name resolvable.
         UnresolvableTypeNames.EnsureAssemblyLoadInvalidation();
 
-        if (ServiceTypes.TryGetValue(serviceInterfaceFullName, out var cached))
+        if (ServiceTypes.TryGetValue(serviceInterfaceFullName, out var cached)
+            && cached.Generation == Volatile.Read(ref _resolvedServiceTypeGeneration))
         {
-            return cached;
+            return cached.Type;
         }
 
         // Fail fast on a name that already failed a full scan: without this, every delivery naming
@@ -194,13 +204,14 @@ internal static class ReflectionExtensions
         }
 
         var generationBeforeScan = UnresolvableTypeNames.GenerationBeforeScan();
+        var resolvedGenerationBeforeScan = Volatile.Read(ref _resolvedServiceTypeGeneration);
 
         foreach (var assembly in AppDomain.CurrentDomain.GetAssemblies())
         {
             var resolved = assembly.GetType(serviceInterfaceFullName, throwOnError: false);
             if (resolved is not null)
             {
-                CacheServiceType(serviceInterfaceFullName, resolved);
+                CacheServiceType(serviceInterfaceFullName, resolved, resolvedGenerationBeforeScan);
                 return resolved;
             }
         }
@@ -209,7 +220,7 @@ internal static class ReflectionExtensions
         var custom = AsyncResponseTypeResolution.Resolve(serviceInterfaceFullName);
         if (custom is not null)
         {
-            CacheServiceType(serviceInterfaceFullName, custom);
+            CacheServiceType(serviceInterfaceFullName, custom, resolvedGenerationBeforeScan);
             return custom;
         }
 
@@ -225,10 +236,12 @@ internal static class ReflectionExtensions
     /// assemblies alive until process exit. Collectible-context types stay resolve-per-call (a
     /// cold path only plugin hosts hit); the negative cache is name-keyed and unaffected.
     /// </summary>
-    private static void CacheServiceType(string serviceInterfaceFullName, Type resolved)
+    private static void CacheServiceType(string serviceInterfaceFullName, Type resolved, int generationBeforeScan)
     {
+        // Indexer, not TryAdd: a stale-stamped survivor of a raced unregister must be replaced by
+        // the fresh scan's answer, not shadow it.
         if (!resolved.Assembly.IsCollectible)
-            ServiceTypes.TryAdd(serviceInterfaceFullName, resolved);
+            ServiceTypes[serviceInterfaceFullName] = (resolved, generationBeforeScan);
     }
 
     [UnconditionalSuppressMessage("Trimming", "IL2075",

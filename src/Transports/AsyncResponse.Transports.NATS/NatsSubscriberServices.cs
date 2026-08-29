@@ -27,7 +27,7 @@ internal abstract class NatsSubscriberService : BackgroundService
         IOptions<NatsAsyncResponseTransportOptions> options,
         INatsConnection connection,
         ILogger logger)
-        : this(options, new NatsJetStreamTransportAdapter(connection.CreateJetStreamContext()), logger)
+        : this(options, new NatsJetStreamTransportAdapter(connection.CreateJetStreamContext(), logger), logger)
     {
     }
 
@@ -83,7 +83,7 @@ internal abstract class NatsSubscriberService : BackgroundService
         {
             await _jetStream.EnsureStreamAsync(Stream, Subject, Options.StreamMaxMessages, stoppingToken).ConfigureAwait(false);
             if (Options.DeadLetterEnabled)
-                await _jetStream.EnsureStreamAsync(Schema.DeadLetterStream, Schema.DeadLetterSubject, Options.DeadLetterStreamMaxMessages, stoppingToken).ConfigureAwait(false);
+                await _jetStream.EnsureDeadLetterStreamAsync(Schema.DeadLetterStream, Schema.DeadLetterSubject, Options.DeadLetterStreamMaxMessages, stoppingToken).ConfigureAwait(false);
         }
 
         await _jetStream.EnsureConsumerAsync(Stream, Consumer, Options.AckWait, stoppingToken).ConfigureAwait(false);

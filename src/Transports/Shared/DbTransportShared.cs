@@ -110,12 +110,11 @@ internal abstract class DbMessageDispatcherBase : IAsyncDisposable
                 delivery.Attempt,
                 cap);
 
-            var buried = await delivery
-                .DeadLetterAsync(
+            var buried = await DeadLetterSwallowingFailureAsync(
+                    delivery,
                     new InvalidOperationException(
                         $"Message exceeded {cap} delivery attempts without settling (attempt {delivery.Attempt})."),
-                    true,
-                    CancellationToken.None)
+                    deleteOriginal: true)
                 .ConfigureAwait(false);
 
             if (!buried)
@@ -376,7 +375,7 @@ internal abstract class DbMessageDispatcherBase : IAsyncDisposable
                     delivery.Queue,
                     _role);
 
-                if (!await delivery.DeadLetterAsync(lapsed, false, CancellationToken.None).ConfigureAwait(false))
+                if (!await DeadLetterSwallowingFailureAsync(delivery, lapsed, deleteOriginal: false).ConfigureAwait(false))
                 {
                     _logger.LogError(
                         "Failed to dead-letter undrained {Provider} message {MessageId} on queue {Queue} ({Role}); the loss is only observable via logs and OnBackgroundFailure.",
@@ -397,7 +396,7 @@ internal abstract class DbMessageDispatcherBase : IAsyncDisposable
             catch (Exception ex)
             {
                 _logger.LogError(ex, "{Provider} background handler failed for {Role} on queue {Queue} after early ACK.", _providerName, _role, delivery.Queue);
-                if (!await delivery.DeadLetterAsync(ex, false, CancellationToken.None).ConfigureAwait(false))
+                if (!await DeadLetterSwallowingFailureAsync(delivery, ex, deleteOriginal: false).ConfigureAwait(false))
                 {
                     _logger.LogError(
                         "Failed to dead-letter already-ACKed {Provider} message {MessageId} on queue {Queue} ({Role}); the failure is only observable via logs and OnBackgroundFailure.",
@@ -430,7 +429,7 @@ internal abstract class DbMessageDispatcherBase : IAsyncDisposable
             // handler failing on its LAST attempt during a stop had the burial aborted (the
             // store's connection/transaction calls throw on the cancelled token) and the row was
             // NAKed back instead of dead-lettered.
-            var deadLettered = await delivery.DeadLetterAsync(exception, true, CancellationToken.None).ConfigureAwait(false);
+            var deadLettered = await DeadLetterSwallowingFailureAsync(delivery, exception, deleteOriginal: true).ConfigureAwait(false);
             if (!deadLettered)
             {
                 _logger.LogWarning(exception, "{Provider} dead-letter publish failed for queue {Queue} ({Role}); releasing for retry.", _providerName, delivery.Queue, _role);
@@ -447,6 +446,31 @@ internal abstract class DbMessageDispatcherBase : IAsyncDisposable
                 _role,
                 delivery.Attempt);
             await NakSwallowingFailureAsync(delivery).ConfigureAwait(false);
+        }
+    }
+
+    // Burial with the same containment rule as NakSwallowingFailureAsync below: the delivery
+    // contract says DeadLetterAsync returns false rather than throwing, but the stores'
+    // DeadLetterEnabled = false branch runs its ack OUTSIDE their guarded region, so a transient
+    // DB failure there escaped as a throw — out of HandleAsync, tearing the subscriber down (and,
+    // from the drain loop, killing the background worker). A burial that throws is a burial that
+    // failed: report false and let the caller's NAK / lease-lapse path apply.
+    private async Task<bool> DeadLetterSwallowingFailureAsync(DbTransportDelivery delivery, Exception exception, bool deleteOriginal)
+    {
+        try
+        {
+            return await delivery.DeadLetterAsync(exception, deleteOriginal, CancellationToken.None).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(
+                ex,
+                "Failed to dead-letter {Provider} message {MessageId} on queue {Queue} ({Role}); treating the burial as failed.",
+                _providerName,
+                delivery.Id,
+                delivery.Queue,
+                _role);
+            return false;
         }
     }
 

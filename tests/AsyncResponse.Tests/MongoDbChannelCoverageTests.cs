@@ -956,9 +956,40 @@ public sealed class MongoDbChannelCoverageTests
         await disposal.WaitAsync(TimeSpan.FromSeconds(5));
     }
 
+    [Fact]
+    public async Task ChannelStore_PinsEveryCollectionHandleAndTheServerClockToPrimaryReads()
+    {
+        // Regression (round 31): the channel's collections inherited the host connection's read
+        // preference, so a secondaryPreferred connection string routed the liveness probe,
+        // recovery-state read and message load to a lagging secondary — a publisher racing a
+        // fresh registration then saw 0 subscribers AND 0 recovery states and dropped the
+        // response while reporting success. Reads (and the watermark's server-clock command,
+        // whose $$NOW authority stamps the rows it bounds) pin Primary at construction, exactly
+        // like the MongoDB durable-flow store.
+        var fixture = new ChannelFixture();
+
+        fixture.Recovery.Verify(c => c.WithReadPreference(ReadPreference.Primary), Times.Once);
+        fixture.Messages.Verify(c => c.WithReadPreference(ReadPreference.Primary), Times.Once);
+        fixture.Subscribers.Verify(c => c.WithReadPreference(ReadPreference.Primary), Times.Once);
+
+        fixture.Database
+            .Setup(d => d.RunCommandAsync(
+                It.IsAny<Command<BsonDocument>>(),
+                It.IsAny<ReadPreference>(),
+                It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new BsonDocument("localTime", new BsonDateTime(DateTime.UtcNow)));
+        await fixture.Store.GetServerTimeUtcAsync(CancellationToken.None);
+        fixture.Database.Verify(
+            d => d.RunCommandAsync(
+                It.IsAny<Command<BsonDocument>>(),
+                ReadPreference.Primary,
+                It.IsAny<CancellationToken>()),
+            Times.Once);
+    }
+
     private static IMongoCollection<BsonDocument> CountersStampedAt(DateTime drawnAt)
     {
-        var counters = new Mock<IMongoCollection<BsonDocument>>(MockBehavior.Loose);
+        var counters = new Mock<IMongoCollection<BsonDocument>>(MockBehavior.Loose).SelfPinning();
         var seq = 0L;
         counters
             .Setup(c => c.FindOneAndUpdateAsync(
@@ -996,6 +1027,11 @@ public sealed class MongoDbChannelCoverageTests
                 DeliveryConfirmationTimeout = TimeSpan.FromMilliseconds(2),
                 DeliveryConfirmationPollInterval = TimeSpan.FromMilliseconds(1)
             });
+            // The store pins ReadPreference.Primary on every handle; loose mocks would answer
+            // that fluent call with null and silently replace each stubbed collection.
+            Recovery.SelfPinning();
+            Messages.SelfPinning();
+            Subscribers.SelfPinning();
             Database
                 .Setup(d => d.GetCollection<MongoRecoveryStateDocument>(
                     It.IsAny<string>(),

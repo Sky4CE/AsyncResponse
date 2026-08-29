@@ -411,6 +411,13 @@ builder.Services.AddAsyncResponse()
 An application-registered `CosmosClient` is reused automatically; omit `ConnectionString` in that
 case. Existing containers must already use the configured partition key and have TTL enabled.
 
+Ledger loads treat only a `404` with sub-status `0` as a genuinely absent flow. Cosmos also
+answers `404` for conditions where the ledger still exists — `1002` (`ReadSessionNotAvailable`,
+routine Session-consistency lag when another process reads right after a write) and `1003`/`1004`
+(container or database recreated) — and those surface as errors so the wake-up is retried or
+dead-lettered instead of being acknowledged against a live run (the same contract point DynamoDB
+pins with `ConsistentRead` and MongoDB with primary reads).
+
 ### DynamoDB
 
 The package reuses a registered `IAmazonDynamoDB`; otherwise it uses the normal AWS SDK credential
@@ -550,7 +557,11 @@ The library does not silently upgrade an incomplete concurrency schema:
 - Cosmos auto-create uses the configured partition key and enables per-item TTL on a new container.
   An existing container must already use that partition key and have TTL enabled, or first use fails.
 - DynamoDB validates that TTL is enabled or being enabled on the configured attribute. A table with
-  TTL on another attribute fails clearly instead of leaking expired ledgers.
+  TTL on another attribute fails clearly instead of leaking expired ledgers. With
+  `AutoCreateTable = false` the check runs regardless of `EnableTimeToLive` — that flag governs
+  whether auto-creation enables TTL, not whether an operator-provisioned table is verified to
+  have it (this store has no application-side pruning, so a table without TTL grows without
+  bound).
 - EF Core never runs DDL. Generate and deploy an EF migration after adding
   `ConfigureAsyncResponseDurableFlows()`.
 

@@ -206,6 +206,25 @@ public class AsyncResponseIngressErrorTests
         await ingress.HandleWorkerMessageAsync("""{"SchemaVersion":1,"Call":null,"CorrelationId":"corr-null-call"}""");
     }
 
+    [Theory]
+    [InlineData("""{"SchemaVersion":1,"Call":{"ServiceInterfaceFullName":null,"MethodName":"Y","Params":[]},"CorrelationId":"c1"}""")]
+    [InlineData("""{"SchemaVersion":1,"Call":{"ServiceInterfaceFullName":"X","MethodName":null,"Params":[]},"CorrelationId":"c1"}""")]
+    [InlineData("""{"SchemaVersion":1,"Call":{"ServiceInterfaceFullName":"X","MethodName":"Y","Params":null},"CorrelationId":"c1"}""")]
+    [InlineData("""{"SchemaVersion":1,"Call":{"ServiceInterfaceFullName":"X","MethodName":"Y","Params":[null]},"CorrelationId":"c1"}""")]
+    public async Task HandleWorkerMessageAsync_NullCallMembers_AreAcknowledgedInsteadOfRedelivered(string json)
+    {
+        // Regression (round 31): the Call-null guard's own mechanism — `required` enforces
+        // presence on the wire, not non-null — applies identically one level down, but
+        // ReflectionCallDto's members got no equivalent check. An explicit "Params": null (or a
+        // null element, or a null target name) parsed, passed the guard, and threw
+        // ArgumentNullException from the first dereference — outside the drop-and-ack filter, so
+        // the transport redelivered it forever. Same contract violation, same answer:
+        // acknowledged, never thrown.
+        var ingress = CreateIngress(new ThrowingRawPublisher(), new RecordingPublisher());
+
+        await ingress.HandleWorkerMessageAsync(json);
+    }
+
     [Fact]
     public async Task HandleWorkerMessageAsync_JsonExceptionFromTheJobBody_PropagatesForRedelivery()
     {

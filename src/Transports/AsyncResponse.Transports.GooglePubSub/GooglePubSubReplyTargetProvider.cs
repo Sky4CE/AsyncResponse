@@ -10,6 +10,9 @@ internal sealed class GooglePubSubReplyTargetProvider(
     public AsyncResponseReplyTarget GetReplyTarget(string? name = null)
     {
         var options = _options.Value;
+        // Options-validator parity with the other transports' providers: a hand-off address must
+        // come from a configuration that passes the transport's own checks.
+        GooglePubSubOptionsValidator.ValidateTimeouts(options);
         var targetName = string.IsNullOrWhiteSpace(name)
             ? options.DefaultReplyTargetName
             : name;
@@ -21,6 +24,17 @@ internal sealed class GooglePubSubReplyTargetProvider(
         var topicId = GooglePubSubOptionsValidator.Required(
             target.TopicId,
             $"{nameof(GooglePubSubReplyTargetOptions)}.{nameof(GooglePubSubReplyTargetOptions.TopicId)}");
+
+        // A NAMED target must not be the worker topic in the transport's own project
+        // (DB-transport parity): its responses would be consumed as worker jobs while the waiter
+        // times out.
+        if (StringComparer.Ordinal.Equals(projectId, options.ProjectId)
+            && StringComparer.Ordinal.Equals(topicId, options.WorkerTopicId))
+        {
+            throw new InvalidOperationException(
+                $"Google Pub/Sub async-response reply target '{targetName}' uses topic '{topicId}' in project '{projectId}', which collides with " +
+                $"{nameof(GooglePubSubAsyncResponseOptions.WorkerTopicId)}; its responses would be consumed as worker jobs.");
+        }
 
         var properties = new Dictionary<string, string>(target.Properties, StringComparer.Ordinal)
         {

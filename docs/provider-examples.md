@@ -502,7 +502,11 @@ builder.Services.AddAsyncResponse()
     })
     .WithPostgreSqlDurableFlows(options =>
     {
-        options.StateExpiry = TimeSpan.FromDays(14);
+        // Must EXCEED the channel's effective default waiter timeout (DefaultTimeout, or
+        // RecoveryStateExpiry = 14 days above when DefaultTimeout is unset): a timeout-less
+        // awaited step waits out that default, and startup validation rejects a ledger TTL that
+        // does not out-live the wait.
+        options.StateExpiry = TimeSpan.FromDays(30);
         options.ExecutionLeaseDuration = TimeSpan.FromMinutes(1);
         options.ExecutionLeaseRenewInterval = TimeSpan.FromSeconds(20);
         options.ConnectionString = postgresConnectionString;

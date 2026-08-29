@@ -47,14 +47,37 @@ internal static class AsyncResponseJson
 
     /// <summary>Serializes with default settings, resolving metadata through the chain.</summary>
     public static string Serialize<T>(T value)
-        => JsonSerializer.Serialize(value, GetTypeInfo<T>(Default));
+    {
+        try
+        {
+            return JsonSerializer.Serialize(value, GetTypeInfo<T>(Default));
+        }
+        catch (NotSupportedException ex) when (!IsRegistrationGuidance(ex))
+        {
+            // The serializer throws its own NotSupportedException when it hits an unregistered
+            // type while WALKING the graph — an object-typed member (CallbackParam.Value) whose
+            // runtime type, an enum say, has no source-generated metadata. That throw never
+            // passes through GetTypeInfo below, so without this catch the actionable
+            // register-your-type guidance is skipped exactly where it is hardest to diagnose.
+            throw MemberRegistrationGuidance(typeof(T), ex);
+        }
+    }
 
     /// <summary>
     /// Serializes by the value's runtime type — the counterpart of the reflection-based
     /// <c>JsonSerializer.Serialize(value, value.GetType())</c> pattern.
     /// </summary>
     public static string Serialize(object value, Type runtimeType)
-        => JsonSerializer.Serialize(value, GetTypeInfo(runtimeType, Default));
+    {
+        try
+        {
+            return JsonSerializer.Serialize(value, GetTypeInfo(runtimeType, Default));
+        }
+        catch (NotSupportedException ex) when (!IsRegistrationGuidance(ex))
+        {
+            throw MemberRegistrationGuidance(runtimeType, ex);
+        }
+    }
 
     /// <summary>
     /// Deserializes with default settings (case-sensitive property matching, like the bare
@@ -69,7 +92,16 @@ internal static class AsyncResponseJson
     /// where the string round-trip doubled the publish-path allocations.
     /// </summary>
     internal static byte[] SerializeToUtf8Bytes<T>(T value)
-        => JsonSerializer.SerializeToUtf8Bytes(value, GetTypeInfo<T>(Default));
+    {
+        try
+        {
+            return JsonSerializer.SerializeToUtf8Bytes(value, GetTypeInfo<T>(Default));
+        }
+        catch (NotSupportedException ex) when (!IsRegistrationGuidance(ex))
+        {
+            throw MemberRegistrationGuidance(typeof(T), ex);
+        }
+    }
 
     /// <summary>
     /// Case-insensitive UTF-8 deserialization — the byte-level twin of the string/JsonElement
@@ -105,13 +137,38 @@ internal static class AsyncResponseJson
         }
         catch (NotSupportedException ex)
         {
-            throw new NotSupportedException(
+            var guidance = new NotSupportedException(
                 $"No JSON metadata is available for '{type}'. This app runs without reflection-based " +
                 "System.Text.Json (trimmed/Native AOT), so payload types must be registered at startup: " +
                 $"declare [JsonSerializable(typeof({type.Name}))] on a JsonSerializerContext and call " +
                 $"{nameof(AsyncResponseJsonSerialization)}.{nameof(AsyncResponseJsonSerialization.RegisterResolver)}(YourContext.Default).",
                 ex);
+            guidance.Data[RegistrationGuidanceMarker] = true;
+            throw guidance;
         }
+    }
+
+    /// <summary>Marks the guidance-carrying NotSupportedException so wrappers never re-wrap it.</summary>
+    private const string RegistrationGuidanceMarker = "asyncresponse.registration_guidance";
+
+    private static bool IsRegistrationGuidance(NotSupportedException ex)
+        => ex.Data.Contains(RegistrationGuidanceMarker);
+
+    /// <summary>
+    /// Guidance for a metadata failure raised mid-serialization by a member's RUNTIME type (the
+    /// root type itself resolved fine); the inner exception names the exact path.
+    /// </summary>
+    private static NotSupportedException MemberRegistrationGuidance(Type rootType, NotSupportedException inner)
+    {
+        var guidance = new NotSupportedException(
+            $"A value reached through '{rootType}' has a runtime type with no JSON metadata — the inner exception names the " +
+            "path (typically an object-typed member such as a worker-call argument whose runtime type is an enum or other " +
+            "unregistered type). This app runs without reflection-based System.Text.Json (trimmed/Native AOT), so that type " +
+            "must be registered at startup: declare [JsonSerializable(typeof(...))] on a JsonSerializerContext and call " +
+            $"{nameof(AsyncResponseJsonSerialization)}.{nameof(AsyncResponseJsonSerialization.RegisterResolver)}(YourContext.Default).",
+            inner);
+        guidance.Data[RegistrationGuidanceMarker] = true;
+        return guidance;
     }
 
     private static IJsonTypeInfoResolver? CreateReflectionResolverIfEnabled()

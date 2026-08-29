@@ -480,6 +480,41 @@ public class RedisDispatcherTests
     }
 
     [Fact]
+    public async Task Queued_AlreadyExceededMax_DeadLettersWithoutEnqueueing()
+    {
+        // Regression (round 31): the pre-execution delivery cap lived only in the awaiting
+        // dispatcher, and the pending-claim loop feeds THIS dispatcher real XPENDING delivery
+        // counts too — so in AckAfterEnqueue mode an over-cap entry (deferred under backpressure
+        // and reclaimed each cycle, or re-claimed after a swallowed post-enqueue ACK failure) was
+        // re-enqueued and re-executed with duplicate side effects forever, with nothing ever
+        // consulting MaxDeliveryAttempts to bury it.
+        var database = new RedisTransportTests.FakeRedisStreamDatabase();
+        var handled = false;
+        var subscriber = new RedisSubscriberOptions { MaxDeliveryAttempts = 3 }
+            .UseAckAfterEnqueue(1, 8, TimeSpan.FromSeconds(5));
+        await using var dispatcher = RedisMessageDispatcher.Create(
+            (_, _) =>
+            {
+                handled = true;
+                return Task.CompletedTask;
+            },
+            database,
+            new RedisAsyncResponseTransportOptions { DeadLetterStream = "dead" },
+            subscriber,
+            NullLogger.Instance,
+            "worker-stream",
+            "worker-group",
+            RedisSubscriberRole.Worker);
+
+        await dispatcher.HandleAsync(Delivery("1-0", attempt: 4), CancellationToken.None);
+        await dispatcher.DisposeAsync();
+
+        Assert.False(handled);
+        Assert.Single(database.Acks);
+        Assert.Equal("max_delivery_attempts_exceeded", RedisTransportTests.Field(Assert.Single(database.Adds).Values, "reason"));
+    }
+
+    [Fact]
     public async Task Queued_AcksBeforeBackgroundHandlerCompletes()
     {
         var database = new RedisTransportTests.FakeRedisStreamDatabase();

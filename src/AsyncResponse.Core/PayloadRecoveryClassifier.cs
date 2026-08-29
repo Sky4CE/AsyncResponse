@@ -37,7 +37,13 @@ internal readonly record struct RecoveryClassification(RecoveryAction? Action, o
 /// </summary>
 internal static class PayloadRecoveryClassifier
 {
-    private static readonly ConcurrentDictionary<string, Type> PayloadTypes = new(StringComparer.Ordinal);
+    // Entries carry the resolver-registry generation observed before the scan that produced them,
+    // mirroring the negative cache's stamp: a plain clear-on-unregister has a race — an in-flight
+    // resolution that got its answer from the departing resolver can insert AFTER the clear,
+    // permanently re-poisoning the name with the revoked type. A stale stamp makes the entry a
+    // non-hit, so the next lookup rescans against the current resolver set.
+    private static readonly ConcurrentDictionary<string, (Type Type, int Generation)> PayloadTypes = new(StringComparer.Ordinal);
+    private static int _resolvedPayloadTypeGeneration;
 
     /// <summary>
     /// Drops resolved payload types when a type resolver is unregistered. Counterpart to
@@ -45,7 +51,13 @@ internal static class PayloadRecoveryClassifier
     /// departing resolver already answered would otherwise keep materializing into its old type,
     /// and keep that type's assembly reachable through this cache.
     /// </summary>
-    internal static void InvalidateResolvedPayloadTypes() => PayloadTypes.Clear();
+    internal static void InvalidateResolvedPayloadTypes()
+    {
+        // Bump BEFORE clearing: the bump is what fences in-flight scans (their pre-scan stamp goes
+        // stale); the clear just reclaims memory.
+        Interlocked.Increment(ref _resolvedPayloadTypeGeneration);
+        PayloadTypes.Clear();
+    }
 
     /// <summary>
     /// Attempts to classify <paramref name="payload"/> for the lost-subscriber path: which route it
@@ -114,8 +126,11 @@ internal static class PayloadRecoveryClassifier
         // active could outlive a later assembly load that makes the name resolvable.
         UnresolvableTypeNames.EnsureAssemblyLoadInvalidation();
 
-        if (PayloadTypes.TryGetValue(payloadTypeFullName, out var cached))
-            return cached;
+        if (PayloadTypes.TryGetValue(payloadTypeFullName, out var cached)
+            && cached.Generation == Volatile.Read(ref _resolvedPayloadTypeGeneration))
+        {
+            return cached.Type;
+        }
 
         // Fail fast on a name that already failed a full scan (shared with the callback service
         // resolver): without this, every redelivery naming an unresolvable payload type (a
@@ -130,6 +145,7 @@ internal static class PayloadRecoveryClassifier
         }
 
         var generationBeforeScan = UnresolvableTypeNames.GenerationBeforeScan();
+        var resolvedGenerationBeforeScan = Volatile.Read(ref _resolvedPayloadTypeGeneration);
 
         var resolved = AppDomain.CurrentDomain
             .GetAssemblies()
@@ -142,9 +158,10 @@ internal static class PayloadRecoveryClassifier
         if (resolved is not null)
         {
             // Collectible (plugin) payload types stay resolve-per-call: a strong process-wide
-            // cache entry would pin the plugin's AssemblyLoadContext after unload.
+            // cache entry would pin the plugin's AssemblyLoadContext after unload. Indexer, not
+            // TryAdd, so a stale-stamped survivor of a raced unregister is replaced.
             if (!resolved.Assembly.IsCollectible)
-                PayloadTypes.TryAdd(payloadTypeFullName, resolved);
+                PayloadTypes[payloadTypeFullName] = (resolved, resolvedGenerationBeforeScan);
         }
         else
         {

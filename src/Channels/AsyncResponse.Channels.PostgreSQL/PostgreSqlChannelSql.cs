@@ -188,45 +188,7 @@ internal sealed class PostgreSqlChannelSql
             // accepts a same-name index with the WRONG definition. Verify against the catalog,
             // in-transaction under the shared DDL lock, that every relation actually IS what the
             // DDL above intended, definitions included.
-            await PostgreSqlRelationVerifier.VerifyAsync(
-                connection,
-                transaction,
-                _options.SchemaName,
-                "channel",
-                [
-                    new(_options.RecoveryStateTable, 'r', Columns:
-                        [
-                            new("correlation_id", "text", Nullable: false, RequiresDeterministicCollation: true),
-                            new("registration_id", "uuid", Nullable: false, RequiresDeterministicCollation: true),
-                            new("state_json", "text", Nullable: false),
-                            new("expires_at", "timestamp with time zone", Nullable: false),
-                            new("registered_at", "timestamp with time zone", Nullable: false, DefaultExpression: "now()"),
-                        ], PrimaryKey: ["correlation_id", "registration_id"]),
-                    new(_options.MessageTable, 'r', Columns:
-                        [
-                            new("id", "uuid", Nullable: false),
-                            new("correlation_id", "text", Nullable: false, RequiresDeterministicCollation: true),
-                            new("envelope_json", "text", Nullable: false),
-                            new("created_at", "timestamp with time zone", Nullable: false, DefaultExpression: "now()"),
-                            new("expires_at", "timestamp with time zone", Nullable: false),
-                            new("acked_at", "timestamp with time zone", Nullable: true),
-                            new("acked_seq", "bigint", Nullable: true),
-                            new("recovery_claimed", "boolean", Nullable: false, DefaultExpression: "false"),
-                        ], PrimaryKey: ["id"]),
-                    new(_options.SubscriberTable, 'r', Columns:
-                        [
-                            new("correlation_id", "text", Nullable: false, RequiresDeterministicCollation: true),
-                            new("registration_id", "uuid", Nullable: false, RequiresDeterministicCollation: true),
-                            new("instance_id", "text", Nullable: false),
-                            new("expires_at", "timestamp with time zone", Nullable: false),
-                        ], PrimaryKey: ["correlation_id", "registration_id"]),
-                    new(AckSequenceName, 'S'),
-                    new(IndexName(_options.RecoveryStateTable, "expires"), 'i', _options.RecoveryStateTable, ["expires_at"]),
-                    new(IndexName(_options.MessageTable, "correlation_created"), 'i', _options.MessageTable, ["correlation_id", "created_at"]),
-                    new(IndexName(_options.MessageTable, "expires"), 'i', _options.MessageTable, ["expires_at"]),
-                    new(IndexName(_options.SubscriberTable, "expires"), 'i', _options.SubscriberTable, ["expires_at"]),
-                ],
-                cancellationToken).ConfigureAwait(false);
+            await VerifyRelationsAsync(connection, transaction, cancellationToken).ConfigureAwait(false);
 
             await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
             _created = true;
@@ -236,6 +198,47 @@ internal sealed class PostgreSqlChannelSql
             _ensureGate.Release();
         }
     }
+
+    private Task VerifyRelationsAsync(NpgsqlConnection connection, NpgsqlTransaction? transaction, CancellationToken cancellationToken)
+        => PostgreSqlRelationVerifier.VerifyAsync(
+            connection,
+            transaction,
+            _options.SchemaName,
+            "channel",
+            [
+                new(_options.RecoveryStateTable, 'r', Columns:
+                    [
+                        new("correlation_id", "text", Nullable: false, RequiresDeterministicCollation: true),
+                        new("registration_id", "uuid", Nullable: false, RequiresDeterministicCollation: true),
+                        new("state_json", "text", Nullable: false),
+                        new("expires_at", "timestamp with time zone", Nullable: false),
+                        new("registered_at", "timestamp with time zone", Nullable: false, DefaultExpression: "now()"),
+                    ], PrimaryKey: ["correlation_id", "registration_id"]),
+                new(_options.MessageTable, 'r', Columns:
+                    [
+                        new("id", "uuid", Nullable: false),
+                        new("correlation_id", "text", Nullable: false, RequiresDeterministicCollation: true),
+                        new("envelope_json", "text", Nullable: false),
+                        new("created_at", "timestamp with time zone", Nullable: false, DefaultExpression: "now()"),
+                        new("expires_at", "timestamp with time zone", Nullable: false),
+                        new("acked_at", "timestamp with time zone", Nullable: true),
+                        new("acked_seq", "bigint", Nullable: true),
+                        new("recovery_claimed", "boolean", Nullable: false, DefaultExpression: "false"),
+                    ], PrimaryKey: ["id"]),
+                new(_options.SubscriberTable, 'r', Columns:
+                    [
+                        new("correlation_id", "text", Nullable: false, RequiresDeterministicCollation: true),
+                        new("registration_id", "uuid", Nullable: false, RequiresDeterministicCollation: true),
+                        new("instance_id", "text", Nullable: false),
+                        new("expires_at", "timestamp with time zone", Nullable: false),
+                    ], PrimaryKey: ["correlation_id", "registration_id"]),
+                new(AckSequenceName, 'S'),
+                new(IndexName(_options.RecoveryStateTable, "expires"), 'i', _options.RecoveryStateTable, ["expires_at"]),
+                new(IndexName(_options.MessageTable, "correlation_created"), 'i', _options.MessageTable, ["correlation_id", "created_at"]),
+                new(IndexName(_options.MessageTable, "expires"), 'i', _options.MessageTable, ["expires_at"]),
+                new(IndexName(_options.SubscriberTable, "expires"), 'i', _options.SubscriberTable, ["expires_at"]),
+            ],
+            cancellationToken);
 
 
     private async Task ValidateManagedSchemaAsync(CancellationToken cancellationToken)
@@ -247,25 +250,31 @@ internal sealed class PostgreSqlChannelSql
                 return;
 
             await using var connection = await _dataSource.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
-            await using var command = connection.CreateCommand();
-            // relkind = 'S' precisely: to_regclass matches ANY relation, so a table sharing the
-            // sequence's name (the pre-fix truncation collision) passed validation and failed at
-            // the first nextval instead.
-            command.CommandText =
-                """
-                SELECT
-                  EXISTS (SELECT 1 FROM information_schema.columns
-                          WHERE table_schema = @schema AND table_name = @table AND column_name = 'acked_seq'),
-                  EXISTS (SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
-                          WHERE n.nspname = @schema AND c.relname = @sequence AND c.relkind = 'S');
-                """;
-            command.Parameters.AddWithValue("schema", _options.SchemaName);
-            command.Parameters.AddWithValue("table", _options.MessageTable);
-            command.Parameters.AddWithValue("sequence", AckSequenceName);
-            await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
-            await reader.ReadAsync(cancellationToken).ConfigureAwait(false);
-            var hasColumn = reader.GetBoolean(0);
-            var hasSequence = reader.GetBoolean(1);
+            bool hasColumn;
+            bool hasSequence;
+            // The probe's command and reader are scoped so they are disposed before the relation
+            // verification below reuses this connection — Npgsql allows one command in progress.
+            await using (var command = connection.CreateCommand())
+            {
+                // relkind = 'S' precisely: to_regclass matches ANY relation, so a table sharing the
+                // sequence's name (the pre-fix truncation collision) passed validation and failed at
+                // the first nextval instead.
+                command.CommandText =
+                    """
+                    SELECT
+                      EXISTS (SELECT 1 FROM information_schema.columns
+                              WHERE table_schema = @schema AND table_name = @table AND column_name = 'acked_seq'),
+                      EXISTS (SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+                              WHERE n.nspname = @schema AND c.relname = @sequence AND c.relkind = 'S');
+                    """;
+                command.Parameters.AddWithValue("schema", _options.SchemaName);
+                command.Parameters.AddWithValue("table", _options.MessageTable);
+                command.Parameters.AddWithValue("sequence", AckSequenceName);
+                await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+                await reader.ReadAsync(cancellationToken).ConfigureAwait(false);
+                hasColumn = reader.GetBoolean(0);
+                hasSequence = reader.GetBoolean(1);
+            }
             if (!hasColumn || !hasSequence)
             {
                 throw new InvalidOperationException(
@@ -277,6 +286,12 @@ internal sealed class PostgreSqlChannelSql
                     $"CREATE SEQUENCE IF NOT EXISTS {AckSequence} AS bigint; " +
                     "See docs/postgresql.md, section 'Upgrading a manually managed schema'.");
             }
+
+            // Full relation verification on the managed path too (transport/flow-store parity):
+            // an operator-provisioned table with the wrong shape — a nondeterministic
+            // correlation_id collation above all — previously passed startup here and
+            // misrouted silently at runtime, which is exactly what verification exists to catch.
+            await VerifyRelationsAsync(connection, transaction: null, cancellationToken).ConfigureAwait(false);
 
             _created = true;
         }

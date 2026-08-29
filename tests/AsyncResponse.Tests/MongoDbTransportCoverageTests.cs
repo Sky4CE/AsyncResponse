@@ -173,13 +173,14 @@ public sealed class MongoDbTransportCoverageTests
     }
 
     [Fact]
-    public async Task Store_DeadLetterOnAStaleClaim_NoOpsAndCompensatesTheDlqCopy()
+    public async Task Store_DeadLetterOnAStaleClaim_NoOpsAndKeepsTheDlqCopy()
     {
-        // Regression (round 29): the DLQ insert ran unconditionally and the fenced delete's result
-        // was ignored, so a claim whose lease had lapsed (a peer re-claimed the document) still
-        // buried a full copy of a message that is still live and may yet succeed under its new
-        // owner — the DLQ showed a poison entry for work that completed, and an operator replaying
-        // it duplicated its side effects. The fenced ack and NAK already no-op in that window.
+        // Round 29 made a stale claim's burial no-op (fenced delete result honored); round 31
+        // removed the COMPENSATING delete of the DLQ copy that no-op used to run: the id is
+        // deterministic, so a peer that also reached the cap buried into the SAME document, and
+        // compensating away "our" copy erased the peer's just-logged burial — the message
+        // vanished from both the live queue and the DLQ. The copy is kept: the worst it can be
+        // is a spurious, prunable DLQ entry for a message whose new owner later succeeds.
         var sourceId = Guid.NewGuid();
         var message = new MongoTransportMessageDocument
         {
@@ -218,11 +219,10 @@ public sealed class MongoDbTransportCoverageTests
 
         Assert.False(await delivery.DeadLetterAsync(new InvalidOperationException("poison"), true, CancellationToken.None));
 
-        // Two deletes: the fenced one that did not match, then the compensating removal of the DLQ
-        // copy written a moment earlier. The deterministic id makes that removal exact.
-        Assert.Equal(2, deletes.Count);
-        Assert.Equal(sourceId, deletes[0]["_id"].AsGuid);
-        Assert.Equal(MongoDbTransportStore.DeadLetterId(sourceId), Assert.Single(deletes[1].Elements).Value.AsGuid);
+        // One delete only: the fenced source removal that did not match. The DLQ copy written a
+        // moment earlier is deliberately NOT compensated away — it may be a racing peer's burial.
+        var fenced = Assert.Single(deletes);
+        Assert.Equal(sourceId, fenced["_id"].AsGuid);
     }
 
     [Fact]

@@ -1042,6 +1042,80 @@ public class RabbitMqDispatcherTests
 
     // ---------- helpers ----------
 
+    [Fact]
+    public async Task Queued_AfterTheDrainBudgetLapses_DoesNotStartFreshWork_DeadLettersAndSurfacesIt()
+    {
+        // Regression (round 31): the drain token cannot stop the REAL handler — it is
+        // _ingress.HandleWorkerMessageAsync(payload), whose target takes no CancellationToken — so
+        // the loop kept dequeuing and EXECUTING past the budget, and whatever was still queued at
+        // process exit vanished with no record: those deliveries were ACKed at enqueue, so the
+        // broker never redelivers them (DB/Redis/Pub-Sub parity).
+        var channel = new FakeDispatcherChannel();
+        var firstStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseFirst = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var handlerRuns = 0;
+        var failures = new List<RabbitMqBackgroundFailureContext>();
+        var subscriber = EnqueueSubscriber(workers: 1, capacity: 8, drain: TimeSpan.FromMilliseconds(100));
+        subscriber.OnBackgroundFailure = context =>
+        {
+            lock (failures)
+            {
+                failures.Add(context);
+            }
+
+            return ValueTask.CompletedTask;
+        };
+
+        var dispatcher = RabbitMqMessageDispatcher.Create(
+            async (_, _) =>
+            {
+                // Deliberately ignores the token, exactly like the ingress handler in production.
+                if (Interlocked.Increment(ref handlerRuns) == 1)
+                {
+                    firstStarted.TrySetResult();
+                    await releaseFirst.Task.ConfigureAwait(false);
+                }
+            },
+            new RabbitMqAsyncResponseOptions { DeadLetterExchange = "dlx" },
+            subscriber,
+            NullLogger.Instance,
+            "worker.q",
+            RabbitMqSubscriberRole.Worker);
+
+        await dispatcher.HandleAsync(Delivery("m1", deliveryTag: 1), channel, CancellationToken.None);
+        await firstStarted.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        await dispatcher.HandleAsync(Delivery("m2", deliveryTag: 2), channel, CancellationToken.None); // ACKed, waiting in queue
+
+        await dispatcher.DisposeAsync(); // the 100ms drain budget lapses while the first handler blocks
+        releaseFirst.TrySetResult();      // ...and only now can the loop reach the queued entry
+
+        var guard = TimeProvider.System.GetUtcNow() + TimeSpan.FromSeconds(10);
+        while (true)
+        {
+            lock (failures)
+            {
+                if (failures.Count == 1)
+                    break;
+            }
+
+            Assert.True(TimeProvider.System.GetUtcNow() < guard, "the undrained delivery was never surfaced");
+            await Task.Delay(TimeSpan.FromMilliseconds(5));
+        }
+
+        lock (failures)
+        {
+            Assert.IsAssignableFrom<OperationCanceledException>(Assert.Single(failures).Exception);
+        }
+
+        // The queued entry was NOT executed after the budget lapsed — and, unlike a mid-handler
+        // interruption, it was published to the DLX: it was ACKed at enqueue, so nothing else can
+        // ever record it.
+        Assert.Equal(1, Volatile.Read(ref handlerRuns));
+        var buried = Assert.Single(channel.Publishes);
+        Assert.Equal("dlx", buried.Exchange);
+        Assert.Equal("m2", Encoding.UTF8.GetString(buried.Body.ToArray()));
+    }
+
     private static RabbitMqSubscriberOptions EnqueueSubscriber(
         int workers = 1,
         int capacity = 8,

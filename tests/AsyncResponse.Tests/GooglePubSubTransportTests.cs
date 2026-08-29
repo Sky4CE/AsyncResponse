@@ -68,6 +68,30 @@ public class GooglePubSubTransportTests
     }
 
     [Fact]
+    public async Task WorkerTransport_Dispose_SwallowsAShutdownTimeoutInsteadOfFaultingTheDisposalChain()
+    {
+        // Regression (round 31): the SDK CANCELS PublisherClient.ShutdownAsync's task when the
+        // timeout expires before the backlog flushes, and the transport is a container-created
+        // singleton — an unguarded await here threw TaskCanceledException out of
+        // ServiceProvider.DisposeAsync and aborted the disposal of every service registered after
+        // it. Dispose is best effort, like the RabbitMQ and Azure Service Bus worker transports'
+        // closes.
+        var publisher = new FakePublisherClient { ShutdownException = new TaskCanceledException("shutdown timed out") };
+        var transport = new GooglePubSubWorkerTransport(
+            Options.Create(new GooglePubSubAsyncResponseOptions
+            {
+                ProjectId = "project-a",
+                WorkerTopicId = "jobs"
+            }),
+            () => Task.FromResult<IGooglePubSubPublisherClient>(publisher));
+
+        await transport.PublishAsync(WorkerJob("corr-shutdown"));
+        await transport.DisposeAsync();
+
+        Assert.Equal(1, publisher.ShutdownCalls);
+    }
+
+    [Fact]
     public async Task WorkerTransport_Publish_EmitsActivityTags()
     {
         using var collector = new AsyncResponseActivityCollector();
@@ -557,6 +581,7 @@ public class GooglePubSubTransportTests
 
         public string MessageId { get; init; } = "message-id";
         public Exception? PublishException { get; init; }
+        public Exception? ShutdownException { get; init; }
         public TaskCompletionSource<string>? PublishCompletion { get; init; }
         public int ShutdownCalls { get; private set; }
         public TimeSpan? LastShutdownTimeout { get; private set; }
@@ -578,7 +603,7 @@ public class GooglePubSubTransportTests
         {
             ShutdownCalls++;
             LastShutdownTimeout = timeout;
-            return Task.CompletedTask;
+            return ShutdownException is null ? Task.CompletedTask : Task.FromException(ShutdownException);
         }
     }
 }

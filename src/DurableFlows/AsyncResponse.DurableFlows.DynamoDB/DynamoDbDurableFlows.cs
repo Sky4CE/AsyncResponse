@@ -50,7 +50,12 @@ public sealed class DynamoDbDurableFlowOptions : DurableFlowOptions
     /// <summary>Creates the table on first use when it does not exist.</summary>
     public bool AutoCreateTable { get; set; } = true;
 
-    /// <summary>Enables DynamoDB TTL on the expiry attribute when auto-creating the table.</summary>
+    /// <summary>
+    /// Enables DynamoDB TTL on the expiry attribute when auto-creating the table. With
+    /// <see cref="AutoCreateTable"/> off, the store still verifies at startup that the
+    /// operator-provisioned table has TTL enabled on the expiry attribute regardless of this
+    /// flag — TTL is the store's only cleanup mechanism.
+    /// </summary>
     public bool EnableTimeToLive { get; set; } = true;
 
     /// <summary>Attribute used for DynamoDB TTL. Default: <c>expires_at</c>.</summary>
@@ -353,7 +358,13 @@ public sealed class DynamoDbFlowStateStore : IFlowStateStore, IDisposable
 
             ValidateTableSchema(table);
 
-            if (_options.EnableTimeToLive)
+            // Verification runs for every operator-provisioned table, not only when
+            // EnableTimeToLive is set: the flag governs ENABLING (an auto-create concern, as its
+            // doc says), but TTL is this store's only cleanup mechanism (no application-side
+            // pruning exists), so an operator who provisioned the table and turned the flag off
+            // was thereby turning off the check that their table actually has TTL — and it grew
+            // without bound with no error and no log line.
+            if (_options.EnableTimeToLive || !_options.AutoCreateTable)
             {
                 // Check the TTL status instead of blind-enabling: UpdateTimeToLive throws when TTL
                 // is already enabled, and relying on a swallowed exception per provisioning is noise.

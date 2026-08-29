@@ -416,9 +416,14 @@ internal sealed class MongoDbTransportStore : IDisposable
 
             // ...but the burial only counts if the fenced delete matched. A stale claim (the lease
             // lapsed and a peer re-claimed the document) must no-op here exactly as the fenced ack
-            // and NAK do, so the DLQ copy written a moment ago is compensated away: leaving it
-            // buried a full copy of a message that is still live and may yet succeed under its new
-            // owner. The deterministic id makes the compensating delete exact and idempotent.
+            // and NAK do. The DLQ copy written a moment ago is deliberately NOT compensated away:
+            // the deterministic id means a peer that also reached the cap buried into the SAME
+            // document, so deleting it here erased the peer's just-logged burial and the message
+            // vanished from both the live queue and the DLQ. The worst a kept copy can be is a
+            // spurious DLQ entry for a message whose new owner later succeeds — visible, prunable
+            // by dead-letter retention, and strictly better than losing the only record. (The SQL
+            // siblings avoid the dilemma by making delete+insert one atomic statement; standalone
+            // MongoDB has no equivalent.)
             var removed = await _messages.DeleteOneAsync(
                 Builders<MongoTransportMessageDocument>.Filter.Eq(item => item.Id, id)
                 & Builders<MongoTransportMessageDocument>.Filter.Eq(item => item.LockId, lockId),
@@ -426,12 +431,8 @@ internal sealed class MongoDbTransportStore : IDisposable
 
             if (removed.DeletedCount == 0)
             {
-                await _messages.DeleteOneAsync(
-                    Builders<MongoTransportMessageDocument>.Filter.Eq(item => item.Id, deadLetterId),
-                    CancellationToken.None).ConfigureAwait(false);
-
                 _logger?.LogWarning(
-                    "MongoDB dead-letter for message {MessageId} from queue {SourceQueue} no-opped: the claim's lease had lapsed and the document was re-claimed.",
+                    "MongoDB dead-letter for message {MessageId} from queue {SourceQueue} no-opped: the claim's lease had lapsed and the document was re-claimed. The dead-letter copy is kept in case the burial raced a peer's.",
                     id,
                     sourceQueue);
                 return false;

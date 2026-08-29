@@ -342,7 +342,7 @@ public sealed class MongoDbStoreQueryTests
             .ReturnsAsync((MongoChannelMessageDocument)null!)
             .ReturnsAsync(new MongoChannelMessageDocument { Id = Guid.NewGuid(), CorrelationId = "corr" })
             .ReturnsAsync((MongoChannelMessageDocument)null!);
-        var store = CreateChannelStore(collection.Object);
+        var store = CreateChannelStore(collection);
 
         Assert.True(await store.TryClaimForDeliveryAsync(Guid.NewGuid(), CancellationToken.None));
         Assert.False(await store.TryClaimForDeliveryAsync(Guid.NewGuid(), CancellationToken.None));
@@ -392,19 +392,15 @@ public sealed class MongoDbStoreQueryTests
         return new MongoDbTransportStore(database.Object, Options.Create(options));
     }
 
-    private static MongoDbChannelStore CreateChannelStore(IMongoCollection<MongoChannelMessageDocument> collection)
+    private static MongoDbChannelStore CreateChannelStore(Mock<IMongoCollection<MongoChannelMessageDocument>> collection)
     {
         var options = new MongoDbAsyncResponseChannelOptions { AutoCreateIndexes = false };
         var database = new Mock<IMongoDatabase>(MockBehavior.Loose);
         database
             .Setup(d => d.GetCollection<MongoChannelMessageDocument>(options.MessageCollection, It.IsAny<MongoCollectionSettings>()))
-            .Returns(collection);
-        database
-            .Setup(d => d.GetCollection<MongoRecoveryStateDocument>(options.RecoveryStateCollection, It.IsAny<MongoCollectionSettings>()))
-            .Returns(Mock.Of<IMongoCollection<MongoRecoveryStateDocument>>());
-        database
-            .Setup(d => d.GetCollection<MongoChannelSubscriberDocument>(options.SubscriberCollection, It.IsAny<MongoCollectionSettings>()))
-            .Returns(Mock.Of<IMongoCollection<MongoChannelSubscriberDocument>>());
+            .Returns(collection.SelfPinning().Object);
+        database.WithLooseCollection<MongoRecoveryStateDocument>();
+        database.WithLooseCollection<MongoChannelSubscriberDocument>();
         database.WithCounters();
         return new MongoDbChannelStore(database.Object, Options.Create(options));
     }

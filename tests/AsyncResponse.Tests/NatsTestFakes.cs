@@ -414,6 +414,11 @@ internal sealed class FakeNatsJetStreamTransport : INatsJetStreamTransport
         return Task.CompletedTask;
     }
 
+    // Same bookkeeping as EnsureStreamAsync: the fake only records that provisioning happened;
+    // the retention difference is the real adapter's concern.
+    public Task EnsureDeadLetterStreamAsync(string stream, string subject, long? maxMessages, CancellationToken cancellationToken)
+        => EnsureStreamAsync(stream, subject, maxMessages, cancellationToken);
+
     public Task EnsureConsumerAsync(string stream, string durable, TimeSpan ackWait, CancellationToken cancellationToken)
     {
         _ensureConsumerAttempts++;
@@ -427,6 +432,10 @@ internal sealed class FakeNatsJetStreamTransport : INatsJetStreamTransport
 
     public Task<string> PublishAsync(string subject, string payload, IReadOnlyDictionary<string, string>? headers, CancellationToken cancellationToken)
     {
+        // Mirrors the real adapter, which forwards the token verbatim to the SDK: a cancelled
+        // token aborts the publish instead of sending it.
+        cancellationToken.ThrowIfCancellationRequested();
+
         _publishAttempts++;
         var failure = PublishFailureForAttempt?.Invoke(_publishAttempts);
         if (failure is not null)

@@ -797,6 +797,49 @@ public sealed class SqlServerDirectIntegrationTests(DataBatchFixture fixture) : 
     }
 
     [Fact]
+    public async Task ManagedSchemaValidation_CaseInsensitiveCorrelationCollation_IsRejectedAtStartup()
+    {
+        // Regression (round 31): AutoCreateSchema = false ran only the acked_seq migration probe
+        // and skipped full relation verification, so an operator-provisioned correlation_id
+        // without a binary collation was accepted at startup — and SQL Server's `=` then folded
+        // case (and padded trailing spaces) at runtime, cross-routing responses silently. The
+        // managed path now verifies relations exactly like the DDL path, the transport and the
+        // flow store.
+        await WithSchemaAsync("managed_collation", async schema =>
+        {
+            var options = ChannelOptions(schema);
+            var creator = new SqlServerChannelSql(Options.Create(options));
+            await creator.EnsureCreatedAsync();
+
+            await using (var connection = new SqlConnection(Fixture.SqlServerConnectionString))
+            {
+                await connection.OpenAsync();
+                await using var degrade = connection.CreateCommand();
+                // The legacy shape an operator-managed migration can produce: the server's
+                // default case-insensitive collation on the identity column. The dependent index
+                // must be dropped for the ALTER and is recreated with its exact definition, so
+                // only the column's collation diverges from the contract.
+                degrade.CommandText =
+                    $"""
+                    DROP INDEX {options.MessageTable}_correlation_created_idx ON {creator.MessageTable};
+                    ALTER TABLE {creator.MessageTable} ALTER COLUMN correlation_id nvarchar(400) COLLATE SQL_Latin1_General_CP1_CI_AS NOT NULL;
+                    CREATE INDEX {options.MessageTable}_correlation_created_idx ON {creator.MessageTable} (correlation_id, created_at);
+                    """;
+                await degrade.ExecuteNonQueryAsync();
+            }
+
+            var managedOptions = ChannelOptions(schema);
+            managedOptions.AutoCreateSchema = false;
+            var managed = new SqlServerChannelSql(Options.Create(managedOptions));
+
+            var ex = await Assert.ThrowsAsync<InvalidOperationException>(
+                () => managed.GetSubscriptionStartAsync(CancellationToken.None));
+            Assert.Contains("correlation_id", ex.Message, StringComparison.Ordinal);
+            Assert.Contains("collation", ex.Message, StringComparison.OrdinalIgnoreCase);
+        });
+    }
+
+    [Fact]
     public async Task ManagedSchemaValidation_MissingAckSequenceObjects_FailsActionably_AndPassesAfterTheDocumentedMigration()
     {
         // A pre-1.0 manually managed schema (AutoCreateSchema = false) lacks acked_seq and its

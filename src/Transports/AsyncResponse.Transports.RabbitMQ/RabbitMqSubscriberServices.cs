@@ -93,7 +93,15 @@ internal abstract class RabbitMqSubscriberService : BackgroundService
     private async Task RunSubscriberAsync(string queue, CancellationToken stoppingToken)
     {
         await using var connection = await _connectionFactory.CreateConnectionAsync(stoppingToken).ConfigureAwait(false);
-        await using var channel = await connection.CreateChannelAsync(cancellationToken: stoppingToken).ConfigureAwait(false);
+        // Publisher confirmations when a dead-letter exchange is configured: the already-ACKed
+        // dead-letter copy is published on THIS channel, and without confirmation tracking an
+        // unroutable (mandatory) return raises only an unobserved basic.return — the publish
+        // "succeeded" and a successful burial was logged for a message the broker discarded.
+        // With confirms the publish throws, and the existing catch logs the failure honestly.
+        // Acks/nacks are unaffected by confirm mode, so channels that never publish pay nothing.
+        await using var channel = await connection.CreateChannelAsync(
+            publisherConfirmations: !string.IsNullOrWhiteSpace(Options.DeadLetterExchange),
+            cancellationToken: stoppingToken).ConfigureAwait(false);
         await EnsureTopologyAsync(channel, stoppingToken).ConfigureAwait(false);
         await channel.BasicQosAsync(SubscriberOptions.PrefetchCount, stoppingToken).ConfigureAwait(false);
 
@@ -140,6 +148,15 @@ internal abstract class RabbitMqSubscriberService : BackgroundService
 
         using var shutdown = new CancellationTokenSource(Options.ShutdownTimeout);
         await channel.BasicCancelAsync(consumer.ConsumerTag, shutdown.Token).ConfigureAwait(false);
+
+        // Drain the ACK-after-enqueue background queue BEFORE closing the channel and connection
+        // (Kafka parity: "leaving the await-using scope drains ... before the consumer commits").
+        // The drain's dead-letter publishes ride this consumer channel, so closing it first made
+        // TryDeadLetterAlreadyAckedAsync find the channel closed on every graceful shutdown and
+        // each already-ACKed failure during the drain lost its DLX record. DisposeAsync is
+        // idempotent, so the `await using` unwind after the closes is a no-op.
+        await dispatcher.DisposeAsync().ConfigureAwait(false);
+
         await channel.CloseAsync(shutdown.Token).ConfigureAwait(false);
         await connection.CloseAsync(Options.ShutdownTimeout, shutdown.Token).ConfigureAwait(false);
     }

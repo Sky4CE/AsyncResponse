@@ -81,6 +81,21 @@ public sealed class TenantOnboardingFlow(IProvisioningClient _client, StepRecord
     }
 }
 
+public sealed record ScopedCrashInput(string Name);
+
+/// <summary>One plain checkpointed step, for pinning flow-scoped crash injection.</summary>
+public sealed class ScopedCrashFlow(StepRecorder _recorder) : IDurableFlow<ScopedCrashInput>
+{
+    public async Task ExecuteAsync(IDurableFlowContext flow, ScopedCrashInput input)
+    {
+        await flow.StepAsync("work", () =>
+        {
+            _recorder.Record($"work:{input.Name}");
+            return Task.CompletedTask;
+        });
+    }
+}
+
 public sealed record DrainSuspendInput(long Id);
 
 /// <summary>
@@ -226,6 +241,47 @@ public class FlowTestHarnessShowcaseTests
             Assert.True(TimeProvider.System.GetUtcNow() < guard, "the parked entry leaked after the failed attempt");
             await Task.Delay(TimeSpan.FromMilliseconds(5));
         }
+    }
+
+    [Fact]
+    public async Task FlowScopedCrash_FiresOnTheNamedRun_NotWhicheverReachesTheStepFirst()
+    {
+        // Regression (round 31): the one-shot crash slot matched on step name alone, so with two
+        // runs (or a parent and a child flow reusing step names) the crash landed on whichever
+        // reached the step first — with the default single worker, deterministically the
+        // first-started run. A test arming a crash for run B then asserted B's replay while B ran
+        // clean and the recovery path never executed. Passing the flow id pins the crash to its
+        // run: another run reaching the step first must NOT consume it.
+        var recorder = new StepRecorder();
+        await using var harness = await FlowTestHarness.StartAsync(options =>
+        {
+            options.ConfigureServices = services => services.AddSingleton(recorder);
+            options.ConfigureAsyncResponse = builder => builder.WithDurableFlow<ScopedCrashFlow, ScopedCrashInput>();
+        });
+
+        harness.CrashBeforeStep("work", flowId: "run-b");
+
+        var a = await harness.StartFlowAsync<ScopedCrashFlow, ScopedCrashInput>(new ScopedCrashInput("a"), "run-a");
+        Assert.Equal(FlowRunStatus.Succeeded, await a.WaitForFinishedAsync());
+
+        var b = await harness.StartFlowAsync<ScopedCrashFlow, ScopedCrashInput>(new ScopedCrashInput("b"), "run-b");
+        // The crashed delivery's redelivery waits out the transport's retry backoff on the
+        // virtual clock; advance until the replay lands (CrashMatrix pattern).
+        var guard = TimeProvider.System.GetUtcNow() + TimeSpan.FromSeconds(10);
+        while ((await b.GetStateAsync())?.Status != FlowRunStatus.Succeeded)
+        {
+            Assert.True(TimeProvider.System.GetUtcNow() < guard, "run-b never finished");
+            await harness.AdvanceAsync(TimeSpan.FromMinutes(1));
+        }
+
+        Assert.Equal(FlowRunStatus.Succeeded, await b.WaitForFinishedAsync());
+
+        // Run A passed the armed step first and did not consume the crash; run B crashed before
+        // its step (two Starting events) and replayed, with the side effect still exactly-once.
+        Assert.Equal(1, a.StepExecutions("work"));
+        Assert.Equal(2, b.StepExecutions("work"));
+        Assert.Single(recorder.Entries, entry => entry == "work:a");
+        Assert.Single(recorder.Entries, entry => entry == "work:b");
     }
 
     [Fact]

@@ -121,6 +121,25 @@ public class NatsRecoveryStateStoreTests
     }
 
     [Fact]
+    public async Task SaveAsync_UnreadableEnvelope_ThrowsInsteadOfOverwriting()
+    {
+        // Regression (round 31): per-ENTRY unreadability is carried through the rewrite (the fact
+        // below), but an envelope whose top-level parse fails deserialized to null — read as "no
+        // entries" — and the revision-conditioned update then committed just the new registration
+        // over registrations this build could not even enumerate, destroying every armed callback
+        // the envelope held. The rewrite must refuse exactly as GetAllAsync does.
+        var key = NatsSubjectSchema.RecoveryKey("corr-a");
+        _kv.Entries[key] = "{not-json";
+
+        var mine = new RecoveryState { RegistrationId = Guid.NewGuid(), CorrelationId = "corr-a" };
+        var unreadable = await Assert.ThrowsAsync<RecoveryStateUnreadableException>(
+            () => _store.SaveAsync("corr-a", mine, TimeSpan.FromMinutes(3)));
+
+        Assert.Equal("corr-a", unreadable.CorrelationId);
+        Assert.Equal("{not-json", _kv.Entries[key]);
+    }
+
+    [Fact]
     public async Task SaveAsync_CarriesAnUnreadableSiblingThroughTheRewrite()
     {
         // Regression (round 29): save and delete are read-MODIFY-write on a SHARED envelope, and

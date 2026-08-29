@@ -47,9 +47,15 @@ public sealed class OptionCeilingSweepTests
             new NatsAsyncResponseTransportOptions { SubscriberRetryBaseDelay = BeyondTimerCeiling, SubscriberRetryMaxDelay = BeyondTimerCeiling }));
         Assert.Contains(nameof(NatsAsyncResponseTransportOptions.SubscriberRetryBaseDelay), retry.Message);
 
-        // AckWait and the NAK redelivery delay ride the wire as nanoseconds and are honored by
-        // the SERVER — a 60-day ack deadline is a legitimate JetStream configuration.
-        NatsTransportOptionsValidator.ValidateCommon(new NatsAsyncResponseTransportOptions { AckWait = BeyondTimerCeiling });
+        // The NAK redelivery delay rides the wire as nanoseconds and is honored by the SERVER —
+        // a 60-day redelivery delay is a legitimate JetStream configuration. AckWait is a server
+        // deadline too, but it ALSO arms the in-process ack-extension heartbeat's Task.Delay at
+        // one third of its value, so its real sink is the timer ceiling: under the persistence
+        // bound a multi-month value passed validation and then killed every batch with
+        // ArgumentOutOfRangeException from the heartbeat's delay.
+        var ackWait = Assert.Throws<InvalidOperationException>(() => NatsTransportOptionsValidator.ValidateCommon(
+            new NatsAsyncResponseTransportOptions { AckWait = BeyondTimerCeiling }));
+        Assert.Contains(nameof(NatsAsyncResponseTransportOptions.AckWait), ackWait.Message);
         NatsTransportOptionsValidator.ValidateSubscriber(new NatsSubscriberOptions { RedeliveryDelay = BeyondTimerCeiling }, "worker");
 
         var drain = Assert.Throws<InvalidOperationException>(() => NatsTransportOptionsValidator.ValidateSubscriber(
@@ -146,12 +152,16 @@ public sealed class OptionCeilingSweepTests
             new RedisAsyncResponseTransportOptions { OperationTimeout = BeyondTimerCeiling }));
         Assert.Contains(nameof(RedisAsyncResponseTransportOptions.OperationTimeout), operation.Message);
 
-        // PendingMessageMinIdleTime is the server-side XAUTOCLAIM min-idle: beyond the timer
-        // ceiling is legitimate. EmptyPollDelay arms the idle Task.Delay and is not.
-        RedisMessageDispatcher.ValidateOptions(
+        // PendingMessageMinIdleTime is the server-side XAUTOCLAIM min-idle, but it also arms the
+        // in-process idle-reset heartbeat's Task.Delay at one third of its value — so its real
+        // sink is the timer ceiling too, exactly like EmptyPollDelay's idle Task.Delay. Under the
+        // persistence bound a 200-day value passed validation and then killed every batch with
+        // ArgumentOutOfRangeException from the heartbeat's delay.
+        var minIdle = Assert.Throws<InvalidOperationException>(() => RedisMessageDispatcher.ValidateOptions(
             new RedisAsyncResponseTransportOptions(),
             new RedisSubscriberOptions { PendingMessageMinIdleTime = BeyondTimerCeiling },
-            RedisSubscriberRole.Worker);
+            RedisSubscriberRole.Worker));
+        Assert.Contains(nameof(RedisSubscriberOptions.PendingMessageMinIdleTime), minIdle.Message);
 
         var poll = Assert.Throws<InvalidOperationException>(() => RedisMessageDispatcher.ValidateOptions(
             new RedisAsyncResponseTransportOptions(),

@@ -70,6 +70,29 @@ public class NatsMessageDispatcherTests
     }
 
     [Fact]
+    public async Task LastAttemptFailure_DuringShutdown_StillDeadLetters()
+    {
+        // Regression (round 31): HandleFailureAsync forwarded the subscriber's stopping token into
+        // the dead-letter publish — the single unpinned settlement in the package (the
+        // pre-execution cap and the early-ACK failure path already used CancellationToken.None) —
+        // so a handler failing on its LAST attempt while the host stopped had the burial aborted
+        // on the cancelled token and the message was NAKed back instead of buried.
+        var rec = new RecordingDelivery();
+        using var stopping = new CancellationTokenSource();
+        stopping.Cancel();
+        await using var dispatcher = CreateDispatcher(
+            (_, _) => throw new InvalidOperationException("handler boom"),
+            new NatsSubscriberOptions { MaxDeliveryAttempts = 3 });
+
+        await dispatcher.HandleAsync(rec.Create("payload", numDelivered: 3), stopping.Token);
+
+        var published = Assert.Single(_jetStream.Published);
+        Assert.Equal(DeadLetterSubject, published.Subject);
+        Assert.Equal(1, rec.Terms);
+        Assert.Empty(rec.Naks);
+    }
+
+    [Fact]
     public async Task AtCapDelivery_StillExecutesTheHandler()
     {
         // The cap's LAST allowed attempt must still run: the pre-execution check refuses only
@@ -612,13 +635,15 @@ public class NatsMessageDispatcherTests
     }
 
     [Fact]
-    public async Task DisposeAsync_QueuedButUnstartedMessages_AreSurfacedViaOnBackgroundFailure_NotDeadLettered()
+    public async Task DisposeAsync_QueuedButUnstartedMessages_AreDeadLetteredAndSurfacedViaOnBackgroundFailure()
     {
         // Regression (r25): the drain-cancellation OperationCanceledException fell into the
         // generic background catch, which wrote never-completed jobs to the dead-letter subject
-        // with reason "A task was canceled" — misfiling a shutdown as a handler failure. Kafka
-        // and Redis both carve the drain cancellation out; NATS now does too: the drop is
-        // surfaced via OnBackgroundFailure only.
+        // with reason "A task was canceled" — misfiling a shutdown as a handler failure. The
+        // mid-handler message is still surfaced via OnBackgroundFailure only. The QUEUED,
+        // never-started message is now (DB/Redis parity) explicitly dead-lettered by the
+        // drain-budget pre-check AND surfaced: it was ACKed at enqueue, so without the DLQ copy
+        // it would vanish at process exit with no record.
         var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var failures = new List<NatsBackgroundFailureContext>();
         var subscriber = new NatsSubscriberOptions
@@ -653,8 +678,9 @@ public class NatsMessageDispatcherTests
         await dispatcher.DisposeAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(2));
 
         // Both the mid-handler message and the still-queued one were already ACKed: the shutdown
-        // interruption is surfaced through OnBackgroundFailure for each, and neither is written
-        // to the dead-letter subject as a phantom handler failure.
+        // interruption is surfaced through OnBackgroundFailure for each. Only the never-started
+        // one is written to the dead-letter subject — as a drain-budget lapse, not a phantom
+        // handler failure — because nothing else can ever record it.
         await WaitUntilAsync(() =>
         {
             lock (failures)
@@ -667,7 +693,9 @@ public class NatsMessageDispatcherTests
             Assert.All(failures, context => Assert.IsAssignableFrom<OperationCanceledException>(context.Exception));
         }
 
-        Assert.Empty(_jetStream.Published);
+        var buried = Assert.Single(_jetStream.Published);
+        Assert.Equal("p2", buried.Payload);
+        Assert.Contains("drain budget lapsed", buried.Headers!["AR-DeadLetter-Reason"], StringComparison.Ordinal);
     }
 
     [Fact]

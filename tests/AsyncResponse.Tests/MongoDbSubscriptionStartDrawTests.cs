@@ -22,7 +22,7 @@ public sealed class MongoDbSubscriptionStartDrawTests
         Action<FindOneAndUpdateOptions<BsonDocument, BsonDocument>>? captureOptions = null)
     {
         var options = new MongoDbAsyncResponseChannelOptions { AutoCreateIndexes = false };
-        var counters = new Mock<IMongoCollection<BsonDocument>>(MockBehavior.Loose);
+        var counters = new Mock<IMongoCollection<BsonDocument>>(MockBehavior.Loose).SelfPinning();
         counters
             .Setup(c => c.FindOneAndUpdateAsync(
                 It.IsAny<FilterDefinition<BsonDocument>>(),
@@ -34,6 +34,9 @@ public sealed class MongoDbSubscriptionStartDrawTests
             .ReturnsAsync(counterDocument);
         var database = new Mock<IMongoDatabase>(MockBehavior.Loose);
         database.SetupGet(d => d.DatabaseNamespace).Returns(new DatabaseNamespace("tests"));
+        database.WithLooseCollection<MongoRecoveryStateDocument>();
+        database.WithLooseCollection<MongoChannelMessageDocument>();
+        database.WithLooseCollection<MongoChannelSubscriberDocument>();
         database
             .Setup(d => d.GetCollection<BsonDocument>(
                 MongoDbChannelStore.CountersCollectionName(options.MessageCollection),

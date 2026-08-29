@@ -114,6 +114,41 @@ public class AsyncResponseTypeResolutionTests : IDisposable
     }
 
     [Fact]
+    public async Task UnregisterResolver_DuringInFlightResolution_DoesNotRepoisonThePositiveCache()
+    {
+        // Regression (round 31): the mirror image of the negative-cache race below. A resolution
+        // starts against the old resolver set, gets its answer from the DEPARTING resolver, and
+        // blocks; the registration is disposed (which clears the positive caches); the in-flight
+        // resolution then completes and re-inserts the revoked mapping AFTER the clear — served
+        // for the life of the process, which is most of what disposing the handle is for.
+        // Generation-stamped positive entries make that stale insert a non-hit.
+        var name = $"Missing.Namespace.Type{Guid.NewGuid():N}";
+        using var scanEntered = new SemaphoreSlim(0);
+        using var releaseScan = new SemaphoreSlim(0);
+        var registration = AsyncResponseTypeResolution.RegisterResolver(candidate =>
+        {
+            if (candidate != name)
+                return null;
+            scanEntered.Release();
+            releaseScan.Wait(TimeSpan.FromSeconds(5));
+            return typeof(OperationResult);
+        });
+
+        var inFlightHit = Task.Run(() => ReflectionExtensions.ResolveServiceType(name));
+        Assert.True(await scanEntered.WaitAsync(TimeSpan.FromSeconds(5)));
+
+        registration.Dispose();
+
+        releaseScan.Release();
+        // The in-flight resolution still returns the answer it already had in hand...
+        Assert.Equal(typeof(OperationResult), await inFlightHit);
+
+        // ...but its stale insert must not outlive the revocation: the next lookup rescans
+        // against the current (empty) resolver set and fails to resolve.
+        Assert.Null(ReflectionExtensions.ResolveServiceType(name));
+    }
+
+    [Fact]
     public void ResolvePayloadType_CachesUnresolvableNames_ConsultsResolversOnce()
     {
         // The payload classifier shares the service resolver's negative cache: a poisoned

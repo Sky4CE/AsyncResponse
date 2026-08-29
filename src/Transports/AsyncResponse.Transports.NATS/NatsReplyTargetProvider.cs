@@ -21,6 +21,19 @@ internal sealed class NatsReplyTargetProvider(
             $"{nameof(NatsReplyTargetOptions)}.{nameof(NatsReplyTargetOptions.ResponseSubject)}");
         var consumer = target.Consumer ?? options.ResponseConsumer;
 
+        // ValidateCommon enforces distinctness for the transport-wide subjects; a NAMED target
+        // must honor the same rule (DB-transport parity) — aimed at the worker or dead-letter
+        // subject, its responses are consumed as worker jobs (or buried as dead letters) while
+        // the waiter times out.
+        if (StringComparer.Ordinal.Equals(responseSubject, schema.WorkerSubject)
+            || StringComparer.Ordinal.Equals(responseSubject, schema.DeadLetterSubject))
+        {
+            throw new InvalidOperationException(
+                $"NATS async-response reply target '{targetName}' uses subject '{responseSubject}', which collides with " +
+                $"{nameof(NatsAsyncResponseTransportOptions.WorkerSubject)} or {nameof(NatsAsyncResponseTransportOptions.DeadLetterSubject)}; " +
+                "its responses would be consumed as worker jobs (or buried as dead letters).");
+        }
+
         var properties = new Dictionary<string, string>(target.Properties, StringComparer.Ordinal)
         {
             ["subject"] = responseSubject,

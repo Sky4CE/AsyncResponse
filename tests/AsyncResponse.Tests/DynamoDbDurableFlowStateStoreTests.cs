@@ -265,6 +265,49 @@ public sealed class DynamoDbDurableFlowStateStoreTests
     }
 
     [Fact]
+    public async Task OperatorProvisionedTable_WithTtlDisabledInOptions_IsStillVerifiedForTtl()
+    {
+        // Regression (round 31): EnableTimeToLive = false skipped the DescribeTimeToLive
+        // VERIFICATION as well as the enabling — and the flag's doc scopes it to auto-created
+        // tables, so an operator with an IaC-provisioned table reasonably turned it off, thereby
+        // turning off the check that their table actually has TTL. This store has no
+        // application-side pruning, so the table grew without bound with no error and no log line.
+        var client = new Mock<IAmazonDynamoDB>();
+        client
+            .Setup(database => database.DescribeTableAsync("flows", It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new DescribeTableResponse { Table = ValidTable() });
+        client
+            .Setup(database => database.DescribeTimeToLiveAsync(
+                It.IsAny<DescribeTimeToLiveRequest>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(Ttl(TimeToLiveStatus.DISABLED));
+
+        using var store = CreateStore(client, autoCreate: false, enableTtl: false);
+        var error = await Assert.ThrowsAsync<InvalidOperationException>(() => store.LoadAsync("flow"));
+        Assert.Contains("TTL", error.Message, StringComparison.Ordinal);
+
+        // Verification never ENABLES on an operator-provisioned table — it only checks.
+        client.Verify(
+            database => database.UpdateTimeToLiveAsync(
+                It.IsAny<UpdateTimeToLiveRequest>(), It.IsAny<CancellationToken>()),
+            Times.Never);
+
+        // A correctly provisioned reaper passes with the flag off.
+        var provisioned = new Mock<IAmazonDynamoDB>();
+        provisioned
+            .Setup(database => database.DescribeTableAsync("flows", It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new DescribeTableResponse { Table = ValidTable() });
+        provisioned
+            .Setup(database => database.DescribeTimeToLiveAsync(
+                It.IsAny<DescribeTimeToLiveRequest>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(Ttl(TimeToLiveStatus.ENABLED));
+        provisioned
+            .Setup(database => database.GetItemAsync(It.IsAny<GetItemRequest>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new GetItemResponse { Item = [] });
+        using var provisionedStore = CreateStore(provisioned, autoCreate: false, enableTtl: false);
+        Assert.Null(await provisionedStore.LoadAsync("flow"));
+    }
+
+    [Fact]
     public async Task Store_HandlesSuccessfulAndConditionalWriteOutcomes()
     {
         var client = ReadyClient();

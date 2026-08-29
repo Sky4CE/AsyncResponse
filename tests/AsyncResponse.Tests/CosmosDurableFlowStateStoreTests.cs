@@ -413,6 +413,33 @@ public sealed class CosmosDurableFlowStateStoreTests
         Revision = state.Revision
     };
 
+    [Fact]
+    public async Task Load_NotFoundWithANonZeroSubStatus_ThrowsInsteadOfReportingAbsence()
+    {
+        // Regression (round 31): every Cosmos 404 was mapped to "the flow is gone", but Cosmos
+        // answers 404 for conditions where the ledger still exists — sub-status 1002
+        // (ReadSessionNotAvailable: routine Session-consistency lag when a DIFFERENT process reads
+        // right after this one's write, surfaced once the SDK's session retries exhaust) and
+        // 1003/1004 (container/database recreated). Callers acknowledge the wake-up on null, so a
+        // live run's only wake-up was silently dropped. Only sub-status 0 means "no such item";
+        // everything else must surface so the delivery is retried or dead-lettered instead.
+        using var harness = new CosmosHarness();
+        harness.Container
+            .Setup(item => item.ReadItemAsync<CosmosFlowStateDocument>(
+                It.IsAny<string>(),
+                It.IsAny<PartitionKey>(),
+                It.IsAny<ItemRequestOptions>(),
+                It.IsAny<CancellationToken>()))
+            .ThrowsAsync(new CosmosException("read session not available", HttpStatusCode.NotFound, 1002, "activity", 0));
+
+        var ex = await Assert.ThrowsAsync<CosmosException>(() => harness.Store.LoadAsync("flow"));
+        Assert.Equal(1002, ex.SubStatusCode);
+
+        // Sub-status 0 stays a genuine absence.
+        harness.ReadsException(HttpStatusCode.NotFound);
+        Assert.Null(await harness.Store.LoadAsync("flow"));
+    }
+
     private static CosmosException CosmosError(HttpStatusCode statusCode)
         => new("test", statusCode, 0, "activity", 0);
 

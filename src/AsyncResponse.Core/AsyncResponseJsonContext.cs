@@ -50,4 +50,21 @@ namespace AsyncResponse;
 [JsonSerializable(typeof(DateTime))]
 [JsonSerializable(typeof(DateTimeOffset))]
 [JsonSerializable(typeof(TimeSpan))]
+// The rest of the closed built-in scalars a worker-call argument (CallbackParam.Value, typed
+// `object`) can carry: under trimmed/Native AOT the object converter resolves the RUNTIME type
+// through this context, so any literal missing here throws from inside the serializer. Enums are
+// open-ended and cannot be pre-registered — they get the actionable registration guidance from
+// AsyncResponseJson instead.
+[JsonSerializable(typeof(float))]
+[JsonSerializable(typeof(short))]
+[JsonSerializable(typeof(ushort))]
+[JsonSerializable(typeof(byte))]
+[JsonSerializable(typeof(sbyte))]
+[JsonSerializable(typeof(uint))]
+[JsonSerializable(typeof(ulong))]
+[JsonSerializable(typeof(char))]
+[JsonSerializable(typeof(DateOnly))]
+[JsonSerializable(typeof(TimeOnly))]
+[JsonSerializable(typeof(Uri))]
+[JsonSerializable(typeof(byte[]))]
 internal sealed partial class AsyncResponseJsonContext : JsonSerializerContext;

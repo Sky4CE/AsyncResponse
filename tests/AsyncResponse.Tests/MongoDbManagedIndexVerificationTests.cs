@@ -49,6 +49,12 @@ public sealed class MongoDbManagedIndexVerificationTests
                 UseOwnershipLedger = false
             });
             Database.SetupGet(d => d.DatabaseNamespace).Returns(new DatabaseNamespace("tests"));
+            // The store pins ReadPreference.Primary on every handle (counters included), so the
+            // fluent call must hand each mock back rather than Moq's default null.
+            Recovery.SelfPinning();
+            Messages.SelfPinning();
+            Subscribers.SelfPinning();
+            Database.WithLooseCollection<BsonDocument>();
             Database
                 .Setup(d => d.GetCollection<MongoRecoveryStateDocument>(It.IsAny<string>(), It.IsAny<MongoCollectionSettings>()))
                 .Returns(Recovery.Object);

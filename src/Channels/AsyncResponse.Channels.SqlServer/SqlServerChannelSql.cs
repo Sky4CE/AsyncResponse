@@ -271,17 +271,23 @@ internal sealed class SqlServerChannelSql
                 return;
 
             await using var connection = await OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
-            await using var command = connection.CreateCommand();
-            command.CommandText =
-                $"""
-                SELECT
-                  CASE WHEN COL_LENGTH(N'{MessageTable}', N'acked_seq') IS NOT NULL THEN 1 ELSE 0 END,
-                  CASE WHEN EXISTS (SELECT 1 FROM sys.sequences WHERE name = N'{AckSequenceName}' AND schema_id = SCHEMA_ID(N'{_options.SchemaName}')) THEN 1 ELSE 0 END;
-                """;
-            await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
-            await reader.ReadAsync(cancellationToken).ConfigureAwait(false);
-            var hasColumn = reader.GetInt32(0) == 1;
-            var hasSequence = reader.GetInt32(1) == 1;
+            bool hasColumn;
+            bool hasSequence;
+            // The probe's command and reader are scoped so they are disposed before the relation
+            // verification below reuses this connection — no MARS, one active command at a time.
+            await using (var command = connection.CreateCommand())
+            {
+                command.CommandText =
+                    $"""
+                    SELECT
+                      CASE WHEN COL_LENGTH(N'{MessageTable}', N'acked_seq') IS NOT NULL THEN 1 ELSE 0 END,
+                      CASE WHEN EXISTS (SELECT 1 FROM sys.sequences WHERE name = N'{AckSequenceName}' AND schema_id = SCHEMA_ID(N'{_options.SchemaName}')) THEN 1 ELSE 0 END;
+                    """;
+                await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+                await reader.ReadAsync(cancellationToken).ConfigureAwait(false);
+                hasColumn = reader.GetInt32(0) == 1;
+                hasSequence = reader.GetInt32(1) == 1;
+            }
             if (!hasColumn || !hasSequence)
             {
                 throw new InvalidOperationException(
@@ -293,6 +299,13 @@ internal sealed class SqlServerChannelSql
                     $"IF NOT EXISTS (SELECT 1 FROM sys.sequences WHERE name = N'{AckSequenceName}' AND schema_id = SCHEMA_ID(N'{_options.SchemaName}')) CREATE SEQUENCE {AckSequence} AS bigint START WITH 1; " +
                     "See docs/sqlserver.md, section 'Upgrading a manually managed schema'.");
             }
+
+            // Full relation verification on the managed path too (transport/flow-store parity):
+            // an operator-provisioned table with the wrong shape — a case-insensitive
+            // correlation_id collation above all, under which `=` pads trailing spaces and
+            // cross-routes responses — previously passed startup here and failed silently at
+            // runtime, which is exactly what verification exists to catch.
+            await VerifyRelationsAsync(connection, transaction: null, cancellationToken).ConfigureAwait(false);
 
             _created = true;
         }

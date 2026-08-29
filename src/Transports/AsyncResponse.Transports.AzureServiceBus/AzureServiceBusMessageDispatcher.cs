@@ -436,6 +436,26 @@ internal sealed class QueuedAzureServiceBusMessageDispatcher : AzureServiceBusMe
         await foreach (var delivery in _queue.Reader.ReadAllAsync().ConfigureAwait(false))
         {
             Interlocked.Decrement(ref _pendingCount);
+
+            // Once the drain budget has lapsed, STOP executing (DB/Redis/Pub-Sub parity). The
+            // token below cannot stop the real handler — it is
+            // `_ingress.HandleWorkerMessageAsync(payload)`, whose target takes no
+            // CancellationToken — so past the budget the loop kept starting fresh work beyond the
+            // host's shutdown budget, and every entry still queued at process exit vanished with
+            // no record (completed at enqueue, so the broker never redelivers it). The settled
+            // lock rules out a DLQ write; OnBackgroundFailure is the record.
+            if (_drainCancellation.IsCancellationRequested)
+            {
+                var lapsed = new OperationCanceledException(
+                    "The ACK-after-enqueue drain budget lapsed before this already-completed message was handled.");
+                Logger.LogWarning(
+                    "Azure Service Bus background handler for already-completed message {MessageId} on {Queue} was not started: the drain budget had lapsed. Surfacing via OnBackgroundFailure.",
+                    delivery.MessageId,
+                    _queueName);
+                await NotifyBackgroundFailureAsync(delivery, lapsed, _queueName, _role).ConfigureAwait(false);
+                continue;
+            }
+
             Interlocked.Increment(ref _runningCount);
 
             try

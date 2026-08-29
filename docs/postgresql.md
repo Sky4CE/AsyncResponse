@@ -84,6 +84,12 @@ against the catalog too, at first use — matching the channel's existing behavi
 is assumed not yet migrated and re-checked on the next operation, while a present table with the
 wrong shape throws with the fix instead of failing silently at the first publish or claim.
 
+The channel does the same: with `AutoCreateSchema = false` it runs its full relation verification
+(tables, columns, indexes, and the deterministic-collation requirement on identity columns such as
+`correlation_id`) at first use, not just the migration probe below — an operator-provisioned
+column with a non-deterministic collation is rejected with the fix instead of silently
+cross-routing responses at runtime.
+
 ### Upgrading a manually managed schema
 
 1.0.0 added a monotonic ack sequence to the channel message table. With `AutoCreateSchema = false`

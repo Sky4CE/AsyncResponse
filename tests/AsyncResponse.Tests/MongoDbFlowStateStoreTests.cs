@@ -140,6 +140,48 @@ public sealed class MongoDbFlowStateStoreTests
         Assert.Contains("expires_at_utc", error.Message, StringComparison.Ordinal);
     }
 
+    [Fact]
+    public async Task DisabledIndexCreationAndOwnershipLedger_StillVerifiesTheTtlIndex()
+    {
+        // Regression (round 31): the round-30 TTL verification sat behind an early-out that
+        // skipped EnsureCreatedAsync entirely when BOTH AutoCreateIndexes and UseOwnershipLedger
+        // were false — the natural locked-down configuration (operator-provisioned indexes, no
+        // ledger writes) the check exists to protect. With both off, a collection provisioned
+        // without expireAfterSeconds grew without bound again, with no error and no log line.
+        var collection = new Mock<IMongoCollection<MongoFlowStateDocument>>();
+        collection
+            .Setup(c => c.WithReadPreference(It.IsAny<ReadPreference>()))
+            .Returns(collection.Object);
+
+        // The provisioned collection lists ONLY the default _id index — no TTL reaper.
+        var cursor = new Mock<IAsyncCursor<BsonDocument>>();
+        cursor.SetupSequence(c => c.MoveNextAsync(It.IsAny<CancellationToken>()))
+            .ReturnsAsync(true)
+            .ReturnsAsync(false);
+        cursor.SetupGet(c => c.Current).Returns(
+        [
+            new BsonDocument { ["name"] = "_id_", ["key"] = new BsonDocument("_id", 1) }
+        ]);
+        var indexes = new Mock<IMongoIndexManager<MongoFlowStateDocument>>();
+        indexes.Setup(m => m.ListAsync(It.IsAny<CancellationToken>())).ReturnsAsync(cursor.Object);
+        collection.SetupGet(c => c.Indexes).Returns(indexes.Object);
+
+        var database = new Mock<IMongoDatabase>().WithTestNamespace();
+        database
+            .Setup(d => d.GetCollection<MongoFlowStateDocument>("flows", It.IsAny<MongoCollectionSettings>()))
+            .Returns(collection.Object);
+        using var store = new MongoDbFlowStateStore(database.Object, Options.Create(new MongoDbDurableFlowOptions
+        {
+            CollectionName = "flows",
+            AutoCreateIndexes = false,
+            UseOwnershipLedger = false
+        }));
+
+        var error = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => store.TryCreateAsync("flow", CreateState("flow"), TimeSpan.FromMinutes(5)));
+        Assert.Contains("TTL index", error.Message, StringComparison.Ordinal);
+    }
+
     private sealed class MongoHarness : IDisposable
     {
         public MongoHarness(BsonDocument helloReply)

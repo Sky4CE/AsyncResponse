@@ -496,6 +496,43 @@ public sealed class PostgreSqlDirectIntegrationTests(DataBatchFixture fixture) :
     }
 
     [Fact]
+    public async Task ManagedSchemaValidation_NonDeterministicCorrelationCollation_IsRejectedAtStartup()
+    {
+        // Regression (round 31): AutoCreateSchema = false ran only the acked_seq migration probe
+        // and skipped full relation verification, so an operator-provisioned correlation_id with
+        // a non-deterministic collation was accepted at startup — and then folded distinct
+        // ordinal ids into one key at runtime, cross-routing responses silently. The managed path
+        // now verifies relations exactly like the DDL path, the transport and the flow store.
+        await WithDataSourceAsync("managed_collation", async (schema, dataSource) =>
+        {
+            var creator = new PostgreSqlChannelSql(dataSource, Options.Create(ChannelOptions(schema)));
+            await creator.EnsureCreatedAsync();
+            await using (var connection = await dataSource.OpenConnectionAsync())
+            await using (var degrade = connection.CreateCommand())
+            {
+                // The legacy shape an operator-managed migration can produce: an ICU
+                // case-folding collation on the identity column. ALTER TYPE rebuilds the
+                // dependent index, so only the column's collation diverges from the contract.
+                degrade.CommandText =
+                    $"""
+                    CREATE COLLATION "{schema}".folding (provider = icu, locale = 'und-u-ks-level2', deterministic = false);
+                    ALTER TABLE {creator.MessageTable} ALTER COLUMN correlation_id TYPE text COLLATE "{schema}".folding;
+                    """;
+                await degrade.ExecuteNonQueryAsync();
+            }
+
+            var managedOptions = ChannelOptions(schema);
+            managedOptions.AutoCreateSchema = false;
+            var managed = new PostgreSqlChannelSql(dataSource, Options.Create(managedOptions));
+
+            var ex = await Assert.ThrowsAsync<InvalidOperationException>(
+                () => managed.GetSubscriptionStartAsync(CancellationToken.None));
+            Assert.Contains("correlation_id", ex.Message, StringComparison.Ordinal);
+            Assert.Contains("non-deterministic", ex.Message, StringComparison.Ordinal);
+        });
+    }
+
+    [Fact]
     public async Task ManagedSchemaValidation_MissingAckSequenceObjects_FailsActionably_AndPassesAfterTheDocumentedMigration()
     {
         // A pre-1.0 manually managed schema (AutoCreateSchema = false) lacks acked_seq and its

@@ -470,6 +470,63 @@ public sealed class DbChannelSharedCoverageTests
     }
 
     /// <summary>
+    /// Regression (round 31): round 30's shared publish-with-recovery helper erased the
+    /// publisher's declared <c>T</c> to <c>object</c>, so the three DB channels serialized the
+    /// recovery payload by its RUNTIME type while the durable envelope (and Redis/NATS/in-memory
+    /// recovery) used the declared contract — leaking derived-only members into the recovery wire
+    /// form and breaking "in-process and broker deliveries of the same response classify
+    /// identically". The recovery wire form must be the declared-type serialization.
+    /// </summary>
+    [Fact]
+    public async Task TypedPublish_RecoveryPayload_UsesTheDeclaredTypeWireForm()
+    {
+        await using var harness = Harness.Create(Provider.MongoDb, failing: false, pollInterval: TimeSpan.FromSeconds(30));
+        var correlationId = $"declared-{Guid.NewGuid():N}";
+        harness.RecoveryState
+            .Setup(store => store.GetAllAsync(correlationId, It.IsAny<CancellationToken>()))
+            .ReturnsAsync(
+            [
+                new RecoveryState
+                {
+                    CorrelationId = correlationId,
+                    RegistrationId = Guid.NewGuid(),
+                    RegisteredAtUtc = DateTime.UtcNow,
+                    PayloadTypeFullName = typeof(SlicedDerivedPayload).FullName
+                }
+            ]);
+
+        SlicedBasePayload.LastRecovered = null;
+        var publisher = (IAsyncResponsePublisher)harness.Channel;
+        await publisher.SetResponse<SlicedBasePayload>(
+            new SlicedDerivedPayload { Message = "m", Extra = "x" },
+            correlationId);
+
+        var recovered = Assert.IsType<SlicedDerivedPayload>(SlicedBasePayload.LastRecovered);
+        Assert.Equal("m", recovered.Message);
+        // The declared-type wire form carries only the contract's members: a runtime-only
+        // property must NOT survive the round trip, exactly as a live envelope would slice it.
+        Assert.Null(recovered.Extra);
+    }
+
+    public class SlicedBasePayload : IAsyncResponsePayload
+    {
+        public static volatile SlicedBasePayload? LastRecovered;
+
+        public string? Message { get; set; }
+
+        public RecoveryAction OnRecovery()
+        {
+            LastRecovered = this;
+            return RecoveryAction.Fail;
+        }
+    }
+
+    public sealed class SlicedDerivedPayload : SlicedBasePayload
+    {
+        public string? Extra { get; set; }
+    }
+
+    /// <summary>
     /// Cleanup is best-effort on both network calls: a recovery-state delete and a subscriber delete
     /// that both fail are logged, and the purely local teardown still runs.
     /// </summary>
@@ -678,14 +735,15 @@ public sealed class DbChannelSharedCoverageTests
                         DeliveryConfirmationPollInterval = TimeSpan.FromMilliseconds(1)
                     });
                     var database = new Mock<IMongoDatabase>(MockBehavior.Loose);
-                    var messages = new Mock<IMongoCollection<MongoChannelMessageDocument>>(MockBehavior.Loose);
-                    var subscribers = new Mock<IMongoCollection<MongoChannelSubscriberDocument>>(MockBehavior.Loose);
+                    var messages = new Mock<IMongoCollection<MongoChannelMessageDocument>>(MockBehavior.Loose).SelfPinning();
+                    var subscribers = new Mock<IMongoCollection<MongoChannelSubscriberDocument>>(MockBehavior.Loose).SelfPinning();
                     database
                         .Setup(db => db.GetCollection<MongoChannelMessageDocument>(It.IsAny<string>(), It.IsAny<MongoCollectionSettings>()))
                         .Returns(messages.Object);
                     database
                         .Setup(db => db.GetCollection<MongoChannelSubscriberDocument>(It.IsAny<string>(), It.IsAny<MongoCollectionSettings>()))
                         .Returns(subscribers.Object);
+                    database.WithLooseCollection<MongoRecoveryStateDocument>();
                     database.WithCounters();
 
                     if (failing)

@@ -21,6 +21,19 @@ internal sealed class RedisReplyTargetProvider(
             $"{nameof(RedisReplyTargetOptions)}.{nameof(RedisReplyTargetOptions.ResponseStream)}");
         var consumerGroup = target.ConsumerGroup ?? options.ResponseConsumerGroup;
 
+        // ValidateCommon enforces distinctness for the transport-wide streams; a NAMED target
+        // must honor the same rule (DB-transport parity) — aimed at the worker or dead-letter
+        // stream, its responses are consumed as worker jobs (or mixed into dead letters) while
+        // the waiter times out.
+        if (StringComparer.Ordinal.Equals(responseStream, schema.WorkerStream.ToString())
+            || StringComparer.Ordinal.Equals(responseStream, schema.DeadLetterStream.ToString()))
+        {
+            throw new InvalidOperationException(
+                $"Redis async-response reply target '{targetName}' uses stream '{responseStream}', which collides with " +
+                $"{nameof(RedisAsyncResponseTransportOptions.WorkerStream)} or {nameof(RedisAsyncResponseTransportOptions.DeadLetterStream)}; " +
+                "its responses would be consumed as worker jobs (or mixed into dead letters).");
+        }
+
         var properties = new Dictionary<string, string>(target.Properties, StringComparer.Ordinal)
         {
             ["stream"] = responseStream,

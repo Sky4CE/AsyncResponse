@@ -73,7 +73,7 @@ internal sealed class RedisRecoveryStateStore : IRecoveryStateStore, IRecoverySt
             var previous = await _database.StringGetAsync(recoveryKey).ConfigureAwait(false);
             var (entries, legacy) = previous.IsNullOrEmpty
                 ? (new List<StoredRegistration>(), false)
-                : DeserializeEntries(previous, recoveryKey, correlationId, logAsError: true, nowUtc, preserveUnreadable: true);
+                : DeserializeEntries(previous, recoveryKey, correlationId, logAsError: true, nowUtc, preserveUnreadable: true, throwOnUnreadableEnvelope: true);
             if (legacy)
             {
                 // Legacy blobs (a bare state list) carry no per-entry expiry — under that format
@@ -333,7 +333,8 @@ internal sealed class RedisRecoveryStateStore : IRecoveryStateStore, IRecoverySt
         string correlationId,
         bool logAsError,
         DateTimeOffset nowUtc,
-        bool preserveUnreadable = false)
+        bool preserveUnreadable = false,
+        bool throwOnUnreadableEnvelope = false)
     {
         var json = value.ToString();
         try
@@ -370,6 +371,14 @@ internal sealed class RedisRecoveryStateStore : IRecoveryStateStore, IRecoverySt
                 _logger.LogError(ex, "Failed to deserialize recovery state at {RecoveryKey}.", recoveryKey);
             else
                 _logger.LogWarning(ex, "Unreadable recovery state at {RecoveryKey}; skipping.", recoveryKey);
+
+            // The rewrite path must refuse, not overwrite: an empty result here would make
+            // SaveAsync commit just the new registration over a blob whose registrations it could
+            // not even ENUMERATE, destroying every armed callback the blob held — "unreadable"
+            // read as "missing", which is exactly what the read path was hardened to refuse.
+            if (throwOnUnreadableEnvelope)
+                throw new RecoveryStateUnreadableException(correlationId, 1);
+
             return ([], false);
         }
     }

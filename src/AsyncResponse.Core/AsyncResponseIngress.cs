@@ -167,6 +167,18 @@ internal sealed class AsyncResponseIngress(
             // the same producer-side contract violation as an unparseable envelope.
             if (job.Call is null)
                 throw new InvalidDataException("Worker envelope carries a null call description.");
+
+            // Same mechanism one level down: ReflectionCallDto's members are `required` too, so an
+            // explicit "params": null (or a null element, or a null target name) parses yet can
+            // never resolve to a callback — it must take this drop-and-ack route, not escape as an
+            // ArgumentNullException the transport would redeliver forever.
+            if (job.Call.ServiceInterfaceFullName is null || job.Call.MethodName is null || job.Call.Params is null)
+                throw new InvalidDataException("Worker envelope carries a call description with a null member.");
+            foreach (var param in job.Call.Params)
+            {
+                if (param is null)
+                    throw new InvalidDataException("Worker envelope carries a call description with a null parameter entry.");
+            }
         }
         catch (Exception ex) when (ex is InvalidDataException or System.Text.Json.JsonException)
         {

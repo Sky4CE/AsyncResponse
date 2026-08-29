@@ -67,6 +67,15 @@ internal sealed class NatsRecoveryStateStore : IRecoveryStateStore, IRecoverySta
 
             var entry = await _store.GetAsync(key, cancellationToken).ConfigureAwait(false);
             var stored = entry is { } existing ? TryDeserialize(existing.Value, key) : null;
+
+            // The rewrite path must refuse, not overwrite: an unparseable envelope deserializing
+            // to "no entries" would make this save commit just the new registration over a blob
+            // whose registrations it could not even ENUMERATE, destroying every armed callback it
+            // held — "unreadable" read as "missing", which is exactly what GetAllAsync was
+            // hardened to refuse.
+            if (entry is not null && stored is null)
+                throw new RecoveryStateUnreadableException(correlationId, 1);
+
             var now = _timeProvider.GetUtcNow();
             List<(RecoveryState? State, DateTimeOffset ExpiresAtUtc)> entries = stored is not null && !IsExpired(stored)
                 ? EntriesFrom(stored)

@@ -372,18 +372,34 @@ internal abstract class KafkaMessageDispatcher : IAsyncDisposable
 
         // Settlement ignores the stopping token, as every sibling settlement path does: a shutdown
         // landing between the dead-letter publish and the offset store would abort the publish
-        // mid-flight and leave the poison message neither buried nor committed.
-        await DeadLetterCoreAsync(
-            message.Topic,
-            message.Partition,
-            message.Offset,
-            message.Payload ?? [],
-            message.Headers,
-            KafkaCorrelationIdExtractor.TryReadHeader(message.Headers, TransportOptions.CorrelationIdHeader),
-            failure,
-            "unprocessable_message",
-            attempts: 0,
-            CancellationToken.None).ConfigureAwait(false);
+        // mid-flight and leave the poison message neither buried nor committed. Guarded for the
+        // same reason as the at-the-cap publish: this runs inside the poll loop, and a permanently
+        // failing dead-letter topic would otherwise fault the subscriber into a restart loop with
+        // the offset unstored.
+        try
+        {
+            await DeadLetterCoreAsync(
+                message.Topic,
+                message.Partition,
+                message.Offset,
+                message.Payload ?? [],
+                message.Headers,
+                KafkaCorrelationIdExtractor.TryReadHeader(message.Headers, TransportOptions.CorrelationIdHeader),
+                failure,
+                "unprocessable_message",
+                attempts: 0,
+                CancellationToken.None).ConfigureAwait(false);
+        }
+        catch (Exception deadLetterException)
+        {
+            Logger.LogError(
+                deadLetterException,
+                "Failed to dead-letter unprocessable Kafka message {Topic}[{Partition}]@{Offset}; its offset is left unstored so the burial is retried after a restart or rebalance, but later settlements on the partition can commit past it — fix the dead-letter topic promptly.",
+                message.Topic,
+                message.Partition,
+                message.Offset);
+            return;
+        }
 
         // Guarded like every other settlement: a rebalance revoking this partition makes
         // StoreOffset throw, and here that throw originates INSIDE the poll loop's catch arm, so
@@ -506,12 +522,34 @@ internal sealed class AwaitingKafkaMessageDispatcher(
                         delivery.Partition,
                         delivery.Offset,
                         MaxDeliveryAttempts);
-                    await DeadLetterAsync(
-                        delivery,
-                        ex,
-                        "handler_failed_max_attempts",
-                        attempt,
-                        CancellationToken.None).ConfigureAwait(false);
+                    // Guarded like the queued dispatcher's identical publish: this runs inside the
+                    // poll loop, and an unguarded throw (a permanently failing dead-letter topic —
+                    // UnknownTopicOrPart with auto-create off, an over-sized payload — burns the
+                    // publish retries and then rethrows) faulted the whole subscriber with the
+                    // offset unstored, so the supervisor rebuilt the consumer and re-executed the
+                    // handler MaxDeliveryAttempts more times per restart, forever. Swallow and
+                    // leave the offset unstored: the message is re-consumed after restart or
+                    // rebalance and the burial retried.
+                    try
+                    {
+                        await DeadLetterAsync(
+                            delivery,
+                            ex,
+                            "handler_failed_max_attempts",
+                            attempt,
+                            CancellationToken.None).ConfigureAwait(false);
+                    }
+                    catch (Exception deadLetterException)
+                    {
+                        Logger.LogError(
+                            deadLetterException,
+                            "Failed to dead-letter Kafka message {Topic}[{Partition}]@{Offset} at the delivery cap; its offset is left unstored so the burial is retried after a restart or rebalance, but later settlements on the partition can commit past it — fix the dead-letter topic promptly.",
+                            delivery.Topic,
+                            delivery.Partition,
+                            delivery.Offset);
+                        return;
+                    }
+
                     StoreOffsetAfterSettlement(delivery);
                     return;
                 }
@@ -667,6 +705,46 @@ internal sealed class QueuedKafkaMessageDispatcher : KafkaMessageDispatcher
         await foreach (var delivery in _queue.Reader.ReadAllAsync().ConfigureAwait(false))
         {
             Interlocked.Decrement(ref _pendingCount);
+
+            // Once the drain budget has lapsed, STOP executing (DB/Redis/Pub-Sub parity). The
+            // drain token cannot stop the real handler — it is
+            // `_ingress.HandleWorkerMessageAsync(payload)`, whose target takes no
+            // CancellationToken — so past the budget the loop kept starting fresh work beyond the
+            // host's shutdown budget, and every entry still queued at process exit vanished with
+            // no record (its offset was stored at enqueue, so Kafka never redelivers it).
+            if (_drainCancellation.IsCancellationRequested)
+            {
+                var lapsed = new OperationCanceledException(
+                    "The ACK-after-enqueue drain budget lapsed before this already-committed message was handled.");
+                Logger.LogWarning(
+                    "Kafka background handler for already-committed message {Topic}[{Partition}]@{Offset} was not started: the drain budget had lapsed. Dead-lettering and surfacing via OnBackgroundFailure.",
+                    delivery.Topic,
+                    delivery.Partition,
+                    delivery.Offset);
+                await NotifyBackgroundFailureAsync(delivery, lapsed).ConfigureAwait(false);
+
+                try
+                {
+                    await DeadLetterAsync(
+                        delivery,
+                        lapsed,
+                        "drain_budget_lapsed_after_commit",
+                        0,
+                        CancellationToken.None).ConfigureAwait(false);
+                }
+                catch (Exception deadLetterException)
+                {
+                    Logger.LogError(
+                        deadLetterException,
+                        "Failed to dead-letter already-committed Kafka message {Topic}[{Partition}]@{Offset}.",
+                        delivery.Topic,
+                        delivery.Partition,
+                        delivery.Offset);
+                }
+
+                continue;
+            }
+
             Interlocked.Increment(ref _runningCount);
 
             try

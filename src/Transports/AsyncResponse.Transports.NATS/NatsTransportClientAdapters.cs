@@ -1,3 +1,4 @@
+using Microsoft.Extensions.Logging;
 using NATS.Client.Core;
 using NATS.Client.JetStream;
 using NATS.Client.JetStream.Models;
@@ -42,6 +43,11 @@ internal interface INatsJetStreamTransport
     /// <summary>Idempotently creates or updates the stream capturing <paramref name="subject"/>.</summary>
     Task EnsureStreamAsync(string stream, string subject, long? maxMessages, CancellationToken cancellationToken);
 
+    /// <summary>
+    /// Ensures the dead-letter stream exists, with retention suited to a stream nothing consumes.
+    /// </summary>
+    Task EnsureDeadLetterStreamAsync(string stream, string subject, long? maxMessages, CancellationToken cancellationToken);
+
     /// <summary>Idempotently creates or updates a durable explicit-ack consumer on <paramref name="stream"/>.</summary>
     Task EnsureConsumerAsync(string stream, string durable, TimeSpan ackWait, CancellationToken cancellationToken);
 
@@ -70,7 +76,7 @@ internal interface INatsJetStreamTransport
 }
 
 /// <summary>Production <see cref="INatsJetStreamTransport"/> over a NATS <see cref="INatsJSContext"/>.</summary>
-internal sealed class NatsJetStreamTransportAdapter(INatsJSContext _jetStream) : INatsJetStreamTransport
+internal sealed class NatsJetStreamTransportAdapter(INatsJSContext _jetStream, ILogger? _logger = null) : INatsJetStreamTransport
 {
     /// <summary>Ensures the required resource exists.</summary>
     public async Task EnsureStreamAsync(string stream, string subject, long? maxMessages, CancellationToken cancellationToken)
@@ -89,6 +95,40 @@ internal sealed class NatsJetStreamTransportAdapter(INatsJSContext _jetStream) :
             Discard = StreamConfigDiscard.New
         };
         await _jetStream.CreateOrUpdateStreamAsync(config, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>Ensures the dead-letter stream exists.</summary>
+    public async Task EnsureDeadLetterStreamAsync(string stream, string subject, long? maxMessages, CancellationToken cancellationToken)
+    {
+        // NOT the work-queue config above: nothing ever consumes (so nothing ever acks) the
+        // dead-letter subject, which means work-queue retention removes nothing and Discard=New
+        // then rejects every burial once MaxMsgs fills — each over-cap poison message NAK-looping
+        // forever because its burial can never be accepted. Limits retention with Discard=Old
+        // makes the DLQ a bounded evict-oldest archive, the same shape as Redis's MAXLEN-trimmed
+        // dead-letter stream.
+        var config = new StreamConfig(stream, [subject])
+        {
+            MaxMsgs = maxMessages ?? -1,
+            Retention = StreamConfigRetention.Limits,
+            Discard = StreamConfigDiscard.Old
+        };
+
+        try
+        {
+            await _jetStream.CreateOrUpdateStreamAsync(config, cancellationToken).ConfigureAwait(false);
+        }
+        catch (NatsJSApiException ex)
+        {
+            // Retention is immutable on an existing stream, so a DLQ provisioned by an earlier
+            // build (work-queue retention) rejects this update. The old stream still accepts
+            // burials until it fills; failing the whole subscriber over it would be worse. Keep
+            // running and tell the operator how to migrate.
+            _logger?.LogWarning(
+                ex,
+                "Could not update the NATS dead-letter stream {Stream} to limits retention (an existing stream's retention policy is immutable). " +
+                "It keeps its current configuration; to migrate, delete and let this host recreate it (its messages are dead letters — export first if needed).",
+                stream);
+        }
     }
 
     /// <summary>Ensures the required resource exists.</summary>

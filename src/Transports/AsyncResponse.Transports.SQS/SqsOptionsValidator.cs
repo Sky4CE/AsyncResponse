@@ -127,6 +127,15 @@ internal static class SqsOptionsValidator
         switch (subscriberOptions.AckMode)
         {
             case SqsAckMode.AckAfterHandlerCompletes:
+                // ShutdownTimeout is spent at shutdown even without a background drain: the
+                // visibility-renewal join on the final batch waits it out against a degraded
+                // endpoint, exactly as its own XML doc says ("at shutdown it counts against the
+                // host's budget").
+                ShutdownBudgetValidator.Validate(
+                    "SQS",
+                    $"{nameof(SqsAsyncResponseOptions)}.{nameof(SqsAsyncResponseOptions.HostShutdownTimeout)}",
+                    transportOptions.HostShutdownTimeout,
+                    ($"{nameof(SqsAsyncResponseOptions)}.{nameof(SqsAsyncResponseOptions.ShutdownTimeout)}", transportOptions.ShutdownTimeout));
                 return;
 
             case SqsAckMode.AckAfterEnqueue:
@@ -146,13 +155,17 @@ internal static class SqsOptionsValidator
 
                 AsyncResponseChannelOptions.EnsureTimerBacked(subscriberOptions.BackgroundDrainTimeout, optionPath, nameof(SqsSubscriberOptions.BackgroundDrainTimeout));
 
-                // SQS subscribers spend only the background drain at shutdown; the receive loop
-                // stops with the host token and the SDK client needs no bounded close.
+                // The receive loop stops with the host token and the SDK client needs no bounded
+                // close, but shutdown spends BOTH the background drain and the visibility-renewal
+                // join's ShutdownTimeout (Azure Service Bus parity) — validating only the drain let
+                // a raised ShutdownTimeout blow the host budget and force-terminate mid-join,
+                // redelivering handled-but-undeleted work.
                 ShutdownBudgetValidator.Validate(
                     "SQS",
                     $"{nameof(SqsAsyncResponseOptions)}.{nameof(SqsAsyncResponseOptions.HostShutdownTimeout)}",
                     transportOptions.HostShutdownTimeout,
-                    ($"{optionPath}.{nameof(SqsSubscriberOptions.BackgroundDrainTimeout)}", subscriberOptions.BackgroundDrainTimeout));
+                    ($"{optionPath}.{nameof(SqsSubscriberOptions.BackgroundDrainTimeout)}", subscriberOptions.BackgroundDrainTimeout),
+                    ($"{nameof(SqsAsyncResponseOptions)}.{nameof(SqsAsyncResponseOptions.ShutdownTimeout)}", transportOptions.ShutdownTimeout));
 
                 return;
 

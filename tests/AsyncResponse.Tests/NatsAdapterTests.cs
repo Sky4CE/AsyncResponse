@@ -361,6 +361,44 @@ public class NatsJetStreamTransportAdapterTests
     }
 
     [Fact]
+    public async Task EnsureDeadLetterStreamAsync_CreatesLimitsRetentionEvictOldestStream()
+    {
+        // Regression (round 31): the dead-letter stream was provisioned with the WORK-QUEUE config
+        // (Retention=Workqueue, Discard=New). Nothing ever consumes the dead-letter subject, so
+        // work-queue retention removed nothing; once MaxMsgs filled, Discard=New rejected every
+        // burial and each over-cap poison message NAK-looped forever (the consumer runs with
+        // MaxDeliver=-1 on the premise that the dispatcher bounds attempts). The DLQ must be a
+        // bounded evict-oldest archive — Redis's MAXLEN-trimmed dead-letter stream shape.
+        _jetStream.Setup(c => c.CreateOrUpdateStreamAsync(It.IsAny<StreamConfig>(), It.IsAny<CancellationToken>())).ReturnsAsync(Mock.Of<INatsJSStream>());
+        var adapter = new NatsJetStreamTransportAdapter(_jetStream.Object);
+
+        await adapter.EnsureDeadLetterStreamAsync("dead-stream", "dead-subj", 100, CancellationToken.None);
+
+        _jetStream.Verify(c => c.CreateOrUpdateStreamAsync(
+            It.Is<StreamConfig>(cfg => cfg.Name == "dead-stream"
+                && cfg.Subjects!.Contains("dead-subj")
+                && cfg.MaxMsgs == 100
+                && cfg.Retention == StreamConfigRetention.Limits
+                && cfg.Discard == StreamConfigDiscard.Old),
+            It.IsAny<CancellationToken>()), Times.Once);
+    }
+
+    [Fact]
+    public async Task EnsureDeadLetterStreamAsync_ExistingStreamWithImmutableRetention_WarnsInsteadOfFailingTheSubscriber()
+    {
+        // JetStream forbids changing an existing stream's retention policy, so a DLQ provisioned
+        // by an earlier build (work-queue retention) rejects the update. The old stream still
+        // accepts burials until it fills; failing the whole subscriber over it would be worse —
+        // keep running and tell the operator how to migrate.
+        _jetStream
+            .Setup(c => c.CreateOrUpdateStreamAsync(It.IsAny<StreamConfig>(), It.IsAny<CancellationToken>()))
+            .ThrowsAsync(new NatsJSApiException(new ApiError { Code = 500, ErrCode = 10052, Description = "stream configuration update can not change retention policy" }));
+        var adapter = new NatsJetStreamTransportAdapter(_jetStream.Object);
+
+        await adapter.EnsureDeadLetterStreamAsync("dead-stream", "dead-subj", 100, CancellationToken.None);
+    }
+
+    [Fact]
     public async Task EnsureConsumerAsync_CreatesDurableExplicitAckConsumer()
     {
         _jetStream.Setup(c => c.CreateOrUpdateConsumerAsync("stream", It.IsAny<ConsumerConfig>(), It.IsAny<CancellationToken>())).ReturnsAsync(Mock.Of<INatsJSConsumer>());

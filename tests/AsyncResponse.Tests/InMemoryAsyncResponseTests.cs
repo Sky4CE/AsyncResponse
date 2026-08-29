@@ -539,7 +539,8 @@ public class InMemoryAsyncResponseTests
             $"{CorrelationId}-logged-exception",
             timeout: TimeSpan.FromSeconds(5));
         await publisher.SetException(new InvalidOperationException("logged exception"), $"{CorrelationId}-logged-exception");
-        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+        // Wire parity: the waiter observes the type-erased failure shape production channels produce.
+        var ex = await Assert.ThrowsAsync<Exception>(() =>
             exceptionWaiter.ResponseTask.WaitAsync(TimeSpan.FromSeconds(2)));
         Assert.Equal("logged exception", ex.Message);
     }

@@ -129,7 +129,20 @@ public sealed class GooglePubSubWorkerTransport : IWorkerTransport, IAsyncDispos
         {
             _disposed = true;
             if (_publisher is not null)
-                await _publisher.ShutdownAsync(_options.ShutdownTimeout).ConfigureAwait(false);
+            {
+                // Best effort, like the RabbitMQ/Azure Service Bus worker transports' closes: the
+                // SDK CANCELS the returned task when the timeout expires before the backlog
+                // flushes, and this is a container-created singleton — a throw here escapes
+                // ServiceProvider.DisposeAsync and aborts the disposal of every service after it.
+                try
+                {
+                    await _publisher.ShutdownAsync(_options.ShutdownTimeout).ConfigureAwait(false);
+                }
+                catch
+                {
+                    // Best effort.
+                }
+            }
         }
         finally
         {

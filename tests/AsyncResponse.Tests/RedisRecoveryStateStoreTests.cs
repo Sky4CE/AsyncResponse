@@ -130,6 +130,32 @@ public class RedisRecoveryStateStoreTests
     }
 
     [Fact]
+    public async Task SaveAsync_UnreadableEnvelope_ThrowsInsteadOfOverwriting()
+    {
+        // Regression (round 31): per-ENTRY unreadability is carried through the rewrite (the fact
+        // below), but a blob whose top-level parse fails deserialized to an EMPTY list — and the
+        // CAS condition still held (the value had not changed), so SaveAsync committed just the
+        // new registration over registrations it could not even enumerate, destroying every armed
+        // callback the blob held. The rewrite must refuse exactly as the read path does.
+        _database
+            .Setup(d => d.StringGetAsync((RedisKey)"ar:recovery:corr-a", It.IsAny<CommandFlags>()))
+            .ReturnsAsync("{not-json");
+        SetupTransactions(true);
+
+        var state = new RecoveryState
+        {
+            RegistrationId = Guid.NewGuid(),
+            CorrelationId = "corr-a",
+            RegisteredAtUtc = DateTime.UtcNow
+        };
+
+        var unreadable = await Assert.ThrowsAsync<RecoveryStateUnreadableException>(
+            () => _store.SaveAsync("corr-a", state, TimeSpan.FromMinutes(3)));
+        Assert.Equal("corr-a", unreadable.CorrelationId);
+        Assert.Empty(_transactions);
+    }
+
+    [Fact]
     public async Task SaveAsync_CarriesAnUnreadableSiblingThroughTheRewrite()
     {
         // Regression (round 29): the read path filters out an entry this build cannot INTERPRET

@@ -61,8 +61,8 @@ AsyncResponse.Testing.FlowTestHarness
 AsyncResponse.Testing.FlowTestHarness.AdvanceAsync(System.TimeSpan delta) -> System.Threading.Tasks.Task!
 AsyncResponse.Testing.FlowTestHarness.Attach(string! flowId) -> AsyncResponse.Testing.FlowRunHandle!
 AsyncResponse.Testing.FlowTestHarness.Clock.get -> AsyncResponse.Testing.VirtualTimeProvider!
-AsyncResponse.Testing.FlowTestHarness.CrashAfterStep(string! stepName) -> void
-AsyncResponse.Testing.FlowTestHarness.CrashBeforeStep(string! stepName) -> void
+AsyncResponse.Testing.FlowTestHarness.CrashAfterStep(string! stepName, string? flowId = null) -> void
+AsyncResponse.Testing.FlowTestHarness.CrashBeforeStep(string! stepName, string? flowId = null) -> void
 AsyncResponse.Testing.FlowTestHarness.DisposeAsync() -> System.Threading.Tasks.ValueTask
 AsyncResponse.Testing.FlowTestHarness.Engine.get -> AsyncResponse.Testing.AsyncResponseTestHarness!
 AsyncResponse.Testing.FlowTestHarness.StartFlowAsync<TFlow, TInput>(TInput input, string? flowId = null) -> System.Threading.Tasks.Task<AsyncResponse.Testing.FlowRunHandle!>!

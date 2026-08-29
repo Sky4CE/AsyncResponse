@@ -152,8 +152,17 @@ public sealed class CosmosFlowStateStore : IFlowStateStore, IDisposable
 
             return DurableFlowStoreShared.ReadState(flowId, document.StateJson, revision);
         }
-        catch (CosmosException ex) when (ex.StatusCode == HttpStatusCode.NotFound)
+        catch (CosmosException ex) when (ex.StatusCode == HttpStatusCode.NotFound && ex.SubStatusCode == 0)
         {
+            // Sub-status 0 is the only 404 that means "no such item". Cosmos also answers 404 for
+            // conditions where the ledger still exists — 1002 ReadSessionNotAvailable (a routine
+            // Session-consistency lag when a DIFFERENT process reads right after this one's write,
+            // surfaced once the SDK's session retries exhaust) and 1003/1004 (container/database
+            // recreated). Callers acknowledge the wake-up on null, so mapping those to null
+            // silently dropped a live run's only wake-up; letting them throw routes the delivery
+            // through retry/dead-letter instead. Same contract point the siblings defend with
+            // ConsistentRead (DynamoDB) and ReadPreference.Primary (MongoDB) — Cosmos cannot
+            // strengthen consistency per-request, so the sub-status is the only discriminator.
             return null;
         }
     }

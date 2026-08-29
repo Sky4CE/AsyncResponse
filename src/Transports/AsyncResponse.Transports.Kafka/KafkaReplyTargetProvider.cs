@@ -21,6 +21,20 @@ internal sealed class KafkaReplyTargetProvider(
             $"{nameof(KafkaReplyTargetOptions)}.{nameof(KafkaReplyTargetOptions.ResponseTopic)}");
         var consumerGroup = target.ConsumerGroup ?? options.ResponseConsumerGroup;
 
+        // ValidateCommon enforces distinctness for the transport-wide topics; a NAMED target must
+        // honor the same rule (DB-transport parity) — aimed at the worker topic its responses are
+        // consumed as worker jobs, and aimed at a derived dead-letter topic they are mixed into
+        // buried traffic, while the waiter times out.
+        if (StringComparer.Ordinal.Equals(responseTopic, schema.WorkerTopic)
+            || StringComparer.Ordinal.Equals(responseTopic, schema.DeadLetterTopicFor(schema.WorkerTopic))
+            || StringComparer.Ordinal.Equals(responseTopic, schema.DeadLetterTopicFor(schema.ResponseTopic)))
+        {
+            throw new InvalidOperationException(
+                $"Kafka async-response reply target '{targetName}' uses topic '{responseTopic}', which collides with " +
+                $"{nameof(KafkaAsyncResponseTransportOptions.WorkerTopic)} or a derived dead-letter topic; " +
+                "its responses would be consumed as worker jobs (or mixed into dead letters).");
+        }
+
         var properties = new Dictionary<string, string>(target.Properties, StringComparer.Ordinal)
         {
             ["topic"] = responseTopic,

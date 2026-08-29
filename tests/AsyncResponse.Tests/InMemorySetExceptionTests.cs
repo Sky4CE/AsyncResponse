@@ -12,20 +12,34 @@ namespace AsyncResponse.Tests;
 public sealed class InMemorySetExceptionTests
 {
     [Fact]
-    public async Task SetException_WithExplicitCorrelation_FaultsActiveWaiterWithSameException()
+    public async Task SetException_WithExplicitCorrelation_FaultsActiveWaiterWithWireParityException()
     {
         await using var provider = CreateProvider();
         var asyncResponse = provider.GetRequiredService<IAsyncResponseBuilder>();
         var publisher = provider.GetRequiredService<IAsyncResponsePublisher>();
-        var expected = new InvalidOperationException("remote technical error");
+        InvalidOperationException expected;
+        try
+        {
+            throw new InvalidOperationException("remote technical error");
+        }
+        catch (InvalidOperationException thrownSource)
+        {
+            expected = thrownSource;
+        }
 
-        var thrown = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+        // Wire parity: every durable channel serializes only the message (+ capped stack trace in
+        // Data["RemoteStackTrace"]) and faults the waiter with a plain Exception — the concrete
+        // type never crosses the wire. Handing the publisher's live instance through let a typed
+        // `catch` pass against this channel that can never match in production.
+        var thrown = await Assert.ThrowsAsync<Exception>(() =>
             asyncResponse
                 .For<OperationResult>()
                 .WithTimeout(TimeSpan.FromSeconds(5))
                 .WaitAsync(ctx => publisher.SetException(expected, ctx.CorrelationId)));
 
-        Assert.Same(expected, thrown);
+        Assert.NotSame(expected, thrown);
+        Assert.Equal(expected.Message, thrown.Message);
+        Assert.NotNull(thrown.Data["RemoteStackTrace"]);
     }
 
     [Fact]
@@ -47,8 +61,10 @@ public sealed class InMemorySetExceptionTests
 
         await publisher.SetException(expected, correlationId);
 
-        var thrown = await Assert.ThrowsAsync<InvalidOperationException>(async () => await waitTask);
-        Assert.Same(expected, thrown);
+        // Wire parity: the waiter observes the type-erased failure shape production channels
+        // produce — a plain Exception carrying only the message.
+        var thrown = await Assert.ThrowsAsync<Exception>(async () => await waitTask);
+        Assert.Equal(expected.Message, thrown.Message);
     }
 
     [Fact]
@@ -68,10 +84,12 @@ public sealed class InMemorySetExceptionTests
 
         await publisher.SetException(expected, correlationId);
 
-        var firstException = await Assert.ThrowsAsync<ApplicationException>(async () => await first);
-        var secondException = await Assert.ThrowsAsync<ApplicationException>(async () => await second);
-        Assert.Same(expected, firstException);
-        Assert.Same(expected, secondException);
+        // Wire parity: each waiter observes its own type-erased failure, exactly as it would
+        // materializing a failure envelope off a durable channel.
+        var firstException = await Assert.ThrowsAsync<Exception>(async () => await first);
+        var secondException = await Assert.ThrowsAsync<Exception>(async () => await second);
+        Assert.Equal(expected.Message, firstException.Message);
+        Assert.Equal(expected.Message, secondException.Message);
         Assert.True(await WaitForSubscriberCountAsync(probe, correlationId, expected: 0));
     }
 
@@ -166,9 +184,10 @@ public sealed class InMemorySetExceptionTests
         var liveWaiter = waiter ?? throw new InvalidOperationException("Retry-live waiter was not created.");
         await using (liveWaiter)
         {
-            var thrown = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            // Wire parity: live delivery faults the waiter with the type-erased failure shape.
+            var thrown = await Assert.ThrowsAsync<Exception>(() =>
                 liveWaiter.ResponseTask.WaitAsync(TimeSpan.FromSeconds(2)));
-            Assert.Same(expected, thrown);
+            Assert.Equal(expected.Message, thrown.Message);
         }
     }
 

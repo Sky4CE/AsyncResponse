@@ -116,6 +116,69 @@ public class DelayedWorkerTransportTests
     }
 
     [Fact]
+    public async Task EarlyDeliveredJob_HostileLastRedelayRemaining_IsRedelayedInsteadOfCrashing()
+    {
+        // Regression (round 31): LastRedelayRemaining is a wire value a foreign producer controls,
+        // and TimeSpan arithmetic is always overflow-checked — TimeSpan.MinValue made the stall
+        // comparison throw OverflowException, a type outside the ingress drop-and-ack filter, so
+        // the envelope redelivered forever with the value never becoming valid. The library only
+        // ever stamps a strictly positive remainder, so a negative hint is discarded and the hop
+        // re-publishes normally.
+        var audit = new RecordingDeferredWorkAudit();
+        await using var harness = await AsyncResponseTestHarness.StartAsync(options =>
+            options.ConfigureServices = services => services.AddSingleton<IDeferredWorkAudit>(audit));
+
+        var transport = harness.Services.GetRequiredService<IWorkerTransport>();
+        await transport.PublishAsync(new WorkerJobEnvelope
+        {
+            Call = Work(),
+            NotBeforeUtc = harness.Clock.GetUtcNow().UtcDateTime.AddHours(1),
+            LastRedelayRemaining = TimeSpan.MinValue
+        });
+
+        await harness.WaitForWorkerIdleAsync();
+        Assert.Empty(audit.Ran);
+
+        // The hostile hint was discarded and the hop parked on the timer wheel like a fresh one.
+        var inMemory = (InMemoryWorkerTransport)transport;
+        Assert.Single(inMemory.SnapshotDelayedJobs());
+        await harness.AdvanceAsync(TimeSpan.FromHours(1));
+        await harness.WaitForWorkerIdleAsync();
+        Assert.Equal(["job"], audit.Ran);
+    }
+
+    [Fact]
+    public async Task EarlyDeliveredJob_HostileStallCount_CannotDisarmTheStallFallback()
+    {
+        // Regression (round 31): RedelayStallCount is an unvalidated wire int incremented in an
+        // unchecked context. int.MaxValue wrapped to int.MinValue, so the `>= threshold` stall
+        // check could never fire again and the anti-livelock fallback was permanently disarmed —
+        // an unbounded re-publish loop, each hop a fresh message id no delivery counter ever
+        // catches. The counter is now clamped, so a hostile value on a proven stall executes the
+        // job instead of re-publishing forever.
+        var audit = new RecordingDeferredWorkAudit();
+        await using var harness = await AsyncResponseTestHarness.StartAsync(options =>
+            options.ConfigureServices = services => services.AddSingleton<IDeferredWorkAudit>(audit));
+
+        var transport = harness.Services.GetRequiredService<IWorkerTransport>();
+        var notBefore = harness.Clock.GetUtcNow().UtcDateTime.AddHours(1);
+        await transport.PublishAsync(new WorkerJobEnvelope
+        {
+            Call = Work(),
+            NotBeforeUtc = notBefore,
+            // A stalled hop (the remainder has not shrunk) carrying a hostile counter.
+            LastRedelayRemaining = notBefore - harness.Clock.GetUtcNow().UtcDateTime,
+            RedelayStallCount = int.MaxValue
+        });
+
+        await harness.WaitForWorkerIdleAsync();
+
+        // The stall was proven and the clamped counter crossed the threshold: the job executed
+        // early (in-process skew handling) instead of re-publishing with a wrapped counter.
+        Assert.Equal(["job"], audit.Ran);
+    }
+
+    [Fact]
     public async Task SkewProvenTimer_WaitsInProcess_InsteadOfMintingAWakeThatForgetsTheProof()
     {
         // Persistent clock skew: the transport keeps handing the wake-up back before its due time.

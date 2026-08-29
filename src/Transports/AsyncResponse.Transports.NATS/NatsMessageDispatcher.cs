@@ -250,10 +250,29 @@ internal sealed class NatsMessageDispatcher : IAsyncDisposable
     private async Task BackgroundWorkerLoopAsync(CancellationToken cancellationToken)
     {
         // Token-less ReadAllAsync: on shutdown the queue is completed and fully drained, so every
-        // already-ACKed delivery is attempted (with the drain token once the drain budget lapses)
-        // instead of being silently dropped; each failure is dead-lettered and surfaced below.
+        // already-ACKed delivery is either attempted or explicitly dead-lettered below — never
+        // silently dropped.
         await foreach (var delivery in _backgroundQueue!.Reader.ReadAllAsync().ConfigureAwait(false))
         {
+            // Once the drain budget has lapsed, STOP executing (DB/Redis/Pub-Sub parity). The
+            // token below cannot stop the real handler — it is `_ingress.HandleWorkerMessageAsync
+            // (payload)`, whose target takes no CancellationToken — so past the budget the loop
+            // kept starting fresh work beyond the host's shutdown budget, and every entry still
+            // queued at process exit vanished with no record (ACKed at enqueue, so JetStream never
+            // redelivers it). Route the rest through the dead-letter/OnBackgroundFailure path.
+            if (_backgroundCts!.IsCancellationRequested)
+            {
+                var lapsed = new OperationCanceledException(
+                    "The ACK-after-enqueue drain budget lapsed before this already-ACKed message was handled.");
+                _logger.LogWarning(
+                    "NATS background handler for already-ACKed message on subject {Subject} ({Role}) was not started: the drain budget had lapsed. Dead-lettering and surfacing via OnBackgroundFailure.",
+                    delivery.Subject,
+                    _role);
+                await DeadLetterAsync(delivery, lapsed, CancellationToken.None).ConfigureAwait(false);
+                await InvokeBackgroundFailureAsync(delivery, lapsed).ConfigureAwait(false);
+                continue;
+            }
+
             try
             {
                 await ExecuteHandlerAsync(delivery, cancellationToken).ConfigureAwait(false);
@@ -291,7 +310,12 @@ internal sealed class NatsMessageDispatcher : IAsyncDisposable
                 _role,
                 delivery.NumDelivered);
 
-            var shouldTerminate = await DeadLetterAsync(delivery, exception, cancellationToken).ConfigureAwait(false);
+            // CancellationToken.None like every other settlement in this package (the
+            // pre-execution cap and the early-ACK failure path already pin it): burying a poison
+            // message must not be abandoned by a shutdown — with the stopping token, a handler
+            // failing on its LAST attempt during a stop had the DLQ publish throw on the cancelled
+            // token, and the message was NAKed back instead of buried.
+            var shouldTerminate = await DeadLetterAsync(delivery, exception, CancellationToken.None).ConfigureAwait(false);
             if (shouldTerminate)
             {
                 // Guarded like both ack sites: TermAsync is the same JetStream request/reply as

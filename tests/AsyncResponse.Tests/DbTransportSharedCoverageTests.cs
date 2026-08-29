@@ -136,6 +136,58 @@ public sealed class DbTransportSharedCoverageTests
     }
 
     /// <summary>
+    /// Regression (round 31): a burial that THROWS must be contained like one that returns false.
+    /// The delivery contract says DeadLetterAsync never throws, but the stores' DeadLetterEnabled
+    /// = false branch runs its compensating ack OUTSIDE their guarded region — so a transient DB
+    /// failure there escaped HandleAsync, tore the subscriber down mid-flight, and (via the
+    /// pre-execution cap) re-threw on every re-claim of the same row.
+    /// </summary>
+    [Theory]
+    [InlineData(Provider.SqlServer)]
+    [InlineData(Provider.PostgreSql)]
+    [InlineData(Provider.MongoDb)]
+    public async Task Burial_ThatThrows_IsContainedAndFallsBackToNak(Provider provider)
+    {
+        var calls = new Calls { DeadLetterThrows = true };
+        var logger = new CollectingLogger();
+
+        // Last-attempt failure: the burial throws, the throw must not escape HandleAsync, and the
+        // row is released for redelivery instead.
+        await RunAsync(
+            provider,
+            logger,
+            lockTimeout: TimeSpan.FromSeconds(30),
+            calls: calls,
+            handler: () => throw new InvalidOperationException("handler blew up"),
+            maxDeliveryAttempts: 1,
+            attempt: 1);
+
+        Assert.Equal(1, calls.DeadLetter);
+        Assert.Equal(1, calls.Nak);
+        Assert.Equal(0, calls.Ack);
+
+        // Pre-execution over-cap path: same containment, and the handler never runs.
+        var overCap = new Calls { DeadLetterThrows = true };
+        var handled = false;
+        await RunAsync(
+            provider,
+            logger,
+            lockTimeout: TimeSpan.FromSeconds(30),
+            calls: overCap,
+            handler: () =>
+            {
+                handled = true;
+                return Task.CompletedTask;
+            },
+            maxDeliveryAttempts: 1,
+            attempt: 2);
+
+        Assert.False(handled);
+        Assert.Equal(1, overCap.DeadLetter);
+        Assert.Equal(1, overCap.Nak);
+    }
+
+    /// <summary>
     /// Regression: the at-the-cap dead-letter passed the subscriber's stopping token, while every
     /// other settlement in the shared file passes <see cref="CancellationToken.None"/>. A handler
     /// failing on its LAST attempt during a stop had the burial aborted inside the store (whose
@@ -559,10 +611,15 @@ public sealed class DbTransportSharedCoverageTests
 
         public CancellationToken? LastDeadLetterToken;
 
+        public bool DeadLetterThrows;
+
         public ValueTask<bool> DeadLetterAsync(Exception exception, bool deleteOriginal, CancellationToken cancellationToken)
         {
             LastDeadLetterToken = cancellationToken;
             Interlocked.Increment(ref DeadLetter);
+            if (DeadLetterThrows)
+                throw new InvalidOperationException("dead-letter store unavailable");
+
             return ValueTask.FromResult(DeadLetterResult);
         }
 

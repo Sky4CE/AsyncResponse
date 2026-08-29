@@ -13,6 +13,65 @@ work that has landed on `main` but not yet shipped. Security reporters credited 
 
 ### Changed
 
+- **The in-memory channel now faults waiters with the wire failure shape**: `SetException`
+  delivers a plain `Exception` carrying the original message (plus the capped stack trace in
+  `Data["RemoteStackTrace"]`), exactly as every durable channel does — the concrete exception
+  type never crosses the wire, so a typed `catch` that passed only against the test harness no
+  longer can. `InMemoryAsyncResponseOptions` gains the durable channels' `IncludeRemoteStackTrace`
+  / `MaxRemoteStackTraceLength` knobs. The in-memory channel also now **throws** (Redis/NATS
+  parity) instead of silently reporting success when delivery keeps racing subscriber churn.
+- **Startup validation is tighter in five places.** Redis `PendingMessageMinIdleTime` and NATS
+  `AckWait` are now bounded by the ~49.7-day timer ceiling (both arm an in-process heartbeat delay
+  at a third of their value; larger values previously passed validation and then killed every
+  batch at runtime). SQS's `ShutdownTimeout` now counts against the host shutdown budget in both
+  ack modes. A NAMED reply target colliding with the worker or dead-letter destination is rejected
+  on all ten transports (previously only PostgreSQL/SQL Server/MongoDB). Durable-flow store
+  options are validated at host startup (the store is constructed once by the startup validator)
+  instead of on the first flow run. The SQL Server and PostgreSQL channels run full relation
+  verification (collation included) under `AutoCreateSchema = false`, not just the migration
+  probe.
+- **Dead-letter paths hardened across transports.** The five ACK-after-enqueue background loops
+  that lacked it (NATS, RabbitMQ, SQS, Azure Service Bus, Kafka) now stop starting fresh work
+  once the drain budget lapses and dead-letter/surface the remainder instead of losing it at
+  process exit. Redis's early-ACK dispatcher now enforces `MaxDeliveryAttempts` on reclaimed
+  entries. Kafka's at-the-cap and unprocessable-message burials no longer fault the subscriber
+  when the dead-letter topic is unavailable. RabbitMQ drains the background queue **before**
+  closing the channel (so shutdown-window failures still reach the DLX) and enables publisher
+  confirmations on the subscriber channel when a `DeadLetterExchange` is configured (an
+  unroutable DLX publish now fails loudly instead of logging a false success). The MongoDB
+  transport no longer deletes the shared deterministic DLQ document after losing a claim fence —
+  a racing peer's burial record is kept, at the cost of an occasional spurious (prunable) DLQ
+  entry. NATS settlement no longer aborts a last-attempt burial on host stop.
+- **The NATS dead-letter stream is provisioned with limits retention (evict-oldest)** instead of
+  the work-queue config: nothing consumes the DLQ, so work-queue retention never removed anything
+  and a full stream rejected every burial, NAK-looping each over-cap message forever. An existing
+  DLQ stream keeps its old retention (JetStream forbids changing it in place); a startup warning
+  explains how to migrate.
+- **PostgreSQL and MongoDB channels default `FullSweepInterval` to 5 seconds** (previously null =
+  full sweep on every 250 ms poll tick, costing one query per in-flight waiter per tick on an
+  idle channel). Push notifications still carry normal delivery; the sweep is the lost-wake
+  safety net. SQL Server keeps the every-tick sweep — polling is its delivery mechanism.
+- **Recovery-state stores refuse to rewrite an unreadable blob.** On Redis and NATS, a
+  registration save that finds the stored envelope unparseable now throws
+  `RecoveryStateUnreadableException` (read-path parity) instead of committing just the new
+  registration over registrations it could not enumerate.
+- **Ledger reads pinned to the authoritative replica/state.** The MongoDB channel's collections
+  (and its server-clock read) now pin `ReadPreference.Primary` like the flow store; Cosmos
+  `LoadAsync` treats only sub-status 0 as a genuinely absent flow (a 404 from session lag or a
+  recreated container now surfaces as an error instead of acking the run's only wake-up); the
+  MongoDB flow store verifies the TTL reaper even with `UseOwnershipLedger = false`; DynamoDB
+  verifies TTL on operator-provisioned tables regardless of `EnableTimeToLive`.
+- **Worker-envelope wire hardening**: a `"call"` whose `params`/service/method members are
+  explicitly null is dropped-and-acked like a null `call`; hostile `LastRedelayRemaining` /
+  `RedelayStallCount` values can no longer overflow the redelay stall detector or disarm it.
+- **`FlowTestHarness.CrashBeforeStep`/`CrashAfterStep` accept an optional `flowId`** to pin the
+  one-shot crash to a specific run when several flows (or a parent and child) reach the same step.
+- Under trimmed/Native AOT, the built-in JSON context registers the remaining closed scalar types
+  (`float`, `short`/`ushort`, `byte`/`sbyte`, `uint`/`ulong`, `char`, `DateOnly`/`TimeOnly`,
+  `Uri`, `byte[]`) for worker-call arguments, and a metadata failure raised mid-serialization by
+  an unregistered runtime type (an enum argument, typically) now carries the actionable
+  register-your-type guidance instead of a bare serializer error.
+
 - **The in-memory worker transport now wire round-trips every published job**, matching every
   broker-backed transport: each publish serializes the job envelope to its wire JSON, and the
   worker receives an instance materialized back from those bytes rather than the caller's live

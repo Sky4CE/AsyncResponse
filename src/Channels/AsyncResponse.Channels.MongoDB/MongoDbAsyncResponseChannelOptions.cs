@@ -94,11 +94,12 @@ public sealed class MongoDbAsyncResponseChannelOptions : DurableAsyncResponseCha
     /// Minimum interval between full safety-net sweeps. A full sweep queries the store once per
     /// subscribed correlation id, so its idle cost is W queries per <see cref="ListenerPollInterval"/>
     /// tick with W in-flight waiters. On this provider the sweep only covers wakes lost in failure
-    /// windows (change streams carry normal delivery), so raising this bounds idle database load
+    /// windows (change streams carry normal delivery), so this bounds idle database load
     /// without touching normal delivery latency — it stretches only the worst-case recovery of a
-    /// LOST wake. Null (the default) sweeps on every poll tick.
+    /// LOST wake. Default: 5 seconds (an unbounded null swept every waiter on every 250 ms tick —
+    /// W sequential queries per tick of pure idle load). Set null to sweep on every poll tick.
     /// </summary>
-    public TimeSpan? FullSweepInterval { get; set; }
+    public TimeSpan? FullSweepInterval { get; set; } = TimeSpan.FromSeconds(5);
 
     /// <summary>
     /// Number of pending response messages loaded per subscribed correlation id per dispatch pass.

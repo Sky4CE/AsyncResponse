@@ -681,6 +681,26 @@ internal sealed class QueuedRabbitMqMessageDispatcher : RabbitMqMessageDispatche
         await foreach (var delivery in _queue.Reader.ReadAllAsync().ConfigureAwait(false))
         {
             Interlocked.Decrement(ref _pendingCount);
+
+            // Once the drain budget has lapsed, STOP executing (DB/Redis/Pub-Sub parity). The
+            // token below cannot stop the real handler — it is
+            // `_ingress.HandleWorkerMessageAsync(payload)`, whose target takes no
+            // CancellationToken — so past the budget the loop kept starting fresh work beyond the
+            // host's shutdown budget, and every entry still queued at process exit vanished with
+            // no record (ACKed at enqueue, so the broker never redelivers it).
+            if (_drainCancellation.IsCancellationRequested)
+            {
+                var lapsed = new OperationCanceledException(
+                    "The ACK-after-enqueue drain budget lapsed before this already-ACKed message was handled.");
+                Logger.LogWarning(
+                    "RabbitMQ background handler for already-ACKed delivery {DeliveryTag} on {Queue} was not started: the drain budget had lapsed. Dead-lettering and surfacing via OnBackgroundFailure.",
+                    delivery.DeliveryTag,
+                    _queueName);
+                await NotifyBackgroundFailureAsync(delivery, lapsed, _queueName, _role).ConfigureAwait(false);
+                await TryDeadLetterAlreadyAckedAsync(delivery, lapsed).ConfigureAwait(false);
+                continue;
+            }
+
             Interlocked.Increment(ref _runningCount);
 
             try

@@ -63,7 +63,7 @@ internal static class PostgreSqlRelationVerifier
 
     public static async Task VerifyAsync(
         NpgsqlConnection connection,
-        NpgsqlTransaction transaction,
+        NpgsqlTransaction? transaction,
         string schemaName,
         string componentName,
         IReadOnlyList<ExpectedRelation> expected,
@@ -112,7 +112,7 @@ internal static class PostgreSqlRelationVerifier
 
     private static async Task<Dictionary<string, ActualRelation>> LoadRelationsAsync(
         NpgsqlConnection connection,
-        NpgsqlTransaction transaction,
+        NpgsqlTransaction? transaction,
         string schemaName,
         IReadOnlyList<ExpectedRelation> expected,
         CancellationToken cancellationToken)
@@ -171,7 +171,7 @@ internal static class PostgreSqlRelationVerifier
 
     private static async Task<Dictionary<(string Table, string Column), ActualColumn>> LoadTableColumnsAsync(
         NpgsqlConnection connection,
-        NpgsqlTransaction transaction,
+        NpgsqlTransaction? transaction,
         string schemaName,
         IReadOnlyList<ExpectedRelation> expected,
         CancellationToken cancellationToken)

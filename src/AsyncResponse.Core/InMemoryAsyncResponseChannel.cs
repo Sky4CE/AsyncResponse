@@ -257,11 +257,19 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
                 activity?.SetTag("asyncresponse.subscribers", subscribers.Count);
                 if (subscribers.Count == 0 && attempt >= 1)
                 {
+                    // Second contradiction: consuming registrations on this evidence would strip a
+                    // live waiter of its recovery arm — leave all state intact and surface the
+                    // non-delivery to the caller, whose retry machinery re-attempts (Redis/NATS
+                    // parity). Returning here instead would silently drop the payload while the
+                    // caller reports success.
                     _logger.LogWarning(
                         "Response for correlationId {CorrelationId} kept racing subscriber churn; recovery registrations are left intact.",
                         correlationId);
                     activity?.SetTag("asyncresponse.recovery.liveness_contradiction", true);
-                    return;
+                    throw new InvalidOperationException(
+                        $"In-memory delivery for correlationId '{correlationId}' found no subscribers twice while a live subscriber kept " +
+                        "appearing; the payload was not delivered and recovery registrations were left intact. Retry the publish once " +
+                        "the waiter's subscription is stable.");
                 }
             }
 
@@ -334,11 +342,19 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
                 activity?.SetTag("asyncresponse.subscribers", subscribers.Count);
                 if (subscribers.Count == 0 && attempt >= 1)
                 {
+                    // Second contradiction: consuming registrations on this evidence would strip a
+                    // live waiter of its recovery arm — leave all state intact and surface the
+                    // non-delivery to the caller, whose retry machinery re-attempts (Redis/NATS
+                    // parity). Returning here instead would silently drop the payload while the
+                    // caller reports success.
                     _logger.LogWarning(
                         "Response for correlationId {CorrelationId} kept racing subscriber churn; recovery registrations are left intact.",
                         correlationId);
                     activity?.SetTag("asyncresponse.recovery.liveness_contradiction", true);
-                    return;
+                    throw new InvalidOperationException(
+                        $"In-memory delivery for correlationId '{correlationId}' found no subscribers twice while a live subscriber kept " +
+                        "appearing; the payload was not delivered and recovery registrations were left intact. Retry the publish once " +
+                        "the waiter's subscription is stable.");
                 }
             }
 
@@ -400,11 +416,19 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
                 activity?.SetTag("asyncresponse.subscribers", subscribers.Count);
                 if (subscribers.Count == 0 && attempt >= 1)
                 {
+                    // Second contradiction: consuming registrations on this evidence would strip a
+                    // live waiter of its recovery arm — leave all state intact and surface the
+                    // non-delivery to the caller, whose retry machinery re-attempts (Redis/NATS
+                    // parity). Returning here instead would silently drop the payload while the
+                    // caller reports success.
                     _logger.LogWarning(
                         "Response for correlationId {CorrelationId} kept racing subscriber churn; recovery registrations are left intact.",
                         correlationId);
                     activity?.SetTag("asyncresponse.recovery.liveness_contradiction", true);
-                    return;
+                    throw new InvalidOperationException(
+                        $"In-memory delivery for correlationId '{correlationId}' found no subscribers twice while a live subscriber kept " +
+                        "appearing; the payload was not delivered and recovery registrations were left intact. Retry the publish once " +
+                        "the waiter's subscription is stable.");
                 }
             }
 
@@ -788,7 +812,21 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
                 return Task.CompletedTask;
 
             AsyncResponseDiagnostics.SetError(_activity, exception);
-            TrySetException(exception);
+
+            // Wire parity: every durable channel transmits only the message (plus, optionally, the
+            // capped stack trace in Data["RemoteStackTrace"]) and faults the waiter with a plain
+            // Exception — the concrete type never crosses the wire. Handing the publisher's live
+            // instance through let a typed `catch` pass against this channel that can never match
+            // in production, the same divergence DeclaredWireSerializer exists to prevent for
+            // payloads.
+            var remoteFailure = new Exception(exception.Message);
+            var remoteStackTrace = RemoteStackTrace.ForWire(
+                exception.StackTrace,
+                _owner._options.IncludeRemoteStackTrace,
+                _owner._options.MaxRemoteStackTraceLength);
+            if (!string.IsNullOrEmpty(remoteStackTrace))
+                remoteFailure.Data["RemoteStackTrace"] = remoteStackTrace;
+            TrySetException(remoteFailure);
             return CleanupOnceAsTask();
         }
 

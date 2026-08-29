@@ -575,7 +575,6 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
     {
         var flowType = ResolveType(state.FlowTypeName, "flow");
         var inputType = ResolveType(state.InputTypeName, "input");
-        var input = state.InputJson is null ? null : JsonSafety.SafeDeserialize(state.InputJson, inputType);
 
         var contract = typeof(IDurableFlow<>).MakeGenericType(inputType);
 
@@ -586,6 +585,13 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
                 $"Durable flow type '{flowType.FullName}' does not implement IDurableFlow<{inputType.Name}> " +
                 "matching the persisted input type; the flow state was written by an incompatible flow definition.");
         }
+
+        // Deserialize only AFTER the contract check above has passed: the ledger's InputTypeName is
+        // attacker-controlled to anyone who can write the flow store, and STJ construction runs
+        // setters/converters/[JsonConstructor] on whatever type it materializes. Requiring a
+        // DI-registered flow that implements IDurableFlow<inputType> first bounds the constructible
+        // set to input types the application actually declared, instead of any loadable CLR type.
+        var input = state.InputJson is null ? null : JsonSafety.SafeDeserialize(state.InputJson, inputType);
 
         var execute = contract.GetMethod(nameof(IDurableFlow<object>.ExecuteAsync))!;
         try

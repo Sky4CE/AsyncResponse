@@ -1058,6 +1058,112 @@ public class RabbitMqTransportTests
     }
 
     [Fact]
+    public async Task Subscriber_GracefulStop_DrainsAlreadyAckedWorkBeforeClosingTheChannel()
+    {
+        // Regression (round 31): the graceful-stop path closed the channel and connection BEFORE
+        // the ACK-after-enqueue dispatcher drained (the `await using` disposal only ran at scope
+        // exit, after the explicit closes), so TryDeadLetterAlreadyAckedAsync found the channel
+        // closed on every shutdown and each already-ACKed failure during the drain lost its DLX
+        // record — a poison job that fails during every shutdown left only a log line. Kafka
+        // orders the same two operations correctly ("leaving the await-using scope drains ...
+        // before the consumer commits"); RabbitMQ now drains before the closes too.
+        var channel = new FakeRabbitMqChannel();
+        var factory = new FakeConnectionFactory(channel);
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var handlerCalls = 0;
+        var ingress = new Mock<IAsyncResponseIngress>();
+        ingress
+            .Setup(i => i.HandleWorkerMessageAsync(It.IsAny<string>()))
+            .Returns(async () =>
+            {
+                if (Interlocked.Increment(ref handlerCalls) == 1)
+                {
+                    entered.TrySetResult();
+                    await release.Task.ConfigureAwait(false);
+                    return;
+                }
+
+                throw new InvalidOperationException("drain boom");
+            });
+        var options = new RabbitMqAsyncResponseOptions
+        {
+            WorkerExchange = "worker.ex",
+            WorkerQueue = "worker.q",
+            WorkerRoutingKey = "worker.rk",
+            DeadLetterExchange = "dlx"
+        };
+        options.WorkerSubscriber.UseAckAfterEnqueue(1, 8, TimeSpan.FromSeconds(20));
+        var subscriber = new RabbitMqWorkerSubscriber(
+            Options.Create(options),
+            ingress.Object,
+            NullLogger<RabbitMqWorkerSubscriber>.Instance,
+            factory);
+
+        await subscriber.StartAsync(CancellationToken.None);
+        await channel.WaitForConsumerAsync();
+
+        await channel.DeliverAsync(Delivery("m1", deliveryTag: 1)); // handler blocks
+        await entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await channel.DeliverAsync(Delivery("m2", deliveryTag: 2)); // ACKed, waiting in queue
+
+        // Initiate the graceful stop; the drain is parked behind the blocked first handler, so
+        // release it only once the stop is past the consumer cancel — the second job then fails
+        // DURING the drain, which is exactly the window whose DLX copy the old ordering lost.
+        var stopping = subscriber.StopAsync(CancellationToken.None);
+        var guard = TimeProvider.System.GetUtcNow() + TimeSpan.FromSeconds(10);
+        while (channel.Cancels.Count == 0)
+        {
+            Assert.True(TimeProvider.System.GetUtcNow() < guard, "the graceful stop never canceled the consumer");
+            await Task.Delay(TimeSpan.FromMilliseconds(5));
+        }
+
+        release.TrySetResult();
+        await stopping.WaitAsync(TimeSpan.FromSeconds(10));
+
+        Assert.Equal(2, handlerCalls);
+        var buried = Assert.Single(channel.Published);
+        Assert.Equal("dlx", buried.Exchange);
+        Assert.Equal("m2", Encoding.UTF8.GetString(buried.Body.ToArray()));
+        Assert.True(channel.CloseCalls >= 1);
+    }
+
+    [Theory]
+    [InlineData("dlx", true)]
+    [InlineData(null, false)]
+    public async Task Subscriber_ChannelRequestsPublisherConfirmations_ExactlyWhenADeadLetterExchangeIsConfigured(
+        string? deadLetterExchange,
+        bool expectConfirmations)
+    {
+        // Regression (round 31): the already-ACKed dead-letter copy publishes on the SUBSCRIBER
+        // channel, and without confirmation tracking an unroutable (mandatory) return raised only
+        // an unobserved basic.return — the publish "succeeded" and a successful burial was logged
+        // for a message the broker discarded. With a DLX configured the channel now requests
+        // confirmations so that publish throws and the failure is logged honestly; without one the
+        // channel keeps the lighter default.
+        var channel = new FakeRabbitMqChannel();
+        var factory = new FakeConnectionFactory(channel);
+        var subscriber = new RabbitMqWorkerSubscriber(
+            Options.Create(new RabbitMqAsyncResponseOptions
+            {
+                WorkerExchange = "worker.ex",
+                WorkerQueue = "worker.q",
+                WorkerRoutingKey = "worker.rk",
+                DeadLetterExchange = deadLetterExchange
+            }),
+            Mock.Of<IAsyncResponseIngress>(),
+            NullLogger<RabbitMqWorkerSubscriber>.Instance,
+            factory);
+
+        await using (new HostedServiceRun(subscriber))
+        {
+            await channel.WaitForConsumerAsync();
+        }
+
+        Assert.Equal(expectConfirmations, factory.Connection.PublisherConfirmationsRequested);
+    }
+
+    [Fact]
     public async Task Subscriber_NormalHostStop_ExitsCleanlyWithoutRebuild()
     {
         var channel = new FakeRabbitMqChannel();
@@ -1328,6 +1434,10 @@ public class RabbitMqTransportTests
             CloseCalls++;
             if (ThrowOnClose is not null)
                 throw ThrowOnClose;
+
+            // Mirrors the real adapter: a closed channel reports IsOpen = false, which is what
+            // TryDeadLetterAlreadyAckedAsync consults before publishing to the DLX.
+            IsOpen = false;
             return Task.CompletedTask;
         }
 

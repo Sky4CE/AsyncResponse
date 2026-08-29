@@ -5,7 +5,10 @@ namespace AsyncResponse;
 /// <c>AddAsyncResponse().WithInMemoryChannel()</c>. Waiters, subscriptions, and recovery state
 /// all live in memory and disappear when the process exits.
 /// </summary>
-public sealed class InMemoryAsyncResponseOptions : AsyncResponseChannelOptions
+// Derives from the DURABLE options despite holding nothing durable: the wire channels serialize
+// failures (message + capped stack trace, type erased), and the in-memory channel reproduces that
+// so tests exercise the same failure shape production sees — including these two policy knobs.
+public sealed class InMemoryAsyncResponseOptions : DurableAsyncResponseChannelOptions
 {
     /// <summary>Runs the InMemoryAsyncResponseOptions operation.</summary>
     public InMemoryAsyncResponseOptions()

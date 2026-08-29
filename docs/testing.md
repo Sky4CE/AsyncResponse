@@ -74,6 +74,12 @@ redelivery, new correlation id, idempotent-trigger contract), `ExecuteDirectAsyn
 executor inline, no worker queue — fully single-threaded for exhaustive matrices), and
 `ResumeAsync()` (the operator wake-up).
 
+`ReplyExceptionAsync` faults the step with the **wire** failure shape every durable channel
+produces: a plain `Exception` carrying the original message, with the capped stack trace in
+`Data["RemoteStackTrace"]` — the concrete exception type never crosses the wire, so a
+`catch (MyDomainException)` in a flow can never match in production and will not match in the
+harness either.
+
 ## Crash injection at checkpoints
 
 `CrashBeforeStep` / `CrashAfterStep` arm a one-shot `SimulatedCrashException` thrown from the
@@ -92,6 +98,11 @@ await harness.AdvanceAsync(TimeSpan.FromSeconds(2));      // let the redelivery 
 Assert.Equal(FlowRunStatus.Succeeded, await run.WaitForFinishedAsync());
 Assert.Equal(1, recorder.Count("create-workspace"));      // a crash costs a delivery, never a duplicate side effect
 ```
+
+When more than one run can reach the armed step — concurrent flows, or a parent and a child flow
+reusing step names — pass the flow id to pin the one-shot crash to its run
+(`harness.CrashAfterStep("create-workspace", flowId: run.FlowId)`); an unscoped crash fires on
+whichever run gets there first.
 
 Run it as a `[Theory]` over every step of your flow — the crash-at-every-checkpoint matrix from
 the library's own suite ([FlowTestHarnessShowcaseTests](../tests/AsyncResponse.Tests/FlowTestHarnessShowcaseTests.cs)),

@@ -117,11 +117,14 @@ internal abstract class RedisMessageDispatcher : IAsyncDisposable
 
         if (subscriberOptions.BatchSize <= 0)
             throw new InvalidOperationException($"{optionPath}.{nameof(RedisSubscriberOptions.BatchSize)} must be positive.");
-        // EmptyPollDelay arms the idle Task.Delay (timer ceiling); PendingMessageMinIdleTime is
-        // the server-side XAUTOCLAIM min-idle in milliseconds and PendingClaimInterval a
-        // "now + interval" schedule stamp — both get the persistence bound.
+        // EmptyPollDelay arms the idle Task.Delay (timer ceiling). PendingMessageMinIdleTime is
+        // the server-side XAUTOCLAIM min-idle in milliseconds, but it ALSO arms the in-process
+        // idle-reset heartbeat's Task.Delay at one third of its value, so its real sink is the
+        // timer ceiling too — under the persistence bound a legal 200-day value passed validation
+        // and then killed every batch with ArgumentOutOfRangeException from the heartbeat's delay.
+        // PendingClaimInterval is a "now + interval" schedule stamp and keeps the persistence bound.
         AsyncResponseChannelOptions.EnsureTimerBacked(subscriberOptions.EmptyPollDelay, optionPath, nameof(RedisSubscriberOptions.EmptyPollDelay));
-        AsyncResponseChannelOptions.EnsurePersistedTtl(subscriberOptions.PendingMessageMinIdleTime, optionPath, nameof(RedisSubscriberOptions.PendingMessageMinIdleTime));
+        AsyncResponseChannelOptions.EnsureTimerBacked(subscriberOptions.PendingMessageMinIdleTime, optionPath, nameof(RedisSubscriberOptions.PendingMessageMinIdleTime));
         AsyncResponseChannelOptions.EnsurePersistedTtl(subscriberOptions.PendingClaimInterval, optionPath, nameof(RedisSubscriberOptions.PendingClaimInterval));
         if (subscriberOptions.PendingClaimBatchSize <= 0)
             throw new InvalidOperationException($"{optionPath}.{nameof(RedisSubscriberOptions.PendingClaimBatchSize)} must be positive.");
@@ -477,6 +480,21 @@ internal sealed class QueuedRedisMessageDispatcher : RedisMessageDispatcher
         RedisStreamDelivery delivery,
         CancellationToken subscriberCancellationToken)
     {
+        // Pre-execution cap, BEFORE the enqueue-and-ACK (awaiting-dispatcher parity): the
+        // pending-claim loop feeds this dispatcher real XPENDING delivery counts too, and without
+        // the check an over-cap entry — deferred under backpressure and reclaimed each cycle, or
+        // re-claimed after a swallowed post-enqueue ACK failure — was re-enqueued and re-executed
+        // forever, with nothing ever consulting MaxDeliveryAttempts to bury it.
+        if (AlreadyExceededDeliveryAttempts(delivery))
+        {
+            await DeadLetterAndAckAsync(
+                delivery,
+                new InvalidOperationException($"Redis message exceeded {MaxDeliveryAttempts} delivery attempts."),
+                "max_delivery_attempts_exceeded",
+                CancellationToken.None).ConfigureAwait(false);
+            return RedisDispatchOutcome.Processed;
+        }
+
         Interlocked.Increment(ref _pendingCount);
         if (!_queue.Writer.TryWrite(delivery))
         {

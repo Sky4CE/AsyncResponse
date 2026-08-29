@@ -4,7 +4,11 @@ namespace AsyncResponse;
 /// Thrown by <see cref="IRecoveryStateStore.GetAllAsync"/> when a correlation id has stored
 /// recovery registrations but this build cannot interpret <em>any</em> of them: malformed JSON, an
 /// incomplete identity, or a schema version outside
-/// <see cref="RecoveryStateSchema.IsReadable"/>.
+/// <see cref="RecoveryStateSchema.IsReadable"/>. Stores whose registrations share one blob per
+/// correlation id (Redis, NATS) also throw it from <see cref="IRecoveryStateStore.SaveAsync"/>
+/// when the stored envelope itself is unparseable: a rewrite that read "unreadable" as "missing"
+/// would commit just the new registration over registrations it could not enumerate, destroying
+/// every armed callback the blob held.
 /// <para>
 /// The same distinction <see cref="FlowStateUnreadableException"/> draws for durable-flow ledgers,
 /// applied to the recovery path. An empty registration list means "nobody ever armed a recovery

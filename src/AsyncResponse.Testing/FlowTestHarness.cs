@@ -70,17 +70,22 @@ public sealed class FlowTestHarness : IAsyncDisposable
     /// Arms a one-shot crash that fires when <paramref name="stepName"/> is next about to execute
     /// (before any of its side effects). The execution attempt fails with
     /// <see cref="SimulatedCrashException"/> and the run resumes from its last checkpoint on the
-    /// next delivery — the flow class under test needs no instrumentation.
+    /// next delivery — the flow class under test needs no instrumentation. Pass
+    /// <paramref name="flowId"/> when more than one run (concurrent flows, or a parent and its
+    /// child) can reach the step: an unscoped crash fires on whichever run gets there first, so a
+    /// test could pass without the intended run ever exercising its recovery path.
     /// </summary>
-    public void CrashBeforeStep(string stepName)
-        => _probe.ArmCrash(stepName, beforeStep: true);
+    public void CrashBeforeStep(string stepName, string? flowId = null)
+        => _probe.ArmCrash(stepName, beforeStep: true, flowId);
 
     /// <summary>
     /// Arms a one-shot crash that fires right after <paramref name="stepName"/>'s completion
     /// checkpoint persists — the classic "died between the checkpoint and the next step" window.
+    /// Pass <paramref name="flowId"/> to pin the crash to one run; see
+    /// <see cref="CrashBeforeStep"/>.
     /// </summary>
-    public void CrashAfterStep(string stepName)
-        => _probe.ArmCrash(stepName, beforeStep: false);
+    public void CrashAfterStep(string stepName, string? flowId = null)
+        => _probe.ArmCrash(stepName, beforeStep: false, flowId);
 
     internal FlowProbe Probe => _probe;
 
@@ -243,9 +248,9 @@ public sealed class FlowProbe : IDurableFlowExecutionObserver
     private readonly ConcurrentDictionary<string, DurableFlowRunEvent> _finished = new(StringComparer.Ordinal);
     private readonly List<Waiter> _waiters = [];
     private readonly List<RunWaiter> _runWaiters = [];
-    private (string Step, bool Before)? _armedCrash;
+    private (string Step, bool Before, string? FlowId)? _armedCrash;
 
-    internal void ArmCrash(string stepName, bool beforeStep)
+    internal void ArmCrash(string stepName, bool beforeStep, string? flowId = null)
     {
         lock (_gate)
         {
@@ -257,14 +262,14 @@ public sealed class FlowProbe : IDurableFlowExecutionObserver
                     $"A crash is already armed for step '{armed.Step}' ({(armed.Before ? "before" : "after")} the step) and has not fired yet; " +
                     "arm one crash at a time, after the previous one has fired.");
 
-            _armedCrash = (stepName, beforeStep);
+            _armedCrash = (stepName, beforeStep, flowId);
         }
     }
 
     ValueTask IDurableFlowExecutionObserver.OnStepStartingAsync(DurableFlowStepEvent step)
     {
         Record(EventKind.Starting, step);
-        MaybeCrash(step.StepName, beforeStep: true);
+        MaybeCrash(step.StepName, beforeStep: true, step.FlowId);
         return default;
     }
 
@@ -277,7 +282,7 @@ public sealed class FlowProbe : IDurableFlowExecutionObserver
     ValueTask IDurableFlowExecutionObserver.OnStepCompletedAsync(DurableFlowStepEvent step)
     {
         Record(EventKind.Completed, step);
-        MaybeCrash(step.StepName, beforeStep: false);
+        MaybeCrash(step.StepName, beforeStep: false, step.FlowId);
         return default;
     }
 
@@ -296,12 +301,21 @@ public sealed class FlowProbe : IDurableFlowExecutionObserver
         return default;
     }
 
-    private void MaybeCrash(string stepName, bool beforeStep)
+    private void MaybeCrash(string stepName, bool beforeStep, string flowId)
     {
         lock (_gate)
         {
-            if (_armedCrash is not { } armed || armed.Step != stepName || armed.Before != beforeStep)
+            // A flow-scoped arm only fires on ITS run: the slot is process-wide and one-shot, so
+            // an unscoped crash intended for run B could be consumed by run A (or a child flow
+            // reusing the step name) reaching the step first — and B's recovery assertion then
+            // passes without the recovery path ever executing.
+            if (_armedCrash is not { } armed
+                || armed.Step != stepName
+                || armed.Before != beforeStep
+                || (armed.FlowId is not null && !string.Equals(armed.FlowId, flowId, StringComparison.Ordinal)))
+            {
                 return;
+            }
 
             _armedCrash = null;
         }
