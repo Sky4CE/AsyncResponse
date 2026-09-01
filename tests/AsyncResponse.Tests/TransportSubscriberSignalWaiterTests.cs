@@ -108,7 +108,7 @@ public sealed class TransportSubscriberSignalWaiterTests
                 var database = new Mock<IMongoDatabase>(MockBehavior.Loose);
                 database
                     .Setup(d => d.GetCollection<MongoTransportMessageDocument>(It.IsAny<string>(), It.IsAny<MongoCollectionSettings>()))
-                    .Returns(new Mock<IMongoCollection<MongoTransportMessageDocument>>(MockBehavior.Loose).Object);
+                    .Returns(new Mock<IMongoCollection<MongoTransportMessageDocument>>(MockBehavior.Loose).SelfPinning().Object);
                 database.WithTestNamespace();
                 var store = new MongoDbTransportStore(database.Object, options);
                 var service = new MongoDbWorkerSubscriber(

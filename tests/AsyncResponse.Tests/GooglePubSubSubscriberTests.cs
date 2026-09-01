@@ -660,6 +660,32 @@ public class GooglePubSubSubscriberTests
             && entry.Message.Contains("DeadLetterPolicy", StringComparison.Ordinal));
     }
 
+    [Fact]
+    public async Task QueuedDispose_SurvivesAWorkerFaultingOutsideItsHandlerGuard()
+    {
+        // Regression: the drain join caught only TimeoutException (the shared DB base and NATS
+        // also carry a general arm). A worker faulting outside its handler guard — here the log
+        // sink throwing from the "handler failed" entry inside the catch arm — rethrew from
+        // Task.WhenAll, escaped DisposeAsync into the subscriber's `await using` and leaked the
+        // drain token source.
+        var logger = new ErrorThrowingLogger();
+        var dispatcher = GooglePubSubMessageDispatcher.Create(
+            (_, _) => throw new InvalidOperationException("handler boom"),
+            new GooglePubSubAsyncResponseOptions(),
+            new GooglePubSubSubscriberOptions().UseAckAfterEnqueue(
+                backgroundWorkerCount: 1,
+                backgroundQueueCapacity: 8,
+                backgroundDrainTimeout: TimeSpan.FromSeconds(5)),
+            logger,
+            "workers",
+            GooglePubSubSubscriberRole.Worker);
+
+        Assert.Equal(SubscriberClient.Reply.Ack, await dispatcher.HandleAsync(Message("message-fault"), CancellationToken.None));
+        await logger.ErrorThrown.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        await dispatcher.DisposeAsync();
+    }
+
     private sealed class CapturingLogger<T> : ILogger<T>
     {
         private readonly object _gate = new();

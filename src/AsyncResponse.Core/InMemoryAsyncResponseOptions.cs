@@ -17,4 +17,18 @@ public sealed class InMemoryAsyncResponseOptions : DurableAsyncResponseChannelOp
         // keeps stale state from lingering — unlike the durable channels' 7-day default.
         RecoveryStateExpiry = TimeSpan.FromMinutes(30);
     }
+
+    /// <summary>
+    /// Validates the options, throwing an actionable <see cref="InvalidOperationException"/> on
+    /// misconfiguration — the same guard set every durable channel applies, so a configuration
+    /// that passes the in-memory harness cannot fail host startup on a real channel.
+    /// </summary>
+    internal void Validate()
+    {
+        ValidateShared(nameof(InMemoryAsyncResponseOptions));
+        // RemoteStackTrace.Cap treats a non-positive cap as "no cap", so without this the bound
+        // on remote traces was silently disabled here while all five wire channels reject it.
+        if (MaxRemoteStackTraceLength < 0)
+            throw new InvalidOperationException($"{nameof(InMemoryAsyncResponseOptions)}.{nameof(MaxRemoteStackTraceLength)} must not be negative.");
+    }
 }

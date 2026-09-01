@@ -46,7 +46,7 @@ public class GooglePubSubTransportTests
         var factoryCalls = 0;
         var transport = new GooglePubSubWorkerTransport(
             Options.Create(options),
-            () =>
+            _ =>
             {
                 factoryCalls++;
                 return Task.FromResult<IGooglePubSubPublisherClient>(publisher);
@@ -83,7 +83,7 @@ public class GooglePubSubTransportTests
                 ProjectId = "project-a",
                 WorkerTopicId = "jobs"
             }),
-            () => Task.FromResult<IGooglePubSubPublisherClient>(publisher));
+            _ => Task.FromResult<IGooglePubSubPublisherClient>(publisher));
 
         await transport.PublishAsync(WorkerJob("corr-shutdown"));
         await transport.DisposeAsync();
@@ -102,7 +102,7 @@ public class GooglePubSubTransportTests
                 ProjectId = "project-a",
                 WorkerTopicId = "jobs"
             }),
-            () => Task.FromResult<IGooglePubSubPublisherClient>(publisher));
+            _ => Task.FromResult<IGooglePubSubPublisherClient>(publisher));
 
         await transport.PublishAsync(WorkerJob("corr-activity"));
 
@@ -126,7 +126,7 @@ public class GooglePubSubTransportTests
                 ProjectId = "project-a",
                 WorkerTopicId = "jobs"
             }),
-            () =>
+            _ =>
             {
                 factoryCalls++;
                 return Task.FromResult<IGooglePubSubPublisherClient>(publisher);
@@ -152,7 +152,7 @@ public class GooglePubSubTransportTests
                 ProjectId = "project-a",
                 WorkerTopicId = "jobs"
             }),
-            () => Task.FromResult<IGooglePubSubPublisherClient>(publisher));
+            _ => Task.FromResult<IGooglePubSubPublisherClient>(publisher));
 
         await transport.PublishAsync(WorkerJob("  "));
 
@@ -171,7 +171,7 @@ public class GooglePubSubTransportTests
                 ProjectId = "project-a",
                 WorkerTopicId = "jobs"
             }),
-            () => Task.FromResult<IGooglePubSubPublisherClient>(publisher));
+            _ => Task.FromResult<IGooglePubSubPublisherClient>(publisher));
 
         var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => transport.PublishAsync(WorkerJob("corr-1")));
 
@@ -189,7 +189,7 @@ public class GooglePubSubTransportTests
                 ProjectId = "project-a",
                 WorkerTopicId = "jobs"
             }),
-            () => Interlocked.Increment(ref factoryCalls) == 1
+            _ => Interlocked.Increment(ref factoryCalls) == 1
                 ? Task.FromException<IGooglePubSubPublisherClient>(new InvalidOperationException("build failed"))
                 : Task.FromResult<IGooglePubSubPublisherClient>(publisher));
 
@@ -218,7 +218,7 @@ public class GooglePubSubTransportTests
                 ProjectId = "project-a",
                 WorkerTopicId = "jobs"
             }),
-            async () =>
+            async _ =>
             {
                 Interlocked.Increment(ref factoryCalls);
                 await releaseFactory.Task.ConfigureAwait(false);
@@ -243,7 +243,7 @@ public class GooglePubSubTransportTests
                 ProjectId = "project-a",
                 WorkerTopicId = "jobs"
             }),
-            () => Task.FromResult<IGooglePubSubPublisherClient>(new FakePublisherClient()));
+            _ => Task.FromResult<IGooglePubSubPublisherClient>(new FakePublisherClient()));
 
         await transport.DisposeAsync();
 
@@ -263,7 +263,7 @@ public class GooglePubSubTransportTests
                 ProjectId = "project-a",
                 WorkerTopicId = "jobs"
             }),
-            () => Task.FromResult<IGooglePubSubPublisherClient>(publisher));
+            _ => Task.FromResult<IGooglePubSubPublisherClient>(publisher));
         using var cts = new CancellationTokenSource();
         cts.Cancel();
 
@@ -513,7 +513,7 @@ public class GooglePubSubTransportTests
                 ProjectId = "project-a",
                 WorkerTopicId = "jobs"
             }),
-            () => Task.FromResult<IGooglePubSubPublisherClient>(new FakePublisherClient()));
+            _ => Task.FromResult<IGooglePubSubPublisherClient>(new FakePublisherClient()));
 
         await transport.DisposeAsync();
 
@@ -535,7 +535,7 @@ public class GooglePubSubTransportTests
                 ProjectId = "project-a",
                 WorkerTopicId = "jobs"
             }),
-            () => Task.FromResult<IGooglePubSubPublisherClient>(publisher));
+            _ => Task.FromResult<IGooglePubSubPublisherClient>(publisher));
         using var cancelled = new CancellationTokenSource();
         cancelled.Cancel();
 
@@ -544,6 +544,34 @@ public class GooglePubSubTransportTests
 
         Assert.Empty(publisher.Messages);
         await transport.DisposeAsync();
+    }
+
+    [Fact]
+    public async Task PublishAsync_ForwardsTheCallersTokenIntoThePublisherBuild()
+    {
+        // Regression: the factory seam took no token, so a stalled credential/metadata lookup or
+        // gRPC handshake under the publisher gate ignored the caller's — and the host's stopping —
+        // token; shutdown blocked on the build. Every sibling forwards the token into its build.
+        var buildStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var transport = new GooglePubSubWorkerTransport(
+            Options.Create(new GooglePubSubAsyncResponseOptions
+            {
+                ProjectId = "project-a",
+                WorkerTopicId = "jobs"
+            }),
+            async cancellationToken =>
+            {
+                buildStarted.TrySetResult();
+                await Task.Delay(Timeout.Infinite, cancellationToken);
+                return (IGooglePubSubPublisherClient)new FakePublisherClient();
+            });
+        using var cancellation = new CancellationTokenSource();
+
+        var publish = transport.PublishAsync(WorkerJob("corr"), cancellation.Token);
+        await buildStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        cancellation.Cancel();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => publish.WaitAsync(TimeSpan.FromSeconds(5)));
     }
 
     private static WorkerJobEnvelope WorkerJob(string? correlationId)

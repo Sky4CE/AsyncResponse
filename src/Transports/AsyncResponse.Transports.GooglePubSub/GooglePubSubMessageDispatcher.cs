@@ -386,6 +386,14 @@ internal sealed class QueuedGooglePubSubMessageDispatcher : GooglePubSubMessageD
                 TaskContinuationOptions.ExecuteSynchronously,
                 TaskScheduler.Default);
         }
+        catch (Exception ex)
+        {
+            // A worker faulted outside its own handler guard (DB/NATS dispatcher parity). WhenAll
+            // only completes once every worker has finished, so the source is safe to dispose here
+            // — and the fault must not escape DisposeAsync and mask the real shutdown path.
+            Logger.LogDebug(ex, "Pub/Sub ACK-after-enqueue dispatcher drain for {SubscriptionId} ended with an error.", _subscriptionId);
+            _drainCancellation.Dispose();
+        }
     }
 
     private async Task RunWorkerAsync(int workerIndex)

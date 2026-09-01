@@ -169,6 +169,11 @@ await harness.PublishAsync(new OperationResult { Status = OperationStatus.Comple
 // the resume callback runs against the NEW incarnation's services.
 ```
 
+The dead incarnation's waiters are abandoned, not disposed: their tasks are cancelled for
+anyone still holding them, and disposing one afterwards (a flow disposes its waiter after the
+cancelled wait; an `await using` caller does the same) is a no-op that leaves the recovery
+registration in place — exactly what a crashed process leaves behind.
+
 This is the recovery tri-state (`Resume` / `Fail` / `KeepWaiting`) — the part of the API teams
 most need to test and previously could not without a broker. Waiter tasks obtained before the
 restart never carry a response or a timeout: the restart abandons them exactly as a crash does —

@@ -246,6 +246,48 @@ public sealed class SqlServerRelationVerifierTests
     /// three assemblies at once, so the C# name is ambiguous and every member is reached through
     /// the anchor assembly instead.
     /// </summary>
+    [Theory]
+    [MemberData(nameof(AnchorTypes))]
+    public void EvaluatePrimaryKeys_IgnoresTheClusteringKeyListedAtOrdinalZero(Type anchor)
+    {
+        // Regression: the primary-key query joined sys.index_columns without the key_ordinal > 0
+        // filter the index query applies. SQL Server lists a NONCLUSTERED primary key's clustering
+        // key at ordinal 0 — it is not part of the key — so the standard random-GUID layout
+        // (`id uniqueidentifier PRIMARY KEY NONCLUSTERED` over `CREATE CLUSTERED INDEX ...
+        // (created_at)`) verified as "a primary key over (created_at, id)" and failed startup
+        // against a correct operator-provisioned schema.
+        var verifier = new Verifier(anchor);
+        var expected = verifier.Tables(verifier.KeyedTable("jobs", "id"));
+
+        Assert.Null(verifier.EvaluatePrimaryKeyRows(expected, [("jobs", new (byte, string)[] { (0, "created_at"), (1, "id") })]));
+
+        // A genuinely wrong key, and a missing one, are still rejected.
+        var wrong = verifier.EvaluatePrimaryKeyRows(expected, [("jobs", new (byte, string)[] { (1, "created_at"), (2, "id") })]);
+        Assert.NotNull(wrong);
+        Assert.Contains("created_at, id", wrong.Message, StringComparison.Ordinal);
+        var missing = verifier.EvaluatePrimaryKeyRows(expected, []);
+        Assert.NotNull(missing);
+        Assert.Contains("has no primary key", missing.Message, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [MemberData(nameof(AnchorTypes))]
+    public void EvaluateSequence_RequiresTheBigintMaximum(Type anchor)
+    {
+        // Regression (PostgreSQL-verifier parity): the sequence check read type, increment and
+        // cycling but never sys.sequences.maximum_value, so an operator-provisioned or restored
+        // `CREATE SEQUENCE ... MAXVALUE 1000000` passed startup and then exhausted mid-production
+        // with error 11728 — on the very path this verification exists to protect.
+        var verifier = new Verifier(anchor);
+
+        Assert.Null(verifier.EvaluateSequenceRow("bigint", increment: 1, cycles: false, maximum: long.MaxValue));
+
+        var capped = verifier.EvaluateSequenceRow("bigint", increment: 1, cycles: false, maximum: 1_000_000);
+        Assert.NotNull(capped);
+        Assert.Contains("MAXVALUE 1000000", capped.Message, StringComparison.Ordinal);
+        Assert.Contains("NO MAXVALUE", capped.Message, StringComparison.Ordinal);
+    }
+
     private sealed class Verifier
     {
         private readonly Type _expectedObject;
@@ -258,6 +300,8 @@ public sealed class SqlServerRelationVerifierTests
         private readonly MethodInfo _renderType;
         private readonly MethodInfo _evaluate;
         private readonly MethodInfo _evaluateIndexes;
+        private readonly MethodInfo _evaluatePrimaryKeys;
+        private readonly MethodInfo _evaluateSequence;
 
         public Verifier(Type anchor)
         {
@@ -275,6 +319,46 @@ public sealed class SqlServerRelationVerifierTests
             _renderType = type.GetMethod("RenderType", BindingFlags.NonPublic | BindingFlags.Static)!;
             _evaluate = type.GetMethod("EvaluateTableColumns", BindingFlags.NonPublic | BindingFlags.Static)!;
             _evaluateIndexes = type.GetMethod("EvaluateIndexes", BindingFlags.NonPublic | BindingFlags.Static)!;
+            _evaluatePrimaryKeys = type.GetMethod("EvaluatePrimaryKeys", BindingFlags.NonPublic | BindingFlags.Static)!;
+            _evaluateSequence = type.GetMethod("EvaluateSequence", BindingFlags.NonPublic | BindingFlags.Static)!;
+        }
+
+        /// <summary>A table expectation that declares only its primary key.</summary>
+        public object KeyedTable(string name, params string[] primaryKey)
+            => Activator.CreateInstance(_expectedObject, name, _tableKind, null, primaryKey, null, null)!;
+
+        /// <summary>Runs the pure primary-key decision over fabricated sys.index_columns rows; null means "accepted".</summary>
+        public InvalidOperationException? EvaluatePrimaryKeyRows(
+            Array tables,
+            (string Table, (byte Ordinal, string Column)[] Columns)[] rows)
+        {
+            var actual = new Dictionary<string, List<(byte Ordinal, string Column)>>(StringComparer.OrdinalIgnoreCase);
+            foreach (var (table, columns) in rows)
+                actual[table] = [.. columns];
+
+            try
+            {
+                _evaluatePrimaryKeys.Invoke(null, ["catalog_test", "channel", tables, actual]);
+                return null;
+            }
+            catch (TargetInvocationException wrapped)
+            {
+                return Assert.IsType<InvalidOperationException>(wrapped.InnerException);
+            }
+        }
+
+        /// <summary>Runs the pure sequence decision over one fabricated sys.sequences row; null means "accepted".</summary>
+        public InvalidOperationException? EvaluateSequenceRow(string type, long increment, bool cycles, long maximum)
+        {
+            try
+            {
+                _evaluateSequence.Invoke(null, ["catalog_test", "channel", "ack_seq", type, increment, cycles, maximum]);
+                return null;
+            }
+            catch (TargetInvocationException wrapped)
+            {
+                return Assert.IsType<InvalidOperationException>(wrapped.InnerException);
+            }
         }
 
         public string RenderType(string typeName, short maxLength, byte scale)

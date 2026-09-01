@@ -515,6 +515,24 @@ public sealed class SqlServerOptionsTests
     }
 
     [Fact]
+    public void ChannelPrunes_AreBounded_SoTheyCannotEscalateToATableLock()
+    {
+        // Regression: the three table-wide prunes ran unbounded, inline on the publish and probe
+        // paths. A backlog past SQL Server's ~5,000-lock escalation threshold took a table lock
+        // that stalled concurrent delivery claims — long enough for a live waiter's claim to lose
+        // to the recovery claim. Every durable-flow store bounds its prune batch; so does the channel.
+        // Reflected rather than called: the helper is the fix, so an older build has no bounded
+        // statement to hand back and this fact fails there instead of failing to compile.
+        var pruneSql = typeof(AsyncResponse.Channels.SqlServer.SqlServerChannelSql)
+            .GetMethod("ExpiredPruneSql", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static);
+        Assert.NotNull(pruneSql);
+        var sql = (string)pruneSql!.Invoke(null, ["[dbo].[ar_messages]"])!;
+
+        Assert.StartsWith("DELETE TOP (1000) FROM [dbo].[ar_messages]", sql, StringComparison.Ordinal);
+        Assert.Contains("expires_at <= SYSUTCDATETIME()", sql, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void CorrelationExtractor_ReadsConfiguredJsonPath()
     {
         var options = TransportOptions();

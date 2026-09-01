@@ -96,7 +96,7 @@ options (on the durable channels — Redis, NATS, PostgreSQL, SQL Server, MongoD
 | Option | Default | Effect |
 |---|---|---|
 | `IncludeRemoteStackTrace` | `true` | When `false`, the remote stack trace is omitted from the wire entirely. |
-| `MaxRemoteStackTraceLength` | `16384` | Length cap (chars) applied to the stack trace on **both** publish and receive, so an oversized or hostile trace can't bloat your payloads or logs. |
+| `MaxRemoteStackTraceLength` | `16384` | Length cap (chars) applied to the stack trace on **both** publish and receive, so an oversized or hostile trace can't bloat your payloads or logs. `0` disables the cap; a negative value is rejected at startup by every channel, the in-memory one included. |
 
 ```csharp
 .WithRedisChannel(options =>

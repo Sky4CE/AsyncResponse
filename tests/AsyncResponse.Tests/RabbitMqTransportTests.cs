@@ -403,10 +403,10 @@ public class RabbitMqTransportTests
         await transport.PublishAsync(WorkerJob("c2", 2));
 
         Assert.Equal(2, factory.Connection.CreateChannelCalls);
-        // The dead channel is dereferenced, NOT disposed: a concurrent publisher that took the
-        // lock-free fast path may still hold it, and disposing under that publisher turns its
-        // retryable AlreadyClosedException into a use-after-dispose. The closed channel holds no
-        // broker resources; the client reclaims it when the owning connection is disposed.
+        // The dead channel is dereferenced, not disposed INLINE: a concurrent publisher that took
+        // the lock-free fast path may still hold it, and disposing under that publisher turns its
+        // retryable AlreadyClosedException into a use-after-dispose. It is disposed later, off the
+        // publish path (see WorkerTransport_DisposesAProtocolReplacedChannel_OffThePublishPath).
         Assert.Equal(0, first.DisposeCalls);
         Assert.Single(first.Published);
         Assert.Single(second.Published);
@@ -1264,6 +1264,89 @@ public class RabbitMqTransportTests
         };
     }
 
+    [Fact]
+    public async Task WorkerTransport_DisposesAProtocolReplacedChannel_OffThePublishPath()
+    {
+        // Regression: the replaced channel was only dereferenced, on the premise that the client
+        // reclaims it when the owning connection is disposed — but that connection lives as long
+        // as the process, so every protocol-error replacement accumulated one more channel the
+        // autorecovering connection kept on its books. It is now disposed best-effort, later.
+        var first = new FakeRabbitMqChannel();
+        var second = new FakeRabbitMqChannel();
+        var factory = new FakeConnectionFactory(first, second);
+        var transport = new RabbitMqWorkerTransport(
+            Options.Create(new RabbitMqAsyncResponseOptions()),
+            factory,
+            discardedChannelDisposeDelay: TimeSpan.FromMilliseconds(10));
+
+        await transport.PublishAsync(WorkerJob("c1", 1));
+        first.IsOpen = false;
+        await transport.PublishAsync(WorkerJob("c2", 2));
+
+        var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(5);
+        while (first.DisposeCalls == 0 && DateTime.UtcNow < deadline)
+            await Task.Delay(10);
+
+        Assert.Equal(1, first.DisposeCalls);
+        Assert.Equal(0, second.DisposeCalls);
+    }
+
+    [Fact]
+    public async Task Subscriber_ClosesChannelAndConnection_WithAFreshBudgetAfterTheDrain()
+    {
+        // Regression: the ShutdownTimeout source was armed BEFORE the background drain, which can
+        // run up to BackgroundDrainTimeout — longer than the 5 s ShutdownTimeout. By the time the
+        // closes ran the token was already cancelled: channel.CloseAsync threw, the connection
+        // close never ran, and both fell through to the unbounded await-using unwind on every
+        // early-ACK shutdown. The closes now get their own budget (ASB/SQS parity).
+        var channel = new FakeRabbitMqChannel();
+        var factory = new FakeConnectionFactory(channel);
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var ingress = new Mock<IAsyncResponseIngress>();
+        ingress
+            .Setup(i => i.HandleWorkerMessageAsync(It.IsAny<string>()))
+            .Returns(async () =>
+            {
+                entered.TrySetResult();
+                await release.Task.ConfigureAwait(false);
+            });
+        var options = new RabbitMqAsyncResponseOptions
+        {
+            WorkerExchange = "worker.ex",
+            WorkerQueue = "worker.q",
+            WorkerRoutingKey = "worker.rk",
+            ShutdownTimeout = TimeSpan.FromMilliseconds(100)
+        };
+        options.WorkerSubscriber.UseAckAfterEnqueue(1, 8, TimeSpan.FromSeconds(5));
+        var subscriber = new RabbitMqWorkerSubscriber(
+            Options.Create(options),
+            ingress.Object,
+            NullLogger<RabbitMqWorkerSubscriber>.Instance,
+            factory);
+
+        await subscriber.StartAsync(CancellationToken.None);
+        await channel.WaitForConsumerAsync();
+        await channel.DeliverAsync(Delivery("m1", deliveryTag: 1)); // ACKed at enqueue; the handler blocks
+        await entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        var stopping = subscriber.StopAsync(CancellationToken.None);
+        var guard = DateTime.UtcNow + TimeSpan.FromSeconds(10);
+        while (channel.Cancels.Count == 0)
+        {
+            Assert.True(DateTime.UtcNow < guard, "the graceful stop never canceled the consumer");
+            await Task.Delay(TimeSpan.FromMilliseconds(5));
+        }
+
+        // Hold the drain well past ShutdownTimeout — the window in which the pre-armed budget lapsed.
+        await Task.Delay(TimeSpan.FromMilliseconds(400));
+        release.TrySetResult();
+        await stopping.WaitAsync(TimeSpan.FromSeconds(10));
+
+        Assert.Equal(1, channel.CloseCalls);
+        Assert.Equal(1, factory.Connection.CloseCalls);
+    }
+
     private sealed class HostedServiceRun : IAsyncDisposable
     {
         private readonly IHostedService _service;
@@ -1321,6 +1404,8 @@ public class RabbitMqTransportTests
 
         public Task CloseAsync(TimeSpan timeout, CancellationToken cancellationToken = default)
         {
+            // Mirrors the real client: a close handed an already-cancelled token never runs.
+            cancellationToken.ThrowIfCancellationRequested();
             CloseCalls++;
             if (ThrowOnClose is not null)
                 throw ThrowOnClose;
@@ -1431,6 +1516,8 @@ public class RabbitMqTransportTests
 
         public Task CloseAsync(CancellationToken cancellationToken = default)
         {
+            // Mirrors the real client: a close handed an already-cancelled token never runs.
+            cancellationToken.ThrowIfCancellationRequested();
             CloseCalls++;
             if (ThrowOnClose is not null)
                 throw ThrowOnClose;

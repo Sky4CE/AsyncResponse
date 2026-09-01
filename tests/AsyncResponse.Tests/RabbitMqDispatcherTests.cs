@@ -565,10 +565,14 @@ public class RabbitMqDispatcherTests
     }
 
     [Fact]
-    public async Task Awaiting_CapAboveTwo_UsesTheOperatorsFullCap_OnceXDeathMakesAttemptsCountable()
+    public async Task Awaiting_CapAboveTwo_RidesTheDeadLetterCycle_OnceXDeathIsPresent()
     {
-        // The counterpart: with a dead-letter cycle configured the broker DOES count attempts, so
-        // the operator's cap applies in full and attempt 2 of 5 still requeues.
+        // The counterpart: with a dead-letter cycle configured the broker counts attempts — but
+        // ONLY dead-letter hops. Attempt 2 of 5 used to plain-requeue here, and a plain requeue
+        // never advances x-death (and `redelivered` is already set), so the message resolved to
+        // attempt 2 forever: an unbounded requeue loop at broker rate that never re-entered the
+        // DLX. Once x-death is present every retry below the cap must reject WITHOUT requeue so
+        // the dead-letter cycle is what counts it up to the operator's cap.
         var properties = new BasicProperties
         {
             Headers = new Dictionary<string, object?>
@@ -590,7 +594,9 @@ public class RabbitMqDispatcherTests
 
         await dispatcher.HandleAsync(Delivery("payload", properties, deliveryTag: 1), channel, CancellationToken.None);
 
-        Assert.True(Assert.Single(channel.Nacks).Requeue);
+        Assert.False(
+            Assert.Single(channel.Nacks).Requeue,
+            "once x-death is present a plain requeue can never advance the attempt; the retry must ride the dead-letter cycle");
     }
 
     [Fact]
@@ -1122,6 +1128,29 @@ public class RabbitMqDispatcherTests
         TimeSpan? drain = null)
         => new RabbitMqSubscriberOptions()
             .UseAckAfterEnqueue(workers, capacity, drain ?? TimeSpan.FromSeconds(5));
+
+    [Fact]
+    public async Task QueuedDispose_SurvivesAWorkerFaultingOutsideItsHandlerGuard()
+    {
+        // Regression: the drain join caught only TimeoutException (the shared DB base and NATS
+        // also carry a general arm). A worker faulting outside its handler guard — here the log
+        // sink throwing from the "handler failed" entry inside the catch arm — rethrew from
+        // Task.WhenAll, escaped DisposeAsync into the subscriber's `await using` and leaked the
+        // drain token source.
+        var logger = new ErrorThrowingLogger();
+        var dispatcher = RabbitMqMessageDispatcher.Create(
+            (_, _) => throw new InvalidOperationException("handler boom"),
+            new RabbitMqAsyncResponseOptions(),
+            new RabbitMqSubscriberOptions().UseAckAfterEnqueue(1, 8, TimeSpan.FromSeconds(5)),
+            logger,
+            "worker.q",
+            RabbitMqSubscriberRole.Worker);
+
+        await dispatcher.HandleAsync(Delivery("payload", deliveryTag: 1), new FakeDispatcherChannel(), CancellationToken.None);
+        await logger.ErrorThrown.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        await dispatcher.DisposeAsync();
+    }
 
     private static RabbitMqDelivery Delivery(
         string body,

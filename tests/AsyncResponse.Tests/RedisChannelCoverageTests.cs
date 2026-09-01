@@ -5,6 +5,7 @@ using Microsoft.Extensions.Options;
 using Moq;
 using StackExchange.Redis;
 using System.Net;
+using System.Reflection;
 using Xunit;
 
 namespace AsyncResponse.Tests;
@@ -305,18 +306,52 @@ public sealed class RedisChannelCoverageTests
             _ => channel.SetException(new InvalidOperationException("boom"), correlationId)
         };
 
-    private RedisAsyncResponseChannel CreateChannel() => new(
-        _services.GetRequiredService<IServiceScopeFactory>(),
-        _multiplexer.Object,
-        _store.Object,
-        Options.Create(new RedisAsyncResponseOptions
+    [Theory]
+    [InlineData(PublishKind.Response)]
+    [InlineData(PublishKind.RawJson)]
+    [InlineData(PublishKind.Exception)]
+    public async Task RecoveryPublish_BoundsTheExecutorRetirementByDisposalDrainTimeout(PublishKind kind)
+    {
+        // Regression: after routing a response with no live subscriber through recovery, the
+        // publish awaited the correlation id's serial-executor retirement — bounded only by the
+        // registry's own 30 s + 30 s defaults. A retirement still draining a work item wedged in a
+        // user Until predicate therefore stalled the ingress consumer thread per late/duplicate
+        // response for up to a minute, with no configured budget applying.
+        _liveSubscribers = 0;
+        _subscriber
+            .Setup(instance => instance.PublishAsync(It.IsAny<RedisChannel>(), It.IsAny<RedisValue>(), It.IsAny<CommandFlags>()))
+            .ReturnsAsync(0L);
+        var channel = CreateChannel(disposalDrainTimeout: TimeSpan.FromMilliseconds(200));
+
+        // Wedge the correlation id's executor with a work item that never completes.
+        var executors = (SerialExecutorRegistry)typeof(RedisAsyncResponseChannel)
+            .GetField("_executors", BindingFlags.Instance | BindingFlags.NonPublic)!
+            .GetValue(channel)!;
+        var channelName = new RedisKeySchema(new RedisAsyncResponseOptions().KeyPrefix).Channel("corr-wedged").ToString()!;
+        Assert.True(await executors.EnqueueAsync(channelName, () => new TaskCompletionSource().Task));
+
+        await PublishAsync(channel, kind, "corr-wedged").WaitAsync(TimeSpan.FromSeconds(5));
+    }
+
+    private RedisAsyncResponseChannel CreateChannel(TimeSpan? disposalDrainTimeout = null)
+    {
+        var options = new RedisAsyncResponseOptions
         {
             DefaultTimeout = TimeSpan.FromSeconds(5),
             RecoveryStateExpiry = TimeSpan.FromMinutes(5)
-        }),
-        new AsyncResponseContextPropagation([]),
-        NullLogger<RedisAsyncResponseChannel>.Instance,
-        new NoopChannelSubscriber());
+        };
+        if (disposalDrainTimeout is { } drain)
+            options.DisposalDrainTimeout = drain;
+
+        return new RedisAsyncResponseChannel(
+            _services.GetRequiredService<IServiceScopeFactory>(),
+            _multiplexer.Object,
+            _store.Object,
+            Options.Create(options),
+            new AsyncResponseContextPropagation([]),
+            NullLogger<RedisAsyncResponseChannel>.Instance,
+            new NoopChannelSubscriber());
+    }
 
     /// <summary>
     /// The channel's async subscribe seam. ChannelMessageQueue is sealed, so the real subscriber

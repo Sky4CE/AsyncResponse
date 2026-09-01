@@ -157,8 +157,14 @@ internal abstract class RabbitMqSubscriberService : BackgroundService
         // idempotent, so the `await using` unwind after the closes is a no-op.
         await dispatcher.DisposeAsync().ConfigureAwait(false);
 
-        await channel.CloseAsync(shutdown.Token).ConfigureAwait(false);
-        await connection.CloseAsync(Options.ShutdownTimeout, shutdown.Token).ConfigureAwait(false);
+        // A fresh budget for the closes (ASB/SQS parity: arm the source right before the call it
+        // bounds). The drain above can run up to BackgroundDrainTimeout, longer than the 5 s
+        // ShutdownTimeout, so the token armed for BasicCancel was already cancelled by the time
+        // it reached CloseAsync — which threw, skipped the connection close, and left both to
+        // the unbounded await-using unwind on every early-ACK shutdown.
+        using var closeBudget = new CancellationTokenSource(Options.ShutdownTimeout);
+        await channel.CloseAsync(closeBudget.Token).ConfigureAwait(false);
+        await connection.CloseAsync(Options.ShutdownTimeout, closeBudget.Token).ConfigureAwait(false);
     }
 }
 

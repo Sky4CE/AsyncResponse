@@ -127,24 +127,31 @@ public sealed class SubscriberSupervisorTests
     }
 
     [Fact]
-    public async Task RunAsync_Propagates_WhenANonCancellationExceptionRacesShutdown()
+    public async Task RunAsync_ExitsQuietly_WhenANonCancellationExceptionRacesShutdown()
     {
         // The while-loop condition passes (the token is not cancelled yet), then run() cancels it
-        // as a side effect and throws something other than OperationCanceledException. Neither
-        // catch clause matches: the OperationCanceledException clause requires that exception type,
-        // and `when (!stoppingToken.IsCancellationRequested)` is now false — so the failure
-        // propagates instead of being retried or swallowed.
+        // as a side effect and throws something other than OperationCanceledException — the
+        // ObjectDisposed/connection-closed shape every broker client raises when the stop tears
+        // its connection down mid-consume. That used to match NEITHER catch clause (one required
+        // the cancellation type, the other's filter required "not shutting down") and escaped
+        // ExecuteAsync, faulting the BackgroundService on every clean redeploy. Shutdown exits
+        // quietly whatever the exception type: no throw, no retry, no retry log.
         using var cts = new CancellationTokenSource();
+        var delayCalls = 0;
+        var logCalls = 0;
 
-        await Assert.ThrowsAsync<InvalidOperationException>(() => RunAsync(
+        await RunAsync(
             _ =>
             {
                 cts.Cancel();
                 throw new InvalidOperationException("boom");
             },
             cts.Token,
-            _ => TimeSpan.Zero,
-            (_, _) => { }));
+            _ => { delayCalls++; return TimeSpan.Zero; },
+            (_, _) => logCalls++);
+
+        Assert.Equal(0, delayCalls);
+        Assert.Equal(0, logCalls);
     }
 
     [Fact]

@@ -541,7 +541,7 @@ internal sealed class InMemoryWorkerHost(
 
             try
             {
-                await ExecuteWithRedeliveryAsync(queued).ConfigureAwait(false);
+                await ExecuteWithRedeliveryAsync(queued, stoppingToken).ConfigureAwait(false);
             }
             catch (Exception ex)
             {
@@ -567,9 +567,10 @@ internal sealed class InMemoryWorkerHost(
     /// and contention recovery, so dropping a job on its first failure (the old behavior) could
     /// strand a flow that a broker-backed transport would have recovered. Retries deliberately
     /// run during the shutdown drain too: accepted jobs were promised in-process execution, and
-    /// the retry budget is bounded when attempts are.
+    /// the retry budget is bounded when attempts are. The backoff SLEEP is not: a stop request
+    /// during it drops the failing job (loudly) so the jobs queued behind it still drain.
     /// </summary>
-    private async Task ExecuteWithRedeliveryAsync(InMemoryWorkerTransport.QueuedJob queued)
+    private async Task ExecuteWithRedeliveryAsync(InMemoryWorkerTransport.QueuedJob queued, CancellationToken stoppingToken)
     {
         var options = _transport.Options;
         for (var attempt = 1; ; attempt++)
@@ -597,7 +598,21 @@ internal sealed class InMemoryWorkerHost(
                 _logger.LogWarning(ex,
                     "In-memory worker job {Target}.{Method} failed on attempt {Attempt}; retrying in {Delay}.",
                     queued.Job.Call.ServiceInterfaceFullName, queued.Job.Call.MethodName, attempt, delay);
-                await Task.Delay(delay, _timeProvider ?? TimeProvider.System).ConfigureAwait(false);
+                try
+                {
+                    await Task.Delay(delay, _timeProvider ?? TimeProvider.System, stoppingToken).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+                {
+                    // Without the token this sleep parked the (single, by default) worker for up to
+                    // RetryMaxDelay per attempt through the whole shutdown drain, and every job
+                    // queued behind the failing one was lost when the bounded stop returned.
+                    _logger.LogError(ex,
+                        "In-memory worker job {Target}.{Method} failed on attempt {Attempt} and host shutdown interrupted its retry backoff; dropping it so the jobs queued behind it can drain. A durable flow waiting on this job must be recovered or resumed explicitly.",
+                        queued.Job.Call.ServiceInterfaceFullName, queued.Job.Call.MethodName, attempt);
+                    AsyncResponseDiagnostics.RecordWorkerOutcome("dropped");
+                    return;
+                }
             }
         }
     }

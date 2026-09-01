@@ -563,6 +563,14 @@ internal sealed class QueuedRedisMessageDispatcher : RedisMessageDispatcher
                 TaskContinuationOptions.ExecuteSynchronously,
                 TaskScheduler.Default);
         }
+        catch (Exception ex)
+        {
+            // A worker faulted outside its own handler guard (DB/NATS dispatcher parity). WhenAll
+            // only completes once every worker has finished, so the source is safe to dispose here
+            // — and the fault must not escape DisposeAsync and mask the real shutdown path.
+            Logger.LogDebug(ex, "Redis ACK-after-enqueue dispatcher drain for {Stream} ended with an error.", _stream);
+            _drainCancellation.Dispose();
+        }
     }
 
     private async Task RunWorkerAsync(int workerIndex)

@@ -656,6 +656,30 @@ public sealed class AzureServiceBusDispatcherTests
         Assert.Equal(0, calls.DeadLetter);
     }
 
+    [Fact]
+    public async Task QueuedDispose_SurvivesAWorkerFaultingOutsideItsHandlerGuard()
+    {
+        // Regression: the drain join caught only TimeoutException (the shared DB base and NATS
+        // also carry a general arm). A worker faulting outside its handler guard — here the log
+        // sink throwing from the "handler failed" entry inside the catch arm — rethrew from
+        // Task.WhenAll, escaped DisposeAsync into the subscriber's `await using` and leaked the
+        // drain token source.
+        var logger = new ErrorThrowingLogger();
+        var calls = new SettlementCalls();
+        var dispatcher = AzureServiceBusMessageDispatcher.Create(
+            (_, _) => throw new InvalidOperationException("handler boom"),
+            new AzureServiceBusAsyncResponseOptions(),
+            new AzureServiceBusSubscriberOptions().UseAckAfterEnqueue(1, 8),
+            logger,
+            "workers",
+            AzureServiceBusSubscriberRole.Worker);
+
+        await dispatcher.HandleAsync(Delivery(calls), CancellationToken.None);
+        await logger.ErrorThrown.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        await dispatcher.DisposeAsync();
+    }
+
     private static AzureServiceBusTransportDelivery Delivery(
         SettlementCalls calls,
         string queue = "workers",

@@ -194,7 +194,16 @@ internal sealed class MongoDbChannelStore : IDisposable
         {
             // IndexOptionsConflict/IndexKeySpecsConflict: an earlier deployment created the
             // same-named index with different options. Replace it in place.
-            await collection.Indexes.DropOneAsync(indexName, cancellationToken).ConfigureAwait(false);
+            try
+            {
+                await collection.Indexes.DropOneAsync(indexName, cancellationToken).ConfigureAwait(false);
+            }
+            catch (MongoCommandException dropException) when (dropException.Code == 27)
+            {
+                // IndexNotFound: a peer host in the same rolling deploy took the same branch and
+                // dropped it first. Converge on the recreate below (idempotent for an identical spec).
+            }
+
             await collection.Indexes.CreateOneAsync(model, cancellationToken: cancellationToken).ConfigureAwait(false);
         }
     }

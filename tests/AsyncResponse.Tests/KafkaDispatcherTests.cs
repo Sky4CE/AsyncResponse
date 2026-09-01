@@ -1066,6 +1066,96 @@ public class KafkaDispatcherTests
         return options;
     }
 
+    [Fact]
+    public async Task DiscardUnprocessable_BoundsTheDeadLetterProduceToAFractionOfThePollInterval()
+    {
+        // Regression: both burial paths block the poll thread on the dead-letter produce, and a
+        // produce to an undeliverable topic waits out librdkafka's message.timeout.ms (5 min by
+        // default) PER attempt — past max.poll.interval.ms, evicting the consumer mid-burial and
+        // rebalancing the partition to a peer that hit the same message: a rebalance storm. The
+        // ladder is now bounded to a quarter of the poll interval and the caller keeps treating a
+        // failed burial as "offset left unstored, retried later".
+        var producer = new HangingKafkaProducerClient();
+        await using var dispatcher = KafkaMessageDispatcher.Create(
+            (_, _) => Task.CompletedTask,
+            new FakeKafkaConsumerClient(),
+            producer,
+            KafkaTestData.NewOptions(),
+            new KafkaSubscriberOptions
+            {
+                MaxDeliveryAttempts = 0,
+                PollTimeout = TimeSpan.FromMilliseconds(10),
+                MaxPollInterval = TimeSpan.FromMilliseconds(400)
+            },
+            NullLogger.Instance,
+            Topic,
+            Group,
+            KafkaSubscriberRole.Worker);
+
+        await dispatcher.DiscardUnprocessableAsync(
+            KafkaTestData.Message(Topic, offset: 4, payload: ""),
+            new InvalidDataException("no payload"),
+            CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.True(producer.SawCancellation);
+    }
+
+    [Fact]
+    public async Task QueuedDispose_SurvivesAWorkerFaultingOutsideItsHandlerGuard()
+    {
+        // Regression: the drain join caught only TimeoutException (the shared DB base and NATS
+        // also carry a general arm). A worker faulting outside its handler guard — here the log
+        // sink throwing from the "handler failed" entry inside the catch arm — rethrew from
+        // Task.WhenAll, escaped DisposeAsync into the subscriber's `await using` (masking the real
+        // shutdown path) and leaked the drain token source.
+        var logger = new ErrorThrowingLogger();
+        var dispatcher = KafkaMessageDispatcher.Create(
+            (_, _) => throw new InvalidOperationException("handler boom"),
+            new FakeKafkaConsumerClient(),
+            new FakeKafkaProducerClient(),
+            KafkaTestData.NewOptions(),
+            new KafkaSubscriberOptions().UseAckAfterEnqueue(1, 8, TimeSpan.FromSeconds(5)),
+            logger,
+            Topic,
+            Group,
+            KafkaSubscriberRole.Worker);
+
+        await dispatcher.HandleAsync(KafkaTestData.Delivery(Topic, offset: 7), CancellationToken.None);
+        await logger.ErrorThrown.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        await dispatcher.DisposeAsync();
+    }
+
+    /// <summary>A producer whose publish never completes until its token is cancelled.</summary>
+    private sealed class HangingKafkaProducerClient : IKafkaProducerClient
+    {
+        public bool SawCancellation { get; private set; }
+
+        public async Task<KafkaPublishResult> PublishAsync(
+            string topic,
+            string? key,
+            byte[] payload,
+            IReadOnlyList<KafkaTransportHeader> headers,
+            CancellationToken cancellationToken)
+        {
+            try
+            {
+                await Task.Delay(Timeout.Infinite, cancellationToken);
+            }
+            catch (OperationCanceledException)
+            {
+                SawCancellation = true;
+                throw;
+            }
+
+            throw new InvalidOperationException("unreachable");
+        }
+
+        public void Dispose()
+        {
+        }
+    }
+
     private static KafkaMessageDispatcher CreateDispatcher(
         Func<KafkaDelivery, CancellationToken, Task> handler,
         KafkaSubscriberOptions subscriberOptions,

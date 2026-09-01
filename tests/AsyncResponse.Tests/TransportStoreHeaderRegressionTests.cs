@@ -180,7 +180,7 @@ public sealed class TransportStoreHeaderRegressionTests
             Attempts = 1
         };
 
-        var collection = new Mock<IMongoCollection<MongoTransportMessageDocument>>(MockBehavior.Loose);
+        var collection = new Mock<IMongoCollection<MongoTransportMessageDocument>>(MockBehavior.Loose).SelfPinning();
         collection
             .Setup(c => c.FindOneAndUpdateAsync(
                 It.IsAny<FilterDefinition<MongoTransportMessageDocument>>(),

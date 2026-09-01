@@ -429,6 +429,14 @@ internal sealed class QueuedAzureServiceBusMessageDispatcher : AzureServiceBusMe
                 TaskContinuationOptions.ExecuteSynchronously,
                 TaskScheduler.Default);
         }
+        catch (Exception ex)
+        {
+            // A worker faulted outside its own handler guard (DB/NATS dispatcher parity). WhenAll
+            // only completes once every worker has finished, so the source is safe to dispose here
+            // — and the fault must not escape DisposeAsync and mask the real shutdown path.
+            Logger.LogDebug(ex, "Azure Service Bus ACK-after-enqueue dispatcher drain for {Queue} ended with an error.", _queueName);
+            _drainCancellation.Dispose();
+        }
     }
 
     private async Task RunWorkerAsync(int workerIndex)

@@ -101,6 +101,37 @@ public class NatsResponseChannelClientTests
     }
 
     [Fact]
+    public async Task RawRequester_PinsThrowIfNoResponders_SoTheLostSubscriberSignalCannotBeInherited()
+    {
+        // Regression: the reply options carried only the timeout, so whether a no-responders 503
+        // THROWS followed the app-supplied connection's RequestReplyMode. Under Direct the sentinel
+        // arrives as an ordinary reply that the requester discards — the channel then reports a
+        // dead subject as answered (and alive to the liveness probe) and drops the response. The
+        // channel's entire lost-subscriber contract rests on the throw, so it is pinned per call.
+        var connection = new Mock<INatsConnection>();
+        NatsSubOpts? capturedReplyOptions = null;
+        connection
+            .Setup(c => c.RequestAsync<string?, string>(
+                "subject",
+                "payload",
+                It.IsAny<NatsHeaders?>(),
+                It.IsAny<INatsSerialize<string?>?>(),
+                It.IsAny<INatsDeserialize<string>?>(),
+                It.IsAny<NatsPubOpts?>(),
+                It.IsAny<NatsSubOpts?>(),
+                It.IsAny<CancellationToken>()))
+            .Callback<string, string?, NatsHeaders?, INatsSerialize<string?>?, INatsDeserialize<string>?, NatsPubOpts?, NatsSubOpts?, CancellationToken>(
+                (_, _, _, _, _, _, replyOptions, _) => capturedReplyOptions = replyOptions)
+            .ReturnsAsync(new NatsMsg<string>("reply", replyTo: null, 0, headers: null, data: "ack", connection: null));
+        var requester = new NatsRawRequester(connection.Object);
+
+        await requester.RequestAsync("subject", "payload", headers: null, TimeSpan.FromSeconds(1), CancellationToken.None);
+
+        Assert.NotNull(capturedReplyOptions);
+        Assert.True(capturedReplyOptions!.ThrowIfNoResponders);
+    }
+
+    [Fact]
     public async Task RawRequester_ForwardsSubscribePublishReplyAndFlush()
     {
         var connection = new Mock<INatsConnection>();

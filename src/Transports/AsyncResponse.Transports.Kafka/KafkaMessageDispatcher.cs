@@ -436,6 +436,15 @@ internal abstract class KafkaMessageDispatcher : IAsyncDisposable
         headers.Add(KafkaTransportHeader.Utf8("exceptionMessage", exception.Message));
         headers.Add(KafkaTransportHeader.Utf8("occurredAtUtc", DateTimeOffset.UtcNow.ToString("O")));
 
+        // Both burial callers block the poll thread on this, and a produce to an undeliverable
+        // dead-letter topic waits out librdkafka's message.timeout.ms (5 min by default) PER
+        // attempt — past max.poll.interval.ms, which evicted the consumer mid-burial and
+        // rebalanced the partition to a peer that hit the same message: a rebalance storm at
+        // zero throughput. Bound the whole ladder to a quarter of the poll interval; every caller
+        // already treats a failed burial as "offset left unstored, retried after restart/rebalance".
+        using var pollBudget = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        pollBudget.CancelAfter(TimeSpan.FromTicks(_subscriberOptions.MaxPollInterval.Ticks / 4));
+
         await KafkaTransportRetry.ExecuteAsync(
             token => _producer.PublishAsync(
                 _topics.DeadLetterTopicFor(sourceTopic),
@@ -446,7 +455,7 @@ internal abstract class KafkaMessageDispatcher : IAsyncDisposable
             TransportOptions.PublishMaxAttempts,
             TransportOptions.PublishRetryBaseDelay,
             TransportOptions.PublishRetryMaxDelay,
-            cancellationToken).ConfigureAwait(false);
+            pollBudget.Token).ConfigureAwait(false);
     }
 
     /// <summary>Runs the NotifyBackgroundFailureAsync operation.</summary>
@@ -697,6 +706,14 @@ internal sealed class QueuedKafkaMessageDispatcher : KafkaMessageDispatcher
                 CancellationToken.None,
                 TaskContinuationOptions.ExecuteSynchronously,
                 TaskScheduler.Default);
+        }
+        catch (Exception ex)
+        {
+            // A worker faulted outside its own handler guard (DB/NATS dispatcher parity). WhenAll
+            // only completes once every worker has finished, so the source is safe to dispose here
+            // — and the fault must not escape DisposeAsync and mask the real shutdown path.
+            Logger.LogDebug(ex, "Kafka ACK-after-enqueue dispatcher drain for {Topic} ended with an error.", _topic);
+            _drainCancellation.Dispose();
         }
     }
 

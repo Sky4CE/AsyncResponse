@@ -666,6 +666,29 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
     // Intentionally duplicated with SetRawResponseJsonCore: this publish method is a latency hot
     // path, and earlier shared helper/delegate refactors regressed throughput in benchmarks.
     // Keep the typed Redis path inline unless a benchmark run proves a refactor is free.
+    /// <summary>
+    /// Retires the correlation id's serial executor after a recovery-routed publish, bounded by
+    /// <c>DisposalDrainTimeout</c>. The registry's own removal joins the executor's retirement,
+    /// and that retirement can be draining a work item wedged in a user <c>Until</c> predicate —
+    /// so an unbounded join here stalled the ingress consumer thread per late/duplicate response
+    /// for the registry's 30 s + 30 s defaults, with no configured budget applying. The
+    /// retirement itself continues in the background once the wait lapses.
+    /// </summary>
+    private async ValueTask RetireExecutorBoundedAsync(string channel)
+    {
+        try
+        {
+            await _executors.RemoveAsync(channel).AsTask().WaitAsync(_options.DisposalDrainTimeout).ConfigureAwait(false);
+        }
+        catch (TimeoutException)
+        {
+            _logger.LogWarning(
+                "Retiring the serial executor for channel {Channel} did not complete within DisposalDrainTimeout ({DisposalDrainTimeout}); leaving it to finish in the background.",
+                channel,
+                _options.DisposalDrainTimeout);
+        }
+    }
+
     private async Task SetResponseCore<T>(T response, string correlationId, CancellationToken cancellationToken)
     {
         using var activity = AsyncResponseDiagnostics.StartActivity("asyncresponse.set_response", ActivityKind.Producer);
@@ -748,7 +771,7 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
                 AsyncResponseDiagnostics.RecordLostSubscriber("response", dispatchResult.Action, dispatchResult.CallbackInvoked, dispatchResult.RouteMixed);
                 activity?.SetTag("asyncresponse.recovery.callback_invoked", dispatchResult.CallbackInvoked);
 
-                await _executors.RemoveAsync(channel.ToString()!).ConfigureAwait(false);
+                await RetireExecutorBoundedAsync(channel.ToString()!).ConfigureAwait(false);
             }
             else
             {
@@ -840,7 +863,7 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
                 AsyncResponseDiagnostics.RecordLostSubscriber("response", dispatchResult.Action, dispatchResult.CallbackInvoked, dispatchResult.RouteMixed);
                 activity?.SetTag("asyncresponse.recovery.callback_invoked", dispatchResult.CallbackInvoked);
 
-                await _executors.RemoveAsync(channel.ToString()!).ConfigureAwait(false);
+                await RetireExecutorBoundedAsync(channel.ToString()!).ConfigureAwait(false);
             }
             else
             {
@@ -939,7 +962,7 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
                 activity?.SetTag("asyncresponse.recovery.callback_invoked", dispatchResult.CallbackInvoked);
                 AsyncResponseDiagnostics.RecordLostSubscriber("exception", action: RecoveryAction.Fail, dispatchResult.CallbackInvoked);
 
-                await _executors.RemoveAsync(channel.ToString()!).ConfigureAwait(false);
+                await RetireExecutorBoundedAsync(channel.ToString()!).ConfigureAwait(false);
             }
             else if (_logger.IsEnabled(LogLevel.Debug))
             {

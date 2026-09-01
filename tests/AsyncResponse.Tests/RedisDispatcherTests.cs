@@ -923,6 +923,31 @@ public class RedisDispatcherTests
             { new RedisSubscriberOptions { MaxDeliveryAttempts = -1 }, nameof(RedisSubscriberOptions.MaxDeliveryAttempts) }
         };
 
+    [Fact]
+    public async Task QueuedDispose_SurvivesAWorkerFaultingOutsideItsHandlerGuard()
+    {
+        // Regression: the drain join caught only TimeoutException (the shared DB base and NATS
+        // also carry a general arm). A worker faulting outside its handler guard — here the log
+        // sink throwing from the "handler failed" entry inside the catch arm — rethrew from
+        // Task.WhenAll, escaped DisposeAsync into the subscriber's `await using` and leaked the
+        // drain token source.
+        var logger = new ErrorThrowingLogger();
+        var dispatcher = RedisMessageDispatcher.Create(
+            (_, _) => throw new InvalidOperationException("handler boom"),
+            new RedisTransportTests.FakeRedisStreamDatabase(),
+            new RedisAsyncResponseTransportOptions(),
+            EnqueueSubscriber(),
+            logger,
+            "worker-stream",
+            "worker-group",
+            RedisSubscriberRole.Worker);
+
+        await dispatcher.HandleAsync(Delivery("1-0", attempt: 1), CancellationToken.None);
+        await logger.ErrorThrown.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        await dispatcher.DisposeAsync();
+    }
+
     private static RedisSubscriberOptions EnqueueSubscriber(
         int workers = 1,
         int capacity = 8,

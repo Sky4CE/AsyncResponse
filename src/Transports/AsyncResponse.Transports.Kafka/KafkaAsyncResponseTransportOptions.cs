@@ -164,7 +164,10 @@ public sealed class KafkaAsyncResponseTransportOptions
 
     /// <summary>
     /// Optional last-chance hook over the producer configuration (compression, linger, batch size,
-    /// security settings, …) after the package applies its defaults.
+    /// security settings, …) after the package applies its defaults. The package sets
+    /// <c>Acks = All</c> and <c>EnableIdempotence = true</c> so a producer-side retry can neither
+    /// duplicate nor reorder a worker job; overriding either from this hook silently breaks that
+    /// guarantee — a retried publish then becomes a duplicate worker execution.
     /// </summary>
     public Action<ProducerConfig>? ConfigureProducer { get; set; }
 

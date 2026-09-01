@@ -19,6 +19,7 @@ public sealed class RabbitMqWorkerTransport : IWorkerTransport, IAsyncDisposable
 {
     private readonly RabbitMqAsyncResponseOptions _options;
     private readonly IRabbitMqConnectionFactory _connectionFactory;
+    private readonly TimeSpan _discardedChannelDisposeDelay;
     private readonly SemaphoreSlim _connectionGate = new(1, 1);
     private IRabbitMqConnection? _connection;
     private IRabbitMqChannel? _channel;
@@ -33,11 +34,15 @@ public sealed class RabbitMqWorkerTransport : IWorkerTransport, IAsyncDisposable
 
     internal RabbitMqWorkerTransport(
         IOptions<RabbitMqAsyncResponseOptions> options,
-        IRabbitMqConnectionFactory connectionFactory)
+        IRabbitMqConnectionFactory connectionFactory,
+        TimeSpan? discardedChannelDisposeDelay = null)
     {
         _options = options.Value;
         ValidatePublishOptions(_options);
         _connectionFactory = connectionFactory;
+        // Long enough for a publisher that took the lock-free fast path with the discarded
+        // channel to have failed its BasicPublish on it and moved on; tests shorten it.
+        _discardedChannelDisposeDelay = discardedChannelDisposeDelay ?? TimeSpan.FromSeconds(30);
     }
 
     private static void ValidatePublishOptions(RabbitMqAsyncResponseOptions options)
@@ -68,7 +73,12 @@ public sealed class RabbitMqWorkerTransport : IWorkerTransport, IAsyncDisposable
             // WITHOUT disposing: a concurrent publisher that took the lock-free fast path above may
             // still hold this object, and disposing it under that publisher turns its retryable
             // AlreadyClosedException into a use-after-dispose. A closed channel holds no broker
-            // resources; the client releases its state when the owning connection is disposed.
+            // resources — but the client only forgets it when it is disposed, and this connection
+            // lives as long as the process, so every protocol-error replacement accumulated one
+            // more recorded channel on it. Dispose the discarded one best-effort, later, off this
+            // path: by then any fast-path publisher holding it has long failed on it.
+            if (_channel is { } discarded)
+                _ = DisposeDiscardedChannelLaterAsync(discarded, _discardedChannelDisposeDelay);
             _channel = null;
 
             // The connection is replaced only when itself closed: with automatic recovery enabled the
@@ -104,6 +114,12 @@ public sealed class RabbitMqWorkerTransport : IWorkerTransport, IAsyncDisposable
         {
             _connectionGate.Release();
         }
+    }
+
+    private static async Task DisposeDiscardedChannelLaterAsync(IRabbitMqChannel discarded, TimeSpan delay)
+    {
+        await Task.Delay(delay).ConfigureAwait(false);
+        await DisposeQuietlyAsync(discarded).ConfigureAwait(false);
     }
 
     private static async ValueTask DisposeQuietlyAsync(IAsyncDisposable resource)

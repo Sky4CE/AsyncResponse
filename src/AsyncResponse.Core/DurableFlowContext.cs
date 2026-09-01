@@ -112,7 +112,11 @@ internal sealed class DurableFlowContext : IDurableFlowContext
         await NotifyStepAsync(static (o, e) => o.OnStepStartingAsync(e), name, DurableFlowStepKind.Local).ConfigureAwait(false);
         await step().ConfigureAwait(false);
         _lease.ThrowIfLost();
-        await CompleteStepAsync(name, checkpoint, resultJson: null, cancellationToken).ConfigureAwait(false);
+        // Deliberately NOT the caller's token (awaited-step parity): the step's side effect has
+        // already happened, so the checkpoint is its only record. A cancellation here lost the
+        // checkpoint — the redelivered execution re-ran the side effect — and the store's
+        // OperationCanceledException tripped MarkLost on a lease whose row was intact.
+        await CompleteStepAsync(name, checkpoint, resultJson: null, CancellationToken.None).ConfigureAwait(false);
     }
 
     /// <inheritdoc />
@@ -130,7 +134,8 @@ internal sealed class DurableFlowContext : IDurableFlowContext
         await NotifyStepAsync(static (o, e) => o.OnStepStartingAsync(e), name, DurableFlowStepKind.Local).ConfigureAwait(false);
         var result = await step().ConfigureAwait(false);
         _lease.ThrowIfLost();
-        await CompleteStepAsync(name, checkpoint, AsyncResponseJson.Serialize(result), cancellationToken).ConfigureAwait(false);
+        // Not the caller's token: see the untyped overload above.
+        await CompleteStepAsync(name, checkpoint, AsyncResponseJson.Serialize(result), CancellationToken.None).ConfigureAwait(false);
         return result;
     }
 
@@ -591,13 +596,15 @@ internal sealed class DurableFlowContext : IDurableFlowContext
 
         switch (child.Status)
         {
+            // A terminal child snapshot is a settled outcome: memoize it uninterruptibly (local
+            // and awaited-step parity) so a cancellation here cannot trip MarkLost on a healthy lease.
             case FlowRunStatus.Succeeded:
-                await CompleteStepAsync(name, checkpoint, FlowStateJson.SerializeSnapshot(child), cancellationToken, kind: DurableFlowStepKind.ChildFlow).ConfigureAwait(false);
+                await CompleteStepAsync(name, checkpoint, FlowStateJson.SerializeSnapshot(child), CancellationToken.None, kind: DurableFlowStepKind.ChildFlow).ConfigureAwait(false);
                 return child;
 
             case FlowRunStatus.Failed:
                 checkpoint.Message = child.LastMessage;
-                await CompleteStepAsync(name, checkpoint, FlowStateJson.SerializeSnapshot(child), cancellationToken, faulted: true, kind: DurableFlowStepKind.ChildFlow).ConfigureAwait(false);
+                await CompleteStepAsync(name, checkpoint, FlowStateJson.SerializeSnapshot(child), CancellationToken.None, faulted: true, kind: DurableFlowStepKind.ChildFlow).ConfigureAwait(false);
                 ThrowIfChildFailed(child, failOnChildFailure);
                 return child;
 

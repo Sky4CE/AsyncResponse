@@ -41,7 +41,7 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
     {
         _recoveryStateStore = recoveryStateStore;
         _options = options.Value;
-        _options.ValidateShared(nameof(InMemoryAsyncResponseOptions));
+        _options.Validate();
         _propagation = propagation;
         _timeProvider = timeProvider ?? TimeProvider.System;
         _logger = logger;
@@ -1027,6 +1027,15 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
         /// </summary>
         public async ValueTask AbandonAsync()
         {
+            // Latch the cleanup as already done: the flag alone only skipped the drain, and the
+            // zombie's own later disposal (a flow's waiter.DisposeAsync after the cancelled wait,
+            // or a caller's `await using`) still ran StartCleanupAsync — which deleted the very
+            // recovery registration this method exists to leave behind.
+            lock (_cleanupSync)
+            {
+                _cleanupTask ??= Task.CompletedTask;
+            }
+
             Interlocked.Exchange(ref _cleanupStarted, 1);
             _ = TryBeginTerminal();
 

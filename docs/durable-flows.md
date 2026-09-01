@@ -109,7 +109,9 @@ process, and `.WithDurableFlows<TStore>()` only when those packages do not match
 2. **Steps are idempotent** (or harmless to repeat). Everything is at-least-once: a crash
    between a step completing and its checkpoint persisting re-executes that step on resume.
    Key remote side effects on the correlation id (`AwaitStepAsync` hands it to your trigger)
-   or on `flow.FlowId`.
+   or on `flow.FlowId`. A `CancellationToken` passed to a step cancels it *before* its body
+   runs, never its checkpoint afterwards: once a step's side effect has happened, the completion
+   checkpoint is written uninterruptibly, so a token firing mid-save cannot cost a re-execution.
 3. **The flow class resolves from DI by its persisted type name** — register the class itself
    and treat its name like a recovery-callback name: rename only with a forwarding type.
 

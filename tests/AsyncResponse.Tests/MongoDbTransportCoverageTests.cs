@@ -18,7 +18,7 @@ public sealed class MongoDbTransportCoverageTests
     public async Task WorkerTransport_PublishesCorrelatedAndUncorrelatedJobs_AndReportsFailures()
     {
         var upserts = new List<(UpdateDefinition<MongoTransportMessageDocument> Update, UpdateOptions Options)>();
-        var collection = new Mock<IMongoCollection<MongoTransportMessageDocument>>(MockBehavior.Loose);
+        var collection = new Mock<IMongoCollection<MongoTransportMessageDocument>>(MockBehavior.Loose).SelfPinning();
         collection
             .Setup(c => c.UpdateOneAsync(
                 It.IsAny<FilterDefinition<MongoTransportMessageDocument>>(),
@@ -78,7 +78,7 @@ public sealed class MongoDbTransportCoverageTests
     public async Task Publish_PrunesDeadLettersWithAServerClockCutoff()
     {
         FilterDefinition<MongoTransportMessageDocument>? pruneFilter = null;
-        var collection = new Mock<IMongoCollection<MongoTransportMessageDocument>>(MockBehavior.Loose);
+        var collection = new Mock<IMongoCollection<MongoTransportMessageDocument>>(MockBehavior.Loose).SelfPinning();
         collection
             .Setup(c => c.DeleteManyAsync(
                 It.IsAny<FilterDefinition<MongoTransportMessageDocument>>(),
@@ -111,7 +111,7 @@ public sealed class MongoDbTransportCoverageTests
     public void WorkerTransport_PublicConstructor_UsesTheProvidedDatabase()
     {
         var options = Options.Create(new MongoDbAsyncResponseTransportOptions { AutoCreateIndexes = false });
-        var collection = new Mock<IMongoCollection<MongoTransportMessageDocument>>();
+        var collection = new Mock<IMongoCollection<MongoTransportMessageDocument>>().SelfPinning();
         var database = Database(collection.Object);
 
         Assert.NotNull(new MongoDbWorkerTransport(options, database.Object));
@@ -127,7 +127,7 @@ public sealed class MongoDbTransportCoverageTests
             Payload = "{}",
             Headers = new Dictionary<string, string>()
         };
-        var collection = new Mock<IMongoCollection<MongoTransportMessageDocument>>(MockBehavior.Loose);
+        var collection = new Mock<IMongoCollection<MongoTransportMessageDocument>>(MockBehavior.Loose).SelfPinning();
         collection
             .Setup(c => c.FindOneAndUpdateAsync(
                 It.IsAny<FilterDefinition<MongoTransportMessageDocument>>(),
@@ -190,7 +190,7 @@ public sealed class MongoDbTransportCoverageTests
             Headers = new Dictionary<string, string>()
         };
         var deletes = new List<BsonDocument>();
-        var collection = new Mock<IMongoCollection<MongoTransportMessageDocument>>(MockBehavior.Loose);
+        var collection = new Mock<IMongoCollection<MongoTransportMessageDocument>>(MockBehavior.Loose).SelfPinning();
         collection
             .Setup(c => c.FindOneAndUpdateAsync(
                 It.IsAny<FilterDefinition<MongoTransportMessageDocument>>(),
@@ -229,7 +229,7 @@ public sealed class MongoDbTransportCoverageTests
     public async Task SubscriberAdapters_ExposeConfiguredRolesAndForwardPayloads()
     {
         var options = Options.Create(new MongoDbAsyncResponseTransportOptions { AutoCreateIndexes = false });
-        var collection = new Mock<IMongoCollection<MongoTransportMessageDocument>>(MockBehavior.Loose);
+        var collection = new Mock<IMongoCollection<MongoTransportMessageDocument>>(MockBehavior.Loose).SelfPinning();
         using var store = CreateStore(collection.Object, options);
         var ingress = new Mock<IAsyncResponseIngress>();
         ingress.Setup(i => i.HandleWorkerMessageAsync("worker-json")).Returns(Task.CompletedTask);
@@ -259,6 +259,9 @@ public sealed class MongoDbTransportCoverageTests
     public void Registration_UsesSharedClientOrOwnedClient_WhenNoDatabaseIsRegistered()
     {
         var database = new Mock<IMongoDatabase>().WithTestNamespace();
+        // The store pins its collection handle to the primary at construction, so the database
+        // mock must hand back a (self-pinning) collection rather than Moq's null default.
+        database.WithLooseCollection<MongoTransportMessageDocument>();
         var client = new Mock<IMongoClient>();
         client.Setup(c => c.GetDatabase("shared_db", It.IsAny<MongoDatabaseSettings>())).Returns(database.Object);
         var sharedServices = Services();
@@ -275,6 +278,55 @@ public sealed class MongoDbTransportCoverageTests
         });
         using var ownedProvider = ownedServices.BuildServiceProvider();
         Assert.NotNull(ownedProvider.GetRequiredService<MongoDbTransportStore>());
+    }
+
+    [Fact]
+    public void Store_PinsTheMessageCollectionToThePrimary()
+    {
+        // Regression (channel / flow-store parity): the transport's handle was not pinned, so a
+        // secondaryPreferred client routed the change-stream wake to a lagging secondary and
+        // worker jobs woke at replication lag — delivery quietly degraded to EmptyPollDelay polling.
+        var database = new Mock<IMongoDatabase>().WithTestNamespace();
+        var collection = new Mock<IMongoCollection<MongoTransportMessageDocument>>(MockBehavior.Loose).SelfPinning();
+        database
+            .Setup(d => d.GetCollection<MongoTransportMessageDocument>(It.IsAny<string>(), It.IsAny<MongoCollectionSettings>()))
+            .Returns(collection.Object);
+
+        _ = new MongoDbTransportStore(database.Object, Options.Create(new MongoDbAsyncResponseTransportOptions { UseOwnershipLedger = false }));
+
+        collection.Verify(c => c.WithReadPreference(ReadPreference.Primary), Times.Once);
+    }
+
+    [Fact]
+    public async Task EnsureCreated_WithoutIndexDdl_WarnsWhenTheClaimIndexIsMissing()
+    {
+        // Regression: with AutoCreateIndexes = false the transport set _created and returned —
+        // both MongoDB siblings verify (the channel warns, the flow store throws). A least-privilege
+        // deployment whose migration omitted the claim index then paid a full collection scan on
+        // every poll tick, per subscriber, with no error and no log line.
+        var database = new Mock<IMongoDatabase>().WithTestNamespace();
+        var collection = new Mock<IMongoCollection<MongoTransportMessageDocument>>(MockBehavior.Loose).SelfPinning();
+        var indexes = new Mock<IMongoIndexManager<MongoTransportMessageDocument>>(MockBehavior.Loose);
+        indexes
+            .Setup(m => m.ListAsync(It.IsAny<CancellationToken>()))
+            .ReturnsAsync(() => new BsonListCursor([]));
+        collection.SetupGet(c => c.Indexes).Returns(indexes.Object);
+        database
+            .Setup(d => d.GetCollection<MongoTransportMessageDocument>(It.IsAny<string>(), It.IsAny<MongoCollectionSettings>()))
+            .Returns(collection.Object);
+        var logger = new CollectingLogger();
+        var store = new MongoDbTransportStore(
+            database.Object,
+            Options.Create(new MongoDbAsyncResponseTransportOptions { AutoCreateIndexes = false, UseOwnershipLedger = false }),
+            logger: logger.For<MongoDbTransportStore>());
+
+        await store.EnsureCreatedAsync();
+
+        Assert.Contains(logger.Messages, message => message.Contains("no index leading on 'queue'", StringComparison.Ordinal));
+        indexes.Verify(m => m.CreateOneAsync(
+            It.IsAny<CreateIndexModel<MongoTransportMessageDocument>>(),
+            It.IsAny<CreateOneIndexOptions>(),
+            It.IsAny<CancellationToken>()), Times.Never);
     }
 
     private static WorkerJobEnvelope Job(string? correlationId) => new()
@@ -336,7 +388,7 @@ public sealed class MongoDbTransportCoverageTests
             AutoCreateIndexes = false,
             WorkerSubscriber = { AckMode = MongoDbAckMode.AckAfterEnqueue }
         });
-        var collection = new Mock<IMongoCollection<MongoTransportMessageDocument>>(MockBehavior.Loose);
+        var collection = new Mock<IMongoCollection<MongoTransportMessageDocument>>(MockBehavior.Loose).SelfPinning();
         using var store = CreateStore(collection.Object, options);
         var subscriber = new MongoDbWorkerSubscriber(options, store, Mock.Of<IAsyncResponseIngress>(), NullLogger<MongoDbWorkerSubscriber>.Instance);
 

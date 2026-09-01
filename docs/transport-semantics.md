@@ -180,13 +180,20 @@ Only cells that need more than a phrase.
   other settlement path — a shutdown landing mid-burial would leave the poison message neither
   buried nor committed. A `StoreOffset` that throws because a rebalance revoked the partition is
   logged rather than faulting the poll loop; the message simply redelivers.
+- Every dead-letter produce runs on the poll thread, so its retry ladder is bounded to a quarter
+  of `MaxPollInterval`: an undeliverable dead-letter topic (auto-create off, a leaderless
+  partition, an over-sized payload) would otherwise wait out librdkafka's `message.timeout.ms`
+  per attempt, overrun `max.poll.interval.ms`, and evict the consumer mid-burial. A burial that
+  runs out of budget leaves the offset unstored and is retried after the next restart/rebalance.
 
 ### RabbitMQ
 
 - The broker does not count plain `basic.nack` requeues: the resolved attempt is
   `max(x-death count, redelivered ? 1 : 0) + 1`, which never exceeds 2 on its own. A
   `MaxDeliveryAttempts` above 2 therefore only takes effect when the dead-letter path forms a
-  TTL-retry cycle that re-delivers the message (each dead-letter hop increments `x-death`);
+  TTL-retry cycle that re-delivers the message (each dead-letter hop increments `x-death`; once
+  `x-death` is present every retry below the cap rejects without requeue so the cycle is what
+  counts it — a plain requeue never advances `x-death`);
   without such a cycle it behaves like 2 and logs a startup warning
   ([troubleshooting](troubleshooting.md#rabbitmq-startup-warns-about-maxdeliveryattempts-or-a-poison-message-loops-forever)).
 - The default `MaxDeliveryAttempts = 0` means unlimited requeues — a poison message hot-loops
@@ -277,7 +284,14 @@ Only cells that need more than a phrase.
   If the fence no longer matches — the lease lapsed and a peer re-claimed the row/document —
   renewal stops and the fenced ack/NAK no-ops for the stale claim: at-least-once is preserved,
   and the loss is logged. Renewal *failures* (transient DB errors) are logged and retried next
-  beat.
+  beat. At settlement the dispatcher joins the heartbeat for at most `LockTimeout`: a renew that
+  never returns (a degraded database mid-command) is abandoned with a warning rather than holding
+  the ack — and at shutdown the host budget — for a full connect+command timeout.
+- The MongoDB transport pins its collection handle to the primary (channel and flow-store
+  parity), so a `secondaryPreferred` client cannot route the change-stream wake to a lagging
+  secondary. With `AutoCreateIndexes = false` it runs a one-time read-only check and **warns**
+  when no index leads on `queue` — every claim would otherwise scan the collection on every poll
+  tick with nothing to show for it.
 - `MaxDeliveryAttempts` is enforced **before** the handler runs, not only after it throws. A
   delivery that ends any other way — the process dies mid-handler, the lease lapses while the
   database is unreachable at settlement — never reaches the post-failure check, and the claim has

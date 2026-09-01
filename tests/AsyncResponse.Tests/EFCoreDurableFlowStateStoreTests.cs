@@ -1,6 +1,7 @@
 using AsyncResponse.DurableFlows.EFCore;
 using Microsoft.Data.Sqlite;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Diagnostics;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -376,6 +377,49 @@ public sealed class EFCoreDurableFlowStateStoreTests
         var services = new ServiceCollection();
         services.AddDbContext<TestFlowDbContext>(options => options.UseSqlite(connectionString));
         return services.BuildServiceProvider(new ServiceProviderOptions { ValidateScopes = true });
+    }
+
+    [Fact]
+    public async Task TryCreate_ReplacesAnExpiredLedgerInPlace_WithoutASeparateInsert()
+    {
+        // Regression: the expired-ledger replace was ExecuteDelete followed by a separate
+        // SaveChanges insert — two transactions, where every sibling store replaces atomically. A
+        // failure between them destroyed the expired row with no replacement. The replace is now a
+        // single in-place update, so an insert that cannot succeed is never needed for it.
+        await using var database = new TempSqliteDatabase();
+        await database.EnsureSchemaAsync();
+        var interceptor = new ArmedThrowingSaveChangesInterceptor();
+        var services = new ServiceCollection();
+        services.AddDbContextFactory<TestFlowDbContext>(options => options
+            .UseSqlite(database.ConnectionString)
+            .AddInterceptors(interceptor));
+        await using var provider = services.BuildServiceProvider(new ServiceProviderOptions { ValidateScopes = true });
+        var store = CreateStore(provider);
+
+        Assert.True(await store.TryCreateAsync("expired-flow", CreateState("expired-flow"), TimeSpan.FromMilliseconds(1)));
+        await Task.Delay(20);
+        interceptor.Armed = true; // from here on any SaveChanges fails: the replace must not need one
+
+        var replacement = CreateState("expired-flow");
+        replacement.LastMessage = "replaced";
+        Assert.True(await store.TryCreateAsync("expired-flow", replacement, TimeSpan.FromMinutes(5)));
+
+        var loaded = await store.LoadAsync("expired-flow");
+        Assert.NotNull(loaded);
+        Assert.Equal("replaced", loaded!.LastMessage);
+    }
+
+    private sealed class ArmedThrowingSaveChangesInterceptor : SaveChangesInterceptor
+    {
+        public bool Armed { get; set; }
+
+        public override ValueTask<InterceptionResult<int>> SavingChangesAsync(
+            DbContextEventData eventData,
+            InterceptionResult<int> result,
+            CancellationToken cancellationToken = default)
+            => Armed
+                ? throw new InvalidOperationException("the insert was lost")
+                : base.SavingChangesAsync(eventData, result, cancellationToken);
     }
 
     private static ServiceProvider BuildFactoryProvider(string connectionString)

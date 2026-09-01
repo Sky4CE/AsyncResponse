@@ -17,7 +17,7 @@ namespace AsyncResponse.Transports.GooglePubSub;
 public sealed class GooglePubSubWorkerTransport : IWorkerTransport, IAsyncDisposable
 {
     private readonly GooglePubSubAsyncResponseOptions _options;
-    private readonly Func<Task<IGooglePubSubPublisherClient>> _publisherFactory;
+    private readonly Func<CancellationToken, Task<IGooglePubSubPublisherClient>> _publisherFactory;
     private readonly SemaphoreSlim _publisherGate = new(1, 1);
     private IGooglePubSubPublisherClient? _publisher;
     private int _disposeGate;
@@ -25,13 +25,13 @@ public sealed class GooglePubSubWorkerTransport : IWorkerTransport, IAsyncDispos
 
     /// <summary>Runs the GooglePubSubWorkerTransport operation.</summary>
     public GooglePubSubWorkerTransport(IOptions<GooglePubSubAsyncResponseOptions> options)
-        : this(options, () => CreatePublisherAsync(options.Value))
+        : this(options, cancellationToken => CreatePublisherAsync(options.Value, cancellationToken))
     {
     }
 
     internal GooglePubSubWorkerTransport(
         IOptions<GooglePubSubAsyncResponseOptions> options,
-        Func<Task<IGooglePubSubPublisherClient>> publisherFactory)
+        Func<CancellationToken, Task<IGooglePubSubPublisherClient>> publisherFactory)
     {
         _options = options.Value;
         _ = GooglePubSubOptionsValidator.Required(_options.ProjectId, nameof(_options.ProjectId));
@@ -54,8 +54,10 @@ public sealed class GooglePubSubWorkerTransport : IWorkerTransport, IAsyncDispos
                 return _publisher;
 
             // Assign only after the await succeeds, so a faulted build attempt is not cached and the next
-            // publish retries instead of awaiting a permanently faulted task.
-            var created = await _publisherFactory().ConfigureAwait(false);
+            // publish retries instead of awaiting a permanently faulted task. The token reaches the
+            // build itself (sibling parity): a stalled credential/metadata lookup or gRPC handshake
+            // under this gate otherwise ignored the caller's — and the host's stopping — token.
+            var created = await _publisherFactory(cancellationToken).ConfigureAwait(false);
             _publisher = created;
             return created;
         }
@@ -67,7 +69,8 @@ public sealed class GooglePubSubWorkerTransport : IWorkerTransport, IAsyncDispos
 
     [System.Diagnostics.CodeAnalysis.ExcludeFromCodeCoverage]
     private static async Task<IGooglePubSubPublisherClient> CreatePublisherAsync(
-        GooglePubSubAsyncResponseOptions options)
+        GooglePubSubAsyncResponseOptions options,
+        CancellationToken cancellationToken)
     {
         var projectId = GooglePubSubOptionsValidator.Required(options.ProjectId, nameof(options.ProjectId));
         var topicId = GooglePubSubOptionsValidator.Required(options.WorkerTopicId, nameof(options.WorkerTopicId));
@@ -78,7 +81,7 @@ public sealed class GooglePubSubWorkerTransport : IWorkerTransport, IAsyncDispos
         {
             TopicName = topicName,
             EmulatorDetection = EmulatorDetection.EmulatorOrProduction
-        }.BuildAsync().ConfigureAwait(false);
+        }.BuildAsync(cancellationToken).ConfigureAwait(false);
         return new GooglePubSubPublisherClientAdapter(publisher);
     }
 

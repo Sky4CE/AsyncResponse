@@ -87,7 +87,7 @@ public sealed class TransportSubscriberTeardownTests
         var watchCancelled = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var cursor = new ParkedChangeStreamCursor(watchStarted, watchCancelled);
 
-        var collection = new Mock<IMongoCollection<MongoTransportMessageDocument>>(MockBehavior.Loose);
+        var collection = new Mock<IMongoCollection<MongoTransportMessageDocument>>(MockBehavior.Loose).SelfPinning();
         collection
             .Setup(c => c.WatchAsync(
                 It.IsAny<PipelineDefinition<ChangeStreamDocument<MongoTransportMessageDocument>, ChangeStreamDocument<MongoTransportMessageDocument>>>(),

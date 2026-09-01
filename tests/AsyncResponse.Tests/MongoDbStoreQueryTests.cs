@@ -242,7 +242,7 @@ public sealed class MongoDbStoreQueryTests
     [Fact]
     public async Task TransportClaimLoop_MapsClaimedDocumentToDelivery_AndFencesAckNakByLockId()
     {
-        var collection = new Mock<IMongoCollection<MongoTransportMessageDocument>>(MockBehavior.Loose);
+        var collection = new Mock<IMongoCollection<MongoTransportMessageDocument>>(MockBehavior.Loose).SelfPinning();
         var claimed = new MongoTransportMessageDocument
         {
             Id = Guid.NewGuid(),
@@ -302,7 +302,7 @@ public sealed class MongoDbStoreQueryTests
     [Fact]
     public async Task TransportClaimBatch_StopsAtEmptyClaimAndHonorsBatchSize()
     {
-        var collection = new Mock<IMongoCollection<MongoTransportMessageDocument>>(MockBehavior.Loose);
+        var collection = new Mock<IMongoCollection<MongoTransportMessageDocument>>(MockBehavior.Loose).SelfPinning();
         collection
             .SetupSequence(c => c.FindOneAndUpdateAsync(
                 It.IsAny<FilterDefinition<MongoTransportMessageDocument>>(),

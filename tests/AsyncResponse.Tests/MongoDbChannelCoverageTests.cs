@@ -1172,6 +1172,40 @@ public sealed class MongoDbChannelCoverageTests
     private static void SetField(object target, string name, object value)
         => target.GetType().GetField(name, BindingFlags.Instance | BindingFlags.NonPublic)!.SetValue(target, value);
 
+    [Fact]
+    public async Task ChannelStore_ConvergesWhenAPeerDroppedTheConflictingTtlIndexFirst()
+    {
+        // Regression: the conflict recovery was drop-then-recreate with no tolerance for a
+        // concurrent drop. In exactly the rolling-deploy case it exists for, two hosts both catch
+        // the options conflict; the second host's DropOneAsync then fails with IndexNotFound (27),
+        // which the 85/86 filter did not cover, and its first waiter or publish failed instead of
+        // converging on the recreated index.
+        var fixture = new ChannelFixture(autoCreateIndexes: true);
+        var indexManager = new Mock<IMongoIndexManager<MongoRecoveryStateDocument>>();
+        indexManager
+            .SetupSequence(i => i.CreateOneAsync(
+                It.IsAny<CreateIndexModel<MongoRecoveryStateDocument>>(),
+                It.IsAny<CreateOneIndexOptions>(),
+                It.IsAny<CancellationToken>()))
+            .ThrowsAsync(MongoCommandException(85))
+            .ReturnsAsync("replacement")
+            .ReturnsAsync("correlation");
+        indexManager
+            .Setup(i => i.DropOneAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .ThrowsAsync(MongoCommandException(27));
+        fixture.Recovery.SetupGet(c => c.Indexes).Returns(indexManager.Object);
+        SetupSuccessfulIndexes(fixture.Messages);
+        SetupSuccessfulIndexes(fixture.Subscribers);
+
+        await fixture.Store.EnsureCreatedAsync();
+
+        indexManager.Verify(i => i.CreateOneAsync(
+            It.IsAny<CreateIndexModel<MongoRecoveryStateDocument>>(),
+            It.IsAny<CreateOneIndexOptions>(),
+            It.IsAny<CancellationToken>()), Times.AtLeast(2));
+        await fixture.Channel.DisposeAsync();
+    }
+
     private static MongoCommandException MongoCommandException(int code)
     {
         var response = new BsonDocument

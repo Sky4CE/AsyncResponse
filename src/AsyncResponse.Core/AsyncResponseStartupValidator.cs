@@ -195,6 +195,7 @@ internal sealed class AsyncResponseStartupValidator(
         foreach (var storeMarker in _flowStores)
             storeMarker.ValidateForwardLifetime();
 
+        ValidateSingleFlowOptions();
         ValidateEarlyAckDeclarations();
         ValidateAwaitedStepLedgerCoverage();
 
@@ -222,9 +223,30 @@ internal sealed class AsyncResponseStartupValidator(
     /// a channel that declares nothing skips the check, and a configured
     /// <c>DefaultStepTimeout</c> makes the channel default unreachable, so the check does not apply.
     /// </summary>
+    /// <summary>
+    /// The engine resolves <see cref="DurableFlowOptions"/> through <c>GetRequiredService</c> — the
+    /// LAST registration — while this validator enumerates them. A second <c>WithDurableFlows</c>
+    /// call for the SAME store type (a provider helper followed by the generic overload to adjust
+    /// a common setting) registers two forwards that the store-count check collapses into one,
+    /// and the validator then judged the first while the engine ran on the second. Fail on the
+    /// duplicate instead; the checks below read the last one, like the engine.
+    /// </summary>
+    private void ValidateSingleFlowOptions()
+    {
+        var registered = _flowOptions?.Distinct().ToArray() ?? [];
+        if (registered.Length > 1)
+        {
+            throw new InvalidOperationException(
+                $"{nameof(DurableFlowOptions)} is registered {registered.Length} times — WithDurableFlows was called more than once " +
+                "(e.g. a provider registration such as .WithPostgreSqlDurableFlows(...) followed by .WithDurableFlows<TStore>(...)). " +
+                "The flow engine consumes only the last registration, so settings from the earlier call are silently ignored. " +
+                "Configure every durable-flow setting in the single registration's callback.");
+        }
+    }
+
     private void ValidateAwaitedStepLedgerCoverage()
     {
-        var flowOptions = _flowOptions?.FirstOrDefault();
+        var flowOptions = _flowOptions?.LastOrDefault();
         if (flowOptions is null || flowOptions.DefaultStepTimeout is not null)
             return;
 
@@ -260,7 +282,7 @@ internal sealed class AsyncResponseStartupValidator(
     /// </summary>
     private void ValidateEarlyAckDeclarations()
     {
-        var flowOptions = _flowOptions?.FirstOrDefault();
+        var flowOptions = _flowOptions?.LastOrDefault();
         foreach (var transport in _transports)
         {
             if (transport.ResponseSubscriberUsesEarlyAck)

@@ -253,7 +253,10 @@ public sealed class CosmosFlowStateStore : IFlowStateStore, IDisposable
                 var document = current.Resource;
                 if (document.ExpiresAtUtc <= now || document.Revision != expectedRevision)
                     return false;
-                if (leaseId is not null && (document.LeaseId != leaseId || document.LeaseExpiresAtUtc <= now))
+                // Positive form (SQL-sibling parity: `lease_id = @lease_id AND lease_expires_at_utc > now()`
+                // is false for NULL). The negated `LeaseExpiresAtUtc <= now` was ALSO false for a
+                // null deadline, so a document with a lease id and no expiry passed the fence.
+                if (leaseId is not null && !(document.LeaseId == leaseId && document.LeaseExpiresAtUtc > now))
                     return false;
 
                 document.StateJson = stateJson;
@@ -477,8 +480,9 @@ public sealed class CosmosFlowStateStore : IFlowStateStore, IDisposable
                     if (document.LeaseId is not null && document.LeaseId != leaseId && document.LeaseExpiresAtUtc > now)
                         return false;
                 }
-                else if (document.LeaseId != leaseId || document.LeaseExpiresAtUtc <= now)
+                else if (!(document.LeaseId == leaseId && document.LeaseExpiresAtUtc > now))
                 {
+                    // Positive form: a renewal needs a live deadline, and a null one is not live.
                     return false;
                 }
 

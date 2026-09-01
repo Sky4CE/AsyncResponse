@@ -323,7 +323,9 @@ public class TypeResolutionTests
     public async Task CustomResolver_ResolvesNameInvisibleToDefaultContext()
     {
         const string aliasName = "Plugin.AsyncResponse.IAliasedFoo.Unique";
-        AsyncResponseTypeResolution.RegisterResolver(name => name == aliasName ? typeof(IPluginService) : null);
+        // Keep and dispose the handle: a discarded registration stays in the process-global
+        // registry for the run, so the collection partner's cache assertions depended on order.
+        using var registration = AsyncResponseTypeResolution.RegisterResolver(name => name == aliasName ? typeof(IPluginService) : null);
 
         var svc = new PluginService();
         var services = new ServiceCollection();

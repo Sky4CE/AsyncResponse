@@ -491,6 +491,38 @@ public sealed class DbTransportSharedCoverageTests
     /// Builds the provider's dispatcher over a delivery wired to <paramref name="calls"/>, handles
     /// one message, and disposes — draining any background worker the early-ACK mode started.
     /// </summary>
+    /// <summary>
+    /// The renewal join is bounded by LockTimeout (ASB/SQS parity): the in-flight renew pins
+    /// CancellationToken.None for its connect and command, so against a degraded database an
+    /// unbounded join held every settlement — on the hot path, and at shutdown the host budget —
+    /// for a full connect+command timeout. Past LockTimeout the lease has lapsed regardless.
+    /// </summary>
+    [Theory]
+    [InlineData(Provider.SqlServer)]
+    [InlineData(Provider.PostgreSql)]
+    [InlineData(Provider.MongoDb)]
+    public async Task RenewalJoin_IsBoundedByLockTimeout_WhenTheInFlightRenewNeverReturns(Provider provider)
+    {
+        var calls = new Calls { RenewGate = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously) };
+        var logger = new CollectingLogger();
+
+        await RunAsync(
+            provider,
+            logger,
+            lockTimeout: TimeSpan.FromMilliseconds(200),
+            calls: calls,
+            handler: async () =>
+            {
+                // Return once a beat is in flight (and, in this fake, wedged for good).
+                while (Volatile.Read(ref calls.Renew) < 1)
+                    await Task.Delay(10);
+            }).WaitAsync(TimeSpan.FromSeconds(10));
+
+        Assert.Equal(1, calls.Ack);
+        Assert.Contains(logger.Messages, message => message.Contains("did not stop within LockTimeout", StringComparison.Ordinal));
+        calls.RenewGate.TrySetResult(true);
+    }
+
     private static async Task RunAsync(
         Provider provider,
         CollectingLogger logger,
@@ -623,11 +655,16 @@ public sealed class DbTransportSharedCoverageTests
             return ValueTask.FromResult(DeadLetterResult);
         }
 
+        /// <summary>When set, every renew parks on this gate — a store call that never returns.</summary>
+        public TaskCompletionSource<bool>? RenewGate;
+
         public ValueTask<bool> RenewAsync()
         {
             Interlocked.Increment(ref Renew);
             if (RenewThrows)
                 throw new InvalidOperationException("lease store unavailable");
+            if (RenewGate is not null)
+                return new ValueTask<bool>(RenewGate.Task);
 
             return ValueTask.FromResult(true);
         }

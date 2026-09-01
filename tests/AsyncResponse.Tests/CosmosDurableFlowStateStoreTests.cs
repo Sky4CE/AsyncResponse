@@ -393,6 +393,28 @@ public sealed class CosmosDurableFlowStateStoreTests
         await ensure;
     }
 
+    [Fact]
+    public async Task LeaseFence_TreatsAMissingLeaseDeadlineAsNotHeld()
+    {
+        // Regression: the fence was written in NEGATED form over a DateTime? —
+        // `LeaseId != leaseId || LeaseExpiresAtUtc <= now` — and a lifted comparison against null
+        // is false, so a document carrying a lease id with no deadline PASSED both the checkpoint
+        // fence and the renewal, while the acquire branch treated the same document as free to
+        // steal: two holders at once. The siblings' positive SQL form is false for NULL; so is
+        // this one now.
+        using var harness = new CosmosHarness();
+        var state = CreateState("flow");
+        state.Revision = 1;
+        var current = Document(CreateState("flow"), DateTime.UtcNow.AddMinutes(5));
+        current.LeaseId = "owner";
+        current.LeaseExpiresAtUtc = null;
+        harness.Reads(current);
+        harness.ReplacesSuccessfully();
+
+        Assert.False(await harness.Store.TryUpdateAsync("flow", state, 0, TimeSpan.FromMinutes(1), leaseId: "owner"));
+        Assert.False(await harness.Store.TryRenewLeaseAsync("flow", "owner", TimeSpan.FromMinutes(1)));
+    }
+
     private static FlowState CreateState(string flowId) => new()
     {
         FlowId = flowId,

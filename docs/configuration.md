@@ -79,7 +79,9 @@ See [recovery.md](recovery.md) for the watchdog in context and [security.md](sec
 `AsyncResponse.DurableFlows.*` provider, `.WithInMemoryDurableFlows()` for a process-local setup, or
 `.WithDurableFlows<TStore>()` for an application-owned atomic store. Every variant accepts the
 common flow-engine options in its own callback; provider variants add store-specific properties to
-that same options object.
+that same options object. Configure everything in that one callback: a second registration for
+the same store (a provider variant followed by `.WithDurableFlows<TStore>()` to "adjust" a common
+setting) is rejected at startup, because the engine would consume only the last one.
 
 ### Common durable-flow options
 
@@ -145,7 +147,7 @@ Every channel has a complete registration in [provider-examples.md](provider-exa
 
 | Option | Channels | Default | Purpose |
 |---|---|---|---|
-| `KeyPrefix` | Redis | `asyncresponse` | Isolate apps/environments sharing one Redis. **Persisted — treat as a deployment contract.** |
+| `KeyPrefix` | Redis | `asyncresponse` | Isolate apps/environments sharing one Redis. **Persisted — treat as a deployment contract.** On Redis Cluster a hash-tagged prefix (`{app}`) co-locates every derived key, the transport's idempotent-publish marker included; a prefix or stream name whose braces do not form one well-formed tag is rejected at startup. |
 | `SubjectPrefix` | NATS | `asyncresponse` | Response subjects: `{prefix}.response.{cid}`. |
 | `RecoveryBucket` | NATS | `asyncresponse-recovery` | JetStream KV bucket for recovery state. |
 | `SchemaName` | PostgreSQL, SQL Server | `public` / `dbo` | Schema that contains the channel tables. |
@@ -156,6 +158,7 @@ Every channel has a complete registration in [provider-examples.md](provider-exa
 | `SubscriberTable` / `SubscriberCollection` | PostgreSQL, SQL Server, MongoDB | `asyncresponse_channel_subscribers` | Live waiter heartbeat rows/documents used for subscriber counts and delivery confirmation. |
 | `NotificationChannel` | PostgreSQL | `asyncresponse_channel_notify` | PostgreSQL `LISTEN/NOTIFY` channel; must be a simple identifier. |
 | `AutoCreateSchema` / `AutoCreateIndexes` | PostgreSQL, SQL Server, MongoDB | `true` | Create schema/tables/indexes (or TTL + lookup indexes on MongoDB) on first use; set `false` when migrations/provisioning own DDL. With `AutoCreateIndexes = false`, MongoDB runs a one-time read-only check instead and **warns** (never throws) if the TTL or correlation-id lookup index is missing — indexes affect retention/performance, not correctness. |
+| `UseOwnershipLedger` | MongoDB | `true` | Claim the effective collections in the reserved `asyncresponse_ownership` collection at first use so two components misconfigured onto one collection fail startup instead of corrupting each other's data. Independent of `AutoCreateIndexes`. Set `false` only for least-privilege deployments that cannot write the ledger collection and audit their collection layout externally. The same option exists on the MongoDB transport and durable-flow options. |
 | `UseChangeStreams` | MongoDB | `true` | Wake waiters with a change stream on the message collection (requires a replica set; single-node is sufficient). When disabled — or when the server is standalone — waiters fall back to `ListenerPollInterval` polling. |
 | `MessageRetention` | PostgreSQL, SQL Server, MongoDB | 1 hour | How long response envelope rows/documents remain available for missed notification / cross-process sweep recovery. MongoDB reaps them natively via a TTL index. |
 | `DeliveryConfirmationTimeout` | PostgreSQL, SQL Server, MongoDB | 5 seconds | How long a publisher waits for live waiter confirmation before routing to lost-subscriber recovery. |
@@ -349,7 +352,10 @@ derived ones such as the channel's `{MessageCollection}_counters` included — i
 `asyncresponse_ownership` collection at first use: one tiny document per collection, so two
 components (in the same process or different hosts) misconfigured onto the same collection fail
 startup with an error naming both claimants instead of silently corrupting each other's data.
-Deployments that disable auto-creation own their provisioning and skip the ledger. Effective
+The claim is independent of `AutoCreateIndexes` — disabling index DDL must not disable collision
+protection — so it still runs when auto-creation is off. A least-privilege deployment whose
+principal cannot write `asyncresponse_ownership` opts out with `UseOwnershipLedger = false` on the
+channel, transport and durable-flow options, and audits its collection layout externally. Effective
 namespaces (`database.collection`, UTF-8 bytes) are validated against MongoDB's sharded limit
 (235 bytes) at store construction.
 

@@ -88,7 +88,11 @@ internal sealed class NatsRawRequester(INatsConnection _connection) : INatsRawRe
             subject,
             payload,
             headers: headers,
-            replyOpts: new NatsSubOpts { Timeout = timeout },
+            // Pinned per call: the channel's lost-subscriber routing and liveness probe both rest on
+            // a no-responders 503 THROWING. Left unset, that follows the app-supplied connection's
+            // RequestReplyMode, and under Direct the sentinel arrives as an ordinary (discarded)
+            // reply — a dead subject then looks answered and the response is dropped.
+            replyOpts: new NatsSubOpts { Timeout = timeout, ThrowIfNoResponders = true },
             cancellationToken: cancellationToken).ConfigureAwait(false);
 
     /// <summary>Runs the SubscribeAsync operation.</summary>

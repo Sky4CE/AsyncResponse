@@ -348,7 +348,7 @@ execution leases. They are independent axes — combine any one of each.
 |---|---|---|
 | In-memory (in `Core`) | in-process | process lifetime |
 | Redis | pub/sub push, zero polling | TTL'd Redis keys |
-| NATS | core request/reply — "no responders" is a positive lost-waiter signal | JetStream Key-Value |
+| NATS | core request/reply — "no responders" is a positive lost-waiter signal (pinned per request, whatever the connection's `RequestReplyMode`) | JetStream Key-Value |
 | PostgreSQL | `LISTEN/NOTIFY` wake + keyset-paged table scan—notifications carry only ids, so response size is not constrained by `NOTIFY` | row per waiter registration, database-clock TTLs |
 | SQL Server | adaptive keyset-paged sweep (tight while waiters exist, backed off while idle); same-process deliveries skip the sweep entirely | row per waiter registration, database-clock TTLs |
 | MongoDB | change-stream wake + keyset-paged collection scan—requires a replica set (single-node is enough); degrades to polling on standalone servers | document per waiter registration, native TTL indexes |

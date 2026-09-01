@@ -7,11 +7,13 @@ namespace AsyncResponse.Transports;
 // of the call into RunAsync below; only the retry-with-backoff loop shape is shared.
 
 /// <summary>
-/// Runs a subscriber's connect-and-consume operation with retry-with-backoff on failure. A
-/// cancellation that matches host shutdown exits quietly; any other exception — including a
-/// cancellation NOT caused by host shutdown, e.g. a transport-internal timeout — increments the
-/// failure count, asks the caller-supplied delay policy how long to wait, reports the retry through
-/// the caller-supplied callback, and waits before trying again.
+/// Runs a subscriber's connect-and-consume operation with retry-with-backoff on failure. Any
+/// exception observed once host shutdown has been requested exits quietly — the cancellation
+/// itself, and equally the ObjectDisposed/connection-closed errors broker clients raise when the
+/// stop tears a connection down mid-consume; any other exception — including a cancellation NOT
+/// caused by host shutdown, e.g. a transport-internal timeout — increments the failure count, asks
+/// the caller-supplied delay policy how long to wait, reports the retry through the caller-supplied
+/// callback, and waits before trying again.
 /// </summary>
 internal static class SubscriberSupervisor
 {
@@ -35,11 +37,16 @@ internal static class SubscriberSupervisor
                 await run(stoppingToken).ConfigureAwait(false);
                 return;
             }
-            catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+            catch (Exception) when (stoppingToken.IsCancellationRequested)
             {
+                // Shutdown. Not only the OperationCanceledException: a client whose connection the
+                // stop just closed throws its own ObjectDisposed/AlreadyClosed/connection error
+                // instead, and with no arm for that shape it escaped ExecuteAsync — faulting the
+                // BackgroundService (a critical "BackgroundService failed" log, and StopApplication
+                // under the default behavior) on every clean redeploy.
                 return;
             }
-            catch (Exception ex) when (!stoppingToken.IsCancellationRequested)
+            catch (Exception ex)
             {
                 failures++;
                 var retryDelay = delayPolicy(failures);

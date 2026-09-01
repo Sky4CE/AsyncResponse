@@ -13,6 +13,50 @@ work that has landed on `main` but not yet shipped. Security reporters credited 
 
 ### Changed
 
+- **Local step checkpoints are no longer interruptible.** `StepAsync`, `StepAsync<TResult>` and
+  the child-flow memoization persist their completion checkpoint under `CancellationToken.None`
+  (awaited-step parity): a caller token firing after the step's side effect had run lost the
+  checkpoint — the redelivered execution re-ran the side effect — and marked a healthy lease lost.
+- **RabbitMQ `MaxDeliveryAttempts` above 2 now terminates.** Once a message carries `x-death`
+  (it has been dead-lettered at least once), every retry below the cap rejects **without**
+  requeue so the dead-letter cycle counts it; a plain requeue never advances `x-death`, so a
+  capped message previously requeued forever at broker rate after its first hop.
+- **Startup validation is tighter in four more places.** The Redis transport rejects a
+  `WorkerStream`/`KeyPrefix` whose braces do not form one well-formed hash tag, and the publish
+  dedup marker now reuses the stream's own tag — the idiomatic `KeyPrefix = "{app}"` cluster
+  co-location previously nested the braces and failed every publish with CROSSSLOT. A second
+  `WithDurableFlows` registration for the same store type is rejected (the engine consumed only
+  the last one while the validator inspected the first). The in-memory channel validates
+  `MaxRemoteStackTraceLength` like the five wire channels. The SQL Server relation verifier
+  ignores non-key index columns when checking a primary key (a nonclustered PK over a clustered
+  index no longer fails a correct schema) and requires the ack sequence's `MAXVALUE` to be the
+  `bigint` maximum (PostgreSQL parity).
+- **NATS channel no-responders detection is pinned per request** (`ThrowIfNoResponders = true`),
+  so an application connection configured with `RequestReplyMode = Direct` can no longer turn a
+  dead subject into an apparently answered one and drop the response.
+- **Shutdown paths hardened.** The shared subscriber supervisor exits quietly on any exception
+  raised after host shutdown was requested (broker clients throw their own connection-closed
+  errors, not `OperationCanceledException`; those faulted the `BackgroundService` on every clean
+  redeploy). RabbitMQ arms a fresh `ShutdownTimeout` budget for the channel/connection closes
+  after the background drain. The database transports bound the lease-renewal join by
+  `LockTimeout`. Six ACK-after-enqueue dispatchers now dispose their drain token source when a
+  worker faults with something other than a timeout. The in-memory worker transport's retry
+  backoff honors the stopping token (a stop during it drops the failing job loudly so the jobs
+  queued behind it still drain).
+- **Kafka dead-letter produces are bounded** to a quarter of `MaxPollInterval` per burial: an
+  undeliverable dead-letter topic previously blocked the poll thread past
+  `max.poll.interval.ms` and triggered a rebalance storm.
+- **MongoDB transport parity**: the message collection is pinned to the primary (change-stream
+  wake no longer opens on a lagging secondary under `secondaryPreferred`), and
+  `AutoCreateIndexes = false` runs a read-only check that warns when the claim index is missing.
+  The MongoDB channel's TTL-index replace tolerates a peer host dropping the index first.
+- **EF Core durable-flow store** replaces an expired ledger in place with one statement instead
+  of delete-then-insert across two transactions. The Cosmos store's lease fence is null-safe.
+- The in-memory channel's `AbandonAsync` (used by `AsyncResponseTestHarness.SimulateRestartAsync`)
+  latches cleanup so the zombie waiter's later disposal cannot delete the recovery registration
+  the simulated crash must leave behind.
+- `.github/workflows/auto-retry.yml` re-runs a failed `main` run only when the failure matches a
+  known infrastructure flake signature.
 - **The in-memory channel now faults waiters with the wire failure shape**: `SetException`
   delivers a plain `Exception` carrying the original message (plus the capped stack trace in
   `Data["RemoteStackTrace"]`), exactly as every durable channel does — the concrete exception

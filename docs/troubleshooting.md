@@ -77,7 +77,9 @@ owns the full story — this page is the map, not the territory.
   plain `basic.nack` requeues, so `MaxDeliveryAttempts` values above 2 need a TTL-retry
   dead-letter cycle to make attempts countable. Without one the cap is *clamped to 2* — the
   message is rejected on its second delivery rather than requeued forever, which is what the
-  startup warning is telling you.
+  startup warning is telling you. Once a message carries `x-death` (it has been dead-lettered at
+  least once), every further retry below the cap rejects **without** requeue so the cycle is what
+  counts it — a plain requeue never advances `x-death`.
 - **Fix:** for production, set a positive `MaxDeliveryAttempts` **and** configure
   `DeadLetterExchange` (so capped-out messages are preserved, not dropped). `DeclareTopology`
   declares the dead-letter *wiring* (`x-dead-letter-exchange` on the worker and response queues),

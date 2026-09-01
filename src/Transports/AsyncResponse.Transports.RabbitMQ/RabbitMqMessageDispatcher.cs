@@ -71,7 +71,7 @@ internal abstract class RabbitMqMessageDispatcher : IAsyncDisposable
             ? 2
             : MaxDeliveryAttempts;
 
-    private static long ReadDeathCount(IReadOnlyBasicProperties properties)
+    protected static long ReadDeathCount(IReadOnlyBasicProperties properties)
     {
         if (properties.Headers is null
             || !properties.Headers.TryGetValue("x-death", out var raw)
@@ -360,8 +360,13 @@ internal sealed class AwaitingRabbitMqMessageDispatcher(
         {
             // Requeue for redelivery, unless a delivery cap is configured and this delivery has reached it —
             // then reject without requeue so the broker dead-letters (or drops) it instead of hot-looping.
+            // Once the broker has dead-lettered the message (x-death present), a plain requeue can never
+            // advance the attempt again — x-death only counts dead-letter hops and `redelivered` is already
+            // set — so a capped message would requeue forever below the cap. From then on every retry
+            // must ride the dead-letter cycle, which is what makes the operator's cap countable at all.
             var requeue = MaxDeliveryAttempts <= 0
-                || ResolveDeliveryAttempt(delivery) < EffectiveDeliveryCap(delivery);
+                || (ReadDeathCount(delivery.BasicProperties) == 0
+                    && ResolveDeliveryAttempt(delivery) < EffectiveDeliveryCap(delivery));
             await TryNackAsync(delivery, channel, requeue).ConfigureAwait(false);
             return;
         }
@@ -673,6 +678,14 @@ internal sealed class QueuedRabbitMqMessageDispatcher : RabbitMqMessageDispatche
                 CancellationToken.None,
                 TaskContinuationOptions.ExecuteSynchronously,
                 TaskScheduler.Default);
+        }
+        catch (Exception ex)
+        {
+            // A worker faulted outside its own handler guard (DB/NATS dispatcher parity). WhenAll
+            // only completes once every worker has finished, so the source is safe to dispose here
+            // — and the fault must not escape DisposeAsync and mask the real shutdown path.
+            Logger.LogDebug(ex, "RabbitMQ ACK-after-enqueue dispatcher drain for {Queue} ended with an error.", _queueName);
+            _drainCancellation.Dispose();
         }
     }
 

@@ -135,7 +135,9 @@ now also checks scale on every fractional-seconds column: a bare `datetime2` abo
 `datetime2(7)`, so the shape needs no change, but a manually reduced scale (`datetime2(3)`,
 `datetime2(0)`) is rejected — SQL Server rounds on store, so a lower-scale column is a different
 clock, not a coarser view of the same one, and could round a timestamp below an already-observed
-watermark. The one column verification deliberately leaves alone on a table it did not create is
+watermark. The primary key is compared on its **key** columns only: the `PRIMARY KEY NONCLUSTERED`
+above, with the clustered index on `created_at`, is the accepted shape — SQL Server lists the
+clustering key on the nonclustered PK at ordinal 0, and it is not part of the key. The one column verification deliberately leaves alone on a table it did not create is
 `queue`: the claim predicate below supplies the binary collation itself and defeats padding on its
 own, so a schema an older build or a hand-written migration left as `varchar` or on the server's
 case-insensitive default still claims exactly and is accepted as-is. On a table the store created,
@@ -177,7 +179,10 @@ IF NOT EXISTS (SELECT 1 FROM sys.sequences
 ```
 
 The column is nullable and the migration is safe to run while old-version hosts are still up:
-rows they ack carry no sequence and fall back to the previous watermark rule. Correlation ids are stored as `nvarchar(400)` key
+rows they ack carry no sequence and fall back to the previous watermark rule. The sequence is
+verified as the monotonic clock it is: `bigint`, `INCREMENT BY 1`, `NO CYCLE`, and the `bigint`
+maximum as its `MAXVALUE` (a restricted maximum would pass startup and then exhaust
+mid-production with error 11728). Correlation ids are stored as `nvarchar(400)` key
 columns — keep ids at or under 400 characters (generated ids are far shorter).
 
 ## Configuration checklist

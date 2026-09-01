@@ -279,17 +279,33 @@ public sealed class EFCoreFlowStateStore<[DynamicallyAccessedMembers(Dynamically
         if (DurableFlowStoreShared.ShouldPrune(ref _lastPruneTicks, _options.PruneInterval))
             await PruneExpiredAsync(db, cancellationToken).ConfigureAwait(false);
 
-        await Records(db)
+        // Replace an expired ledger IN PLACE, in one statement (sibling parity: PostgreSQL
+        // `ON CONFLICT ... DO UPDATE ... WHERE expired`, SQL Server/Oracle `MERGE ... WHEN MATCHED
+        // ... WHERE`). Delete-then-insert spanned two transactions, and a failure between them
+        // destroyed the expired row with no replacement. The lease columns are cleared as the
+        // siblings clear them: the replaced ledger is a fresh, unleased run.
+        var expiresAtUtc = DurableFlowStoreShared.AddSaturating(now, ttl);
+        var revision = state.Revision;
+        var replaced = await Records(db)
             .Where(r => r.FlowId == flowId && r.ExpiresAtUtc <= now)
-            .ExecuteDeleteAsync(cancellationToken)
+            .ExecuteUpdateAsync(setters => setters
+                .SetProperty(r => r.StateJson, stateJson)
+                .SetProperty(r => r.ExpiresAtUtc, expiresAtUtc)
+                .SetProperty(r => r.UpdatedAtUtc, now)
+                .SetProperty(r => r.Revision, revision)
+                .SetProperty(r => r.LeaseId, (string?)null)
+                .SetProperty(r => r.LeaseExpiresAtUtc, (DateTime?)null), cancellationToken)
             .ConfigureAwait(false);
+        if (replaced > 0)
+            return true;
+
         db.Add(new DurableFlowStateRecord
         {
             FlowId = flowId,
             StateJson = stateJson,
-            ExpiresAtUtc = DurableFlowStoreShared.AddSaturating(now, ttl),
+            ExpiresAtUtc = expiresAtUtc,
             UpdatedAtUtc = now,
-            Revision = state.Revision
+            Revision = revision
         });
         try
         {

@@ -247,7 +247,9 @@ Recovery state lives in the durable channel's store and survives a redeploy:
   per-entry expiry layered over the bucket's `MaxAge`. Registration-list updates are
   revision-conditioned (KV compare-and-set with retries), so concurrent registrations for one
   correlation id all survive. Waiter-liveness probing over NATS Core reports presence, not
-  counts: only a "no responders" answer is a definitive zero. A request that was delivered but not
+  counts: only a "no responders" answer is a definitive zero (the channel pins
+  `ThrowIfNoResponders` on every request, so an application connection configured with
+  `RequestReplyMode = Direct` cannot turn that answer into an ordinary reply). A request that was delivered but not
   answered inside `PresenceProbeTimeout` is reported as **unprobeable**, not dead — the consume
   loop acks a probe only when it reads it, serially, behind the previous message's `Until`
   predicate, so any predicate slower than the 2 s default would otherwise make a healthy waiter

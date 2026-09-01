@@ -334,7 +334,7 @@ public sealed class MongoDbSubscriberServiceTests
         }
 
         public Mock<IMongoDatabase> Database { get; } = new(MockBehavior.Loose);
-        public Mock<IMongoCollection<MongoTransportMessageDocument>> Messages { get; } = new(MockBehavior.Loose);
+        public Mock<IMongoCollection<MongoTransportMessageDocument>> Messages { get; } = new Mock<IMongoCollection<MongoTransportMessageDocument>>(MockBehavior.Loose).SelfPinning();
         public Mock<IAsyncResponseIngress> Ingress { get; } = new();
         public CollectingLogger Logger { get; } = new();
 

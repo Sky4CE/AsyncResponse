@@ -155,7 +155,24 @@ internal abstract class DbMessageDispatcherBase : IAsyncDisposable
             finally
             {
                 renewalCancellation.Cancel();
-                await renewalTask.ConfigureAwait(false);
+                try
+                {
+                    // Bounded (ASB/SQS parity): the in-flight renew pins CancellationToken.None
+                    // for its connect and command, so against a degraded database an unbounded
+                    // join held every settlement — on the hot path, and at shutdown the host
+                    // budget — for a full connect+command timeout. Past LockTimeout the lease
+                    // has lapsed regardless, so there is nothing left to wait for.
+                    await renewalTask.WaitAsync(_options.LockTimeout).ConfigureAwait(false);
+                }
+                catch (TimeoutException)
+                {
+                    _logger.LogWarning(
+                        "{Provider} lease renewal for queue {Queue} ({Role}) did not stop within LockTimeout ({LockTimeout}); abandoning the renewal task.",
+                        _providerName,
+                        delivery.Queue,
+                        _role,
+                        _options.LockTimeout);
+                }
             }
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
@@ -324,7 +341,24 @@ internal abstract class DbMessageDispatcherBase : IAsyncDisposable
             finally
             {
                 renewalCancellation.Cancel();
-                await renewalTask.ConfigureAwait(false);
+                try
+                {
+                    // Bounded (ASB/SQS parity): the in-flight renew pins CancellationToken.None
+                    // for its connect and command, so against a degraded database an unbounded
+                    // join held every settlement — on the hot path, and at shutdown the host
+                    // budget — for a full connect+command timeout. Past LockTimeout the lease
+                    // has lapsed regardless, so there is nothing left to wait for.
+                    await renewalTask.WaitAsync(_options.LockTimeout).ConfigureAwait(false);
+                }
+                catch (TimeoutException)
+                {
+                    _logger.LogWarning(
+                        "{Provider} lease renewal for queue {Queue} ({Role}) did not stop within LockTimeout ({LockTimeout}); abandoning the renewal task.",
+                        _providerName,
+                        delivery.Queue,
+                        _role,
+                        _options.LockTimeout);
+                }
             }
         }
 

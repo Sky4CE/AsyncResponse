@@ -39,6 +39,8 @@ public abstract class IntegrationFixture : IAsyncLifetime
     private DistributedApplication? _app;
     private string? _previousOracleConnectionString;
     private string? _previousCosmosConnectionString;
+    private string? _previousPubSubEmulatorHost;
+    private bool _pubSubEmulatorWired;
 
     public HttpClient Client { get; private protected set; } = null!;
     public HttpClient EarlyAckClient { get; private protected set; } = null!;
@@ -133,6 +135,15 @@ public abstract class IntegrationFixture : IAsyncLifetime
     private protected void WirePubSubEmulator(string projectId)
     {
         var endpoint = App.GetEndpoint("pubsub", "pubsub");
+        // Saved and restored on dispose like the Oracle/Cosmos variables: batches run sequentially
+        // in one process, and a stale value would point every later Pub/Sub client at a torn-down
+        // emulator endpoint.
+        if (!_pubSubEmulatorWired)
+        {
+            _previousPubSubEmulatorHost = Environment.GetEnvironmentVariable("PUBSUB_EMULATOR_HOST");
+            _pubSubEmulatorWired = true;
+        }
+
         Environment.SetEnvironmentVariable("PUBSUB_EMULATOR_HOST", $"{endpoint.Host}:{endpoint.Port}");
         PubSubProjectId = projectId;
     }
@@ -303,6 +314,8 @@ public abstract class IntegrationFixture : IAsyncLifetime
         {
             Environment.SetEnvironmentVariable(OracleConnectionStringEnvironmentVariable, _previousOracleConnectionString);
             Environment.SetEnvironmentVariable(CosmosConnectionStringEnvironmentVariable, _previousCosmosConnectionString);
+            if (_pubSubEmulatorWired)
+                Environment.SetEnvironmentVariable("PUBSUB_EMULATOR_HOST", _previousPubSubEmulatorHost);
             Environment.SetEnvironmentVariable(BatchEnvironmentVariable, _previousBatch);
         }
     }

@@ -341,7 +341,7 @@ public sealed class TransportSubscriberCoverageTests
     [Fact]
     public async Task MongoDbTransportStore_WatchQueueAsync_InvokesOnNotification()
     {
-        var mockCollection = new Mock<IMongoCollection<MongoTransportMessageDocument>>();
+        var mockCollection = new Mock<IMongoCollection<MongoTransportMessageDocument>>().SelfPinning();
         var mockDatabase = new Mock<IMongoDatabase>().WithTestNamespace();
         mockDatabase.Setup(d => d.GetCollection<MongoTransportMessageDocument>(It.IsAny<string>(), It.IsAny<MongoCollectionSettings>()))
             .Returns(mockCollection.Object);

@@ -30,5 +30,14 @@ jobs:
           ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
         run: |
           set -euo pipefail
+          # Retry only on a known infrastructure signature (ci.yml's own retry step gates on the
+          # same fixture-boot flake). An unconditional re-run gave an intermittently failing
+          # product bug — a race, a lease, a watchdog — five chances to land green on main, and
+          # publish.yml relies on main's check as the reviewed gate.
+          if ! gh run view "$RUN_ID" --log-failed 2>/dev/null \
+               | grep -Eq "Fixture' threw in InitializeAsync|lost communication with the server|The runner has received a shutdown signal"; then
+            echo "::warning::Not re-running ${{ github.event.workflow_run.name }} run $RUN_ID (attempt $ATTEMPT): the failure does not match a known flake signature."
+            exit 0
+          fi
           echo "::notice::Re-running failed jobs of ${{ github.event.workflow_run.name }} run $RUN_ID (attempt $ATTEMPT of 5)"
           gh api --method POST "repos/$GH_REPO/actions/runs/$RUN_ID/rerun-failed-jobs"

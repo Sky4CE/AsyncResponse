@@ -124,6 +124,40 @@ public sealed class InMemoryWorkerTransportRedeliveryTests
         _ = new InMemoryWorkerTransport(Options.Create(new InMemoryWorkerTransportOptions { MaxDeliveryAttempts = 0 }));
     }
 
+    [Fact]
+    public async Task StopDuringARetryBackoff_DropsTheFailingJob_AndDrainsTheJobsBehindIt()
+    {
+        // Regression: the retry backoff took no cancellation token, so a stop request during it
+        // left the (single, by default) worker parked for up to RetryMaxDelay per attempt through
+        // the whole drain — and every job queued BEHIND the failing one was lost when the bounded
+        // stop returned. The sleep now honours the stopping token: the failing job is dropped
+        // loudly and the queue behind it drains.
+        var probe = new RedeliveryProbe();
+        probe.FailuresBeforeSuccess["poison"] = int.MaxValue;
+        var logger = new CollectingLogger();
+        var host = await StartHostAsync(probe, new InMemoryWorkerTransportOptions
+        {
+            MaxDeliveryAttempts = 0,
+            RetryBaseDelay = TimeSpan.FromMinutes(10),
+            RetryMaxDelay = TimeSpan.FromMinutes(10)
+        }, logger);
+
+        await host.PublishAsync("poison");
+        await host.PublishAsync("healthy");
+        var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(5);
+        while (probe.Attempts("poison") < 1 && DateTime.UtcNow < deadline)
+            await Task.Delay(10);
+        Assert.Equal(1, probe.Attempts("poison")); // now parked in its ten-minute backoff
+
+        using var cutoff = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        await host.StopAsync(cutoff.Token);
+
+        Assert.False(cutoff.IsCancellationRequested, "the stop should have drained on its own, not been cut off");
+        Assert.True(probe.Completed.Task.IsCompletedSuccessfully, "the job queued behind the failing one must still run");
+        Assert.Contains(logger.Messages, message => message.Contains("host shutdown interrupted its retry backoff", StringComparison.Ordinal));
+        await host.DisposeAsync();
+    }
+
     private static async Task<HostHandle> StartHostAsync(
         RedeliveryProbe probe,
         InMemoryWorkerTransportOptions options,
@@ -160,6 +194,8 @@ public sealed class InMemoryWorkerTransportRedeliveryTests
                     Params = [CallbackParam.ForValue(jobId)]
                 }
             });
+
+        public Task StopAsync(CancellationToken cancellationToken) => _host.StopAsync(cancellationToken);
 
         public async ValueTask DisposeAsync()
         {

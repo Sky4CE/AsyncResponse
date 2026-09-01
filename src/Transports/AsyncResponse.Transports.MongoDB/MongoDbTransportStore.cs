@@ -71,13 +71,19 @@ internal sealed class MongoDbTransportStore : IDisposable
         MongoNamespaceRegistry.ValidateEffectiveNamespace(database, _options.MessageCollection, nameof(_options.MessageCollection));
 
         _database = database;
-        _messages = database.GetCollection<MongoTransportMessageDocument>(_options.MessageCollection);
+        // Pinned to the primary (channel / flow-store parity): a secondaryPreferred client would
+        // route the change-stream wake to a lagging secondary, so worker jobs woke at replication
+        // lag and delivery quietly degraded to EmptyPollDelay polling.
+        _messages = database.GetCollection<MongoTransportMessageDocument>(_options.MessageCollection)
+            .WithReadPreference(ReadPreference.Primary);
         _ownedClient = ownedClient;
     }
 
     public async Task EnsureCreatedAsync(CancellationToken cancellationToken = default)
     {
-        if (_created || (!_options.AutoCreateIndexes && !_options.UseOwnershipLedger))
+        // Not short-circuited on AutoCreateIndexes/UseOwnershipLedger both being off: the
+        // read-only index check below still runs once, and _created then keeps this cheap.
+        if (_created)
             return;
 
         await _ensureGate.WaitAsync(cancellationToken).ConfigureAwait(false);
@@ -99,6 +105,10 @@ internal sealed class MongoDbTransportStore : IDisposable
 
             if (!_options.AutoCreateIndexes)
             {
+                // Channel / flow-store parity: verify (read-only, warn-only) instead of skipping
+                // silently. A missing claim index turned every claim into a full collection scan
+                // per poll tick, per subscriber, with no error and no log line.
+                await WarnIfClaimIndexMissingAsync(cancellationToken).ConfigureAwait(false);
                 _created = true;
                 return;
             }
@@ -121,6 +131,48 @@ internal sealed class MongoDbTransportStore : IDisposable
         finally
         {
             _ensureGate.Release();
+        }
+    }
+
+    private async Task WarnIfClaimIndexMissingAsync(CancellationToken cancellationToken)
+    {
+        try
+        {
+            List<BsonDocument> indexes;
+            try
+            {
+                using var cursor = await _messages.Indexes.ListAsync(cancellationToken).ConfigureAwait(false);
+                indexes = await cursor.ToListAsync(cancellationToken).ConfigureAwait(false);
+            }
+            catch (MongoCommandException ex) when (ex.Code == 26)
+            {
+                // NamespaceNotFound: MongoDB creates the collection bare on the first write —
+                // which, with index DDL disabled, is exactly a collection with no claim index.
+                indexes = [];
+            }
+
+            // Matched by KEY, not by name: operators own the naming of manually provisioned indexes.
+            var claimIndexed = indexes.Any(index =>
+                index.TryGetValue("key", out var key)
+                && key is BsonDocument keys
+                && keys.ElementCount > 0
+                && string.Equals(keys.GetElement(0).Name, "queue", StringComparison.Ordinal));
+            if (!claimIndexed)
+            {
+                _logger?.LogWarning(
+                    "MongoDB collection {Database}.{Collection} has no index leading on 'queue' and AutoCreateIndexes is disabled. " +
+                    "Every claim scans the whole collection on every poll tick — performance only; create the claim index " +
+                    "(queue, available_at, created_at) or enable AutoCreateIndexes.",
+                    _database.DatabaseNamespace.DatabaseName,
+                    _options.MessageCollection);
+            }
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            // A deployment that cannot even list indexes (no listIndexes privilege, server
+            // unreachable at first use) must not lose the actual operation to the check: the
+            // caller's own store call surfaces any real connectivity failure.
+            _logger?.LogDebug(ex, "Skipping index verification for the manually managed MongoDB transport collection; listIndexes was not available.");
         }
     }
 

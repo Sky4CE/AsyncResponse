@@ -725,12 +725,25 @@ internal sealed class SqlServerChannelSql
         return result is long count ? count : 0L;
     }
 
+    /// <summary>
+    /// Bound on the table-wide prunes (durable-flow-store parity). They run inline on the publish
+    /// and probe paths, and an unbounded DELETE over a backlog past SQL Server's ~5,000-lock
+    /// escalation threshold takes a table lock that stalls concurrent delivery claims on the same
+    /// table — long enough for a live waiter's claim to lose to the recovery claim. A bounded
+    /// batch drains a backlog across successive calls instead.
+    /// </summary>
+    private const int PruneBatchSize = 1000;
+
+    /// <summary>The bounded table-wide prune statement for <paramref name="table"/>.</summary>
+    internal static string ExpiredPruneSql(string table)
+        => $"DELETE TOP ({PruneBatchSize}) FROM {table} WHERE expires_at <= SYSUTCDATETIME();";
+
     private async Task PruneExpiredRecoveryAsync(string? correlationId, CancellationToken cancellationToken)
     {
         await using var connection = await OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         await using var command = connection.CreateCommand();
         command.CommandText = correlationId is null
-            ? $"DELETE FROM {RecoveryTable} WHERE expires_at <= SYSUTCDATETIME();"
+            ? ExpiredPruneSql(RecoveryTable)
             : $"DELETE FROM {RecoveryTable} WHERE correlation_id = @correlation_id AND expires_at <= SYSUTCDATETIME();";
         if (correlationId is not null)
             command.Parameters.AddWithValue("@correlation_id", correlationId);
@@ -741,7 +754,7 @@ internal sealed class SqlServerChannelSql
     {
         await using var connection = await OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         await using var command = connection.CreateCommand();
-        command.CommandText = $"DELETE FROM {MessageTable} WHERE expires_at <= SYSUTCDATETIME();";
+        command.CommandText = ExpiredPruneSql(MessageTable);
         await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
     }
 
@@ -750,7 +763,7 @@ internal sealed class SqlServerChannelSql
         await using var connection = await OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         await using var command = connection.CreateCommand();
         command.CommandText = correlationId is null
-            ? $"DELETE FROM {SubscriberTable} WHERE expires_at <= SYSUTCDATETIME();"
+            ? ExpiredPruneSql(SubscriberTable)
             : $"DELETE FROM {SubscriberTable} WHERE correlation_id = @correlation_id AND expires_at <= SYSUTCDATETIME();";
         if (correlationId is not null)
             command.Parameters.AddWithValue("@correlation_id", correlationId);

@@ -530,6 +530,51 @@ public class DurableFlowTests
     }
 
     [Fact]
+    public async Task LocalStep_CancellationDuringCompletionSave_StillCheckpointsTheSideEffect()
+    {
+        // Regression: StepAsync persisted its completion checkpoint under the CALLER's token —
+        // the awaited-step path deliberately uses CancellationToken.None for the same reason. A
+        // token firing after the step body had run (money moved) lost the checkpoint, so the
+        // redelivered execution re-ran the side effect, and the store's cancellation tripped
+        // MarkLost on a lease whose row was intact. A local step's FIRST store update is the
+        // completion save (no breadcrumb precedes it), so ordinal 1 cancels mid-save.
+        using var cancellation = new CancellationTokenSource();
+        var store = new CancelOnNthUpdateStore(cancellation, 1);
+        var state = new FlowState { FlowId = "local-cancel-mid-save-flow" };
+        await using var lease = await CreateLeaseAsync(store, state);
+        var context = new DurableFlowContext(
+            state,
+            store,
+            Mock.Of<IAsyncResponseBuilder>(),
+            new AsyncResponseContextPropagation([]),
+            new DurableFlowOptions(),
+            Mock.Of<IAsyncResponseSubscriber>(),
+            recoverableSubscriber: null,
+            NullLogger.Instance,
+            lease);
+
+        var sideEffects = 0;
+        var result = await context.StepAsync(
+            "charge",
+            () =>
+            {
+                sideEffects++;
+                return Task.FromResult(42);
+            },
+            cancellation.Token);
+
+        Assert.Equal(42, result);
+        Assert.Equal(1, sideEffects);
+        Assert.True(cancellation.IsCancellationRequested);
+        Assert.True(state.Steps!["charge"].Completed);
+        // The PERSISTED ledger is what a redelivered execution reloads.
+        var persisted = await store.LoadAsync("local-cancel-mid-save-flow");
+        Assert.True(persisted!.Steps!["charge"].Completed);
+        // And the fence was never marked lost: the row is intact and still this run's.
+        lease.ThrowIfLost();
+    }
+
+    [Fact]
     public async Task AwaitStep_ResponseWinningTheDisposalSettlement_IsCheckpointedNotStranded()
     {
         // The race a point-in-time check missed: cancellation throws, the completed-successfully

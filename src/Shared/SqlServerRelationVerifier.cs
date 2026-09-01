@@ -242,7 +242,7 @@ internal static class SqlServerRelationVerifier
         command.Transaction = transaction;
         command.CommandText =
             $"""
-            SELECT sq.name, t.name, CAST(sq.increment AS bigint), sq.is_cycling
+            SELECT sq.name, t.name, CAST(sq.increment AS bigint), sq.is_cycling, CAST(sq.maximum_value AS bigint)
             FROM sys.sequences sq
             JOIN sys.schemas s ON s.schema_id = sq.schema_id
             JOIN sys.types t ON t.user_type_id = sq.user_type_id
@@ -257,15 +257,34 @@ internal static class SqlServerRelationVerifier
             var type = reader.GetString(1);
             var increment = reader.GetInt64(2);
             var cycles = reader.GetBoolean(3);
-            if (!string.Equals(type, "bigint", StringComparison.Ordinal) || increment != 1 || cycles)
-            {
-                throw new InvalidOperationException(
-                    $"The SQL Server {componentName} store's sequence '{schemaName}.{name}' exists but is not a monotonic counter: " +
-                    $"expected bigint INCREMENT BY 1 NO CYCLE; found {type} INCREMENT BY {increment.ToString(CultureInfo.InvariantCulture)}" +
-                    $"{(cycles ? " CYCLE" : " NO CYCLE")}. Acknowledgement ordering is derived from this sequence, so a descending or " +
-                    "wrapping sequence silently reorders delivery. Fix it with " +
-                    $"ALTER SEQUENCE {schemaName}.{name} INCREMENT BY 1 NO CYCLE; (recreate it if the type is wrong).");
-            }
+            var maximum = reader.GetInt64(4);
+            EvaluateSequence(schemaName, componentName, name, type, increment, cycles, maximum);
+        }
+    }
+
+    /// <summary>
+    /// The pure sequence decision over one loaded catalog row, split out so the unit suite can run
+    /// it without a server. MAXVALUE is part of it (PostgreSQL-verifier parity): a restricted
+    /// maximum passes the type/increment/cycle checks and then exhausts mid-production with
+    /// error 11728, on the very path this verification exists to protect.
+    /// </summary>
+    internal static void EvaluateSequence(
+        string schemaName,
+        string componentName,
+        string name,
+        string type,
+        long increment,
+        bool cycles,
+        long maximum)
+    {
+        if (!string.Equals(type, "bigint", StringComparison.Ordinal) || increment != 1 || cycles || maximum != long.MaxValue)
+        {
+            throw new InvalidOperationException(
+                $"The SQL Server {componentName} store's sequence '{schemaName}.{name}' exists but is not a monotonic counter: " +
+                $"expected bigint INCREMENT BY 1 NO CYCLE MAXVALUE {long.MaxValue}; found {type} INCREMENT BY {increment.ToString(CultureInfo.InvariantCulture)}" +
+                $"{(cycles ? " CYCLE" : " NO CYCLE")} MAXVALUE {maximum.ToString(CultureInfo.InvariantCulture)}. Acknowledgement ordering is derived " +
+                "from this sequence, so a descending or wrapping sequence silently reorders delivery, and a restricted maximum exhausts it. Fix it with " +
+                $"ALTER SEQUENCE {schemaName}.{name} INCREMENT BY 1 NO CYCLE NO MAXVALUE; (recreate it if the type is wrong).");
         }
     }
 
@@ -426,7 +445,7 @@ internal static class SqlServerRelationVerifier
             FROM sys.indexes i
             JOIN sys.objects o ON o.object_id = i.object_id
             JOIN sys.schemas s ON s.schema_id = o.schema_id
-            JOIN sys.index_columns ic ON ic.object_id = i.object_id AND ic.index_id = i.index_id
+            JOIN sys.index_columns ic ON ic.object_id = i.object_id AND ic.index_id = i.index_id AND ic.key_ordinal > 0
             JOIN sys.columns col ON col.object_id = i.object_id AND col.column_id = ic.column_id
             WHERE i.is_primary_key = 1 AND s.name = @schema
               AND o.name IN ({NameParameters(command, keyed.Select(e => e.Name))});
@@ -447,10 +466,27 @@ internal static class SqlServerRelationVerifier
             }
         }
 
+        EvaluatePrimaryKeys(schemaName, componentName, keyed, actual);
+    }
+
+    /// <summary>
+    /// The pure primary-key decision over loaded catalog rows, split out (like
+    /// <see cref="EvaluateIndexes"/>) so the unit suite can run it without a server. Only KEY
+    /// columns take part — belt and braces with the query's <c>key_ordinal &gt; 0</c> filter:
+    /// SQL Server lists a nonclustered primary key's clustering key at ordinal 0, and it is not
+    /// part of the key, so counting it rejected the standard random-GUID layout (nonclustered PK
+    /// over a clustered timestamp index) as "a primary key over (created_at, id)".
+    /// </summary>
+    internal static void EvaluatePrimaryKeys(
+        string schemaName,
+        string componentName,
+        IReadOnlyList<ExpectedObject> keyed,
+        Dictionary<string, List<(byte Ordinal, string Column)>> actual)
+    {
         foreach (var table in keyed)
         {
             var found = actual.TryGetValue(table.Name, out var columns)
-                ? columns.OrderBy(c => c.Ordinal).Select(c => c.Column).ToArray()
+                ? columns.Where(c => c.Ordinal > 0).OrderBy(c => c.Ordinal).Select(c => c.Column).ToArray()
                 : [];
 
             if (!found.AsSpan().SequenceEqual(table.PrimaryKey!, StringComparer.OrdinalIgnoreCase))

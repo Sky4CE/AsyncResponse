@@ -55,6 +55,20 @@ internal static class RedisTransportOptionsValidator
                 $"(it resolves to '{deadLetterStream}') so dead-lettered messages park instead of re-entering live consumption.");
         }
 
+        // The worker publish dedup marker must share the worker stream's cluster slot (a
+        // MULTI/EXEC couples them). The schema reuses the stream's own hash tag when it carries a
+        // well-formed one; a name whose braces do NOT form one has no marker key that can land in
+        // its slot, so reject it here instead of failing every publish with CROSSSLOT.
+        var workerStream = schema.WorkerStream.ToString();
+        if (workerStream.AsSpan().IndexOfAny('{', '}') >= 0
+            && string.Equals(RedisTransportKeySchema.HashTagOf(workerStream), workerStream, StringComparison.Ordinal))
+        {
+            throw new InvalidOperationException(
+                $"{nameof(RedisAsyncResponseTransportOptions)}.{nameof(options.WorkerStream)} (resolved to '{workerStream}') contains " +
+                "braces that do not form one well-formed Redis hash tag ('{tag}' with a non-empty tag). The idempotent publish marker " +
+                "must share the stream's cluster slot, which is only possible when the name has no braces or exactly one such tag.");
+        }
+
         // OperationTimeout arms a CancellationTokenSource per command; the retry delays feed
         // Task.Delay — all timer-armed, so all carry the .NET timer ceiling.
         AsyncResponseChannelOptions.EnsureTimerBacked(options.OperationTimeout, nameof(RedisAsyncResponseTransportOptions), nameof(options.OperationTimeout));
