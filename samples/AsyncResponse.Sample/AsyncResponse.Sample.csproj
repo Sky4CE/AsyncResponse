@@ -44,6 +44,8 @@
     <!-- Direct pin overriding the vulnerable Microsoft.OpenApi that Microsoft.AspNetCore.OpenApi
          pulls transitively. The version floor and CVE detail live in Directory.Packages.props. -->
     <PackageReference Include="Microsoft.OpenApi" />
+    <PackageReference Include="OpenTelemetry.Exporter.OpenTelemetryProtocol" />
+    <PackageReference Include="OpenTelemetry.Extensions.Hosting" />
     <PackageReference Include="Swashbuckle.AspNetCore.SwaggerUI" />
   </ItemGroup>
 
