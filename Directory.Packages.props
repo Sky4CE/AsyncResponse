@@ -28,7 +28,7 @@
   </ItemGroup>
   <!-- Channel / transport provider clients. -->
   <ItemGroup>
-    <PackageVersion Include="AWSSDK.SQS" Version="4.0.100.8" />
+    <PackageVersion Include="AWSSDK.SQS" Version="4.0.100.11" />
     <PackageVersion Include="Azure.Messaging.ServiceBus" Version="7.20.2" />
     <PackageVersion Include="Confluent.Kafka" Version="2.15.0" />
     <PackageVersion Include="Google.Cloud.PubSub.V1" Version="3.36.0" />
@@ -41,7 +41,7 @@
   </ItemGroup>
   <!-- Durable-flow state-store clients. -->
   <ItemGroup>
-    <PackageVersion Include="AWSSDK.DynamoDBv2" Version="4.0.103.1" />
+    <PackageVersion Include="AWSSDK.DynamoDBv2" Version="4.0.103.5" />
     <PackageVersion Include="Microsoft.Azure.Cosmos" Version="3.62.1" />
     <PackageVersion Include="Microsoft.Data.Sqlite" Version="10.0.11" />
     <!-- Explicit native-lib pin overriding the older e_sqlite3 that Microsoft.Data.Sqlite bundles.
