@@ -1,9 +1,12 @@
 name: Auto-retry failed jobs
 
 # Hosted runners are flaky and this repo runs 24 job legs per push to main. When a run on main
-# fails, re-run only its failed jobs (and their dependents) — the same button as "Re-run failed
-# jobs" in the UI, pressed automatically. The run_attempt guard is what stops this recursing:
-# each re-run fires `workflow_run: completed` again when it finishes.
+# fails on a KNOWN infrastructure signature, re-run only its failed jobs (and their dependents) —
+# the same button as "Re-run failed jobs" in the UI, pressed automatically. Any other failure is
+# left red: an unconditional re-run gave an intermittently failing product bug — a race, a lease,
+# a watchdog — five chances to land green on main, and publish.yml relies on main's check as the
+# reviewed gate. The run_attempt guard is what stops this recursing: each re-run fires
+# `workflow_run: completed` again when it finishes.
 on:
   workflow_run:
     workflows: [CI, CodeQL]
@@ -11,6 +14,7 @@ on:
 
 permissions:
   actions: write
+  contents: read
 
 jobs:
   rerun:
@@ -28,16 +32,40 @@ jobs:
           GH_REPO: ${{ github.repository }}
           RUN_ID: ${{ github.event.workflow_run.id }}
           ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+          WORKFLOW: ${{ github.event.workflow_run.name }}
+          # ci.yml's own in-job retry gates on the same fixture-boot flake. "database is locked"
+          # is SQLite on a slow runner disk during the EF Core storm tests (see the tests' own
+          # comments); the last two are hosted-runner infrastructure loss.
+          FLAKE_SIGNATURES: >-
+            Fixture' threw in InitializeAsync|SQLite Error 5: 'database is locked'|lost communication with the server|The runner has received a shutdown signal
         run: |
           set -euo pipefail
-          # Retry only on a known infrastructure signature (ci.yml's own retry step gates on the
-          # same fixture-boot flake). An unconditional re-run gave an intermittently failing
-          # product bug — a race, a lease, a watchdog — five chances to land green on main, and
-          # publish.yml relies on main's check as the reviewed gate.
-          if ! gh run view "$RUN_ID" --log-failed 2>/dev/null \
-               | grep -Eq "Fixture' threw in InitializeAsync|lost communication with the server|The runner has received a shutdown signal"; then
-            echo "::warning::Not re-running ${{ github.event.workflow_run.name }} run $RUN_ID (attempt $ATTEMPT): the failure does not match a known flake signature."
+          # Per-job logs through the same `gh api` path the re-run call itself uses. The whole-run
+          # download (`gh run view --log-failed`) came back empty under this token and, with its
+          # stderr discarded, silently classified a matching failure as "not a flake".
+          failed_jobs=$(gh api --paginate "repos/$GH_REPO/actions/runs/$RUN_ID/jobs?per_page=100" \
+            --jq '.jobs[] | select(.conclusion == "failure") | "\(.id) \(.name)"')
+          if [ -z "$failed_jobs" ]; then
+            echo "::warning::$WORKFLOW run $RUN_ID failed but lists no failed jobs; not re-running."
             exit 0
           fi
-          echo "::notice::Re-running failed jobs of ${{ github.event.workflow_run.name }} run $RUN_ID (attempt $ATTEMPT of 5)"
+          echo "Failed jobs:"; echo "$failed_jobs"
+
+          matched=""
+          while read -r job_id job_name; do
+            if ! gh api "repos/$GH_REPO/actions/jobs/$job_id/logs" > "job-$job_id.log" 2> "job-$job_id.err"; then
+              echo "::warning::Could not fetch the log of job $job_id ($job_name): $(tr '\n' ' ' < "job-$job_id.err")"
+              continue
+            fi
+            if grep -Eq "$FLAKE_SIGNATURES" "job-$job_id.log"; then
+              matched="$job_id ($job_name)"
+              break
+            fi
+          done <<< "$failed_jobs"
+
+          if [ -z "$matched" ]; then
+            echo "::warning::Not re-running $WORKFLOW run $RUN_ID (attempt $ATTEMPT): no failed job's log matches a known flake signature."
+            exit 0
+          fi
+          echo "::notice::Re-running failed jobs of $WORKFLOW run $RUN_ID (attempt $ATTEMPT of 5): job $matched matched a known flake signature."
           gh api --method POST "repos/$GH_REPO/actions/runs/$RUN_ID/rerun-failed-jobs"

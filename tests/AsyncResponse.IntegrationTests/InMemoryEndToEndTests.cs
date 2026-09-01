@@ -124,7 +124,9 @@ public sealed class InMemoryEndToEndTests : IClassFixture<InMemoryEndToEndTests.
         var step = Assert.Single(result.Steps);
         Assert.Equal("first", step.Name);
         Assert.False(step.Succeeded);
-        Assert.Equal(nameof(InvalidOperationException), step.ExceptionType);
+        // The wire failure shape (parity with every durable channel): the concrete type never
+        // crosses the wire, only the message does.
+        Assert.Equal(nameof(Exception), step.ExceptionType);
         Assert.Contains("first technical error", step.Detail, StringComparison.Ordinal);
     }
 
@@ -136,7 +138,7 @@ public sealed class InMemoryEndToEndTests : IClassFixture<InMemoryEndToEndTests.
         response.EnsureSuccessStatusCode();
         var result = await response.Content.ReadFromJsonAsync<AmbientExceptionResult>();
         Assert.True(result!.Faulted);
-        Assert.Equal(nameof(InvalidOperationException), result.ExceptionType);
+        Assert.Equal(nameof(Exception), result.ExceptionType); // wire failure shape, as on every durable channel
         Assert.Equal("ambient boom", result.Detail);
     }
 
@@ -150,7 +152,7 @@ public sealed class InMemoryEndToEndTests : IClassFixture<InMemoryEndToEndTests.
         Assert.Equal(2, result!.Failures.Count);
         Assert.All(result.Failures, failure =>
         {
-            Assert.Contains(nameof(InvalidOperationException), failure, StringComparison.Ordinal);
+            Assert.StartsWith($"{nameof(Exception)}: ", failure, StringComparison.Ordinal); // wire failure shape
             Assert.Contains("fanout boom", failure, StringComparison.Ordinal);
         });
     }

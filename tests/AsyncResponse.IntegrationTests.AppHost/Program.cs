@@ -213,8 +213,12 @@ IResourceBuilder<ContainerResource> AddRabbitMqContainer()
         .WithEndpoint(targetPort: 5672, scheme: "tcp", name: "amqp")
         .WithEndpoint(targetPort: 15672, scheme: "http", name: "management");
 
+// Pinned to a tag that exists: Google prunes old `google-cloud-cli` tags, and the previous pin
+// (446.0.1-emulators) vanished from the registry — every batch that boots this resource then
+// failed at "Dependency resource 'pubsub' failed to start". Bump to a current `*-emulators` tag
+// (see https://gcr.io/v2/google.com/cloudsdktool/google-cloud-cli/tags/list) when it happens again.
 IResourceBuilder<ContainerResource> AddPubSubContainer()
-    => builder.AddContainer("pubsub", "gcr.io/google.com/cloudsdktool/google-cloud-cli", "446.0.1-emulators")
+    => builder.AddContainer("pubsub", "gcr.io/google.com/cloudsdktool/google-cloud-cli", "583.0.0-emulators")
     .WithArgs("gcloud", "beta", "emulators", "pubsub", "start", "--host-port=0.0.0.0:8085", $"--project={ProjectId}")
     .WithEndpoint(targetPort: 8085, scheme: "tcp", name: "pubsub");
 

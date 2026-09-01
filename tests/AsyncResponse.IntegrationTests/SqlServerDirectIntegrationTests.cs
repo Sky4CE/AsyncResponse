@@ -358,13 +358,16 @@ public sealed class SqlServerDirectIntegrationTests(DataBatchFixture fixture) : 
     }
 
     [Fact]
-    public async Task LegacyCaseInsensitiveTables_DoNotDeliverAcrossCorrelationIds()
+    public async Task LegacyCaseInsensitiveTables_AreRejectedAtFirstUse_InsteadOfCrossDelivering()
     {
         // The collation above protects tables this build creates. Tables created by an EARLIER
         // build inherit the database's case-insensitive collation, and re-collating a primary-key
-        // column is not something an upgrade can do silently — so the dispatch loop re-checks the
-        // returned correlation id ordinally. Here the tables are deliberately created the old way:
-        // the store returns the wrong-case row, and the channel must refuse to deliver it.
+        // column is not something an upgrade can do silently. The dispatch loop re-checks the
+        // returned correlation id ordinally as the last line of defence — but with
+        // AutoCreateSchema = false the channel now verifies the relations it did not create
+        // (round 31), and a non-binary identity column fails that verification at first use with
+        // the actionable error, rather than the sweep ever cross-matching 'LEGACY-CI' and
+        // 'legacy-ci'. Here the tables are deliberately created the old way.
         var schema = NewSchema("sql_legacy_ci");
         ServiceProvider? provider = null;
         try
@@ -372,16 +375,14 @@ public sealed class SqlServerDirectIntegrationTests(DataBatchFixture fixture) : 
             await CreateLegacyChannelSchemaAsync(schema, "Latin1_General_100_CI_AS");
             provider = BuildProvider(schema, options => options.AutoCreateSchema = false);
             var subscriber = provider.GetRequiredService<IAsyncResponseSubscriber>();
-            var publisher = provider.GetRequiredService<IAsyncResponsePublisher>();
 
-            await using var upper = await subscriber.CreateResponseWaiter<OperationResult>("LEGACY-CI", timeout: TimeSpan.FromSeconds(5));
-            await publisher.SetResponse(new OperationResult { Status = OperationStatus.Completed }, "legacy-ci");
+            var rejected = await Assert.ThrowsAsync<InvalidOperationException>(async () =>
+            {
+                await using var upper = await subscriber.CreateResponseWaiter<OperationResult>("LEGACY-CI", timeout: TimeSpan.FromSeconds(5));
+            });
 
-            // The lower-case publish belongs to a different conversation. Pre-fix the sweep matched
-            // it case-insensitively and completed this waiter with somebody else's response; now
-            // the ordinal re-check refuses to deliver it, however long the sweep runs.
-            await Task.Delay(TimeSpan.FromSeconds(2));
-            Assert.False(upper.ResponseTask.IsCompleted);
+            Assert.Contains("Latin1_General_100_CI_AS", rejected.Message, StringComparison.Ordinal);
+            Assert.Contains("_BIN2", rejected.Message, StringComparison.Ordinal);
         }
         finally
         {

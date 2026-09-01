@@ -127,8 +127,11 @@ public class IngressBenchmarks
             await task.ConfigureAwait(false);
             return false;
         }
-        catch (InvalidOperationException)
+        catch (Exception ex) when (ex is not OperationCanceledException)
         {
+            // The wire failure shape: the channel faults the waiter with a plain Exception carrying
+            // the remote message — the publisher's concrete type never crosses the wire, on the
+            // in-memory channel exactly as on every durable one.
             return true;
         }
     }
