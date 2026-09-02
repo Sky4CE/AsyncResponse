@@ -55,8 +55,11 @@ work that has landed on `main` but not yet shipped. Security reporters credited 
 - The in-memory channel's `AbandonAsync` (used by `AsyncResponseTestHarness.SimulateRestartAsync`)
   latches cleanup so the zombie waiter's later disposal cannot delete the recovery registration
   the simulated crash must leave behind.
-- `.github/workflows/auto-retry.yml` re-runs a failed `main` run only when the failure matches a
-  known infrastructure flake signature.
+- `.github/workflows/auto-retry.yml` re-runs a failed `main` run once unconditionally; further
+  re-runs (up to five attempts) need a failed job's log to match a known infrastructure flake
+  signature, so an intermittently failing product bug gets two chances instead of five. Job logs
+  are fetched with `curl` — the runner's `gh` refuses to print a response carrying ANSI colour
+  codes, which had silently disabled the gate.
 - **The in-memory channel now faults waiters with the wire failure shape**: `SetException`
   delivers a plain `Exception` carrying the original message (plus the capped stack trace in
   `Data["RemoteStackTrace"]`), exactly as every durable channel does — the concrete exception

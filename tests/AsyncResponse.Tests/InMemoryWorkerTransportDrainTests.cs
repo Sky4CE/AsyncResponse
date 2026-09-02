@@ -321,16 +321,25 @@ public sealed class InMemoryWorkerTransportDrainTests
 
         // Saturate the thread pool so anything the host QUEUES (instead of running inline) cannot
         // execute during the start→stop window: once PendingWorkItemCount is positive, every pool
-        // thread is occupied and later work items wait behind the blockers.
+        // thread is occupied and later work items wait behind the blockers. The pool may already
+        // have grown far past ProcessorCount by the time this test runs (earlier tests' blocking
+        // waits make it inject threads), so a fixed 2×ProcessorCount blockers sometimes all found
+        // an idle thread and nothing ever queued — keep adding blockers until something does.
         using var gate = new ManualResetEventSlim(initialState: false);
-        var blockers = Enumerable.Range(0, Environment.ProcessorCount * 2)
-            .Select(_ => Task.Run(() => gate.Wait()))
-            .ToArray();
+        var blockers = new List<Task>();
         try
         {
-            var saturated = DateTime.UtcNow.AddSeconds(5);
-            while (ThreadPool.PendingWorkItemCount == 0 && DateTime.UtcNow < saturated)
-                Thread.Yield();
+            var saturated = DateTime.UtcNow.AddSeconds(10);
+            while (ThreadPool.PendingWorkItemCount == 0 && DateTime.UtcNow < saturated && blockers.Count < 4096)
+            {
+                for (var i = 0; i < Environment.ProcessorCount; i++)
+                    blockers.Add(Task.Run(() => gate.Wait()));
+
+                var settle = DateTime.UtcNow.AddMilliseconds(50);
+                while (ThreadPool.PendingWorkItemCount == 0 && DateTime.UtcNow < settle)
+                    Thread.Yield();
+            }
+
             Assert.True(ThreadPool.PendingWorkItemCount > 0, "could not saturate the thread pool");
 
             await host.StartAsync(CancellationToken.None);
