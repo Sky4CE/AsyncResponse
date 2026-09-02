@@ -108,7 +108,7 @@ public sealed class SqlServerFlowStateStore : IFlowStateStore
         var stateJson = DurableFlowStoreShared.SerializeBounded(flowId, state, _options.MaxStateBytes, "SQL Server");
         await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
         if (DurableFlowStoreShared.ShouldPrune(ref _lastPruneTicks, _options.PruneInterval))
-            await PruneExpiredAsync(cancellationToken).ConfigureAwait(false);
+            await DurableFlowStoreShared.PruneQuietlyAsync(() => PruneExpiredAsync(cancellationToken)).ConfigureAwait(false);
 
         await using var connection = await OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         await using var command = connection.CreateCommand();

@@ -13,6 +13,84 @@ work that has landed on `main` but not yet shipped. Security reporters credited 
 
 ### Changed
 
+- **Durable-flow failure callbacks are correlation-scoped.** The lost-subscriber FAILURE target a
+  flow registers for an awaited step is now `IDurableFlowExecutor.FailAsync(flowId, exception,
+  correlationId)` (new overload): it fails the run only while a step is still pending on that
+  correlation id, and a late error for a superseded or already-settled id — a dead worker's
+  registration outliving its replacement's — is ignored instead of terminally failing a run that
+  was live on a newer id. The two-argument `FailAsync(flowId, exception)` remains the unscoped
+  operator form. Two more re-attach fixes: a response won in the same instant the execution lease
+  lapses is checkpointed through the lease-less compare-and-swap on the normal completion path
+  too (previously only on the cancellation branch — the acked payload was otherwise lost, and the
+  redelivery re-attached to a consumed id, burned the step timeout, and re-sent); and a non-wait
+  failure raised after the trigger sent (a throwing `OnStepWaitingAsync` observer or logger)
+  keeps the breadcrumb, so the redelivered execution re-attaches instead of re-sending.
+- **RabbitMQ `MaxDeliveryAttempts` is enforced before the handler runs, and the cap now parks.**
+  A delivery whose previous attempt ended without a thrown exception (process killed mid-handler;
+  the broker requeued it with `redelivered`) is judged against the cap before executing
+  (NATS/database-transport parity). At the cap with `x-death` present — the message has already
+  ridden the operator's TTL-retry dead-letter cycle — it is parked terminally: copied to
+  `DeadLetterQueue` through the default exchange (bypassing the cycling DLX) and ACKed, or ACKed
+  and dropped with an error log when no `DeadLetterQueue` is configured; previously the reject
+  re-entered the cycle at TTL rate forever. Startup validation now sums `ShutdownTimeout` twice
+  (consumer cancel, then channel/connection close) plus `BackgroundDrainTimeout` against
+  `HostShutdownTimeout`.
+- **Kafka `MaxDeliveryAttempts = 0` under `AckAfterEnqueue` means a single attempt** before the
+  already-committed message is dead-lettered and surfaced via `OnBackgroundFailure` (it retried
+  forever and wedged the background worker with no record). `AckAfterHandlerCompletes` keeps
+  `0` = unlimited in-process retries.
+- **Redis transport early-ACK hardening.** `XREADGROUP` reads and `XCLAIM` pending claims are
+  clamped to the dispatcher's free capacity, so entries are never deferred into the PEL with a
+  bumped delivery count; a failing dead-letter `XADD` no longer faults the subscriber (logged,
+  the entry stays pending); on Redis 5/6 an `XCLAIM` tombstone (entry trimmed while pending) is
+  ACKed by its pending id so it drains; the unparsable-entry discard ignores cancellation like
+  every other settlement.
+- **Database transports (PostgreSQL, SQL Server, MongoDB).** `BackgroundDrainTimeout` is split —
+  three quarters for queued/running handlers, one quarter reserved for dead-lettering (and
+  `OnBackgroundFailure`) the already-ACKed entries still queued when the budget lapses — so the
+  documented "dead-lettered, not lost at process exit" guarantee actually holds. The
+  lease-renewal join is skipped while the subscriber is stopping (`LockTimeout`, an unvalidated
+  term, is no longer spent on the stop path). SQL Server prunes dead letters in
+  `DELETE TOP (1000)` batches per throttle window (an unbounded delete escalated to a table lock
+  that `READPAST` cannot skip). The MongoDB transport's claim and dead-letter prune pin the
+  simple (binary) collation, so an operator-created collection with a folding default collation
+  can no longer let one subscriber claim another queue's documents — an index built under a
+  folding collation cannot serve that query, so the claim scans there.
+- **Azure Service Bus startup validation covers `AckAfterHandlerCompletes`:**
+  `HostShutdownTimeout` must fit `2 × ShutdownTimeout` when `LockRenewalInterval` is set
+  (lock-renewal join, then receiver close), `1 ×` when it is `null`. **SQS** `CreateQueues = true`
+  converging an existing `.fifo` queue no longer re-applies the create-only `FifoQueue`
+  attribute, which `SetQueueAttributes` rejected — failing host startup once the provisioning
+  retries were exhausted.
+- **Channels.** The Redis channel's response pub/sub channels are key-routed
+  (`RedisChannel.WithKeyRouting`), so on Redis Cluster `SUBSCRIBE` and `PUBLISH` land on the same
+  node and `PUBLISH`'s subscriber count — the lost-subscriber signal — is meaningful; the channel
+  now implements `IAsyncDisposable`, and executor retirements are joined when DI disposes the
+  singleton at host shutdown. The database channels' same-process fast path for an idempotent
+  duplicate publish carries the original row's settlement columns, so a retry can no longer
+  replay an already-consumed response to a waiter registered after the ack. The MongoDB channel
+  ignores `FullSweepInterval` (sweeping on every `ListenerPollInterval` tick) whenever change
+  streams are not carrying delivery — `UseChangeStreams = false`, or a standalone server —
+  because there the throttled sweep was the only cross-process wake and its 5 s default equalled
+  `DeliveryConfirmationTimeout`. The NATS channel's `SubjectPrefix` and the NATS transport's
+  `SubjectPrefix`/explicit subjects reject a value that yields an empty subject token
+  (leading/trailing `.` or `..`; a dotted prefix like `my.app` stays valid).
+- **Core hardening.** A type-level `Allow<T>()` no longer authorizes property/event accessors
+  (`get_`/`set_`) or `object`'s members — only ordinary methods are callback candidates.
+  Persisted type names (service interfaces, recovery payload types) resolve only against
+  assemblies already loaded into the process; a name whose generic argument names an unloaded
+  assembly resolves to null instead of forcing the load. A `Success: true` envelope with an
+  ABSENT `Payload` is rejected (`JsonException`, permanent) exactly like an explicit `null`, and
+  a duplicated `Payload` key binds last-wins. The in-memory worker transport keeps retrying
+  during the shutdown drain with each backoff capped at `RetryBaseDelay` (a drain-time failure
+  previously dropped the job after one attempt); unlimited attempts (`0`) still drop on stop.
+- **Durable-flow stores.** Cosmos's update, lease and delete paths treat only a 404 with
+  sub-status 0 as "no such item" (matching `LoadAsync`); 1002/1003/1004 propagate as errors
+  instead of reading as a lost lease. The relational stores (PostgreSQL, SQL Server, MySQL,
+  Oracle, SQLite, EF Core) no longer fail `StartAsync` when the opportunistic prune inside
+  `TryCreateAsync` fails; the prune is skipped until the next `PruneInterval`.
+- The stress harness's ACK-after-enqueue dispatch storms now time the background drain as part
+  of the measured region, so the published throughput series measures dispatch, not enqueue.
 - **Local step checkpoints are no longer interruptible.** `StepAsync`, `StepAsync<TResult>` and
   the child-flow memoization persist their completion checkpoint under `CancellationToken.None`
   (awaited-step parity): a caller token firing after the step's side effect had run lost the
@@ -233,7 +311,10 @@ work that has landed on `main` but not yet shipped. Security reporters credited 
   Testing harness is built on it and it doubles as a lightweight production telemetry hook.
   Observer exceptions fail the current execution attempt like a step failure (that contract is
   the crash-injection mechanism) — except in `OnRunAttemptFailedAsync`, which fires while the
-  attempt's own exception is already propagating and therefore swallows observer throws.
+  attempt's own exception is already propagating and therefore swallows observer throws. A throw
+  from `OnStepWaitingAsync` (the trigger has already sent) fails the attempt but keeps the step's
+  correlation-id breadcrumb, so the redelivered execution re-attaches to the in-flight wait
+  rather than restarting the step fresh and re-sending.
 - **Engine-wide `TimeProvider` seam** — `AddAsyncResponse()` registers `TimeProvider.System`
   (TryAdd; a host or the test harness can pre-register its own), and every time-driven Core
   component resolves it: waiter timeouts, execution leases and their renewal, the recovery

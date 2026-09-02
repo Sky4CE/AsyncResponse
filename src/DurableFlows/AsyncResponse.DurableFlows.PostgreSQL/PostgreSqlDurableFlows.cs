@@ -140,7 +140,7 @@ public sealed class PostgreSqlFlowStateStore : IFlowStateStore, IDisposable, IAs
         var stateJson = DurableFlowStoreShared.SerializeBounded(flowId, state, _options.MaxStateBytes, "PostgreSQL");
         await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
         if (DurableFlowStoreShared.ShouldPrune(ref _lastPruneTicks, _options.PruneInterval))
-            await PruneExpiredAsync(cancellationToken).ConfigureAwait(false);
+            await DurableFlowStoreShared.PruneQuietlyAsync(() => PruneExpiredAsync(cancellationToken)).ConfigureAwait(false);
 
         await using var connection = await _dataSource.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         await using var command = connection.CreateCommand();

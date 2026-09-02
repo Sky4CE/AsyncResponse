@@ -14,6 +14,9 @@ only as trustworthy as the store and transport it travels through.** Recovery st
 name a service interface and method that the receiving process will resolve from its DI container and
 invoke. Anyone who can write to the recovery store or worker stream can therefore ask a consuming
 process to invoke any registered (service, method) pair with attacker-influenced arguments.
+Persisted type names are resolved only against assemblies already loaded into the process — a
+name never makes the process load one — so that reach is bounded to what the consuming process
+has itself loaded.
 
 - Authenticate and authorize access to your channel store and transport broker — Redis (or Valkey /
   Dragonfly / Garnet), NATS, PostgreSQL, SQL Server, Azure Service Bus, AWS SQS, Google Pub/Sub,
@@ -33,7 +36,10 @@ By default there is **no authorizer**: every registered callback/worker target i
 as before — zero boilerplate. When you register an authorizer, only the allowed (service, method)
 pairs are invokable by persisted callbacks and worker jobs; everything else is refused. This is
 **type-level** authorization — you allow a service type (and optionally narrow by method name), not
-per-method attributes on your flow classes.
+per-method attributes on your flow classes. A type-level allowance admits only the type's ordinary
+methods: property and event accessors (`get_`/`set_`/`add_`/`remove_`) and `object`'s own members
+are never callback candidates, so a descriptor aimed at `set_ApiKey` on an allowed DI singleton is
+refused rather than executed.
 
 ```csharp
 builder.Services.AddAsyncResponse()
@@ -159,9 +165,12 @@ logged and skipped rather than throwing, so bad input cannot crash ingress.
 ## Type resolution for plugins / AssemblyLoadContext
 
 Recovery callbacks and worker payloads are persisted as **type name strings** and resolved on the
-receiving side. If your callback/payload types live in assemblies loaded into a non-default
-`AssemblyLoadContext` (plugins, add-ins, dynamically loaded modules), the default resolver may not
-find them. Register them explicitly (opt-in):
+receiving side — against the assemblies **already loaded** into the process only, every component
+of the name included: a generic argument naming an assembly the process has not loaded resolves
+the whole name to unresolved rather than forcing that assembly to load. If your callback/payload
+types live in assemblies loaded into a non-default `AssemblyLoadContext` (plugins, add-ins,
+dynamically loaded modules), the default resolver may not find them. Register them explicitly
+(opt-in):
 
 ```csharp
 using AsyncResponse;

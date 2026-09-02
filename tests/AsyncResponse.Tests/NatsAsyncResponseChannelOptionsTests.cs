@@ -127,6 +127,28 @@ public class NatsAsyncResponseChannelOptionsTests
     public void Validate_Accepts_NullDefaultTimeout()
         => new NatsAsyncResponseChannelOptions { DefaultTimeout = null }.Validate();
 
+    /// <summary>
+    /// Regression (round 33): the prefix guard rejected whitespace and the wildcards but not an
+    /// EMPTY subject token. A leading, trailing or doubled '.' passed startup; nats-server then
+    /// rejected every SUB with a non-fatal -ERR that NATS.Net never surfaces, so every waiter
+    /// registered with no server-side interest and every response took the lost-subscriber path
+    /// while the live waiter ran to its timeout. Pre-fix: <c>Validate</c> accepted all three.
+    /// </summary>
+    [Theory]
+    [InlineData(".asyncresponse")]
+    [InlineData("asyncresponse.")]
+    [InlineData("async..response")]
+    public void Validate_Throws_ForSubjectPrefixWithAnEmptyToken(string prefix)
+        => AssertInvalid(o => o.SubjectPrefix = prefix);
+
+    /// <summary>
+    /// A dotted prefix is the intended namespacing ("my.app" → my.app.response.&lt;id&gt;) and must
+    /// keep passing: the rule is about EMPTY tokens, not about dots.
+    /// </summary>
+    [Fact]
+    public void Validate_Accepts_DottedSubjectPrefix()
+        => new NatsAsyncResponseChannelOptions { SubjectPrefix = "my.app" }.Validate();
+
     private static void AssertInvalid(Action<NatsAsyncResponseChannelOptions> mutate)
     {
         var options = new NatsAsyncResponseChannelOptions();

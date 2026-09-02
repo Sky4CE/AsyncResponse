@@ -55,6 +55,31 @@ internal static class AzureServiceBusOptionsValidator
         switch (subscriberOptions.AckMode)
         {
             case AzureServiceBusAckMode.AckAfterHandlerCompletes:
+                // ShutdownTimeout is spent at shutdown even without a background drain (SQS
+                // parity, and what this option's own XML doc and transport-semantics.md promise
+                // is validated): the lock-renewal join on the final batch, then the receiver
+                // close, run SEQUENTIALLY on the stop path, so with renewal on the budget must
+                // fit two of them. Returning here without summing anything let a raised
+                // ShutdownTimeout overrun the host's stop budget, force-terminating mid-close and
+                // redelivering handled-but-uncompleted messages whose locks then lapsed.
+                if (subscriberOptions.LockRenewalInterval is not null)
+                {
+                    ShutdownBudgetValidator.Validate(
+                        "Azure Service Bus",
+                        $"{nameof(AzureServiceBusAsyncResponseOptions)}.{nameof(AzureServiceBusAsyncResponseOptions.HostShutdownTimeout)}",
+                        transportOptions.HostShutdownTimeout,
+                        ($"{nameof(AzureServiceBusAsyncResponseOptions)}.{nameof(AzureServiceBusAsyncResponseOptions.ShutdownTimeout)} (lock-renewal join)", transportOptions.ShutdownTimeout),
+                        ($"{nameof(AzureServiceBusAsyncResponseOptions)}.{nameof(AzureServiceBusAsyncResponseOptions.ShutdownTimeout)} (receiver close)", transportOptions.ShutdownTimeout));
+                }
+                else
+                {
+                    ShutdownBudgetValidator.Validate(
+                        "Azure Service Bus",
+                        $"{nameof(AzureServiceBusAsyncResponseOptions)}.{nameof(AzureServiceBusAsyncResponseOptions.HostShutdownTimeout)}",
+                        transportOptions.HostShutdownTimeout,
+                        ($"{nameof(AzureServiceBusAsyncResponseOptions)}.{nameof(AzureServiceBusAsyncResponseOptions.ShutdownTimeout)} (receiver close)", transportOptions.ShutdownTimeout));
+                }
+
                 return;
 
             case AzureServiceBusAckMode.AckAfterEnqueue:

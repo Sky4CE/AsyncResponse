@@ -36,7 +36,9 @@ These hold for every transport in the matrix, verified per package:
   handler fails after the message was already settled (see the
   [context table](#what-onbackgroundfailure-receives) for what each transport reports).
 - **`BackgroundDrainTimeout` = 20 s.** The maximum time to wait for queued and running
-  background handlers while a hosted subscriber stops.
+  background handlers while a hosted subscriber stops. The database transports split it —
+  three quarters for the handlers, one quarter reserved for dead-lettering what is still queued
+  when that lapses (see [their notes](#postgresql-sql-server-mongodb)).
 - **`HostShutdownTimeout` = 30 s.** A mirror of `Microsoft.Extensions.Hosting`
   `HostOptions.ShutdownTimeout` (whose real default is also 30 s). When a subscriber opts into
   early ACK, startup validation sums the transport's worst-case shutdown spend and **throws
@@ -63,8 +65,11 @@ These hold for every transport in the matrix, verified per package:
   own it.
 - **drain** — `BackgroundDrainTimeout` (20 s default); **+ close 5 s** — the transport also
   spends its `ShutdownTimeout` (5 s default) on a bounded close/join, and startup validation
-  counts both against `HostShutdownTimeout`. Transports without the close component have no
-  `ShutdownTimeout` option at all.
+  counts both against `HostShutdownTimeout` — twice over for RabbitMQ (consumer cancel, then the
+  channel/connection close after the drain), and for Azure Service Bus in both ack modes (in
+  ack-after-handler mode the renewal-task join and the receiver close are two terms when
+  `LockRenewalInterval` is set, one when it is `null`). Transports without the close component
+  have no `ShutdownTimeout` option at all.
 - **—** — not applicable to that transport.
 - Unqualified option names are per-subscriber (`WorkerSubscriber.` / `ResponseSubscriber.`);
   `MaxDeliveryAttempts` defaults to 5 with `0` = unlimited unless the row says otherwise.
@@ -73,13 +78,13 @@ These hold for every transport in the matrix, verified per package:
 
 | Transport | Ack semantics (default mode) | Attempt counting | Dead-letter destination | After a failure post-early-ACK | Shutdown drain budget | Lock/lease renewal |
 |---|---|---|---|---|---|---|
-| **AzureServiceBus** | peek-lock: complete on success, abandon on failure | broker `DeliveryCount`; dead-letter at `MaxDeliveryAttempts` (`0` = defer to the entity's `MaxDeliveryCount`) | native dead-letter subqueue (broker built-in, nothing to declare) | log + `OnBackgroundFailure`; the lock is settled, no DLQ write possible | drain + close 5 s (receiver/sender close, renewal-task join) | `LockRenewalInterval` 10 s, on by default; `null` disables |
+| **AzureServiceBus** | peek-lock: complete on success, abandon on failure | broker `DeliveryCount`; dead-letter at `MaxDeliveryAttempts` (`0` = defer to the entity's `MaxDeliveryCount`) | native dead-letter subqueue (broker built-in, nothing to declare) | log + `OnBackgroundFailure`; the lock is settled, no DLQ write possible | drain + close 5 s (renewal-task join, then receiver/sender close; validated in both ack modes — two `ShutdownTimeout` terms with renewal on, one with it off) | `LockRenewalInterval` 10 s, on by default; `null` disables |
 | **GooglePubSub** | streaming pull: ACK on success, NACK on failure | native — subscription retry policy + `DeadLetterPolicy` `maxDeliveryAttempts`; no app counter by design | subscription `DeadLetterPolicy` (delegated to infra) | log + `OnBackgroundFailure`; already ACKed, no DLQ write possible | drain + close 5 s (subscriber-client stop) | — (the Pub/Sub client manages the ack deadline) |
 | **Kafka** | manual offset store, auto-committed every `OffsetCommitInterval` 5 s; offsets cannot NACK one message | in-process retries with backoff (100 ms → 5 s); counted per process delivery — a restart before the commit resets the count | `{topic}.deadletter` (or one `DeadLetterTopic`); declared by `CreateTopics` (default on) | retried in-process, then log + `OnBackgroundFailure` + produced to the DLQ topic | drain only | — (stay under `max.poll.interval.ms` instead) |
 | **MongoDB** | claimed document: delete on success, reschedule after `RedeliveryDelay` 5 s on failure | store — the `findOneAndUpdate` claim increments the attempt | `deadletter` logical queue in the same collection; `DeadLetterEnabled` default on, optional `DeadLetterRetention` | log + `OnBackgroundFailure` + DLQ document | drain + close 5 s (change-stream listen join) | automatic fenced renewal at `LockTimeout`/2 (server-clock `$$NOW`, `lock_id` fence) |
 | **NATS** | JetStream explicit ack: ACK on success, NAK + `RedeliveryDelay` 5 s on failure | broker `NumDelivered`; at `MaxDeliveryAttempts` the message is ACKed + dead-lettered — including a delivery whose earlier attempts never settled (process killed mid-handler), refused before execution | `{prefix}.transport.deadletter` subject/stream; declared by `CreateStreams` (default on) | log + `OnBackgroundFailure` + published to the DLQ subject | drain only | automatic in-progress heartbeat every `AckWait`/3 across the in-flight batch (not configurable) |
 | **PostgreSQL** | claimed row: delete on success, reschedule after `RedeliveryDelay` 5 s on failure | store — the `FOR UPDATE SKIP LOCKED` claim increments `attempts` | `deadletter` logical queue in the same table; `DeadLetterEnabled` default on, optional `DeadLetterRetention` | log + `OnBackgroundFailure` + DLQ row | drain + close 5 s (LISTEN task join) | automatic fenced renewal at `LockTimeout`/2 (`lock_id` fence) |
-| **RabbitMQ** | per-delivery `basic.ack`; `basic.nack` + requeue on failure | broker `x-death` header + `redelivered` flag; **`MaxDeliveryAttempts` default `0` = unlimited**; values > 2 need a TTL-retry DLX cycle (see notes) | optional `DeadLetterExchange` (default `null` → exhausted messages are **dropped**); declared when set and `DeclareTopology` is on | log + `OnBackgroundFailure` + published to the `DeadLetterExchange` when one is configured (the early ACK already foreclosed the native reject-without-requeue route; with a DLX configured the subscriber channel enables publisher confirmations, so an unroutable copy fails loudly instead of logging a false success) | drain + close 5 s (connection close) | — (unacked deliveries hold no expiring lock) |
+| **RabbitMQ** | per-delivery `basic.ack`; `basic.nack` + requeue on failure | broker `x-death` header + `redelivered` flag, judged before the handler runs; **`MaxDeliveryAttempts` default `0` = unlimited**; values > 2 need a TTL-retry DLX cycle, and at the cap a message that has ridden it is parked terminally (see notes) | optional `DeadLetterExchange` (default `null` → exhausted messages are **dropped**); declared when set and `DeclareTopology` is on; a message capped after riding the DLX cycle is parked in `DeadLetterQueue` via the default exchange (ACKed and dropped when none is configured) | log + `OnBackgroundFailure` + published to the `DeadLetterExchange` when one is configured (the early ACK already foreclosed the native reject-without-requeue route; with a DLX configured the subscriber channel enables publisher confirmations, so an unroutable copy fails loudly instead of logging a false success) | drain + close 5 s ×2 (consumer cancel, then channel/connection close) | — (unacked deliveries hold no expiring lock) |
 | **Redis** | consumer group: `XACK` on success; a failed entry stays in the PEL and is reclaimed after `PendingMessageMinIdleTime` 30 s | broker — PEL delivery count (`XPENDING`) + 1 at claim; at `MaxDeliveryAttempts` the entry is dead-lettered + `XACK`ed | `{prefix}:transport:deadletter` stream (`XADD` auto-creates it); `DeadLetterEnabled` default on | log + `OnBackgroundFailure` + `XADD` to the DLQ stream | drain only | — (`PendingMessageMinIdleTime` must exceed the slowest handler) |
 | **SQS** | visibility settle: delete on success; failure lets the visibility timeout lapse (or shortens it to `RedeliveryDelay`) | native `ApproximateReceiveCount` + redrive `maxReceiveCount`; no app counter by design | native redrive DLQ; delegated — or declared by `CreateQueues` (default **off**): `{queue}-dlq` + `MaxReceiveCount` 5 | log + `OnBackgroundFailure`; already deleted, no DLQ write possible | drain + up to `ShutdownTimeout` joining the visibility-renewal task on the final batch | opt-in `VisibilityRenewalInterval` (default off); suppressed per message once the failure path schedules `RedeliveryDelay` |
 | **SqlServer** | claimed row: delete on success, reschedule after `RedeliveryDelay` 5 s on failure | store — the `UPDLOCK/READPAST` claim increments `attempts` | `deadletter` logical queue in the same table; `DeadLetterEnabled` default on, optional `DeadLetterRetention` | log + `OnBackgroundFailure` + DLQ row | drain only | automatic fenced renewal at `LockTimeout`/2 (`lock_id` fence) |
@@ -133,7 +138,9 @@ Only cells that need more than a phrase.
   ([troubleshooting](troubleshooting.md#azure-service-bus-messagelocklostexception-redeliveries-of-already-processed-messages)).
   Renewal failures are logged and processing continues — the message simply redelivers,
   preserving at-least-once. Ignored in early ACK (the message is already completed); the
-  renewal task's join at shutdown is bounded by `ShutdownTimeout`.
+  renewal task's join at shutdown is bounded by `ShutdownTimeout` and runs before the receiver
+  close, so in ack-after-handler mode startup validation requires `HostShutdownTimeout` to fit
+  `2 × ShutdownTimeout` with renewal on (`1 ×` with `LockRenewalInterval = null`).
 - Every abandon burns broker `DeliveryCount`, which also counts toward the *entity's*
   `MaxDeliveryCount` policy. `MaxDeliveryAttempts = 0` disables the package-level dead-letter
   decision and leaves poison handling entirely to that broker policy.
@@ -172,7 +179,11 @@ Only cells that need more than a phrase.
 - Attempts are counted per process delivery: a consumer restart before the offset commit
   resets the count. The message that exhausts its attempts is produced to the dead-letter
   topic with failure-detail headers and its offset committed, so the partition keeps moving.
-  The same retry-then-dead-letter path runs for background failures after an early ACK.
+  The same retry-then-dead-letter path runs for background failures after an early ACK, with
+  one difference in what `MaxDeliveryAttempts = 0` means: unlimited in-process retries in
+  ack-after-handler mode, but a **single** attempt under early ACK — the offset is already
+  committed, and retrying a committed message forever wedged the background worker with no
+  record — after which the message is dead-lettered and surfaced via `OnBackgroundFailure`.
 - In early ACK, a full background queue pauses consumption on all assigned partitions
   (re-checked every `BackpressurePollDelay` 50 ms) rather than dropping or re-fetching.
 - A message that cannot be projected at all (empty payload, unresolvable correlation id) is
@@ -196,11 +207,24 @@ Only cells that need more than a phrase.
   counts it — a plain requeue never advances `x-death`);
   without such a cycle it behaves like 2 and logs a startup warning
   ([troubleshooting](troubleshooting.md#rabbitmq-startup-warns-about-maxdeliveryattempts-or-a-poison-message-loops-forever)).
+- **At the cap with `x-death` present the message is parked, terminally.** Rejecting it again
+  would only re-enter the cycle at its TTL rate forever, so it is copied to `DeadLetterQueue`
+  through the default exchange (bypassing the cycling `DeadLetterExchange`) and ACKed — or, with
+  no `DeadLetterQueue` configured, ACKed and **dropped** with an error log. A failed copy leaves
+  the delivery un-ACKed, so the broker redelivers it and the park retries.
+- The cap is judged **before** the handler runs as well (NATS and database-transport parity): a
+  delivery whose previous attempt ended without a thrown exception — the process was killed
+  mid-handler and the broker requeued it with `redelivered` set — is dead-lettered (or parked)
+  without executing, instead of crash-looping every replica in turn.
 - The default `MaxDeliveryAttempts = 0` means unlimited requeues — a poison message hot-loops
   until a cap (with a `DeadLetterExchange`) is configured. With a cap but no
   `DeadLetterExchange`, the exhausted message is rejected without requeue and **dropped**.
-- In early ACK, a full background queue NACKs the delivery with requeue, so it redelivers
-  instead of waiting.
+- In early ACK, a full background queue parks the delivery on the bounded in-process channel
+  until capacity frees; a NACK with requeue is sent only when that enqueue fails during
+  shutdown/dispose, so backpressure itself never churns redeliveries.
+- Shutdown spends `ShutdownTimeout` twice — cancelling the consumer, then closing the channel
+  and connection after the background drain — and startup validation sums both plus
+  `BackgroundDrainTimeout` against `HostShutdownTimeout`.
 
 ### Redis
 
@@ -208,8 +232,16 @@ Only cells that need more than a phrase.
   pending-entries list every `PendingClaimInterval` (5 s) and claims entries idle longer than
   `PendingMessageMinIdleTime` (30 s) with `XCLAIM`, so a crashed consumer's in-flight work is
   retried by a peer; the attempt is the PEL delivery count + 1.
-- In early ACK, a full background queue leaves the entry un-ACKed in the PEL for the reclaim
-  loop to retry — nothing is NACKed because Redis has no NACK.
+- In early ACK, `XREADGROUP` reads and `XCLAIM` pending claims are clamped to the dispatcher's
+  free capacity (Azure Service Bus/SQS parity), so an entry is never read only to be deferred
+  into the PEL with a bumped delivery count — backpressure pauses consumption instead of
+  spending attempts, and nothing is NACKed because Redis has no NACK.
+- A dead-letter `XADD` that fails (MISCONF/OOM, a timeout, `WRONGTYPE` on the dead-letter key)
+  is logged and leaves the entry pending for the next reclaim cycle instead of faulting the
+  subscriber. On Redis 5/6, `XCLAIM` answers with a nil entry for an id trimmed while still
+  pending; that tombstone is ACKed by its pending id so it drains rather than being
+  re-dead-lettered every claim cycle. Discarding an unparsable entry is a settlement and ignores
+  cancellation like every other one.
 - Worker publishes are idempotent across their retry window: `XADD` has no natural identity (the
   entry id is server-generated), so a retry after an ambiguous timeout — the command was abandoned
   client-side while the server kept running it — used to append the same job twice. Each publish
@@ -267,7 +299,10 @@ Only cells that need more than a phrase.
   the AWS SDK's own client-side HTTP timeout, which surfaces as `TaskCanceledException` — is logged
   and the sweep continues with the rest of the batch; only the subscriber's own stop ends it.
 - `CreateQueues` is the only provisioning default that is **off** — production queues (and
-  their redrive policies) are usually owned by infrastructure code.
+  their redrive policies) are usually owned by infrastructure code. When on, converging an
+  existing `.fifo` queue re-applies only its mutable attributes: the create-only `FifoQueue`
+  attribute is skipped, since `SetQueueAttributes` rejects it (which previously failed host
+  startup once the provisioning retries were exhausted).
 - `CorrelationIdAttribute` resolution is case-**sensitive**, unlike every other transport's
   case-insensitive inbound header lookup — AWS message attribute names are themselves
   case-sensitive, so `CorrelationId` and `correlationId` can coexist as two distinct attributes on
@@ -286,12 +321,20 @@ Only cells that need more than a phrase.
   and the loss is logged. Renewal *failures* (transient DB errors) are logged and retried next
   beat. At settlement the dispatcher joins the heartbeat for at most `LockTimeout`: a renew that
   never returns (a degraded database mid-command) is abandoned with a warning rather than holding
-  the ack — and at shutdown the host budget — for a full connect+command timeout.
+  the ack for a full connect+command timeout. While the subscriber is **stopping** the join is
+  skipped altogether — the lease lapses on its own — so `LockTimeout`, a term no shutdown-budget
+  validator counts, is never spent on the stop path.
 - The MongoDB transport pins its collection handle to the primary (channel and flow-store
   parity), so a `secondaryPreferred` client cannot route the change-stream wake to a lagging
   secondary. With `AutoCreateIndexes = false` it runs a one-time read-only check and **warns**
   when no index leads on `queue` — every claim would otherwise scan the collection on every poll
-  tick with nothing to show for it.
+  tick with nothing to show for it. The claim and the dead-letter prune pin the **simple**
+  (binary) collation, so an operator-created collection with a case- or accent-folding default
+  collation cannot let one subscriber claim another logical queue's documents (the worker
+  subscriber previously claimed response documents, which the ingress then dropped and ACKed
+  with no dead-letter record). The trade-off: an index built under a folding collation cannot
+  serve a simple-collation query, so the claim scans there — a collection with the default
+  (simple) collation is unaffected.
 - `MaxDeliveryAttempts` is enforced **before** the handler runs, not only after it throws. A
   delivery that ends any other way — the process dies mid-handler, the lease lapses while the
   database is unreachable at settlement — never reaches the post-failure check, and the claim has
@@ -304,9 +347,16 @@ Only cells that need more than a phrase.
   under a deterministic id, and removed again when the fenced delete does not match).
 - The dead-letter queue is rows/documents in the same table/collection under the
   `DeadLetterQueue` logical name; it has no consumer by default, so set `DeadLetterRetention`
-  if entries should be pruned instead of kept for manual inspection. DDL is owned by
+  if entries should be pruned instead of kept for manual inspection (SQL Server prunes
+  `DELETE TOP (1000)` rows per throttle window — an unbounded delete over a large backlog
+  escalated to a table lock that `READPAST` cannot skip, stalling every claim, ACK and lease
+  renewal behind it; a bigger backlog drains over successive windows). DDL is owned by
   `AutoCreateSchema` (PostgreSQL, SQL Server) / `AutoCreateIndexes` (MongoDB) — disable when
   migrations own it.
+- Under early ACK, `BackgroundDrainTimeout` is split: three quarters for the queued and running
+  handlers, one quarter reserved for dead-lettering — and reporting via `OnBackgroundFailure` —
+  the already-ACKed entries still queued when that drain budget lapses. Their rows/documents were
+  deleted by the early ACK, so without the reserve they were simply lost at process exit.
 - Only PostgreSQL and MongoDB spend a `ShutdownTimeout` at stop (bounding the LISTEN /
   change-stream task join). SQL Server has no push channel to join and therefore no
   `ShutdownTimeout` option; it budgets only the drain.

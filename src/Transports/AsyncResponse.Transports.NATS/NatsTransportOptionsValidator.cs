@@ -17,9 +17,20 @@ internal static class NatsTransportOptionsValidator
 
     private static void ValidateSubjectToken(string? value, string name)
     {
-        if (!string.IsNullOrWhiteSpace(value) && value.IndexOfAny([' ', '\t', '*', '>', '\r', '\n']) >= 0)
+        if (string.IsNullOrWhiteSpace(value))
+            return;
+
+        if (value.IndexOfAny([' ', '\t', '*', '>', '\r', '\n']) >= 0)
             throw new InvalidOperationException(
                 $"{nameof(NatsAsyncResponseTransportOptions)}.{name} '{value}' must not contain whitespace or the NATS wildcards '*'/'>'.");
+
+        // Dots namespace a subject, but a leading, trailing or doubled '.' yields an EMPTY token
+        // — a subject nats-server rejects with a non-fatal -ERR that NATS.Net never surfaces, so
+        // the failure showed up as silent NoResponders at runtime rather than here (channel-options
+        // parity).
+        if (value.StartsWith('.') || value.EndsWith('.') || value.Contains("..", StringComparison.Ordinal))
+            throw new InvalidOperationException(
+                $"{nameof(NatsAsyncResponseTransportOptions)}.{name} '{value}' must not begin or end with '.' or contain '..' (an empty NATS subject token).");
     }
 
     /// <summary>
@@ -59,10 +70,8 @@ internal static class NatsTransportOptionsValidator
         _ = Required(options.DefaultReplyTargetName, nameof(options.DefaultReplyTargetName));
 
         // A subject prefix becomes leading tokens of every transport subject; it must not contain
-        // whitespace or the NATS subject wildcards.
-        if (options.SubjectPrefix.IndexOfAny([' ', '\t', '*', '>', '\r', '\n']) >= 0)
-            throw new InvalidOperationException(
-                $"{nameof(NatsAsyncResponseTransportOptions)}.{nameof(options.SubjectPrefix)} '{options.SubjectPrefix}' must not contain whitespace or the NATS wildcards '*'/'>'.");
+        // whitespace, the NATS subject wildcards, or an empty token.
+        ValidateSubjectToken(options.SubjectPrefix, nameof(options.SubjectPrefix));
 
         // An explicitly configured subject must satisfy the same token rules as the prefix-derived
         // defaults: whitespace or a wildcard fails stream/consumer creation at first use — deep

@@ -462,6 +462,59 @@ public sealed class CosmosDurableFlowStateStoreTests
         Assert.Null(await harness.Store.LoadAsync("flow"));
     }
 
+    /// <summary>
+    /// Regression (round 33): TryUpdateAsync, the lease paths and TryDeleteAsync still caught every
+    /// NotFound regardless of sub-status and reported the ledger gone (false, or a silent return) —
+    /// only LoadAsync had learned to discriminate. A 404 with sub-status 1002
+    /// (ReadSessionNotAvailable: a lagging replica) names a ledger that still exists, so the
+    /// checkpoint returned false, the lease marked itself lost, the delivery redelivered, and the
+    /// step's already-performed side effect ran a second time. Sub-status 0 alone is absence; every
+    /// other sub-status now surfaces so the delivery is retried instead.
+    /// </summary>
+    [Fact]
+    public async Task Writes_NotFoundWithANonZeroSubStatus_ThrowInsteadOfReportingAbsence()
+    {
+        using var harness = new CosmosHarness();
+        var state = CreateState("flow");
+        state.Revision = 1;
+        harness.ReadsFactory(() =>
+        {
+            var document = Document(CreateState("flow"), DateTime.UtcNow.AddMinutes(5));
+            document.LeaseId = "owner";
+            document.LeaseExpiresAtUtc = DateTime.UtcNow.AddMinutes(1);
+            return document;
+        });
+
+        // The replace after a successful read answers 404/1002.
+        harness.ReplacesThrowing(ReadSessionNotAvailable());
+        var checkpoint = await Assert.ThrowsAsync<CosmosException>(
+            () => harness.Store.TryUpdateAsync("flow", state, 0, TimeSpan.FromMinutes(1), leaseId: "owner"));
+        Assert.Equal(1002, checkpoint.SubStatusCode);
+        await Assert.ThrowsAsync<CosmosException>(() => harness.Store.TryRenewLeaseAsync("flow", "owner", TimeSpan.FromMinutes(1)));
+        await Assert.ThrowsAsync<CosmosException>(() => harness.Store.TryAcquireLeaseAsync("flow", "owner", TimeSpan.FromMinutes(1)));
+        await Assert.ThrowsAsync<CosmosException>(() => harness.Store.ReleaseLeaseAsync("flow", "owner"));
+
+        // The read itself answers 404/1002 (one filter guards both calls of each path).
+        harness.ReadsThrowing(ReadSessionNotAvailable());
+        await Assert.ThrowsAsync<CosmosException>(() => harness.Store.TryUpdateAsync("flow", state, 0, TimeSpan.FromMinutes(1)));
+        await Assert.ThrowsAsync<CosmosException>(() => harness.Store.TryAcquireLeaseAsync("flow", "owner", TimeSpan.FromMinutes(1)));
+        await Assert.ThrowsAsync<CosmosException>(() => harness.Store.ReleaseLeaseAsync("flow", "owner"));
+
+        harness.DeletesThrowing(ReadSessionNotAvailable());
+        await Assert.ThrowsAsync<CosmosException>(() => harness.Store.TryDeleteAsync("flow"));
+
+        // Sub-status 0 stays a genuine absence on every path.
+        harness.ReadsException(HttpStatusCode.NotFound);
+        Assert.False(await harness.Store.TryUpdateAsync("flow", state, 0, TimeSpan.FromMinutes(1)));
+        Assert.False(await harness.Store.TryAcquireLeaseAsync("flow", "owner", TimeSpan.FromMinutes(1)));
+        await harness.Store.ReleaseLeaseAsync("flow", "owner");
+        harness.DeletesThrowing(CosmosError(HttpStatusCode.NotFound));
+        Assert.False(await harness.Store.TryDeleteAsync("flow"));
+    }
+
+    private static CosmosException ReadSessionNotAvailable()
+        => new("read session not available", HttpStatusCode.NotFound, 1002, "activity", 0);
+
     private static CosmosException CosmosError(HttpStatusCode statusCode)
         => new("test", statusCode, 0, "activity", 0);
 
@@ -539,6 +592,34 @@ public sealed class CosmosDurableFlowStateStoreTests
                     It.IsAny<ItemRequestOptions>(),
                     It.IsAny<CancellationToken>()))
                 .ThrowsAsync(CosmosError(statusCode));
+
+        public void ReadsThrowing(CosmosException exception)
+            => Container
+                .Setup(item => item.ReadItemAsync<CosmosFlowStateDocument>(
+                    It.IsAny<string>(),
+                    It.IsAny<PartitionKey>(),
+                    It.IsAny<ItemRequestOptions>(),
+                    It.IsAny<CancellationToken>()))
+                .ThrowsAsync(exception);
+
+        public void ReplacesThrowing(CosmosException exception)
+            => Container
+                .Setup(item => item.ReplaceItemAsync(
+                    It.IsAny<CosmosFlowStateDocument>(),
+                    It.IsAny<string>(),
+                    It.IsAny<PartitionKey?>(),
+                    It.IsAny<ItemRequestOptions>(),
+                    It.IsAny<CancellationToken>()))
+                .ThrowsAsync(exception);
+
+        public void DeletesThrowing(CosmosException exception)
+            => Container
+                .Setup(item => item.DeleteItemAsync<CosmosFlowStateDocument>(
+                    It.IsAny<string>(),
+                    It.IsAny<PartitionKey>(),
+                    It.IsAny<ItemRequestOptions>(),
+                    It.IsAny<CancellationToken>()))
+                .ThrowsAsync(exception);
 
         public void ReplacesSuccessfully(Action<CosmosFlowStateDocument>? onReplace = null)
             => Container

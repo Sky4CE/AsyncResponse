@@ -342,6 +342,111 @@ public class AsyncResponseTypeResolutionTests : IDisposable
         Assert.Null(ReflectionExtensions.ResolveServiceType(serviceAlias));
         Assert.Null(PayloadRecoveryClassifier.ResolvePayloadType(payloadAlias));
     }
+
+    // ---------------------------------------------------------------------------------------
+    // Round 33: the default scan resolved a persisted name with Assembly.GetType, which parses
+    // the full CLR type-name grammar — a generic instantiation naming an assembly-qualified
+    // argument LOADED that assembly on the way to a verdict, and whoever can write the recovery
+    // store or the worker stream chose which. The scan must be confined to what is already
+    // loaded, for every component of the name.
+    // ---------------------------------------------------------------------------------------
+
+    /// <summary>
+    /// Shared-framework assemblies nothing in this test process references, as (type, assembly)
+    /// pairs. A probe takes the first one NOT loaded when it runs, so the two round-33 probes
+    /// below each get a fresh target even on pre-fix code, where the first probe loads its pick.
+    /// </summary>
+    private static readonly (string TypeName, string AssemblyName)[] UnloadedAssemblyCandidates =
+    [
+        ("System.Net.Mail.MailAddress", "System.Net.Mail"),
+        ("System.Net.NetworkInformation.Ping", "System.Net.Ping"),
+        ("System.Net.Dns", "System.Net.NameResolution"),
+        ("System.Runtime.Serialization.DataContractSerializer", "System.Runtime.Serialization.Xml"),
+        ("System.IO.Pipes.PipeStream", "System.IO.Pipes"),
+    ];
+
+    private static bool IsLoaded(string assemblyName)
+        => AppDomain.CurrentDomain.GetAssemblies()
+            .Any(assembly => string.Equals(assembly.GetName().Name, assemblyName, StringComparison.OrdinalIgnoreCase));
+
+    private static (string TypeName, string AssemblyName) PickUnloadedAssembly()
+    {
+        var candidate = Array.Find(UnloadedAssemblyCandidates, c => !IsLoaded(c.AssemblyName));
+        Assert.True(candidate.AssemblyName is not null, "Every candidate assembly is already loaded; add another shared-framework assembly this process does not reference.");
+        return candidate;
+    }
+
+    /// <summary>
+    /// Round 33, the recovery-store half: a persisted payload type name whose generic argument is
+    /// qualified to an assembly this process has not loaded. Pre-fix the scan loaded that
+    /// assembly and returned the closed type; the verdict must be "unresolvable" with the
+    /// process's assembly set unchanged.
+    /// </summary>
+    [Fact]
+    public void ResolvePayloadType_ArgumentQualifiedToAnUnloadedAssembly_ResolvesNothingAndLoadsNothing()
+    {
+        var (typeName, assemblyName) = PickUnloadedAssembly();
+        var persistedName = $"{typeof(Round33Outer<>).FullName}[[{typeName}, {assemblyName}]]";
+
+        var resolved = PayloadRecoveryClassifier.ResolvePayloadType(persistedName);
+
+        Assert.Null(resolved);
+        Assert.False(IsLoaded(assemblyName), $"Resolving '{persistedName}' loaded {assemblyName}.");
+    }
+
+    /// <summary>
+    /// Round 33, the worker-stream half: the envelope's service name goes through the same scan.
+    /// Pre-fix a name aiming its generic argument at an unloaded assembly loaded it on delivery;
+    /// it must resolve to nothing and load nothing.
+    /// </summary>
+    [Fact]
+    public void ResolveServiceType_ArgumentQualifiedToAnUnloadedAssembly_ResolvesNothingAndLoadsNothing()
+    {
+        var (typeName, assemblyName) = PickUnloadedAssembly();
+        var wireName = $"{typeof(IRound33Service<>).FullName}[[{typeName}, {assemblyName}]]";
+
+        var resolved = ReflectionExtensions.ResolveServiceType(wireName);
+
+        Assert.Null(resolved);
+        Assert.False(IsLoaded(assemblyName), $"Resolving '{wireName}' loaded {assemblyName}.");
+    }
+
+    /// <summary>
+    /// Round 33 control: the loaded-only scan is not over-broad. What the library actually
+    /// persists for a closed generic — <c>typeof(T).FullName</c>, whose argument is
+    /// assembly-qualified to an assembly that IS loaded (CoreLib, this test assembly) — still
+    /// resolves on both paths, and the classifier still routes on it.
+    /// </summary>
+    [Fact]
+    public void ClosedGeneric_WithLoadedArguments_StillResolvesAndClassifies()
+    {
+        Assert.Same(typeof(Round33Outer<int>), PayloadRecoveryClassifier.ResolvePayloadType(typeof(Round33Outer<int>).FullName!));
+        Assert.Same(typeof(Round33Outer<OperationResult>), PayloadRecoveryClassifier.ResolvePayloadType(typeof(Round33Outer<OperationResult>).FullName!));
+        Assert.Same(typeof(IRound33Service<int>), ReflectionExtensions.ResolveServiceType(typeof(IRound33Service<int>).FullName!));
+
+        var wireJson = AsyncResponseJson.Serialize(new Round33Outer<int> { Inner = 7 });
+        var classification = PayloadRecoveryClassifier.Classify(wireJson, typeof(Round33Outer<int>).FullName);
+
+        Assert.Equal(RecoveryAction.Resume, classification.Action);
+        Assert.Equal(7, Assert.IsType<Round33Outer<int>>(classification.MaterializedPayload).Inner);
+    }
+}
+
+/// <summary>
+/// Open generic payload whose closed names are the round-33 assembly-load probe: the argument's
+/// assembly qualification is what a persisted name can smuggle in.
+/// </summary>
+public sealed class Round33Outer<T> : IAsyncResponsePayload
+{
+    public T? Inner { get; set; }
+
+    public RecoveryAction OnRecovery() => RecoveryAction.Resume;
+}
+
+/// <summary>Open generic service contract; the worker-stream twin of <see cref="Round33Outer{T}"/>.</summary>
+public interface IRound33Service<T>
+{
+    Task RunAsync(T value);
 }
 
 /// <summary>

@@ -808,7 +808,12 @@ internal sealed class QueuedKafkaMessageDispatcher : KafkaMessageDispatcher
             }
             catch (Exception ex)
             {
-                if (ReachedDeliveryAttempts(attempt))
+                // Unlimited retries (0) on this path spun a background worker on an already-
+                // committed message forever: the bounded queue filled, the poll loop pinned the
+                // assignment paused, and the subscriber wedged with no dead-letter record and no
+                // OnBackgroundFailure, because both live inside this block. After an early ACK
+                // the sibling transports never retry at all, so 0 means a single attempt here.
+                if (MaxDeliveryAttempts <= 0 || ReachedDeliveryAttempts(attempt))
                 {
                     Logger.LogError(
                         ex,

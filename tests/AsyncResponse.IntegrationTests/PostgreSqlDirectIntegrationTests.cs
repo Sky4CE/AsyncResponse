@@ -675,7 +675,7 @@ public sealed class PostgreSqlDirectIntegrationTests(DataBatchFixture fixture) :
             await winnerTransaction.CommitAsync();
             var resolved = await competing.WaitAsync(TimeSpan.FromSeconds(10));
 
-            Assert.Equal(new DateTimeOffset(winnerStamp, TimeSpan.Zero), resolved);
+            Assert.Equal(new DateTimeOffset(winnerStamp, TimeSpan.Zero), resolved.CreatedAtUtc);
         });
     }
 
@@ -783,8 +783,8 @@ public sealed class PostgreSqlDirectIntegrationTests(DataBatchFixture fixture) :
 
             var startedAt = await sql.GetServerTimeUtcAsync(CancellationToken.None);
             var messageId = Guid.NewGuid();
-            var firstCreatedAt = await sql.InsertMessageAsync(messageId, "message-correlation", SuccessEnvelope("first"), TimeSpan.FromSeconds(30), CancellationToken.None);
-            var duplicateCreatedAt = await sql.InsertMessageAsync(messageId, "message-correlation", SuccessEnvelope("duplicate"), TimeSpan.FromSeconds(30), CancellationToken.None);
+            var firstCreatedAt = (await sql.InsertMessageAsync(messageId, "message-correlation", SuccessEnvelope("first"), TimeSpan.FromSeconds(30), CancellationToken.None)).CreatedAtUtc;
+            var duplicateCreatedAt = (await sql.InsertMessageAsync(messageId, "message-correlation", SuccessEnvelope("duplicate"), TimeSpan.FromSeconds(30), CancellationToken.None)).CreatedAtUtc;
 
             // The insert returns the row's server-stamped created_at — the ORIGINAL row's on a
             // duplicate — so the same-process fast path compares like clocks under app-clock skew.
@@ -1715,6 +1715,152 @@ public sealed class PostgreSqlDirectIntegrationTests(DataBatchFixture fixture) :
             await channel.DisposeAsync();
             await channelClean.DisposeAsync();
         });
+    }
+
+    /// <summary>
+    /// Regression (round 33): a publish RETRY — the same message id landing as an idempotent
+    /// duplicate (<c>ON CONFLICT DO NOTHING</c>) after another process had already claimed and
+    /// acked the first attempt — reached the same-process fast path with a fabricated
+    /// <c>AckedAtUtc = null</c>, which bypassed <c>IsWithinWatermark</c>'s acked-history exclusion
+    /// and replayed the consumed response to a waiter registered AFTER the ack (the delivery claim
+    /// gates only on <c>recovery_claimed</c>, so it won again). The store now returns the ORIGINAL
+    /// row's settlement columns for a duplicate and the fast path dispatches that. Driven through
+    /// the channel's own publish path with the acked message's id. Pre-fix: the late waiter
+    /// completed with the retried response.
+    /// </summary>
+    [Fact]
+    public async Task PublishRetry_OfAnAckedMessage_DoesNotReplayItToAWaiterRegisteredAfterTheAck()
+    {
+        await WithDataSourceAsync("retry_acked", async (schema, dataSource) =>
+        {
+            var options = ChannelOptions(schema);
+            var sql = new PostgreSqlChannelSql(dataSource, Options.Create(options));
+            await using var channel = new PostgreSqlAsyncResponseChannel(
+                new ServiceCollection().BuildServiceProvider().GetRequiredService<IServiceScopeFactory>(),
+                sql,
+                MockRecoveryStore(),
+                Options.Create(options),
+                new AsyncResponseContextPropagation([]),
+                NullLogger<PostgreSqlAsyncResponseChannel>.Instance);
+            await sql.EnsureCreatedAsync();
+
+            // First attempt: persisted, then claimed and acked by "another process".
+            var messageId = Guid.NewGuid();
+            await sql.InsertMessageAsync(messageId, "corr", SuccessEnvelope("consumed"), TimeSpan.FromSeconds(30), CancellationToken.None);
+            Assert.True(await sql.TryClaimForDeliveryAsync(messageId, CancellationToken.None));
+
+            // A waiter registering AFTER that ack, stamped on the server clock the watermark
+            // compares against — exactly what CreateResponseWaiter draws.
+            var (startedAt, startedSeq) = await sql.GetSubscriptionStartAsync(CancellationToken.None);
+            var late = Subscription(typeof(PostgreSqlAsyncResponseChannel), "DbSubscription`1", channel, _ => new ValueTask<bool>(true), startedAt, startedSeq);
+            InheritedMethod(typeof(PostgreSqlAsyncResponseChannel), "AddSubscription").Invoke(channel, ["corr", late.Instance]);
+
+            // The retry lands through the channel's publish path with the SAME message id.
+            await (Task)InheritedMethod(typeof(PostgreSqlAsyncResponseChannel), "PublishMessageAsync")
+                .Invoke(channel, [messageId, "corr", SuccessEnvelope("retry"), CancellationToken.None])!;
+            await DrainLocalDispatchAsync(typeof(PostgreSqlAsyncResponseChannel), channel, "corr");
+
+            Assert.False(late.Completion.Task.IsCompleted, "the consumed response was replayed to a waiter registered after its ack");
+
+            // The original settlement is what the fast path saw: acked before the waiter existed,
+            // and the row still carries exactly one ack.
+            var stored = Assert.Single(await sql.LoadMessagesAsync("corr", startedAt.AddSeconds(-30), 10, null, null, CancellationToken.None));
+            Assert.NotNull(stored.AckedAtUtc);
+            Assert.True(stored.AckedAtUtc <= startedAt, $"acked_at {stored.AckedAtUtc:O} is not before the waiter's start {startedAt:O}");
+        });
+    }
+
+    /// <summary>
+    /// Regression (round 33), the store contract behind the fast-path fix: an idempotent duplicate
+    /// insert returns the ORIGINAL row — its server-stamped <c>created_at</c> AND its settlement
+    /// columns (<c>acked_at</c>, <c>acked_seq</c>) exactly as the sweep's <c>LoadMessagesAsync</c>
+    /// reads them — so the same-process fast path compares against the watermark like the sweep
+    /// does. Pre-fix the insert returned only <c>created_at</c> and the channel fabricated a null
+    /// <c>acked_at</c> (this method did not compile: the return type is the fix).
+    /// </summary>
+    [Fact]
+    public async Task InsertMessage_Duplicate_ReturnsTheOriginalRowsSettlementColumns()
+    {
+        await WithDataSourceAsync("dup_settled", async (schema, dataSource) =>
+        {
+            var sql = new PostgreSqlChannelSql(dataSource, Options.Create(ChannelOptions(schema)));
+            await sql.EnsureCreatedAsync();
+            var since = await sql.GetServerTimeUtcAsync(CancellationToken.None);
+
+            var messageId = Guid.NewGuid();
+            var first = await sql.InsertMessageAsync(messageId, "settled", SuccessEnvelope("first"), TimeSpan.FromSeconds(30), CancellationToken.None);
+            Assert.Null(first.AckedAtUtc);
+            Assert.Null(first.AckedSeq);
+            Assert.True(await sql.TryClaimForDeliveryAsync(messageId, CancellationToken.None));
+
+            var duplicate = await sql.InsertMessageAsync(messageId, "settled", SuccessEnvelope("retry"), TimeSpan.FromSeconds(30), CancellationToken.None);
+
+            var stored = Assert.Single(await sql.LoadMessagesAsync("settled", since.AddSeconds(-5), 10, null, null, CancellationToken.None));
+            Assert.Equal(messageId, duplicate.Id);
+            Assert.Equal(first.CreatedAtUtc, duplicate.CreatedAtUtc);
+            Assert.NotNull(duplicate.AckedAtUtc);
+            Assert.NotNull(duplicate.AckedSeq);
+            Assert.Equal(stored.AckedAtUtc, duplicate.AckedAtUtc);
+            Assert.Equal(stored.AckedSeq, duplicate.AckedSeq);
+        });
+    }
+
+    /// <summary>
+    /// A <c>DbSubscription</c> registered at an explicit server-clock watermark, for the
+    /// registered-after-the-ack scenario; the no-argument overload above stamps the app clock.
+    /// </summary>
+    private static (object Instance, TaskCompletionSource<OperationResult> Completion) Subscription(
+        Type channelType,
+        string nestedTypeName,
+        object channel,
+        Func<OperationResult, ValueTask<bool>> predicate,
+        DateTimeOffset startedAtUtc,
+        long startedSeq)
+    {
+        var completion = new TaskCompletionSource<OperationResult>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var type = channelType.BaseType!.GetNestedType(nestedTypeName, BindingFlags.NonPublic)!
+            .MakeGenericType(typeof(OperationResult));
+        var instance = Activator.CreateInstance(
+            type,
+            BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic,
+            binder: null,
+            [channel, "corr", Guid.NewGuid(), startedAtUtc, startedSeq, predicate, completion, null],
+            culture: null)!;
+        SetField(instance, "_cleanupStarted", 1);
+        return (instance, completion);
+    }
+
+    /// <summary>Resolves a method declared anywhere up the channel's hierarchy (private base members are invisible to a derived-type lookup).</summary>
+    private static MethodInfo InheritedMethod(Type channelType, string name)
+    {
+        for (var type = channelType; type is not null; type = type.BaseType)
+        {
+            var method = type.GetMethod(name, BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+            if (method is not null)
+                return method;
+        }
+
+        throw new MissingMethodException(channelType.FullName, name);
+    }
+
+    /// <summary>
+    /// Queues a marker behind whatever the same-process fast path enqueued on the correlation
+    /// id's serial executor and waits for it, so an assertion about that dispatch's outcome never
+    /// races the dispatch itself.
+    /// </summary>
+    private static async Task DrainLocalDispatchAsync(Type channelType, object channel, string correlationId)
+    {
+        var executors = (SerialExecutorRegistry)channelType.BaseType!
+            .GetField("_executors", BindingFlags.Instance | BindingFlags.NonPublic)!
+            .GetValue(channel)!;
+        var channelName = (string)InheritedMethod(channelType, "ChannelName").Invoke(channel, [correlationId])!;
+        var drained = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        Assert.True(await executors.EnqueueAsync(channelName, () =>
+        {
+            drained.TrySetResult();
+            return Task.CompletedTask;
+        }));
+        await drained.Task.WaitAsync(TimeSpan.FromSeconds(10));
     }
 
     private static (object Instance, TaskCompletionSource<OperationResult> Completion) Subscription(

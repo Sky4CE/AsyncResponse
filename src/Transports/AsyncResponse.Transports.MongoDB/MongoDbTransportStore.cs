@@ -199,13 +199,21 @@ internal sealed class MongoDbTransportStore : IDisposable
 
         // findOneAndUpdate is atomic per document: of all competing consumers, exactly one observes
         // the document unlocked and stamps its lock_id/locked_until in the same server-side step.
+        // Binary (simple) collation pinned on the claim (SQL Server BIN2 / PostgreSQL
+        // deterministic-collation parity): the three logical queues share this collection and
+        // are told apart by nothing but the queue field, and an operator-created collection
+        // with a case- or accent-folding default collation made the worker subscriber claim
+        // response documents — which the ingress then dropped and ACKed with no dead-letter
+        // record. An explicit simple collation cannot use an index built with a folding one, so
+        // correctness costs a scan there; the default (bare) collection is unaffected.
         var claimed = await _messages.FindOneAndUpdateAsync(
             BuildClaimFilter(queue),
             BuildClaimUpdate(lockId, lockTimeout),
             new FindOneAndUpdateOptions<MongoTransportMessageDocument>
             {
                 Sort = Builders<MongoTransportMessageDocument>.Sort.Ascending(item => item.CreatedAtUtc),
-                ReturnDocument = ReturnDocument.After
+                ReturnDocument = ReturnDocument.After,
+                Collation = Collation.Simple
             },
             cancellationToken).ConfigureAwait(false);
         if (claimed is null)
@@ -549,8 +557,11 @@ internal sealed class MongoDbTransportStore : IDisposable
         if (_options.DeadLetterRetention is not { } retention || !ShouldPruneDeadLetters())
             return;
 
+        // Same binary collation as the claim: under a folding collection collation this prune
+        // matched live-queue documents whose name differed only by case.
         await _messages.DeleteManyAsync(
             BuildDeadLetterPruneFilter(_options.DeadLetterQueue, retention),
+            new DeleteOptions { Collation = Collation.Simple },
             cancellationToken).ConfigureAwait(false);
     }
 

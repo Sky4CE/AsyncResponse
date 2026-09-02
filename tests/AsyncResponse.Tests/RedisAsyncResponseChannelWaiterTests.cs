@@ -731,6 +731,81 @@ public class RedisAsyncResponseChannelWaiterTests
         Assert.False(HasExecutorRegistration(registry, _channelSubscriber.SubscribedChannel.ToString()!));
     }
 
+    /// <summary>
+    /// Regression (round 33): the channel implemented no <see cref="IAsyncDisposable"/> at all, so
+    /// container disposal at host shutdown had nothing to join — an executor retirement scheduled
+    /// off a subscription's cleanup was a discarded <c>Task.Run</c> that died with the process.
+    /// Pre-fix: the channel was not assignable to <see cref="IAsyncDisposable"/>.
+    /// </summary>
+    [Fact]
+    public void Channel_IsAsyncDisposable_SoHostShutdownJoinsExecutorRetirements()
+        => Assert.IsAssignableFrom<IAsyncDisposable>(CreateChannel());
+
+    /// <summary>
+    /// Regression (round 33): the executor retirement scheduled from a subscription's cleanup was
+    /// a discarded <c>Task.Run(RemoveAsync)</c> and nothing at host shutdown waited for it — a
+    /// retirement still draining a user completion predicate was killed mid-flight with the
+    /// predicate's side effects half-applied, and no record of it. Retirements are now tracked and
+    /// the channel's <c>DisposeAsync</c> joins them: it must NOT return while a retirement is still
+    /// inside the predicate, and must return once that predicate has finished. The terminal
+    /// message's cleanup schedules the retirement; a second message, admitted while the first was
+    /// still in its predicate, runs on the retiring executor and is what the retirement's drain is
+    /// parked on. Pre-fix: the cast to <see cref="IAsyncDisposable"/> failed (there was nothing to
+    /// join).
+    /// </summary>
+    [Fact]
+    public async Task DisposeAsync_JoinsAnExecutorRetirementStillDrainingACompletionPredicate()
+    {
+        var channel = CreateChannel();
+        var firstStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseFirst = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var secondStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseSecond = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var secondFinished = 0;
+        var calls = 0;
+        await using var waiter = await channel.CreateResponseWaiter<OperationResult>(
+            "corr-retire",
+            async _ =>
+            {
+                if (Interlocked.Increment(ref calls) == 1)
+                {
+                    // Terminal once released: its cleanup retires the executor.
+                    firstStarted.TrySetResult();
+                    await releaseFirst.Task;
+                    return true;
+                }
+
+                // Runs on the RETIRING executor: the retirement's drain is parked right here.
+                secondStarted.TrySetResult();
+                await releaseSecond.Task;
+                Volatile.Write(ref secondFinished, 1);
+                return true;
+            },
+            timeout: TimeSpan.FromSeconds(30));
+        var payload = new OperationResult { Status = OperationStatus.Completed, Message = "done" };
+
+        await PublishSuccess(payload);
+        await firstStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        // Admitted behind the first while it is still inside its predicate, so it can only run
+        // after the terminal cleanup has scheduled the retirement — on the executor being retired.
+        await PublishSuccess(payload);
+        releaseFirst.TrySetResult();
+        await secondStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal("done", (await waiter.ResponseTask).Message);
+
+        // Through object: the pre-fix channel implemented no IAsyncDisposable to cast to.
+        var disposal = ((IAsyncDisposable)(object)channel).DisposeAsync().AsTask();
+        await Task.Delay(200);
+        Assert.False(
+            disposal.IsCompleted,
+            "DisposeAsync returned while an executor retirement was still draining a completion predicate");
+        Assert.Equal(0, Volatile.Read(ref secondFinished));
+
+        releaseSecond.TrySetResult();
+        await disposal.WaitAsync(TimeSpan.FromSeconds(10));
+        Assert.Equal(1, Volatile.Read(ref secondFinished));
+    }
+
     private static object GetExecutorRegistry(RedisAsyncResponseChannel channel)
         => typeof(RedisAsyncResponseChannel)
             .GetField("_executors", BindingFlags.Instance | BindingFlags.NonPublic)!

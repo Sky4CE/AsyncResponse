@@ -38,7 +38,10 @@ same response. `acked_seq` and each subscription's registration draw from the sa
 sequence, arbitrating "acked before this waiter registered" (history, not redelivered) versus
 "acked to a fan-out group including this waiter" (delivered) even when both events land on the
 same server-clock tick — with one conservative residual: a claim whose sequence draw stalled
-across ticks resolves as history, never as a replayed response.
+across ticks resolves as history, never as a replayed response. The same-process fast path honors
+that arbitration too: an idempotent duplicate publish (a retry carrying the same message id)
+dispatches with the stored row's settlement columns rather than a fresh unacked view, so it
+cannot replay an already-consumed response to a waiter that registered after the ack.
 
 ## Recovery state
 

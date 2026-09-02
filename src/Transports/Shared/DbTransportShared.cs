@@ -155,24 +155,7 @@ internal abstract class DbMessageDispatcherBase : IAsyncDisposable
             finally
             {
                 renewalCancellation.Cancel();
-                try
-                {
-                    // Bounded (ASB/SQS parity): the in-flight renew pins CancellationToken.None
-                    // for its connect and command, so against a degraded database an unbounded
-                    // join held every settlement — on the hot path, and at shutdown the host
-                    // budget — for a full connect+command timeout. Past LockTimeout the lease
-                    // has lapsed regardless, so there is nothing left to wait for.
-                    await renewalTask.WaitAsync(_options.LockTimeout).ConfigureAwait(false);
-                }
-                catch (TimeoutException)
-                {
-                    _logger.LogWarning(
-                        "{Provider} lease renewal for queue {Queue} ({Role}) did not stop within LockTimeout ({LockTimeout}); abandoning the renewal task.",
-                        _providerName,
-                        delivery.Queue,
-                        _role,
-                        _options.LockTimeout);
-                }
+                await JoinRenewalAsync(renewalTask, delivery, cancellationToken).ConfigureAwait(false);
             }
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
@@ -291,6 +274,45 @@ internal abstract class DbMessageDispatcherBase : IAsyncDisposable
         }
     }
 
+    /// <summary>
+    /// Joins the lease-renewal heartbeat after its cancellation. Bounded (ASB/SQS parity): the
+    /// in-flight renew pins <see cref="CancellationToken.None"/> for its connect and command, so
+    /// against a degraded database an unbounded join held every settlement on the hot path for a
+    /// full connect+command timeout; past <c>LockTimeout</c> the lease has lapsed regardless.
+    /// NOT joined at all while the subscriber is stopping: settlement (the NAK or ACK around the
+    /// caller) is fenced by <c>lock_id</c>, so a beat still in flight is a no-op against it — and
+    /// the join spent up to <c>LockTimeout</c> of the host's stop budget, a term no shutdown
+    /// validator sums: against a degraded database the full default 30s BEFORE the background
+    /// drain even began, so already-ACKed entries were lost when the host expired mid-drain.
+    /// </summary>
+    private async Task JoinRenewalAsync(Task renewalTask, DbTransportDelivery delivery, CancellationToken cancellationToken)
+    {
+        if (cancellationToken.IsCancellationRequested)
+        {
+            // The loop swallows its own faults; observe defensively and let the beat finish.
+            _ = renewalTask.ContinueWith(
+                static task => _ = task.Exception,
+                CancellationToken.None,
+                TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously,
+                TaskScheduler.Default);
+            return;
+        }
+
+        try
+        {
+            await renewalTask.WaitAsync(_options.LockTimeout).ConfigureAwait(false);
+        }
+        catch (TimeoutException)
+        {
+            _logger.LogWarning(
+                "{Provider} lease renewal for queue {Queue} ({Role}) did not stop within LockTimeout ({LockTimeout}); abandoning the renewal task.",
+                _providerName,
+                delivery.Queue,
+                _role,
+                _options.LockTimeout);
+        }
+    }
+
     private async Task HandleEarlyAckAsync(DbTransportDelivery delivery, CancellationToken cancellationToken)
     {
         if (!_backgroundQueue!.Writer.TryWrite(delivery))
@@ -341,24 +363,7 @@ internal abstract class DbMessageDispatcherBase : IAsyncDisposable
             finally
             {
                 renewalCancellation.Cancel();
-                try
-                {
-                    // Bounded (ASB/SQS parity): the in-flight renew pins CancellationToken.None
-                    // for its connect and command, so against a degraded database an unbounded
-                    // join held every settlement — on the hot path, and at shutdown the host
-                    // budget — for a full connect+command timeout. Past LockTimeout the lease
-                    // has lapsed regardless, so there is nothing left to wait for.
-                    await renewalTask.WaitAsync(_options.LockTimeout).ConfigureAwait(false);
-                }
-                catch (TimeoutException)
-                {
-                    _logger.LogWarning(
-                        "{Provider} lease renewal for queue {Queue} ({Role}) did not stop within LockTimeout ({LockTimeout}); abandoning the renewal task.",
-                        _providerName,
-                        delivery.Queue,
-                        _role,
-                        _options.LockTimeout);
-                }
+                await JoinRenewalAsync(renewalTask, delivery, cancellationToken).ConfigureAwait(false);
             }
         }
 
@@ -556,24 +561,56 @@ internal abstract class DbMessageDispatcherBase : IAsyncDisposable
             return;
 
         _backgroundQueue.Writer.TryComplete();
+
+        // BackgroundDrainTimeout is the whole spend the shutdown-budget validator sums for this
+        // dispatcher, so it is split rather than exceeded: most of it lets queued and running
+        // handlers finish, and the rest is RESERVED for the post-lapse routing the worker loop
+        // performs once cancelled (dead-letter + OnBackgroundFailure for every entry still
+        // queued). That routing used to be fire-and-forget with no budget at all: DisposeAsync
+        // returned, the subscriber and then the host finished stopping, and the already-ACKed
+        // entries the workers were only starting to bury vanished with no record — the very
+        // loss docs/transport-semantics.md promises this path prevents.
+        var routingReserve = TimeSpan.FromTicks(_subscriberOptions.BackgroundDrainTimeout.Ticks / 4);
+        var drainBudget = _subscriberOptions.BackgroundDrainTimeout - routingReserve;
         try
         {
-            await Task.WhenAll(_backgroundWorkers!).WaitAsync(_subscriberOptions.BackgroundDrainTimeout).ConfigureAwait(false);
+            await Task.WhenAll(_backgroundWorkers!).WaitAsync(drainBudget).ConfigureAwait(false);
             _backgroundCts!.Dispose();
         }
         catch (TimeoutException)
         {
-            _logger.LogWarning("{Provider} background handlers for {Role} did not drain within {Timeout}.", _providerName, _role, _subscriberOptions.BackgroundDrainTimeout);
+            _logger.LogWarning("{Provider} background handlers for {Role} did not drain within {Timeout}; dead-lettering the entries still queued.", _providerName, _role, drainBudget);
             await _backgroundCts!.CancelAsync().ConfigureAwait(false);
 
-            // The workers are still running and observe _backgroundCts.Token inside ReadAllAsync, so disposing
-            // it now would throw ObjectDisposedException inside them. Dispose once they actually finish, off
-            // the shutdown path, so the source is not leaked either.
-            _ = Task.WhenAll(_backgroundWorkers!).ContinueWith(
-                _ => _backgroundCts.Dispose(),
-                CancellationToken.None,
-                TaskContinuationOptions.ExecuteSynchronously,
-                TaskScheduler.Default);
+            try
+            {
+                await Task.WhenAll(_backgroundWorkers!).WaitAsync(routingReserve).ConfigureAwait(false);
+            }
+            catch (TimeoutException)
+            {
+                _logger.LogError(
+                    "{Provider} background workers for {Role} did not finish dead-lettering the undrained entries within the reserved {Reserve}; entries still queued at process exit are lost (their rows were deleted by the early ACK).",
+                    _providerName,
+                    _role,
+                    routingReserve);
+
+                // The workers are still running and observe _backgroundCts.Token inside ReadAllAsync, so disposing
+                // it now would throw ObjectDisposedException inside them. Dispose once they actually finish, off
+                // the shutdown path, so the source is not leaked either.
+                _ = Task.WhenAll(_backgroundWorkers!).ContinueWith(
+                    _ => _backgroundCts.Dispose(),
+                    CancellationToken.None,
+                    TaskContinuationOptions.ExecuteSynchronously,
+                    TaskScheduler.Default);
+                return;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogDebug(ex, "{Provider} background worker drain for {Role} ended with an error.", _providerName, _role);
+            }
+
+            // WhenAll completed one way or the other, so every worker has finished.
+            _backgroundCts.Dispose();
         }
         catch (Exception ex)
         {

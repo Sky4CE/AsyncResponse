@@ -125,56 +125,67 @@ if (existingUrl is not null || existingAzureServiceBusUrl is not null || existin
         }
     }
 
-    rabbitMqBaseAddress = new Uri(existingRabbitMqUrl ?? existingUrl ?? existingAzureServiceBusUrl!);
-    Console.WriteLine($"Load testing existing RabbitMQ instance at {rabbitMqBaseAddress}.");
+    // Guarded like the Azure Service Bus and SQS blocks above: these fallback chains ended in a
+    // null-forgiving `!`, so any single --<transport>-url invocation whose chain did not happen
+    // to include that transport threw ArgumentNullException here before any load ran — seven of
+    // the ten invocations documented at the top of this file.
+    rabbitMqBaseAddress = (existingRabbitMqUrl ?? existingUrl ?? existingAzureServiceBusUrl) is { } rabbitMqUrl ? new Uri(rabbitMqUrl) : null;
+    if (rabbitMqBaseAddress is not null)
+        Console.WriteLine($"Load testing existing RabbitMQ instance at {rabbitMqBaseAddress}.");
     if (existingRabbitMqEarlyAckUrl is not null)
     {
         rabbitMqEarlyAckBaseAddress = new Uri(existingRabbitMqEarlyAckUrl);
         Console.WriteLine($"Load testing existing RabbitMQ ACK-after-enqueue instance at {rabbitMqEarlyAckBaseAddress}.");
     }
 
-    redisBaseAddress = new Uri(existingRedisUrl ?? existingUrl ?? existingAzureServiceBusUrl ?? existingRabbitMqUrl!);
-    Console.WriteLine($"Load testing existing Redis transport instance at {redisBaseAddress}.");
+    redisBaseAddress = (existingRedisUrl ?? existingUrl ?? existingAzureServiceBusUrl ?? existingRabbitMqUrl) is { } redisUrl ? new Uri(redisUrl) : null;
+    if (redisBaseAddress is not null)
+        Console.WriteLine($"Load testing existing Redis transport instance at {redisBaseAddress}.");
     if (existingRedisEarlyAckUrl is not null)
     {
         redisEarlyAckBaseAddress = new Uri(existingRedisEarlyAckUrl);
         Console.WriteLine($"Load testing existing Redis transport ACK-after-enqueue instance at {redisEarlyAckBaseAddress}.");
     }
 
-    natsBaseAddress = new Uri(existingNatsUrl ?? existingUrl ?? existingAzureServiceBusUrl ?? existingRabbitMqUrl ?? existingRedisUrl ?? existingPostgreSqlUrl!);
-    Console.WriteLine($"Load testing existing NATS instance at {natsBaseAddress}.");
+    natsBaseAddress = (existingNatsUrl ?? existingUrl ?? existingAzureServiceBusUrl ?? existingRabbitMqUrl ?? existingRedisUrl ?? existingPostgreSqlUrl) is { } natsUrl ? new Uri(natsUrl) : null;
+    if (natsBaseAddress is not null)
+        Console.WriteLine($"Load testing existing NATS instance at {natsBaseAddress}.");
     if (existingNatsEarlyAckUrl is not null)
     {
         natsEarlyAckBaseAddress = new Uri(existingNatsEarlyAckUrl);
         Console.WriteLine($"Load testing existing NATS ACK-after-enqueue instance at {natsEarlyAckBaseAddress}.");
     }
 
-    postgreSqlBaseAddress = new Uri(existingPostgreSqlUrl ?? existingUrl ?? existingAzureServiceBusUrl ?? existingRabbitMqUrl ?? existingRedisUrl ?? existingNatsUrl ?? existingKafkaUrl!);
-    Console.WriteLine($"Load testing existing PostgreSQL instance at {postgreSqlBaseAddress}.");
+    postgreSqlBaseAddress = (existingPostgreSqlUrl ?? existingUrl ?? existingAzureServiceBusUrl ?? existingRabbitMqUrl ?? existingRedisUrl ?? existingNatsUrl ?? existingKafkaUrl) is { } postgreSqlUrl ? new Uri(postgreSqlUrl) : null;
+    if (postgreSqlBaseAddress is not null)
+        Console.WriteLine($"Load testing existing PostgreSQL instance at {postgreSqlBaseAddress}.");
     if (existingPostgreSqlEarlyAckUrl is not null)
     {
         postgreSqlEarlyAckBaseAddress = new Uri(existingPostgreSqlEarlyAckUrl);
         Console.WriteLine($"Load testing existing PostgreSQL ACK-after-enqueue instance at {postgreSqlEarlyAckBaseAddress}.");
     }
 
-    kafkaBaseAddress = new Uri(existingKafkaUrl ?? existingUrl ?? existingAzureServiceBusUrl ?? existingRabbitMqUrl ?? existingRedisUrl ?? existingNatsUrl ?? existingPostgreSqlUrl ?? existingSqlServerUrl!);
-    Console.WriteLine($"Load testing existing Kafka instance at {kafkaBaseAddress}.");
+    kafkaBaseAddress = (existingKafkaUrl ?? existingUrl ?? existingAzureServiceBusUrl ?? existingRabbitMqUrl ?? existingRedisUrl ?? existingNatsUrl ?? existingPostgreSqlUrl ?? existingSqlServerUrl) is { } kafkaUrl ? new Uri(kafkaUrl) : null;
+    if (kafkaBaseAddress is not null)
+        Console.WriteLine($"Load testing existing Kafka instance at {kafkaBaseAddress}.");
     if (existingKafkaEarlyAckUrl is not null)
     {
         kafkaEarlyAckBaseAddress = new Uri(existingKafkaEarlyAckUrl);
         Console.WriteLine($"Load testing existing Kafka ACK-after-enqueue instance at {kafkaEarlyAckBaseAddress}.");
     }
 
-    sqlServerBaseAddress = new Uri(existingSqlServerUrl ?? existingUrl ?? existingAzureServiceBusUrl ?? existingRabbitMqUrl ?? existingRedisUrl ?? existingNatsUrl ?? existingPostgreSqlUrl ?? existingKafkaUrl!);
-    Console.WriteLine($"Load testing existing SQL Server instance at {sqlServerBaseAddress}.");
+    sqlServerBaseAddress = (existingSqlServerUrl ?? existingUrl ?? existingAzureServiceBusUrl ?? existingRabbitMqUrl ?? existingRedisUrl ?? existingNatsUrl ?? existingPostgreSqlUrl ?? existingKafkaUrl) is { } sqlServerUrl ? new Uri(sqlServerUrl) : null;
+    if (sqlServerBaseAddress is not null)
+        Console.WriteLine($"Load testing existing SQL Server instance at {sqlServerBaseAddress}.");
     if (existingSqlServerEarlyAckUrl is not null)
     {
         sqlServerEarlyAckBaseAddress = new Uri(existingSqlServerEarlyAckUrl);
         Console.WriteLine($"Load testing existing SQL Server ACK-after-enqueue instance at {sqlServerEarlyAckBaseAddress}.");
     }
 
-    mongoDbBaseAddress = new Uri(existingMongoDbUrl ?? existingUrl ?? existingAzureServiceBusUrl ?? existingRabbitMqUrl ?? existingRedisUrl ?? existingNatsUrl ?? existingPostgreSqlUrl ?? existingKafkaUrl ?? existingSqlServerUrl!);
-    Console.WriteLine($"Load testing existing MongoDB instance at {mongoDbBaseAddress}.");
+    mongoDbBaseAddress = (existingMongoDbUrl ?? existingUrl ?? existingAzureServiceBusUrl ?? existingRabbitMqUrl ?? existingRedisUrl ?? existingNatsUrl ?? existingPostgreSqlUrl ?? existingKafkaUrl ?? existingSqlServerUrl) is { } mongoDbUrl ? new Uri(mongoDbUrl) : null;
+    if (mongoDbBaseAddress is not null)
+        Console.WriteLine($"Load testing existing MongoDB instance at {mongoDbBaseAddress}.");
     if (existingMongoDbEarlyAckUrl is not null)
     {
         mongoDbEarlyAckBaseAddress = new Uri(existingMongoDbEarlyAckUrl);

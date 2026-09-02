@@ -411,12 +411,14 @@ builder.Services.AddAsyncResponse()
 An application-registered `CosmosClient` is reused automatically; omit `ConnectionString` in that
 case. Existing containers must already use the configured partition key and have TTL enabled.
 
-Ledger loads treat only a `404` with sub-status `0` as a genuinely absent flow. Cosmos also
-answers `404` for conditions where the ledger still exists — `1002` (`ReadSessionNotAvailable`,
-routine Session-consistency lag when another process reads right after a write) and `1003`/`1004`
-(container or database recreated) — and those surface as errors so the wake-up is retried or
-dead-lettered instead of being acknowledged against a live run (the same contract point DynamoDB
-pins with `ConsistentRead` and MongoDB with primary reads).
+Every ledger operation — loads, updates, lease acquire/renew/release, and deletes — treats only a
+`404` with sub-status `0` as a genuinely absent flow. Cosmos also answers `404` for conditions
+where the ledger still exists — `1002` (`ReadSessionNotAvailable`, routine Session-consistency lag
+when another process reads right after a write) and `1003`/`1004` (container or database
+recreated) — and those surface as errors so the wake-up is retried or dead-lettered instead of
+being acknowledged against a live run, and so an update or lease call does not misread one as a
+lost lease (the same contract point DynamoDB pins with `ConsistentRead` and MongoDB with primary
+reads).
 
 ### DynamoDB
 
@@ -579,8 +581,8 @@ state; physical cleanup is separate:
 
 | Store | Cleanup |
 |---|---|
-| PostgreSQL, SQL Server, MySQL, SQLite, Oracle | Opportunistic expired-row prune on flow creation, throttled by `PruneInterval` (default 5 minutes) |
-| EF Core | Provider-side expired-row cleanup through the mapped table |
+| PostgreSQL, SQL Server, MySQL, SQLite, Oracle | Opportunistic expired-row prune on flow creation, throttled by `PruneInterval` (default 5 minutes); a prune that fails — a deadlock victim, a lock timeout — is skipped until the next interval, never failing the `StartAsync` it rides on (loads filter on expiry, so the cost until then is disk) |
+| EF Core | Provider-side expired-row cleanup through the mapped table, pruned opportunistically like the SQL stores (a failing prune is skipped, not surfaced) |
 | MongoDB | TTL index on `expires_at_utc`; reads still filter because Mongo's TTL monitor is periodic |
 | Cosmos DB | Container TTL plus a per-item `ttl` value |
 | DynamoDB | Native TTL on `TimeToLiveAttributeName`; expiry is rounded up to avoid shortening the requested lifetime |

@@ -2,12 +2,13 @@ name: Auto-retry failed jobs
 
 # Hosted runners are flaky and this repo runs 24 job legs per push to main. When a run on main
 # fails, re-run only its failed jobs (and their dependents) — the same button as "Re-run failed
-# jobs" in the UI, pressed automatically. The FIRST re-run is unconditional. Later re-runs need a
-# failed job's log to match a known infrastructure signature: an unconditional five-attempt loop
-# gave an intermittently failing product bug — a race, a lease, a watchdog — five chances to land
-# green on main, and publish.yml relies on main's check as the reviewed gate. The run_attempt
-# guard is what stops this recursing: each re-run fires `workflow_run: completed` again when it
-# finishes.
+# jobs" in the UI, pressed automatically. The FIRST re-run is unconditional. Later re-runs need
+# EVERY failed job's log to match a known infrastructure signature: an unconditional five-attempt
+# loop gave an intermittently failing product bug — a race, a lease, a watchdog — five chances to
+# land green on main, and publish.yml relies on main's check as the reviewed gate. Any-job
+# matching was not enough either: rerun-failed-jobs re-runs ALL failed jobs, so one genuine
+# fixture flake re-ran a co-failing real bug alongside it. The run_attempt guard is what stops
+# this recursing: each re-run fires `workflow_run: completed` again when it finishes.
 on:
   workflow_run:
     workflows: [CI, CodeQL]
@@ -51,8 +52,12 @@ jobs:
             exit 0
           fi
 
-          # From the second re-run on, a failed job's log must match a known flake signature.
+          # From the second re-run on, EVERY failed job's log must match a known flake signature:
+          # the gate is per run but rerun-failed-jobs is per job, so one matching job must not
+          # carry an unmatched (real) failure along for another attempt. A log that cannot be
+          # fetched counts as unmatched — an unreadable failure cannot be proven a flake.
           matched=""
+          unmatched=""
           fetched=0
           while read -r job_id job_name; do
             [ -n "$job_id" ] || continue
@@ -67,22 +72,24 @@ jobs:
                  -H "X-GitHub-Api-Version: 2022-11-28" \
                  "https://api.github.com/repos/$GH_REPO/actions/jobs/$job_id/logs" > "job-$job_id.log" 2> "job-$job_id.err"; then
               echo "::warning::Could not fetch the log of job $job_id ($job_name): $(tr '\n' ' ' < "job-$job_id.err")"
+              unmatched="${unmatched:+$unmatched, }$job_id ($job_name, log unavailable)"
               continue
             fi
             fetched=$((fetched + 1))
             if grep -Eq "$FLAKE_SIGNATURES" "job-$job_id.log"; then
-              matched="$job_id ($job_name)"
-              break
+              matched="${matched:+$matched, }$job_id ($job_name)"
+            else
+              unmatched="${unmatched:+$unmatched, }$job_id ($job_name)"
             fi
           done <<< "$failed_jobs"
 
-          if [ -z "$matched" ]; then
-            if [ "$fetched" -eq 0 ]; then
-              echo "::warning::Not re-running $WORKFLOW run $RUN_ID (attempt $ATTEMPT): could not read any failed job log, so the gate cannot tell a flake from a bug. Fix the log fetch above."
-            else
-              echo "::warning::Not re-running $WORKFLOW run $RUN_ID (attempt $ATTEMPT): no failed job's log matches a known flake signature; a failure that survives one re-run is treated as real."
-            fi
+          if [ "$fetched" -eq 0 ]; then
+            echo "::warning::Not re-running $WORKFLOW run $RUN_ID (attempt $ATTEMPT): could not read any failed job log, so the gate cannot tell a flake from a bug. Fix the log fetch above."
             exit 0
           fi
-          echo "::notice::Re-running failed jobs of $WORKFLOW run $RUN_ID (attempt $ATTEMPT of 5): job $matched matched a known flake signature."
+          if [ -n "$unmatched" ]; then
+            echo "::warning::Not re-running $WORKFLOW run $RUN_ID (attempt $ATTEMPT): failed job(s) $unmatched match no known flake signature; a failure that survives one re-run is treated as real (flake-matching jobs alongside: ${matched:-none})."
+            exit 0
+          fi
+          echo "::notice::Re-running failed jobs of $WORKFLOW run $RUN_ID (attempt $ATTEMPT of 5): every failed job matched a known flake signature ($matched)."
           gh api --method POST "repos/$GH_REPO/actions/runs/$RUN_ID/rerun-failed-jobs"

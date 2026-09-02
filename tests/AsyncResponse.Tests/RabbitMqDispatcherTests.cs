@@ -175,6 +175,48 @@ public class RabbitMqDispatcherTests
             RabbitMqSubscriberRole.Worker);
     }
 
+    /// <summary>
+    /// Round 33 (B3): the early-ACK shutdown budget summed BackgroundDrainTimeout + ShutdownTimeout,
+    /// but the stop path arms ShutdownTimeout TWICE — once for BasicCancel, then a fresh budget for
+    /// the channel/connection closes after the drain. Pre-fix 5s + 25s (+ the uncounted 5s) passed a
+    /// 30s host budget that the real stop path overran by a full ShutdownTimeout.
+    /// </summary>
+    [Fact]
+    public void ValidateOptions_AckAfterEnqueue_CountsShutdownTimeoutTwice_ForTheCancelAndTheClose()
+    {
+        var ex = Assert.Throws<InvalidOperationException>(() =>
+            RabbitMqMessageDispatcher.ValidateOptions(
+                new RabbitMqAsyncResponseOptions
+                {
+                    ShutdownTimeout = TimeSpan.FromSeconds(5),
+                    HostShutdownTimeout = TimeSpan.FromSeconds(30)
+                },
+                EnqueueSubscriber(drain: TimeSpan.FromSeconds(25)),
+                RabbitMqSubscriberRole.Worker));
+
+        Assert.Contains(nameof(RabbitMqAsyncResponseOptions.HostShutdownTimeout), ex.Message, StringComparison.Ordinal);
+        Assert.Contains(nameof(RabbitMqSubscriberOptions.BackgroundDrainTimeout), ex.Message, StringComparison.Ordinal);
+        Assert.Contains(nameof(RabbitMqAsyncResponseOptions.ShutdownTimeout), ex.Message, StringComparison.Ordinal);
+        Assert.Contains("00:00:35", ex.Message, StringComparison.Ordinal); // 5s cancel + 25s drain + 5s close
+    }
+
+    /// <summary>
+    /// Control for the three-term budget: 5s + 20s + 5s = 30s fits a 30s host budget exactly (the
+    /// comparison is inclusive), so the documented defaults keep starting.
+    /// </summary>
+    [Fact]
+    public void ValidateOptions_AckAfterEnqueue_TwoShutdownTimeoutsPlusDrainExactlyAtTheHostBudget_Passes()
+    {
+        RabbitMqMessageDispatcher.ValidateOptions(
+            new RabbitMqAsyncResponseOptions
+            {
+                ShutdownTimeout = TimeSpan.FromSeconds(5),
+                HostShutdownTimeout = TimeSpan.FromSeconds(30)
+            },
+            EnqueueSubscriber(drain: TimeSpan.FromSeconds(20)),
+            RabbitMqSubscriberRole.Worker);
+    }
+
     [Fact]
     public void ValidateOptions_UnsupportedAckMode_Throws()
     {
@@ -597,6 +639,201 @@ public class RabbitMqDispatcherTests
         Assert.False(
             Assert.Single(channel.Nacks).Requeue,
             "once x-death is present a plain requeue can never advance the attempt; the retry must ride the dead-letter cycle");
+    }
+
+    /// <summary>
+    /// Round 33 (B1): AT the cap with <c>x-death</c> present the catch still rejected without
+    /// requeue — but x-death means the dead-letter exchange already returned this message once
+    /// (DLX → retry queue → TTL → back), so that reject re-entered the same cycle and the poison
+    /// message looped at the cycle's TTL rate forever; the cap never parked anything. Pre-fix:
+    /// <c>BasicNack(requeue: false)</c>, no publish, no ACK. Now attempt 3 of 3 is copied to
+    /// <see cref="RabbitMqAsyncResponseOptions.DeadLetterQueue"/> through the DEFAULT exchange
+    /// (bypassing the cycling DLX) and ACKed so the loop ends.
+    /// </summary>
+    [Fact]
+    public async Task Awaiting_AtCapWithXDeath_ParksInTheDeadLetterQueueAndAcks_InsteadOfRejectingBackIntoTheCycle()
+    {
+        var properties = new BasicProperties
+        {
+            CorrelationId = "cid-park",
+            Headers = new Dictionary<string, object?>
+            {
+                ["x-death"] = new List<object?> { new Dictionary<string, object?> { ["count"] = 2L } }
+            }
+        };
+
+        var channel = new FakeDispatcherChannel();
+        await using var dispatcher = RabbitMqMessageDispatcher.Create(
+            (_, _) => throw new InvalidOperationException("handler boom"),
+            new RabbitMqAsyncResponseOptions { DeadLetterExchange = "dlx", DeadLetterQueue = "parked" },
+            new RabbitMqSubscriberOptions { MaxDeliveryAttempts = 3 },
+            NullLogger.Instance,
+            "worker.q",
+            RabbitMqSubscriberRole.Worker);
+
+        var delivery = Delivery("poison-payload", properties, routingKey: "worker.route", deliveryTag: 71);
+        Assert.Equal(3, RabbitMqMessageDispatcher.ResolveDeliveryAttempt(delivery)); // at the cap, and countable
+        Assert.Equal(3, dispatcher.EffectiveDeliveryCap(delivery));
+
+        await dispatcher.HandleAsync(delivery, channel, CancellationToken.None);
+
+        var parked = Assert.Single(channel.Publishes);
+        Assert.Equal(string.Empty, parked.Exchange); // the default exchange routes by queue name: never back through the DLX
+        Assert.Equal("parked", parked.RoutingKey);
+        Assert.Equal("poison-payload", Encoding.UTF8.GetString(parked.Body.ToArray()));
+        Assert.Equal("cid-park", parked.Properties.CorrelationId);
+        Assert.Equal("handler boom", Assert.IsType<string>(parked.Properties.Headers!["AR-DeadLetter-Reason"]));
+        Assert.Equal("worker.q", Assert.IsType<string>(parked.Properties.Headers!["AR-DeadLetter-Source-Queue"]));
+        Assert.Equal(71UL, Assert.Single(channel.Acks));
+        Assert.Empty(channel.Nacks);
+    }
+
+    /// <summary>
+    /// Round 33 (B1), no <see cref="RabbitMqAsyncResponseOptions.DeadLetterQueue"/>: there is nowhere
+    /// to park the message, but another reject would still re-enter the dead-letter cycle forever, so
+    /// the delivery is ACKed (the message is dropped) and the drop is logged as an error. Pre-fix:
+    /// <c>BasicNack(requeue: false)</c>, no ACK.
+    /// </summary>
+    [Fact]
+    public async Task Awaiting_AtCapWithXDeath_WithoutADeadLetterQueue_AcksTheDropAndLogsAnError()
+    {
+        var logger = new ListLogger();
+        var properties = new BasicProperties
+        {
+            Headers = new Dictionary<string, object?>
+            {
+                ["x-death"] = new List<object?> { new Dictionary<string, object?> { ["count"] = 2L } }
+            }
+        };
+
+        var channel = new FakeDispatcherChannel();
+        await using var dispatcher = RabbitMqMessageDispatcher.Create(
+            (_, _) => throw new InvalidOperationException("handler boom"),
+            new RabbitMqAsyncResponseOptions { DeadLetterExchange = "dlx" },
+            new RabbitMqSubscriberOptions { MaxDeliveryAttempts = 3 },
+            logger,
+            "worker.q",
+            RabbitMqSubscriberRole.Worker);
+
+        await dispatcher.HandleAsync(Delivery("payload", properties, deliveryTag: 72), channel, CancellationToken.None);
+
+        Assert.Equal(72UL, Assert.Single(channel.Acks));
+        Assert.Empty(channel.Nacks);
+        Assert.Empty(channel.Publishes);
+        Assert.Contains(
+            logger.Entries,
+            entry => entry.Level == LogLevel.Error
+                && entry.Message.Contains("72", StringComparison.Ordinal)
+                && entry.Message.Contains(nameof(RabbitMqAsyncResponseOptions.DeadLetterQueue), StringComparison.Ordinal));
+    }
+
+    /// <summary>
+    /// Round 33 (B2): the cap was consulted only in the catch, i.e. only when THIS attempt threw. A
+    /// delivery whose previous attempt ended without a thrown exception — the process OOM-killed or
+    /// FailFast mid-handler, a hang that tripped the broker's consumer_timeout — comes back requeued
+    /// with <c>redelivered</c> set and ran again with no cap check at all, so with
+    /// <c>MaxDeliveryAttempts = 1</c> one poison message crash-looped every replica in turn.
+    /// Pre-fix: the handler ran (and here ACKed). Now attempt 2 of a 1-attempt cap is rejected
+    /// without requeue BEFORE the handler runs.
+    /// </summary>
+    [Fact]
+    public async Task Awaiting_RedeliveredPastTheCap_RejectsWithoutRunningTheHandler()
+    {
+        var channel = new FakeDispatcherChannel();
+        var handlerRuns = 0;
+        await using var dispatcher = RabbitMqMessageDispatcher.Create(
+            (_, _) =>
+            {
+                // The crash that ended the previous attempt was the process's, not the handler's:
+                // nothing here throws, so the catch-side cap never sees this delivery.
+                Interlocked.Increment(ref handlerRuns);
+                return Task.CompletedTask;
+            },
+            new RabbitMqAsyncResponseOptions(),
+            new RabbitMqSubscriberOptions { MaxDeliveryAttempts = 1 },
+            NullLogger.Instance,
+            "worker.q",
+            RabbitMqSubscriberRole.Worker);
+
+        await dispatcher.HandleAsync(Delivery("payload", deliveryTag: 81, redelivered: true), channel, CancellationToken.None);
+
+        Assert.Equal(0, Volatile.Read(ref handlerRuns));
+        var nack = Assert.Single(channel.Nacks);
+        Assert.Equal(81UL, nack.DeliveryTag);
+        Assert.False(nack.Requeue);
+        Assert.Empty(channel.Acks);
+    }
+
+    /// <summary>
+    /// Control for the pre-execution cap: attempt 1 of a 1-attempt cap is AT the cap, not past it,
+    /// so the handler runs and its success ACKs exactly as before.
+    /// </summary>
+    [Fact]
+    public async Task Awaiting_FirstDeliveryAtTheCap_StillRunsTheHandler()
+    {
+        var channel = new FakeDispatcherChannel();
+        var handlerRuns = 0;
+        await using var dispatcher = RabbitMqMessageDispatcher.Create(
+            (_, _) =>
+            {
+                Interlocked.Increment(ref handlerRuns);
+                return Task.CompletedTask;
+            },
+            new RabbitMqAsyncResponseOptions(),
+            new RabbitMqSubscriberOptions { MaxDeliveryAttempts = 1 },
+            NullLogger.Instance,
+            "worker.q",
+            RabbitMqSubscriberRole.Worker);
+
+        await dispatcher.HandleAsync(Delivery("payload", deliveryTag: 82, redelivered: false), channel, CancellationToken.None);
+
+        Assert.Equal(1, Volatile.Read(ref handlerRuns));
+        Assert.Equal(82UL, Assert.Single(channel.Acks));
+        Assert.Empty(channel.Nacks);
+    }
+
+    /// <summary>
+    /// Round 33 (B2), the guard's other arm: past the cap AND <c>x-death</c> present means the
+    /// dead-letter cycle already returned this message, so a reject would only re-enter it (B1) —
+    /// it is parked in <see cref="RabbitMqAsyncResponseOptions.DeadLetterQueue"/> and ACKed, and the
+    /// handler never runs. Pre-fix: the handler ran again.
+    /// </summary>
+    [Fact]
+    public async Task Awaiting_PastTheCapWithXDeath_ParksWithoutRunningTheHandler()
+    {
+        var properties = new BasicProperties
+        {
+            Headers = new Dictionary<string, object?>
+            {
+                ["x-death"] = new List<object?> { new Dictionary<string, object?> { ["count"] = 2L } }
+            }
+        };
+
+        var channel = new FakeDispatcherChannel();
+        var handlerRuns = 0;
+        await using var dispatcher = RabbitMqMessageDispatcher.Create(
+            (_, _) =>
+            {
+                Interlocked.Increment(ref handlerRuns);
+                return Task.CompletedTask;
+            },
+            new RabbitMqAsyncResponseOptions { DeadLetterExchange = "dlx", DeadLetterQueue = "parked" },
+            new RabbitMqSubscriberOptions { MaxDeliveryAttempts = 2 },
+            NullLogger.Instance,
+            "worker.q",
+            RabbitMqSubscriberRole.Worker);
+
+        var delivery = Delivery("payload", properties, deliveryTag: 83);
+        Assert.Equal(3, RabbitMqMessageDispatcher.ResolveDeliveryAttempt(delivery)); // past a cap of 2
+
+        await dispatcher.HandleAsync(delivery, channel, CancellationToken.None);
+
+        Assert.Equal(0, Volatile.Read(ref handlerRuns));
+        var parked = Assert.Single(channel.Publishes);
+        Assert.Equal(string.Empty, parked.Exchange);
+        Assert.Equal("parked", parked.RoutingKey);
+        Assert.Equal(83UL, Assert.Single(channel.Acks));
+        Assert.Empty(channel.Nacks);
     }
 
     [Fact]

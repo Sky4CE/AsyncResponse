@@ -277,7 +277,7 @@ public sealed class EFCoreFlowStateStore<[DynamicallyAccessedMembers(Dynamically
         var now = DateTime.UtcNow;
 
         if (DurableFlowStoreShared.ShouldPrune(ref _lastPruneTicks, _options.PruneInterval))
-            await PruneExpiredAsync(db, cancellationToken).ConfigureAwait(false);
+            await DurableFlowStoreShared.PruneQuietlyAsync(() => PruneExpiredAsync(db, cancellationToken)).ConfigureAwait(false);
 
         // Replace an expired ledger IN PLACE, in one statement (sibling parity: PostgreSQL
         // `ON CONFLICT ... DO UPDATE ... WHERE expired`, SQL Server/Oracle `MERGE ... WHEN MATCHED

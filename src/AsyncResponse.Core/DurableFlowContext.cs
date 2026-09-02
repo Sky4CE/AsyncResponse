@@ -829,6 +829,51 @@ internal sealed class DurableFlowContext : IDurableFlowContext
         }
         catch (Exception ex)
         {
+            if (triggerCompleted)
+            {
+                // The remote request is in flight (or already answered). SETTLE the handoff
+                // before deciding, exactly as the cancellation branch does: after this await the
+                // response task is terminal and the decision below is authoritative.
+                await waiter.DisposeAsync().ConfigureAwait(false);
+
+                if (waiter.ResponseTask.IsCompletedSuccessfully)
+                {
+                    // The response was won. Task.WaitAsync hands back a completed task BEFORE it
+                    // consults the token, so a lease lost in the same instant the response landed
+                    // returns the payload and lands here (not in the cancellation branch) when the
+                    // fenced completion save trips ThrowIfLost — and the clock-based check inside
+                    // that save can trip on its own in the same window. The claimed,
+                    // channel-acked payload exists nowhere else: persist it through the lease-less
+                    // compare-and-swap before the takeover signal propagates, as the cancellation
+                    // branch does. Without this the redelivered execution re-attached to a
+                    // consumed correlation id, burned the step timeout, and re-sent the request.
+                    var received = waiter.ResponseTask.Result;
+                    checkpoint.PendingCorrelationId = null;
+                    if (_lease.IsLost)
+                    {
+                        await CheckpointReceivedWithoutLeaseAsync(name, checkpoint, received, correlationId).ConfigureAwait(false);
+                        _lease.ThrowIfLost(ex);
+                    }
+
+                    await CompleteStepAsync(name, checkpoint, AsyncResponseJson.Serialize(received), CancellationToken.None, kind: DurableFlowStepKind.Awaited, correlationId: correlationId).ConfigureAwait(false);
+                    return received;
+                }
+
+                if (!waiter.ResponseTask.IsFaulted)
+                {
+                    // Nothing was delivered and the wait itself did not fault: the throw came from
+                    // OUTSIDE the wait (a step observer, the logger, the replay branch's ledger
+                    // re-extension) while the remote request was already sent. Marking the step
+                    // faulted here made the redelivered execution mint a fresh correlation id and
+                    // send the request AGAIN — the double-send the breadcrumb exists to prevent,
+                    // and worse than a real crash, which leaves the breadcrumb intact. Keep it:
+                    // the next execution re-attaches, or the persisted deadline faults it.
+                    checkpoint.Message = ex.Message;
+                    await SaveAsync(CancellationToken.None, cause: ex).ConfigureAwait(false);
+                    throw;
+                }
+            }
+
             // Timeout, trigger failure (including trigger-thrown cancellation), or a faulted
             // wait: record it so the next execution restarts this step fresh instead of
             // re-attaching to a dead correlation id. The original failure rides along as `cause`
@@ -912,7 +957,13 @@ internal sealed class DurableFlowContext : IDurableFlowContext
                 flowId,
                 Placeholder.Payload<TResponse>()!,
                 Placeholder.CorrelationId());
-            Expression<Func<IDurableFlowExecutor, Task>> failure = executor => executor.FailAsync(flowId, Placeholder.Exception());
+            // Correlation-scoped like the resume target: a dead worker's registration outlives
+            // the replacement's, so an unscoped failure let a late error for a superseded
+            // correlation id terminally fail a run that was live on another one.
+            Expression<Func<IDurableFlowExecutor, Task>> failure = executor => executor.FailAsync(
+                flowId,
+                Placeholder.Exception(),
+                Placeholder.CorrelationId());
 
             return await _recoverableSubscriber.CreateRecoverableResponseWaiter(
                 correlationId,

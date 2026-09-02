@@ -7,7 +7,7 @@ namespace AsyncResponse;
 /// <summary>
 /// Executes durable flow runs. Its methods are the durable targets behind every flow: worker jobs
 /// carry <see cref="ExecuteAsync"/>, and awaited steps register <see cref="RecoverAsync"/> /
-/// <see cref="FailAsync"/> as their lost-subscriber callbacks — invoked by whichever process
+/// <see cref="FailAsync(string, System.Exception, string)"/> as their lost-subscriber callbacks — invoked by whichever process
 /// receives a late response, possibly a different deployment.
 /// <para>
 /// <b>Naming contract:</b> like all recovery callbacks, these targets are persisted as
@@ -37,6 +37,16 @@ public interface IDurableFlowExecutor
 
     /// <summary>Lost-subscriber failure target: marks the run terminally <see cref="FlowRunStatus.Failed"/>.</summary>
     Task FailAsync(string flowId, Exception exception);
+
+    /// <summary>
+    /// Correlation-scoped lost-subscriber failure target: marks the run terminally
+    /// <see cref="FlowRunStatus.Failed"/> only while a step is still pending on
+    /// <paramref name="correlationId"/>. A failure for a correlation id the flow has since settled
+    /// or superseded (a dead worker's registration outliving the replacement's, a late error for a
+    /// step that already restarted fresh) is stale and is ignored — the same scoping
+    /// <see cref="RecoverAsync"/> applies to the success target.
+    /// </summary>
+    Task FailAsync(string flowId, Exception exception, string correlationId);
 }
 
 /// <inheritdoc cref="IDurableFlowExecutor" />
@@ -452,7 +462,16 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
     }
 
     /// <inheritdoc />
-    public async Task FailAsync(string flowId, Exception exception)
+    public Task FailAsync(string flowId, Exception exception)
+        => FailCoreAsync(flowId, exception, correlationId: null);
+
+    public Task FailAsync(string flowId, Exception exception, string correlationId)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(correlationId);
+        return FailCoreAsync(flowId, exception, correlationId);
+    }
+
+    private async Task FailCoreAsync(string flowId, Exception exception, string? correlationId)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(flowId);
         ArgumentNullException.ThrowIfNull(exception);
@@ -462,6 +481,7 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
 
         FlowState? updated = null;
         var failedNow = false;
+        var stale = false;
         var found = await FlowStateConcurrency.MutateAsync(
             store,
             flowId,
@@ -471,8 +491,21 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
             {
                 updated = state;
                 failedNow = false;
+                stale = false;
                 if (state.Status != FlowRunStatus.Running)
                     return false;
+
+                // A correlation-scoped failure only counts against the step still pending on
+                // that id (RecoverAsync parity): a dead worker's registration outlives the
+                // replacement's, so a late error for a superseded or already-settled correlation
+                // id must not fail a run that is live on another one.
+                if (correlationId is not null
+                    && (state.Steps is null
+                        || !state.Steps.Values.Any(step => string.Equals(step.PendingCorrelationId, correlationId, StringComparison.Ordinal))))
+                {
+                    stale = true;
+                    return false;
+                }
 
                 state.Status = FlowRunStatus.Failed;
                 state.LastMessage = exception.Message;
@@ -483,6 +516,12 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
         if (!found || updated is null)
         {
             _logger.LogWarning("Durable flow {FlowId} cannot be failed: no state (unknown, expired, or unreadable).", flowId);
+            return;
+        }
+
+        if (stale)
+        {
+            _logger.LogDebug("Durable flow {FlowId} has no step pending on correlationId {CorrelationId}; ignoring stale failure signal.", flowId, correlationId);
             return;
         }
 

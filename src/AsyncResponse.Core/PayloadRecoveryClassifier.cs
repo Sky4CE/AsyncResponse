@@ -147,10 +147,9 @@ internal static class PayloadRecoveryClassifier
         var generationBeforeScan = UnresolvableTypeNames.GenerationBeforeScan();
         var resolvedGenerationBeforeScan = Volatile.Read(ref _resolvedPayloadTypeGeneration);
 
-        var resolved = AppDomain.CurrentDomain
-            .GetAssemblies()
-            .Select(a => a.GetType(payloadTypeFullName, throwOnError: false))
-            .FirstOrDefault(t => t != null);
+        // Loaded assemblies only — every component of the name, generic arguments included (see
+        // ResolveLoaded): a persisted name must never make the process load an assembly.
+        var resolved = AsyncResponseTypeResolution.ResolveLoaded(payloadTypeFullName);
 
         // Opt-in fallback for payload types loaded into a non-default AssemblyLoadContext (plugins).
         resolved ??= AsyncResponseTypeResolution.Resolve(payloadTypeFullName);

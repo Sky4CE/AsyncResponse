@@ -95,9 +95,13 @@ public sealed class KafkaSubscriberOptions
     /// Maximum number of in-process delivery attempts before a failing message is produced to the
     /// dead-letter topic and its offset committed. Kafka offsets cannot NACK a single message, so
     /// retries run in-process with backoff and stall the message's partition while they run (per
-    /// classic consumer-group semantics). <c>0</c> means unlimited retries. Attempts are counted
-    /// per process delivery: a consumer restart before the offset commit resets the count.
-    /// Default: <c>5</c>.
+    /// classic consumer-group semantics). <c>0</c> means unlimited retries on the
+    /// <see cref="KafkaAckMode.AckAfterHandlerCompletes"/> path; under
+    /// <see cref="KafkaAckMode.AckAfterEnqueue"/> the offset is already committed, so <c>0</c>
+    /// means a single attempt before the message is dead-lettered and surfaced via
+    /// <see cref="OnBackgroundFailure"/> (retrying a committed message forever wedged the
+    /// background worker with no record). Attempts are counted per process delivery: a consumer
+    /// restart before the offset commit resets the count. Default: <c>5</c>.
     /// </summary>
     public int MaxDeliveryAttempts { get; set; } = 5;
 

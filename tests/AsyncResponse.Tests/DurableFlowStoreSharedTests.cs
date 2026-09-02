@@ -155,6 +155,35 @@ public sealed class DurableFlowStoreSharedTests
             Invoke(shared, "ServerClockTtlMilliseconds", TimeSpan.MaxValue));
     }
 
+    /// <summary>
+    /// Regression (round 33): the six relational stores awaited their opportunistic prune bare
+    /// inside TryCreateAsync, so a prune DELETE chosen as the deadlock victim (1205) or hitting a
+    /// lock-wait timeout against the store's own checkpoint traffic failed StartAsync for a flow
+    /// whose row would have been created without incident — and ShouldPrune had already consumed
+    /// the interval, so it was not retried either. PruneQuietlyAsync contains the prune's failure
+    /// (the next interval retries); cancellation still propagates. Reflected: the helper is the
+    /// fix, so an older build has none and this fact fails there instead of failing to compile.
+    /// </summary>
+    [Theory]
+    [MemberData(nameof(ProviderOptionTypes))]
+    public async Task PruneQuietly_ContainsPruneFailures_ButPropagatesCancellation(Type providerOptionsType)
+    {
+        var shared = providerOptionsType.Assembly.GetType(SharedTypeName, throwOnError: true)!;
+        var pruneQuietly = shared.GetMethod("PruneQuietlyAsync", BindingFlags.Public | BindingFlags.Static);
+        Assert.NotNull(pruneQuietly);
+
+        var attempted = 0;
+        await Quietly(() => { attempted++; throw new InvalidOperationException("deadlock victim"); });
+        await Quietly(() => { attempted++; return Task.FromException(new TimeoutException("lock wait timeout")); });
+        Assert.Equal(2, attempted);
+
+        await Assert.ThrowsAsync<OperationCanceledException>(() => Quietly(() => throw new OperationCanceledException()));
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            () => Quietly(() => Task.FromCanceled(new CancellationToken(canceled: true))));
+
+        Task Quietly(Func<Task> prune) => (Task)pruneQuietly!.Invoke(null, [prune])!;
+    }
+
     public static TheoryData<Type> ProviderOptionTypes =>
     [
         typeof(CosmosDurableFlowOptions),

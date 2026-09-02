@@ -601,6 +601,62 @@ public class KafkaDispatcherTests
         Assert.Single(consumer.StoredOffsets); // only the enqueue-time store; dead-lettering does not store again
     }
 
+    /// <summary>
+    /// Round 33 (B4): the queued (early-ACK) retry loop's only exit was <c>ReachedDeliveryAttempts</c>,
+    /// which is never true for the documented "unlimited" value <c>MaxDeliveryAttempts = 0</c> — so an
+    /// already-committed message retried on a background worker forever: no <c>OnBackgroundFailure</c>,
+    /// no dead-letter record (both live inside the exit block), the bounded queue filled and the
+    /// subscriber wedged. Pre-fix: the failure callback never fires and nothing is produced. After an
+    /// early ACK 0 now means a single attempt, like the sibling transports that never retry there.
+    /// </summary>
+    [Fact]
+    public async Task Queued_UnlimitedAttempts_MeansOneAttemptAfterTheEarlyAck_ThenNotifiesAndDeadLetters()
+    {
+        var consumer = new FakeKafkaConsumerClient();
+        var producer = new FakeKafkaProducerClient();
+        var failureReported = new TaskCompletionSource<KafkaBackgroundFailureContext>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var subscriberOptions = new KafkaSubscriberOptions
+        {
+            MaxDeliveryAttempts = 0,
+            // Slow enough that the pre-fix loop is no hot spin, fast enough to stay well inside the wait below.
+            HandlerRetryBaseDelay = TimeSpan.FromMilliseconds(50),
+            HandlerRetryMaxDelay = TimeSpan.FromMilliseconds(100)
+        }.UseAckAfterEnqueue(1, 8, TimeSpan.FromMilliseconds(250));
+        subscriberOptions.OnBackgroundFailure = context =>
+        {
+            failureReported.TrySetResult(context);
+            return ValueTask.CompletedTask;
+        };
+
+        var attempts = 0;
+        await using var dispatcher = CreateDispatcher(
+            (_, _) =>
+            {
+                Interlocked.Increment(ref attempts);
+                throw new InvalidOperationException("background boom");
+            },
+            subscriberOptions,
+            consumer: consumer,
+            producer: producer);
+
+        await dispatcher.HandleAsync(KafkaTestData.Delivery(Topic, offset: 5), CancellationToken.None);
+
+        var failure = await failureReported.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        Assert.Equal(5, failure.Offset);
+        Assert.IsType<InvalidOperationException>(failure.Exception);
+
+        await KafkaTestData.WaitUntilAsync(() => producer.Publishes.Count == 1);
+        var dead = Assert.Single(producer.Publishes);
+        Assert.Equal($"{Topic}.deadletter", dead.Topic);
+        Assert.Equal("background_handler_failed_after_commit", FakeKafkaProducerClient.Header(dead.Headers, "reason"));
+        Assert.Equal("1", FakeKafkaProducerClient.Header(dead.Headers, "attempts"));
+        Assert.Single(consumer.StoredOffsets); // the enqueue-time store only
+
+        // The worker moved on: nothing retries the already-committed message once it is buried.
+        await Task.Delay(TimeSpan.FromMilliseconds(300));
+        Assert.Equal(1, Volatile.Read(ref attempts));
+    }
+
     [Fact]
     public async Task Queued_BackgroundFailureCallbackThrow_IsSwallowed()
     {

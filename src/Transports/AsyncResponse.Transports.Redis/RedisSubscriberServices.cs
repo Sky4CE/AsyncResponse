@@ -123,19 +123,28 @@ internal abstract class RedisSubscriberService : BackgroundService
                     nextPendingClaimAt = utcNow + SubscriberOptions.PendingClaimInterval;
                 }
 
-                var entries = await _database.StreamReadGroupAsync(
-                    Stream,
-                    ConsumerGroup,
-                    consumerName,
-                    SubscriberOptions.BatchSize,
-                    stoppingToken).ConfigureAwait(false);
+                // Clamp the read to the dispatcher's FREE slots (ASB/SQS parity), not merely to
+                // "is there one": a full BatchSize read into a nearly-full early-ACK queue deferred
+                // the surplus into the PEL un-ACKed, every reclaim bumped its delivery count, and
+                // the pre-execution cap eventually dead-lettered healthy jobs whose handler never
+                // ran. The claim above may have taken the last slot.
+                var readCount = Math.Min(SubscriberOptions.BatchSize, dispatcher.FreeCapacity);
+                if (readCount > 0)
+                {
+                    var entries = await _database.StreamReadGroupAsync(
+                        Stream,
+                        ConsumerGroup,
+                        consumerName,
+                        readCount,
+                        stoppingToken).ConfigureAwait(false);
 
-                processed += await DispatchBatchAsync(
-                    dispatcher,
-                    entries,
-                    consumerName,
-                    static _ => 1,
-                    stoppingToken).ConfigureAwait(false);
+                    processed += await DispatchBatchAsync(
+                        dispatcher,
+                        entries,
+                        consumerName,
+                        static _ => 1,
+                        stoppingToken).ConfigureAwait(false);
+                }
             }
 
             // Throttle when nothing advanced — an empty stream, or every entry deferred under backpressure.
@@ -194,11 +203,17 @@ internal abstract class RedisSubscriberService : BackgroundService
         RedisValue consumerName,
         CancellationToken cancellationToken)
     {
+        // Same clamp as the read: reclaiming more than the dispatcher can take defers the rest
+        // straight back into the PEL with a bumped delivery count.
+        var claimCount = Math.Min(SubscriberOptions.PendingClaimBatchSize, dispatcher.FreeCapacity);
+        if (claimCount <= 0)
+            return 0;
+
         var minIdleMs = ToPositiveMilliseconds(SubscriberOptions.PendingMessageMinIdleTime);
         var pending = await _database.StreamPendingMessagesAsync(
             Stream,
             ConsumerGroup,
-            SubscriberOptions.PendingClaimBatchSize,
+            claimCount,
             RedisValue.Null,
             minId: null,
             maxId: null,
@@ -218,6 +233,44 @@ internal abstract class RedisSubscriberService : BackgroundService
             minIdleMs,
             pending.Select(item => item.MessageId).ToArray(),
             cancellationToken).ConfigureAwait(false);
+
+        // Redis 5/6 answer XCLAIM with a nil entry for an id whose message was trimmed while still
+        // pending (7.x drops it from the PEL instead). A nil entry has no id, so neither the
+        // dispatch path nor the JUSTID heartbeat can name it, and it stayed in the PEL to be
+        // re-claimed every cycle. When the reply is complete its order matches the request, so
+        // the tombstones are ACKed by their pending ids here; a partial reply leaves them for the
+        // next cycle. Either way only real entries are dispatched.
+        if (Array.Exists(claimed, static entry => entry.Id.IsNull))
+        {
+            if (claimed.Length == pending.Length)
+            {
+                for (var index = 0; index < claimed.Length; index++)
+                {
+                    if (!claimed[index].Id.IsNull)
+                        continue;
+
+                    var tombstoneId = pending[index].MessageId;
+                    try
+                    {
+                        await _database.StreamAcknowledgeAsync(Stream, ConsumerGroup, tombstoneId, CancellationToken.None).ConfigureAwait(false);
+                        Logger.LogWarning(
+                            "Redis pending entry {MessageId} on {Stream} was trimmed while still pending; ACKed the tombstone so it drains.",
+                            tombstoneId.ToString(),
+                            Stream.ToString());
+                    }
+                    catch (Exception ex)
+                    {
+                        Logger.LogWarning(
+                            ex,
+                            "Failed to ACK trimmed pending entry {MessageId} on {Stream}; it is retried on the next pending-claim cycle.",
+                            tombstoneId.ToString(),
+                            Stream.ToString());
+                    }
+                }
+            }
+
+            claimed = Array.FindAll(claimed, static entry => !entry.Id.IsNull);
+        }
 
         return await DispatchBatchAsync(
             dispatcher,

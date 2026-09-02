@@ -99,10 +99,19 @@ public sealed class NatsAsyncResponseChannelOptions : DurableAsyncResponseChanne
         }
 
         // A subject prefix becomes leading tokens of every response subject; it must not contain the
-        // NATS subject wildcards or separators that would break addressing.
+        // NATS subject wildcards or whitespace that would break addressing.
         if (SubjectPrefix.IndexOfAny([' ', '\t', '*', '>', '\r', '\n']) >= 0)
             throw new InvalidOperationException(
                 $"{nameof(NatsAsyncResponseChannelOptions)}.{nameof(SubjectPrefix)} '{SubjectPrefix}' must not contain whitespace or the NATS wildcards '*'/'>'.");
+
+        // A dotted prefix is the intended way to namespace ("my.app" -> my.app.response.<id>), but
+        // a leading, trailing or doubled '.' yields an EMPTY token — a subject nats-server rejects
+        // on SUB with a non-fatal -ERR that NATS.Net never surfaces. Startup passed, every waiter
+        // registered with no server-side interest, and every SetResponse got NoResponders and
+        // took the lost-subscriber path while the live waiter ran to its timeout.
+        if (SubjectPrefix.StartsWith('.') || SubjectPrefix.EndsWith('.') || SubjectPrefix.Contains("..", StringComparison.Ordinal))
+            throw new InvalidOperationException(
+                $"{nameof(NatsAsyncResponseChannelOptions)}.{nameof(SubjectPrefix)} '{SubjectPrefix}' must not begin or end with '.' or contain '..' (an empty NATS subject token).");
     }
 
     private static void Required(string? value, string name)

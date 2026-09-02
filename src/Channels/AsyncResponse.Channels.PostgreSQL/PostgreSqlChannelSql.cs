@@ -379,11 +379,13 @@ internal sealed class PostgreSqlChannelSql
     /// <summary>
     /// Inserts a response envelope row and notifies listeners. The caller supplies the message id so
     /// the insert is idempotent under retry (<c>ON CONFLICT DO NOTHING</c>); the NOTIFY still fires so
-    /// a retried publish never strands an active waiter. Returns the row's server-stamped
-    /// <c>created_at</c> (the original row's on a duplicate) so the same-process fast path compares
-    /// against subscription watermarks on the server clock rather than the app clock.
+    /// a retried publish never strands an active waiter. Returns the same-process fast-path
+    /// message carrying the row's server-stamped <c>created_at</c> — and, on a duplicate, the
+    /// ORIGINAL row's settlement columns, so the fast path compares against subscription
+    /// watermarks exactly as the sweep does (a fabricated null <c>acked_at</c> replayed an
+    /// already-consumed response to a waiter registered after the ack).
     /// </summary>
-    public Task<DateTimeOffset> InsertMessageAsync(Guid id, string correlationId, string envelopeJson, TimeSpan retention, CancellationToken cancellationToken)
+    public Task<PostgreSqlChannelMessage> InsertMessageAsync(Guid id, string correlationId, string envelopeJson, TimeSpan retention, CancellationToken cancellationToken)
         => AsyncResponseRetry.ExecuteAsync(
             token => InsertMessageOnceAsync(id, correlationId, envelopeJson, retention, token),
             IsTransient,
@@ -392,7 +394,7 @@ internal sealed class PostgreSqlChannelSql
             _options.PublishRetryMaxDelay,
             cancellationToken);
 
-    private async Task<DateTimeOffset> InsertMessageOnceAsync(Guid id, string correlationId, string envelopeJson, TimeSpan retention, CancellationToken cancellationToken)
+    private async Task<PostgreSqlChannelMessage> InsertMessageOnceAsync(Guid id, string correlationId, string envelopeJson, TimeSpan retention, CancellationToken cancellationToken)
     {
         await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
         if (ShouldPrune(ref _lastMessagePruneTicks))
@@ -401,8 +403,8 @@ internal sealed class PostgreSqlChannelSql
         await using var connection = await _dataSource.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         await using var command = connection.CreateCommand();
         // Single statement: the final SELECT both fires the NOTIFY exactly once and returns the
-        // server-stamped created_at — the fresh row's via RETURNING, or the original row's when
-        // the idempotent insert hit a duplicate.
+        // fresh row's server-stamped created_at via RETURNING — NULL when the idempotent insert
+        // hit a duplicate, which the separate lookup below resolves.
         command.CommandText =
             $"""
             WITH inserted AS (
@@ -411,9 +413,7 @@ internal sealed class PostgreSqlChannelSql
                 ON CONFLICT (id) DO NOTHING
                 RETURNING created_at
             )
-            SELECT COALESCE(
-                       (SELECT created_at FROM inserted),
-                       (SELECT created_at FROM {MessageTable} WHERE id = @id)) AS created_at,
+            SELECT (SELECT created_at FROM inserted) AS created_at,
                    pg_notify(@channel, @payload);
             """;
         command.Parameters.AddWithValue("id", id);
@@ -430,30 +430,34 @@ internal sealed class PostgreSqlChannelSql
         }
 
         if (createdAt is { } stamped)
-            return stamped;
+            return new PostgreSqlChannelMessage(id, correlationId, envelopeJson, stamped);
 
-        // NULL is (almost always) a CONCURRENT idempotent publish, not a missing row: ON CONFLICT
-        // detects the other transaction's row against latest data, but the same-statement fallback
-        // subquery reads under this statement's snapshot, which predates that commit — so the row
-        // exists and is invisible here (reproduced on PostgreSQL 16). A fresh statement gets a
-        // fresh read-committed snapshot and resolves it deterministically; no retry loop needed.
+        // Duplicate: a publish retry, or a CONCURRENT idempotent publish (ON CONFLICT detects the
+        // other transaction's row against latest data, while a same-statement subquery would read
+        // under this statement's older snapshot — reproduced on PostgreSQL 16). A fresh statement
+        // gets a fresh read-committed snapshot and resolves both deterministically, and it reads
+        // the original row's settlement columns for the fast-path watermark.
         await using var lookup = connection.CreateCommand();
-        lookup.CommandText = $"SELECT created_at FROM {MessageTable} WHERE id = @id;";
+        lookup.CommandText = $"SELECT created_at, acked_at, acked_seq FROM {MessageTable} WHERE id = @id;";
         lookup.Parameters.AddWithValue("id", id);
-        var existing = await lookup.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false);
-
-        return existing switch
+        await using var existing = await lookup.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+        if (await existing.ReadAsync(cancellationToken).ConfigureAwait(false))
         {
-            DateTimeOffset offset => offset,
-            DateTime dateTime => new DateTimeOffset(dateTime, TimeSpan.Zero),
+            return new PostgreSqlChannelMessage(
+                id,
+                correlationId,
+                envelopeJson,
+                existing.GetFieldValue<DateTimeOffset>(0),
+                existing.IsDBNull(1) ? null : existing.GetFieldValue<DateTimeOffset>(1),
+                existing.IsDBNull(2) ? null : existing.GetInt64(2));
+        }
 
-            // Only reachable when the duplicate's original row is genuinely gone (pruned
-            // mid-publish): the message is not persisted, and reporting success with a fabricated
-            // app-clock timestamp would both lie about persistence and feed a client clock into
-            // the server-clock watermark.
-            _ => throw new InvalidOperationException(
-                $"PostgreSQL response insert for message {id} found no row after a duplicate: the original no longer exists (pruned). The response is not persisted.")
-        };
+        // Only reachable when the duplicate's original row is genuinely gone (pruned
+        // mid-publish): the message is not persisted, and reporting success with a fabricated
+        // app-clock timestamp would both lie about persistence and feed a client clock into
+        // the server-clock watermark.
+        throw new InvalidOperationException(
+            $"PostgreSQL response insert for message {id} found no row after a duplicate: the original no longer exists (pruned). The response is not persisted.");
     }
 
     public async Task<IReadOnlyList<PostgreSqlChannelMessage>> LoadMessagesAsync(

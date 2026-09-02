@@ -6,6 +6,31 @@ namespace AsyncResponse.DurableFlows.Internal;
 internal static class DurableFlowStoreShared
 {
     /// <summary>
+    /// Runs an opportunistic prune so that its failure never fails the primitive it rides on.
+    /// Awaited bare inside <c>TryCreateAsync</c>, a prune chosen as the deadlock victim (1205)
+    /// or hitting a lock-wait timeout against the store's own live checkpoint traffic failed
+    /// <c>StartAsync</c> for a flow whose row would have been created without incident — and
+    /// <see cref="ShouldPrune"/> had already consumed the interval, so it was not retried either.
+    /// Loads filter on expiry, so a skipped prune costs nothing but disk until the next interval.
+    /// Cancellation still propagates.
+    /// </summary>
+    public static async Task PruneQuietlyAsync(Func<Task> prune)
+    {
+        try
+        {
+            await prune().ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception)
+        {
+            // Opportunistic maintenance; the next interval retries.
+        }
+    }
+
+    /// <summary>
     /// Upper bound for TTL values handed to server-clock date arithmetic (~68 years). SQL Server's
     /// <c>DATEADD</c> takes <c>int</c> seconds, and MySQL/Oracle datetime types stop at year 9999,
     /// so an absurd <see cref="DurableFlowOptions.StateExpiry"/> (for example

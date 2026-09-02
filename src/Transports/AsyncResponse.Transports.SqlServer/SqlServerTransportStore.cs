@@ -598,13 +598,22 @@ internal sealed class SqlServerTransportStore
         if (_options.DeadLetterRetention is not { } retention || !ShouldPruneDeadLetters())
             return;
 
+        // Bounded batch (SQL Server channel parity): the dead-letter rows share the queue table
+        // with live claims, and an unbounded DELETE over a backlog past SQL Server's ~5,000-lock
+        // escalation threshold takes a table X lock that READPAST cannot skip — every claim, ACK
+        // and lease renewal blocked behind it for up to the command timeout, which is the whole
+        // LockTimeout, so a live handler's lease lapsed and a peer re-ran its job concurrently.
+        // Any backlog beyond the batch waits for the next throttle window.
         await using var connection = await OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         await using var command = connection.CreateCommand();
-        command.CommandText = $"DELETE FROM {MessageTable} WHERE {ExactQueueMatch} AND created_at < {AddMilliseconds("@negative_retention_ms")};";
+        command.CommandText = $"DELETE TOP ({DeadLetterPruneBatchSize}) FROM {MessageTable} WHERE {ExactQueueMatch} AND created_at < {AddMilliseconds("@negative_retention_ms")};";
         command.Parameters.AddWithValue("@queue", _options.DeadLetterQueue);
         command.Parameters.AddWithValue("@negative_retention_ms", -(long)retention.TotalMilliseconds);
         await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
     }
+
+    /// <summary>Rows per prune statement; well under the ~5,000-lock escalation threshold.</summary>
+    private const int DeadLetterPruneBatchSize = 1000;
 
     private bool ShouldPruneDeadLetters()
     {

@@ -595,6 +595,25 @@ internal sealed class InMemoryWorkerHost(
                 }
 
                 var delay = RetryDelay(options, attempt);
+                if (stoppingToken.IsCancellationRequested && options.MaxDeliveryAttempts > 0)
+                {
+                    // The shutdown drain IS this token's cancellation (BeginShutdownDrain is its
+                    // registration), so every drain-time failure lands here with the token already
+                    // set — and binding the sleep below to it made MaxDeliveryAttempts effectively
+                    // 1 for the whole drain: the delay threw before it began, and one failure
+                    // dropped the job with its remaining attempts unspent, stranding the durable
+                    // flow behind it exactly when lease contention peaks. Accepted jobs were
+                    // promised in-process execution, so the bounded ladder still runs; each backoff
+                    // is capped at the base delay so a failing job cannot park the worker behind
+                    // the jobs queued after it.
+                    var drainDelay = delay < options.RetryBaseDelay ? delay : options.RetryBaseDelay;
+                    _logger.LogWarning(ex,
+                        "In-memory worker job {Target}.{Method} failed on attempt {Attempt} during the shutdown drain; retrying in {Delay}.",
+                        queued.Job.Call.ServiceInterfaceFullName, queued.Job.Call.MethodName, attempt, drainDelay);
+                    await Task.Delay(drainDelay, _timeProvider ?? TimeProvider.System).ConfigureAwait(false);
+                    continue;
+                }
+
                 _logger.LogWarning(ex,
                     "In-memory worker job {Target}.{Method} failed on attempt {Attempt}; retrying in {Delay}.",
                     queued.Job.Call.ServiceInterfaceFullName, queued.Job.Call.MethodName, attempt, delay);

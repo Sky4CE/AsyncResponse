@@ -21,7 +21,10 @@ owns the full story — this page is the map, not the territory.
   startup logs a change-stream error.
 - **Cause:** MongoDB change streams require a **replica set**. Against a standalone server the
   channel falls back to `ListenerPollInterval` polling (the transport to `EmptyPollDelay`), which
-  is correct but slower.
+  is correct but slower. In that mode — and with `UseChangeStreams = false` — the channel sweeps
+  on every tick, ignoring `FullSweepInterval`: the throttled sweep would be its only cross-process
+  wake, and the 5 s default equalled `DeliveryConfirmationTimeout`, so a cross-process response
+  could route to recovery before its waiter had even looked.
 - **Fix:** run a replica set — single-node is sufficient — and include `directConnection=true` in
   the connection string when connecting to a single-node replica set. See the MongoDB rows in
   [channel options](configuration.md#channel-options).
@@ -79,14 +82,21 @@ owns the full story — this page is the map, not the territory.
   message is rejected on its second delivery rather than requeued forever, which is what the
   startup warning is telling you. Once a message carries `x-death` (it has been dead-lettered at
   least once), every further retry below the cap rejects **without** requeue so the cycle is what
-  counts it — a plain requeue never advances `x-death`.
+  counts it — a plain requeue never advances `x-death`. The cap is judged before the handler
+  runs too: a delivery whose previous attempt ended without a thrown exception (the process was
+  killed mid-handler; the broker requeued it with `redelivered`) is dead-lettered without
+  executing rather than crash-looping every replica.
 - **Fix:** for production, set a positive `MaxDeliveryAttempts` **and** configure
   `DeadLetterExchange` (so capped-out messages are preserved, not dropped). `DeclareTopology`
   declares the dead-letter *wiring* (`x-dead-letter-exchange` on the worker and response queues),
   not the retry cycle: to make a cap above 2 reachable, declare a dead-letter queue with
-  `x-message-ttl` that dead-letters back to the source exchange in your own topology. Otherwise
-  keep `MaxDeliveryAttempts` at 2 or below and silence the warning. See
-  [transport options](configuration.md#transport-options).
+  `x-message-ttl` that dead-letters back to the source exchange in your own topology. The cap
+  then **terminates** that cycle: a message reaching it with `x-death` present is parked — copied
+  to `DeadLetterQueue` through the default exchange (bypassing the cycling exchange) and ACKed, or
+  ACKed and dropped with an error log when no `DeadLetterQueue` is configured — instead of
+  re-entering the cycle at its TTL rate forever, so configure `DeadLetterQueue` as well if the
+  parked copy must be kept. Otherwise keep `MaxDeliveryAttempts` at 2 or below and silence the
+  warning. See [transport options](configuration.md#transport-options).
 
 ## Durable flows
 

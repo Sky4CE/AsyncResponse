@@ -358,7 +358,10 @@ against the explicit in-memory store. The core concurrency
 invariants are gated on every CI run, at smaller scale, by
 [`ConcurrencyTests`](../tests/AsyncResponse.Tests/ConcurrencyTests.cs) in the unit suite. The broker
 dispatch storms stay in-process too: they bypass external Pub/Sub/Azure Service Bus/SQS/RabbitMQ/Redis/NATS/PostgreSQL/SQL Server/Kafka/MongoDB
-servers while exercising the transport callback/ACK dispatchers.
+servers while exercising the transport callback/ACK dispatchers. Their timed region includes the
+background drain — the clock stops when every ACKed message has been processed, not when the last
+enqueue returned — so the throughput series they publish measures dispatch, not enqueue (a drain
+that times out is reported as unsettled and fails the correctness gate).
 
 **End-to-end load (NBomber).** [`benchmarks/AsyncResponse.LoadTests`](../benchmarks/AsyncResponse.LoadTests)
 drives the sample app's HTTP endpoints with [NBomber v4](https://nbomber.com) over the **real** stack —

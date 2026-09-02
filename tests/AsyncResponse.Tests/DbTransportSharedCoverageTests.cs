@@ -2,6 +2,7 @@ using AsyncResponse.Transports.MongoDB;
 using AsyncResponse.Transports.PostgreSQL;
 using AsyncResponse.Transports.SqlServer;
 using Microsoft.Extensions.Logging.Abstractions;
+using System.Diagnostics;
 using Xunit;
 
 namespace AsyncResponse.Tests;
@@ -242,7 +243,7 @@ public sealed class DbTransportSharedCoverageTests
         var (dispatcher, handle) = CreateEarlyAckDispatcher(
             provider,
             calls,
-            handler: async () =>
+            handler: async _ =>
             {
                 Interlocked.Increment(ref executed);
                 await releaseFirst.Task;
@@ -276,14 +277,70 @@ public sealed class DbTransportSharedCoverageTests
         Assert.Equal(1, Volatile.Read(ref executed));
     }
 
+    /// <summary>
+    /// Regression (round 33): once the drain budget lapsed, DisposeAsync cancelled the workers and
+    /// RETURNED — the routing of every still-queued already-ACKed entry (dead-letter +
+    /// OnBackgroundFailure, the path the lapse fact above pins) ran fire-and-forget with no budget
+    /// at all, so the subscriber and then the host finished stopping while the workers were only
+    /// starting to bury them, and the entries vanished with no record (their rows were deleted by
+    /// the early ACK). That is why the fact above has to poll with Eventually AFTER DisposeAsync
+    /// returns. BackgroundDrainTimeout is now SPLIT rather than exceeded: three quarters let the
+    /// handlers drain, the last quarter is reserved for the post-lapse routing, which DisposeAsync
+    /// awaits before returning — so with slow burials the counts hold synchronously here.
+    /// </summary>
+    [Theory]
+    [InlineData(Provider.SqlServer)]
+    [InlineData(Provider.PostgreSql)]
+    [InlineData(Provider.MongoDb)]
+    public async Task EarlyAck_DrainBudgetLapse_FinishesDeadLetteringQueuedWorkBeforeDisposeReturns(Provider provider)
+    {
+        // Each burial takes 25 ms to commit; the counter moves only once it has. With a 3 s budget
+        // the reserved quarter (750 ms) comfortably covers the three burials; the old fire-and-forget
+        // dispose returned with none of them committed.
+        var calls = new Calls { DeadLetterDelay = TimeSpan.FromMilliseconds(25) };
+        var backgroundFailures = 0;
+        var drain = TimeSpan.FromSeconds(3);
+        var (dispatcher, handle) = CreateEarlyAckDispatcher(
+            provider,
+            calls,
+            // Blocks the single worker until the drain budget lapses and the worker token fires,
+            // then returns normally so the loop reads what is still queued past the budget.
+            handler: async token => await Task.Delay(Timeout.InfiniteTimeSpan, token).ConfigureAwait(ConfigureAwaitOptions.SuppressThrowing),
+            onBackgroundFailure: () => Interlocked.Increment(ref backgroundFailures),
+            drain: drain);
+
+        // First delivery occupies the worker; three more queue behind it, each ACKed at enqueue.
+        for (var i = 0; i < 4; i++)
+            await handle(CancellationToken.None);
+        Assert.Equal(4, calls.Ack);
+
+        var stopwatch = Stopwatch.StartNew();
+        await dispatcher.DisposeAsync();
+        stopwatch.Stop();
+
+        // Synchronous, no Eventually: every queued entry was buried and surfaced before
+        // DisposeAsync returned.
+        Assert.Equal(3, calls.DeadLetter);
+        Assert.Equal(3, Volatile.Read(ref backgroundFailures));
+
+        // Split, not extended: the routing rode inside BackgroundDrainTimeout, the only term the
+        // shutdown-budget validator sums for this dispatcher.
+        Assert.True(
+            stopwatch.Elapsed < drain + TimeSpan.FromSeconds(1),
+            $"DisposeAsync took {stopwatch.Elapsed} against a {drain} budget");
+    }
+
     private static (IAsyncDisposable Dispatcher, Func<CancellationToken, Task> Handle) CreateEarlyAckDispatcher(
         Provider provider,
         Calls calls,
-        Func<Task> handler,
+        Func<CancellationToken, Task> handler,
         Action onBackgroundFailure,
-        TimeSpan drain)
+        TimeSpan drain,
+        int queueCapacity = 8,
+        TimeSpan? lockTimeout = null)
     {
         var logger = new CollectingLogger();
+        var lease = lockTimeout ?? TimeSpan.FromSeconds(30);
         switch (provider)
         {
             case Provider.SqlServer:
@@ -291,12 +348,12 @@ public sealed class DbTransportSharedCoverageTests
                 var options = new SqlServerAsyncResponseTransportOptions
                 {
                     ConnectionString = "Server=localhost;Database=unused;User ID=sa;Password=unused;TrustServerCertificate=True",
-                    LockTimeout = TimeSpan.FromSeconds(30)
+                    LockTimeout = lease
                 };
                 var subscriber = new SqlServerSubscriberOptions();
-                subscriber.UseAckAfterEnqueue(1, 8, drain);
+                subscriber.UseAckAfterEnqueue(1, queueCapacity, drain);
                 subscriber.OnBackgroundFailure = _ => { onBackgroundFailure(); return ValueTask.CompletedTask; };
-                var dispatcher = new SqlServerMessageDispatcher((_, _) => handler(), options, subscriber, logger, SqlServerSubscriberRole.Worker);
+                var dispatcher = new SqlServerMessageDispatcher((_, token) => handler(token), options, subscriber, logger, SqlServerSubscriberRole.Worker);
                 return (dispatcher, token => dispatcher.HandleAsync(
                     new SqlServerTransportDelivery(
                         Guid.NewGuid(), "worker", "{}", Headers, 1,
@@ -306,11 +363,11 @@ public sealed class DbTransportSharedCoverageTests
 
             case Provider.PostgreSql:
             {
-                var options = new PostgreSqlAsyncResponseTransportOptions { LockTimeout = TimeSpan.FromSeconds(30) };
+                var options = new PostgreSqlAsyncResponseTransportOptions { LockTimeout = lease };
                 var subscriber = new PostgreSqlSubscriberOptions();
-                subscriber.UseAckAfterEnqueue(1, 8, drain);
+                subscriber.UseAckAfterEnqueue(1, queueCapacity, drain);
                 subscriber.OnBackgroundFailure = _ => { onBackgroundFailure(); return ValueTask.CompletedTask; };
-                var dispatcher = new PostgreSqlMessageDispatcher((_, _) => handler(), options, subscriber, logger, PostgreSqlSubscriberRole.Worker);
+                var dispatcher = new PostgreSqlMessageDispatcher((_, token) => handler(token), options, subscriber, logger, PostgreSqlSubscriberRole.Worker);
                 return (dispatcher, token => dispatcher.HandleAsync(
                     new PostgreSqlTransportDelivery(
                         Guid.NewGuid(), "worker", "{}", Headers, 1,
@@ -320,11 +377,11 @@ public sealed class DbTransportSharedCoverageTests
 
             default:
             {
-                var options = new MongoDbAsyncResponseTransportOptions { LockTimeout = TimeSpan.FromSeconds(30) };
+                var options = new MongoDbAsyncResponseTransportOptions { LockTimeout = lease };
                 var subscriber = new MongoDbSubscriberOptions();
-                subscriber.UseAckAfterEnqueue(1, 8, drain);
+                subscriber.UseAckAfterEnqueue(1, queueCapacity, drain);
                 subscriber.OnBackgroundFailure = _ => { onBackgroundFailure(); return ValueTask.CompletedTask; };
-                var dispatcher = new MongoDbMessageDispatcher((_, _) => handler(), options, subscriber, logger, MongoDbSubscriberRole.Worker);
+                var dispatcher = new MongoDbMessageDispatcher((_, token) => handler(token), options, subscriber, logger, MongoDbSubscriberRole.Worker);
                 return (dispatcher, token => dispatcher.HandleAsync(
                     new MongoDbTransportDelivery(
                         Guid.NewGuid(), "worker", "{}", Headers, 1,
@@ -523,6 +580,102 @@ public sealed class DbTransportSharedCoverageTests
         calls.RenewGate.TrySetResult(true);
     }
 
+    /// <summary>
+    /// Regression (round 33): the join above ran even while the subscriber was STOPPING. RenewAsync
+    /// pins CancellationToken.None, so against a stalled database the stop path spent the full
+    /// LockTimeout (30 s by default) — a term no shutdown validator sums — BEFORE the background
+    /// drain even began, and already-ACKed entries were lost when the host expired mid-drain.
+    /// Settlement is fenced by lock_id, so a beat still in flight is a no-op against it: once the
+    /// stopping token is cancelled the join is skipped entirely. Inline (ack-after-handler) path.
+    /// </summary>
+    [Theory]
+    [InlineData(Provider.SqlServer)]
+    [InlineData(Provider.PostgreSql)]
+    [InlineData(Provider.MongoDb)]
+    public async Task RenewalJoin_IsSkippedWhileStopping_SoSettlementDoesNotSpendLockTimeout(Provider provider)
+    {
+        var calls = new Calls { RenewGate = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously) };
+        var logger = new CollectingLogger();
+        using var stopping = new CancellationTokenSource();
+        var afterHandler = new Stopwatch();
+
+        await RunAsync(
+            provider,
+            logger,
+            lockTimeout: TimeSpan.FromSeconds(2),
+            calls: calls,
+            handler: async () =>
+            {
+                // Once a beat is in flight (and, in this fake, wedged for good) the subscriber
+                // starts stopping; the handler itself completes normally.
+                while (Volatile.Read(ref calls.Renew) < 1)
+                    await Task.Delay(10);
+                await stopping.CancelAsync();
+                afterHandler.Start();
+            },
+            cancellationToken: stopping.Token).WaitAsync(TimeSpan.FromSeconds(10));
+        afterHandler.Stop();
+
+        Assert.Equal(1, calls.Ack);
+        Assert.True(
+            afterHandler.Elapsed < TimeSpan.FromSeconds(1),
+            $"settlement waited {afterHandler.Elapsed} on the wedged renewal while stopping (LockTimeout is 2 s)");
+        Assert.DoesNotContain(logger.Messages, message => message.Contains("did not stop within LockTimeout", StringComparison.Ordinal));
+        calls.RenewGate.TrySetResult(true);
+    }
+
+    /// <summary>
+    /// The same regression on the early-ACK park: a claim parked on a full background queue arms
+    /// the heartbeat for the park's duration, and a stop that lands while its beat is wedged used
+    /// to spend LockTimeout in the join before the NAK'ed delivery's HandleAsync returned.
+    /// </summary>
+    [Theory]
+    [InlineData(Provider.SqlServer)]
+    [InlineData(Provider.PostgreSql)]
+    [InlineData(Provider.MongoDb)]
+    public async Task RenewalJoin_IsSkippedWhileStopping_OnTheEarlyAckPark(Provider provider)
+    {
+        var calls = new Calls { RenewGate = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously) };
+        var releaseFirst = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var stopping = new CancellationTokenSource();
+        var (dispatcher, handle) = CreateEarlyAckDispatcher(
+            provider,
+            calls,
+            handler: _ => releaseFirst.Task,
+            onBackgroundFailure: static () => { },
+            drain: TimeSpan.FromSeconds(5),
+            queueCapacity: 1,
+            lockTimeout: TimeSpan.FromSeconds(2));
+
+        try
+        {
+            // First delivery occupies the single worker, the second fills the one-slot queue, so
+            // the third parks — with the fenced heartbeat armed for the park.
+            await handle(CancellationToken.None);
+            await handle(CancellationToken.None);
+            var parked = handle(stopping.Token);
+            await Eventually(() => Volatile.Read(ref calls.Renew) >= 1);
+
+            var stopwatch = Stopwatch.StartNew();
+            await stopping.CancelAsync();
+            await parked.WaitAsync(TimeSpan.FromSeconds(10));
+            stopwatch.Stop();
+
+            // Released promptly (never enqueued), without a LockTimeout join on the wedged beat.
+            Assert.Equal(1, calls.Nak);
+            Assert.Equal(2, calls.Ack);
+            Assert.True(
+                stopwatch.Elapsed < TimeSpan.FromSeconds(1),
+                $"the parked claim's HandleAsync took {stopwatch.Elapsed} to return after the stop (LockTimeout is 2 s)");
+        }
+        finally
+        {
+            releaseFirst.TrySetResult();
+            calls.RenewGate.TrySetResult(true);
+            await dispatcher.DisposeAsync();
+        }
+    }
+
     private static async Task RunAsync(
         Provider provider,
         CollectingLogger logger,
@@ -645,14 +798,27 @@ public sealed class DbTransportSharedCoverageTests
 
         public bool DeadLetterThrows;
 
+        /// <summary>When set, every burial takes this long to commit and is counted only once it has.</summary>
+        public TimeSpan DeadLetterDelay;
+
         public ValueTask<bool> DeadLetterAsync(Exception exception, bool deleteOriginal, CancellationToken cancellationToken)
         {
             LastDeadLetterToken = cancellationToken;
+            if (DeadLetterDelay > TimeSpan.Zero)
+                return new ValueTask<bool>(SlowDeadLetterAsync());
+
             Interlocked.Increment(ref DeadLetter);
             if (DeadLetterThrows)
                 throw new InvalidOperationException("dead-letter store unavailable");
 
             return ValueTask.FromResult(DeadLetterResult);
+        }
+
+        private async Task<bool> SlowDeadLetterAsync()
+        {
+            await Task.Delay(DeadLetterDelay);
+            Interlocked.Increment(ref DeadLetter);
+            return DeadLetterResult;
         }
 
         /// <summary>When set, every renew parks on this gate — a store call that never returns.</summary>

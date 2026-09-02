@@ -116,6 +116,40 @@ public static class AsyncResponseTypeResolution
         }
     }
 
+    /// <summary>
+    /// The default scan: resolves a persisted type name against the assemblies ALREADY loaded into
+    /// the process, and only those. The name is parsed with the full CLR type-name grammar, so a
+    /// generic instantiation whose argument is assembly-qualified — chosen by whoever can write
+    /// the recovery store or the worker stream — made <c>Assembly.GetType</c> LOAD that assembly
+    /// (and everything it references) on the way to a verdict, and then ran the argument type's
+    /// constructor and setters through deserialization before the marker-interface gate ever
+    /// looked at it. Supplying the resolvers confines every component of the name to what is
+    /// loaded, which is the contract this class documents; the registered resolvers above are
+    /// consulted only when this returns <c>null</c>.
+    /// </summary>
+    [RequiresUnreferencedCode("Resolves a persisted type name by string; a trimmed app may have removed the type.")]
+    internal static Type? ResolveLoaded(string fullName)
+    {
+        var loaded = AppDomain.CurrentDomain.GetAssemblies();
+        return Type.GetType(
+            fullName,
+            assemblyResolver: name => Array.Find(loaded, assembly => AssemblyName.ReferenceMatchesDefinition(name, assembly.GetName())),
+            typeResolver: (assembly, typeName, ignoreCase) =>
+            {
+                if (assembly is not null)
+                    return assembly.GetType(typeName, throwOnError: false, ignoreCase);
+
+                foreach (var candidate in loaded)
+                {
+                    if (candidate.GetType(typeName, throwOnError: false, ignoreCase) is { } type)
+                        return type;
+                }
+
+                return null;
+            },
+            throwOnError: false);
+    }
+
     /// <summary>Consults the registered resolvers in order; returns the first non-null match, or <c>null</c>.</summary>
     internal static Type? Resolve(string fullName)
     {

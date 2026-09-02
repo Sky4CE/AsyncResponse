@@ -520,13 +520,23 @@ The API encodes the *checkpointed-flow pattern*, extracted from years of product
 - `AwaitStepAsync` creates the response subscription **first**, then persists the correlation-id
   **breadcrumb**, then runs your trigger. That ordering is the whole trick: "breadcrumb exists"
   implies "someone is listening", so a crash on either side of the send re-attaches or safely
-  restarts — never a lost run, never a double-send.
+  restarts — never a lost run, never a double-send. A failure raised *after* the send but outside
+  the wait itself — a throwing `IDurableFlowExecutionObserver.OnStepWaitingAsync`, a logger —
+  fails the execution attempt but keeps the breadcrumb, so the redelivered execution re-attaches
+  to the in-flight wait (or faults it at the persisted deadline) instead of minting a fresh
+  correlation id and sending the request again; only a genuine step failure restarts a step
+  fresh.
 - Every awaited step auto-registers the flow executor's payload-recovery and failure methods as
   lost-subscriber callbacks — the same recovery machinery as [recovery.md](recovery.md), with its
-  at-least-once, idempotency-required contract. The in-memory channel registers them too (its
-  recovery store is process-local, so they cover waiter loss within one process lifetime and the
-  simulated restarts of [AsyncResponse.Testing](testing.md); durable channels extend the same
-  contract across real restarts).
+  at-least-once, idempotency-required contract. Both targets are correlation-scoped: the failure
+  callback is `IDurableFlowExecutor.FailAsync(flowId, exception, correlationId)`, which fails the
+  run only while a step is still pending on that correlation id — a late error for a superseded
+  or already-settled id (a dead worker's registration outliving its replacement's) is ignored —
+  while the two-argument `FailAsync(flowId, exception)` remains the unscoped operator form. The
+  in-memory channel registers them too (its recovery store is process-local, so they cover waiter
+  loss within one process lifetime and the simulated restarts of
+  [AsyncResponse.Testing](testing.md); durable channels extend the same contract across real
+  restarts).
 - Starting a flow enqueues a worker job carrying only the flow id; resume, redelivery, and
   operator kicks all re-enqueue that same job. `StartAsync` with a caller-supplied `flowId` is
   atomically idempotent for the same flow type and semantically identical input. Conflicting reuse
@@ -535,7 +545,12 @@ The API encodes the *checkpointed-flow pattern*, extracted from years of product
   so supply deterministic ids wherever the caller may retry (see the failure table above).
 - Built-in stores persist a monotonic `FlowState.Revision`. Every execution owns a renewable lease
   and every checkpoint requires both the expected revision and that lease, so a stale worker cannot
-  overwrite recovery state written by a newer execution.
+  overwrite recovery state written by a newer execution. One deliberate exception: a response won
+  in the same instant the lease lapses is still checkpointed, through the lease-less
+  compare-and-swap that recovery uses — on the normal completion path as well as the cancellation
+  branch — because the channel has already acked that payload and it exists nowhere else; the
+  execution then stops as lease-lost and the redelivery replays from that checkpoint instead of
+  re-attaching to a consumed correlation id and burning the step timeout.
 
 ## Honest comparison with a dedicated workflow engine
 

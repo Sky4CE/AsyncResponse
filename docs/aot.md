@@ -94,7 +94,9 @@ Two operational caveats under Native AOT:
 
 - A worker/recovery deployment that only *executes* callbacks enqueued by a different app must
   itself reference the callback target types statically (registering them in DI is the natural
-  way); type names cannot resurrect trimmed code.
+  way); type names cannot resurrect trimmed code — nor do they load assemblies: a persisted name
+  is resolved only against what the process has already loaded (see
+  [security.md](security.md#type-resolution-for-plugins--assemblyloadcontext)).
 - Callback methods returning `ValueTask<T>` with a *value-type* `T` need that exact instantiation
   compiled into the app; `Task`/`Task<T>`/`ValueTask` returns have no such constraint. Failures
   are loud, not silent.

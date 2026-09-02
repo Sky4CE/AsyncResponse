@@ -99,6 +99,33 @@ internal abstract class RabbitMqMessageDispatcher : IAsyncDisposable
         return max;
     }
 
+    /// <summary>
+    /// Builds the properties for a dead-letter copy of <paramref name="delivery"/>: the original
+    /// headers plus the <c>AR-DeadLetter-*</c> forensic headers.
+    /// </summary>
+    protected BasicProperties BuildDeadLetterProperties(RabbitMqDelivery delivery, Exception exception)
+    {
+        var headers = new Dictionary<string, object?>(StringComparer.Ordinal);
+        if (delivery.BasicProperties.Headers is { } original)
+        {
+            foreach (var header in original)
+                headers[header.Key] = header.Value;
+        }
+
+        headers["AR-DeadLetter-Reason"] = exception.Message is { Length: > 512 } longMessage ? longMessage[..512] : exception.Message;
+        headers["AR-DeadLetter-Source-Queue"] = _queue;
+        headers["AR-DeadLetter-Role"] = _role.ToString();
+
+        return new BasicProperties
+        {
+            Persistent = true,
+            ContentType = delivery.BasicProperties.ContentType,
+            MessageId = delivery.BasicProperties.MessageId,
+            CorrelationId = delivery.BasicProperties.CorrelationId,
+            Headers = headers
+        };
+    }
+
     /// <summary>Creates the configured dispatcher.</summary>
     public static RabbitMqMessageDispatcher Create(
         Func<RabbitMqDelivery, CancellationToken, Task> handler,
@@ -236,14 +263,18 @@ internal abstract class RabbitMqMessageDispatcher : IAsyncDisposable
                 AsyncResponseChannelOptions.EnsureTimerBacked(subscriberOptions.BackgroundDrainTimeout, optionPath, nameof(RabbitMqSubscriberOptions.BackgroundDrainTimeout));
                 AsyncResponseChannelOptions.EnsureTimerBacked(transportOptions.ShutdownTimeout, nameof(RabbitMqAsyncResponseOptions), nameof(RabbitMqAsyncResponseOptions.ShutdownTimeout));
 
-                // RabbitMQ spends the background drain plus the bounded connection close
-                // (ShutdownTimeout) at shutdown; both must fit inside the host budget.
+                // RabbitMQ arms ShutdownTimeout TWICE on the stop path — once for BasicCancel,
+                // then (after the background drain) a fresh budget for the channel and connection
+                // closes — so the worst case is ShutdownTimeout + drain + ShutdownTimeout, and all
+                // three must fit inside the host budget. Summing only one close term let a
+                // configuration that overran the host by a full ShutdownTimeout start.
                 ShutdownBudgetValidator.Validate(
                     "RabbitMQ",
                     $"{nameof(RabbitMqAsyncResponseOptions)}.{nameof(RabbitMqAsyncResponseOptions.HostShutdownTimeout)}",
                     transportOptions.HostShutdownTimeout,
+                    ($"{nameof(RabbitMqAsyncResponseOptions)}.{nameof(RabbitMqAsyncResponseOptions.ShutdownTimeout)} (consumer cancel)", transportOptions.ShutdownTimeout),
                     ($"{optionPath}.{nameof(RabbitMqSubscriberOptions.BackgroundDrainTimeout)}", subscriberOptions.BackgroundDrainTimeout),
-                    ($"{nameof(RabbitMqAsyncResponseOptions)}.{nameof(RabbitMqAsyncResponseOptions.ShutdownTimeout)}", transportOptions.ShutdownTimeout));
+                    ($"{nameof(RabbitMqAsyncResponseOptions)}.{nameof(RabbitMqAsyncResponseOptions.ShutdownTimeout)} (channel/connection close)", transportOptions.ShutdownTimeout));
 
                 return;
 
@@ -344,6 +375,28 @@ internal sealed class AwaitingRabbitMqMessageDispatcher(
         IRabbitMqChannel channel,
         CancellationToken subscriberCancellationToken)
     {
+        // Pre-execution cap (NATS/DB-transport parity), BEFORE the handler runs: a delivery whose
+        // previous attempt ended WITHOUT a thrown exception — the process OOM-killed mid-handler,
+        // FailFast, a hang that tripped the broker's consumer_timeout — is requeued by the broker
+        // and never reaches the catch below, so nothing ever judged it against the cap and one
+        // poison message crash-looped every replica in turn whatever MaxDeliveryAttempts said.
+        if (MaxDeliveryAttempts > 0 && ResolveDeliveryAttempt(delivery) > EffectiveDeliveryCap(delivery))
+        {
+            if (ReadDeathCount(delivery.BasicProperties) == 0)
+            {
+                await TryNackAsync(delivery, channel, requeue: false).ConfigureAwait(false);
+            }
+            else
+            {
+                await ParkAtCapAsync(
+                    delivery,
+                    channel,
+                    new InvalidOperationException($"RabbitMQ delivery exceeded {MaxDeliveryAttempts} delivery attempts before its handler ran.")).ConfigureAwait(false);
+            }
+
+            return;
+        }
+
         try
         {
             await ExecuteHandlerAsync(delivery, subscriberCancellationToken).ConfigureAwait(false);
@@ -356,18 +409,25 @@ internal sealed class AwaitingRabbitMqMessageDispatcher(
             // the channel closes.
             return;
         }
-        catch
+        catch (Exception ex)
         {
             // Requeue for redelivery, unless a delivery cap is configured and this delivery has reached it —
             // then reject without requeue so the broker dead-letters (or drops) it instead of hot-looping.
             // Once the broker has dead-lettered the message (x-death present), a plain requeue can never
             // advance the attempt again — x-death only counts dead-letter hops and `redelivered` is already
-            // set — so a capped message would requeue forever below the cap. From then on every retry
-            // must ride the dead-letter cycle, which is what makes the operator's cap countable at all.
-            var requeue = MaxDeliveryAttempts <= 0
-                || (ReadDeathCount(delivery.BasicProperties) == 0
-                    && ResolveDeliveryAttempt(delivery) < EffectiveDeliveryCap(delivery));
-            await TryNackAsync(delivery, channel, requeue).ConfigureAwait(false);
+            // set — so every retry BELOW the cap must ride the dead-letter cycle, which is what makes the
+            // operator's cap countable at all. AT the cap with x-death present that same cycle is exactly
+            // what must not run again: the dead-letter exchange already brought this message back once,
+            // so a reject re-entered it at the cycle's TTL rate forever and the cap never parked anything
+            // (EffectiveDeliveryCap was unreachable on the very path it was written for). Park it here.
+            var deathCount = ReadDeathCount(delivery.BasicProperties);
+            var belowCap = ResolveDeliveryAttempt(delivery) < EffectiveDeliveryCap(delivery);
+            if (MaxDeliveryAttempts <= 0 || (deathCount == 0 && belowCap))
+                await TryNackAsync(delivery, channel, requeue: true).ConfigureAwait(false);
+            else if (deathCount == 0 || belowCap)
+                await TryNackAsync(delivery, channel, requeue: false).ConfigureAwait(false);
+            else
+                await ParkAtCapAsync(delivery, channel, ex).ConfigureAwait(false);
             return;
         }
 
@@ -386,6 +446,75 @@ internal sealed class AwaitingRabbitMqMessageDispatcher(
             Logger.LogError(
                 ex,
                 "Failed to ACK RabbitMQ delivery {DeliveryTag} for {Queue} after a successful handler; the broker will redeliver it when the channel closes.",
+                delivery.DeliveryTag,
+                QueueName);
+        }
+    }
+
+    /// <summary>
+    /// Terminal settlement for a delivery at its cap whose <c>x-death</c> shows the dead-letter
+    /// exchange already returned it once: another reject would only re-enter that cycle. The
+    /// message is copied to <see cref="RabbitMqAsyncResponseOptions.DeadLetterQueue"/> through
+    /// the default exchange when one is configured — bypassing the exchange that cycles — and the
+    /// delivery is ACKed so the loop ends; without a queue the drop is logged as an error. A
+    /// failed copy leaves the delivery un-ACKed, so the broker redelivers it and the park retries.
+    /// </summary>
+    private async Task ParkAtCapAsync(RabbitMqDelivery delivery, IRabbitMqChannel channel, Exception exception)
+    {
+        // A closed channel already requeued every un-ACKed delivery; it comes back with the same
+        // x-death count and parks on its next attempt.
+        if (!channel.IsOpen)
+            return;
+
+        var deadLetterQueue = TransportOptions.DeadLetterQueue;
+        if (!string.IsNullOrWhiteSpace(deadLetterQueue))
+        {
+            try
+            {
+                await channel.BasicPublishAsync(
+                    string.Empty,
+                    deadLetterQueue,
+                    BuildDeadLetterProperties(delivery, exception),
+                    delivery.Body,
+                    CancellationToken.None).ConfigureAwait(false);
+                Logger.LogWarning(
+                    exception,
+                    "RabbitMQ delivery {DeliveryTag} on {Queue} reached {MaxDeliveryAttempts} delivery attempts after riding the dead-letter cycle; parked in {DeadLetterQueue}.",
+                    delivery.DeliveryTag,
+                    QueueName,
+                    MaxDeliveryAttempts,
+                    deadLetterQueue);
+            }
+            catch (Exception publishException)
+            {
+                Logger.LogError(
+                    publishException,
+                    "Failed to park capped RabbitMQ delivery {DeliveryTag} on {Queue} in {DeadLetterQueue}; leaving it un-ACKed so the broker redelivers it.",
+                    delivery.DeliveryTag,
+                    QueueName,
+                    deadLetterQueue);
+                return;
+            }
+        }
+        else
+        {
+            Logger.LogError(
+                exception,
+                "RabbitMQ delivery {DeliveryTag} on {Queue} reached {MaxDeliveryAttempts} delivery attempts after riding the dead-letter cycle and no DeadLetterQueue is configured; ACKing it so the cycle ends — the message is dropped.",
+                delivery.DeliveryTag,
+                QueueName,
+                MaxDeliveryAttempts);
+        }
+
+        try
+        {
+            await channel.BasicAckAsync(delivery.DeliveryTag, CancellationToken.None).ConfigureAwait(false);
+        }
+        catch (Exception ackException)
+        {
+            Logger.LogWarning(
+                ackException,
+                "Failed to ACK parked RabbitMQ delivery {DeliveryTag} on {Queue}; the broker redelivers it when the channel closes.",
                 delivery.DeliveryTag,
                 QueueName);
         }
@@ -567,25 +696,7 @@ internal sealed class QueuedRabbitMqMessageDispatcher : RabbitMqMessageDispatche
             return;
         }
 
-        var headers = new Dictionary<string, object?>(StringComparer.Ordinal);
-        if (delivery.BasicProperties.Headers is { } original)
-        {
-            foreach (var header in original)
-                headers[header.Key] = header.Value;
-        }
-
-        headers["AR-DeadLetter-Reason"] = exception.Message is { Length: > 512 } longMessage ? longMessage[..512] : exception.Message;
-        headers["AR-DeadLetter-Source-Queue"] = _queueName;
-        headers["AR-DeadLetter-Role"] = _role.ToString();
-
-        var properties = new BasicProperties
-        {
-            Persistent = true,
-            ContentType = delivery.BasicProperties.ContentType,
-            MessageId = delivery.BasicProperties.MessageId,
-            CorrelationId = delivery.BasicProperties.CorrelationId,
-            Headers = headers
-        };
+        var properties = BuildDeadLetterProperties(delivery, exception);
 
         var routingKey = string.IsNullOrWhiteSpace(TransportOptions.DeadLetterRoutingKey)
             ? delivery.RoutingKey

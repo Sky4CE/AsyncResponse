@@ -3,6 +3,7 @@ using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using StackExchange.Redis;
 using System.Buffers;
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Text;
 using System.Text.Json;
@@ -20,7 +21,7 @@ namespace AsyncResponse.Channels.Redis;
 /// (or keeps the registration armed for a checkpoint).</description></item>
 /// </list>
 /// </summary>
-internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawAsyncResponsePublisher, IRecoverableAsyncResponseSubscriber, IActiveSubscriberProbe
+internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawAsyncResponsePublisher, IRecoverableAsyncResponseSubscriber, IActiveSubscriberProbe, IAsyncDisposable
 {
 
     private readonly ISubscriber _subscriber;
@@ -59,6 +60,36 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
         _logger = logger;
         _lostSubscriberDispatcher = new LostSubscriberCallbackDispatcher(scopeFactory, propagation, logger, _timeProvider);
         _executors = new SerialExecutorRegistry(logger, timeProvider: _timeProvider);
+    }
+
+    // Executor retirements scheduled off the cleanup path (see CleanupCoreAsync). TRACKED, as
+    // DbChannelShared does: untracked, a retirement could still be inside its drain budget — a
+    // user completion predicate mid-flight — when the host tore down the logger and Main
+    // returned, and the pool thread running it was killed with the predicate's side effects
+    // half-applied. Keyed by the task itself and self-evicting.
+    private readonly ConcurrentDictionary<Task, byte> _pendingRetirements = new();
+
+    private void TrackRetirement(Task retirement)
+    {
+        _pendingRetirements[retirement] = 0;
+        _ = retirement.ContinueWith(
+            static (completed, state) => ((ConcurrentDictionary<Task, byte>)state!).TryRemove(completed, out _),
+            _pendingRetirements,
+            CancellationToken.None,
+            TaskContinuationOptions.ExecuteSynchronously,
+            TaskScheduler.Default);
+    }
+
+    /// <summary>
+    /// Joins every executor retirement still in flight, so container disposal at host shutdown
+    /// means "every executor is retired" rather than "every retirement was started". The bodies
+    /// swallow, so this cannot throw; the drain budgets inside RemoveAsync bound how long it takes.
+    /// </summary>
+    public async ValueTask DisposeAsync()
+    {
+        var retirements = _pendingRetirements.Keys.ToArray();
+        if (retirements.Length > 0)
+            await Task.WhenAll(retirements).ConfigureAwait(false);
     }
 
     // ---------------------------------------------------------------------------------------
@@ -612,8 +643,9 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
                     _owner._executors.OnSubscriptionRetired(ChannelName);
 
                 // Schedule the disposal on the thread pool; do not await directly to prevent
-                // deadlocks with work currently running on the executor.
-                _ = Task.Run(async () =>
+                // deadlocks with work currently running on the executor. Tracked so the channel's
+                // DisposeAsync can join it at host shutdown.
+                _owner.TrackRetirement(Task.Run(async () =>
                 {
                     try
                     {
@@ -623,7 +655,7 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
                     {
                         _owner._logger.LogError(ex, "Failed to retire the executor for channel {Channel}.", ChannelName);
                     }
-                });
+                }));
 
                 await _timeoutRegistration.DisposeAsync().ConfigureAwait(false);
                 _cancellationTokenSource.Dispose();

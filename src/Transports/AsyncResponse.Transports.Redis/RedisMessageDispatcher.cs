@@ -182,6 +182,12 @@ internal abstract class RedisMessageDispatcher : IAsyncDisposable
     /// </summary>
     public virtual bool CanAcceptMore => true;
 
+    /// <summary>
+    /// How many entries the dispatcher can take right now without deferring any (ASB/SQS parity);
+    /// unbounded for the awaiting dispatcher. The subscriber clamps every read and claim to it.
+    /// </summary>
+    public virtual int FreeCapacity => int.MaxValue;
+
     /// <summary>Releases resources held by this instance.</summary>
     public virtual ValueTask DisposeAsync() => ValueTask.CompletedTask;
 
@@ -288,6 +294,17 @@ internal abstract class RedisMessageDispatcher : IAsyncDisposable
         Exception failure,
         CancellationToken cancellationToken)
     {
+        if (entry.Id.IsNull)
+        {
+            // A trimmed-while-pending tombstone (Redis 5/6 answer XCLAIM with a nil entry) carries
+            // no id to ACK and no payload to record: sending its null id to XACK is rejected by the
+            // client from inside the caller's catch, which replaced the original error, faulted the
+            // subscriber, and re-dead-lettered the tombstone every claim cycle. The claim loop
+            // drains it by its pending id instead; nothing to settle here.
+            Logger.LogDebug(failure, "Redis claim on {Stream} returned a trimmed tombstone; skipping it.", _stream);
+            return;
+        }
+
         Logger.LogError(
             failure,
             "Redis entry {MessageId} on {Stream} could not be parsed into a delivery; dead-lettering and ACKing it to avoid a poison-message loop.",
@@ -303,7 +320,10 @@ internal abstract class RedisMessageDispatcher : IAsyncDisposable
             Attempt: 0,
             entry);
 
-        await DeadLetterAndAckAsync(delivery, failure, "unparsable_entry", cancellationToken).ConfigureAwait(false);
+        // Settlement deliberately ignores cancellation (as every other settlement in this file
+        // does): a shutdown landing between the dead-letter XADD and the XACK left the entry in
+        // the PEL to be reclaimed and dead-lettered a SECOND time after restart.
+        await DeadLetterAndAckAsync(delivery, failure, "unparsable_entry", CancellationToken.None).ConfigureAwait(false);
     }
 
     private static string DescribeRawEntry(StreamEntry entry)
@@ -359,14 +379,10 @@ internal sealed class AwaitingRedisMessageDispatcher(
     {
         if (AlreadyExceededDeliveryAttempts(delivery))
         {
-            // Settlement deliberately ignores cancellation (parity with the post-handler over-cap
-            // path below): a shutdown landing between the dead-letter XADD and the XACK would
-            // leave the entry in the PEL to be reclaimed and dead-lettered a SECOND time.
-            await DeadLetterAndAckAsync(
+            await TryDeadLetterAndAckAsync(
                 delivery,
                 new InvalidOperationException($"Redis message exceeded {MaxDeliveryAttempts} delivery attempts."),
-                "max_delivery_attempts_exceeded",
-                CancellationToken.None).ConfigureAwait(false);
+                "max_delivery_attempts_exceeded").ConfigureAwait(false);
             return RedisDispatchOutcome.Processed;
         }
 
@@ -385,11 +401,7 @@ internal sealed class AwaitingRedisMessageDispatcher(
                 "Redis message {MessageId} reached max delivery attempts ({MaxDeliveryAttempts}); writing to dead-letter stream.",
                 delivery.MessageId.ToString(),
                 MaxDeliveryAttempts);
-            await DeadLetterAndAckAsync(
-                delivery,
-                ex,
-                "handler_failed_max_attempts",
-                CancellationToken.None).ConfigureAwait(false);
+            await TryDeadLetterAndAckAsync(delivery, ex, "handler_failed_max_attempts").ConfigureAwait(false);
             return RedisDispatchOutcome.Processed;
         }
         catch
@@ -420,6 +432,32 @@ internal sealed class AwaitingRedisMessageDispatcher(
         }
 
         return RedisDispatchOutcome.Processed;
+    }
+
+    /// <summary>
+    /// Burial that never throws (queued-dispatcher and DB-transport parity: "a burial that throws
+    /// is a burial that failed"). Unguarded, a dead-letter XADD that failed — MISCONF/OOM, the
+    /// adapter's timeout, a WRONGTYPE on the dead-letter key — escaped past the XACK to the
+    /// supervisor, which restarted the subscriber; the pending-claim loop then re-claimed the
+    /// same entry every cycle and the whole stream stopped draining. Settlement deliberately
+    /// ignores cancellation: a shutdown landing between the XADD and the XACK would leave the
+    /// entry in the PEL to be reclaimed and dead-lettered a SECOND time.
+    /// </summary>
+    private async Task TryDeadLetterAndAckAsync(RedisStreamDelivery delivery, Exception exception, string reason)
+    {
+        try
+        {
+            await DeadLetterAndAckAsync(delivery, exception, reason, CancellationToken.None).ConfigureAwait(false);
+        }
+        catch (Exception deadLetterException)
+        {
+            Logger.LogError(
+                deadLetterException,
+                "Failed to dead-letter Redis message {MessageId} on {Stream} ({Reason}); the entry stays pending and is reclaimed on the next pending-claim cycle.",
+                delivery.MessageId.ToString(),
+                delivery.Stream.ToString(),
+                reason);
+        }
     }
 }
 
@@ -474,6 +512,8 @@ internal sealed class QueuedRedisMessageDispatcher : RedisMessageDispatcher
     internal int RunningCount => Volatile.Read(ref _runningCount);
 
     public override bool CanAcceptMore => Volatile.Read(ref _pendingCount) < _capacity;
+
+    public override int FreeCapacity => Math.Max(0, _capacity - Volatile.Read(ref _pendingCount));
 
     /// <summary>Handles the delivered message.</summary>
     public override async Task<RedisDispatchOutcome> HandleAsync(

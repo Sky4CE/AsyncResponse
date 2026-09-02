@@ -107,6 +107,95 @@ public class AsyncResponseEnvelopeTests
             json, AsyncResponseEnvelopeOptions<int>.Instance));
     }
 
+    // ---------------------------------------------------------------------------------------
+    // Round 33: the success-null guard's flag was only ever set inside the Payload branch, so an
+    // envelope with NO Payload key at all deserialized as Success=true / Payload=null — and every
+    // channel then handed `envelope.Payload!` to the user's Until predicate and TrySetResult. The
+    // flag also latched: on a duplicate key (legal JSON; last-wins everywhere else in STJ) a null
+    // followed by a value still threw.
+    // ---------------------------------------------------------------------------------------
+
+    /// <summary>
+    /// Round 33: an ABSENT Payload on a Success envelope is the same producer-side violation as an
+    /// explicit null and must fail fast the same way. Pre-fix each of these deserialized to
+    /// Success=true with a null (or default) Payload. The third shape is the realistic one: a
+    /// case-variant key is an unknown property to the byte-exact envelope reader, so an external
+    /// producer writing "payload" completed the waiter with nothing.
+    /// </summary>
+    [Theory]
+    [InlineData("""{"SchemaVersion":1,"Success":true}""")]
+    [InlineData("""{"Success":true,"SchemaVersion":1,"ExceptionMessage":null,"ExceptionStackTrace":null}""")]
+    [InlineData("""{"SchemaVersion":1,"Success":true,"payload":{"Status":2}}""")]
+    public void AbsentPayload_OnASuccessEnvelope_ThrowsJsonException(string json)
+    {
+        Assert.Throws<JsonException>(() => JsonSerializer.Deserialize<AsyncResponseEnvelope<OperationResult>>(
+            json, AsyncResponseEnvelopeOptions<OperationResult>.Instance));
+        Assert.Throws<JsonException>(() => JsonSerializer.Deserialize<AsyncResponseEnvelope<int>>(
+            json, AsyncResponseEnvelopeOptions<int>.Instance));
+
+        // The ingress entry point: the parse failure surfaces as the permanently-classified
+        // InvalidDataException, not as an envelope the dispatcher would complete a waiter with.
+        Assert.Throws<InvalidDataException>(() => AsyncResponseEnvelopeJson.SafeDeserialize<OperationResult>(json));
+    }
+
+    /// <summary>
+    /// Round 33: a duplicate Payload key is legal JSON and binds last-wins like every other STJ
+    /// property, so a null occurrence followed by a value IS a value. Pre-fix the null latched the
+    /// guard and the envelope was rejected although a payload followed.
+    /// </summary>
+    [Fact]
+    public void DuplicatePayloadKey_NullThenValue_OnASuccessEnvelope_BindsTheValue()
+    {
+        var restored = JsonSerializer.Deserialize<AsyncResponseEnvelope<OperationResult>>(
+            """{"SchemaVersion":1,"Success":true,"Payload":null,"Payload":{"Status":2,"Message":"done"}}""",
+            AsyncResponseEnvelopeOptions<OperationResult>.Instance);
+
+        Assert.NotNull(restored);
+        Assert.True(restored!.Success);
+        Assert.Equal(OperationStatus.Completed, restored.Payload!.Status);
+        Assert.Equal("done", restored.Payload.Message);
+
+        var restoredValue = JsonSerializer.Deserialize<AsyncResponseEnvelope<int>>(
+            """{"SchemaVersion":1,"Success":true,"Payload":null,"Payload":7}""",
+            AsyncResponseEnvelopeOptions<int>.Instance);
+
+        Assert.NotNull(restoredValue);
+        Assert.Equal(7, restoredValue!.Payload);
+    }
+
+    /// <summary>
+    /// Round 33 control for the last-wins rule: the reverse order — a value followed by a null —
+    /// leaves the payload null, which the success guard still rejects.
+    /// </summary>
+    [Fact]
+    public void DuplicatePayloadKey_ValueThenNull_OnASuccessEnvelope_StillThrows()
+        => Assert.Throws<JsonException>(() => JsonSerializer.Deserialize<AsyncResponseEnvelope<OperationResult>>(
+            """{"SchemaVersion":1,"Success":true,"Payload":{"Status":2},"Payload":null}""",
+            AsyncResponseEnvelopeOptions<OperationResult>.Instance));
+
+    /// <summary>
+    /// Round 33 control for over-reach: a failure envelope without a Payload key is a routine
+    /// shape and must keep deserializing with a default payload, exactly like its explicit-null
+    /// form.
+    /// </summary>
+    [Fact]
+    public void AbsentPayload_OnAFailureEnvelope_BecomesDefault()
+    {
+        var restored = JsonSerializer.Deserialize<AsyncResponseEnvelope<OperationResult>>(
+            """{"SchemaVersion":1,"Success":false,"ExceptionMessage":"boom"}""",
+            AsyncResponseEnvelopeOptions<OperationResult>.Instance);
+        var restoredValue = JsonSerializer.Deserialize<AsyncResponseEnvelope<int>>(
+            """{"SchemaVersion":1,"Success":false,"ExceptionMessage":"boom"}""",
+            AsyncResponseEnvelopeOptions<int>.Instance);
+
+        Assert.NotNull(restored);
+        Assert.False(restored!.Success);
+        Assert.Null(restored.Payload);
+        Assert.Equal("boom", restored.ExceptionMessage);
+        Assert.NotNull(restoredValue);
+        Assert.Equal(0, restoredValue!.Payload);
+    }
+
     [Fact]
     public void PayloadProperties_BindCaseInsensitively()
     {

@@ -126,6 +126,7 @@ AsyncResponse.DurableFlowOptions.TimerInProcessThreshold.set -> void
 AsyncResponse.IDurableFlowExecutor
 AsyncResponse.IDurableFlowExecutor.ExecuteAsync(string! flowId) -> System.Threading.Tasks.Task!
 AsyncResponse.IDurableFlowExecutor.FailAsync(string! flowId, System.Exception! exception) -> System.Threading.Tasks.Task!
+AsyncResponse.IDurableFlowExecutor.FailAsync(string! flowId, System.Exception! exception, string! correlationId) -> System.Threading.Tasks.Task!
 AsyncResponse.IDurableFlowExecutor.RecoverAsync(string! flowId, object! payload, string! correlationId) -> System.Threading.Tasks.Task!
 AsyncResponse.IDurableFlowExecutor.ResumeAsync(string! flowId) -> System.Threading.Tasks.Task!
 AsyncResponse.InMemoryAsyncResponseOptions

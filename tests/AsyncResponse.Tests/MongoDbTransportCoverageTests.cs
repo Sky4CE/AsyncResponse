@@ -78,12 +78,18 @@ public sealed class MongoDbTransportCoverageTests
     public async Task Publish_PrunesDeadLettersWithAServerClockCutoff()
     {
         FilterDefinition<MongoTransportMessageDocument>? pruneFilter = null;
+        DeleteOptions? pruneOptions = null;
         var collection = new Mock<IMongoCollection<MongoTransportMessageDocument>>(MockBehavior.Loose).SelfPinning();
         collection
             .Setup(c => c.DeleteManyAsync(
                 It.IsAny<FilterDefinition<MongoTransportMessageDocument>>(),
+                It.IsAny<DeleteOptions>(),
                 It.IsAny<CancellationToken>()))
-            .Callback((FilterDefinition<MongoTransportMessageDocument> filter, CancellationToken _) => pruneFilter = filter)
+            .Callback((FilterDefinition<MongoTransportMessageDocument> filter, DeleteOptions deleteOptions, CancellationToken _) =>
+            {
+                pruneFilter = filter;
+                pruneOptions = deleteOptions;
+            })
             .ReturnsAsync(new DeleteResult.Acknowledged(0));
         var options = Options.Create(new MongoDbAsyncResponseTransportOptions
         {
@@ -95,6 +101,10 @@ public sealed class MongoDbTransportCoverageTests
         await store.PublishAsync(Guid.NewGuid(), "worker", "{}", headers: null, CancellationToken.None);
 
         Assert.NotNull(pruneFilter);
+        // Binary collation, like the claim: under a folding collection collation the prune matched
+        // live-queue documents whose name differed only by case.
+        Assert.NotNull(pruneOptions);
+        Assert.Same(Collation.Simple, pruneOptions!.Collation);
         var rendered = pruneFilter!.Render(TransportRenderArgs());
         Assert.Equal(options.Value.DeadLetterQueue, rendered["queue"].AsString);
         Assert.True(rendered.Contains("$expr"), $"prune cutoff is not server-clock based: {rendered}");
@@ -102,6 +112,41 @@ public sealed class MongoDbTransportCoverageTests
         Assert.Equal(
             new BsonArray { "$$NOW", 1_800_000d },
             rendered["$expr"]["$lt"].AsBsonArray[1]["$subtract"].AsBsonArray);
+    }
+
+    /// <summary>
+    /// Regression (round 33): the claim's FindOneAndUpdateOptions carried no collation. The three
+    /// logical queues share one collection and are told apart by nothing but the queue field, so
+    /// on an operator-created collection with a case- or accent-folding default collation the
+    /// WORKER subscriber claimed RESPONSE-queue documents — which the ingress then dropped and
+    /// ACKed with no dead-letter record. The claim now pins the binary (simple) collation, like
+    /// the prune above (SQL Server BIN2 / PostgreSQL deterministic-collation parity).
+    /// </summary>
+    [Fact]
+    public async Task Claim_PinsTheBinaryCollation_SoAFoldingCollectionCannotCrossRouteQueues()
+    {
+        FindOneAndUpdateOptions<MongoTransportMessageDocument, MongoTransportMessageDocument>? claimOptions = null;
+        var collection = new Mock<IMongoCollection<MongoTransportMessageDocument>>(MockBehavior.Loose).SelfPinning();
+        collection
+            .Setup(c => c.FindOneAndUpdateAsync(
+                It.IsAny<FilterDefinition<MongoTransportMessageDocument>>(),
+                It.IsAny<UpdateDefinition<MongoTransportMessageDocument>>(),
+                It.IsAny<FindOneAndUpdateOptions<MongoTransportMessageDocument, MongoTransportMessageDocument>>(),
+                It.IsAny<CancellationToken>()))
+            .Callback((
+                FilterDefinition<MongoTransportMessageDocument> _,
+                UpdateDefinition<MongoTransportMessageDocument> _,
+                FindOneAndUpdateOptions<MongoTransportMessageDocument, MongoTransportMessageDocument> options,
+                CancellationToken _) => claimOptions = options)
+            .ReturnsAsync((MongoTransportMessageDocument)null!);
+        var options = Options.Create(new MongoDbAsyncResponseTransportOptions { AutoCreateIndexes = false });
+        using var store = CreateStore(collection.Object, options);
+
+        Assert.Null(await store.TryClaimAsync("worker", TimeSpan.FromSeconds(1), CancellationToken.None));
+
+        Assert.NotNull(claimOptions);
+        Assert.Same(Collation.Simple, claimOptions!.Collation);
+        Assert.Equal(ReturnDocument.After, claimOptions.ReturnDocument);
     }
 
     private static RenderArgs<MongoTransportMessageDocument> TransportRenderArgs()

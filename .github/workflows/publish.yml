@@ -52,10 +52,14 @@ jobs:
             8.0.x
             10.0.x
 
+      # Strict SemVer 2.0 shape: prerelease and build-metadata identifiers are limited to
+      # [0-9A-Za-z.-]. The ancestry check above exists so that tag-push rights alone cannot decide
+      # what gets published; a looser pattern (anything after the first '-') left the tag NAME as a
+      # build input — MSBuild splits -p: on ';', so v1.0.0-a;Version=2.0.0 published 2.0.0.
       - name: Derive package version from tag
         run: |
           TAG="${GITHUB_REF_NAME}"
-          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-.+].*)?$ ]]; then
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
             echo "::error::Tag '$TAG' does not look like a semantic version tag (expected e.g. v1.2.3 or v1.2.3-preview.1)."
             exit 1
           fi
@@ -66,7 +70,7 @@ jobs:
         run: dotnet restore
 
       - name: Build
-        run: dotnet build --configuration Release --no-restore -p:Version=$PACKAGE_VERSION
+        run: dotnet build --configuration Release --no-restore -p:Version="$PACKAGE_VERSION"
 
       # Unit suite only, one TFM at a time — same invocation shape as ci.yml (MTP otherwise runs
       # both TFMs concurrently, which starves real-time tests on the 2-core hosted runner).
@@ -91,7 +95,7 @@ jobs:
       - name: Pack
         # Solution-level pack: every non-src project sets IsPackable=false, so this packs exactly
         # the shipped src/** packages without a hand-maintained list.
-        run: dotnet pack AsyncResponse.slnx --configuration Release --no-build -p:Version=$PACKAGE_VERSION -o ./artifacts
+        run: dotnet pack AsyncResponse.slnx --configuration Release --no-build -p:Version="$PACKAGE_VERSION" -o ./artifacts
 
       - name: Push to nuget.org
         run: >

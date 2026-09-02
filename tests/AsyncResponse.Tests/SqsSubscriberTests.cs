@@ -674,6 +674,125 @@ public sealed class SqsSubscriberTests
         Assert.Contains(QueueAttributeName.RedrivePolicy.Value, update.Attributes.Keys);
     }
 
+    /// <summary>
+    /// Round 33 (B6): on <see cref="QueueNameExistsException"/> the WHOLE create dictionary was
+    /// re-applied through SetQueueAttributes — including <c>FifoQueue</c>, which SQS accepts only at
+    /// creation (InvalidAttributeName on update) — so re-provisioning an existing ".fifo" pair could
+    /// never converge: RetryAsync burned its 40 attempts on that deterministic rejection (the FIFO
+    /// dead-letter queue first, created with that attribute alone) and aborted host startup.
+    /// Pre-fix: both updates carry <c>FifoQueue</c>. Now it is dropped from the update and the
+    /// redrive policy still converges.
+    /// </summary>
+    [Fact]
+    public async Task ProvisioningService_ExistingFifoQueues_ConvergeWithoutTheCreateOnlyFifoAttribute()
+    {
+        var client = new FakeSqsClient();
+        client.ExistingQueues.Add("workers-dlq.fifo");
+        client.ExistingQueues.Add("workers.fifo");
+        var service = new SqsQueueProvisioningService(
+            Options.Create(new SqsAsyncResponseOptions
+            {
+                WorkerQueue = "workers.fifo",
+                ResponseQueue = "responses",
+                CreateQueues = true
+            }),
+            client,
+            NullLogger<SqsQueueProvisioningService>.Instance);
+
+        await service.StartAsync(CancellationToken.None);
+
+        Assert.DoesNotContain(client.CreatedQueues, created => created.QueueName.EndsWith(".fifo", StringComparison.Ordinal));
+        Assert.All(
+            client.AttributeUpdates,
+            update => Assert.False(
+                update.Attributes.ContainsKey(QueueAttributeName.FifoQueue.Value),
+                $"{update.QueueUrl} re-applied the create-only FifoQueue attribute"));
+
+        // The dead-letter queue was created with FifoQueue alone, so nothing is left to converge.
+        Assert.DoesNotContain(client.AttributeUpdates, update => update.QueueUrl == FakeSqsClient.UrlFor("workers-dlq.fifo"));
+
+        // The worker queue's redrive policy still converges onto the FIFO dead-letter queue.
+        var workerUpdate = Assert.Single(client.AttributeUpdates, update => update.QueueUrl == FakeSqsClient.UrlFor("workers.fifo"));
+        Assert.Contains(
+            FakeSqsClient.ArnFor("workers-dlq.fifo"),
+            workerUpdate.Attributes[QueueAttributeName.RedrivePolicy.Value],
+            StringComparison.Ordinal);
+
+        // The standard response pair is unaffected.
+        Assert.Equal(["responses-dlq", "responses"], client.CreatedQueues.Select(created => created.QueueName));
+    }
+
+    /// <summary>
+    /// Round 33 (B6), the production shape: SQS answers an update that carries <c>FifoQueue</c> with
+    /// <see cref="InvalidAttributeNameException"/>, deterministically, and the provisioning retry loop
+    /// treated it as transient — 40 attempts, then the exception escaped <c>StartAsync</c> and the
+    /// host never came up. Pre-fix: StartAsync throws. With the attribute dropped the existing FIFO
+    /// pair converges on the first try.
+    /// </summary>
+    [Fact]
+    public async Task ProvisioningService_ExistingFifoQueues_StartupNoLongerBurnsEveryRetryOnTheRejectedFifoAttribute()
+    {
+        var inner = new FakeSqsClient();
+        inner.ExistingQueues.Add("workers-dlq.fifo");
+        inner.ExistingQueues.Add("workers.fifo");
+        var client = new FifoAttributeRejectingSqsClient(inner);
+        var service = new SqsQueueProvisioningService(
+            Options.Create(new SqsAsyncResponseOptions
+            {
+                WorkerQueue = "workers.fifo",
+                ResponseQueue = "responses",
+                CreateQueues = true,
+                SubscriberRetryBaseDelay = TimeSpan.FromMilliseconds(1),
+                SubscriberRetryMaxDelay = TimeSpan.FromMilliseconds(1)
+            }),
+            client,
+            NullLogger<SqsQueueProvisioningService>.Instance);
+
+        await service.StartAsync(CancellationToken.None);
+
+        Assert.Equal(0, client.RejectedUpdates);
+        var workerUpdate = Assert.Single(inner.AttributeUpdates);
+        Assert.Equal(FakeSqsClient.UrlFor("workers.fifo"), workerUpdate.QueueUrl);
+        Assert.Contains(QueueAttributeName.RedrivePolicy.Value, workerUpdate.Attributes.Keys);
+    }
+
+    /// <summary>
+    /// Wraps <see cref="FakeSqsClient"/> with real SQS's rule that <c>FifoQueue</c> is create-only:
+    /// an update carrying it is rejected with <see cref="InvalidAttributeNameException"/>.
+    /// </summary>
+    private sealed class FifoAttributeRejectingSqsClient(FakeSqsClient inner) : ISqsClient
+    {
+        public int RejectedUpdates { get; private set; }
+
+        public Task<string> GetQueueUrlAsync(string queueName, CancellationToken cancellationToken = default)
+            => inner.GetQueueUrlAsync(queueName, cancellationToken);
+
+        public Task<string> CreateQueueAsync(string queueName, IReadOnlyDictionary<string, string> attributes, CancellationToken cancellationToken = default)
+            => inner.CreateQueueAsync(queueName, attributes, cancellationToken);
+
+        public Task<string> GetQueueArnAsync(string queueUrl, CancellationToken cancellationToken = default)
+            => inner.GetQueueArnAsync(queueUrl, cancellationToken);
+
+        public Task SetQueueAttributesAsync(string queueUrl, IReadOnlyDictionary<string, string> attributes, CancellationToken cancellationToken = default)
+        {
+            if (attributes.ContainsKey(QueueAttributeName.FifoQueue.Value))
+            {
+                RejectedUpdates++;
+                throw new InvalidAttributeNameException("Unknown Attribute FifoQueue.");
+            }
+
+            return inner.SetQueueAttributesAsync(queueUrl, attributes, cancellationToken);
+        }
+
+        public Task<string> SendMessageAsync(SqsOutboundMessage message, CancellationToken cancellationToken = default)
+            => inner.SendMessageAsync(message, cancellationToken);
+
+        public Task<IReadOnlyList<SqsTransportDelivery>> ReceiveMessagesAsync(SqsReceiveRequest request, CancellationToken cancellationToken = default)
+            => inner.ReceiveMessagesAsync(request, cancellationToken);
+
+        public ValueTask DisposeAsync() => inner.DisposeAsync();
+    }
+
     [Fact]
     public async Task ProvisioningService_RetriesTransientFailures()
     {

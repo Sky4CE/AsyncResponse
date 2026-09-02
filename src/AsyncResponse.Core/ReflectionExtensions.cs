@@ -206,14 +206,13 @@ internal static class ReflectionExtensions
         var generationBeforeScan = UnresolvableTypeNames.GenerationBeforeScan();
         var resolvedGenerationBeforeScan = Volatile.Read(ref _resolvedServiceTypeGeneration);
 
-        foreach (var assembly in AppDomain.CurrentDomain.GetAssemblies())
+        // Loaded assemblies only — every component of the name, generic arguments included (see
+        // ResolveLoaded): the wire-supplied name must never make the process load an assembly.
+        var resolved = AsyncResponseTypeResolution.ResolveLoaded(serviceInterfaceFullName);
+        if (resolved is not null)
         {
-            var resolved = assembly.GetType(serviceInterfaceFullName, throwOnError: false);
-            if (resolved is not null)
-            {
-                CacheServiceType(serviceInterfaceFullName, resolved, resolvedGenerationBeforeScan);
-                return resolved;
-            }
+            CacheServiceType(serviceInterfaceFullName, resolved, resolvedGenerationBeforeScan);
+            return resolved;
         }
 
         // Opt-in fallback for callback targets loaded into a non-default AssemblyLoadContext (plugins).
@@ -322,15 +321,38 @@ internal static class ReflectionExtensions
     [UnconditionalSuppressMessage("Trimming", "IL2075:UnrecognizedReflectionPattern", Justification = TrimmingJustification)]
     private static List<MethodInfo> CandidateMethods(Type serviceType)
     {
-        var candidates = new List<MethodInfo>(serviceType.GetMethods(BindingFlags.Instance | BindingFlags.Public));
+        var candidates = new List<MethodInfo>();
+        foreach (var method in serviceType.GetMethods(BindingFlags.Instance | BindingFlags.Public))
+        {
+            if (IsCallbackCandidate(method))
+                candidates.Add(method);
+        }
+
         if (!serviceType.IsInterface)
             return candidates;
 
         foreach (var baseInterface in serviceType.GetInterfaces())
-            candidates.AddRange(baseInterface.GetMethods(BindingFlags.Instance | BindingFlags.Public));
+        {
+            foreach (var method in baseInterface.GetMethods(BindingFlags.Instance | BindingFlags.Public))
+            {
+                if (IsCallbackCandidate(method))
+                    candidates.Add(method);
+            }
+        }
 
         return candidates;
     }
+
+    /// <summary>
+    /// Callback targets are ordinary methods. Property and event accessors and operators are
+    /// <see cref="MethodBase.IsSpecialName"/>, and <see cref="object"/>'s members are never a
+    /// callback — without this filter a type-level <c>Allow&lt;T&gt;()</c> on the callback
+    /// allowlist also authorized every property SETTER (and <c>GetHashCode</c>/<c>ToString</c>),
+    /// so a worker-transport writer could aim <c>set_ApiKey</c> at a DI singleton and change
+    /// process-wide state. The plan accepts <c>void</c> returns, so nothing downstream caught it.
+    /// </summary>
+    private static bool IsCallbackCandidate(MethodInfo method)
+        => !method.IsSpecialName && method.DeclaringType != typeof(object);
 
     private static AsyncMethodInvoker CreateInvoker(MethodInfo method, ParameterInfo[] parameters)
     {

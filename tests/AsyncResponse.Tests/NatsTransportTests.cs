@@ -21,6 +21,60 @@ public class NatsTransportOptionsAndSchemaTests
         => Assert.Throws<InvalidOperationException>(() =>
             NatsTransportOptionsValidator.ValidateCommon(new NatsAsyncResponseTransportOptions { SubjectPrefix = prefix }));
 
+    /// <summary>
+    /// Regression (round 33), channel-options parity: the transport's prefix guard rejected
+    /// whitespace and the wildcards but not an EMPTY subject token, so a leading, trailing or
+    /// doubled '.' passed startup and showed up only as silent NoResponders at runtime —
+    /// nats-server rejects the SUB with a non-fatal -ERR that NATS.Net never surfaces. Pre-fix:
+    /// no throw for any of the three.
+    /// </summary>
+    [Theory]
+    [InlineData(".app")]
+    [InlineData("app.")]
+    [InlineData("my..app")]
+    public void ValidateCommon_Throws_ForSubjectPrefixWithAnEmptyToken(string prefix)
+    {
+        var ex = Assert.Throws<InvalidOperationException>(() => NatsTransportOptionsValidator.ValidateCommon(
+            new NatsAsyncResponseTransportOptions { SubjectPrefix = prefix }));
+
+        Assert.Contains(nameof(NatsAsyncResponseTransportOptions.SubjectPrefix), ex.Message, StringComparison.Ordinal);
+        Assert.Contains("empty NATS subject token", ex.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Regression (round 33): the empty-token rule lives in the shared token validator, so an
+    /// explicitly configured subject gets it too — the same silent NoResponders otherwise waited
+    /// at first use. Pre-fix: "jobs..work" passed as a worker subject.
+    /// </summary>
+    [Theory]
+    [InlineData(".jobs.work")]
+    [InlineData("jobs.work.")]
+    [InlineData("jobs..work")]
+    public void ValidateCommon_Throws_ForExplicitSubjectWithAnEmptyToken(string subject)
+    {
+        var ex = Assert.Throws<InvalidOperationException>(() => NatsTransportOptionsValidator.ValidateCommon(
+            new NatsAsyncResponseTransportOptions { WorkerSubject = subject }));
+
+        Assert.Contains(nameof(NatsAsyncResponseTransportOptions.WorkerSubject), ex.Message, StringComparison.Ordinal);
+        Assert.Contains("empty NATS subject token", ex.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Dots between non-empty tokens are the intended namespacing and must keep passing, for the
+    /// prefix and for explicit subjects alike: the rule is about EMPTY tokens, not about dots.
+    /// </summary>
+    [Fact]
+    public void ValidateCommon_Accepts_DottedPrefixAndSubjects()
+    {
+        NatsTransportOptionsValidator.ValidateCommon(new NatsAsyncResponseTransportOptions { SubjectPrefix = "my.app" });
+        NatsTransportOptionsValidator.ValidateCommon(new NatsAsyncResponseTransportOptions
+        {
+            WorkerSubject = "my.app.work",
+            ResponseSubject = "my.app.reply",
+            DeadLetterSubject = "my.app.dead"
+        });
+    }
+
     [Fact]
     public void ValidateCommon_Throws_WhenRetryBaseExceedsMax()
         => Assert.Throws<InvalidOperationException>(() => NatsTransportOptionsValidator.ValidateCommon(

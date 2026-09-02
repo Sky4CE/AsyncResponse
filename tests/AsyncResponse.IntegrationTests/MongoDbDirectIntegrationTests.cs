@@ -137,8 +137,8 @@ public sealed class MongoDbDirectIntegrationTests(DataBatchFixture fixture) : In
         Assert.True((DateTimeOffset.UtcNow - since).Duration() < TimeSpan.FromMinutes(5));
 
         var messageId = Guid.NewGuid();
-        var firstCreatedAt = await store.InsertMessageAsync(messageId, messageCorrelation, """{"Success":true}""", TimeSpan.FromMinutes(5), CancellationToken.None);
-        var duplicateCreatedAt = await store.InsertMessageAsync(messageId, messageCorrelation, """{"Success":true}""", TimeSpan.FromMinutes(5), CancellationToken.None);
+        var firstCreatedAt = (await store.InsertMessageAsync(messageId, messageCorrelation, """{"Success":true}""", TimeSpan.FromMinutes(5), CancellationToken.None)).CreatedAtUtc;
+        var duplicateCreatedAt = (await store.InsertMessageAsync(messageId, messageCorrelation, """{"Success":true}""", TimeSpan.FromMinutes(5), CancellationToken.None)).CreatedAtUtc;
 
         // The insert returns the document's server-stamped ($$NOW) created_at — the ORIGINAL
         // document's on a duplicate, per the pipeline's $ifNull — so the same-process fast path

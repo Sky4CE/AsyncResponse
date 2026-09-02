@@ -126,6 +126,95 @@ public sealed class AzureServiceBusDispatcherTests
         Assert.Contains(nameof(AzureServiceBusAsyncResponseOptions.HostShutdownTimeout), ex.Message, StringComparison.Ordinal);
     }
 
+    /// <summary>
+    /// Round 33 (B5): <c>AckAfterHandlerCompletes</c> returned without any shutdown-budget check,
+    /// although its stop path spends <c>ShutdownTimeout</c> TWICE, sequentially — the lock-renewal
+    /// join on the final batch, then the receiver close — whenever <c>LockRenewalInterval</c> is set
+    /// (default 10s). A 20s ShutdownTimeout therefore needs 40s and overran a 30s host budget,
+    /// force-terminating mid-close and redelivering handled-but-uncompleted messages whose locks then
+    /// lapsed. Pre-fix: the configuration started.
+    /// </summary>
+    [Fact]
+    public void ValidateOptions_AckAfterHandlerCompletes_WithLockRenewal_RejectsTwoShutdownTimeoutsExceedingHostBudget()
+    {
+        var ex = Assert.Throws<InvalidOperationException>(() =>
+            AzureServiceBusMessageDispatcher.ValidateOptions(
+                new AzureServiceBusAsyncResponseOptions
+                {
+                    ShutdownTimeout = TimeSpan.FromSeconds(20),
+                    HostShutdownTimeout = TimeSpan.FromSeconds(30)
+                },
+                new AzureServiceBusSubscriberOptions { AckMode = AzureServiceBusAckMode.AckAfterHandlerCompletes },
+                AzureServiceBusSubscriberRole.Worker));
+
+        Assert.Contains(nameof(AzureServiceBusAsyncResponseOptions.HostShutdownTimeout), ex.Message, StringComparison.Ordinal);
+        Assert.Contains(nameof(AzureServiceBusAsyncResponseOptions.ShutdownTimeout), ex.Message, StringComparison.Ordinal);
+        Assert.Contains("00:00:40", ex.Message, StringComparison.Ordinal); // 20s renewal join + 20s receiver close
+    }
+
+    /// <summary>
+    /// Control for the two-term budget: 15s × 2 = 30s fits a 30s host budget exactly (the
+    /// comparison is inclusive).
+    /// </summary>
+    [Fact]
+    public void ValidateOptions_AckAfterHandlerCompletes_WithLockRenewal_TwoShutdownTimeoutsExactlyAtTheHostBudget_Pass()
+    {
+        AzureServiceBusMessageDispatcher.ValidateOptions(
+            new AzureServiceBusAsyncResponseOptions
+            {
+                ShutdownTimeout = TimeSpan.FromSeconds(15),
+                HostShutdownTimeout = TimeSpan.FromSeconds(30)
+            },
+            new AzureServiceBusSubscriberOptions { AckMode = AzureServiceBusAckMode.AckAfterHandlerCompletes },
+            AzureServiceBusSubscriberRole.Worker);
+    }
+
+    /// <summary>
+    /// With renewal off there is no renewal task to join: only the receiver close spends
+    /// <c>ShutdownTimeout</c>, so 20s fits the 30s budget that 2 × 20s could not.
+    /// </summary>
+    [Fact]
+    public void ValidateOptions_AckAfterHandlerCompletes_WithoutLockRenewal_CountsShutdownTimeoutOnce()
+    {
+        AzureServiceBusMessageDispatcher.ValidateOptions(
+            new AzureServiceBusAsyncResponseOptions
+            {
+                ShutdownTimeout = TimeSpan.FromSeconds(20),
+                HostShutdownTimeout = TimeSpan.FromSeconds(30)
+            },
+            new AzureServiceBusSubscriberOptions
+            {
+                AckMode = AzureServiceBusAckMode.AckAfterHandlerCompletes,
+                LockRenewalInterval = null
+            },
+            AzureServiceBusSubscriberRole.Worker);
+    }
+
+    /// <summary>
+    /// Round 33 (B5), renewal off: the single receiver-close term is still validated — a 40s
+    /// ShutdownTimeout cannot fit a 30s host budget. Pre-fix: the configuration started.
+    /// </summary>
+    [Fact]
+    public void ValidateOptions_AckAfterHandlerCompletes_WithoutLockRenewal_RejectsShutdownTimeoutExceedingHostBudget()
+    {
+        var ex = Assert.Throws<InvalidOperationException>(() =>
+            AzureServiceBusMessageDispatcher.ValidateOptions(
+                new AzureServiceBusAsyncResponseOptions
+                {
+                    ShutdownTimeout = TimeSpan.FromSeconds(40),
+                    HostShutdownTimeout = TimeSpan.FromSeconds(30)
+                },
+                new AzureServiceBusSubscriberOptions
+                {
+                    AckMode = AzureServiceBusAckMode.AckAfterHandlerCompletes,
+                    LockRenewalInterval = null
+                },
+                AzureServiceBusSubscriberRole.Worker));
+
+        Assert.Contains(nameof(AzureServiceBusAsyncResponseOptions.HostShutdownTimeout), ex.Message, StringComparison.Ordinal);
+        Assert.Contains(nameof(AzureServiceBusAsyncResponseOptions.ShutdownTimeout), ex.Message, StringComparison.Ordinal);
+    }
+
     [Fact]
     public void UseAckAfterEnqueue_WhenDrainTimeoutIsOmitted_KeepsDefaultDrainTimeout()
     {

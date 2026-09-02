@@ -141,7 +141,6 @@ public sealed class DbChannelSharedCoverageTests
     [Theory]
     [InlineData(Provider.SqlServer)]
     [InlineData(Provider.PostgreSql)]
-    [InlineData(Provider.MongoDb)]
     public async Task CollectDispatchScope_SuppressesPollSweepsInsideFullSweepInterval(Provider provider)
     {
         await using var harness = Harness.Create(
@@ -158,6 +157,39 @@ public sealed class DbChannelSharedCoverageTests
         harness.Invoke("SignalDispatcher", "corr-signal");
         var targeted = Assert.IsType<HashSet<string>>(await harness.CollectDispatchScopeAsync());
         Assert.Single(targeted, "corr-signal");
+    }
+
+    /// <summary>
+    /// MongoDB honours the throttle only while change streams carry delivery: with them on (and
+    /// not reported unsupported) a not-yet-due tick scans nothing, exactly as the relational
+    /// providers above.
+    /// </summary>
+    [Fact]
+    public async Task CollectDispatchScope_MongoDbWithChangeStreams_SuppressesPollSweepsInsideFullSweepInterval()
+    {
+        await using var harness = Harness.Create(
+            Provider.MongoDb, failing: false, pollInterval: TimeSpan.FromMilliseconds(20), fullSweepInterval: TimeSpan.FromMinutes(10), useChangeStreams: true);
+
+        Assert.Null(await harness.CollectDispatchScopeAsync());
+        var suppressed = Assert.IsType<HashSet<string>>(await harness.CollectDispatchScopeAsync());
+        Assert.Empty(suppressed);
+    }
+
+    /// <summary>
+    /// With change streams off, MongoDB has no push wake: the sweep IS cross-process delivery,
+    /// and the 5s default throttle equalled DeliveryConfirmationTimeout — the publisher gave up,
+    /// claimed the message for recovery and fired the lost-subscriber callback a beat before the
+    /// healthy waiter's throttled sweep found it. The option is ignored in that mode: every poll
+    /// tick is a full sweep, as the UseChangeStreams doc promises.
+    /// </summary>
+    [Fact]
+    public async Task CollectDispatchScope_MongoDbWithoutChangeStreams_IgnoresFullSweepInterval()
+    {
+        await using var harness = Harness.Create(
+            Provider.MongoDb, failing: false, pollInterval: TimeSpan.FromMilliseconds(20), fullSweepInterval: TimeSpan.FromMinutes(10));
+
+        Assert.Null(await harness.CollectDispatchScopeAsync());
+        Assert.Null(await harness.CollectDispatchScopeAsync());
     }
 
     /// <summary>Null (the default) keeps the pre-option behavior: every poll tick is a full sweep.</summary>
@@ -588,6 +620,90 @@ public sealed class DbChannelSharedCoverageTests
             activities.Single(name, "asyncresponse.channel", tag);
     }
 
+    /// <summary>
+    /// Regression (round 33): the same-process fast path built its dispatch message with a
+    /// fabricated <c>AckedAtUtc = null</c>, so a publish RETRY — the same message id landing as an
+    /// idempotent duplicate after another process had already claimed and acked the first attempt
+    /// — bypassed <c>IsWithinWatermark</c>'s acked-history exclusion (<c>AckedAtUtc is null</c>
+    /// admits) and replayed the consumed response to a waiter registered AFTER the ack; the
+    /// delivery claim gates only on <c>recovery_claimed</c>, so it won again. The store now returns
+    /// the ORIGINAL row, settlement columns included, and the fast path dispatches exactly that.
+    /// Mongo harness only: its store is the real <c>MongoDbChannelStore</c> over a mocked
+    /// collection, so the duplicate's acked document is arranged directly on the upsert (the
+    /// relational harnesses' closed-port stores cannot answer an insert); the fast path itself is
+    /// shared source. Pre-fix: the delivery claim ran and the late waiter completed with the stale
+    /// response.
+    /// </summary>
+    [Fact]
+    public async Task FastPath_PublishRetryOfAnAckedMessage_DoesNotReplayItToAWaiterRegisteredAfterTheAck()
+    {
+        await using var harness = Harness.Create(Provider.MongoDb, failing: false, pollInterval: TimeSpan.FromSeconds(30));
+        var startedAt = DateTimeOffset.UtcNow;
+        var (late, completion) = harness.Subscription("corr", startedAt, startedSeq: 100);
+        harness.AddSubscription("corr", late);
+
+        // The idempotent duplicate: the upsert returns the ORIGINAL document — created inside the
+        // watermark's 1s tolerance, but claimed and acked BEFORE this waiter registered.
+        var messageId = Guid.NewGuid();
+        harness.MongoMessages!
+            .Setup(collection => collection.FindOneAndUpdateAsync(
+                It.IsAny<FilterDefinition<MongoChannelMessageDocument>>(),
+                It.IsAny<UpdateDefinition<MongoChannelMessageDocument>>(),
+                It.Is<FindOneAndUpdateOptions<MongoChannelMessageDocument, MongoChannelMessageDocument>>(options => options != null && options.IsUpsert),
+                It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new MongoChannelMessageDocument
+            {
+                Id = messageId,
+                CorrelationId = "corr",
+                EnvelopeJson = StaleEnvelope,
+                CreatedAtUtc = startedAt.AddMilliseconds(-500).UtcDateTime,
+                ExpiresAtUtc = startedAt.AddMinutes(5).UtcDateTime,
+                AckedAtUtc = startedAt.AddMilliseconds(-200).UtcDateTime,
+                AckedSeq = 7
+            });
+        // The delivery claim (no upsert) would win again: it gates only on recovery_claimed.
+        harness.MongoMessages
+            .Setup(collection => collection.FindOneAndUpdateAsync(
+                It.IsAny<FilterDefinition<MongoChannelMessageDocument>>(),
+                It.IsAny<UpdateDefinition<MongoChannelMessageDocument>>(),
+                It.Is<FindOneAndUpdateOptions<MongoChannelMessageDocument, MongoChannelMessageDocument>>(options => options == null || !options.IsUpsert),
+                It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new MongoChannelMessageDocument
+            {
+                Id = messageId,
+                CorrelationId = "corr",
+                EnvelopeJson = StaleEnvelope,
+                CreatedAtUtc = startedAt.AddMilliseconds(-500).UtcDateTime,
+                ExpiresAtUtc = startedAt.AddMinutes(5).UtcDateTime,
+                AckedAtUtc = startedAt.AddMilliseconds(-200).UtcDateTime,
+                AckedSeq = 7
+            });
+
+        // The retry lands through the publish path with the SAME message id...
+        await harness.InvokeAsync("PublishMessageAsync", messageId, "corr", StaleEnvelope, CancellationToken.None);
+        // ...whose fast path dispatches on the per-correlation executor; a marker queued behind it
+        // proves that dispatch ran to completion before anything is asserted.
+        var dispatched = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        Assert.True(await harness.Executors.EnqueueAsync(harness.ChannelName("corr"), () =>
+        {
+            dispatched.TrySetResult();
+            return Task.CompletedTask;
+        }));
+        await dispatched.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.False(completion.Task.IsCompleted, "the consumed response was replayed to a waiter registered after its ack");
+        harness.MongoMessages.Verify(
+            collection => collection.FindOneAndUpdateAsync(
+                It.IsAny<FilterDefinition<MongoChannelMessageDocument>>(),
+                It.IsAny<UpdateDefinition<MongoChannelMessageDocument>>(),
+                It.Is<FindOneAndUpdateOptions<MongoChannelMessageDocument, MongoChannelMessageDocument>>(options => options == null || !options.IsUpsert),
+                It.IsAny<CancellationToken>()),
+            Times.Never);
+    }
+
+    private const string StaleEnvelope =
+        """{"SchemaVersion":1,"Success":true,"Payload":{"Status":2,"Message":"stale"},"ExceptionMessage":null,"ExceptionStackTrace":null}""";
+
     // ---------------------------------------------------------------------------------------
     // Harness
     // ---------------------------------------------------------------------------------------
@@ -633,7 +749,10 @@ public sealed class DbChannelSharedCoverageTests
         /// <summary>Mongo harness only: the subscribers-collection mock, for heartbeat fault injection.</summary>
         public Mock<IMongoCollection<MongoChannelSubscriberDocument>>? MongoSubscribers { get; private set; }
 
-        public static Harness Create(Provider provider, bool failing, TimeSpan pollInterval, TimeSpan? fullSweepInterval = null)
+        /// <summary>Mongo harness only: the messages-collection mock, for arranging what the store's upsert and claim return.</summary>
+        public Mock<IMongoCollection<MongoChannelMessageDocument>>? MongoMessages { get; private set; }
+
+        public static Harness Create(Provider provider, bool failing, TimeSpan pollInterval, TimeSpan? fullSweepInterval = null, bool useChangeStreams = false)
         {
             var logger = new CollectingLogger();
             var recoveryState = new Mock<IRecoveryStateStore>();
@@ -726,7 +845,11 @@ public sealed class DbChannelSharedCoverageTests
                         // read-only index check on this path swallows the loose mocks' faults, so
                         // it cannot interfere.)
                         UseOwnershipLedger = false,
-                        UseChangeStreams = false,
+                        // Off by default: the mocked collection cannot serve a change stream, and
+                        // no harness test starts the wake listener with it on. It only decides
+                        // whether the FullSweepInterval throttle applies (see the Mongo-specific
+                        // CollectDispatchScope tests).
+                        UseChangeStreams = useChangeStreams,
                         ListenerPollInterval = pollInterval,
                         FullSweepInterval = fullSweepInterval,
                         SubscriberHeartbeatInterval = heartbeat,
@@ -792,6 +915,7 @@ public sealed class DbChannelSharedCoverageTests
                         recoveryState,
                         dataSource: null);
                     harness.MongoSubscribers = subscribers;
+                    harness.MongoMessages = messages;
                     return harness;
                 }
             }

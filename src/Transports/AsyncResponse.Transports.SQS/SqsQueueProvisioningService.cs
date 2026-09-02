@@ -98,9 +98,21 @@ internal sealed class SqsQueueProvisioningService(
             {
                 // The queue exists with different attributes (for example a redrive policy set by an
                 // earlier run against a different DLQ ARN): converge by re-applying the attributes.
+                // FifoQueue is create-only — SetQueueAttributes rejects it with InvalidAttributeName,
+                // and RetryAsync then burned every attempt on that deterministic error before
+                // aborting host startup (the FIFO dead-letter queue first, since it is created
+                // with that attribute alone) — so it is dropped from the update; the queue is
+                // already FIFO by the fact of its name.
                 var queueUrl = await client.GetQueueUrlAsync(queueName, cancellationToken).ConfigureAwait(false);
-                if (attributes.Count > 0)
-                    await client.SetQueueAttributesAsync(queueUrl, attributes, cancellationToken).ConfigureAwait(false);
+                var updatable = new Dictionary<string, string>(StringComparer.Ordinal);
+                foreach (var attribute in attributes)
+                {
+                    if (!string.Equals(attribute.Key, QueueAttributeName.FifoQueue.Value, StringComparison.Ordinal))
+                        updatable[attribute.Key] = attribute.Value;
+                }
+
+                if (updatable.Count > 0)
+                    await client.SetQueueAttributesAsync(queueUrl, updatable, cancellationToken).ConfigureAwait(false);
                 return queueUrl;
             }
         }

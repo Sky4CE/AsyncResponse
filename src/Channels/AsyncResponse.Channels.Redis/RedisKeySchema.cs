@@ -43,9 +43,17 @@ internal sealed class RedisKeySchema
 
     public string RecoveryKeyPattern => $"{_keyPrefix}:recovery:*";
 
-    /// <summary>Runs the Channel operation.</summary>
+    /// <summary>
+    /// The response pub/sub channel for a correlation id. Key-routed: on Redis Cluster a plain
+    /// channel lets each client pick its own node, and PUBLISH's reply counts only the
+    /// subscribers on the node that received it — so a waiter subscribed elsewhere received the
+    /// message while the publisher read 0, re-published a duplicate into the waiter's predicate
+    /// (or fired lost-subscriber recovery for a delivered response). Routing SUBSCRIBE and
+    /// PUBLISH to the channel's slot owner makes the count mean what the code reads it as; on a
+    /// single node it changes nothing.
+    /// </summary>
     public RedisChannel Channel(string correlationId)
-        => new($"{_keyPrefix}:response:{correlationId}", RedisChannel.PatternMode.Literal);
+        => new RedisChannel($"{_keyPrefix}:response:{correlationId}", RedisChannel.PatternMode.Literal).WithKeyRouting();
 
     /// <summary>Runs the RecoveryKey operation.</summary>
     public string RecoveryKey(string correlationId) => $"{_keyPrefix}:recovery:{correlationId}";

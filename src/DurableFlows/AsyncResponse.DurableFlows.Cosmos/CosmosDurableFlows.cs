@@ -272,8 +272,13 @@ public sealed class CosmosFlowStateStore : IFlowStateStore, IDisposable
                     cancellationToken).ConfigureAwait(false);
                 return true;
             }
-            catch (CosmosException ex) when (ex.StatusCode == HttpStatusCode.NotFound)
+            catch (CosmosException ex) when (ex.StatusCode == HttpStatusCode.NotFound && ex.SubStatusCode == 0)
             {
+                // Sub-status 0 only (LoadAsync's discriminator, for the same reason): a 404/1002
+                // ReadSessionNotAvailable from a lagging replica names a ledger that still exists.
+                // Reporting it as "gone" made the lease mark itself lost, the delivery redeliver,
+                // and the step's already-performed side effect run a second time. Letting the
+                // other sub-statuses throw routes the delivery through retry instead.
                 return false;
             }
             catch (CosmosException ex) when (ex.StatusCode == HttpStatusCode.PreconditionFailed)
@@ -323,7 +328,7 @@ public sealed class CosmosFlowStateStore : IFlowStateStore, IDisposable
                     cancellationToken).ConfigureAwait(false);
                 return;
             }
-            catch (CosmosException ex) when (ex.StatusCode == HttpStatusCode.NotFound)
+            catch (CosmosException ex) when (ex.StatusCode == HttpStatusCode.NotFound && ex.SubStatusCode == 0)
             {
                 return;
             }
@@ -346,7 +351,7 @@ public sealed class CosmosFlowStateStore : IFlowStateStore, IDisposable
                 cancellationToken: cancellationToken).ConfigureAwait(false);
             return true;
         }
-        catch (CosmosException ex) when (ex.StatusCode == HttpStatusCode.NotFound)
+        catch (CosmosException ex) when (ex.StatusCode == HttpStatusCode.NotFound && ex.SubStatusCode == 0)
         {
             return false;
         }
@@ -500,7 +505,7 @@ public sealed class CosmosFlowStateStore : IFlowStateStore, IDisposable
                     cancellationToken).ConfigureAwait(false);
                 return true;
             }
-            catch (CosmosException ex) when (ex.StatusCode == HttpStatusCode.NotFound)
+            catch (CosmosException ex) when (ex.StatusCode == HttpStatusCode.NotFound && ex.SubStatusCode == 0)
             {
                 return false;
             }

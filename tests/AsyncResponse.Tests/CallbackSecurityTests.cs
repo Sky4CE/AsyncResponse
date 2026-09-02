@@ -42,6 +42,30 @@ public sealed class RestoreRecordingPropagator : IAsyncResponseContextPropagator
 }
 
 /// <summary>
+/// The target of the round-33 setter finding: a DI singleton carrying process-wide state behind a
+/// settable property, next to the one method that is a legitimate callback.
+/// </summary>
+public interface IRound33KeyHolder
+{
+    string ApiKey { get; set; }
+    Task RotateAsync(string value);
+}
+
+public sealed class Round33KeyHolder : IRound33KeyHolder
+{
+    public const string InitialKey = "initial-key";
+
+    public string ApiKey { get; set; } = InitialKey;
+    public List<string> Rotations { get; } = [];
+
+    public Task RotateAsync(string value)
+    {
+        Rotations.Add(value);
+        return Task.CompletedTask;
+    }
+}
+
+/// <summary>
 /// Opt-in callback authorization (review item 1): when an <see cref="IAsyncResponseCallbackAuthorizer"/>
 /// is registered, only allowed (service, method) pairs may be invoked through the reflection
 /// machinery. With none registered, behavior is unchanged (allow all) — zero boilerplate by default.
@@ -278,6 +302,144 @@ public class CallbackAuthorizationTests
 
         var ex = await Assert.ThrowsAnyAsync<InvalidOperationException>(() => provider.InvokeAsync(executorCall));
         Assert.Contains("not authorized", ex.Message, StringComparison.Ordinal);
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Round 33: a type-level Allow<T>() authorizes every (T, method) pair by NAME, and the
+    // invocation plan picked its candidates from GetMethods(Instance | Public) unfiltered — so
+    // property accessors (set_X / get_X) and object's own members were invocable callbacks. A
+    // worker-transport writer could aim "set_ApiKey" at a DI singleton and change process-wide
+    // state; the plan accepts a void return, so nothing downstream noticed.
+    // ---------------------------------------------------------------------------------------
+
+    /// <summary>
+    /// Round 33, the wire shape of the finding: a worker envelope naming <c>set_ApiKey</c> on a
+    /// singleton whose TYPE is allowlisted. Pre-fix the setter ran — no exception, the key
+    /// changed. The plan must refuse an accessor as "no method" and leave the state untouched.
+    /// </summary>
+    [Fact]
+    public async Task WorkerJob_AimedAtAPropertySetter_UnderATypeLevelAllow_IsRefusedAndTheSetterNeverRuns()
+    {
+        var holder = new Round33KeyHolder();
+        var services = new ServiceCollection();
+        services.AddSingleton(typeof(ILogger<>), typeof(NullLogger<>));
+        services.AddSingleton<IRound33KeyHolder>(holder);
+        services
+            .AddAsyncResponse()
+            .WithInMemoryChannel()
+            .AuthorizeCallbacks(a => a.Allow<IRound33KeyHolder>());
+        using var provider = services.BuildServiceProvider();
+        var ingress = provider.GetRequiredService<IAsyncResponseIngress>();
+
+        var json = JsonSerializer.Serialize(new WorkerJobEnvelope
+        {
+            Call = new ReflectionCallDto
+            {
+                ServiceInterfaceFullName = typeof(IRound33KeyHolder).FullName!,
+                MethodName = "set_ApiKey",
+                Params = [CallbackParam.ForValue("attacker-key")],
+            },
+            CorrelationId = "cid",
+        });
+
+        var ex = await Assert.ThrowsAnyAsync<InvalidOperationException>(() => ingress.HandleWorkerMessageAsync(json));
+
+        Assert.Contains("No method", ex.Message, StringComparison.Ordinal);
+        Assert.Equal(Round33KeyHolder.InitialKey, holder.ApiKey);
+    }
+
+    /// <summary>
+    /// Round 33, in-process shape: the accessor pair on the allowlisted interface, driven straight
+    /// through the reflection invoker. Pre-fix both resolved as callbacks (the getter's return was
+    /// discarded, the setter ran); both must be "no method".
+    /// </summary>
+    [Theory]
+    [InlineData("set_ApiKey", 1)]
+    [InlineData("get_ApiKey", 0)]
+    public async Task PropertyAccessors_OnAnAllowlistedInterface_AreNeverCallbackCandidates(string accessor, int arity)
+    {
+        var holder = new Round33KeyHolder();
+        var services = new ServiceCollection();
+        services.AddSingleton(typeof(ILogger<>), typeof(NullLogger<>));
+        services.AddSingleton<IRound33KeyHolder>(holder);
+        services.AddAsyncResponse().AuthorizeCallbacks(a => a.Allow<IRound33KeyHolder>());
+        using var provider = services.BuildServiceProvider();
+
+        var ex = await Assert.ThrowsAnyAsync<InvalidOperationException>(() => provider.InvokeAsync(new ReflectionInvocationDto
+        {
+            ServiceInterfaceFullName = typeof(IRound33KeyHolder).FullName!,
+            MethodName = accessor,
+            Params = arity == 1 ? ["attacker-key"] : []
+        }));
+
+        Assert.Contains("No method", ex.Message, StringComparison.Ordinal);
+        Assert.Equal(Round33KeyHolder.InitialKey, holder.ApiKey);
+    }
+
+    /// <summary>
+    /// Round 33, concrete-class shape: a singleton registered as its own class carries its
+    /// accessors directly and inherits <see cref="object"/>'s public members. Pre-fix every one
+    /// of these resolved and ran (the GetHashCode/ToString/GetType/Equals results were simply
+    /// discarded); none is a callback.
+    /// </summary>
+    [Theory]
+    [InlineData("set_ApiKey", 1)]
+    [InlineData("get_ApiKey", 0)]
+    [InlineData("GetHashCode", 0)]
+    [InlineData("ToString", 0)]
+    [InlineData("GetType", 0)]
+    [InlineData("Equals", 1)]
+    public async Task AccessorsAndObjectMembers_OnAnAllowlistedClass_AreNeverCallbackCandidates(string member, int arity)
+    {
+        var holder = new Round33KeyHolder();
+        var services = new ServiceCollection();
+        services.AddSingleton(typeof(ILogger<>), typeof(NullLogger<>));
+        services.AddSingleton(holder);
+        services.AddAsyncResponse().AuthorizeCallbacks(a => a.Allow<Round33KeyHolder>());
+        using var provider = services.BuildServiceProvider();
+
+        var ex = await Assert.ThrowsAnyAsync<InvalidOperationException>(() => provider.InvokeAsync(new ReflectionInvocationDto
+        {
+            ServiceInterfaceFullName = typeof(Round33KeyHolder).FullName!,
+            MethodName = member,
+            Params = arity == 1 ? ["attacker-key"] : []
+        }));
+
+        Assert.Contains("No method", ex.Message, StringComparison.Ordinal);
+        Assert.Equal(Round33KeyHolder.InitialKey, holder.ApiKey);
+    }
+
+    /// <summary>
+    /// Round 33 control: the accessor filter must not swallow the real callback — the same
+    /// allowlisted type still dispatches its ordinary method through both the interface and the
+    /// concrete registration.
+    /// </summary>
+    [Fact]
+    public async Task OrdinaryMethod_OnTheSameAllowlistedType_StillDispatches()
+    {
+        var holder = new Round33KeyHolder();
+        var services = new ServiceCollection();
+        services.AddSingleton(typeof(ILogger<>), typeof(NullLogger<>));
+        services.AddSingleton<IRound33KeyHolder>(holder);
+        services.AddSingleton(holder);
+        services.AddAsyncResponse().AuthorizeCallbacks(a => a.Allow<IRound33KeyHolder>().Allow<Round33KeyHolder>());
+        using var provider = services.BuildServiceProvider();
+
+        await provider.InvokeAsync(new ReflectionInvocationDto
+        {
+            ServiceInterfaceFullName = typeof(IRound33KeyHolder).FullName!,
+            MethodName = nameof(IRound33KeyHolder.RotateAsync),
+            Params = ["via-interface"]
+        });
+        await provider.InvokeAsync(new ReflectionInvocationDto
+        {
+            ServiceInterfaceFullName = typeof(Round33KeyHolder).FullName!,
+            MethodName = nameof(Round33KeyHolder.RotateAsync),
+            Params = ["via-class"]
+        });
+
+        Assert.Equal(["via-interface", "via-class"], holder.Rotations);
+        Assert.Equal(Round33KeyHolder.InitialKey, holder.ApiKey);
     }
 
     private sealed class StaticAuthorizer(bool allowed) : IAsyncResponseCallbackAuthorizer

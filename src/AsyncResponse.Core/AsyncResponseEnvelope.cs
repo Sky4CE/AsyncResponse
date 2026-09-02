@@ -135,6 +135,7 @@ internal sealed class AsyncResponseEnvelopeConverter<T> : JsonConverter<AsyncRes
         int schemaVersion = default;
         bool hasSchemaVersion = false;
         bool success = false;
+        bool hasPayload = false;
         bool payloadIsNull = false;
         T? payload = default;
         string? exceptionMessage = null;
@@ -167,6 +168,7 @@ internal sealed class AsyncResponseEnvelopeConverter<T> : JsonConverter<AsyncRes
                 }
                 else if (property == EnvelopeProperty.Payload)
                 {
+                    hasPayload = true;
                     if (reader.TokenType == JsonTokenType.Null)
                     {
                         // Instead of throwing, assign default(T); whether null was legal here is
@@ -176,6 +178,9 @@ internal sealed class AsyncResponseEnvelopeConverter<T> : JsonConverter<AsyncRes
                     }
                     else
                     {
+                        // Last wins, as every other STJ binding: a null occurrence followed by a
+                        // value is a value, so the flag must not latch.
+                        payloadIsNull = false;
                         payload = JsonSerializer.Deserialize(ref reader, AsyncResponseJson.GetTypeInfo<T>(options));
                     }
                 }
@@ -205,9 +210,12 @@ internal sealed class AsyncResponseEnvelopeConverter<T> : JsonConverter<AsyncRes
         // null Payload only arises from a producer-side contract violation — typically a raw
         // ingress body of literal `null` wrapped verbatim into the envelope. JsonException makes
         // it fail fast: the ingress classifies it as permanent (no retry burn) and the waiter
-        // faults with the reason instead of completing with a null payload.
-        if (success && payloadIsNull)
-            throw new JsonException("Payload is null on a Success envelope; a successful response must carry a non-null payload.");
+        // faults with the reason instead of completing with a null payload. An ABSENT Payload
+        // is the same violation: the flag above is only ever set inside the Payload branch, so
+        // {"SchemaVersion":1,"Success":true} slipped past this guard and every channel then
+        // handed `envelope.Payload!` — null — to the user's Until predicate and TrySetResult.
+        if (success && (!hasPayload || payloadIsNull))
+            throw new JsonException("Payload is null or absent on a Success envelope; a successful response must carry a non-null payload.");
 
         return new AsyncResponseEnvelope<T>
         {

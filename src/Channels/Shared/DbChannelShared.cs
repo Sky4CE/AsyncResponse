@@ -655,6 +655,15 @@ internal abstract class DbAsyncResponseChannelBase :
             TaskScheduler.Default);
     }
 
+    /// <summary>
+    /// The effective minimum interval between full safety-net sweeps, <c>null</c> to sweep on
+    /// every poll tick. Defaults to the configured <c>FullSweepInterval</c>; a provider overrides
+    /// it when its push wake is not carrying delivery, because the throttled sweep is then the
+    /// ONLY cross-process wake and a throttle equal to the delivery-confirmation timeout routed
+    /// live waiters' responses into lost-subscriber recovery.
+    /// </summary>
+    protected virtual TimeSpan? CurrentFullSweepInterval() => _options.FullSweepInterval;
+
     private void ThrowIfDisposed()
     {
         lock (_listenerGate)
@@ -851,8 +860,10 @@ internal abstract class DbAsyncResponseChannelBase :
             // The timer sweep costs one store query per subscribed correlation id, so with W
             // waiters an idle channel pays W queries per poll tick. FullSweepInterval bounds that:
             // a tick whose sweep is not yet due scans nothing (signaled scans are unaffected —
-            // they arrive through the signal branch below with their own scope).
-            if (_options.FullSweepInterval is { } fullSweepInterval)
+            // they arrive through the signal branch below with their own scope). Provider-
+            // resolved: a provider whose push wake is off or unavailable has no other
+            // cross-process delivery path and must sweep every tick.
+            if (CurrentFullSweepInterval() is { } fullSweepInterval)
             {
                 var now = DateTimeOffset.UtcNow;
                 if (now - _lastFullSweepUtc < fullSweepInterval)
@@ -1019,15 +1030,18 @@ internal abstract class DbAsyncResponseChannelBase :
         // The insert itself carries the remote wake where the provider has one (a NOTIFY rides the
         // PostgreSQL insert; MongoDB change streams observe it) and the SQL Server sweep polls it
         // up. Only the local fast path and a targeted local signal are needed on top. The store
-        // returns the SERVER-stamped created_at for the local fast-path message: subscription
+        // returns the fast-path message with the SERVER-stamped created_at: subscription
         // watermarks are server-clock, and an app-clock timestamp here silently disabled the fast
         // path whenever the app clock ran more than the 1s tolerance behind the database — delivery
-        // then quietly degraded to sweep latency on every publish.
-        var createdAtUtc = await _store.InsertMessageAsync(messageId, correlationId, envelopeJson, _options.MessageRetention, cancellationToken)
+        // then quietly degraded to sweep latency on every publish. On an idempotent duplicate (a
+        // publish retry) it is the ORIGINAL row, settlement columns included: fabricating
+        // AckedAtUtc = null here bypassed IsWithinWatermark's acked-history exclusion, and a retry
+        // landing after another process had claimed and acked the first attempt replayed that
+        // consumed response to a waiter registered since — the sweep path never had the problem
+        // because LoadMessagesAsync reads acked_at.
+        var message = await _store.InsertMessageAsync(messageId, correlationId, envelopeJson, _options.MessageRetention, cancellationToken)
             .ConfigureAwait(false);
-        await TryDispatchLocalSubscribersAsync(
-            new DbChannelMessage(messageId, correlationId, envelopeJson, createdAtUtc),
-            cancellationToken).ConfigureAwait(false);
+        await TryDispatchLocalSubscribersAsync(message, cancellationToken).ConfigureAwait(false);
         SignalDispatcher(correlationId);
     }
 

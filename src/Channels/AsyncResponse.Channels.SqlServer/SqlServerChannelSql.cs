@@ -399,12 +399,13 @@ internal sealed class SqlServerChannelSql
     /// <summary>
     /// Inserts a response envelope row. The caller supplies the message id so the insert is
     /// idempotent under retry — a duplicate insert (lost WHERE NOT EXISTS race or an outer retry)
-    /// is treated as success, so a retried publish never duplicates a response. Returns the row's
-    /// server-stamped <c>created_at</c> (the original row's on a duplicate) so the same-process
-    /// fast path compares against subscription watermarks on the server clock rather than the
-    /// app clock.
+    /// is treated as success, so a retried publish never duplicates a response. Returns the
+    /// same-process fast-path message carrying the row's server-stamped <c>created_at</c> — and,
+    /// on a duplicate, the ORIGINAL row's settlement columns, so the fast path compares against
+    /// subscription watermarks exactly as the sweep does (a fabricated null <c>acked_at</c>
+    /// replayed an already-consumed response to a waiter registered after the ack).
     /// </summary>
-    public Task<DateTimeOffset> InsertMessageAsync(Guid id, string correlationId, string envelopeJson, TimeSpan retention, CancellationToken cancellationToken)
+    public Task<SqlServerChannelMessage> InsertMessageAsync(Guid id, string correlationId, string envelopeJson, TimeSpan retention, CancellationToken cancellationToken)
         => AsyncResponseRetry.ExecuteAsync(
             token => InsertMessageOnceAsync(id, correlationId, envelopeJson, retention, token),
             IsTransient,
@@ -413,7 +414,7 @@ internal sealed class SqlServerChannelSql
             _options.PublishRetryMaxDelay,
             cancellationToken);
 
-    private async Task<DateTimeOffset> InsertMessageOnceAsync(Guid id, string correlationId, string envelopeJson, TimeSpan retention, CancellationToken cancellationToken)
+    private async Task<SqlServerChannelMessage> InsertMessageOnceAsync(Guid id, string correlationId, string envelopeJson, TimeSpan retention, CancellationToken cancellationToken)
     {
         await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
         if (ShouldPrune(ref _lastMessagePruneTicks))
@@ -443,27 +444,37 @@ internal sealed class SqlServerChannelSql
         }
 
         if (createdAt is DateTime insertedCreatedAt)
-            return new DateTimeOffset(insertedCreatedAt, TimeSpan.Zero);
+            return new SqlServerChannelMessage(id, correlationId, envelopeJson, new DateTimeOffset(insertedCreatedAt, TimeSpan.Zero));
 
         // Duplicate insert (WHERE NOT EXISTS suppressed it, or the key-violation race lost):
-        // return the original row's server-stamped created_at. Unlike PostgreSQL's single-statement
-        // CTE, this fallback is already a SEPARATE statement, so a concurrent same-id publish is
-        // resolved here deterministically: the HOLDLOCK range lock on the first statement
+        // return the original row with its server-stamped created_at AND its settlement columns,
+        // so the same-process fast path compares against the watermark exactly as the sweep does
+        // (a fabricated null acked_at replayed an already-consumed response to a waiter registered
+        // after the ack). This fallback is a SEPARATE statement, so a concurrent same-id publish
+        // is resolved here deterministically: the HOLDLOCK range lock on the first statement
         // serializes against the competing insert, and this second statement reads its own fresh
         // snapshot/locks and sees the committed row.
         await using var lookup = connection.CreateCommand();
-        lookup.CommandText = $"SELECT created_at FROM {MessageTable} WHERE id = @id;";
+        lookup.CommandText = $"SELECT created_at, acked_at, acked_seq FROM {MessageTable} WHERE id = @id;";
         lookup.Parameters.AddWithValue("@id", id);
-        var existing = await lookup.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false);
+        await using var existing = await lookup.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+        if (await existing.ReadAsync(cancellationToken).ConfigureAwait(false))
+        {
+            return new SqlServerChannelMessage(
+                id,
+                correlationId,
+                envelopeJson,
+                new DateTimeOffset(existing.GetDateTime(0), TimeSpan.Zero),
+                existing.IsDBNull(1) ? null : new DateTimeOffset(existing.GetDateTime(1), TimeSpan.Zero),
+                existing.IsDBNull(2) ? null : existing.GetInt64(2));
+        }
 
         // A missing row means the idempotent duplicate's original is already gone (pruned
         // mid-publish): the message is not persisted, so reporting success with a fabricated
         // app-clock timestamp would both lie about persistence and feed a client clock into the
         // server-clock watermark. Fail instead, so the publisher's error handling runs.
-        return existing is DateTime existingCreatedAt
-            ? new DateTimeOffset(existingCreatedAt, TimeSpan.Zero)
-            : throw new InvalidOperationException(
-                $"SQL Server response insert for message {id} found no row after a duplicate: the original no longer exists (pruned). The response is not persisted.");
+        throw new InvalidOperationException(
+            $"SQL Server response insert for message {id} found no row after a duplicate: the original no longer exists (pruned). The response is not persisted.");
     }
 
     public async Task<IReadOnlyList<SqlServerChannelMessage>> LoadMessagesAsync(

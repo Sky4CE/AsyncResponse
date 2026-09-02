@@ -179,8 +179,9 @@ builder.Services.AddAsyncResponse()
 ```
 
 Change-stream wake requires a replica set; a single-node replica set is enough. On a standalone
-server the channel falls back to `ListenerPollInterval` polling. A registered `IMongoDatabase`, or
-an `IMongoClient` plus `DatabaseName`, is reused automatically.
+server (or with `UseChangeStreams = false`) the channel falls back to `ListenerPollInterval`
+polling with the full sweep on every tick — `FullSweepInterval` is ignored there. A registered
+`IMongoDatabase`, or an `IMongoClient` plus `DatabaseName`, is reused automatically.
 
 ## Transport examples
 

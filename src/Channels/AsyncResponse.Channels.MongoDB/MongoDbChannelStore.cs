@@ -349,7 +349,7 @@ internal sealed class MongoDbChannelStore : IDisposable
     /// dispatch watermarks never mix client and server clocks. The insert itself is the wake signal:
     /// every process's change stream observes it.
     /// </summary>
-    public Task<DateTimeOffset> InsertMessageAsync(Guid id, string correlationId, string envelopeJson, TimeSpan retention, CancellationToken cancellationToken)
+    public Task<MongoDbChannelMessage> InsertMessageAsync(Guid id, string correlationId, string envelopeJson, TimeSpan retention, CancellationToken cancellationToken)
         => AsyncResponseRetry.ExecuteAsync(
             token => InsertMessageOnceAsync(id, correlationId, envelopeJson, retention, token),
             MongoTransientFaults.IsTransient,
@@ -358,13 +358,15 @@ internal sealed class MongoDbChannelStore : IDisposable
             _options.PublishRetryMaxDelay,
             cancellationToken);
 
-    private async Task<DateTimeOffset> InsertMessageOnceAsync(Guid id, string correlationId, string envelopeJson, TimeSpan retention, CancellationToken cancellationToken)
+    private async Task<MongoDbChannelMessage> InsertMessageOnceAsync(Guid id, string correlationId, string envelopeJson, TimeSpan retention, CancellationToken cancellationToken)
     {
         await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
 
         // findOneAndUpdate instead of updateOne so the returned document carries the
         // server-stamped ($$NOW) created_at — the original document's on a publish retry, per the
-        // pipeline's $ifNull — for the same-process fast path's watermark comparison.
+        // pipeline's $ifNull, together with its settlement columns — for the same-process fast
+        // path's watermark comparison (a fabricated null acked_at replayed an already-consumed
+        // response to a waiter registered after the ack).
         var document = await _messages.FindOneAndUpdateAsync(
             Builders<MongoChannelMessageDocument>.Filter.Eq(item => item.Id, id),
             BuildInsertMessagePipeline(correlationId, envelopeJson, retention),
@@ -382,7 +384,13 @@ internal sealed class MongoDbChannelStore : IDisposable
         return document is null
             ? throw new InvalidOperationException(
                 $"MongoDB response upsert for message {id} returned no document despite IsUpsert + ReturnDocument.After; persistence is unknown.")
-            : new DateTimeOffset(document.CreatedAtUtc, TimeSpan.Zero);
+            : new MongoDbChannelMessage(
+                id,
+                correlationId,
+                envelopeJson,
+                new DateTimeOffset(document.CreatedAtUtc, TimeSpan.Zero),
+                document.AckedAtUtc is { } acked ? new DateTimeOffset(acked, TimeSpan.Zero) : null,
+                document.AckedSeq);
     }
 
     /// <summary>

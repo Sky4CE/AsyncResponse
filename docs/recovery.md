@@ -103,9 +103,10 @@ work; guards like `payload is OrderResult` behave identically to the live path.
 This matters most for services that register **one callback for several payload types** (an
 `object`-typed parameter): binding the raw JSON to the *declared* parameter type used to hand such a
 callback a `JsonElement`, silently failing every type guard inside it. If the recorded payload type
-cannot be resolved or materialized (e.g. renamed/removed across a deploy), the response is routed
-conservatively to the failure callback with the raw payload attached, and the type-resolution
-failure is surfaced through diagnostics.
+cannot be resolved or materialized (e.g. renamed/removed across a deploy, or a name whose generic
+argument lives in an assembly this process has not loaded — resolution never loads one), the
+response is routed conservatively to the failure callback with the raw payload attached, and the
+type-resolution failure is surfaced through diagnostics.
 
 ## Registering recovery callbacks
 
@@ -294,8 +295,11 @@ strict server-clock comparison.
 `RecoveryState`, `WorkerJobEnvelope`, and the response envelope each carry a **`SchemaVersion`**. A
 reader accepts only versions explicitly supported by that build. Today that is the current version;
 arbitrary lower numbers are not guessed to be compatible. The schema property is mandatory;
-missing, null, and unsupported values are rejected rather than inferred. Add historical versions
-only alongside a tested migration path.
+missing, null, and unsupported values are rejected rather than inferred. The response envelope's
+`Payload` is held to the same standard: on a `Success: true` envelope an **absent** `Payload` is
+rejected exactly like an explicit `"Payload": null` (`JsonException`, permanent — the delivery
+faults instead of completing a waiter with `null`), and a duplicated `Payload` key binds
+last-wins. Add historical versions only alongside a tested migration path.
 
 Keep all hosts that share recovery or worker storage on the same wire schema during deployment.
 An incompatible writer fails safe—the reader refuses the payload instead of invoking a callback or

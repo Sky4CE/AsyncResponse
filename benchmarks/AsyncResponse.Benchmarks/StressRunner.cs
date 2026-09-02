@@ -371,17 +371,9 @@ internal static class StressRunner
 
             if (reply is not SubscriberClient.Reply.Ack)
                 Interlocked.Increment(ref nacks);
-        });
+        }, settle: () => allProcessed.Task.WaitAsync(TimeSpan.FromSeconds(60)));
 
-        var drained = false;
-        try
-        {
-            await allProcessed.Task.WaitAsync(TimeSpan.FromSeconds(60)).ConfigureAwait(false);
-            drained = true;
-        }
-        catch (TimeoutException)
-        {
-        }
+        var drained = metrics.Settled;
 
         metrics.Print();
         metrics.Emit("google-pubsub-ack-after-enqueue-dispatch-storm");
@@ -451,17 +443,9 @@ internal static class StressRunner
                 CancellationToken: CancellationToken.None);
 
             await dispatcher.HandleAsync(delivery, channel, CancellationToken.None).ConfigureAwait(false);
-        });
+        }, settle: () => allProcessed.Task.WaitAsync(TimeSpan.FromSeconds(60)));
 
-        var drained = false;
-        try
-        {
-            await allProcessed.Task.WaitAsync(TimeSpan.FromSeconds(60)).ConfigureAwait(false);
-            drained = true;
-        }
-        catch (TimeoutException)
-        {
-        }
+        var drained = metrics.Settled;
 
         metrics.Print();
         metrics.Emit("rabbitmq-ack-after-enqueue-dispatch-storm");
@@ -536,17 +520,9 @@ internal static class StressRunner
                 Attempt: 1,
                 new StreamEntry(id, [new NameValueEntry("payload", "{}"), new NameValueEntry("correlationId", $"stress-{i}")])),
                 CancellationToken.None).ConfigureAwait(false);
-        });
+        }, settle: () => allProcessed.Task.WaitAsync(TimeSpan.FromSeconds(60)));
 
-        var drained = false;
-        try
-        {
-            await allProcessed.Task.WaitAsync(TimeSpan.FromSeconds(60)).ConfigureAwait(false);
-            drained = true;
-        }
-        catch (TimeoutException)
-        {
-        }
+        var drained = metrics.Settled;
 
         metrics.Print();
         metrics.Emit("redis-ack-after-enqueue-dispatch-storm");
@@ -627,17 +603,9 @@ internal static class StressRunner
                 _ => { Interlocked.Increment(ref naks); return ValueTask.CompletedTask; },
                 () => { Interlocked.Increment(ref terms); return ValueTask.CompletedTask; }),
                 CancellationToken.None).ConfigureAwait(false);
-        });
+        }, settle: () => allProcessed.Task.WaitAsync(TimeSpan.FromSeconds(60)));
 
-        var drained = false;
-        try
-        {
-            await allProcessed.Task.WaitAsync(TimeSpan.FromSeconds(60)).ConfigureAwait(false);
-            drained = true;
-        }
-        catch (TimeoutException)
-        {
-        }
+        var drained = metrics.Settled;
 
         metrics.Print();
         metrics.Emit("nats-ack-after-receive-dispatch-storm");
@@ -716,17 +684,9 @@ internal static class StressRunner
                 (_, _, _) => { Interlocked.Increment(ref deadLetters); return ValueTask.FromResult(true); },
                 () => ValueTask.FromResult(true)),
                 CancellationToken.None).ConfigureAwait(false);
-        });
+        }, settle: () => allProcessed.Task.WaitAsync(TimeSpan.FromSeconds(60)));
 
-        var drained = false;
-        try
-        {
-            await allProcessed.Task.WaitAsync(TimeSpan.FromSeconds(60)).ConfigureAwait(false);
-            drained = true;
-        }
-        catch (TimeoutException)
-        {
-        }
+        var drained = metrics.Settled;
 
         metrics.Print();
         metrics.Emit("postgresql-ack-after-receive-dispatch-storm");
@@ -806,17 +766,9 @@ internal static class StressRunner
                 (_, _, _) => { Interlocked.Increment(ref deadLetters); return ValueTask.FromResult(true); },
                 () => ValueTask.FromResult(true)),
                 CancellationToken.None).ConfigureAwait(false);
-        });
+        }, settle: () => allProcessed.Task.WaitAsync(TimeSpan.FromSeconds(60)));
 
-        var drained = false;
-        try
-        {
-            await allProcessed.Task.WaitAsync(TimeSpan.FromSeconds(60)).ConfigureAwait(false);
-            drained = true;
-        }
-        catch (TimeoutException)
-        {
-        }
+        var drained = metrics.Settled;
 
         metrics.Print();
         metrics.Emit("sqlserver-ack-after-enqueue-dispatch-storm");
@@ -896,17 +848,9 @@ internal static class StressRunner
                 (_, _, _) => { Interlocked.Increment(ref deadLetters); return ValueTask.FromResult(true); },
                 () => ValueTask.FromResult(true)),
                 CancellationToken.None).ConfigureAwait(false);
-        });
+        }, settle: () => allProcessed.Task.WaitAsync(TimeSpan.FromSeconds(60)));
 
-        var drained = false;
-        try
-        {
-            await allProcessed.Task.WaitAsync(TimeSpan.FromSeconds(60)).ConfigureAwait(false);
-            drained = true;
-        }
-        catch (TimeoutException)
-        {
-        }
+        var drained = metrics.Settled;
 
         metrics.Print();
         metrics.Emit("mongodb-ack-after-enqueue-dispatch-storm");
@@ -989,17 +933,9 @@ internal static class StressRunner
                 (_, _) => { Interlocked.Increment(ref deadLetters); return ValueTask.CompletedTask; },
                 _ => ValueTask.CompletedTask),
                 CancellationToken.None).ConfigureAwait(false);
-        });
+        }, settle: () => allProcessed.Task.WaitAsync(TimeSpan.FromSeconds(60)));
 
-        var drained = false;
-        try
-        {
-            await allProcessed.Task.WaitAsync(TimeSpan.FromSeconds(60)).ConfigureAwait(false);
-            drained = true;
-        }
-        catch (TimeoutException)
-        {
-        }
+        var drained = metrics.Settled;
 
         metrics.Print();
         metrics.Emit("azure-servicebus-ack-after-receive-dispatch-storm");
@@ -1072,17 +1008,9 @@ internal static class StressRunner
                 $"stress-{i}",
                 [KafkaTransportHeader.Utf8("correlationId", $"stress-{i}")]),
                 CancellationToken.None).ConfigureAwait(false);
-        });
+        }, settle: () => allProcessed.Task.WaitAsync(TimeSpan.FromSeconds(60)));
 
-        var drained = false;
-        try
-        {
-            await allProcessed.Task.WaitAsync(TimeSpan.FromSeconds(60)).ConfigureAwait(false);
-            drained = true;
-        }
-        catch (TimeoutException)
-        {
-        }
+        var drained = metrics.Settled;
 
         metrics.Print();
         metrics.Emit("kafka-ack-after-enqueue-dispatch-storm");
@@ -1588,17 +1516,9 @@ internal static class StressRunner
                 () => { Interlocked.Increment(ref deletes); return ValueTask.CompletedTask; },
                 (_, _) => { Interlocked.Increment(ref visibilityReleases); return ValueTask.CompletedTask; }),
                 CancellationToken.None).ConfigureAwait(false);
-        });
+        }, settle: () => allProcessed.Task.WaitAsync(TimeSpan.FromSeconds(60)));
 
-        var drained = false;
-        try
-        {
-            await allProcessed.Task.WaitAsync(TimeSpan.FromSeconds(60)).ConfigureAwait(false);
-            drained = true;
-        }
-        catch (TimeoutException)
-        {
-        }
+        var drained = metrics.Settled;
 
         metrics.Print();
         metrics.Emit("sqs-ack-after-enqueue-dispatch-storm");
@@ -1729,7 +1649,13 @@ internal static class StressRunner
         }
     }
 
-    private static async Task<Metrics> Measure(string name, int count, int concurrency, Func<int, Task> operation)
+    // `settle`, when given, is awaited INSIDE the timed region: the ACK-after-enqueue dispatch
+    // storms hand the real work to background workers, so a clock stopped when the last enqueue
+    // returned measured channel-write + early-ACK cost and published it as "dispatch" throughput
+    // — make the workers ten times slower and the charted series barely moved. Its timeout is
+    // recorded as Settled = false rather than thrown, so the scenario's correctness gate can
+    // still report it.
+    private static async Task<Metrics> Measure(string name, int count, int concurrency, Func<int, Task> operation, Func<Task>? settle = null)
     {
         var latencies = new double[count];
         GC.Collect();
@@ -1746,11 +1672,25 @@ internal static class StressRunner
             latencies[i] = Stopwatch.GetElapsedTime(start).TotalMilliseconds;
         });
 
+        var settled = true;
+        if (settle is not null)
+        {
+            try
+            {
+                await settle();
+            }
+            catch (TimeoutException)
+            {
+                settled = false;
+            }
+        }
+
         sw.Stop();
         return new Metrics
         {
             Name = name,
             Count = count,
+            Settled = settled,
             Elapsed = sw.Elapsed,
             Latencies = latencies,
             AllocatedBytes = GC.GetTotalAllocatedBytes() - allocBefore,
@@ -1859,6 +1799,7 @@ internal static class StressRunner
     {
         public string Name = "";
         public int Count;
+        public bool Settled = true;
         public TimeSpan Elapsed;
         public double[] Latencies = [];
         public long AllocatedBytes;
