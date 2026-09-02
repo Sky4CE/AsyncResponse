@@ -1249,7 +1249,10 @@ internal static class StressRunner
                     .ConfigureAwait(false);
 
                 var failures = await Task.WhenAll(captures).ConfigureAwait(false);
-                if (failures.Count(static name => name == nameof(InvalidOperationException)) != fanout)
+                // The wire failure shape: every channel — the in-memory one included — faults the
+                // waiter with a plain Exception carrying the remote message; the publisher's concrete
+                // type never crosses the wire.
+                if (failures.Count(static name => name == nameof(Exception)) != fanout)
                     Interlocked.Increment(ref wrongException);
             }
             catch
