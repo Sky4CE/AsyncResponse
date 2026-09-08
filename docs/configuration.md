@@ -120,20 +120,25 @@ Configure these on the selected store, for example:
 
 | Package | Provider-specific options (in addition to the common options above) |
 |---|---|
-| `SqlServer` | `ConnectionString`, `SchemaName`, `TableName`, `AutoCreateSchema`, `PruneInterval` |
-| `PostgreSQL` | `ConnectionString` or registered `NpgsqlDataSource`, `SchemaName`, `TableName`, `AutoCreateSchema`, `PruneInterval` |
-| `MySql` | `ConnectionString`, `TableName`, `AutoCreateSchema`, `PruneInterval` |
-| `Sqlite` | `ConnectionString`, `TableName`, `AutoCreateSchema`, `PruneInterval` |
-| `Oracle` | `ConnectionString`, `TableName`, `AutoCreateSchema`, `PruneInterval` |
+| `SqlServer` | `ConnectionString`, `SchemaName`, `TableName`, `AutoCreateSchema`, `PruneInterval`, `PruneBudget` |
+| `PostgreSQL` | `ConnectionString` or registered `NpgsqlDataSource`, `SchemaName`, `TableName`, `AutoCreateSchema`, `PruneInterval`, `PruneBudget` |
+| `MySql` | `ConnectionString`, `TableName`, `AutoCreateSchema`, `PruneInterval`, `PruneBudget` |
+| `Sqlite` | `ConnectionString`, `TableName`, `AutoCreateSchema`, `PruneInterval`, `PruneBudget` |
+| `Oracle` | `ConnectionString`, `TableName`, `AutoCreateSchema`, `PruneInterval`, `PruneBudget` |
 | `MongoDB` | `ConnectionString` or registered `IMongoDatabase`/`IMongoClient`, `DatabaseName`, `CollectionName`, `AutoCreateIndexes` |
 | `Cosmos` | `ConnectionString` or registered `CosmosClient`, `DatabaseName`, `ContainerName`, `PartitionKeyPath`, `AutoCreateContainer`, `Throughput` |
 | `DynamoDB` | registered/default `IAmazonDynamoDB`, `TableName`, `AutoCreateTable`, `EnableTimeToLive`, `TimeToLiveAttributeName` |
-| `EFCore` | application `DbContext` mapping via `ConfigureAsyncResponseDurableFlows(...)`; schema changes are owned by your EF migrations |
+| `EFCore` | application `DbContext` mapping via `ConfigureAsyncResponseDurableFlows(...)`, `PruneInterval`, `PruneBudget`; schema changes are owned by your EF migrations |
 
 The SQL stores prune expired rows opportunistically on flow creation, throttled by `PruneInterval`
-(default 5 minutes; zero or negative prunes on every save) — a prune that fails is skipped
-until the next interval, never failing the `StartAsync` it rides on; MongoDB, Cosmos, and
-DynamoDB use native TTL instead. All packages register their store as a singleton and reuse a
+(default 5 minutes; zero or negative prunes on every save). Each prune deletes in batches of 1000
+rows and keeps going while batches come back full, for at most `PruneBudget` (default 2 seconds;
+zero keeps the historical single batch) — the create that triggered it waits, so the budget also
+bounds that create's added latency. A prune that fails is skipped until the next interval, never
+failing the `StartAsync` it rides on, and the outcome is reported either way: deleted rows,
+failures, and a lapsed budget with rows remaining land on the `AsyncResponse` meter
+(`asyncresponse.flow_state.pruned_rows` / `prune_failures` / `prune_budget_exhausted`, tagged by
+provider) and the store's logger at Warning. MongoDB, Cosmos, and DynamoDB use native TTL instead. All packages register their store as a singleton and reuse a
 host-registered client when one exists. See
 [durable-flow-state-stores.md](durable-flow-state-stores.md) for
 package examples, lifetimes, cleanup mechanics, and schema ownership guidance.

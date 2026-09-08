@@ -11,8 +11,20 @@ internal sealed class InMemoryFlowStateStore : IFlowStateStore
     private static DateTime Expiry(DateTime now, TimeSpan ttl)
         => ttl >= DateTime.MaxValue - now ? DateTime.MaxValue : now.Add(ttl);
 
+    /// <summary>
+    /// How often <see cref="TryCreateAsync"/> sweeps expired entries whose ids are never touched
+    /// again. Expiry used to be enforced only on access to the SAME id (a load or a replacement),
+    /// which a completed run normally never gets — so a long-lived process minting unique flow
+    /// ids retained every expired ledger (inputs, memoized results, value bags) for its lifetime;
+    /// <c>StateExpiry</c> hid them from reads without ever bounding memory. On the engine's clock,
+    /// like every other stamp here: a virtual clock that never advances never sweeps, and
+    /// nothing has expired under it either.
+    /// </summary>
+    internal static readonly TimeSpan SweepInterval = TimeSpan.FromMinutes(1);
+
     private readonly ConcurrentDictionary<string, Entry> _entries = new(StringComparer.Ordinal);
     private readonly TimeProvider _timeProvider;
+    private long _nextSweepTicks;
 
     /// <summary>Creates the store; expiry and lease stamps come from the engine's clock.</summary>
     public InMemoryFlowStateStore(TimeProvider? timeProvider = null)
@@ -30,6 +42,7 @@ internal sealed class InMemoryFlowStateStore : IFlowStateStore
             throw new ArgumentException("A new flow ledger must start at revision zero.", nameof(state));
 
         var now = _timeProvider.GetUtcNow().UtcDateTime;
+        SweepExpired(now);
         var created = CreateEntry(state, Expiry(now, ttl));
         while (true)
         {
@@ -176,6 +189,29 @@ internal sealed class InMemoryFlowStateStore : IFlowStateStore
         ArgumentException.ThrowIfNullOrWhiteSpace(flowId);
         cancellationToken.ThrowIfCancellationRequested();
         return Task.FromResult(_entries.TryRemove(flowId, out _));
+    }
+
+    /// <summary>
+    /// Removes every entry expired at <paramref name="now"/>, at most once per
+    /// <see cref="SweepInterval"/>; one sweeper at a time (the interval stamp is claimed by
+    /// compare-exchange). Removal is conditional on the observed entry, so a concurrent
+    /// update/create that swapped the entry in between keeps its (unexpired) replacement.
+    /// </summary>
+    private void SweepExpired(DateTime now)
+    {
+        var due = Interlocked.Read(ref _nextSweepTicks);
+        if (now.Ticks < due)
+            return;
+
+        var next = Expiry(now, SweepInterval).Ticks;
+        if (Interlocked.CompareExchange(ref _nextSweepTicks, next, due) != due)
+            return;
+
+        foreach (var pair in _entries)
+        {
+            if (pair.Value.ExpiresAtUtc <= now)
+                _entries.TryRemove(pair);
+        }
     }
 
     private Task<bool> TryChangeLeaseAsync(

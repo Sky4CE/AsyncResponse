@@ -105,20 +105,25 @@ internal sealed class AsyncResponseIngress(
             // NAK/redeliver instead of terminally failing a waiter whose response was never lost.
             // Recovery resume callbacks may be re-invoked by these retries, which matches their
             // contract — broker redelivery re-invokes them the same way.
+            //
+            // RecoveryCallbackFailedException is excluded from both as well: the lost-subscriber
+            // dispatcher already ran its own ladder against the failure callback, and escalating
+            // through SetException would only invoke that same failing callback again. It
+            // propagates so the transport redelivers the still-unacknowledged terminal signal.
             await AsyncResponseRetry.ExecuteAsync(
                 async _ =>
                 {
                     await _rawPublisher.SetRawResponseJson(messageJson, correlationId).ConfigureAwait(false);
                     return true;
                 },
-                isTransient: static ex => ex is not (System.Text.Json.JsonException or InvalidDataException or OperationCanceledException),
+                isTransient: static ex => ex is not (System.Text.Json.JsonException or InvalidDataException or OperationCanceledException or RecoveryCallbackFailedException),
                 maxAttempts: 4,
                 baseDelay: TimeSpan.FromMilliseconds(250),
                 maxDelay: TimeSpan.FromSeconds(2),
                 CancellationToken.None,
                 _timeProvider).ConfigureAwait(false);
         }
-        catch (Exception ex) when (ex is not OperationCanceledException)
+        catch (Exception ex) when (ex is not (OperationCanceledException or RecoveryCallbackFailedException))
         {
             _logger.LogError(ex, "Ingress failed to process the inbound response message.");
             AsyncResponseDiagnostics.SetError(activity, ex);

@@ -9,12 +9,14 @@ AsyncResponse.DurableFlows.MySql.MySqlDurableFlowOptions.MaxStateBytes.set -> vo
 AsyncResponse.DurableFlows.MySql.MySqlDurableFlowOptions.MySqlDurableFlowOptions() -> void
 AsyncResponse.DurableFlows.MySql.MySqlDurableFlowOptions.PruneInterval.get -> System.TimeSpan
 AsyncResponse.DurableFlows.MySql.MySqlDurableFlowOptions.PruneInterval.set -> void
+AsyncResponse.DurableFlows.MySql.MySqlDurableFlowOptions.PruneBudget.get -> System.TimeSpan
+AsyncResponse.DurableFlows.MySql.MySqlDurableFlowOptions.PruneBudget.set -> void
 AsyncResponse.DurableFlows.MySql.MySqlDurableFlowOptions.TableName.get -> string!
 AsyncResponse.DurableFlows.MySql.MySqlDurableFlowOptions.TableName.set -> void
 AsyncResponse.DurableFlows.MySql.MySqlDurableFlowOptions.Validate() -> void
 AsyncResponse.DurableFlows.MySql.MySqlFlowStateStore
 AsyncResponse.DurableFlows.MySql.MySqlFlowStateStore.LoadAsync(string! flowId, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task<AsyncResponse.FlowState?>!
-AsyncResponse.DurableFlows.MySql.MySqlFlowStateStore.MySqlFlowStateStore(Microsoft.Extensions.Options.IOptions<AsyncResponse.DurableFlows.MySql.MySqlDurableFlowOptions!>! options) -> void
+AsyncResponse.DurableFlows.MySql.MySqlFlowStateStore.MySqlFlowStateStore(Microsoft.Extensions.Options.IOptions<AsyncResponse.DurableFlows.MySql.MySqlDurableFlowOptions!>! options, Microsoft.Extensions.Logging.ILogger<AsyncResponse.DurableFlows.MySql.MySqlFlowStateStore!>? logger = null) -> void
 AsyncResponse.DurableFlows.MySql.MySqlFlowStateStore.ReleaseLeaseAsync(string! flowId, string! leaseId, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task!
 AsyncResponse.DurableFlows.MySql.MySqlFlowStateStore.TryAcquireLeaseAsync(string! flowId, string! leaseId, System.TimeSpan leaseDuration, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task<bool>!
 AsyncResponse.DurableFlows.MySql.MySqlFlowStateStore.TryCreateAsync(string! flowId, AsyncResponse.FlowState! state, System.TimeSpan ttl, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task<bool>!

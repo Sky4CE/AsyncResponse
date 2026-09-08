@@ -363,7 +363,10 @@ public class InMemoryAsyncResponseTests
 
         await rawPublisher.SetRawResponse("not-json", correlationId);
 
-        await Assert.ThrowsAsync<JsonException>(() => waiter.ResponseTask.WaitAsync(TimeSpan.FromSeconds(2)));
+        // Body-free since round 34: materialization goes through the JSON safety helper, so the
+        // waiter's fault names size and position, never the body (a JsonException quoted it).
+        var thrown = await Assert.ThrowsAsync<InvalidDataException>(() => waiter.ResponseTask.WaitAsync(TimeSpan.FromSeconds(2)));
+        Assert.DoesNotContain("not-json", thrown.Message, StringComparison.Ordinal);
         Assert.Equal(0, await probe.CountActiveSubscribersAsync(correlationId));
     }
 

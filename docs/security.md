@@ -133,7 +133,10 @@ dictionary keys read straight off the wire, such as a worker envelope's propagat
 for a malformed literal it quotes several raw body characters. Both the message and the chained
 inner exception the ingress logs (and, on the response path, republishes to the waiter through
 `SetException`) are rebuilt from position only: line, byte position, and size. The reader's own
-message and path are dropped, not chained.
+message and path are dropped, not chained. The same scrubbing covers the **second** reader pass —
+converting an already-parsed worker-job argument or recovery payload into the callback's
+parameter type, which walks the payload's own property names and dictionary keys — because the
+exception that escapes it is logged by the worker ingress too.
 
 **Nor a hash of one.** A content digest reads like harmless metadata and is not: it is
 deterministic, so two log entries showing the same prefix prove the two payloads were identical —
@@ -141,6 +144,16 @@ across messages, hosts, and days — and a payload drawn from a small set (a sta
 id, a yes/no result) can be confirmed outright by hashing the candidates until one matches. The
 correlation id and the trace id already tie an entry to its conversation, which is what the digest
 was there for.
+
+### The sample's test-only routes are gated
+
+The sample application (the integration suite's system under test) exposes three unauthenticated
+mutation routes for tests — `/seed-recovery`, `DELETE /test/recovery/{correlationId}`, and
+`POST /test/reset`, which erases every recovery registration the scanner can see. They are mapped
+only in the Development environment or when `Sample:EnableTestEndpoints=true` is configured (the
+integration AppHost and the load-test launcher set it); a Production instance answers 404 and logs
+that they are disabled. If you fork the sample into a service, keep them behind that switch — or
+behind real authorization — rather than on a shared backend.
 
 ## Explicit correlation id
 

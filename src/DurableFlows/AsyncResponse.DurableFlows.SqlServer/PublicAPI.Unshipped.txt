@@ -8,6 +8,8 @@ AsyncResponse.DurableFlows.SqlServer.SqlServerDurableFlowOptions.MaxStateBytes.g
 AsyncResponse.DurableFlows.SqlServer.SqlServerDurableFlowOptions.MaxStateBytes.set -> void
 AsyncResponse.DurableFlows.SqlServer.SqlServerDurableFlowOptions.PruneInterval.get -> System.TimeSpan
 AsyncResponse.DurableFlows.SqlServer.SqlServerDurableFlowOptions.PruneInterval.set -> void
+AsyncResponse.DurableFlows.SqlServer.SqlServerDurableFlowOptions.PruneBudget.get -> System.TimeSpan
+AsyncResponse.DurableFlows.SqlServer.SqlServerDurableFlowOptions.PruneBudget.set -> void
 AsyncResponse.DurableFlows.SqlServer.SqlServerDurableFlowOptions.SchemaName.get -> string!
 AsyncResponse.DurableFlows.SqlServer.SqlServerDurableFlowOptions.SchemaName.set -> void
 AsyncResponse.DurableFlows.SqlServer.SqlServerDurableFlowOptions.SqlServerDurableFlowOptions() -> void
@@ -17,7 +19,7 @@ AsyncResponse.DurableFlows.SqlServer.SqlServerDurableFlowOptions.Validate() -> v
 AsyncResponse.DurableFlows.SqlServer.SqlServerFlowStateStore
 AsyncResponse.DurableFlows.SqlServer.SqlServerFlowStateStore.LoadAsync(string! flowId, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task<AsyncResponse.FlowState?>!
 AsyncResponse.DurableFlows.SqlServer.SqlServerFlowStateStore.ReleaseLeaseAsync(string! flowId, string! leaseId, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task!
-AsyncResponse.DurableFlows.SqlServer.SqlServerFlowStateStore.SqlServerFlowStateStore(Microsoft.Extensions.Options.IOptions<AsyncResponse.DurableFlows.SqlServer.SqlServerDurableFlowOptions!>! options) -> void
+AsyncResponse.DurableFlows.SqlServer.SqlServerFlowStateStore.SqlServerFlowStateStore(Microsoft.Extensions.Options.IOptions<AsyncResponse.DurableFlows.SqlServer.SqlServerDurableFlowOptions!>! options, Microsoft.Extensions.Logging.ILogger<AsyncResponse.DurableFlows.SqlServer.SqlServerFlowStateStore!>? logger = null) -> void
 AsyncResponse.DurableFlows.SqlServer.SqlServerFlowStateStore.TryAcquireLeaseAsync(string! flowId, string! leaseId, System.TimeSpan leaseDuration, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task<bool>!
 AsyncResponse.DurableFlows.SqlServer.SqlServerFlowStateStore.TryCreateAsync(string! flowId, AsyncResponse.FlowState! state, System.TimeSpan ttl, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task<bool>!
 AsyncResponse.DurableFlows.SqlServer.SqlServerFlowStateStore.TryDeleteAsync(string! flowId, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task<bool>!

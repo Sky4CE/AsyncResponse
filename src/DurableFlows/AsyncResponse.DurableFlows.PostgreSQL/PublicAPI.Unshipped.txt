@@ -9,6 +9,8 @@ AsyncResponse.DurableFlows.PostgreSQL.PostgreSqlDurableFlowOptions.MaxStateBytes
 AsyncResponse.DurableFlows.PostgreSQL.PostgreSqlDurableFlowOptions.PostgreSqlDurableFlowOptions() -> void
 AsyncResponse.DurableFlows.PostgreSQL.PostgreSqlDurableFlowOptions.PruneInterval.get -> System.TimeSpan
 AsyncResponse.DurableFlows.PostgreSQL.PostgreSqlDurableFlowOptions.PruneInterval.set -> void
+AsyncResponse.DurableFlows.PostgreSQL.PostgreSqlDurableFlowOptions.PruneBudget.get -> System.TimeSpan
+AsyncResponse.DurableFlows.PostgreSQL.PostgreSqlDurableFlowOptions.PruneBudget.set -> void
 AsyncResponse.DurableFlows.PostgreSQL.PostgreSqlDurableFlowOptions.SchemaName.get -> string!
 AsyncResponse.DurableFlows.PostgreSQL.PostgreSqlDurableFlowOptions.SchemaName.set -> void
 AsyncResponse.DurableFlows.PostgreSQL.PostgreSqlDurableFlowOptions.TableName.get -> string!
@@ -18,7 +20,7 @@ AsyncResponse.DurableFlows.PostgreSQL.PostgreSqlFlowStateStore
 AsyncResponse.DurableFlows.PostgreSQL.PostgreSqlFlowStateStore.Dispose() -> void
 AsyncResponse.DurableFlows.PostgreSQL.PostgreSqlFlowStateStore.DisposeAsync() -> System.Threading.Tasks.ValueTask
 AsyncResponse.DurableFlows.PostgreSQL.PostgreSqlFlowStateStore.LoadAsync(string! flowId, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task<AsyncResponse.FlowState?>!
-AsyncResponse.DurableFlows.PostgreSQL.PostgreSqlFlowStateStore.PostgreSqlFlowStateStore(Npgsql.NpgsqlDataSource! dataSource, Microsoft.Extensions.Options.IOptions<AsyncResponse.DurableFlows.PostgreSQL.PostgreSqlDurableFlowOptions!>! options, bool ownsDataSource = false) -> void
+AsyncResponse.DurableFlows.PostgreSQL.PostgreSqlFlowStateStore.PostgreSqlFlowStateStore(Npgsql.NpgsqlDataSource! dataSource, Microsoft.Extensions.Options.IOptions<AsyncResponse.DurableFlows.PostgreSQL.PostgreSqlDurableFlowOptions!>! options, bool ownsDataSource = false, Microsoft.Extensions.Logging.ILogger<AsyncResponse.DurableFlows.PostgreSQL.PostgreSqlFlowStateStore!>? logger = null) -> void
 AsyncResponse.DurableFlows.PostgreSQL.PostgreSqlFlowStateStore.ReleaseLeaseAsync(string! flowId, string! leaseId, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task!
 AsyncResponse.DurableFlows.PostgreSQL.PostgreSqlFlowStateStore.TryAcquireLeaseAsync(string! flowId, string! leaseId, System.TimeSpan leaseDuration, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task<bool>!
 AsyncResponse.DurableFlows.PostgreSQL.PostgreSqlFlowStateStore.TryCreateAsync(string! flowId, AsyncResponse.FlowState! state, System.TimeSpan ttl, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task<bool>!

@@ -6,6 +6,7 @@ using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Infrastructure;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 
 namespace Microsoft.Extensions.DependencyInjection
@@ -50,6 +51,18 @@ public sealed class EFCoreDurableFlowOptions : DurableFlowOptions
     /// pruning bounds table growth). Zero or negative prunes on every save. Default: 5 minutes.
     /// </summary>
     public TimeSpan PruneInterval { get; set; } = TimeSpan.FromMinutes(5);
+
+    /// <summary>
+    /// Wall-clock budget one opportunistic prune may spend draining expired rows in batches of
+    /// 1000 after its first batch (the first always runs). A single batch per interval capped
+    /// cleanup at ~3 rows/second, which any busier instance outgrew forever; the prune now drains
+    /// batches until one comes back short or this budget lapses, and reports the outcome on the
+    /// <c>AsyncResponse</c> meter (<c>asyncresponse.flow_state.pruned_rows</c>,
+    /// <c>prune_failures</c>, <c>prune_budget_exhausted</c>) and the store's logger. The create
+    /// that triggers the prune waits for it, so this bounds that create's added latency. Zero
+    /// keeps the historical single batch. Default: 2 seconds.
+    /// </summary>
+    public TimeSpan PruneBudget { get; set; } = DurableFlowStoreShared.DefaultPruneBudget;
 
     /// <summary>
     /// Maximum serialized flow-state size in bytes accepted by writes; oversized ledgers fail fast
@@ -227,7 +240,7 @@ public static class EFCoreDurableFlowModelBuilderExtensions
 public sealed class EFCoreFlowStateStore<[DynamicallyAccessedMembers(DynamicallyAccessedMemberTypes.PublicConstructors | DynamicallyAccessedMemberTypes.NonPublicConstructors | DynamicallyAccessedMemberTypes.PublicProperties)] TContext> : IFlowStateStore
     where TContext : DbContext
 {
-    private const int PruneBatchSize = 1000;
+    private readonly ILogger<EFCoreFlowStateStore<TContext>>? _logger;
 
     // Time authority: this store deliberately keeps the app clock (DateTime.UtcNow) for expiry
     // and lease comparisons. It is provider-agnostic LINQ — there is no portable way to reference
@@ -239,11 +252,13 @@ public sealed class EFCoreFlowStateStore<[DynamicallyAccessedMembers(Dynamically
     private long _lastPruneTicks;
     private volatile bool _modelChecked;
 
-    public EFCoreFlowStateStore(IServiceScopeFactory scopeFactory, IOptions<EFCoreDurableFlowOptions> options)
+    public EFCoreFlowStateStore(IServiceScopeFactory scopeFactory, IOptions<EFCoreDurableFlowOptions> options, ILogger<EFCoreFlowStateStore<TContext>>? logger = null)
     {
         _scopeFactory = scopeFactory;
         _options = options.Value;
+        _logger = logger;
         DurableFlowStoreShared.ValidateMaxStateBytes(_options.MaxStateBytes, nameof(EFCoreDurableFlowOptions));
+        DurableFlowStoreShared.ValidatePruneBudget(_options.PruneBudget, nameof(EFCoreDurableFlowOptions));
     }
 
     public async Task<FlowState?> LoadAsync(string flowId, CancellationToken cancellationToken = default)
@@ -277,7 +292,7 @@ public sealed class EFCoreFlowStateStore<[DynamicallyAccessedMembers(Dynamically
         var now = DateTime.UtcNow;
 
         if (DurableFlowStoreShared.ShouldPrune(ref _lastPruneTicks, _options.PruneInterval))
-            await DurableFlowStoreShared.PruneQuietlyAsync(() => PruneExpiredAsync(db, cancellationToken)).ConfigureAwait(false);
+            await DurableFlowStoreShared.PruneQuietlyAsync(() => PruneExpiredAsync(db, cancellationToken), _options.PruneBudget, "EF Core", _logger).ConfigureAwait(false);
 
         // Replace an expired ledger IN PLACE, in one statement (sibling parity: PostgreSQL
         // `ON CONFLICT ... DO UPDATE ... WHERE expired`, SQL Server/Oracle `MERGE ... WHEN MATCHED
@@ -384,19 +399,20 @@ public sealed class EFCoreFlowStateStore<[DynamicallyAccessedMembers(Dynamically
         return deleted > 0;
     }
 
-    private static async Task PruneExpiredAsync(TContext db, CancellationToken cancellationToken)
+    private static async Task<int> PruneExpiredAsync(TContext db, CancellationToken cancellationToken)
     {
-        // One bounded batch per prune interval (policy shared by all relational stores): an
-        // unbatched delete over a large expired backlog holds row locks and bloats one
+        // One bounded batch per call; DurableFlowStoreShared.PruneQuietlyAsync repeats it under
+        // the PruneBudget while batches come back full (policy shared by all relational stores):
+        // an unbatched delete over a large expired backlog holds row locks and bloats one
         // transaction for the unlucky create that triggered the prune. Loads already filter on
-        // expiry, so any backlog beyond the batch just waits for the next interval. The OrderBy
+        // expiry, so any backlog beyond the budget just waits for the next interval. The OrderBy
         // makes the row-limited delete deterministic (and keeps providers from warning about an
         // unordered Take).
         var now = DateTime.UtcNow;
-        await Records(db)
+        return await Records(db)
             .Where(r => r.ExpiresAtUtc <= now)
             .OrderBy(r => r.FlowId)
-            .Take(PruneBatchSize)
+            .Take(DurableFlowStoreShared.PruneBatchSize)
             .ExecuteDeleteAsync(cancellationToken)
             .ConfigureAwait(false);
     }

@@ -13,6 +13,56 @@ work that has landed on `main` but not yet shipped. Security reporters credited 
 
 ### Changed
 
+- **Round-34 review (2026-09-08): recovery correctness, retention, and settlement.**
+  - *Lease-less checkpoint fencing.* The "won response after the lease lapsed" checkpoint is now
+    fenced to the attempt that won it, exactly like a recovered payload: it applies only while the
+    reloaded step is still pending on the same correlation id and the run is Running or
+    Suspended. A takeover that re-triggered the step under a new id, or failed the run, no longer
+    has its ledger completed with the stale executor's response (the response is discarded with a
+    warning).
+  - *Failure callbacks that keep failing no longer acknowledge the response.* When the
+    lost-subscriber failure callback fails all four in-process attempts transiently, the publish
+    throws the new `RecoveryCallbackFailedException` (correlation id, attempts, cause) instead of
+    returning normally. The broker ingress passes it through untouched — no second retry ladder,
+    no `SetException` escalation — so the transport redelivers the terminal signal under its own
+    `MaxDeliveryAttempts`/dead-letter policy; the registration stays armed. Deterministic faults
+    (unresolvable target, unbound method) are still logged and acknowledged. Direct callers of
+    `SetResponse`/`SetException` now see the exception too.
+  - *Worker-argument conversion is body-free.* Converting a worker-job argument or recovery
+    payload into the callback's parameter type goes through the same scrubbing as the envelope
+    parse: the exception the ingress logs carries size and reader position only, never the
+    payload's property names or dictionary keys (`Path: $.<key>`).
+  - *Memoized child snapshots are depth-independent.* A parent's memo of a completed child elides
+    the child's own child-flow step results (id, completion, and fault marker stay), so nested
+    parent → child → grandchild chains no longer grow the ledger exponentially with depth (a
+    72-byte leaf reached ~600 KB at depth 15). Load a grandchild's snapshot from its own ledger via
+    `ChildFlowId` when you need it.
+  - *In-memory flow store retention.* `WithInMemoryDurableFlows` now sweeps every expired ledger
+    on flow creation, at most once per minute of the engine clock — expired entries were removed
+    only when their own id was loaded again, which a completed run's never is.
+  - *Relational prune budget.* PostgreSQL, SQL Server, MySQL, SQLite, Oracle, and EF Core stores
+    drain expired rows in 1000-row batches for up to a new `PruneBudget` (default 2 seconds; zero
+    keeps the historical single batch) instead of one batch per `PruneInterval` (~3 rows/second).
+    The outcome is no longer silent: `asyncresponse.flow_state.pruned_rows`, `prune_failures`, and
+    `prune_budget_exhausted` counters (tagged by provider), plus Warning logs through the store's
+    `ILogger` (a new optional constructor parameter DI supplies). `DurableFlowStoreShared.
+    PruneQuietlyAsync` changed shape for the shared source.
+  - *Scheduled occurrences are never abandoned once committed.* An occurrence whose ledger was
+    committed but whose worker job could not be published is re-driven every
+    `ScheduledFlowOptions.RedriveInterval` (new, default 30 s) until published, seen executed, or
+    expired; at startup each schedule probes the last `StartupRedriveWindow` (new, default 1 hour)
+    of occurrences and re-drives any Running ledger with zero attempts — the crash-between-commit-
+    and-publish signature. Both options validate at registration.
+  - *Sample test routes are gated.* The sample's `/seed-recovery`, `/test/recovery/{id}`, and
+    `/test/reset` are mapped only in Development or with `Sample:EnableTestEndpoints=true` (the
+    integration AppHost and load-test launcher set it); Production answers 404.
+  - *CI auto-retry never retries a correctness failure.* The flake-signature gate applies from the
+    first re-run (the first was unconditional), a job whose log carries an executed-test assertion
+    or build error is never re-run whatever else it matched, and every automatic re-run leaves a
+    warning annotation naming the flake evidence.
+  - Tests: 38 new cases (2 in-process integration tests for the sample gate); the behavior pins
+    were proven red against 54b9590 in a worktree. Docs: durable-flows, recovery, security,
+    configuration, timers-and-scheduling, durable-flow-state-stores, observability.
 - **Durable-flow failure callbacks are correlation-scoped.** The lost-subscriber FAILURE target a
   flow registers for an awaited step is now `IDurableFlowExecutor.FailAsync(flowId, exception,
   correlationId)` (new overload): it fails the run only while a step is still pending on that

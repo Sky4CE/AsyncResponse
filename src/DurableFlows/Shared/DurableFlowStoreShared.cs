@@ -1,33 +1,95 @@
 using System.Data.Common;
+using System.Diagnostics;
 using System.Text;
+using Microsoft.Extensions.Logging;
 
 namespace AsyncResponse.DurableFlows.Internal;
 
 internal static class DurableFlowStoreShared
 {
     /// <summary>
-    /// Runs an opportunistic prune so that its failure never fails the primitive it rides on.
-    /// Awaited bare inside <c>TryCreateAsync</c>, a prune chosen as the deadlock victim (1205)
-    /// or hitting a lock-wait timeout against the store's own live checkpoint traffic failed
-    /// <c>StartAsync</c> for a flow whose row would have been created without incident — and
-    /// <see cref="ShouldPrune"/> had already consumed the interval, so it was not retried either.
-    /// Loads filter on expiry, so a skipped prune costs nothing but disk until the next interval.
-    /// Cancellation still propagates.
+    /// Rows one prune statement deletes. Every relational store deletes in batches of this size:
+    /// an unbatched DELETE over a large expired backlog holds row locks and bloats one transaction
+    /// for the unlucky create that triggered the prune.
     /// </summary>
-    public static async Task PruneQuietlyAsync(Func<Task> prune)
+    public const int PruneBatchSize = 1000;
+
+    /// <summary>
+    /// The default <c>PruneBudget</c>: wall-clock time one opportunistic prune may spend draining
+    /// batches after the first. Two seconds at ~1000 rows per batch drains tens of thousands of
+    /// expired rows per interval on an ordinary database, against the ~3 rows/second a single
+    /// batch per five-minute interval sustained — which any instance creating more than that fell
+    /// behind forever.
+    /// </summary>
+    public static readonly TimeSpan DefaultPruneBudget = TimeSpan.FromSeconds(2);
+
+    /// <summary>
+    /// Runs an opportunistic prune so that its failure never fails the primitive it rides on,
+    /// draining <see cref="PruneBatchSize"/>-row batches until a batch comes back short (the
+    /// backlog is gone) or <paramref name="budget"/> lapses. The first batch always runs, so a
+    /// zero budget is the historical single-batch policy. Awaited bare inside
+    /// <c>TryCreateAsync</c>, a prune chosen as the deadlock victim (1205) or hitting a lock-wait
+    /// timeout against the store's own live checkpoint traffic failed <c>StartAsync</c> for a flow
+    /// whose row would have been created without incident — and <see cref="ShouldPrune"/> had
+    /// already consumed the interval, so it was not retried either. Loads filter on expiry, so a
+    /// skipped prune costs nothing but disk until the next interval. The outcome is never silent:
+    /// deleted rows, a lapsed budget with rows remaining, and failures are counted on the
+    /// <c>AsyncResponse</c> meter and logged when the store has a logger. Cancellation still
+    /// propagates.
+    /// </summary>
+    /// <param name="pruneBatch">Deletes one batch and returns the rows it deleted.</param>
+    /// <param name="budget">Wall-clock budget for batches after the first.</param>
+    /// <param name="providerName">Metric/log tag for the store ("PostgreSQL", "SQL Server", …).</param>
+    /// <param name="logger">The store's logger when DI supplied one.</param>
+    public static async Task PruneQuietlyAsync(Func<Task<int>> pruneBatch, TimeSpan budget, string providerName, ILogger? logger)
     {
+        var started = Stopwatch.GetTimestamp();
+        var deleted = 0L;
+        var batches = 0;
         try
         {
-            await prune().ConfigureAwait(false);
+            while (true)
+            {
+                var batchDeleted = await pruneBatch().ConfigureAwait(false);
+                batches++;
+                deleted += Math.Max(batchDeleted, 0);
+                if (batchDeleted < PruneBatchSize)
+                    break;
+
+                if (Stopwatch.GetElapsedTime(started) >= budget)
+                {
+                    AsyncResponseDiagnostics.RecordFlowStatePruneBudgetExhausted(providerName);
+                    logger?.LogWarning(
+                        "{Provider} durable-flow prune deleted {Deleted} expired rows in {Batches} batches and stopped at its {Budget} PruneBudget with expired rows remaining; the backlog is outgrowing the prune — raise PruneBudget or shorten PruneInterval.",
+                        providerName, deleted, batches, budget);
+                    break;
+                }
+            }
+
+            AsyncResponseDiagnostics.RecordFlowStatePruned(providerName, deleted);
         }
         catch (OperationCanceledException)
         {
+            AsyncResponseDiagnostics.RecordFlowStatePruned(providerName, deleted);
             throw;
         }
-        catch (Exception)
+        catch (Exception ex)
         {
-            // Opportunistic maintenance; the next interval retries.
+            // Opportunistic maintenance; the next interval retries — but never silently.
+            AsyncResponseDiagnostics.RecordFlowStatePruned(providerName, deleted);
+            AsyncResponseDiagnostics.RecordFlowStatePruneFailure(providerName);
+            logger?.LogWarning(
+                ex,
+                "{Provider} durable-flow prune failed after deleting {Deleted} expired rows in {Batches} batches; the flow creation it rode on is unaffected and the next PruneInterval retries.",
+                providerName, deleted, batches);
         }
+    }
+
+    /// <summary>A <c>PruneBudget</c> is a non-negative duration; zero means a single batch per interval.</summary>
+    public static void ValidatePruneBudget(TimeSpan budget, string optionsName)
+    {
+        if (budget < TimeSpan.Zero)
+            throw new InvalidOperationException($"{optionsName}.PruneBudget cannot be negative (zero limits each prune to one batch).");
     }
 
     /// <summary>

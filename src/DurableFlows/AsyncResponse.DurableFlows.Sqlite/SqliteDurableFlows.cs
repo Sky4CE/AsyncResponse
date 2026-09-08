@@ -3,6 +3,7 @@ using AsyncResponse.DurableFlows.Internal;
 using AsyncResponse.DurableFlows.Sqlite;
 using Microsoft.Data.Sqlite;
 using Microsoft.Extensions.DependencyInjection.Extensions;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 
 namespace Microsoft.Extensions.DependencyInjection
@@ -46,6 +47,18 @@ public sealed class SqliteDurableFlowOptions : DurableFlowOptions
     public TimeSpan PruneInterval { get; set; } = TimeSpan.FromMinutes(5);
 
     /// <summary>
+    /// Wall-clock budget one opportunistic prune may spend draining expired rows in batches of
+    /// 1000 after its first batch (the first always runs). A single batch per interval capped
+    /// cleanup at ~3 rows/second, which any busier instance outgrew forever; the prune now drains
+    /// batches until one comes back short or this budget lapses, and reports the outcome on the
+    /// <c>AsyncResponse</c> meter (<c>asyncresponse.flow_state.pruned_rows</c>,
+    /// <c>prune_failures</c>, <c>prune_budget_exhausted</c>) and the store's logger. The create
+    /// that triggers the prune waits for it, so this bounds that create's added latency. Zero
+    /// keeps the historical single batch. Default: 2 seconds.
+    /// </summary>
+    public TimeSpan PruneBudget { get; set; } = DurableFlowStoreShared.DefaultPruneBudget;
+
+    /// <summary>
     /// Maximum serialized flow-state size in bytes accepted by writes; oversized ledgers fail fast
     /// with an actionable error instead of an opaque provider error. Default: <c>null</c>
     /// (unlimited — SQLite <c>TEXT</c> holds up to ~1 GB), settable as an operator budget.
@@ -58,13 +71,14 @@ public sealed class SqliteDurableFlowOptions : DurableFlowOptions
         DurableFlowStoreShared.ValidateConnectionString(ConnectionString, nameof(SqliteDurableFlowOptions));
         DurableFlowStoreShared.ValidateIdentifier(TableName, $"{nameof(SqliteDurableFlowOptions)}.{nameof(TableName)}", "SQLite");
         DurableFlowStoreShared.ValidateMaxStateBytes(MaxStateBytes, nameof(SqliteDurableFlowOptions));
+        DurableFlowStoreShared.ValidatePruneBudget(PruneBudget, nameof(SqliteDurableFlowOptions));
     }
 }
 
 /// <summary>SQLite implementation of <see cref="IFlowStateStore"/>.</summary>
 public sealed class SqliteFlowStateStore : IFlowStateStore
 {
-    private const int PruneBatchSize = 1000;
+    private readonly ILogger<SqliteFlowStateStore>? _logger;
 
     // Time authority: this store deliberately keeps the app clock (DateTime.UtcNow) for expiry
     // and lease comparisons. A SQLite database file lives on a single machine, and every writer
@@ -84,8 +98,9 @@ public sealed class SqliteFlowStateStore : IFlowStateStore
     private long _lastPruneTicks;
     private volatile bool _created;
 
-    public SqliteFlowStateStore(IOptions<SqliteDurableFlowOptions> options)
+    public SqliteFlowStateStore(IOptions<SqliteDurableFlowOptions> options, ILogger<SqliteFlowStateStore>? logger = null)
     {
+        _logger = logger;
         _options = options.Value;
         _options.Validate();
     }
@@ -123,7 +138,7 @@ public sealed class SqliteFlowStateStore : IFlowStateStore
         var stateJson = DurableFlowStoreShared.SerializeBounded(flowId, state, _options.MaxStateBytes, "SQLite");
         await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
         if (DurableFlowStoreShared.ShouldPrune(ref _lastPruneTicks, _options.PruneInterval))
-            await DurableFlowStoreShared.PruneQuietlyAsync(() => PruneExpiredAsync(cancellationToken)).ConfigureAwait(false);
+            await DurableFlowStoreShared.PruneQuietlyAsync(() => PruneExpiredAsync(cancellationToken), _options.PruneBudget, "SQLite", _logger).ConfigureAwait(false);
         await using var connection = await OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         await using var command = connection.CreateCommand();
         command.CommandText =
@@ -214,10 +229,11 @@ public sealed class SqliteFlowStateStore : IFlowStateStore
         return await ExecuteWriteAsync(command, cancellationToken).ConfigureAwait(false) > 0;
     }
 
-    private async Task PruneExpiredAsync(CancellationToken cancellationToken)
+    private async Task<int> PruneExpiredAsync(CancellationToken cancellationToken)
     {
         // Timestamps are stored as ISO-8601 TEXT, which compares correctly lexicographically.
-        // One bounded batch per prune interval (policy shared by all relational stores): an
+        // One bounded batch per call; DurableFlowStoreShared.PruneQuietlyAsync repeats it under
+        // the PruneBudget while batches come back full (policy shared by all relational stores): an
         // unbatched DELETE over a large expired backlog holds the single SQLite write lock for
         // the whole sweep. Loads already filter on expiry, so any backlog beyond the batch just
         // waits for the next interval. Id-subquery form because DELETE ... LIMIT needs a
@@ -227,10 +243,10 @@ public sealed class SqliteFlowStateStore : IFlowStateStore
         command.CommandText =
             $"""
             DELETE FROM {Table}
-            WHERE flow_id IN (SELECT flow_id FROM {Table} WHERE expires_at_utc <= $now_utc LIMIT {PruneBatchSize});
+            WHERE flow_id IN (SELECT flow_id FROM {Table} WHERE expires_at_utc <= $now_utc LIMIT {DurableFlowStoreShared.PruneBatchSize});
             """;
         command.Parameters.AddWithValue("$now_utc", DateTime.UtcNow);
-        await ExecuteWriteAsync(command, cancellationToken).ConfigureAwait(false);
+        return await ExecuteWriteAsync(command, cancellationToken).ConfigureAwait(false);
     }
 
     private async Task EnsureCreatedAsync(CancellationToken cancellationToken)

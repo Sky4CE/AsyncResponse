@@ -89,6 +89,9 @@ builder.Services.AddOpenTelemetry()
 | `asyncresponse.recovery.unprobeable` | observable gauge | — | Entries whose waiter liveness could not be probed (a probe outage, or no `IActiveSubscriberProbe` registered) — their staleness is unknown and they are never flagged stale. A non-zero value also degrades the recovery health check. |
 | `asyncresponse.recovery.scan_truncated` | observable gauge | — | `1` when the last watchdog scan stopped at the `MaxScanEntries` buffer cap: `outstanding`/`stale` then describe the buffered subset only, and the recovery health check reports **Degraded**. Alert on it — a capped scan cannot attest staleness. |
 | `asyncresponse.type_resolution.unresolved` | counter | `kind` = `service`\|`payload` | Callback/payload type names that could not be resolved (see [security.md](security.md)). |
+| `asyncresponse.flow_state.pruned_rows` | counter | `provider` | Expired durable-flow ledger rows deleted by the relational stores' opportunistic prune (PostgreSQL, SQL Server, MySQL, SQLite, Oracle, EF Core). |
+| `asyncresponse.flow_state.prune_failures` | counter | `provider` | Opportunistic prunes that failed; the flow creation they rode on still succeeded and the next `PruneInterval` retries. Alert on a sustained rate: expired rows are accumulating. |
+| `asyncresponse.flow_state.prune_budget_exhausted` | counter | `provider` | Prunes that stopped at `PruneBudget` with a full last batch — expired rows remain and the backlog is outgrowing the prune. Raise `PruneBudget` or shorten `PruneInterval`. |
 
 The lost-subscriber counter is the one to alert on: a nonzero `route=failure` or
 `route=unclassified` rate means flows are dying mid-wait and being failed on recovery (a

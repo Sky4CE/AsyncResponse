@@ -9,12 +9,14 @@ AsyncResponse.DurableFlows.Oracle.OracleDurableFlowOptions.MaxStateBytes.set -> 
 AsyncResponse.DurableFlows.Oracle.OracleDurableFlowOptions.OracleDurableFlowOptions() -> void
 AsyncResponse.DurableFlows.Oracle.OracleDurableFlowOptions.PruneInterval.get -> System.TimeSpan
 AsyncResponse.DurableFlows.Oracle.OracleDurableFlowOptions.PruneInterval.set -> void
+AsyncResponse.DurableFlows.Oracle.OracleDurableFlowOptions.PruneBudget.get -> System.TimeSpan
+AsyncResponse.DurableFlows.Oracle.OracleDurableFlowOptions.PruneBudget.set -> void
 AsyncResponse.DurableFlows.Oracle.OracleDurableFlowOptions.TableName.get -> string!
 AsyncResponse.DurableFlows.Oracle.OracleDurableFlowOptions.TableName.set -> void
 AsyncResponse.DurableFlows.Oracle.OracleDurableFlowOptions.Validate() -> void
 AsyncResponse.DurableFlows.Oracle.OracleFlowStateStore
 AsyncResponse.DurableFlows.Oracle.OracleFlowStateStore.LoadAsync(string! flowId, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task<AsyncResponse.FlowState?>!
-AsyncResponse.DurableFlows.Oracle.OracleFlowStateStore.OracleFlowStateStore(Microsoft.Extensions.Options.IOptions<AsyncResponse.DurableFlows.Oracle.OracleDurableFlowOptions!>! options) -> void
+AsyncResponse.DurableFlows.Oracle.OracleFlowStateStore.OracleFlowStateStore(Microsoft.Extensions.Options.IOptions<AsyncResponse.DurableFlows.Oracle.OracleDurableFlowOptions!>! options, Microsoft.Extensions.Logging.ILogger<AsyncResponse.DurableFlows.Oracle.OracleFlowStateStore!>? logger = null) -> void
 AsyncResponse.DurableFlows.Oracle.OracleFlowStateStore.ReleaseLeaseAsync(string! flowId, string! leaseId, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task!
 AsyncResponse.DurableFlows.Oracle.OracleFlowStateStore.TryAcquireLeaseAsync(string! flowId, string! leaseId, System.TimeSpan leaseDuration, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task<bool>!
 AsyncResponse.DurableFlows.Oracle.OracleFlowStateStore.TryCreateAsync(string! flowId, AsyncResponse.FlowState! state, System.TimeSpan ttl, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task<bool>!

@@ -180,6 +180,22 @@ distributed claim step in front of the callback — resume must already be re-at
 extra store round-trip per recovery would buy nothing. Treat both callbacks as idempotent: key side
 effects on the correlation id, not on the invocation.
 
+**When the failure callback cannot be invoked.** The dispatcher retries a failure callback four
+times in-process (250 ms → 2 s backoff) for transient faults. If every attempt fails, the publish
+throws `RecoveryCallbackFailedException` (carrying the correlation id and attempt count) instead
+of returning normally: the registration stays armed, the broker ingress passes the exception
+through untouched — no further retry, no `SetException` escalation (that would only invoke the
+same failing callback again) — and the **transport redelivers the message** under its own
+`MaxDeliveryAttempts`/dead-letter policy. A terminal signal is therefore never acknowledged into
+a log line while the flow stays stuck: it waits in the broker until the callback's dependency
+recovers or an operator replays it from the dead-letter destination. On RabbitMQ's default
+`MaxDeliveryAttempts = 0` that is the same unlimited requeue any failing handler gets — configure
+a cap and a `DeadLetterExchange` there as you would for worker jobs. Deterministic faults — an
+unauthorized or unresolvable target, a method that no longer binds — are still logged and
+acknowledged (redelivery cannot fix them); the kept registration is what the watchdog surfaces.
+A direct caller of `SetResponse`/`SetException` (an HTTP callback endpoint) sees the same
+exception; answer the remote system with a retriable status.
+
 The complete multi-step recipe built on these rules — a persisted step ledger, re-attach via the
 pending correlation id, subset runs, and compensation — is documented in
 [durable-flows.md](durable-flows.md).

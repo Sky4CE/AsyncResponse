@@ -22,8 +22,10 @@ AsyncResponse.DurableFlows.EFCore.EFCoreDurableFlowOptions.MaxStateBytes.get -> 
 AsyncResponse.DurableFlows.EFCore.EFCoreDurableFlowOptions.MaxStateBytes.set -> void
 AsyncResponse.DurableFlows.EFCore.EFCoreDurableFlowOptions.PruneInterval.get -> System.TimeSpan
 AsyncResponse.DurableFlows.EFCore.EFCoreDurableFlowOptions.PruneInterval.set -> void
+AsyncResponse.DurableFlows.EFCore.EFCoreDurableFlowOptions.PruneBudget.get -> System.TimeSpan
+AsyncResponse.DurableFlows.EFCore.EFCoreDurableFlowOptions.PruneBudget.set -> void
 AsyncResponse.DurableFlows.EFCore.EFCoreFlowStateStore<TContext>
-AsyncResponse.DurableFlows.EFCore.EFCoreFlowStateStore<TContext>.EFCoreFlowStateStore(Microsoft.Extensions.DependencyInjection.IServiceScopeFactory! scopeFactory, Microsoft.Extensions.Options.IOptions<AsyncResponse.DurableFlows.EFCore.EFCoreDurableFlowOptions!>! options) -> void
+AsyncResponse.DurableFlows.EFCore.EFCoreFlowStateStore<TContext>.EFCoreFlowStateStore(Microsoft.Extensions.DependencyInjection.IServiceScopeFactory! scopeFactory, Microsoft.Extensions.Options.IOptions<AsyncResponse.DurableFlows.EFCore.EFCoreDurableFlowOptions!>! options, Microsoft.Extensions.Logging.ILogger<AsyncResponse.DurableFlows.EFCore.EFCoreFlowStateStore<TContext!>!>? logger = null) -> void
 AsyncResponse.DurableFlows.EFCore.EFCoreFlowStateStore<TContext>.LoadAsync(string! flowId, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task<AsyncResponse.FlowState?>!
 AsyncResponse.DurableFlows.EFCore.EFCoreFlowStateStore<TContext>.ReleaseLeaseAsync(string! flowId, string! leaseId, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task!
 AsyncResponse.DurableFlows.EFCore.EFCoreFlowStateStore<TContext>.TryAcquireLeaseAsync(string! flowId, string! leaseId, System.TimeSpan leaseDuration, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task<bool>!

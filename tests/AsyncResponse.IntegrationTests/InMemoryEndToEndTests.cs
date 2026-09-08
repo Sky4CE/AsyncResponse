@@ -240,6 +240,10 @@ public sealed class InMemoryEndToEndTests : IClassFixture<InMemoryEndToEndTests.
         {
             builder.UseSetting("AsyncResponse:Channel", "InMemory");
             builder.UseSetting("AsyncResponse:Transport", "InMemory");
+            // The per-test /test/reset is a test-only mutation route the sample maps only on
+            // request (or in Development); say so explicitly rather than lean on the factory's
+            // default environment.
+            builder.UseSetting("Sample:EnableTestEndpoints", "true");
         }
     }
 }

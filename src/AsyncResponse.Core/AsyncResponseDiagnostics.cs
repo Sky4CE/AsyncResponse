@@ -58,6 +58,18 @@ public static class AsyncResponseDiagnostics
         Meter.CreateCounter<long>("asyncresponse.ingress.oversized_messages", unit: "{message}",
             description: "Inbound messages acknowledged without processing because they exceed AsyncResponseOptions.MaxInboundMessageChars, tagged by route.");
 
+    private static readonly Counter<long> FlowStatePrunedRows =
+        Meter.CreateCounter<long>("asyncresponse.flow_state.pruned_rows", unit: "{row}",
+            description: "Expired durable-flow ledger rows deleted by the relational stores' opportunistic prune, tagged by provider.");
+
+    private static readonly Counter<long> FlowStatePruneFailures =
+        Meter.CreateCounter<long>("asyncresponse.flow_state.prune_failures", unit: "{failure}",
+            description: "Opportunistic durable-flow prunes that failed (the flow creation they rode on still succeeded; the next PruneInterval retries), tagged by provider.");
+
+    private static readonly Counter<long> FlowStatePruneBudgetExhausted =
+        Meter.CreateCounter<long>("asyncresponse.flow_state.prune_budget_exhausted", unit: "{prune}",
+            description: "Opportunistic durable-flow prunes that stopped at PruneBudget with expired rows still remaining — the expired backlog is outgrowing the prune, tagged by provider.");
+
     private static int _watchdogGaugesRegistered;
     private static AsyncResponseWatchdogState? _watchdogState;
 
@@ -193,6 +205,27 @@ public static class AsyncResponseDiagnostics
     {
         if (OversizedInboundCounter.Enabled)
             OversizedInboundCounter.Add(1, new KeyValuePair<string, object?>("route", route));
+    }
+
+    /// <summary>Records the rows one opportunistic durable-flow prune deleted (zero is not recorded).</summary>
+    internal static void RecordFlowStatePruned(string provider, long rows)
+    {
+        if (rows > 0 && FlowStatePrunedRows.Enabled)
+            FlowStatePrunedRows.Add(rows, new KeyValuePair<string, object?>("provider", provider));
+    }
+
+    /// <summary>Records one failed opportunistic durable-flow prune (the create it rode on succeeded).</summary>
+    internal static void RecordFlowStatePruneFailure(string provider)
+    {
+        if (FlowStatePruneFailures.Enabled)
+            FlowStatePruneFailures.Add(1, new KeyValuePair<string, object?>("provider", provider));
+    }
+
+    /// <summary>Records one prune that hit its budget with a full last batch — expired rows remain.</summary>
+    internal static void RecordFlowStatePruneBudgetExhausted(string provider)
+    {
+        if (FlowStatePruneBudgetExhausted.Enabled)
+            FlowStatePruneBudgetExhausted.Add(1, new KeyValuePair<string, object?>("provider", provider));
     }
 
     /// <summary>

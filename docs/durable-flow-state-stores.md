@@ -581,12 +581,12 @@ state; physical cleanup is separate:
 
 | Store | Cleanup |
 |---|---|
-| PostgreSQL, SQL Server, MySQL, SQLite, Oracle | Opportunistic expired-row prune on flow creation, throttled by `PruneInterval` (default 5 minutes); a prune that fails — a deadlock victim, a lock timeout — is skipped until the next interval, never failing the `StartAsync` it rides on (loads filter on expiry, so the cost until then is disk) |
-| EF Core | Provider-side expired-row cleanup through the mapped table, pruned opportunistically like the SQL stores (a failing prune is skipped, not surfaced) |
+| PostgreSQL, SQL Server, MySQL, SQLite, Oracle | Opportunistic expired-row prune on flow creation, throttled by `PruneInterval` (default 5 minutes), draining 1000-row batches while they come back full for up to `PruneBudget` (default 2 seconds; zero = one batch); a prune that fails — a deadlock victim, a lock timeout — is skipped until the next interval, never failing the `StartAsync` it rides on (loads filter on expiry, so the cost until then is disk). Deleted rows, failures, and a lapsed budget with rows remaining are counted on the `AsyncResponse` meter and logged at Warning through the store's `ILogger` |
+| EF Core | Provider-side expired-row cleanup through the mapped table, pruned opportunistically like the SQL stores (same batches, budget, metrics, and logging) |
 | MongoDB | TTL index on `expires_at_utc`; reads still filter because Mongo's TTL monitor is periodic |
 | Cosmos DB | Container TTL plus a per-item `ttl` value |
 | DynamoDB | Native TTL on `TimeToLiveAttributeName`; expiry is rounded up to avoid shortening the requested lifetime |
-| In-memory | Expired entries are removed on access or replacement |
+| In-memory | Expired entries are removed on access or replacement, and every flow creation sweeps all expired entries at most once per minute of the engine clock — so a long-lived process with unique flow ids does not retain expired ledgers |
 
 Keep `StateExpiry` longer than the longest legitimate period without a checkpoint. Deleting a
 ledger or allowing it to expire while a flow is suspended makes its outcome unknowable.
