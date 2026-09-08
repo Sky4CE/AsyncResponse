@@ -196,6 +196,11 @@ public static class AsyncResponseCoreServiceCollectionExtensions
         var options = new ScheduledFlowOptions();
         configure?.Invoke(options);
         ArgumentNullException.ThrowIfNull(options.TimeZone, $"{nameof(ScheduledFlowOptions)}.{nameof(ScheduledFlowOptions.TimeZone)}");
+        // The re-drive interval arms a Task.Delay, so it gets the timer ceiling; the startup window
+        // is only ever subtracted from "now" (zero disables the probe).
+        AsyncResponseChannelOptions.EnsureTimerBacked(options.RedriveInterval, nameof(ScheduledFlowOptions), nameof(ScheduledFlowOptions.RedriveInterval));
+        if (options.StartupRedriveWindow < TimeSpan.Zero)
+            throw new ArgumentException($"{nameof(ScheduledFlowOptions)}.{nameof(ScheduledFlowOptions.StartupRedriveWindow)} cannot be negative (zero disables the startup probe).", nameof(configure));
 
         // Validate the FINAL occurrence id against the WHOLE portable contract now — length,
         // bytes, characters, surrounding spaces — by running the id the scheduler will actually

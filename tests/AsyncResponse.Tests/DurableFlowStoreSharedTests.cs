@@ -174,14 +174,16 @@ public sealed class DurableFlowStoreSharedTests
 
         var attempted = 0;
         await Quietly(() => { attempted++; throw new InvalidOperationException("deadlock victim"); });
-        await Quietly(() => { attempted++; return Task.FromException(new TimeoutException("lock wait timeout")); });
+        await Quietly(() => { attempted++; return Task.FromException<int>(new TimeoutException("lock wait timeout")); });
         Assert.Equal(2, attempted);
 
         await Assert.ThrowsAsync<OperationCanceledException>(() => Quietly(() => throw new OperationCanceledException()));
         await Assert.ThrowsAnyAsync<OperationCanceledException>(
-            () => Quietly(() => Task.FromCanceled(new CancellationToken(canceled: true))));
+            () => Quietly(() => Task.FromCanceled<int>(new CancellationToken(canceled: true))));
 
-        Task Quietly(Func<Task> prune) => (Task)pruneQuietly!.Invoke(null, [prune])!;
+        // Round 34: the helper drains batches under a budget and reports; the single-batch shape
+        // is the zero budget. See Round34NewApiTests for the batching and reporting pins.
+        Task Quietly(Func<Task<int>> prune) => (Task)pruneQuietly!.Invoke(null, [prune, TimeSpan.Zero, "test", null])!;
     }
 
     public static TheoryData<Type> ProviderOptionTypes =>

@@ -63,6 +63,27 @@ internal static class JsonSafety
     }
 
     /// <summary>
+    /// Converts an already-parsed <see cref="JsonElement"/> (a worker-job argument, a recovery
+    /// payload) to <paramref name="returnType"/> with the same body-free failure contract as the
+    /// string overloads. The outer envelope parse is guarded elsewhere; this is the second reader
+    /// pass — the one that reads dictionary keys and property values off the wire into the
+    /// callback's parameter types — and its <see cref="JsonException"/> carries the same
+    /// <c>Path: $.&lt;key&gt;</c> the envelope's would, so it needs the same scrubbing.
+    /// </summary>
+    public static object? SafeDeserialize(JsonElement element, Type returnType, JsonSerializerOptions? options = null)
+    {
+        try
+        {
+            return JsonSerializer.Deserialize(element, AsyncResponseJson.GetTypeInfo(returnType, WithResolver(options)));
+        }
+        catch (JsonException jsonException)
+        {
+            // GetRawText only on the failure path, and only for its length.
+            throw ParseFailure(element.GetRawText(), jsonException);
+        }
+    }
+
+    /// <summary>
     /// Builds the body-free parse failure: size plus the JSON coordinates the reader stopped at.
     /// <para>
     /// The inner exception is deliberately NOT the raw <see cref="JsonException"/>. Its message is

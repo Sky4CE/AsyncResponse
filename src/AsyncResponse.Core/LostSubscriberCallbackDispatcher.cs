@@ -458,7 +458,7 @@ internal sealed class LostSubscriberCallbackDispatcher(
                     return true;
                 },
                 isTransient: static ex => !IsPermanentCallbackFailure(ex),
-                maxAttempts: 4,
+                maxAttempts: FailureCallbackAttempts,
                 baseDelay: TimeSpan.FromMilliseconds(250),
                 maxDelay: TimeSpan.FromSeconds(2),
                 CancellationToken.None,
@@ -470,18 +470,38 @@ internal sealed class LostSubscriberCallbackDispatcher(
         }
         catch (Exception ex)
         {
-            // Deliberately not rethrown once the retries are exhausted — keep the swallow. An
-            // exception would bubble up to the broker ingress, which reacts with SetException and
-            // would invoke this same failure callback a second time; routing it to transport
-            // redelivery instead would hot-loop a permanently-throwing callback on RabbitMQ's
-            // unbounded default. The domain failure has already been dispatched (and retried
-            // above), and the kept recovery row is surfaced by the watchdog's staleness report,
-            // so the drop is operator-visible rather than silent.
             AsyncResponseDiagnostics.SetError(activity, ex);
-            _logger.LogError(ex, "Failure callback failed for channel {Channel}.", channel);
-            return false;
+
+            if (IsPermanentCallbackFailure(ex))
+            {
+                // Deterministic by construction: the same call fails the same way on every
+                // delivery, so redelivery would only burn the transport's attempts (or hot-loop
+                // on RabbitMQ's unbounded default). Swallow: the message is acknowledged, the
+                // kept recovery row is surfaced by the watchdog's staleness report, and the
+                // error log names the misconfiguration to fix.
+                _logger.LogError(ex, "Failure callback for channel {Channel} cannot be invoked (deterministic fault); the message is acknowledged and the registration stays for the watchdog.", channel);
+                return false;
+            }
+
+            // Transient and exhausted: the response is a TERMINAL signal that, once acknowledged,
+            // exists nowhere (the recovery row keeps the callback, not the payload; the watchdog
+            // only reports). Propagate as a dedicated type the ingress passes through untouched —
+            // no retry (the ladder above already ran) and no SetException escalation (that would
+            // only re-invoke this same callback) — so the transport keeps the message for its own
+            // bounded redelivery and dead-letter policy. On RabbitMQ's default MaxDeliveryAttempts
+            // = 0 that is the documented unlimited requeue any failing handler gets; configure a
+            // cap there as for worker jobs.
+            _logger.LogError(
+                ex,
+                "Failure callback for channel {Channel} failed on all {Attempts} attempts; the message is left unacknowledged for transport redelivery and the registration stays armed.",
+                channel,
+                FailureCallbackAttempts);
+            throw new RecoveryCallbackFailedException(recoveryState.CorrelationId ?? string.Empty, FailureCallbackAttempts, ex);
         }
     }
+
+    /// <summary>In-process invocations of a failure callback per delivery before the delivery is handed back to the transport.</summary>
+    internal const int FailureCallbackAttempts = 4;
 
     /// <summary>
     /// Whether a failed callback invocation is deterministic — the same call will fail the same

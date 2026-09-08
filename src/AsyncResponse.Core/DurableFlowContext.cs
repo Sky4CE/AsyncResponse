@@ -1159,6 +1159,16 @@ internal sealed class DurableFlowContext : IDurableFlowContext
     /// than clobbering it. Best-effort by construction: on a conflict or an absent ledger the step
     /// simply restarts, which is the pre-existing behavior — but on the common path the response
     /// survives instead of being dropped.
+    /// <para>
+    /// Fenced to THIS attempt, exactly as <c>DurableFlowExecutor.RecoverAsync</c> fences a recovered
+    /// payload: the reloaded step must still be pending on <paramref name="correlationId"/> and the
+    /// run must still be checkpointable. Losing the lease means a takeover may already have run —
+    /// timed the breadcrumb out, re-triggered the step under a NEW correlation id, or failed the
+    /// run — and a write keyed only on "step name, not completed" would complete the newer
+    /// attempt's pending step with this attempt's stale response (revision CAS cannot catch it:
+    /// the mutation deliberately targets the freshly loaded revision). A stale response is
+    /// discarded with a warning; the newer attempt's own response is the one that counts.
+    /// </para>
     /// </summary>
     private async Task CheckpointReceivedWithoutLeaseAsync<T>(
         string name,
@@ -1168,18 +1178,49 @@ internal sealed class DurableFlowContext : IDurableFlowContext
     {
         var resultJson = AsyncResponseJson.Serialize(received);
         var completedAtUtc = UtcNow;
+        var applied = false;
+        string? skipReason = null;
 
         try
         {
-            await FlowStateConcurrency.MutateAsync(
+            var found = await FlowStateConcurrency.MutateAsync(
                 _store,
                 FlowId,
                 _options.StateExpiry,
                 _timeProvider,
                 state =>
                 {
-                    if (state.Steps is not { } steps || !steps.TryGetValue(name, out var current) || current.Completed)
+                    applied = false;
+                    skipReason = null;
+
+                    // Same eligibility as RecoverAsync: Suspended runs still take the checkpoint
+                    // (an operator parked the run; the payload exists nowhere else and un-parking
+                    // replays from it), terminal runs never do.
+                    if (state.Status is not (FlowRunStatus.Running or FlowRunStatus.Suspended))
+                    {
+                        skipReason = $"the run is {state.Status}";
                         return false;
+                    }
+
+                    if (state.Steps is not { } steps || !steps.TryGetValue(name, out var current))
+                    {
+                        skipReason = "the step no longer exists in the ledger";
+                        return false;
+                    }
+
+                    if (current.Completed)
+                    {
+                        skipReason = "the step is already completed";
+                        return false;
+                    }
+
+                    if (!string.Equals(current.PendingCorrelationId, correlationId, StringComparison.Ordinal))
+                    {
+                        skipReason = current.PendingCorrelationId is null
+                            ? "the step is no longer pending on any correlation id"
+                            : "the step is pending on a newer correlation id (a takeover re-triggered it)";
+                        return false;
+                    }
 
                     current.Completed = true;
                     current.ResultJson = resultJson;
@@ -1188,15 +1229,28 @@ internal sealed class DurableFlowContext : IDurableFlowContext
                     current.Faulted = false;
                     current.CompletedAtUtc = completedAtUtc;
                     state.LastMessage = $"Step '{name}' completed (checkpointed after the execution lease was lost).";
+                    applied = true;
                     return true;
                 },
                 CancellationToken.None).ConfigureAwait(false);
 
-            _logger.LogWarning(
-                "Flow {FlowId} lost its execution lease while step '{Step}' held a claimed response for correlationId {CorrelationId}; the response was checkpointed without the lease so the takeover resumes from it.",
-                FlowId,
-                name,
-                correlationId);
+            if (applied)
+            {
+                _logger.LogWarning(
+                    "Flow {FlowId} lost its execution lease while step '{Step}' held a claimed response for correlationId {CorrelationId}; the response was checkpointed without the lease so the takeover resumes from it.",
+                    FlowId,
+                    name,
+                    correlationId);
+            }
+            else
+            {
+                _logger.LogWarning(
+                    "Flow {FlowId} lost its execution lease while step '{Step}' held a claimed response for correlationId {CorrelationId}; the response was discarded because {Reason}.",
+                    FlowId,
+                    name,
+                    correlationId,
+                    found ? skipReason : "the ledger no longer exists");
+            }
         }
         catch (Exception ex)
         {
@@ -1208,6 +1262,9 @@ internal sealed class DurableFlowContext : IDurableFlowContext
                 FlowId,
                 name);
         }
+
+        if (!applied)
+            return;
 
         step.Completed = true;
         step.ResultJson = resultJson;

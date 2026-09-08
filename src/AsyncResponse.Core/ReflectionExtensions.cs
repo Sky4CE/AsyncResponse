@@ -495,10 +495,14 @@ internal static class ReflectionExtensions
         public object? Convert(object? value)
         {
             // Handle JSON payloads (contract metadata resolved through the AOT-safe chain; loose
-            // case-insensitive matching as before).
+            // case-insensitive matching as before). Through JsonSafety, not the raw serializer:
+            // this is the reader pass that walks the payload's own property names and dictionary
+            // keys into the parameter type, and a raw JsonException quotes them ("Path:
+            // $.<key>") — the worker ingress logs the exception that escapes here, so the payload
+            // must not be in it (docs/security.md: the library never logs a message body).
             if (value is JsonElement je)
             {
-                return JsonSerializer.Deserialize(je, AsyncResponseJson.GetTypeInfo(targetType, AsyncResponseJson.CaseInsensitive));
+                return JsonSafety.SafeDeserialize(je, targetType, AsyncResponseJson.CaseInsensitive);
             }
 
             // Already the correct CLR type (a boxed value also satisfies its nullable counterpart).
@@ -512,10 +516,11 @@ internal static class ReflectionExtensions
                 return value;
             }
 
-            // JSON in a string (a target the string cannot satisfy directly)
+            // JSON in a string (a target the string cannot satisfy directly); same body-free
+            // failure contract as the element branch above.
             if (value is string s && !_isString)
             {
-                return JsonSerializer.Deserialize(s, AsyncResponseJson.GetTypeInfo(targetType, AsyncResponseJson.CaseInsensitive));
+                return JsonSafety.SafeDeserialize(s, targetType, AsyncResponseJson.CaseInsensitive);
             }
 
             // Null handling

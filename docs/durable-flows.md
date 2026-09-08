@@ -222,9 +222,17 @@ transport's dead-lettering. If a child gets stuck, that shows up as the child's 
 entry or its stale ledger), not as a silent parent hang — see the failure table below.
 
 **Ledger-size note.** The memoized child snapshot excludes the captured ambient `Context` (it is
-propagation machinery the parent never needs), but it does embed the child's own step results —
-so deeply nested parent → child → grandchild chains grow the parent's ledger with each completed
-child. Keep very large payloads in your own storage and pass references through flow state.
+propagation machinery the parent never needs) and the child's **own memoized child snapshots**: a
+child step whose `ChildFlowId` is set keeps its id, completion, and fault marker in the parent's
+memo, but its `ResultJson` is elided. The snapshot is stored as a JSON *string* inside the parent's
+ledger, so each ancestor level re-escapes the level below it; carrying grandchild snapshots along
+made a parent → child → grandchild chain grow **exponentially** with depth (a 72-byte leaf reached
+~600 KB at depth 15 with no business payload — past DynamoDB's item cap). With the elision a
+memoized snapshot is depth-independent: a parent sees its direct children's outcomes and local
+step results; a grandchild's snapshot lives in the grandchild's own ledger, loadable through
+`IDurableFlows.GetStateAsync(step.ChildFlowId)` while that ledger lives. The child's own local
+step results are still embedded, so keep very large payloads in your own storage and pass
+references through flow state.
 Stores enforce a `MaxStateBytes` budget on every write (defaulted below each provider's hard
 item/document cap — DynamoDB 400 KB, Cosmos 2 MB, MongoDB 16 MB); an oversized checkpoint fails
 with an error naming the flow id, size, and limit instead of a raw provider error
@@ -550,7 +558,12 @@ The API encodes the *checkpointed-flow pattern*, extracted from years of product
   compare-and-swap that recovery uses — on the normal completion path as well as the cancellation
   branch — because the channel has already acked that payload and it exists nowhere else; the
   execution then stops as lease-lost and the redelivery replays from that checkpoint instead of
-  re-attaching to a consumed correlation id and burning the step timeout.
+  re-attaching to a consumed correlation id and burning the step timeout. That lease-less write
+  is fenced to the attempt that won the response, exactly as a recovered payload is: it applies
+  only while the reloaded step is still pending on the **same** correlation id and the run is
+  still Running (or Suspended). If a takeover already timed the breadcrumb out and re-triggered the
+  step under a new id, or failed the run, the stale response is discarded with a warning — it
+  answers a request the newer attempt no longer owns.
 
 ## Honest comparison with a dedicated workflow engine
 

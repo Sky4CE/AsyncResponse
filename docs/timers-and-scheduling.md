@@ -120,6 +120,20 @@ The `input` factory receives the occurrence's scheduled UTC instant and **must b
 across replicas** (every replica must produce the same value for the same occurrence — don't put
 `Guid.NewGuid()` in it).
 
+**A committed occurrence is never abandoned.** Starting an occurrence commits its ledger and then
+publishes its worker job. If the publish fails after the start's own retry ladder (a broker outage;
+`DurableFlowNotDispatchedException`), the run exists as *Running* with no wake-up — so the
+scheduler keeps it in an in-process re-drive queue and repeats the idempotent start every
+`ScheduledFlowOptions.RedriveInterval` (default 30 seconds) until the job is published, the run is
+seen to have executed (another replica re-drove it), or its ledger is gone. Because that queue dies
+with the process, each schedule also probes the last `StartupRedriveWindow` (default 1 hour; zero
+disables it; at most the 64 most recent occurrences) at startup and re-drives any occurrence whose
+ledger is Running with zero attempts — the signature a crash between the ledger commit and the
+publish leaves behind. A run that is merely queued behind a busy worker looks the same and is
+re-driven too, harmlessly: the duplicate wake-up is absorbed by the execution lease. Every re-drive
+is logged; a queue that exceeds 256 undispatched occurrences drops the oldest with an error naming
+its id, which stays re-drivable by starting the same occurrence id again.
+
 ## Cron syntax
 
 Five fields — `minute hour day-of-month month day-of-week` — parsed by `CronSchedule` (public,
@@ -153,7 +167,9 @@ are rejected.
   so editing the code mid-run cannot double- or under-sleep an in-flight run.
 - **Schedules are at-most-once.** Occurrences that pass while *no* replica is up are skipped on
   restart, by design — the run history shows the gap. A late timer fire (seconds) still starts
-  its own occurrence.
+  its own occurrence. Skipping applies only to occurrences whose ledger was never created: a
+  committed occurrence whose job was not published is re-driven (see above), in-process and
+  across restarts.
 - **Renaming a schedule** changes the ids future occurrences dedup on; in-flight runs are
   unaffected.
 - **Suspended-timer wake-ups are broker messages.** Their loss modes are the transport's loss

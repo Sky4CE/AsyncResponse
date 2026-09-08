@@ -290,16 +290,22 @@ public class LostSubscriberRoutingTests
     }
 
     [Fact]
-    public async Task SetResponse_FailureCallbackThrows_IsRetriedThenSwallowedAndRecoveryStateIsKept()
+    public async Task SetResponse_FailureCallbackThrows_IsRetriedThenThrowsAndRecoveryStateIsKept()
     {
         ArmRecoveryState();
         _spy.FailureCallbackError = new InvalidOperationException("handler exploded");
 
-        // Must not throw: rethrowing would loop back through the ingress's SetException safety
-        // net and invoke the same failure callback a second time. A persistently failing callback
-        // is retried in-process (bounded, mirroring the ingress policy) before the swallow.
-        await Publisher.SetResponse(new OperationResult { Status = OperationStatus.Failed }, CorrelationId);
+        // Round 34: a persistently failing callback is retried in-process (bounded, mirroring the
+        // ingress policy) and then the publish THROWS the dedicated type instead of returning —
+        // returning normally acknowledged a terminal signal that then existed nowhere. The
+        // ingress passes this type through untouched (no SetException loop back into the same
+        // callback), so the transport redelivers; the registration stays for that redelivery.
+        var thrown = await Assert.ThrowsAsync<RecoveryCallbackFailedException>(
+            () => Publisher.SetResponse(new OperationResult { Status = OperationStatus.Failed }, CorrelationId));
 
+        Assert.Equal(CorrelationId, thrown.CorrelationId);
+        Assert.Equal(4, thrown.Attempts);
+        Assert.Same(_spy.FailureCallbackError, thrown.InnerException);
         Assert.Equal(4, _spy.Failures.Count);
         _database.Verify(d => d.KeyDeleteAsync(It.IsAny<RedisKey>(), It.IsAny<CommandFlags>()), Times.Never);
     }

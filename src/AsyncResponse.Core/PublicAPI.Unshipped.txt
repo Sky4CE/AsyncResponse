@@ -149,6 +149,10 @@ AsyncResponse.InMemoryWorkerTransportOptions.RetryMaxDelay.get -> System.TimeSpa
 AsyncResponse.InMemoryWorkerTransportOptions.RetryMaxDelay.set -> void
 AsyncResponse.InMemoryWorkerTransportOptions.WorkerCount.get -> int
 AsyncResponse.InMemoryWorkerTransportOptions.WorkerCount.set -> void
+AsyncResponse.RecoveryCallbackFailedException
+AsyncResponse.RecoveryCallbackFailedException.Attempts.get -> int
+AsyncResponse.RecoveryCallbackFailedException.CorrelationId.get -> string!
+AsyncResponse.RecoveryCallbackFailedException.RecoveryCallbackFailedException(string! correlationId, int attempts, System.Exception! innerException) -> void
 AsyncResponse.RecoveryStateObservation
 AsyncResponse.RecoveryStateObservation.<Clone>$() -> AsyncResponse.RecoveryStateObservation!
 AsyncResponse.RecoveryStateObservation.ActiveSubscribers.get -> long
@@ -165,7 +169,11 @@ AsyncResponse.RecoveryStateObservation.RegisteredAtUtc.init -> void
 AsyncResponse.ScheduledFlowOptions
 AsyncResponse.ScheduledFlowOptions.Enabled.get -> bool
 AsyncResponse.ScheduledFlowOptions.Enabled.set -> void
+AsyncResponse.ScheduledFlowOptions.RedriveInterval.get -> System.TimeSpan
+AsyncResponse.ScheduledFlowOptions.RedriveInterval.set -> void
 AsyncResponse.ScheduledFlowOptions.ScheduledFlowOptions() -> void
+AsyncResponse.ScheduledFlowOptions.StartupRedriveWindow.get -> System.TimeSpan
+AsyncResponse.ScheduledFlowOptions.StartupRedriveWindow.set -> void
 AsyncResponse.ScheduledFlowOptions.TimeZone.get -> System.TimeZoneInfo!
 AsyncResponse.ScheduledFlowOptions.TimeZone.set -> void
 Microsoft.Extensions.DependencyInjection.AsyncResponseCallbackAllowList

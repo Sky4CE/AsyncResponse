@@ -64,14 +64,37 @@ internal static class FlowStateJson
 
     /// <summary>
     /// Serializes a child <see cref="FlowState"/> for memoization as a parent step result, without
-    /// the captured ambient <see cref="FlowState.Context"/>: it is propagation machinery (it can
-    /// carry principal/tenant values) that the parent never needs, and dropping it keeps nested
-    /// child snapshots from compounding ledger size.
+    /// the captured ambient <see cref="FlowState.Context"/> (propagation machinery — it can carry
+    /// principal/tenant values — that the parent never needs) and without the child's OWN
+    /// memoized child snapshots: a step whose <see cref="FlowStepState.ChildFlowId"/> is set has
+    /// its <see cref="FlowStepState.ResultJson"/> elided (the id, completion, and fault marker
+    /// stay). The snapshot is stored as a JSON <em>string</em> inside the parent's ledger, so every
+    /// ancestor level re-escapes the level below it; carrying grandchild snapshots along made the
+    /// ledger grow exponentially with nesting depth (a 72-byte leaf became ~77 KB at depth 12 and
+    /// ~600 KB at depth 15 — past DynamoDB's item cap — with no business payload at all). Eliding
+    /// them makes a memoized snapshot depth-independent: a parent holds its direct children's
+    /// outcomes and local step results; a grandchild's own snapshot lives in the grandchild's
+    /// ledger, reachable by the elided step's <c>ChildFlowId</c> while that ledger lives.
+    /// The instance handed in is restored before returning.
     /// </summary>
     public static string SerializeSnapshot(FlowState state)
     {
         var context = state.Context;
         state.Context = null;
+
+        List<(FlowStepState Step, string ResultJson)>? elided = null;
+        if (state.Steps is { } steps)
+        {
+            foreach (var step in steps.Values)
+            {
+                if (step.ChildFlowId is null || step.ResultJson is null)
+                    continue;
+
+                (elided ??= []).Add((step, step.ResultJson));
+                step.ResultJson = null;
+            }
+        }
+
         try
         {
             return Serialize(state);
@@ -79,6 +102,11 @@ internal static class FlowStateJson
         finally
         {
             state.Context = context;
+            if (elided is not null)
+            {
+                foreach (var (step, resultJson) in elided)
+                    step.ResultJson = resultJson;
+            }
         }
     }
 }

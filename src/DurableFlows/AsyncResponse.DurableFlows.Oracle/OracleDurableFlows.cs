@@ -2,6 +2,7 @@ using AsyncResponse;
 using AsyncResponse.DurableFlows.Internal;
 using AsyncResponse.DurableFlows.Oracle;
 using Microsoft.Extensions.DependencyInjection.Extensions;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using Oracle.ManagedDataAccess.Client;
 
@@ -46,6 +47,18 @@ public sealed class OracleDurableFlowOptions : DurableFlowOptions
     public TimeSpan PruneInterval { get; set; } = TimeSpan.FromMinutes(5);
 
     /// <summary>
+    /// Wall-clock budget one opportunistic prune may spend draining expired rows in batches of
+    /// 1000 after its first batch (the first always runs). A single batch per interval capped
+    /// cleanup at ~3 rows/second, which any busier instance outgrew forever; the prune now drains
+    /// batches until one comes back short or this budget lapses, and reports the outcome on the
+    /// <c>AsyncResponse</c> meter (<c>asyncresponse.flow_state.pruned_rows</c>,
+    /// <c>prune_failures</c>, <c>prune_budget_exhausted</c>) and the store's logger. The create
+    /// that triggers the prune waits for it, so this bounds that create's added latency. Zero
+    /// keeps the historical single batch. Default: 2 seconds.
+    /// </summary>
+    public TimeSpan PruneBudget { get; set; } = DurableFlowStoreShared.DefaultPruneBudget;
+
+    /// <summary>
     /// Maximum serialized flow-state size in bytes accepted by writes; oversized ledgers fail fast
     /// with an actionable error instead of an opaque provider error. Default: <c>null</c>
     /// (unlimited — <c>NCLOB</c> is effectively unbounded), settable as an operator budget.
@@ -67,6 +80,7 @@ public sealed class OracleDurableFlowOptions : DurableFlowOptions
             throw new InvalidOperationException(
                 $"{nameof(OracleDurableFlowOptions)}.{nameof(TableName)} '{TableName}' collides with its derived expiry-index name; rename the table.");
         DurableFlowStoreShared.ValidateMaxStateBytes(MaxStateBytes, nameof(OracleDurableFlowOptions));
+        DurableFlowStoreShared.ValidatePruneBudget(PruneBudget, nameof(OracleDurableFlowOptions));
     }
 }
 
@@ -76,7 +90,7 @@ public sealed class OracleFlowStateStore : IFlowStateStore
     private const int ObjectAlreadyExists = 955;
     private const int ColumnListAlreadyIndexed = 1408;
     private const int UniqueConstraintViolated = 1;
-    private const int PruneBatchSize = 1000;
+    private readonly ILogger<OracleFlowStateStore>? _logger;
 
     /// <summary>
     /// SQL expression adding a millisecond bind parameter to the database clock. All expiry and
@@ -94,8 +108,9 @@ public sealed class OracleFlowStateStore : IFlowStateStore
     private long _lastPruneTicks;
     private volatile bool _created;
 
-    public OracleFlowStateStore(IOptions<OracleDurableFlowOptions> options)
+    public OracleFlowStateStore(IOptions<OracleDurableFlowOptions> options, ILogger<OracleFlowStateStore>? logger = null)
     {
+        _logger = logger;
         _options = options.Value;
         _options.Validate();
     }
@@ -124,7 +139,7 @@ public sealed class OracleFlowStateStore : IFlowStateStore
         var stateJson = DurableFlowStoreShared.SerializeBounded(flowId, state, _options.MaxStateBytes, "Oracle");
         await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
         if (DurableFlowStoreShared.ShouldPrune(ref _lastPruneTicks, _options.PruneInterval))
-            await DurableFlowStoreShared.PruneQuietlyAsync(() => PruneExpiredAsync(cancellationToken)).ConfigureAwait(false);
+            await DurableFlowStoreShared.PruneQuietlyAsync(() => PruneExpiredAsync(cancellationToken), _options.PruneBudget, "Oracle", _logger).ConfigureAwait(false);
 
         await using var connection = await OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         try
@@ -237,17 +252,18 @@ public sealed class OracleFlowStateStore : IFlowStateStore
         return await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) > 0;
     }
 
-    private async Task PruneExpiredAsync(CancellationToken cancellationToken)
+    private async Task<int> PruneExpiredAsync(CancellationToken cancellationToken)
     {
-        // One bounded batch per prune interval (policy shared by all relational stores): an
+        // One bounded batch per call; DurableFlowStoreShared.PruneQuietlyAsync repeats it under
+        // the PruneBudget while batches come back full (policy shared by all relational stores): an
         // unbatched DELETE over a large expired backlog holds row locks and bloats one
         // transaction for the unlucky create that triggered the prune. Loads already filter on
         // expiry, so any backlog beyond the batch just waits for the next interval.
         await using var connection = await OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         await using var command = connection.CreateCommand();
         command.BindByName = true;
-        command.CommandText = $"DELETE FROM {Table} WHERE expires_at_utc <= {UtcNowSql} AND ROWNUM <= {PruneBatchSize}";
-        await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+        command.CommandText = $"DELETE FROM {Table} WHERE expires_at_utc <= {UtcNowSql} AND ROWNUM <= {DurableFlowStoreShared.PruneBatchSize}";
+        return await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
     }
 
     private async Task EnsureCreatedAsync(CancellationToken cancellationToken)

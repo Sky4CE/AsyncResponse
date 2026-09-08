@@ -1,7 +1,9 @@
 using AsyncResponse;
 using AsyncResponse.DurableFlows.Internal;
 using AsyncResponse.DurableFlows.PostgreSQL;
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using Npgsql;
 using NpgsqlTypes;
@@ -33,12 +35,13 @@ namespace Microsoft.Extensions.DependencyInjection
                 // bare NpgsqlDataSource service, so unrelated resolutions of that type are never
                 // answered — or broken — by this package.
                 var shared = provider.GetService<NpgsqlDataSource>();
+                var logger = provider.GetService<ILogger<PostgreSqlFlowStateStore>>();
                 if (shared is not null)
-                    return new PostgreSqlFlowStateStore(shared, options);
+                    return new PostgreSqlFlowStateStore(shared, options, logger: logger);
 
                 if (string.IsNullOrWhiteSpace(options.Value.ConnectionString))
                     throw new InvalidOperationException($"{nameof(PostgreSqlDurableFlowOptions)}.{nameof(PostgreSqlDurableFlowOptions.ConnectionString)} must be configured when no NpgsqlDataSource is registered.");
-                return new PostgreSqlFlowStateStore(NpgsqlDataSource.Create(options.Value.ConnectionString), options, ownsDataSource: true);
+                return new PostgreSqlFlowStateStore(NpgsqlDataSource.Create(options.Value.ConnectionString), options, ownsDataSource: true, logger: logger);
             });
             return builder.WithDurableFlows<PostgreSqlFlowStateStore, PostgreSqlDurableFlowOptions>(configure);
         }
@@ -70,6 +73,18 @@ public sealed class PostgreSqlDurableFlowOptions : DurableFlowOptions
     public TimeSpan PruneInterval { get; set; } = TimeSpan.FromMinutes(5);
 
     /// <summary>
+    /// Wall-clock budget one opportunistic prune may spend draining expired rows in batches of
+    /// 1000 after its first batch (the first always runs). A single batch per interval capped
+    /// cleanup at ~3 rows/second, which any busier instance outgrew forever; the prune now drains
+    /// batches until one comes back short or this budget lapses, and reports the outcome on the
+    /// <c>AsyncResponse</c> meter (<c>asyncresponse.flow_state.pruned_rows</c>,
+    /// <c>prune_failures</c>, <c>prune_budget_exhausted</c>) and the store's logger. The create
+    /// that triggers the prune waits for it, so this bounds that create's added latency. Zero
+    /// keeps the historical single batch. Default: 2 seconds.
+    /// </summary>
+    public TimeSpan PruneBudget { get; set; } = DurableFlowStoreShared.DefaultPruneBudget;
+
+    /// <summary>
     /// Maximum serialized flow-state size in bytes accepted by writes; oversized ledgers fail fast
     /// with an actionable error instead of an opaque provider error. Default: <c>null</c>
     /// (unlimited — PostgreSQL <c>jsonb</c> is effectively unbounded), settable as an operator budget.
@@ -89,13 +104,14 @@ public sealed class PostgreSqlDurableFlowOptions : DurableFlowOptions
             throw new InvalidOperationException(
                 $"{nameof(PostgreSqlDurableFlowOptions)}.{nameof(TableName)} '{TableName}' collides with its derived expiry-index name; rename the table.");
         DurableFlowStoreShared.ValidateMaxStateBytes(MaxStateBytes, nameof(PostgreSqlDurableFlowOptions));
+        DurableFlowStoreShared.ValidatePruneBudget(PruneBudget, nameof(PostgreSqlDurableFlowOptions));
     }
 }
 
 /// <summary>PostgreSQL implementation of <see cref="IFlowStateStore"/>.</summary>
 public sealed class PostgreSqlFlowStateStore : IFlowStateStore, IDisposable, IAsyncDisposable
 {
-    private const int PruneBatchSize = 1000;
+    private readonly ILogger<PostgreSqlFlowStateStore>? _logger;
 
     private readonly NpgsqlDataSource _dataSource;
     private readonly PostgreSqlDurableFlowOptions _options;
@@ -105,9 +121,10 @@ public sealed class PostgreSqlFlowStateStore : IFlowStateStore, IDisposable, IAs
     private long _lastPruneTicks;
     private volatile bool _created;
 
-    public PostgreSqlFlowStateStore(NpgsqlDataSource dataSource, IOptions<PostgreSqlDurableFlowOptions> options, bool ownsDataSource = false)
+    public PostgreSqlFlowStateStore(NpgsqlDataSource dataSource, IOptions<PostgreSqlDurableFlowOptions> options, bool ownsDataSource = false, ILogger<PostgreSqlFlowStateStore>? logger = null)
     {
         _dataSource = dataSource;
+        _logger = logger;
         _options = options.Value;
         _options.Validate();
         _ownsDataSource = ownsDataSource;
@@ -140,7 +157,7 @@ public sealed class PostgreSqlFlowStateStore : IFlowStateStore, IDisposable, IAs
         var stateJson = DurableFlowStoreShared.SerializeBounded(flowId, state, _options.MaxStateBytes, "PostgreSQL");
         await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
         if (DurableFlowStoreShared.ShouldPrune(ref _lastPruneTicks, _options.PruneInterval))
-            await DurableFlowStoreShared.PruneQuietlyAsync(() => PruneExpiredAsync(cancellationToken)).ConfigureAwait(false);
+            await DurableFlowStoreShared.PruneQuietlyAsync(() => PruneExpiredAsync(cancellationToken), _options.PruneBudget, "PostgreSQL", _logger).ConfigureAwait(false);
 
         await using var connection = await _dataSource.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         await using var command = connection.CreateCommand();
@@ -228,9 +245,10 @@ public sealed class PostgreSqlFlowStateStore : IFlowStateStore, IDisposable, IAs
         return await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) > 0;
     }
 
-    private async Task PruneExpiredAsync(CancellationToken cancellationToken)
+    private async Task<int> PruneExpiredAsync(CancellationToken cancellationToken)
     {
-        // One bounded batch per prune interval (policy shared by all relational stores): an
+        // One bounded batch per call; DurableFlowStoreShared.PruneQuietlyAsync repeats it under
+        // the PruneBudget while batches come back full (policy shared by all relational stores): an
         // unbatched DELETE over a large expired backlog holds row locks and bloats one
         // transaction for the unlucky create that triggered the prune. Loads already filter on
         // expiry, so any backlog beyond the batch just waits for the next interval.
@@ -239,9 +257,9 @@ public sealed class PostgreSqlFlowStateStore : IFlowStateStore, IDisposable, IAs
         command.CommandText =
             $"""
             DELETE FROM {Table}
-            WHERE ctid IN (SELECT ctid FROM {Table} WHERE expires_at_utc <= now() LIMIT {PruneBatchSize});
+            WHERE ctid IN (SELECT ctid FROM {Table} WHERE expires_at_utc <= now() LIMIT {DurableFlowStoreShared.PruneBatchSize});
             """;
-        await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+        return await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
     }
 
     private async Task EnsureCreatedAsync(CancellationToken cancellationToken)

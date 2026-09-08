@@ -131,7 +131,11 @@ IResourceBuilder<IResourceWithEnvironment> AddSutApp(string name, bool aotCapabl
         // allocated port through ASPNETCORE_HTTP_PORTS keeps Kestrel on the proxied endpoint.
         var exe = builder.AddExecutable(name, sutAotPath, Path.GetDirectoryName(Path.GetFullPath(sutAotPath))!)
             .WithHttpEndpoint(env: "ASPNETCORE_HTTP_PORTS")
-            .WithHttpHealthCheck("/alive");
+            .WithHttpHealthCheck("/alive")
+            // The suite's per-test reset and recovery seeding go through the sample's test-only
+            // mutation routes, which the sample maps only when told to (never in Production by
+            // default); every SUT app is a test fixture here, so opt in explicitly.
+            .WithEnvironment("Sample:EnableTestEndpoints", "true");
         foreach (var dependency in waitFor)
             exe.WaitFor(dependency);
         return exe;
@@ -139,7 +143,8 @@ IResourceBuilder<IResourceWithEnvironment> AddSutApp(string name, bool aotCapabl
 
     var project = builder.AddProject<Projects.AsyncResponse_Sample>(name, launchProfileName: null)
         .WithHttpEndpoint()
-        .WithHttpHealthCheck("/alive");
+        .WithHttpHealthCheck("/alive")
+        .WithEnvironment("Sample:EnableTestEndpoints", "true");
     foreach (var dependency in waitFor)
         project.WaitFor(dependency);
     return project;

@@ -2458,6 +2458,33 @@ app.MapGet("/calls", async (FlowRecorder recorder, string key, int? timeoutMs) =
 })
 .WithTags("Observability");
 
+// --- Test-only mutation routes: gated, never on in Production by default -------------------
+// /seed-recovery writes a recovery registration, /test/recovery/{id} deletes one, and /test/reset
+// erases EVERY recovery registration the scanner can see plus the flow recorder. Against a shared
+// persistent backend those strand real in-flight work, and none of them is authenticated — they
+// exist for the integration suite and the load-test launcher, which enable them explicitly via
+// "Sample:EnableTestEndpoints=true" (the AppHost sets it for every SUT app). Otherwise they are
+// mapped only in the Development environment; a Production instance answers 404. Operational
+// recovery tooling belongs behind real authorization, not behind this switch.
+var testEndpointsSetting = builder.Configuration["Sample:EnableTestEndpoints"];
+var enableTestEndpoints = bool.TryParse(testEndpointsSetting, out var enableTestEndpointsParsed)
+    ? enableTestEndpointsParsed
+    : app.Environment.IsDevelopment();
+if (enableTestEndpoints)
+{
+    app.Logger.LogWarning(
+        "Test-only mutation endpoints (/seed-recovery, /test/recovery/{{correlationId}}, /test/reset) are enabled in the {Environment} environment; they delete recovery registrations without authorization. Set Sample:EnableTestEndpoints=false to disable them.",
+        app.Environment.EnvironmentName);
+}
+else
+{
+    app.Logger.LogInformation(
+        "Test-only mutation endpoints are disabled in the {Environment} environment (set Sample:EnableTestEndpoints=true to map them).",
+        app.Environment.EnvironmentName);
+}
+
+if (enableTestEndpoints)
+{
 // Seed a stale recovery entry (no live subscriber) so the watchdog surfaces it as Degraded health.
 app.MapPost("/seed-recovery", async (IRecoveryStateStore store, string correlationId, int? ageMinutes) =>
 {
@@ -2501,6 +2528,7 @@ app.MapPost("/test/reset", async (IRecoveryStateScanner scanner, IRecoveryStateS
     return Results.Ok(new DeletedResult(deleted));
 })
 .WithTags("Observability");
+}
 
 // Health endpoint with full JSON details, including the recovery check's data payload.
 // Typed metadata + an explicit camelCase policy reproduce the previous anonymous-type health
