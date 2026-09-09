@@ -281,7 +281,8 @@ property makes every failure mode collapse into "run it again":
 | Process is down when a **failed** response arrives | `OnRecovery() == Fail` routes to the auto-registered **failure** callback: the run is marked `Failed` — a failure is never resumed as a success |
 | The **terminal** response itself was the lost message | Its payload is already the step result. The resumed run skips that completed await and continues; it does not wait for a consumed correlation id or re-send the remote request |
 | The same flow job is delivered to two replicas | Atomic start preserves the first input, and the execution lease lets one worker run. The duplicate delivery returns without entering flow code; if the owner disappears, the lease expires and another worker resumes from the last compare-and-swap checkpoint |
-| `StartAsync`'s **publish fails ambiguously** (the job may or may not have been accepted) | With a **caller-supplied `flowId`**, retrying `StartAsync` is safe: the atomic create dedupes and re-enqueues the same run. With a **generated id** (the `flowId: null` default), a retry mints a fresh id — a second independent run is created and, if the first publish had actually been accepted, **both execute**. Supply deterministic ids wherever the caller may retry. If the create succeeded but the publish threw outright, `StartAsync` retries the publish and then throws **`DurableFlowNotDispatchedException`**, whose `FlowId` carries the id out — including a generated one — so the orphan is re-drivable: retry `StartAsync` with that id (the atomic create dedupes and re-enqueues the same run), or call `ResumeAsync(flowId)` |
+| The process **dies mid-`StartAsync`** | The publish of the start job is the start's commit point, and the job carries the initial ledger: `IDurableFlowExecutor.CreateAndExecuteAsync` creates the run (insert-if-absent) before executing it. A crash **before** the publish leaves nothing behind; a crash **after** it leaves a job whose execution creates and runs the flow. There is no window in which a committed `Running` ledger exists that nothing will ever execute (the pre-1.0 order — create, then publish — had exactly that window, and `IFlowStateStore` has no enumeration a reconciler could use to find such a run). The starter still writes the ledger itself after the publish, so `GetStateAsync`/`ResumeAsync` right after a start see the run; losing that write to the executor (or to a concurrent identical start) is the expected shape, not an error |
+| `StartAsync`'s **publish fails** | After the start's own retry ladder, `StartAsync` throws **`DurableFlowNotDispatchedException`** and **nothing was persisted**. Its `FlowId` carries the id the start would have used — including a generated one — so the retry stays idempotent: if the publish had in fact landed (the ambiguous case is deliberately included), the same id dedupes against the run the job created; a retry with a fresh generated id would start a second, independent run. Supply deterministic ids wherever the caller may retry |
 | A child flow is running | The parent run is parked as `Running`; the child terminal state re-enqueues the parent, which reloads the child state and continues |
 | A **child run dead-letters** (a retriable failure exhausts the transport's delivery attempts) | The child stays `Running` and the parent stays suspended — **the child's DLQ entry is the alarm**. Replay the DLQ entry or call `ResumeAsync(childFlowId)`; re-enqueueing the parent (`ResumeAsync(parentFlowId)`) also works — it re-enqueues the child. The parent resumes automatically once the child reaches a terminal state |
 | You want a dead-lettered run to **wait for you** | A `Running` run can be resurrected at any time by a late response or recovery — by design. To take manual control first, set the run's status to `FlowRunStatus.Suspended` in the flow store: wake-ups, resumes, and failure signals are ignored while suspended (a parent awaiting a suspended child keeps waiting). A recovered **terminal** response is not discarded: it is checkpointed into the suspended run's ledger *without waking it*, so un-parking replays from that preserved result; non-terminal checkpoints keep the recovery registration armed. When ready, set it back to `Running` and call `ResumeAsync(flowId)` to replay from checkpoints. **Park only runs that are not mid-execution**: the store write bumps the ledger revision, so a worker actively executing that flow fails its next checkpoint (logged as a lost execution lease) and everything after its last checkpoint replays on un-park — the normal at-least-once replay, but with side effects that already ran once |
@@ -454,6 +455,18 @@ Supported packages:
 | DynamoDB | `WithDynamoDbDurableFlows(...)` |
 | Entity Framework Core (any relational provider) | `WithEFCoreDurableFlows<TDbContext>(...)` |
 
+**Ledger growth is the cost model to watch.** Every checkpoint rewrites the *whole* ledger —
+input, every completed step's result, values, context — so a run of N steps with similar result
+sizes serializes about N²/2 step-results over its lifetime (100 steps of 1 KiB: ~6 MB written for a
+115 KB final ledger; 400 steps: ~92 MB for 458 KB). The store's `MaxStateBytes` (or the provider's
+item cap) is the hard limit; `DurableFlowOptions.LedgerSizeWarningBytes` (default 512 KiB, `null`
+disables) is the early signal — a warning naming the flow when its estimated size first crosses
+the threshold and again at each doubling. Keep step results small (persist large data yourself
+and pass references — the claim-check seam on the [roadmap](roadmap.md) will do this
+transparently), partition a long history into [child flows](#child-flows) (a parent memoizes
+only a compact snapshot of each child), and lower the threshold on DynamoDB, whose 350 KB item
+cap sits under the default.
+
 For tests, development, or a deliberately one-process application:
 
 ```csharp
@@ -545,12 +558,20 @@ The API encodes the *checkpointed-flow pattern*, extracted from years of product
   loss within one process lifetime and the simulated restarts of
   [AsyncResponse.Testing](testing.md); durable channels extend the same contract across real
   restarts).
-- Starting a flow enqueues a worker job carrying only the flow id; resume, redelivery, and
-  operator kicks all re-enqueue that same job. `StartAsync` with a caller-supplied `flowId` is
-  atomically idempotent for the same flow type and semantically identical input. Conflicting reuse
-  is rejected; an existing run is never replaced silently. A **generated** id (the default) cannot
-  survive a retried ambiguous publish — the retry mints a fresh id and a second independent run —
-  so supply deterministic ids wherever the caller may retry (see the failure table above).
+- Starting a flow **publishes first**: the start job carries the initial ledger (flow and input
+  type names, the input JSON, the captured ambient context — the same wire format the stores
+  hold), and its target, `IDurableFlowExecutor.CreateAndExecuteAsync`, creates the ledger if the
+  starter's own write never happened before running the flow. That makes the publish the start's
+  single commit point (see the failure table above). Resume, redelivery, and operator kicks all
+  re-enqueue the lighter `ExecuteAsync(flowId)` job. The cost is the input travelling twice —
+  once in the job, once in the ledger — so mind the transport's payload ceiling for large inputs
+  (SQS and Azure Service Bus cap a message at 256 KiB). `StartAsync` with a caller-supplied
+  `flowId` is atomically idempotent for the same flow type and semantically identical input; the
+  starter reports a conflicting reuse as `DurableFlowIdConflictException` and the executor drops
+  the job it already published on the same test, so an existing run is never replaced silently. A
+  **generated** id (the default) cannot survive a retried ambiguous publish — the retry mints a
+  fresh id and a second independent run — so supply deterministic ids wherever the caller may
+  retry.
 - Built-in stores persist a monotonic `FlowState.Revision`. Every execution owns a renewable lease
   and every checkpoint requires both the expected revision and that lease, so a stale worker cannot
   overwrite recovery state written by a newer execution. One deliberate exception: a response won

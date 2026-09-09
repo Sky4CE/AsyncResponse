@@ -128,8 +128,11 @@ internal sealed class ChannelSerialExecutor : IAsyncDisposable
     /// <summary>
     /// Synchronously queues a work delegate, returning <c>false</c> when the executor is already
     /// shutting down or full. Use <see cref="Enqueue"/> when the producer can wait for capacity.
+    /// <paramref name="logIfFull"/> is <c>false</c> for producers that treat a full queue as
+    /// expected backpressure and come back later (the DB channels' dispatch sweep), so a busy
+    /// correlation id does not log a warning per sweep tick.
     /// </summary>
-    public bool TryEnqueue(Func<Task> work)
+    public bool TryEnqueue(Func<Task> work, bool logIfFull = true)
     {
         ArgumentNullException.ThrowIfNull(work);
         Interlocked.Increment(ref _pending);
@@ -141,7 +144,10 @@ internal sealed class ChannelSerialExecutor : IAsyncDisposable
         }
 
         Interlocked.Decrement(ref _pending);
-        _logger.LogWarning("Channel executor could not enqueue work for {Channel}; queue is full or completed (pending {PendingCount}).", _channel, PendingCount);
+        if (logIfFull)
+            _logger.LogWarning("Channel executor could not enqueue work for {Channel}; queue is full or completed (pending {PendingCount}).", _channel, PendingCount);
+        else if (_logger.IsEnabled(LogLevel.Debug))
+            _logger.LogDebug("Channel executor for {Channel} is at capacity (pending {PendingCount}); the producer will retry later.", _channel, PendingCount);
         return false;
     }
 

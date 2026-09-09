@@ -13,6 +13,71 @@ work that has landed on `main` but not yet shipped. Security reporters credited 
 
 ### Changed
 
+- **Round-35 review (2026-09-09): delivery correctness at the persisted-state / acknowledgement /
+  execution handoffs.**
+  - *A durable-flow start can no longer be stranded.* `IDurableFlows.StartAsync` publishes its
+    worker job **first** and writes the ledger second; the job carries the initial ledger and its
+    new target, `IDurableFlowExecutor.CreateAndExecuteAsync(flowId, initialStateJson)`, creates
+    the run (insert-if-absent) before executing it. The publish is therefore the start's single
+    commit point: a crash before it leaves nothing, a crash after it leaves a job whose execution
+    creates and runs the flow — the previous order left a committed `Running` ledger with
+    `Attempts = 0` that nothing would ever execute and no store API could enumerate.
+    `DurableFlowNotDispatchedException` now means *nothing was persisted* (its `FlowId` is for an
+    idempotent retry, not for re-driving an orphan); a conflicting reuse of an explicit id is still
+    reported to the starter (`DurableFlowIdConflictException`) and the already-published job is
+    dropped by the executor on the same test. The input travels twice (job + ledger) — mind the
+    256 KiB SQS/Azure Service Bus message caps for large inputs. Custom
+    `IAsyncResponseCallbackAuthorizer`s that allow `IDurableFlowExecutor` type-level need no
+    change; per-method allowlists must add `CreateAndExecuteAsync`.
+  - *Kafka never commits past a message it could not dead-letter.* In ack-after-handler mode and
+    the malformed-message discard, an exhausted dead-letter publish faults the subscriber
+    (`KafkaDeadLetterPublishFailedException`, internal) instead of being swallowed with the offset
+    left unstored: Kafka commits a partition position, so the next successful settlement on the
+    partition was committing past the failed message and a restart skipped it with no record. The
+    supervisor rebuilds the consumer after its backoff and the burial is retried per restart — a
+    loud, bounded-rate loop that parks the subscriber at the poison message until the dead-letter
+    topic is fixed. Early-ACK burial failures are unchanged (already committed; surfaced via
+    `OnBackgroundFailure`).
+  - *Partial recovery success no longer acknowledges the sibling's payload.* When several
+    registrations share a correlation id and one callback succeeds while another fails
+    transiently, the publish throws `RecoveryCallbackFailedException` (the ingress passes it
+    through, so the transport redelivers) instead of returning normally; the successful
+    registrations are consumed first, so the redelivery reaches only the failed one. A
+    deterministic sibling failure keeps the log-and-acknowledge behavior. The exception's message
+    and doc now cover both paths (`Attempts` is 1 for a partial fan-out).
+  - *`async void` callback implementations are refused before invocation.* A void-returning
+    target whose resolved implementation carries the compiler's async state-machine marker throws
+    `CallbackTargetUnresolvableException` (deterministic) instead of being acknowledged with its
+    body still running and its DI scope disposed. Checked at plan time for class-typed services
+    and on first dispatch (cached per implementation type) through interfaces; synchronous `void`
+    targets are unaffected.
+  - *Ambiguous callback targets fail at registration.* The expression converter behind
+    `EnqueueWorkerAsync<T>` and `OnLostSubscriberResume/Failure<T>` runs the dispatcher's binding
+    validation (unique name + arity, no by-ref or open-generic parameters) and throws in the
+    caller's stack; an interface with `Run(int)` / `Run(string)` used to accept `svc => svc.Run(1)`
+    and fail every dispatch as ambiguous after publication.
+  - *One saturated correlation id no longer stalls database-channel delivery.* The PostgreSQL,
+    SQL Server, and MongoDB dispatch sweep admits work to a correlation id's serial executor
+    without waiting (`SerialExecutorRegistry.TryEnqueue`): at capacity the rest of that id's
+    messages stay unclaimed in the store, in order, and only that id is rescanned after one poll
+    interval, while every other correlation id keeps delivering. Previously the sweep awaited the
+    capacity, so a waiter wedged in a slow `Until` predicate under a progress flood blocked every
+    waiter in the process.
+  - *Ledger-growth early warning.* New `DurableFlowOptions.LedgerSizeWarningBytes` (default
+    512 KiB; `null` disables; validated positive): the executor logs a warning naming the flow when
+    its estimated ledger size first crosses the threshold and again at each doubling. Every
+    checkpoint rewrites the whole ledger, so a run of N similar steps serializes about N²/2
+    step-results over its lifetime; the docs now state that cost model, the mitigations (small
+    results, references, child flows), and the DynamoDB caveat.
+  - *Sample: every test affordance is behind the switch.* `/arm`, `/crash`, `/publish`,
+    `/lost-subscriber-flow`, `/emit-response`, `/calls`, `GET /durable-flow/{flowId}`, and
+    `POST /durable-flow/{flowId}/resume` join the round-34 mutation routes behind
+    `Sample:EnableTestEndpoints` (Development default on; Production 404). An integration test
+    pins the exact Production route inventory; the Native AOT gate opts its published sample in.
+  - Tests: 29 new or rewritten cases; 18 behavior pins proven red against 684a3fb in a worktree
+    (the DB-channel sweep pin runs the shared source through the Mongo mock harness). 2823 unit
+    tests green on net10.0.
+
 - **Round-34 review (2026-09-08): recovery correctness, retention, and settlement.**
   - *Lease-less checkpoint fencing.* The "won response after the lease lapsed" checkpoint is now
     fenced to the attempt that won it, exactly like a recovered payload: it applies only while the

@@ -1,3 +1,4 @@
+using System.Diagnostics.CodeAnalysis;
 using System.Linq.Expressions;
 using System.Reflection;
 
@@ -12,18 +13,18 @@ namespace AsyncResponse;
 internal static class CallbackExpressionConverter
 {
     /// <summary>Converts the callback expression to a reflection call descriptor.</summary>
-    public static ReflectionCallDto ToReflectionCall<TService>(Expression<Action<TService>> expression)
+    public static ReflectionCallDto ToReflectionCall<[DynamicallyAccessedMembers(DynamicallyAccessedMemberTypes.PublicMethods)] TService>(Expression<Action<TService>> expression)
         => Build<TService>(expression.Body);
 
     /// <summary>Converts the callback expression to a reflection call descriptor.</summary>
-    public static ReflectionCallDto ToReflectionCall<TService>(Expression<Func<TService, Task>> expression)
+    public static ReflectionCallDto ToReflectionCall<[DynamicallyAccessedMembers(DynamicallyAccessedMemberTypes.PublicMethods)] TService>(Expression<Func<TService, Task>> expression)
         => Build<TService>(expression.Body);
 
     /// <summary>Converts the callback expression to a reflection call descriptor.</summary>
-    public static ReflectionCallDto ToReflectionCall<TService>(Expression<Func<TService, ValueTask>> expression)
+    public static ReflectionCallDto ToReflectionCall<[DynamicallyAccessedMembers(DynamicallyAccessedMemberTypes.PublicMethods)] TService>(Expression<Func<TService, ValueTask>> expression)
         => Build<TService>(expression.Body);
 
-    private static ReflectionCallDto Build<TService>(Expression body)
+    private static ReflectionCallDto Build<[DynamicallyAccessedMembers(DynamicallyAccessedMemberTypes.PublicMethods)] TService>(Expression body)
     {
         if (body is not MethodCallExpression call)
             throw new NotSupportedException($"Only direct method calls are supported. Got: {body.NodeType}");
@@ -33,6 +34,15 @@ internal static class CallbackExpressionConverter
             throw new NotSupportedException("Lambda must be like: svc => svc.YourMethod(args)");
 
         var args = call.Arguments.Select(arg => ConvertArgument(arg, svcParam)).ToArray();
+
+        // The compiler resolved `call.Method` from full signatures, but the descriptor persists only
+        // its NAME and ARITY — the wire contract every deployment reading it shares. Validate here,
+        // where the caller's stack is, that name + arity still select exactly this one method (no
+        // overload set sharing both, no by-ref or open-generic parameters). Without this an
+        // interface such as `Run(int)` / `Run(string)` accepted `svc => svc.Run(1)` and every
+        // dispatch of the job then failed as ambiguous — after publication, on a worker, burning
+        // the transport's retries or stranding a recovery registration.
+        ReflectionExtensions.EnsureBindable(typeof(TService), call.Method.Name, args.Length);
 
         return new ReflectionCallDto
         {

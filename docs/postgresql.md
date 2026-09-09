@@ -176,6 +176,13 @@ Recommended Npgsql connection-string settings:
 - `PendingMessageBatchSize` is a page-size tuning knob, not a cap per sweep. Smaller pages lower
   peak materialization; larger pages reduce round trips when one correlation id carries heavy
   progress traffic.
+- Delivery is serialized per correlation id on a bounded (1024-item) executor. The sweep admits
+  work to it **without waiting**: when one correlation id's executor is full — a waiter wedged in
+  a slow `Until` predicate under a progress flood — the rest of that id's messages stay unclaimed
+  in the table, in order, and only that id is rescanned after one poll interval; every other
+  correlation id keeps delivering. (Until round 35 the sweep awaited the capacity, so one
+  saturated correlation stalled every waiter in the process.) The same-process fast path still
+  applies backpressure to the publisher of that one correlation id.
 - Keep `DeliveryConfirmationTimeout` long enough for the slowest expected live delivery, but short
   enough that a truly lost subscriber routes to recovery promptly.
 - Set `DeadLetterRetention` if operators do not inspect dead-letter rows indefinitely.

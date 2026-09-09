@@ -158,8 +158,12 @@ storage and passes references on the wire, transparently on publish and material
 market moved here too: Temporal productized exactly this as "External Storage" at Replay 2026,
 and SQS raised its maximum payload to 1 MB in January 2026 (which helps, and also signals where
 payloads are heading). This is also the structural answer to flow-ledger size limits: the
-`MaxStateBytes` guard (Train 0) tells you when you hit the wall; claim-check is how you stop
-hitting it.
+`MaxStateBytes` guard (Train 0) tells you when you hit the wall, the `LedgerSizeWarningBytes`
+warning (round 35) tells you when you are heading for it; claim-check is how you stop hitting it.
+The store-side complement for genuinely long histories — **incremental step persistence** 🟡
+(append completed steps instead of rewriting the whole ledger per checkpoint, under the same
+revision and lease fencing) — waits for a workload that measurably needs it; the current
+quadratic write cost is documented in [durable-flows.md](durable-flows.md#storage-where-flow-state-lives).
 
 ### 4.4 Flow operations API + observability pack 🟠
 

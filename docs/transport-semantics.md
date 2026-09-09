@@ -194,8 +194,21 @@ Only cells that need more than a phrase.
 - Every dead-letter produce runs on the poll thread, so its retry ladder is bounded to a quarter
   of `MaxPollInterval`: an undeliverable dead-letter topic (auto-create off, a leaderless
   partition, an over-sized payload) would otherwise wait out librdkafka's `message.timeout.ms`
-  per attempt, overrun `max.poll.interval.ms`, and evict the consumer mid-burial. A burial that
-  runs out of budget leaves the offset unstored and is retried after the next restart/rebalance.
+  per attempt, overrun `max.poll.interval.ms`, and evict the consumer mid-burial.
+- **A burial that fails for good faults the subscriber** (ack-after-handler mode and the
+  malformed-message discard). Kafka commits a partition *position*, not per-record
+  acknowledgements, so merely leaving the failed message's offset unstored protects nothing: the
+  next successful settlement on the same partition stores a higher offset and the auto-committer
+  commits past the failed message, which a restart then skips with no dead-letter copy anywhere.
+  Instead the poll loop throws, the consumer closes without ever storing past the message, and the
+  supervisor rebuilds it after its backoff (`SubscriberRetryBaseDelay` → `SubscriberRetryMaxDelay`);
+  the restarted consumer re-consumes from the committed position, re-runs the handler up to
+  `MaxDeliveryAttempts`, and retries the burial — a loud, bounded-rate loop that parks **every**
+  partition of that subscriber at the poison message until the dead-letter topic is fixed (each
+  restart logs the failure). That is the at-least-once outcome; the previous swallow was a silent
+  loss. Messages already committed at enqueue time (early ACK) are outside this rule: their
+  burial failure is logged and surfaced through `OnBackgroundFailure`, because Kafka will not
+  redeliver them either way.
 
 ### RabbitMQ
 

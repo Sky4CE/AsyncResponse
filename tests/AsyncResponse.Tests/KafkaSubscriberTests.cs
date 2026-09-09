@@ -340,6 +340,63 @@ public class KafkaSubscriberTests
         Assert.Contains(nameof(KafkaSubscriberOptions.BackgroundWorkerCount), ex.Message, StringComparison.Ordinal);
     }
 
+    /// <summary>
+    /// Round 35: the reviewer's two-message scenario. Offset 10 exhausts its handling and its
+    /// dead-letter publish fails; offset 11 then succeeds. Pre-fix, the burial failure was swallowed
+    /// with offset 10 left unstored, offset 11's settlement stored the partition position past it,
+    /// and the auto-committer committed that — a restart skipped offset 10 with no dead-letter copy
+    /// anywhere. The subscriber must now fault at offset 10 (never storing past it) and be rebuilt by
+    /// the supervisor, which re-consumes from the committed position.
+    /// </summary>
+    [Fact]
+    public async Task WorkerSubscriber_WhenAFailedMessageCannotBeDeadLettered_NeverCommitsPastIt_AndRestarts()
+    {
+        var first = new FakeKafkaConsumerClient();
+        first.Enqueue(KafkaTestData.Message("workers", offset: 10, payload: "poison", ("correlationId", "corr-poison")));
+        first.Enqueue(KafkaTestData.Message("workers", offset: 11, payload: "fine", ("correlationId", "corr-fine")));
+        var second = new FakeKafkaConsumerClient();
+        var factory = new FakeKafkaConsumerClientFactory(first, second);
+
+        var ingress = new Mock<IAsyncResponseIngress>();
+        ingress.Setup(i => i.HandleWorkerMessageAsync("poison")).ThrowsAsync(new InvalidOperationException("handler boom"));
+        ingress.Setup(i => i.HandleWorkerMessageAsync("fine")).Returns(Task.CompletedTask);
+
+        var options = NewOptions(o =>
+        {
+            o.WorkerTopic = "workers";
+            o.WorkerConsumerGroup = "workers-group";
+            o.WorkerSubscriber.MaxDeliveryAttempts = 1;
+            o.WorkerSubscriber.HandlerRetryBaseDelay = TimeSpan.FromMilliseconds(1);
+            o.WorkerSubscriber.HandlerRetryMaxDelay = TimeSpan.FromMilliseconds(2);
+            o.PublishRetryBaseDelay = TimeSpan.FromMilliseconds(1);
+            o.PublishRetryMaxDelay = TimeSpan.FromMilliseconds(2);
+        });
+        var subscriber = new KafkaWorkerSubscriber(
+            Options.Create(options),
+            factory,
+            new FakeKafkaProducerClient { PublishException = new InvalidOperationException("dead-letter topic gone") },
+            new FakeKafkaAdminClient(),
+            ingress.Object,
+            NullLogger<KafkaWorkerSubscriber>.Instance);
+
+        await subscriber.StartAsync(CancellationToken.None);
+        try
+        {
+            // The supervisor rebuilt the consumer: the first one faulted at offset 10.
+            await KafkaTestData.WaitUntilAsync(() => factory.CreatedRoles.Count >= 2, TimeSpan.FromSeconds(10));
+        }
+        finally
+        {
+            await subscriber.StopAsync(CancellationToken.None);
+        }
+
+        // Nothing was ever stored on the faulted consumer: offset 11 was never handled behind the
+        // unresolved offset 10, so its close committed nothing past the poison message.
+        Assert.Empty(first.StoredOffsets);
+        Assert.True(first.Closed);
+        ingress.Verify(i => i.HandleWorkerMessageAsync("fine"), Times.Never);
+    }
+
     // ---------- Helpers ----------
 
     private static readonly Dictionary<KafkaSubscriberService, FakeKafkaConsumerClientFactory> Factories = [];

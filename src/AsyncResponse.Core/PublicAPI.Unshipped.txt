@@ -117,6 +117,8 @@ AsyncResponse.DurableFlowOptions.ExecutionLeaseDuration.get -> System.TimeSpan
 AsyncResponse.DurableFlowOptions.ExecutionLeaseDuration.set -> void
 AsyncResponse.DurableFlowOptions.ExecutionLeaseRenewInterval.get -> System.TimeSpan
 AsyncResponse.DurableFlowOptions.ExecutionLeaseRenewInterval.set -> void
+AsyncResponse.DurableFlowOptions.LedgerSizeWarningBytes.get -> long?
+AsyncResponse.DurableFlowOptions.LedgerSizeWarningBytes.set -> void
 AsyncResponse.DurableFlowOptions.ProgressPersistenceInterval.get -> System.TimeSpan
 AsyncResponse.DurableFlowOptions.ProgressPersistenceInterval.set -> void
 AsyncResponse.DurableFlowOptions.StateExpiry.get -> System.TimeSpan
@@ -124,6 +126,7 @@ AsyncResponse.DurableFlowOptions.StateExpiry.set -> void
 AsyncResponse.DurableFlowOptions.TimerInProcessThreshold.get -> System.TimeSpan
 AsyncResponse.DurableFlowOptions.TimerInProcessThreshold.set -> void
 AsyncResponse.IDurableFlowExecutor
+AsyncResponse.IDurableFlowExecutor.CreateAndExecuteAsync(string! flowId, string! initialStateJson) -> System.Threading.Tasks.Task!
 AsyncResponse.IDurableFlowExecutor.ExecuteAsync(string! flowId) -> System.Threading.Tasks.Task!
 AsyncResponse.IDurableFlowExecutor.FailAsync(string! flowId, System.Exception! exception) -> System.Threading.Tasks.Task!
 AsyncResponse.IDurableFlowExecutor.FailAsync(string! flowId, System.Exception! exception, string! correlationId) -> System.Threading.Tasks.Task!

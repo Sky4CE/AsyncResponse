@@ -182,6 +182,67 @@ internal sealed class SerialExecutorRegistry(
         }
     }
 
+    /// <summary>The outcome of a non-blocking <see cref="TryEnqueue"/>.</summary>
+    public enum TryEnqueueOutcome
+    {
+        /// <summary>Accepted by the channel's live executor.</summary>
+        Accepted,
+
+        /// <summary>
+        /// Not accepted right now — the executor's bounded queue is full, or the channel's executor
+        /// is mid-retirement. The work was not queued; the producer should come back later.
+        /// </summary>
+        Full,
+
+        /// <summary>Suppressed by a tombstone (retired executor, no registration left): nothing will ever run it.</summary>
+        Suppressed
+    }
+
+    /// <summary>
+    /// Non-blocking counterpart of <see cref="EnqueueAsync"/>: never waits for queue capacity or
+    /// for a retirement to finish. Built for the DB channels' process-wide dispatch sweep, which
+    /// walks every subscribed correlation id in turn: awaiting one correlation id's capacity there
+    /// parked the whole loop — a single waiter wedged in a slow completion predicate, fed a
+    /// backlog of NEW progress messages, stopped every other correlation id's delivery until its
+    /// executor drained. A <see cref="TryEnqueueOutcome.Full"/> result leaves the message
+    /// unclaimed in the store for a later rescan of that one correlation id.
+    /// </summary>
+    public TryEnqueueOutcome TryEnqueue(string channel, Func<Task> work)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(channel);
+        ArgumentNullException.ThrowIfNull(work);
+
+        lock (_gate)
+        {
+            if (!_executors.TryGetValue(channel, out var current))
+            {
+                // Same tombstone rule as EnqueueAsync: no registration and a live tombstone means
+                // the work would run against no subscription; recreating an executor would leak it.
+                if (!_registrations.ContainsKey(channel) && IsTombstonedUnderLock(channel))
+                {
+                    _logger.LogWarning(
+                        "Suppressed a delivery for channel {Channel}: the channel is tombstoned and has no registered subscription.",
+                        channel);
+                    return TryEnqueueOutcome.Suppressed;
+                }
+
+                current = new ExecutorEntry(new ChannelSerialExecutor(_logger, channel));
+                _executors[channel] = current;
+            }
+
+            // Mid-retirement: EnqueueAsync would wait for the drain and then recreate; a
+            // non-blocking caller simply comes back after it.
+            if (current.Retiring)
+                return TryEnqueueOutcome.Full;
+
+            // TryWrite is synchronous and never blocks, so it can run under the gate; no in-flight
+            // enqueue bookkeeping is needed because nothing is left waiting for capacity.
+            return current.Executor.TryEnqueue(work, logIfFull: false)
+                ? TryEnqueueOutcome.Accepted
+                : TryEnqueueOutcome.Full;
+        }
+    }
+
     /// <summary>
     /// Retires the channel's serial executor (if present), draining its queued work. Safe to call
     /// concurrently with <see cref="EnqueueAsync"/>: admitted enqueues finish against the retiring

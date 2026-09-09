@@ -6,6 +6,7 @@ using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
 using MongoDB.Bson;
+using MongoDB.Bson.Serialization;
 using MongoDB.Driver;
 using Moq;
 using Npgsql;
@@ -621,6 +622,138 @@ public sealed class DbChannelSharedCoverageTests
     }
 
     /// <summary>
+    /// Round 35 (P1): the process-wide dispatch sweep visited correlation ids sequentially and
+    /// AWAITED each id's serial-executor capacity. One waiter wedged in a slow completion predicate
+    /// (its executor's single reader blocked on the first message) plus a backlog of NEW progress
+    /// messages for that id filled the 1024-slot queue, and the sweep then parked on slot 1025
+    /// without ever querying the next correlation id — every other waiter in the process stopped
+    /// receiving. The sweep now admits work without waiting: at capacity it leaves the rest of that
+    /// id's messages unclaimed in the store, schedules a rescan of that id alone, and moves on.
+    /// Mongo harness only: its store is the real <c>MongoDbChannelStore</c> over a mocked
+    /// collection, so the backlog can be arranged (the relational harnesses' closed-port stores
+    /// cannot answer a query); the sweep itself is shared source, identical in all three
+    /// assemblies. The targeted scope is a <c>HashSet</c> whose enumeration follows insertion order
+    /// for a small, removal-free set, so the wedged id is visited first — the shape that hung.
+    /// Pre-fix failure: the live waiter's delivery never arrives (the sweep is parked), and the
+    /// sweep task never completes.
+    /// </summary>
+    [Fact]
+    public async Task DispatchSweep_ASaturatedCorrelationExecutor_DoesNotBlockDeliveryToOtherCorrelations()
+    {
+        await using var harness = Harness.Create(Provider.MongoDb, failing: false, pollInterval: TimeSpan.FromSeconds(30), pendingMessageBatchSize: 4096);
+        var startedAt = DateTimeOffset.UtcNow;
+
+        // The wedged waiter: its dispatch hook never completes, so the first message parks its
+        // executor's reader and every later message for the id queues behind it.
+        var (blocked, _) = harness.Subscription("corr-blocked", startedAt);
+        var wedged = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        harness.SetProcessHook(blocked, () => wedged.Task);
+        harness.AddSubscription("corr-blocked", blocked);
+
+        // The unrelated waiter whose delivery must not wait behind it.
+        var (live, _) = harness.Subscription("corr-live", startedAt);
+        var delivered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        harness.SetProcessHook(live, () =>
+        {
+            delivered.TrySetResult();
+            return Task.CompletedTask;
+        });
+        harness.AddSubscription("corr-live", live);
+
+        // The store: 1100 distinct pending progress messages for the wedged id (more than the
+        // executor's capacity), one for the live id — all unacked and inside both watermarks.
+        MongoChannelMessageDocument Pending(string correlationId, int i) => new()
+        {
+            Id = Guid.NewGuid(),
+            CorrelationId = correlationId,
+            EnvelopeJson = StaleEnvelope,
+            CreatedAtUtc = startedAt.AddMilliseconds(i).UtcDateTime,
+            ExpiresAtUtc = startedAt.AddMinutes(5).UtcDateTime
+        };
+        var backlog = Enumerable.Range(0, ChannelSerialExecutor.DefaultCapacity + 76).Select(i => Pending("corr-blocked", i)).ToList();
+        var single = new List<MongoChannelMessageDocument> { Pending("corr-live", 0) };
+        harness.MongoMessages!
+            .Setup(collection => collection.FindAsync(
+                It.IsAny<FilterDefinition<MongoChannelMessageDocument>>(),
+                It.IsAny<FindOptions<MongoChannelMessageDocument, MongoChannelMessageDocument>>(),
+                It.IsAny<CancellationToken>()))
+            .Returns((FilterDefinition<MongoChannelMessageDocument> filter, FindOptions<MongoChannelMessageDocument, MongoChannelMessageDocument> _, CancellationToken _) =>
+                Task.FromResult(Cursor(CorrelationIdOf(filter) == "corr-blocked" ? backlog : single)));
+        // Every delivery claim wins (the claim gates only on recovery_claimed).
+        harness.MongoMessages
+            .Setup(collection => collection.FindOneAndUpdateAsync(
+                It.IsAny<FilterDefinition<MongoChannelMessageDocument>>(),
+                It.IsAny<UpdateDefinition<MongoChannelMessageDocument>>(),
+                It.IsAny<FindOneAndUpdateOptions<MongoChannelMessageDocument, MongoChannelMessageDocument>>(),
+                It.IsAny<CancellationToken>()))
+            .ReturnsAsync(Pending("claimed", 0));
+
+        using var sweepCancellation = new CancellationTokenSource();
+        var sweep = harness.InvokeAsync(
+            "DispatchPendingMessagesAsync",
+            new HashSet<string>(StringComparer.Ordinal) { "corr-blocked", "corr-live" },
+            sweepCancellation.Token);
+
+        try
+        {
+            await delivered.Task.WaitAsync(TimeSpan.FromSeconds(10));
+            await sweep.WaitAsync(TimeSpan.FromSeconds(10));
+        }
+        finally
+        {
+            // On the pre-fix build the sweep is parked on the wedged id's 1025th enqueue; unpark
+            // it so the harness can dispose.
+            sweepCancellation.Cancel();
+            wedged.TrySetResult();
+        }
+    }
+
+    /// <summary>A one-batch cursor over <paramref name="items"/>, for the mocked collection's <c>FindAsync</c>.</summary>
+    private static IAsyncCursor<T> Cursor<T>(IReadOnlyList<T> items)
+    {
+        var cursor = new Mock<IAsyncCursor<T>>();
+        var moved = false;
+        cursor.Setup(c => c.MoveNextAsync(It.IsAny<CancellationToken>())).ReturnsAsync(() => !moved && (moved = true));
+        cursor.Setup(c => c.MoveNext(It.IsAny<CancellationToken>())).Returns(() => !moved && (moved = true));
+        cursor.SetupGet(c => c.Current).Returns(items);
+        return cursor.Object;
+    }
+
+    /// <summary>The <c>correlation_id</c> a rendered message filter asks for, or <c>null</c>.</summary>
+    private static string? CorrelationIdOf(FilterDefinition<MongoChannelMessageDocument> filter)
+    {
+        var rendered = filter.Render(new RenderArgs<MongoChannelMessageDocument>(
+            BsonSerializer.LookupSerializer<MongoChannelMessageDocument>(),
+            BsonSerializer.SerializerRegistry));
+        return FindCorrelationId(rendered);
+
+        static string? FindCorrelationId(BsonValue value)
+        {
+            switch (value)
+            {
+                case BsonDocument document:
+                    if (document.TryGetValue("correlation_id", out var id) && id.IsString)
+                        return id.AsString;
+                    foreach (var element in document)
+                    {
+                        if (FindCorrelationId(element.Value) is { } nested)
+                            return nested;
+                    }
+                    return null;
+                case BsonArray array:
+                    foreach (var item in array)
+                    {
+                        if (FindCorrelationId(item) is { } nested)
+                            return nested;
+                    }
+                    return null;
+                default:
+                    return null;
+            }
+        }
+    }
+
+    /// <summary>
     /// Regression (round 33): the same-process fast path built its dispatch message with a
     /// fabricated <c>AckedAtUtc = null</c>, so a publish RETRY — the same message id landing as an
     /// idempotent duplicate after another process had already claimed and acked the first attempt
@@ -720,6 +853,9 @@ public sealed class DbChannelSharedCoverageTests
     /// base. "Failing" points the relational providers at a closed port and arms the Mongo mocks to
     /// throw, so every store call faults deterministically without a container.
     /// </summary>
+    /// <summary>Target of <see cref="Harness.SetProcessHook"/>: bound to <paramref name="body"/>, ignores the message.</summary>
+    private static Task InvokeProcessHook<TMessage>(Func<Task> body, TMessage _) => body();
+
     private sealed class Harness : IAsyncDisposable
     {
         private readonly Type _channelType;
@@ -752,7 +888,7 @@ public sealed class DbChannelSharedCoverageTests
         /// <summary>Mongo harness only: the messages-collection mock, for arranging what the store's upsert and claim return.</summary>
         public Mock<IMongoCollection<MongoChannelMessageDocument>>? MongoMessages { get; private set; }
 
-        public static Harness Create(Provider provider, bool failing, TimeSpan pollInterval, TimeSpan? fullSweepInterval = null, bool useChangeStreams = false)
+        public static Harness Create(Provider provider, bool failing, TimeSpan pollInterval, TimeSpan? fullSweepInterval = null, bool useChangeStreams = false, int? pendingMessageBatchSize = null)
         {
             var logger = new CollectingLogger();
             var recoveryState = new Mock<IRecoveryStateStore>();
@@ -852,6 +988,7 @@ public sealed class DbChannelSharedCoverageTests
                         UseChangeStreams = useChangeStreams,
                         ListenerPollInterval = pollInterval,
                         FullSweepInterval = fullSweepInterval,
+                        PendingMessageBatchSize = pendingMessageBatchSize ?? 64,
                         SubscriberHeartbeatInterval = heartbeat,
                         SubscriberHeartbeatTimeout = TimeSpan.FromSeconds(5),
                         DeliveryConfirmationTimeout = TimeSpan.FromMilliseconds(2),
@@ -980,6 +1117,22 @@ public sealed class DbChannelSharedCoverageTests
 
         public void AddSubscription(string correlationId, object subscription)
             => Method("AddSubscription").Invoke(Channel, [correlationId, subscription]);
+
+        /// <summary>
+        /// Replaces the subscription's per-message dispatch delegate (<c>ProcessUnderContextAsync</c>,
+        /// a <c>Func&lt;DbChannelMessage, Task&gt;</c> over the provider assembly's message type) with
+        /// <paramref name="body"/>, so a test can wedge or observe delivery without an envelope.
+        /// </summary>
+        public void SetProcessHook(object subscription, Func<Task> body)
+        {
+            var property = subscription.GetType().GetProperty("ProcessUnderContextAsync", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)!;
+            var messageType = property.PropertyType.GetGenericArguments()[0];
+            var hook = typeof(DbChannelSharedCoverageTests)
+                .GetMethod(nameof(InvokeProcessHook), BindingFlags.Static | BindingFlags.NonPublic)!
+                .MakeGenericMethod(messageType)
+                .CreateDelegate(property.PropertyType, body);
+            property.SetValue(subscription, hook);
+        }
 
         /// <summary>The per-correlation serial executor the disposal drain has to get through.</summary>
         public SerialExecutorRegistry Executors => (SerialExecutorRegistry)Field("_executors").GetValue(Channel)!;

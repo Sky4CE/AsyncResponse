@@ -70,22 +70,19 @@ public sealed class DurableFlowIdConflictException : InvalidOperationException
 }
 
 /// <summary>
-/// Thrown by <c>IDurableFlows.StartAsync</c> when the flow's ledger was committed but its worker
-/// job could not be published — the run exists, in <c>Running</c>, with nothing scheduled to
-/// execute it.
-/// <para>
-/// The distinct type exists to carry <see cref="FlowId"/> out of the failure. A start called
-/// without an explicit id generates one, and a plain throw discarded it: the caller was left
-/// knowing a flow might exist but not which, and the store interface has no enumeration to go
-/// looking. With the id in hand, recovery is a re-call of <c>StartAsync</c> with that same id —
-/// idempotent by contract, since an identical start re-enqueues the existing run rather than
-/// creating a second one.
-/// </para>
+/// Thrown by <c>IDurableFlows.StartAsync</c> when the flow's start job could not be published to the
+/// worker transport after retries. <b>Nothing was persisted</b>: the publish is the start's commit
+/// point (the job carries the initial ledger and its execution creates the run), so a failed
+/// publish leaves no orphaned <c>Running</c> ledger behind — the caller simply retries the start.
+/// <see cref="FlowId"/> carries the id the start would have used, including a generated one, so a
+/// retry can reuse it and stay idempotent: an identical start of an id that already exists
+/// re-enqueues the existing run rather than creating a second one.
 /// <para>
 /// Publication is retried before this surfaces, so it means the transport stayed unavailable, not
 /// that it blinked. The ambiguous case is deliberately included: a publish that may or may not
-/// have landed also throws here, because a duplicate delivery of a durable flow is harmless
-/// (completed steps skip via their checkpoints) while a dropped one is not.
+/// have landed also throws here. If it did land, the job creates and runs the flow on its own; a
+/// retried start with the SAME id then dedupes against that run, while a retry with a fresh
+/// generated id starts a second, independent run — supply deterministic ids where callers retry.
 /// </para>
 /// </summary>
 public sealed class DurableFlowNotDispatchedException : InvalidOperationException
@@ -93,12 +90,12 @@ public sealed class DurableFlowNotDispatchedException : InvalidOperationExceptio
     /// <summary>Creates the failure for <paramref name="flowId"/>.</summary>
     public DurableFlowNotDispatchedException(string flowId, Exception? innerException = null)
         : base(
-            $"Durable flow '{flowId}' was persisted but its worker job could not be published, so nothing " +
-            $"is scheduled to execute it. Retry the start with this same flow id — an identical start " +
-            $"re-enqueues the existing run instead of creating a duplicate.",
+            $"Durable flow '{flowId}' could not be started: its worker job was not published, so nothing " +
+            $"was persisted and nothing is scheduled to execute it. Retry the start with this same flow id — an " +
+            $"identical start is idempotent, so a job that did land is not duplicated.",
             innerException)
         => FlowId = flowId;
 
-    /// <summary>The id of the persisted-but-undispatched run, so a caller can re-drive it.</summary>
+    /// <summary>The id the start would have used, so a caller can retry idempotently with it.</summary>
     public string FlowId { get; }
 }

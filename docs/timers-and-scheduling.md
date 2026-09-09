@@ -120,19 +120,22 @@ The `input` factory receives the occurrence's scheduled UTC instant and **must b
 across replicas** (every replica must produce the same value for the same occurrence — don't put
 `Guid.NewGuid()` in it).
 
-**A committed occurrence is never abandoned.** Starting an occurrence commits its ledger and then
-publishes its worker job. If the publish fails after the start's own retry ladder (a broker outage;
-`DurableFlowNotDispatchedException`), the run exists as *Running* with no wake-up — so the
-scheduler keeps it in an in-process re-drive queue and repeats the idempotent start every
+**A due occurrence whose start could not be published is never abandoned.** Starting an
+occurrence publishes its start job first — the job carries the initial ledger and creates the run
+when executed (see [durable-flows.md](durable-flows.md#what-happens-when-things-die)) — so a
+publish that fails after the start's own retry ladder (a broker outage;
+`DurableFlowNotDispatchedException`) leaves nothing persisted. The scheduler keeps such an
+occurrence in an in-process re-drive queue and repeats the idempotent start every
 `ScheduledFlowOptions.RedriveInterval` (default 30 seconds) until the job is published, the run is
-seen to have executed (another replica re-drove it), or its ledger is gone. Because that queue dies
-with the process, each schedule also probes the last `StartupRedriveWindow` (default 1 hour; zero
+seen to exist (another replica started it), or the occurrence is gone. Because that queue dies with
+the process, each schedule also probes the last `StartupRedriveWindow` (default 1 hour; zero
 disables it; at most the 64 most recent occurrences) at startup and re-drives any occurrence whose
-ledger is Running with zero attempts — the signature a crash between the ledger commit and the
-publish leaves behind. A run that is merely queued behind a busy worker looks the same and is
-re-driven too, harmlessly: the duplicate wake-up is absorbed by the execution lease. Every re-drive
-is logged; a queue that exceeds 256 undispatched occurrences drops the oldest with an error naming
-its id, which stays re-drivable by starting the same occurrence id again.
+ledger is Running with zero attempts — a run whose wake-up was lost in transit (an early-ACK worker
+subscriber, a broker that dropped the job) and that nothing else would find. A run that is merely
+queued behind a busy worker looks the same and is re-driven too, harmlessly: the duplicate wake-up
+is absorbed by the execution lease. Every re-drive is logged; a queue that exceeds 256
+undispatched occurrences drops the oldest with an error naming its id, which stays re-drivable by
+starting the same occurrence id again.
 
 ## Cron syntax
 

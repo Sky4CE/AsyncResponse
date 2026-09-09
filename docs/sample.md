@@ -159,6 +159,14 @@ curl -X POST 'http://localhost:5000/lost-subscriber-flow?outcome=Failed'        
 curl -X POST 'http://localhost:5000/lost-subscriber-flow?outcome=Exception'        # arm + drop this channel + late SetException → fail
 ```
 
+> The scenarios marked *Recovery*, the composed `/lost-subscriber-flow`, `/emit-response`,
+> `/calls`, and the flow **read/resume** routes (`GET /durable-flow/<flowId>`,
+> `POST /durable-flow/<flowId>/resume`) are test affordances: they inject responses, drop
+> subscriptions, or return a run's full ledger without authentication. They are mapped only in the
+> Development environment (the `dotnet run` default) or with `Sample:EnableTestEndpoints=true`; a
+> Production instance answers 404 for all of them (see
+> [security.md](security.md#the-samples-test-only-routes-are-gated)).
+
 For the lost-subscriber flow, copy the `correlationId` returned by `/arm` and replace `<id>` in a
 `/publish` request. `Completed` exercises the resume callback; `Failed` exercises the failure
 callback with an `AsyncResponseDomainFailureException`; `exception=...` exercises the technical

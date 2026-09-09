@@ -2,6 +2,7 @@ using System.Collections.Concurrent;
 using System.Diagnostics.CodeAnalysis;
 using System.Linq.Expressions;
 using System.Reflection;
+using System.Runtime.CompilerServices;
 using System.Text.Json;
 
 namespace AsyncResponse;
@@ -122,13 +123,8 @@ internal static class ReflectionExtensions
                        ?? throw new CallbackTargetUnresolvableException(
                             $"Service '{dto.ServiceInterfaceFullName}' is not registered.");
 
-            // 4) Resolve and cache method metadata + compiled invocation delegate. Collectible
-            // (plugin) service types are planned per call: a strong Type-keyed cache entry would
-            // pin the plugin's AssemblyLoadContext after unload.
-            var planKey = new InvocationPlanKey(serviceType, dto.MethodName, dto.Params.Length);
-            var plan = serviceType.Assembly.IsCollectible
-                ? CreateInvocationPlan(planKey)
-                : InvocationPlans.GetOrAdd(planKey, static key => CreateInvocationPlan(key));
+            // 4) Resolve and cache method metadata + compiled invocation delegate.
+            var plan = GetInvocationPlan(serviceType, dto.MethodName, dto.Params.Length);
 
             // 5) Convert only the arguments that need conversion, keeping already-typed arrays hot.
             var invocationArgs = plan.ConvertArguments(dto.Params);
@@ -173,6 +169,34 @@ internal static class ReflectionExtensions
 
     private static async Task AwaitSlow(ValueTask pending)
         => await pending.ConfigureAwait(false);
+
+    /// <summary>
+    /// The one binding rule, applied at every boundary a callback crosses: the persisted
+    /// <c>(service, method name, parameter count)</c> triple must select exactly one public
+    /// instance method, with no by-ref parameters and no open generics. Expression-based
+    /// registration calls this at conversion time (<see cref="CallbackExpressionConverter"/>), so a
+    /// descriptor that could never dispatch — an overload set that shares a name and arity, which
+    /// the compiler resolves happily but a name-plus-arity descriptor cannot — fails at the
+    /// <c>EnqueueWorkerAsync</c>/<c>OnLostSubscriber*</c> call, in the caller's stack, instead of
+    /// after publication where it burns transport retries or strands a recovery. Dispatch calls the
+    /// same method, so the two can never disagree; the plan built here is the one dispatch reuses.
+    /// </summary>
+    /// <exception cref="CallbackTargetUnresolvableException">The descriptor does not bind to exactly one supported method.</exception>
+    internal static void EnsureBindable(Type serviceType, string methodName, int parameterCount)
+        => GetInvocationPlan(serviceType, methodName, parameterCount);
+
+    /// <summary>
+    /// Resolves (and caches) the compiled plan for a <c>(service type, method, arity)</c> key.
+    /// Collectible (plugin) service types are planned per call: a strong Type-keyed cache entry
+    /// would pin the plugin's AssemblyLoadContext after unload.
+    /// </summary>
+    private static InvocationPlan GetInvocationPlan(Type serviceType, string methodName, int parameterCount)
+    {
+        var planKey = new InvocationPlanKey(serviceType, methodName, parameterCount);
+        return serviceType.Assembly.IsCollectible
+            ? CreateInvocationPlan(planKey)
+            : InvocationPlans.GetOrAdd(planKey, static key => CreateInvocationPlan(key));
+    }
 
     // Internal: the durable-flow executor resolves persisted flow/input type names through the
     // same default-ALC scan + custom-resolver chain as persisted callback targets.
@@ -295,7 +319,102 @@ internal static class ReflectionExtensions
                 $"Callback method '{method.Name}' on '{key.ServiceType.Name}' has unbound generic parameters, which are not supported.");
         }
 
-        return new InvocationPlan(converters, CreateInvoker(method, parameters));
+        // A void-returning target is awaited as "already complete" (ToValueTaskExpression), which
+        // is exactly right for a synchronous method and exactly wrong for an `async void` one: its
+        // body is still running at the first await when the invoker returns, so the worker job is
+        // acknowledged, the DI scope disposed, and any later exception lost to the thread pool.
+        // A concrete (class-typed) service exposes the implementation here, so it is rejected at
+        // plan time; an interface hides it behind the DI resolution, so the plan carries the
+        // interface method and checks the resolved implementation on invoke.
+        MethodInfo? voidMethod = null;
+        if (method.ReturnType == typeof(void))
+        {
+            if (!key.ServiceType.IsInterface)
+                ThrowIfAsyncVoid(method, key.ServiceType);
+            voidMethod = method;
+        }
+
+        return new InvocationPlan(converters, CreateInvoker(method, parameters), voidMethod);
+    }
+
+    /// <summary>
+    /// Implementations already verified to be synchronous for a given void interface method, keyed
+    /// by the concrete service type. Collectible (plugin) types are never cached — a Type key would
+    /// pin their AssemblyLoadContext — and are re-checked per call, the plugin-host cold path.
+    /// </summary>
+    private static readonly ConcurrentDictionary<(Type Implementation, MethodInfo Method), bool> VerifiedSynchronousVoid = new();
+
+    /// <summary>
+    /// Rejects an <c>async void</c> implementation of a void-returning callback target before it is
+    /// invoked. The C# compiler marks every <c>async</c> method with
+    /// <see cref="AsyncStateMachineAttribute"/>; a <c>void</c> return with that marker is the one
+    /// shape a caller can neither await nor observe faults from. Failing open when the interface
+    /// map is unavailable (a runtime without it) keeps the historical behavior there.
+    /// </summary>
+    [UnconditionalSuppressMessage("Trimming", "IL2072",
+        Justification = "GetInterfaceMap is asked for the callback method's own declaring interface, which the registration " +
+                        "already rooted (DynamicallyAccessedMembers(PublicMethods) on TService); no member beyond the ones the " +
+                        "invocation itself needs is required, and an unavailable map fails open to the pre-existing behavior.")]
+    [UnconditionalSuppressMessage("Trimming", "IL2075",
+        Justification = "The implementation type is the DI-resolved service for an interface rooted at registration " +
+                        "(DynamicallyAccessedMembers(PublicMethods|Interfaces) on TService, or WithDurableFlow's static route); " +
+                        "the interface map needs only the members the invocation itself already requires. If the runtime cannot " +
+                        "produce the map the check fails open — the pre-existing behavior — never closed.")]
+    private static void EnsureNotAsyncVoid(object service, MethodInfo voidMethod)
+    {
+        var implementationType = service.GetType();
+        var cacheable = !implementationType.Assembly.IsCollectible;
+        if (cacheable && VerifiedSynchronousVoid.ContainsKey((implementationType, voidMethod)))
+            return;
+
+        MethodInfo? implementation = null;
+        try
+        {
+            var declaringType = voidMethod.DeclaringType!;
+            if (declaringType.IsInterface)
+            {
+                if (declaringType.IsAssignableFrom(implementationType))
+                {
+                    var map = implementationType.GetInterfaceMap(declaringType);
+                    var index = Array.IndexOf(map.InterfaceMethods, voidMethod);
+                    if (index >= 0)
+                        implementation = map.TargetMethods[index];
+                }
+            }
+            else
+            {
+                // Class-typed service: the plan already rejected the declared method; a derived
+                // registration may override it, so look the override up on the resolved type.
+                implementation = implementationType.GetMethod(
+                    voidMethod.Name,
+                    BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic,
+                    binder: null,
+                    voidMethod.GetParameters().Select(p => p.ParameterType).ToArray(),
+                    modifiers: null);
+            }
+        }
+        catch (Exception ex) when (ex is NotSupportedException or ArgumentException or TypeLoadException or AmbiguousMatchException)
+        {
+            // No map on this runtime, or a shape it cannot answer for: fail open.
+            implementation = null;
+        }
+
+        if (implementation is not null)
+            ThrowIfAsyncVoid(implementation, implementationType);
+
+        if (cacheable)
+            VerifiedSynchronousVoid.TryAdd((implementationType, voidMethod), true);
+    }
+
+    private static void ThrowIfAsyncVoid(MethodInfo implementation, Type implementationType)
+    {
+        if (implementation.ReturnType != typeof(void) || !implementation.IsDefined(typeof(AsyncStateMachineAttribute), inherit: false))
+            return;
+
+        throw new CallbackTargetUnresolvableException(
+            $"'{implementationType.FullName}.{implementation.Name}' is an async void method. The dispatcher cannot await it: the worker job or " +
+            "recovery callback would be acknowledged, and its DI scope disposed, while the body is still running at its first await, and any " +
+            "later exception would escape to the thread pool. Return Task or ValueTask instead (a synchronous void method is fine).");
     }
 
     /// <summary>
@@ -447,7 +566,7 @@ internal static class ReflectionExtensions
 
     private readonly record struct InvocationPlanKey(Type ServiceType, string MethodName, int ParameterCount);
 
-    private sealed class InvocationPlan(ConversionPlan[] converters, AsyncMethodInvoker invoker)
+    private sealed class InvocationPlan(ConversionPlan[] converters, AsyncMethodInvoker invoker, MethodInfo? voidMethod)
     {
         /// <summary>Runs the ConvertArguments operation.</summary>
         public object?[] ConvertArguments(object?[] args)
@@ -474,7 +593,14 @@ internal static class ReflectionExtensions
 
         /// <summary>Invokes the reflected operation.</summary>
         public ValueTask Invoke(object service, object?[] args)
-            => invoker(service, args);
+        {
+            // Only void-returning plans pay for the implementation check; Task/ValueTask targets
+            // are awaited for real and need none.
+            if (voidMethod is not null)
+                EnsureNotAsyncVoid(service, voidMethod);
+
+            return invoker(service, args);
+        }
 
         private static object?[] CopyPrefix(object?[] args, int length)
         {

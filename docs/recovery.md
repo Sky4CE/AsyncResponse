@@ -163,6 +163,18 @@ public sealed class OrderFlow(ILogger<OrderFlow> _logger, IOrderStore _orders) :
 > change for in-flight recovery state — deploy renames with care (keep a forwarding method for one
 > expiry window).
 
+> ⚠️ **Binding contract:** the persisted descriptor is *name + parameter count*, so the target
+> must be the only public method on the interface (base interfaces included) with that name and
+> arity — an overload set such as `Run(int)` / `Run(string)` cannot be told apart on the wire.
+> The expression overloads (`OnLostSubscriberResume<T>(...)`, `EnqueueWorkerAsync<T>(...)`)
+> validate this **at registration**, in your stack, and throw for an ambiguous, by-ref, or
+> open-generic target; the same check runs at dispatch, so the two never disagree. Targets must
+> return `Task`, `ValueTask`, or `void` **synchronously** — an `async void` implementation is
+> refused before it is invoked (its body would still be running when the job is acknowledged and
+> its DI scope disposed, and any later exception would escape to the thread pool). The refusal
+> applies to the *implementation* the interface resolves to, so it is checked on the first
+> dispatch and cached per implementation type.
+
 ### Make resume callbacks re-entrant
 
 A resume may re-trigger a flow whose step is still running remotely; resume should *re-attach*
@@ -348,6 +360,20 @@ pre-1.0 build carry no sequence and keep that older at-most-once tie resolution.
 waiters are lost, the recovery store keeps one registration per waiter and a
 late response/exception dispatches to every stored callback for that correlation id. A waiter that
 completes normally removes only its own registration, so a still-active sibling remains recoverable.
+
+Each registration keeps its own delivery guarantee through that fan-out. A registration whose
+callback succeeds is consumed (deleted) immediately. If a **sibling's** callback then fails
+*transiently* (its dependency blipped), the publish throws `RecoveryCallbackFailedException` — the
+same type the failure-callback ladder uses — and the broker ingress passes it through untouched:
+no second retry ladder, no `SetException` escalation (which would fail flows whose resume merely
+blipped), so the transport **redelivers** the terminal signal under its own `MaxDeliveryAttempts`
+and dead-letter policy. Because the successful registrations are already gone, the redelivery
+reaches only the one that failed and settles it when the dependency is back (the same holds for a
+direct `SetResponse`/`SetException` caller that retries). A sibling failure that is *deterministic*
+— an unauthorized or unresolvable target, a method that no longer binds — is logged and the
+message acknowledged, since redelivery cannot fix it; that registration stays for the watchdog to
+surface. (Until round 35 a partial success was swallowed outright, which returned success to the
+broker for a payload the failed registration never received.)
 
 The watchdog reports shared-correlation recovery state once per correlation id, not once per stored
 waiter registration.

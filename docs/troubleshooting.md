@@ -70,6 +70,21 @@ owns the full story — this page is the map, not the territory.
 - **Fix:** keep the retry budget well under `max.poll.interval.ms`, or raise the interval via
   `ConfigureConsumer`. See [transport options](configuration.md#transport-options).
 
+### Kafka: the subscriber restarts repeatedly, each time naming a message it "could not dead-letter"
+
+- **Symptom:** `Kafka subscriber failed for topic … retrying in …` on a backoff cadence, each
+  preceded by `Failed to dead-letter Kafka message …@{offset}`; that subscriber's partitions stop
+  advancing.
+- **Cause:** a message exhausted `MaxDeliveryAttempts` (or could not be parsed) and its produce to
+  the dead-letter topic keeps failing — the topic does not exist with auto-create off, its
+  partition is leaderless, the payload exceeds the broker's message cap. The library faults the
+  subscriber on purpose: leaving the offset unstored and consuming on would let the next
+  settlement commit past the message, losing it with no record (see
+  [transport semantics](transport-semantics.md#kafka)).
+- **Fix:** fix the dead-letter topic (create it, size `message.max.bytes`, restore its leader).
+  The next restart buries the message and the partition moves. Do not raise `MaxDeliveryAttempts`
+  to "get past" it — the handler is re-run per restart regardless.
+
 ### RabbitMQ: startup warns about `MaxDeliveryAttempts`, or a poison message loops forever
 
 - **Symptom:** a startup warning about delivery attempts, or a failing message that redelivers
@@ -105,11 +120,25 @@ owns the full story — this page is the map, not the territory.
 - **Symptom:** `GetStateAsync` reports `Running`, but nothing progresses.
 - **Cause:** the worker job carrying the flow id dead-lettered (a retriable failure exhausted the
   transport's delivery attempts), or the owning process died and its execution lease has not
-  expired yet.
+  expired yet. A run with `Attempts == 0` was never picked up: its wake-up is queued behind a busy
+  worker, or was lost in transit (an early-ACK worker subscriber, a broker that dropped it).
 - **Fix:** check the transport's dead-letter queue first — the DLQ entry is the alarm. Replay it
   or call `ResumeAsync(flowId)` to re-enqueue the run. After a crash, expect up to
   `ExecutionLeaseDuration` before another replica may take the run over. See
   [what happens when things die](durable-flows.md#what-happens-when-things-die).
+
+### A flow logs a `LedgerSizeWarningBytes` warning
+
+- **Symptom:** `Durable flow {id} ledger is roughly N bytes over K step(s), past the … threshold`,
+  once and then again each time the size doubles.
+- **Cause:** step results (and values) accumulate in the ledger, and every checkpoint rewrites the
+  whole ledger — a run of N similar steps serializes about N²/2 step-results over its lifetime and
+  eventually hits the store's `MaxStateBytes` cap.
+- **Fix:** keep large results out of the ledger (persist them yourself and pass references),
+  partition a long history into child flows, or — if the sizes are expected — raise
+  `DurableFlowOptions.LedgerSizeWarningBytes` (set `null` to disable). On DynamoDB lower it: the
+  350 KB item cap sits under the 512 KiB default. See
+  [ledger growth](durable-flows.md#storage-where-flow-state-lives).
 
 ### Every attempt of an awaited step fails with an `OnRecovery` error
 

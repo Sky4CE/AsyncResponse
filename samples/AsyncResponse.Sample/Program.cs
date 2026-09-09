@@ -601,6 +601,37 @@ asyncResponse.WithDurableFlow<SampleSeedDataFlow, string>();                 // 
 
 var app = builder.Build();
 app.Logger.LogInformation("AsyncResponse sample started: channel={Channel}, transport={Transport}.", channel, transport);
+// --- Test-only, simulation, and observability routes: gated, never on in Production by default
+// Two kinds of route are mapped only in the Development environment or when
+// "Sample:EnableTestEndpoints=true" is configured (the integration AppHost, the in-process test
+// factory, the load-test launcher, and the Native AOT gate set it): the test-only MUTATION routes
+// (/seed-recovery, DELETE /test/recovery/{id}, /test/reset — they write and erase recovery
+// registrations), and the SIMULATION / INJECTION / OBSERVABILITY routes (/arm, /crash, /publish,
+// /lost-subscriber-flow, /emit-response, /calls, GET /durable-flow/{id}, /durable-flow/{id}/resume).
+// None of them is authenticated: /publish and /emit-response inject responses and exceptions for any
+// correlation id, /crash drops every local subscription on the shared channel (with Redis it calls
+// UnsubscribeAll on the shared multiplexer), /calls and GET /durable-flow/{id} return recorded call
+// data and a flow's full ledger (input JSON, execution metadata). Against a shared backend those
+// strand real in-flight work or disclose it, so a Production instance answers 404 for all of them.
+// Operational flow tooling (reading and resuming runs) belongs behind real authorization and
+// ownership checks, not behind this switch.
+var testEndpointsSetting = builder.Configuration["Sample:EnableTestEndpoints"];
+var enableTestEndpoints = bool.TryParse(testEndpointsSetting, out var enableTestEndpointsParsed)
+    ? enableTestEndpointsParsed
+    : app.Environment.IsDevelopment();
+if (enableTestEndpoints)
+{
+    app.Logger.LogWarning(
+        "Test-only endpoints (/seed-recovery, /test/recovery/{{correlationId}}, /test/reset, /arm, /crash, /publish, /lost-subscriber-flow, /emit-response, /calls, GET /durable-flow/{{flowId}}, /durable-flow/{{flowId}}/resume) are enabled in the {Environment} environment; they mutate recovery state, inject responses, and read flow ledgers without authorization. Set Sample:EnableTestEndpoints=false to disable them.",
+        app.Environment.EnvironmentName);
+}
+else
+{
+    app.Logger.LogInformation(
+        "Test-only endpoints are disabled in the {Environment} environment (set Sample:EnableTestEndpoints=true to map them).",
+        app.Environment.EnvironmentName);
+}
+
 app.MapOpenApi();
 app.UseSwaggerUI(options => options.SwaggerEndpoint("/openapi/v1.json", "AsyncResponse sample v1"));
 
@@ -1674,19 +1705,25 @@ app.MapPost("/durable-flow", async (IDurableFlows flows, string? name, bool? fai
 })
 .WithTags("Flows");
 
+if (enableTestEndpoints)
+{
 app.MapGet("/durable-flow/{flowId}", async (IDurableFlows flows, string flowId) =>
 {
     var state = await flows.GetStateAsync(flowId);
     return state is null ? Results.NotFound() : Results.Ok(state);
 })
 .WithTags("Flows");
+}
 
+if (enableTestEndpoints)
+{
 app.MapPost("/durable-flow/{flowId}/resume", async (IDurableFlows flows, string flowId) =>
 {
     await flows.ResumeAsync(flowId);
     return Results.Ok();
 })
 .WithTags("Flows");
+}
 
 // 2b-child) Flow composition: the parent runs a local step, then AwaitChildFlowAsync starts a
 //     child durable flow and suspends the parent (worker released) until the child reaches a
@@ -1791,6 +1828,8 @@ app.MapPost("/worker", async (IAsyncResponseBuilder asyncResponse, string token,
 // 5a) Lost-subscriber recovery — arm: register a waiter with recovery callbacks and keep it waiting
 //     in the background. The HTTP request returns immediately; the subscription and persisted
 //     recovery state stay alive. The propagators capture the trace/tenant into the recovery state.
+if (enableTestEndpoints)
+{
 app.MapPost("/arm", async (IServiceProvider services, FlowRecorder recorder, string? trace) =>
 {
     var asyncResponse = services.GetService<IRecoverableAsyncResponseBuilder>();
@@ -1826,9 +1865,12 @@ app.MapPost("/arm", async (IServiceProvider services, FlowRecorder recorder, str
     return Results.Ok(new CorrelationResult(correlationId));
 })
 .WithTags("Recovery");
+}
 
 // 5b) Lost-subscriber recovery — crash: drop every local subscription, like a redeploy would. The
 //     durable recovery state stays in the channel store; only the in-memory waiters die.
+if (enableTestEndpoints)
+{
 app.MapPost("/crash", async (IServiceProvider services, CancellationToken cancellationToken) =>
 {
     var multiplexer = services.GetService<IConnectionMultiplexer>();
@@ -1862,9 +1904,12 @@ app.MapPost("/crash", async (IServiceProvider services, CancellationToken cancel
     return Results.Ok();
 })
 .WithTags("Recovery");
+}
 
 // 5c) Deliver a late response/exception for a correlation id through the configured channel (used by
 //     the lost-subscriber recovery scenarios after /crash, and by the active-waiter scenarios).
+if (enableTestEndpoints)
+{
 app.MapPost("/publish", async (IAsyncResponsePublisher publisher, string correlationId, string? status, string? message, string? exception) =>
 {
     if (exception is not null)
@@ -1880,10 +1925,13 @@ app.MapPost("/publish", async (IAsyncResponsePublisher publisher, string correla
     return Results.Accepted();
 })
 .WithTags("Recovery");
+}
 
 // 5d) Composed lost-subscriber recovery: arm, simulate the crash, publish the late terminal signal,
 //     and wait for the recovery callback in one request. This endpoint complements the lower-level
 //     /arm + /crash + /publish endpoints that integration tests can still drive step by step.
+if (enableTestEndpoints)
+{
 app.MapPost("/lost-subscriber-flow", async (
     IAsyncResponsePublisher publisher,
     FlowRecorder recorder,
@@ -1953,6 +2001,7 @@ app.MapPost("/lost-subscriber-flow", async (
     return Results.Ok(new LostSubscriberFlowResult(correlationId, normalized, callback));
 })
 .WithTags("Recovery");
+}
 
 static async Task<bool> DropLocalSubscriptionAsync(
     IServiceProvider services,
@@ -2001,6 +2050,8 @@ static async Task<bool> DropLocalSubscriptionAsync(
 // 6) Publish a raw response to the configured broker response destination, acting as the remote
 //    system. With useAttribute the correlation id rides broker metadata; otherwise it goes in the
 //    JSON body so the extractor's JSON-path fallback is exercised. (broker transports only.)
+if (enableTestEndpoints)
+{
 app.MapPost("/emit-response", async (
     IServiceProvider services,
     string correlationId,
@@ -2044,6 +2095,7 @@ app.MapPost("/emit-response", async (
     return Results.Conflict("Raw response ingress requires a transport such as AzureServiceBus, GooglePubSub, SQS, Kafka, RabbitMQ, Redis, NATS, PostgreSQL, SqlServer, or MongoDB.");
 })
 .WithTags("Workers");
+}
 
 static async Task<IResult> EmitSqsResponseAsync(
     IServiceProvider services,
@@ -2444,6 +2496,8 @@ static ConnectionFactory CreateRabbitMqConnectionFactory(RabbitMqAsyncResponseOp
 // --- Observability / test affordances --------------------------------------------------------
 
 // Long-poll the flow recorder for a recorded call (e.g. worker:{token}, resume:{cid}, waiter:{cid}).
+if (enableTestEndpoints)
+{
 app.MapGet("/calls", async (FlowRecorder recorder, string key, int? timeoutMs) =>
 {
     try
@@ -2457,32 +2511,9 @@ app.MapGet("/calls", async (FlowRecorder recorder, string key, int? timeoutMs) =
     }
 })
 .WithTags("Observability");
-
-// --- Test-only mutation routes: gated, never on in Production by default -------------------
-// /seed-recovery writes a recovery registration, /test/recovery/{id} deletes one, and /test/reset
-// erases EVERY recovery registration the scanner can see plus the flow recorder. Against a shared
-// persistent backend those strand real in-flight work, and none of them is authenticated — they
-// exist for the integration suite and the load-test launcher, which enable them explicitly via
-// "Sample:EnableTestEndpoints=true" (the AppHost sets it for every SUT app). Otherwise they are
-// mapped only in the Development environment; a Production instance answers 404. Operational
-// recovery tooling belongs behind real authorization, not behind this switch.
-var testEndpointsSetting = builder.Configuration["Sample:EnableTestEndpoints"];
-var enableTestEndpoints = bool.TryParse(testEndpointsSetting, out var enableTestEndpointsParsed)
-    ? enableTestEndpointsParsed
-    : app.Environment.IsDevelopment();
-if (enableTestEndpoints)
-{
-    app.Logger.LogWarning(
-        "Test-only mutation endpoints (/seed-recovery, /test/recovery/{{correlationId}}, /test/reset) are enabled in the {Environment} environment; they delete recovery registrations without authorization. Set Sample:EnableTestEndpoints=false to disable them.",
-        app.Environment.EnvironmentName);
-}
-else
-{
-    app.Logger.LogInformation(
-        "Test-only mutation endpoints are disabled in the {Environment} environment (set Sample:EnableTestEndpoints=true to map them).",
-        app.Environment.EnvironmentName);
 }
 
+// --- Test-only mutation routes (gated: see enableTestEndpoints above) --------------------
 if (enableTestEndpoints)
 {
 // Seed a stale recovery entry (no live subscriber) so the watchdog surfaces it as Degraded health.

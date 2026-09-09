@@ -33,6 +33,10 @@ internal sealed class DurableFlowContext : IDurableFlowContext
     private bool _progressDirty;
     private DateTime _lastPersistenceUtc;
 
+    // The next ledger-size estimate (in chars) that logs the growth warning; long.MaxValue when
+    // the warning is disabled. Doubles after every warning so a long run logs O(log n) times.
+    private long _nextLedgerSizeWarningChars;
+
     /// <summary>
     /// How many ancestors a long park refreshes (see <see cref="ExtendAncestorLedgersAsync"/>);
     /// far beyond any sane child-flow nesting, small enough to bound a corrupted parent cycle.
@@ -60,6 +64,7 @@ internal sealed class DurableFlowContext : IDurableFlowContext
         _builder = builder;
         _propagation = propagation;
         _options = options;
+        _nextLedgerSizeWarningChars = options.LedgerSizeWarningBytes ?? long.MaxValue;
         _subscriber = subscriber;
         _recoverableSubscriber = recoverableSubscriber;
         _logger = logger;
@@ -1283,6 +1288,35 @@ internal sealed class DurableFlowContext : IDurableFlowContext
 
         _progressDirty = false;
         _lastPersistenceUtc = UtcNow;
+        WarnIfLedgerLarge();
+    }
+
+    /// <summary>
+    /// Every checkpoint rewrites the whole ledger, so a run whose steps retain sizeable results
+    /// pays a persistence cost that grows with each completed step (about N²/2 step-results
+    /// serialized over a run of N similar steps) until it hits the store's hard cap. The
+    /// <see cref="DurableFlowOptions.LedgerSizeWarningBytes"/> threshold turns that curve into an
+    /// early operator signal: one warning when it is first crossed, another at each doubling.
+    /// </summary>
+    private void WarnIfLedgerLarge()
+    {
+        if (_nextLedgerSizeWarningChars == long.MaxValue)
+            return;
+
+        var estimate = FlowStateJson.EstimateLedgerChars(_state);
+        if (estimate < _nextLedgerSizeWarningChars)
+            return;
+
+        _logger.LogWarning(
+            "Durable flow {FlowId} ledger is roughly {LedgerBytes} bytes over {StepCount} step(s), past the {Threshold}-byte LedgerSizeWarningBytes threshold. Every checkpoint rewrites the whole ledger, so persistence cost now grows with each completed step and the store's MaxStateBytes cap is the hard limit. Keep step results small (persist large data yourself and pass references) or partition a long history into child flows.",
+            FlowId,
+            estimate,
+            _state.Steps?.Count ?? 0,
+            _options.LedgerSizeWarningBytes);
+
+        // Next warning at the next doubling of the CURRENT size (a single huge result may have
+        // skipped several thresholds at once), saturating instead of overflowing.
+        _nextLedgerSizeWarningChars = estimate > long.MaxValue / 2 ? long.MaxValue - 1 : estimate * 2;
     }
 
     private async Task<TResponse> WaitForResponseAsync<TResponse>(Task<TResponse> responseTask, CancellationToken cancellationToken)

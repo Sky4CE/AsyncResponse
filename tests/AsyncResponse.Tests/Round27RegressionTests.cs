@@ -176,8 +176,14 @@ public sealed class Round27RegressionTests
         return services.BuildServiceProvider();
     }
 
+    /// <summary>
+    /// Round 27 pinned that a failed publish surfaces the generated id AFTER retrying. Round 35
+    /// changed what the id points at: the publish is now the start's commit point, so nothing is
+    /// persisted when it fails — the id is for an idempotent retry, not for re-driving an orphan.
+    /// (The orphan half of this test moved to Round35RegressionTests, inverted.)
+    /// </summary>
     [Fact]
-    public async Task StartWithAGeneratedId_WhosePublishFails_SurfacesTheIdSoTheRunCanBeReDriven()
+    public async Task StartWithAGeneratedId_WhosePublishFails_SurfacesTheIdSoTheStartCanBeRetriedIdempotently()
     {
         var clock = new VirtualTimeProvider();
         var transport = new FailingWorkerTransport();
@@ -198,18 +204,17 @@ public sealed class Round27RegressionTests
         // The publish was actually retried, not given up on after one throw.
         Assert.True(transport.PublishAttempts > 1, $"expected the publish to be retried; saw {transport.PublishAttempts} attempt(s)");
 
-        // The generated id survives the failure — this is what made the orphan unrecoverable.
+        // The generated id survives the failure, and — since round 35 — nothing was persisted
+        // under it: the publish is the commit point, so a failed start leaves no orphan behind.
         Assert.False(string.IsNullOrWhiteSpace(ex.FlowId));
-        var orphan = await store.LoadAsync(ex.FlowId);
-        Assert.NotNull(orphan);
-        Assert.Equal(FlowRunStatus.Running, orphan!.Status);
+        Assert.Null(await store.LoadAsync(ex.FlowId));
 
-        // And with the id, the documented recovery genuinely works: the same start re-enqueues the
-        // existing run rather than creating a second one.
+        // With the id, the documented retry is idempotent: it creates the run and publishes one job.
         transport.Fail = false;
-        var reDriven = await flows.StartAsync<MarkerFlow, R27Input>(new R27Input("acme"), ex.FlowId);
+        var retried = await flows.StartAsync<MarkerFlow, R27Input>(new R27Input("acme"), ex.FlowId);
 
-        Assert.Equal(ex.FlowId, reDriven);
+        Assert.Equal(ex.FlowId, retried);
+        Assert.Equal(FlowRunStatus.Running, (await store.LoadAsync(ex.FlowId))!.Status);
         lock (transport.Published)
             Assert.Single(transport.Published);
     }

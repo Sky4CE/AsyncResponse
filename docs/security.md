@@ -71,13 +71,15 @@ reaches the store, only an explicitly allowlisted surface can be driven.
 
 ### The durable-flow executor and the allowlist
 
-Durable flows persist `IDurableFlowExecutor` methods (`ExecuteAsync`, `ResumeAsync`, `RecoverAsync`,
-`FailAsync`) as every flow's resume/recover/fail targets, so the **allowlist builder admits the
-executor by default** — rejecting it would break flow recovery. This is a deliberate, visible
-trade-off: an attacker with write access to the recovery store or worker transport can then drive
-those four methods, which is bounded to waking/failing flows by id and checkpointing a chosen
-payload into a flow's pending step (`RecoverAsync`) — not arbitrary service invocation. If you do
-not use durable flows, or want to gate the executor yourself, opt out:
+Durable flows persist `IDurableFlowExecutor` methods (`CreateAndExecuteAsync`, `ExecuteAsync`,
+`ResumeAsync`, `RecoverAsync`, `FailAsync`) as every flow's start/resume/recover/fail targets, so
+the **allowlist builder admits the executor by default** — rejecting it would break flow starts and
+recovery. This is a deliberate, visible trade-off: an attacker with write access to the recovery
+store or worker transport can then drive those methods, which is bounded to waking/failing flows
+by id, checkpointing a chosen payload into a flow's pending step (`RecoverAsync`), and starting a
+run of a *registered* flow type with a chosen input (`CreateAndExecuteAsync` — the same thing a
+worker-transport writer could already do by publishing any worker job) — not arbitrary service
+invocation. If you do not use durable flows, or want to gate the executor yourself, opt out:
 
 ```csharp
 .AuthorizeCallbacks(a =>
@@ -147,13 +149,21 @@ was there for.
 
 ### The sample's test-only routes are gated
 
-The sample application (the integration suite's system under test) exposes three unauthenticated
-mutation routes for tests — `/seed-recovery`, `DELETE /test/recovery/{correlationId}`, and
-`POST /test/reset`, which erases every recovery registration the scanner can see. They are mapped
-only in the Development environment or when `Sample:EnableTestEndpoints=true` is configured (the
-integration AppHost and the load-test launcher set it); a Production instance answers 404 and logs
-that they are disabled. If you fork the sample into a service, keep them behind that switch — or
-behind real authorization — rather than on a shared backend.
+The sample application (the integration suite's system under test) exposes unauthenticated routes
+that exist for tests and demos, in two groups: the **mutation** routes — `/seed-recovery`,
+`DELETE /test/recovery/{correlationId}`, and `POST /test/reset`, which erases every recovery
+registration the scanner can see — and the **simulation, injection, and observability** routes —
+`/arm`, `/crash` (drops every local subscription on the shared channel; with Redis it calls
+`UnsubscribeAll` on the shared multiplexer), `/publish` and `/emit-response` (inject a response or
+exception for any correlation id), `/lost-subscriber-flow` (composes all three), `/calls` (recorded
+call data), and `GET /durable-flow/{flowId}` / `POST /durable-flow/{flowId}/resume` (a run's full
+ledger, input JSON included, and an operator kick). All of them are mapped only in the Development
+environment or when `Sample:EnableTestEndpoints=true` is configured (the integration AppHost, the
+in-process test factory, the load-test launcher, and the Native AOT gate set it); a Production
+instance answers 404 for every one and logs that they are disabled, and an integration test pins
+the exact Production route inventory. If you fork the sample into a service, keep them behind that
+switch — and put flow reads/resumes behind real authorization and ownership checks — rather than on
+a shared backend.
 
 ## Explicit correlation id
 
