@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1788964295752,
+  "lastUpdate": 1788964317004,
   "repoUrl": "https://github.com/Sky4CE/AsyncResponse",
   "entries": {
     "AsyncResponse Microbenchmarks": [
@@ -102938,6 +102938,140 @@ window.BENCHMARK_DATA = {
           {
             "name": "durable-flow-storm throughput",
             "value": 2758.0175017171414,
+            "unit": "flows/s"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "tyunisov@gmail.com",
+            "name": "Sky4CE",
+            "username": "Sky4CE"
+          },
+          "committer": {
+            "email": "tyunisov@gmail.com",
+            "name": "Sky4CE",
+            "username": "Sky4CE"
+          },
+          "distinct": true,
+          "id": "7277a8822e3506680da6703036fcd2c128e29fd8",
+          "message": "fix: apply round-35 review — 8 findings with red-on-old regression tests, docs and CHANGELOG synced\n\nDurable flows: StartAsync publishes first and the job carries the initial ledger; the new\nIDurableFlowExecutor.CreateAndExecuteAsync creates the run if absent, so a crash mid-start can no\nlonger leave a Running ledger nothing will execute (DurableFlowNotDispatchedException now means\nnothing was persisted). New DurableFlowOptions.LedgerSizeWarningBytes warns once and per doubling\nas a ledger grows toward the store cap. Kafka: an exhausted dead-letter publish faults the\nsubscriber instead of being swallowed, because a later settlement committed past the failed\noffset (reverses the round-31 swallow). Recovery: a transient sibling failure in a shared-\ncorrelation fan-out propagates as RecoveryCallbackFailedException for redelivery; deterministic\nones still acknowledge. Callbacks: async void implementations are refused before invocation, and\nambiguous name/arity targets fail at registration through the dispatcher's own binding check.\nDB channels: the dispatch sweep admits work without waiting on a saturated correlation executor\nand rescans that id alone. Sample: all simulation, injection, and ledger routes ride the\nSample:EnableTestEndpoints switch; an integration test pins the Production route inventory.\n\nTests: 29 new or rewritten cases, 18 pins proven red against 684a3fb; 2823 unit tests green on\nnet8.0 and net10.0; CI-parity Release build clean.",
+          "timestamp": "2026-09-09T16:19:20+02:00",
+          "tree_id": "b713fa594ca906e5fa1762c4f6b07d1e9ee85b0f",
+          "url": "https://github.com/Sky4CE/AsyncResponse/commit/7277a8822e3506680da6703036fcd2c128e29fd8"
+        },
+        "date": 1788964316031,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "waiter-storm throughput",
+            "value": 108168.26135528774,
+            "unit": "ops/s"
+          },
+          {
+            "name": "progress-storm throughput",
+            "value": 56700.39962441655,
+            "unit": "ops/s"
+          },
+          {
+            "name": "worker-storm throughput",
+            "value": 70115.39030012472,
+            "unit": "jobs/s"
+          },
+          {
+            "name": "google-pubsub-ack-after-enqueue-dispatch-storm throughput",
+            "value": 295288.37863057066,
+            "unit": "ops/s"
+          },
+          {
+            "name": "rabbitmq-ack-after-enqueue-dispatch-storm throughput",
+            "value": 498663.5816013085,
+            "unit": "ops/s"
+          },
+          {
+            "name": "redis-ack-after-enqueue-dispatch-storm throughput",
+            "value": 363636.36363636365,
+            "unit": "ops/s"
+          },
+          {
+            "name": "nats-ack-after-receive-dispatch-storm throughput",
+            "value": 407737.2215154777,
+            "unit": "ops/s"
+          },
+          {
+            "name": "postgresql-ack-after-receive-dispatch-storm throughput",
+            "value": 305090.1236225181,
+            "unit": "ops/s"
+          },
+          {
+            "name": "sqlserver-ack-after-enqueue-dispatch-storm throughput",
+            "value": 308109.4404732561,
+            "unit": "ops/s"
+          },
+          {
+            "name": "mongodb-ack-after-enqueue-dispatch-storm throughput",
+            "value": 336677.66480371694,
+            "unit": "ops/s"
+          },
+          {
+            "name": "azure-servicebus-ack-after-receive-dispatch-storm throughput",
+            "value": 382041.01592346956,
+            "unit": "ops/s"
+          },
+          {
+            "name": "sqs-ack-after-enqueue-dispatch-storm throughput",
+            "value": 441750.7465587617,
+            "unit": "ops/s"
+          },
+          {
+            "name": "kafka-ack-after-enqueue-dispatch-storm throughput",
+            "value": 436262.1062734491,
+            "unit": "ops/s"
+          },
+          {
+            "name": "race-burst throughput",
+            "value": 168619.16417503747,
+            "unit": "ops/s"
+          },
+          {
+            "name": "raw-ingress-storm throughput",
+            "value": 151652.00596174365,
+            "unit": "ops/s"
+          },
+          {
+            "name": "shared-response-fanout throughput",
+            "value": 50557.42595561624,
+            "unit": "ops/s"
+          },
+          {
+            "name": "exception-fanout throughput",
+            "value": 42847.721255349104,
+            "unit": "ops/s"
+          },
+          {
+            "name": "timeout-storm throughput",
+            "value": 4866.169392816415,
+            "unit": "ops/s"
+          },
+          {
+            "name": "dispose-cleanup-storm throughput",
+            "value": 316107.5777308534,
+            "unit": "ops/s"
+          },
+          {
+            "name": "context-isolation-storm throughput",
+            "value": 113286.71962443186,
+            "unit": "ops/s"
+          },
+          {
+            "name": "watchdog-scan-storm throughput",
+            "value": 2165252.035336913,
+            "unit": "entries/s"
+          },
+          {
+            "name": "durable-flow-storm throughput",
+            "value": 2074.3865043401142,
             "unit": "flows/s"
           }
         ]
