@@ -18,74 +18,75 @@
   <ItemGroup>
     <!-- Shipped through AsyncResponse.Testing (its harness hosts a real container), so a bump
          here changes that package's declared minimum — not a samples/benchmarks-only version. -->
-    <PackageVersion Include="Microsoft.Extensions.DependencyInjection" Version="10.0.11" />
-    <PackageVersion Include="Microsoft.Extensions.DependencyInjection.Abstractions" Version="10.0.11" />
-    <PackageVersion Include="Microsoft.Extensions.Diagnostics.HealthChecks" Version="10.0.11" />
-    <PackageVersion Include="Microsoft.Extensions.Hosting" Version="10.0.11" />
-    <PackageVersion Include="Microsoft.Extensions.Hosting.Abstractions" Version="10.0.11" />
-    <PackageVersion Include="Microsoft.Extensions.Logging.Abstractions" Version="10.0.11" />
-    <PackageVersion Include="Microsoft.Extensions.Options" Version="10.0.11" />
+    <PackageVersion Include="Microsoft.Extensions.DependencyInjection" Version="10.0.12" />
+    <PackageVersion Include="Microsoft.Extensions.DependencyInjection.Abstractions" Version="10.0.12" />
+    <PackageVersion Include="Microsoft.Extensions.Diagnostics.HealthChecks" Version="10.0.12" />
+    <PackageVersion Include="Microsoft.Extensions.Hosting" Version="10.0.12" />
+    <PackageVersion Include="Microsoft.Extensions.Hosting.Abstractions" Version="10.0.12" />
+    <PackageVersion Include="Microsoft.Extensions.Logging.Abstractions" Version="10.0.12" />
+    <PackageVersion Include="Microsoft.Extensions.Options" Version="10.0.12" />
   </ItemGroup>
   <!-- Channel / transport provider clients. -->
   <ItemGroup>
-    <PackageVersion Include="AWSSDK.SQS" Version="4.0.100.8" />
+    <PackageVersion Include="AWSSDK.SQS" Version="4.0.100.12" />
     <PackageVersion Include="Azure.Messaging.ServiceBus" Version="7.20.2" />
     <PackageVersion Include="Confluent.Kafka" Version="2.15.0" />
-    <PackageVersion Include="Google.Cloud.PubSub.V1" Version="3.36.0" />
+    <PackageVersion Include="Google.Cloud.PubSub.V1" Version="3.37.0" />
     <PackageVersion Include="Microsoft.Data.SqlClient" Version="7.0.2" />
-    <PackageVersion Include="MongoDB.Driver" Version="3.11.0" />
-    <PackageVersion Include="NATS.Net" Version="3.1.0" />
+    <PackageVersion Include="MongoDB.Driver" Version="3.11.1" />
+    <PackageVersion Include="NATS.Net" Version="3.2.0" />
     <PackageVersion Include="Npgsql" Version="10.0.3" />
     <PackageVersion Include="RabbitMQ.Client" Version="7.2.2" />
-    <PackageVersion Include="StackExchange.Redis" Version="3.1.13" />
+    <PackageVersion Include="StackExchange.Redis" Version="3.1.31" />
   </ItemGroup>
   <!-- Durable-flow state-store clients. -->
   <ItemGroup>
-    <PackageVersion Include="AWSSDK.DynamoDBv2" Version="4.0.103.1" />
-    <PackageVersion Include="Microsoft.Azure.Cosmos" Version="3.62.1" />
-    <PackageVersion Include="Microsoft.Data.Sqlite" Version="10.0.11" />
+    <PackageVersion Include="AWSSDK.DynamoDBv2" Version="4.0.103.6" />
+    <PackageVersion Include="Microsoft.Azure.Cosmos" Version="3.63.0" />
+    <PackageVersion Include="Microsoft.Data.Sqlite" Version="10.0.12" />
     <!-- Explicit native-lib pin overriding the older e_sqlite3 that Microsoft.Data.Sqlite bundles.
          Bump in step with Microsoft.Data.Sqlite above, matching the provider major/minor its
          SQLitePCLRaw bundle expects. Referenced by AsyncResponse.DurableFlows.Sqlite and the tests. -->
     <PackageVersion Include="SQLitePCLRaw.lib.e_sqlite3" Version="3.53.3" />
     <PackageVersion Include="MySqlConnector" Version="2.6.2" />
     <PackageVersion Include="Newtonsoft.Json" Version="13.0.4" />
-    <PackageVersion Include="Oracle.ManagedDataAccess.Core" Version="23.26.300" />
+    <PackageVersion Include="Oracle.ManagedDataAccess.Core" Version="23.26.301" />
   </ItemGroup>
   <!-- Build-time only (analyzers + SourceLink), referenced with PrivateAssets="All" so they never
        become package dependencies of the shipped libraries. -->
   <ItemGroup>
     <PackageVersion Include="Microsoft.CodeAnalysis.PublicApiAnalyzers" Version="5.6.0" />
-    <PackageVersion Include="Microsoft.SourceLink.GitHub" Version="10.0.400" />
+    <PackageVersion Include="Microsoft.SourceLink.GitHub" Version="10.0.401" />
   </ItemGroup>
   <!-- ==========================================================================================
        Samples, AppHosts and benchmarks (IsPackable=false: never shipped).
        ========================================================================================== -->
   <ItemGroup>
-    <PackageVersion Include="Aspire.Hosting.AppHost" Version="13.4.6" />
-    <PackageVersion Include="Aspire.Hosting.Kafka" Version="13.4.6" />
-    <PackageVersion Include="Aspire.Hosting.Redis" Version="13.4.6" />
-    <PackageVersion Include="Aspire.Hosting.Testing" Version="13.4.6" />
+    <PackageVersion Include="Aspire.Hosting.AppHost" Version="13.5.3" />
+    <PackageVersion Include="Aspire.Hosting.Kafka" Version="13.5.3" />
+    <PackageVersion Include="Aspire.Hosting.Redis" Version="13.5.3" />
+    <PackageVersion Include="Aspire.Hosting.Testing" Version="13.5.3" />
     <PackageVersion Include="BenchmarkDotNet" Version="0.15.8" />
     <PackageVersion Include="MessagePack" Version="3.1.8" />
-    <PackageVersion Include="Microsoft.AspNetCore.OpenApi" Version="10.0.11" />
-    <!-- Capped at the 2.x line by ASP.NET Core, NOT by choice: Microsoft.AspNetCore.OpenApi 10.0.11
-         declares Microsoft.OpenApi [2.7.5, 3.0.0) — an exclusive upper bound. Microsoft.OpenApi 3.x
+    <PackageVersion Include="Microsoft.AspNetCore.OpenApi" Version="10.0.12" />
+    <!-- Capped at the 2.x line by ASP.NET Core, NOT by choice: Microsoft.AspNetCore.OpenApi 10.0.12
+         declares Microsoft.OpenApi [2.12.0, 3.0.0) — an exclusive upper bound. Microsoft.OpenApi 3.x
          is therefore unreachable until ASP.NET Core itself moves to it (expected with the 11.x
          line): pinning 3.x resolves outside the declared range (NU1608) and binds the sample
-         against a type surface ASP.NET Core was not compiled against. 2.12.0 is the newest release
-         inside the range. That range floor also clears the high-severity advisory (NU1903,
-         GHSA-v5pm-xwqc-g5wc) that affected 2.x below 2.7.5, which is why the floor sits there.
-         Re-check the upper bound whenever Microsoft.AspNetCore.OpenApi is bumped.
+         against a type surface ASP.NET Core was not compiled against. This pin sits exactly on the
+         range floor, which ASP.NET Core raised from 2.7.5 to 2.12.0 in 10.0.12; 2.12.2 is the
+         newest release inside the range. That floor is also well clear of the high-severity
+         advisory (NU1903, GHSA-v5pm-xwqc-g5wc) that affected 2.x below 2.7.5.
+         Re-check the range whenever Microsoft.AspNetCore.OpenApi is bumped — the floor moves with it.
          The direct reference that carries this pin lives in AsyncResponse.Sample. -->
     <PackageVersion Include="Microsoft.OpenApi" Version="2.12.0" />
     <PackageVersion Include="NBomber" Version="4.1.2" />
     <PackageVersion Include="NBomber.Http" Version="4.1.1" />
-    <PackageVersion Include="OpenTelemetry.Exporter.OpenTelemetryProtocol" Version="1.17.0" />
-    <PackageVersion Include="OpenTelemetry.Extensions.Hosting" Version="1.17.0" />
-    <PackageVersion Include="OpenTelemetry.Instrumentation.AspNetCore" Version="1.17.0" />
-    <PackageVersion Include="OpenTelemetry.Instrumentation.Http" Version="1.17.0" />
-    <PackageVersion Include="OpenTelemetry.Instrumentation.Runtime" Version="1.17.0" />
+    <PackageVersion Include="OpenTelemetry.Exporter.OpenTelemetryProtocol" Version="1.18.0" />
+    <PackageVersion Include="OpenTelemetry.Extensions.Hosting" Version="1.18.0" />
+    <PackageVersion Include="OpenTelemetry.Instrumentation.AspNetCore" Version="1.18.0" />
+    <PackageVersion Include="OpenTelemetry.Instrumentation.Http" Version="1.18.0" />
+    <PackageVersion Include="OpenTelemetry.Instrumentation.Runtime" Version="1.18.0" />
     <PackageVersion Include="Swashbuckle.AspNetCore.SwaggerUI" Version="10.2.3" />
   </ItemGroup>
   <!-- ==========================================================================================
@@ -93,15 +94,15 @@
        `mtp-v2` one is built against Microsoft.Testing.Platform v2, so the platform host and its
        TrxReport extension are pinned together on the 2.x line to keep the shared testing-host
        assembly compatible — a major mismatch fails at startup with a TypeLoadException on
-       IDataConsumer. xunit.v3.mtp-v2 4.0.0 depends on MTP >= 2.3.3, which is what is pinned here,
-       so the 3.2.x -> 4.0.0 bump stays inside the same MTP major.
+       IDataConsumer. xunit.v3.mtp-v2 4.0.0 floors MTP at 2.3.3 (via xunit.v3.core.mtp-v2); the
+       2.4.0 pinned here is above that floor and inside the same MTP major, so the lock holds.
        Microsoft.Testing.Extensions.CodeCoverage tracks its own 18.x cadence, independent of that lock.
        ========================================================================================== -->
   <ItemGroup>
-    <PackageVersion Include="Microsoft.AspNetCore.Mvc.Testing" Version="10.0.11" />
-    <PackageVersion Include="Microsoft.Testing.Extensions.CodeCoverage" Version="18.10.0" />
-    <PackageVersion Include="Microsoft.Testing.Extensions.TrxReport" Version="2.3.3" />
-    <PackageVersion Include="Microsoft.Testing.Platform" Version="2.3.3" />
+    <PackageVersion Include="Microsoft.AspNetCore.Mvc.Testing" Version="10.0.12" />
+    <PackageVersion Include="Microsoft.Testing.Extensions.CodeCoverage" Version="18.11.0" />
+    <PackageVersion Include="Microsoft.Testing.Extensions.TrxReport" Version="2.4.0" />
+    <PackageVersion Include="Microsoft.Testing.Platform" Version="2.4.0" />
     <PackageVersion Include="Moq" Version="4.20.72" />
     <PackageVersion Include="xunit.runner.visualstudio" Version="4.0.0" />
     <PackageVersion Include="xunit.v3.mtp-v2" Version="4.0.0" />
@@ -115,13 +116,13 @@
        SQL Server, and that shared source compiles into the multi-targeted unit-test project too.
        ========================================================================================== -->
   <ItemGroup Condition="'$(TargetFramework)' == 'net8.0'">
-    <PackageVersion Include="Microsoft.EntityFrameworkCore.Relational" Version="8.0.30" />
-    <PackageVersion Include="Microsoft.EntityFrameworkCore.Sqlite" Version="8.0.30" />
-    <PackageVersion Include="Microsoft.EntityFrameworkCore.SqlServer" Version="8.0.30" />
+    <PackageVersion Include="Microsoft.EntityFrameworkCore.Relational" Version="8.0.31" />
+    <PackageVersion Include="Microsoft.EntityFrameworkCore.Sqlite" Version="8.0.31" />
+    <PackageVersion Include="Microsoft.EntityFrameworkCore.SqlServer" Version="8.0.31" />
   </ItemGroup>
   <ItemGroup Condition="'$(TargetFramework)' == 'net10.0'">
-    <PackageVersion Include="Microsoft.EntityFrameworkCore.Relational" Version="10.0.11" />
-    <PackageVersion Include="Microsoft.EntityFrameworkCore.Sqlite" Version="10.0.11" />
-    <PackageVersion Include="Microsoft.EntityFrameworkCore.SqlServer" Version="10.0.11" />
+    <PackageVersion Include="Microsoft.EntityFrameworkCore.Relational" Version="10.0.12" />
+    <PackageVersion Include="Microsoft.EntityFrameworkCore.Sqlite" Version="10.0.12" />
+    <PackageVersion Include="Microsoft.EntityFrameworkCore.SqlServer" Version="10.0.12" />
   </ItemGroup>
 </Project>
