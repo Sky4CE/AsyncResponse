@@ -77,6 +77,15 @@ work that has landed on `main` but not yet shipped. Security reporters credited 
   - Tests: 29 new or rewritten cases; 18 behavior pins proven red against 684a3fb in a worktree
     (the DB-channel sweep pin runs the shared source through the Mongo mock harness). 2823 unit
     tests green on net10.0.
+  - *CI: two wall-clock races and a saturated load profile.* Follow-up to the round-35 push, whose
+    red pipelines were both environment-timing, not behavior (the sub-second load-test scenarios
+    and the `ExpressionToReflectionCall` benchmark were unchanged). The early-ACK drain fact now
+    reserves 1.5 s for 30 ms of burials instead of 750 ms for 75 ms, and the durable-flow store
+    end-to-end fact waits 30 s (not 5 s) for a run that finishes in milliseconds — both assert
+    that something happened, never how fast. The load test's push profile drops to 3 requests per
+    second per scenario: at 5/s its 60 scenarios offered 300 req/s to a fleet that completes about
+    210, so even passing runs averaged ~31 s per request against the client's ~35 s ceiling and
+    the gate was decided by runner speed. Both gate thresholds are unchanged.
 
 - **Round-34 review (2026-09-08): recovery correctness, retention, and settlement.**
   - *Lease-less checkpoint fencing.* The "won response after the lease lapsed" checkpoint is now

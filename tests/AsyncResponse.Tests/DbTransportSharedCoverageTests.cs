@@ -294,12 +294,20 @@ public sealed class DbTransportSharedCoverageTests
     [InlineData(Provider.MongoDb)]
     public async Task EarlyAck_DrainBudgetLapse_FinishesDeadLetteringQueuedWorkBeforeDisposeReturns(Provider provider)
     {
-        // Each burial takes 25 ms to commit; the counter moves only once it has. With a 3 s budget
-        // the reserved quarter (750 ms) comfortably covers the three burials; the old fire-and-forget
-        // dispose returned with none of them committed.
-        var calls = new Calls { DeadLetterDelay = TimeSpan.FromMilliseconds(25) };
+        // Each burial takes 10 ms to commit; the counter moves only once it has. With a 6 s budget
+        // the reserved quarter (1.5 s) covers the three burials (30 ms of work) ~50x over; the old
+        // fire-and-forget dispose returned with none of them committed.
+        //
+        // The headroom is deliberately that wide. At 25 ms per burial inside a 3 s budget the
+        // reserve was 750 ms for 75 ms of work — 10x — and a starved Windows CI runner still
+        // stalled long enough to commit only two of the three (the assertion below is synchronous
+        // by design, so it cannot wait the stall out). Nothing here measures speed: the fact is
+        // that DisposeAsync does not return until the queued entries are buried, so buying the
+        // margin with a smaller unit of work and a larger reserve costs a few seconds and removes
+        // a wall-clock race against the runner.
+        var calls = new Calls { DeadLetterDelay = TimeSpan.FromMilliseconds(10) };
         var backgroundFailures = 0;
-        var drain = TimeSpan.FromSeconds(3);
+        var drain = TimeSpan.FromSeconds(6);
         var (dispatcher, handle) = CreateEarlyAckDispatcher(
             provider,
             calls,
