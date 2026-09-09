@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1788971211855,
+  "lastUpdate": 1788971235387,
   "repoUrl": "https://github.com/Sky4CE/AsyncResponse",
   "entries": {
     "AsyncResponse Microbenchmarks": [
@@ -103600,6 +103600,140 @@ window.BENCHMARK_DATA = {
           {
             "name": "durable-flow-storm throughput",
             "value": 2074.3865043401142,
+            "unit": "flows/s"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "tyunisov@gmail.com",
+            "name": "Sky4CE",
+            "username": "Sky4CE"
+          },
+          "committer": {
+            "email": "tyunisov@gmail.com",
+            "name": "Sky4CE",
+            "username": "Sky4CE"
+          },
+          "distinct": true,
+          "id": "145aa8cd823d3f24466a3651268e615387c18ecc",
+          "message": "fix(ci): stop two wall-clock races and back the load profile off its saturation cliff\n\nThe round-35 push went red on Windows net10.0 and the load test; neither failure was\nbehavioral, and no library code changes here.\n\nThe two Windows failures were timing races — one of them in DbTransportShared, which round 35\nnever touched. Neither reproduces locally (6 clean runs idle, 3 more under 3x CPU\noversubscription); the Windows agent ran 25% slower than its own recent history. Both are\nhardened by widening the margin, not by changing what they assert: the early-ACK drain fact\nreserves 1.5s for 30ms of burials instead of 750ms for 75ms, and still asserts synchronously\nafter DisposeAsync so a fire-and-forget dispose still reads 0; the durable-flow store\nend-to-end fact waits 30s (was 5s) for a run that finishes in milliseconds.\n\nThe load test failed at 7.22% against its 5% gate, but the sub-second scenarios were unchanged\n(647ms -> 652ms) while only the already-saturated Redis-channel ones moved (31.7s -> 33.3s):\na cliff, not a slowdown. At 5/s the broad profile's 60 scenarios offered 300 req/s to a fleet\nthat completes about 210, so even passing runs averaged ~31s against the client's ~35s ceiling\nand the gate was decided by runner speed. The push default drops to 3/s; both gate thresholds,\nthe workflow_dispatch default of 20, and the LOADTEST_RATE override are unchanged.\n\nVerified: 2823 unit tests green on net8.0 and net10.0; CI-parity Release build clean.",
+          "timestamp": "2026-09-09T18:09:28+02:00",
+          "tree_id": "d23f86d546cef8481b842c6dd656dd64d5b39a12",
+          "url": "https://github.com/Sky4CE/AsyncResponse/commit/145aa8cd823d3f24466a3651268e615387c18ecc"
+        },
+        "date": 1788971234532,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "waiter-storm throughput",
+            "value": 82565.58349428118,
+            "unit": "ops/s"
+          },
+          {
+            "name": "progress-storm throughput",
+            "value": 45445.704199364845,
+            "unit": "ops/s"
+          },
+          {
+            "name": "worker-storm throughput",
+            "value": 47693.20373754468,
+            "unit": "jobs/s"
+          },
+          {
+            "name": "google-pubsub-ack-after-enqueue-dispatch-storm throughput",
+            "value": 212876.47204080416,
+            "unit": "ops/s"
+          },
+          {
+            "name": "rabbitmq-ack-after-enqueue-dispatch-storm throughput",
+            "value": 259764.5494124126,
+            "unit": "ops/s"
+          },
+          {
+            "name": "redis-ack-after-enqueue-dispatch-storm throughput",
+            "value": 253948.90548021736,
+            "unit": "ops/s"
+          },
+          {
+            "name": "nats-ack-after-receive-dispatch-storm throughput",
+            "value": 240428.5398293919,
+            "unit": "ops/s"
+          },
+          {
+            "name": "postgresql-ack-after-receive-dispatch-storm throughput",
+            "value": 201455.31318242988,
+            "unit": "ops/s"
+          },
+          {
+            "name": "sqlserver-ack-after-enqueue-dispatch-storm throughput",
+            "value": 200264.3489406016,
+            "unit": "ops/s"
+          },
+          {
+            "name": "mongodb-ack-after-enqueue-dispatch-storm throughput",
+            "value": 200110.4609744579,
+            "unit": "ops/s"
+          },
+          {
+            "name": "azure-servicebus-ack-after-receive-dispatch-storm throughput",
+            "value": 226453.37777858294,
+            "unit": "ops/s"
+          },
+          {
+            "name": "sqs-ack-after-enqueue-dispatch-storm throughput",
+            "value": 268698.745714255,
+            "unit": "ops/s"
+          },
+          {
+            "name": "kafka-ack-after-enqueue-dispatch-storm throughput",
+            "value": 391144.4887741532,
+            "unit": "ops/s"
+          },
+          {
+            "name": "race-burst throughput",
+            "value": 143691.29133064457,
+            "unit": "ops/s"
+          },
+          {
+            "name": "raw-ingress-storm throughput",
+            "value": 116645.82594576436,
+            "unit": "ops/s"
+          },
+          {
+            "name": "shared-response-fanout throughput",
+            "value": 47526.493168351764,
+            "unit": "ops/s"
+          },
+          {
+            "name": "exception-fanout throughput",
+            "value": 43411.309305926094,
+            "unit": "ops/s"
+          },
+          {
+            "name": "timeout-storm throughput",
+            "value": 4876.046033775396,
+            "unit": "ops/s"
+          },
+          {
+            "name": "dispose-cleanup-storm throughput",
+            "value": 265041.081367612,
+            "unit": "ops/s"
+          },
+          {
+            "name": "context-isolation-storm throughput",
+            "value": 108837.1404565065,
+            "unit": "ops/s"
+          },
+          {
+            "name": "watchdog-scan-storm throughput",
+            "value": 1620509.1639793224,
+            "unit": "entries/s"
+          },
+          {
+            "name": "durable-flow-storm throughput",
+            "value": 2356.1628549606467,
             "unit": "flows/s"
           }
         ]
