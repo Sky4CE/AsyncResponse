@@ -1,22 +1,22 @@
 Summary - AsyncResponse (Release / net8.0+net10.0 / unit+integration)
-  Generated on: 09/09/2026 - 14:38:29
-  Coverage date: 09/09/2026 - 14:23:43 - 09/09/2026 - 14:34:37
+  Generated on: 09/09/2026 - 16:28:04
+  Coverage date: 09/09/2026 - 16:13:14 - 09/09/2026 - 16:25:20
   Parser: MultiReport (16x Cobertura)
   Assemblies: 27
   Classes: 458
   Files: 226
-  Line coverage: 94.9%
-  Covered lines: 26430
-  Uncovered lines: 1418
+  Line coverage: 94.8%
+  Covered lines: 26420
+  Uncovered lines: 1428
   Coverable lines: 27848
   Total lines: 53573
-  Branch coverage: 88.6% (9082 of 10240)
-  Covered branches: 9082
+  Branch coverage: 88.7% (9083 of 10240)
+  Covered branches: 9083
   Total branches: 10240
   Method coverage: 97.6% (3869 of 3961)
-  Full method coverage: 90.7% (3594 of 3961)
+  Full method coverage: 90.6% (3591 of 3961)
   Covered methods: 3869
-  Fully covered methods: 3594
+  Fully covered methods: 3591
   Total methods: 3961
 
 AsyncResponse.Abstractions                                                                               97.9%
@@ -78,8 +78,8 @@ AsyncResponse.Channels.NATS                                                     
   AsyncResponse.Channels.NATS.NatsSubjectSchema                                                           100%
   Microsoft.Extensions.DependencyInjection.NatsAsyncResponseChannelServiceCollectionExtensions            100%
 
-AsyncResponse.Channels.PostgreSQL                                                                        93.7%
-  AsyncResponse.Channels.DbAsyncResponseChannelBase                                                      91.1%
+AsyncResponse.Channels.PostgreSQL                                                                        93.6%
+  AsyncResponse.Channels.DbAsyncResponseChannelBase                                                      90.9%
   AsyncResponse.Channels.PostgreSQL.PostgreSqlAsyncResponseChannel                                       94.2%
   AsyncResponse.Channels.PostgreSQL.PostgreSqlAsyncResponseChannelOptions                                 100%
   AsyncResponse.Channels.PostgreSQL.PostgreSqlAsyncResponseWaiter<T>                                      100%
@@ -156,7 +156,7 @@ AsyncResponse.Core                                                              
   AsyncResponse.DurableFlowRegistration                                                                   100%
   AsyncResponse.DurableFlowService                                                                       93.1%
   AsyncResponse.DurableFlowSuspendedException                                                             100%
-  AsyncResponse.FlowExecutionLease                                                                       98.4%
+  AsyncResponse.FlowExecutionLease                                                                       97.7%
   AsyncResponse.FlowStateConcurrency                                                                      100%
   AsyncResponse.FlowStateJson                                                                             100%
   AsyncResponse.InMemoryAsyncResponseChannel                                                             94.5%
@@ -429,9 +429,9 @@ AsyncResponse.Transports.PostgreSQL                                             
   AsyncResponse.Transports.SubscriberSupervisor                                                           100%
   Microsoft.Extensions.DependencyInjection.PostgreSqlAsyncResponseTransportServiceCollectionExtensions    100%
 
-AsyncResponse.Transports.RabbitMQ                                                                        96.3%
+AsyncResponse.Transports.RabbitMQ                                                                        95.6%
   AsyncResponse.Transports.CorrelationIdJsonPaths                                                          99%
-  AsyncResponse.Transports.RabbitMQ.AwaitingRabbitMqMessageDispatcher                                    82.6%
+  AsyncResponse.Transports.RabbitMQ.AwaitingRabbitMqMessageDispatcher                                      75%
   AsyncResponse.Transports.RabbitMQ.QueuedRabbitMqMessageDispatcher                                      88.1%
   AsyncResponse.Transports.RabbitMQ.RabbitMqAsyncResponseOptions                                          100%
   AsyncResponse.Transports.RabbitMQ.RabbitMqBackgroundFailureContext                                      100%

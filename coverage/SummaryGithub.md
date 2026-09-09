@@ -3,19 +3,19 @@
 
 |||
 |:---|:---|
-| Generated on: | 09/09/2026 - 14:38:29 |
-| Coverage date: | 09/09/2026 - 14:23:43 - 09/09/2026 - 14:34:37 |
+| Generated on: | 09/09/2026 - 16:28:04 |
+| Coverage date: | 09/09/2026 - 16:13:14 - 09/09/2026 - 16:25:20 |
 | Parser: | MultiReport (16x Cobertura) |
 | Assemblies: | 27 |
 | Classes: | 458 |
 | Files: | 226 |
-| **Line coverage:** | 94.9% (26430 of 27848) |
-| Covered lines: | 26430 |
-| Uncovered lines: | 1418 |
+| **Line coverage:** | 94.8% (26420 of 27848) |
+| Covered lines: | 26420 |
+| Uncovered lines: | 1428 |
 | Coverable lines: | 27848 |
 | Total lines: | 53573 |
-| **Branch coverage:** | 88.6% (9082 of 10240) |
-| Covered branches: | 9082 |
+| **Branch coverage:** | 88.7% (9083 of 10240) |
+| Covered branches: | 9083 |
 | Total branches: | 10240 |
 | **Method coverage:** | [Feature is only available for sponsors](https://reportgenerator.io/pro) |
 
@@ -60,8 +60,8 @@
 
 |**Name**|**Line**|**Branch**|
 |:---|---:|---:|
-|**AsyncResponse.Channels.MongoDB**|**95.6%**|**89.3%**|
-|AsyncResponse.Channels.DbAsyncResponseChannelBase|95%|90.4%|
+|**AsyncResponse.Channels.MongoDB**|**95.6%**|**89.9%**|
+|AsyncResponse.Channels.DbAsyncResponseChannelBase|95%|91.4%|
 |AsyncResponse.Channels.MongoDB.MongoChannelMessageDocument|100%||
 |AsyncResponse.Channels.MongoDB.MongoChannelSubscriberDocument|0%||
 |AsyncResponse.Channels.MongoDB.MongoDbAsyncResponseChannel|68.8%|70%|
@@ -96,12 +96,12 @@
 |Microsoft.Extensions.DependencyInjection.NatsAsyncResponseChannelServiceCol<br/>lectionExtensions|100%|75%|
 
 </details>
-<details><summary>AsyncResponse.Channels.PostgreSQL - 93.7%</summary>
+<details><summary>AsyncResponse.Channels.PostgreSQL - 93.6%</summary>
 
 |**Name**|**Line**|**Branch**|
 |:---|---:|---:|
-|**AsyncResponse.Channels.PostgreSQL**|**93.7%**|**84.8%**|
-|AsyncResponse.Channels.DbAsyncResponseChannelBase|91.1%|87.5%|
+|**AsyncResponse.Channels.PostgreSQL**|**93.6%**|**84.8%**|
+|AsyncResponse.Channels.DbAsyncResponseChannelBase|90.9%|87.5%|
 |AsyncResponse.Channels.PostgreSQL.PostgreSqlAsyncResponseChannel|94.2%|75%|
 |AsyncResponse.Channels.PostgreSQL.PostgreSqlAsyncResponseChannelOptions|100%|100%|
 |AsyncResponse.Channels.PostgreSQL.PostgreSqlAsyncResponseWaiter`1|100%||
@@ -150,7 +150,7 @@
 
 |**Name**|**Line**|**Branch**|
 |:---|---:|---:|
-|**AsyncResponse.Core**|**95.2%**|**90.9%**|
+|**AsyncResponse.Core**|**95.2%**|**90.8%**|
 |AsyncResponse.AsyncResponseBuilder|100%||
 |AsyncResponse.AsyncResponseBuilder`1|100%|100%|
 |AsyncResponse.AsyncResponseBuilderBase|94.2%|95%|
@@ -193,14 +193,14 @@
 |AsyncResponse.DurableFlowRegistration|100%||
 |AsyncResponse.DurableFlowService|93.1%|93.7%|
 |AsyncResponse.DurableFlowSuspendedException|100%||
-|AsyncResponse.FlowExecutionLease|98.4%|94.4%|
+|AsyncResponse.FlowExecutionLease|97.7%|91.6%|
 |AsyncResponse.FlowStateConcurrency|100%|98.3%|
 |AsyncResponse.FlowStateJson|100%|96.1%|
 |AsyncResponse.InMemoryAsyncResponseChannel|94.5%|91.4%|
 |AsyncResponse.InMemoryAsyncResponseOptions|100%|100%|
 |AsyncResponse.InMemoryAsyncResponseWaiter`1|100%||
 |AsyncResponse.InMemoryFlowStateStore|99.1%|90.2%|
-|AsyncResponse.InMemoryRecoveryStateStore|96.7%|90.4%|
+|AsyncResponse.InMemoryRecoveryStateStore|96.7%|89.6%|
 |AsyncResponse.InMemoryWorkerHost|93.4%|88.2%|
 |AsyncResponse.InMemoryWorkerTransport|89.1%|81.4%|
 |AsyncResponse.InMemoryWorkerTransportOptions|100%|100%|
@@ -547,13 +547,13 @@
 |Microsoft.Extensions.DependencyInjection.PostgreSqlAsyncResponseTransportSe<br/>rviceCollectionExtensions|100%||
 
 </details>
-<details><summary>AsyncResponse.Transports.RabbitMQ - 96.3%</summary>
+<details><summary>AsyncResponse.Transports.RabbitMQ - 95.6%</summary>
 
 |**Name**|**Line**|**Branch**|
 |:---|---:|---:|
-|**AsyncResponse.Transports.RabbitMQ**|**96.3%**|**89.2%**|
+|**AsyncResponse.Transports.RabbitMQ**|**95.6%**|**89.2%**|
 |AsyncResponse.Transports.CorrelationIdJsonPaths|99%|93.1%|
-|AsyncResponse.Transports.RabbitMQ.AwaitingRabbitMqMessageDispatcher|82.6%|86.3%|
+|AsyncResponse.Transports.RabbitMQ.AwaitingRabbitMqMessageDispatcher|75%|86.3%|
 |AsyncResponse.Transports.RabbitMQ.QueuedRabbitMqMessageDispatcher|88.1%|83.3%|
 |AsyncResponse.Transports.RabbitMQ.RabbitMqAsyncResponseOptions|100%||
 |AsyncResponse.Transports.RabbitMQ.RabbitMqBackgroundFailureContext|100%||
