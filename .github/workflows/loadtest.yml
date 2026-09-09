@@ -106,7 +106,17 @@ jobs:
 
           rate="${LOADTEST_RATE:-20}"
           if [ "${GITHUB_EVENT_NAME:-}" = "push" ]; then
-            rate="${LOADTEST_RATE:-5}"
+            # The broad profile is 60 scenarios, so this is a PER-SCENARIO rate: 5/s offered 300
+            # requests per second to 14 SUT apps plus ~10 broker/database containers on one runner,
+            # and the request/response scenarios each carry ~1 s of simulated remote work. That put
+            # the fleet ~30x past its knee: even on runs that PASSED, the Redis-channel scenarios
+            # averaged ~31 s per request against the client's ~35 s ceiling, so the gate was decided
+            # by how fast that particular runner happened to be — a 5 % slower one pushed the mean
+            # past the ceiling and the failure rate from 2.5 % to 7.2 % with no code change behind
+            # it (the sub-second worker scenarios were unchanged at 0.65 s across both runs).
+            # 3/s keeps every scenario and both gate thresholds while restoring headroom, so a
+            # failure means the library, not the runner. Override with LOADTEST_RATE to push harder.
+            rate="${LOADTEST_RATE:-3}"
           fi
 
           args=(

@@ -450,9 +450,13 @@ public sealed class DurableFlowStateStoreExampleTests
         services.AddScoped<TestOnboardingFlow>();
 
         var builder = services.AddAsyncResponse()
+            // Generous, not tuned: every wait in this method is a liveness check ("did the run get
+            // there at all"), never a performance assertion, and the whole flow finishes in
+            // milliseconds on an idle machine. Tight values only decide how a starved CI runner
+            // fails — a Windows agent stalled past the old 5 s run wait with the flow mid-flight.
             .WithInMemoryChannel(options =>
             {
-                options.DefaultTimeout = TimeSpan.FromSeconds(10);
+                options.DefaultTimeout = TimeSpan.FromSeconds(60);
                 options.RecoveryStateExpiry = TimeSpan.FromMinutes(5);
             })
             .WithInMemoryTransport();
@@ -466,11 +470,11 @@ public sealed class DurableFlowStateStoreExampleTests
 
         var flowId = await flows.StartAsync<TestOnboardingFlow, TestFlowInput>(new TestFlowInput(7));
         var run = executor.ExecuteAsync(flowId);
-        var correlationId = await probe.TriggerFired.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        var correlationId = await probe.TriggerFired.Task.WaitAsync(TimeSpan.FromSeconds(30));
 
         await publisher.SetResponse(new OperationResult { Status = OperationStatus.Running, Message = "halfway" }, correlationId);
         await publisher.SetResponse(new OperationResult { Status = OperationStatus.Completed }, correlationId);
-        await run.WaitAsync(TimeSpan.FromSeconds(5));
+        await run.WaitAsync(TimeSpan.FromSeconds(30));
 
         var state = await flows.GetStateAsync(flowId);
         Assert.Equal(FlowRunStatus.Succeeded, state!.Status);
