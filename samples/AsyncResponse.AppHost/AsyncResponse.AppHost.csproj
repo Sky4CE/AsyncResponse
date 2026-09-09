@@ -1,12 +1,18 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
-  <Sdk Name="Aspire.AppHost.Sdk" Version="13.4.6" />
+  <Sdk Name="Aspire.AppHost.Sdk" Version="13.5.3" />
 
   <PropertyGroup>
     <OutputType>Exe</OutputType>
     <TargetFramework>net10.0</TargetFramework>
     <IsPackable>false</IsPackable>
     <IsAspireHost>true</IsAspireHost>
+    <!-- Aspire 13.5 warns (ASPIRE010) whenever AspireUseCliBundle is false — which is its own
+         default. Left off deliberately: the bundle changes how DCP and the dashboard are acquired
+         (through the Aspire CLI rather than the package references the SDK adds when it is off),
+         and nothing here launches through the Aspire CLI — AppHosts run via `dotnet run` and
+         Aspire.Hosting.Testing. Opting in is a harness behaviour change, not a version bump. -->
+    <NoWarn>$(NoWarn);ASPIRE010</NoWarn>
     <UserSecretsId>asyncresponse-apphost-7253e3ff-66ad-4f3c-95f1-a44f0327ddda</UserSecretsId>
   </PropertyGroup>
 
