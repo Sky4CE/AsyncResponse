@@ -82,6 +82,21 @@ public class DurableFlowOptions
     public TimeSpan TimerInProcessThreshold { get; set; } = TimeSpan.FromSeconds(10);
 
     /// <summary>
+    /// Ledger size, in bytes (estimated from the serialized input, step results, values, and
+    /// context), past which the executor logs a warning naming the flow — once when the threshold
+    /// is first crossed and again at each doubling, so a long run logs a handful of times, not once
+    /// per step. Every checkpoint rewrites the <em>whole</em> ledger, so persistence cost grows
+    /// with each completed step: a run of N steps with similar result sizes serializes about N²/2
+    /// step-results over its lifetime, and the store's <c>MaxStateBytes</c> (or the provider's
+    /// item cap) is the hard limit. The warning is the early signal to keep step results small
+    /// (persist large data yourself and pass references) or to partition a long history into child
+    /// flows. <c>null</c> disables it. Default: 512 KiB — under the smallest bundled hard cap
+    /// (DynamoDB's 350 KB item, whose store defaults <c>MaxStateBytes</c> to 350 000) users should
+    /// lower it accordingly.
+    /// </summary>
+    public long? LedgerSizeWarningBytes { get; set; } = 512 * 1024;
+
+    /// <summary>
     /// Accepts the risk of running the worker subscriber in early ACK (<c>AckAfterEnqueue</c>)
     /// while durable flows are registered, suppressing the startup error. Durable-flow wake-ups
     /// ride the worker queue and rely on broker redelivery for crash recovery; with early ACK, a

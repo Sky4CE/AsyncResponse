@@ -978,23 +978,35 @@ internal abstract class DbAsyncResponseChannelBase :
 
                 // Pre-filter BEFORE enqueueing. The work item re-checks this anyway, but the store
                 // deliberately keeps returning acked rows (cross-process fan-out), so every sweep
-                // tick and every targeted signal re-enqueued one item per retained message. A
-                // waiter wedged in a slow user Until predicate holds its per-correlation executor,
-                // those items pile up against the executor's bounded queue, and the next
-                // EnqueueAsync then parks the PROCESS-WIDE dispatch loop — which walks correlation
-                // ids sequentially — so every other waiter stopped receiving and local publishers
-                // blocked on the same enqueue. Skipping messages no live subscription would take
-                // keeps a wedged predicate's blast radius inside its own correlation id.
+                // tick and every targeted signal re-enqueued one item per retained message.
+                // Skipping messages no live subscription would take keeps the already-consumed
+                // history out of the executor queue.
                 if (!WouldDeliverToAnySubscription(message, subscriptions))
                     continue;
 
                 // Work-item class, not a lambda: a queued closure would chain display classes
                 // pinning this paging frame (batch list, cursors, watermark) for as long as the
                 // item sits in the executor's bounded queue.
-                await _executors.EnqueueAsync(
+                //
+                // NON-BLOCKING admission. This loop is the process-wide dispatch sweep and walks
+                // correlation ids sequentially, so waiting for ONE correlation id's executor
+                // capacity here (the old EnqueueAsync) parked delivery for every other waiter in
+                // the process: a waiter wedged in a slow Until predicate, fed a backlog of NEW
+                // progress messages (the pre-filter above only screens consumed history), filled
+                // its 1024-slot executor and the sweep then blocked on slot 1025 without ever
+                // querying the next correlation id. Its per-correlation backpressure became shared
+                // delivery blockage — unrelated remote/polled responses timed out behind it. At
+                // capacity the rest of this correlation id's messages are left unclaimed in the
+                // store, in order (nothing later is enqueued ahead of them), and a rescan of just
+                // this id is scheduled for when the executor has had a poll interval to drain.
+                var outcome = _executors.TryEnqueue(
                     ChannelName(correlationId),
-                    new LocalDispatchWorkItem(this, message, subscriptions, cancellationToken).InvokeAsync,
-                    cancellationToken).ConfigureAwait(false);
+                    new LocalDispatchWorkItem(this, message, subscriptions, cancellationToken).InvokeAsync);
+                if (outcome == SerialExecutorRegistry.TryEnqueueOutcome.Full)
+                {
+                    ScheduleBackpressureRescan(correlationId, cancellationToken);
+                    return;
+                }
             }
 
             if (messages.Count < _options.PendingMessageBatchSize)
@@ -1253,6 +1265,53 @@ internal abstract class DbAsyncResponseChannelBase :
     }
 
     private protected void SignalDispatcher(string? correlationId = null) => _signals.Writer.TryWrite(correlationId);
+
+    /// <summary>
+    /// Correlation ids whose executor was at capacity during a sweep and that have a rescan
+    /// pending. One pending rescan per id: a saturated id is re-signalled once per poll interval,
+    /// not once per sweep that found it full.
+    /// </summary>
+    private readonly ConcurrentDictionary<string, byte> _backpressureRescans = new(StringComparer.Ordinal);
+
+    /// <summary>
+    /// Re-signals a targeted scan of <paramref name="correlationId"/> after one poll interval —
+    /// the time the sweep would otherwise have waited for the saturated executor, spent letting
+    /// every other correlation id deliver instead. The messages themselves stay in the store
+    /// (unclaimed, unseen) until that scan enqueues them, in their original order.
+    /// </summary>
+    private void ScheduleBackpressureRescan(string correlationId, CancellationToken cancellationToken)
+    {
+        if (!_backpressureRescans.TryAdd(correlationId, 0))
+            return;
+
+        if (_logger.IsEnabled(LogLevel.Debug))
+        {
+            _logger.LogDebug(
+                "{Provider} dispatch for correlationId {CorrelationId} is at executor capacity; the remaining messages are left in the store and this id is rescanned after the poll interval.",
+                _providerName, correlationId);
+        }
+
+        _ = RescanAfterDelayAsync(correlationId, cancellationToken);
+    }
+
+    private async Task RescanAfterDelayAsync(string correlationId, CancellationToken cancellationToken)
+    {
+        try
+        {
+            await Task.Delay(CurrentPollInterval(), cancellationToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            // Listener stopping: nothing to rescan for.
+        }
+        finally
+        {
+            _backpressureRescans.TryRemove(correlationId, out _);
+        }
+
+        if (!cancellationToken.IsCancellationRequested)
+            SignalDispatcher(correlationId);
+    }
 
     private async Task<bool> WaitForAcknowledgementAsync(PendingConfirmation confirmation, CancellationToken cancellationToken)
     {

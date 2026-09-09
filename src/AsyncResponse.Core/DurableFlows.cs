@@ -46,6 +46,10 @@ internal sealed class DurableFlowService : IDurableFlows
         else
             ArgumentException.ThrowIfNullOrWhiteSpace(flowId);
 
+        // Every id is validated BEFORE anything is published: the publish below is the start's
+        // commit point, and a job for an id every store would reject must never leave the process.
+        FlowStateConcurrency.EnsurePortableFlowId(flowId);
+
         await using var scope = _scopeFactory.CreateAsyncScope();
         var store = scope.ServiceProvider.GetRequiredService<IFlowStateStore>();
 
@@ -61,52 +65,100 @@ internal sealed class DurableFlowService : IDurableFlows
             LastMessage = "Flow started.",
             CreatedAtUtc = now,
             UpdatedAtUtc = now,
+            Revision = 0,
             Context = _propagation.Capture()
         };
 
-        if (await FlowStateConcurrency.TryCreateAsync(
+        // PUBLISH FIRST, then create. The worker job carries the whole initial ledger, and
+        // IDurableFlowExecutor.CreateAndExecuteAsync creates the ledger itself (insert-if-absent)
+        // before executing — so the publish is the single durable commit point of a start:
+        //  - a crash before the publish leaves nothing behind (the caller sees a fault and retries);
+        //  - a crash after the publish leaves a job whose execution creates and runs the flow.
+        // The previous order (create, then publish) had an unrecoverable gap: a process dying
+        // between the two left a committed Running ledger with Attempts = 0 that nothing would
+        // ever execute, and IFlowStateStore has no enumeration for a reconciler to go find it.
+        // The publish still runs the retry ladder the ingress uses, and a publish that fails for
+        // good surfaces the id (DurableFlowNotDispatchedException) — now with nothing persisted.
+        var id = flowId;
+        var initialStateJson = FlowStateJson.Serialize(state);
+        await PublishStartAsync(
+            executor => executor.CreateAndExecuteAsync(id, initialStateJson),
+            id,
+            cancellationToken).ConfigureAwait(false);
+
+        // The starter's own create keeps the caller-facing contract: the ledger exists by the time
+        // StartAsync returns (GetStateAsync / ResumeAsync right after a start see it), and a
+        // conflicting reuse of an explicit id is reported to THIS caller. Losing the create race —
+        // to the executor that already picked the job up, or to a concurrent identical start — is
+        // the expected shape, not an error. A store fault here no longer matters for the run: the
+        // job is published and the executor creates the ledger; the caller gets the id.
+        bool created;
+        try
+        {
+            created = await FlowStateConcurrency.TryCreateAsync(
                 store,
                 flowId,
                 state,
                 _options.StateExpiry,
-                cancellationToken).ConfigureAwait(false))
+                cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException || !cancellationToken.IsCancellationRequested)
+        {
+            _logger.LogWarning(
+                ex,
+                "Durable flow {FlowId} start job is published but the starter could not write the ledger; the executor creates it when the job is picked up.",
+                flowId);
+            return flowId;
+        }
+
+        if (created)
         {
             _logger.LogInformation("Started durable flow {FlowId} ({FlowType}).", flowId, typeof(TFlow).Name);
+            return flowId;
         }
-        else
+
+        var existing = await store.LoadAsync(flowId, cancellationToken).ConfigureAwait(false);
+        if (existing is null)
         {
-            var existing = await store.LoadAsync(flowId, cancellationToken).ConfigureAwait(false)
-                ?? throw new InvalidOperationException(
-                    $"Durable flow '{flowId}' already exists but its ledger is expired or unreadable.");
-            EnsureIdempotentStart<TFlow, TInput>(existing, inputJson, flowId);
-
-            // A semantically identical retry re-enqueues the existing run; completed steps skip.
-            _logger.LogInformation("Durable flow {FlowId} already exists; re-enqueueing instead of creating a duplicate.", flowId);
+            // Lost the create to a ledger that has since expired: the published job's create wins
+            // the next time round. Nothing for the caller to do.
+            _logger.LogWarning("Durable flow {FlowId} start job is published; the existing ledger is expired and the executor re-creates it.", flowId);
+            return flowId;
         }
 
-        // The ledger is committed; from here the run EXISTS and is Running. If the wake-up never
-        // gets published, nothing in the system will ever execute it — IFlowStateStore has no
-        // enumeration, so no reconciler can go find it either. Retry the publish through the same
-        // ladder the ingress uses, and if it still fails, surface the flow id rather than the bare
-        // transport fault: with the id, a caller can re-drive the start idempotently; without it
-        // (the generated-id case) the run is simply lost.
-        var id = flowId;
+        // Throws DurableFlowIdConflictException for different work; the executor drops the
+        // already-published job on the same test.
+        EnsureIdempotentStart<TFlow, TInput>(existing, inputJson, flowId);
+
+        // A semantically identical retry: the published job re-enqueues the existing run
+        // (completed steps skip) instead of creating a duplicate.
+        _logger.LogInformation("Durable flow {FlowId} already exists; the start job re-enqueues the existing run instead of creating a duplicate.", flowId);
+        return flowId;
+    }
+
+    /// <summary>
+    /// Publishes a start job through the ingress's retry ladder. A publish that still fails
+    /// surfaces as <see cref="DurableFlowNotDispatchedException"/> carrying the id: nothing was
+    /// persisted, so the caller simply retries the start (idempotent with the same id).
+    /// </summary>
+    private async Task PublishStartAsync(
+        System.Linq.Expressions.Expression<Func<IDurableFlowExecutor, Task>> job,
+        string flowId,
+        CancellationToken cancellationToken)
+    {
         try
         {
             await AsyncResponseRetry.ExecuteAsync(
                 async token =>
                 {
-                    await _builder.EnqueueWorkerAsync<IDurableFlowExecutor>(
-                        executor => executor.ExecuteAsync(id),
-                        token).ConfigureAwait(false);
+                    await _builder.EnqueueWorkerAsync(job, token).ConfigureAwait(false);
                     return true;
                 },
                 // Only the CALLER's cancellation ends the ladder. An OperationCanceledException
                 // whose token is not the caller's is a transport or SDK timeout — brokers surface
                 // those as TaskCanceledException all the time — and that is exactly the transient
                 // shape this retry exists for. Excluding the whole exception type meant the most
-                // common recoverable publish failure got zero retries and went straight to an
-                // orphaned Running ledger.
+                // common recoverable publish failure got zero retries.
                 isTransient: ex => ex is not OperationCanceledException || !cancellationToken.IsCancellationRequested,
                 maxAttempts: 4,
                 baseDelay: TimeSpan.FromMilliseconds(250),
@@ -118,12 +170,10 @@ internal sealed class DurableFlowService : IDurableFlows
         {
             _logger.LogError(
                 ex,
-                "Durable flow {FlowId} was persisted but its worker job could not be published; the run exists with no wake-up. Retry the start with this id to re-enqueue it.",
-                id);
-            throw new DurableFlowNotDispatchedException(id, ex);
+                "Durable flow {FlowId} could not be started: its worker job was not published after retries. Nothing was persisted; retry the start (idempotent with this id).",
+                flowId);
+            throw new DurableFlowNotDispatchedException(flowId, ex);
         }
-
-        return flowId;
     }
 
     /// <inheritdoc />
@@ -164,9 +214,7 @@ internal sealed class DurableFlowService : IDurableFlows
         string requestedInputJson,
         string flowId)
     {
-        var sameFlowType = string.Equals(existing.FlowTypeName, typeof(TFlow).FullName, StringComparison.Ordinal);
-        var sameInputType = string.Equals(existing.InputTypeName, typeof(TInput).FullName, StringComparison.Ordinal);
-        if (sameFlowType && sameInputType && FlowStateJson.JsonEquivalent(existing.InputJson, requestedInputJson))
+        if (FlowStateConcurrency.IsSameStart(existing, typeof(TFlow).FullName, typeof(TInput).FullName, requestedInputJson))
             return;
 
         throw new DurableFlowIdConflictException(

@@ -24,6 +24,18 @@ public interface IDurableFlowExecutor
     Task ExecuteAsync(string flowId);
 
     /// <summary>
+    /// Start target: the job <see cref="IDurableFlows.StartAsync{TFlow,TInput}"/> publishes. Creates
+    /// the ledger from the serialized initial state the job carries when no ledger exists yet
+    /// (insert-if-absent), then runs <see cref="ExecuteAsync"/>. The publish of this job — not the
+    /// starter's own ledger write — is the start's commit point: a process that dies after the
+    /// publish leaves a job whose execution creates the run, never a committed ledger that nothing
+    /// will ever execute. An existing ledger for the same flow type and semantically identical
+    /// input is executed as an idempotent re-start; one bound to different work is logged and the
+    /// job dropped (the starter already reported the conflict to its caller).
+    /// </summary>
+    Task CreateAndExecuteAsync(string flowId, string initialStateJson);
+
+    /// <summary>
     /// Lost-subscriber resume target: re-enqueues <see cref="ExecuteAsync"/> on the worker
     /// transport (never runs the flow inline on a publisher's dispatch path).
     /// </summary>
@@ -308,6 +320,63 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
             "Durable flow {FlowId} is executing on another live worker (lease renewed through the full wait window); skipping duplicate delivery.",
             flowId);
         return null;
+    }
+
+    /// <inheritdoc />
+    public async Task CreateAndExecuteAsync(string flowId, string initialStateJson)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(flowId);
+        ArgumentException.ThrowIfNullOrWhiteSpace(initialStateJson);
+
+        // The carrier is the ledger wire format itself. A carrier this build cannot read is
+        // deterministic: FlowStateUnreadableException propagates to the transport's retry and
+        // dead-letter policy, which is the alarm — the same treatment an unreadable stored ledger
+        // gets in ExecuteAsync, and for the same reason (acknowledging it would lose the start).
+        var initial = FlowStateJson.Deserialize(initialStateJson, flowId);
+        if (!string.Equals(initial.FlowId, flowId, StringComparison.Ordinal))
+        {
+            throw new InvalidOperationException(
+                $"The start job for durable flow '{flowId}' carries initial state for '{initial.FlowId}'; refusing to create a ledger under the wrong id.");
+        }
+
+        await using (var scope = _scopeFactory.CreateAsyncScope())
+        {
+            var store = scope.ServiceProvider.GetRequiredService<IFlowStateStore>();
+            if (await FlowStateConcurrency.TryCreateAsync(store, flowId, initial, _options.StateExpiry).ConfigureAwait(false))
+            {
+                // The starter died (or has not got there yet) between its publish and its own
+                // create: the job is the durable record of the start, so the ledger comes from it.
+                _logger.LogInformation("Durable flow {FlowId} ({FlowType}) ledger created from its start job.", flowId, initial.FlowTypeName);
+            }
+            else
+            {
+                var existing = await store.LoadAsync(flowId).ConfigureAwait(false);
+                if (existing is null)
+                {
+                    // Created and already expired or pruned between the two calls: genuinely gone,
+                    // the one case where acknowledging the start is right (ExecuteAsync's rule).
+                    _logger.LogWarning("Durable flow {FlowId} exists but its ledger is expired or gone; nothing to execute.", flowId);
+                    return;
+                }
+
+                if (!FlowStateConcurrency.IsSameStart(existing, initial.FlowTypeName, initial.InputTypeName, initial.InputJson))
+                {
+                    // The id was reused for different work. The starter that published this job
+                    // saw the same conflict on its own create and threw DurableFlowIdConflictException
+                    // to its caller; executing the EXISTING run here would wake a flow nobody asked
+                    // to wake, and creating a second one is impossible. Drop the job, loudly.
+                    _logger.LogError(
+                        "Durable flow {FlowId} start job dropped: the id is already bound to flow type {ExistingFlowType} with different input, not {RequestedFlowType}. Idempotent retries must use the same flow type, input type, and semantically identical input.",
+                        flowId, existing.FlowTypeName, initial.FlowTypeName);
+                    return;
+                }
+
+                // Same start, ledger already there (the starter's own create won, or this is a
+                // redelivery / an idempotent re-start of a live run): fall through and execute it.
+            }
+        }
+
+        await ExecuteAsync(flowId).ConfigureAwait(false);
     }
 
     /// <inheritdoc />

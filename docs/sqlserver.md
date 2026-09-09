@@ -29,6 +29,12 @@ mode can be added later behind the same options if demand appears):
 - The sweep advances a stable `created_at, id` keyset cursor until every retained row for that
   correlation id is considered. `PendingMessageBatchSize` controls page shape; it no longer limits
   one sweep to the oldest batch, so sustained progress cannot starve a later terminal response.
+- Delivery is serialized per correlation id on a bounded (1024-item) executor, and the sweep
+  admits work to it **without waiting**: a correlation id whose executor is full (a waiter wedged
+  in a slow `Until` predicate under a progress flood) has the rest of its rows left unclaimed, in
+  order, and is rescanned alone after one poll interval, while every other correlation id keeps
+  delivering. Until round 35 the sweep awaited that capacity, so one saturated correlation
+  stalled every waiter in the process.
 
 Active waiters write rows to `asyncresponse_channel_subscribers`; one channel-level loop snapshots
 the registrations that are still active locally and extends only those rows in bounded SQL batches

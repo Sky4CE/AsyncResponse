@@ -90,6 +90,10 @@ public sealed class NativeAotPublishGateTests
                     ["ASPNETCORE_HTTP_PORTS"] = port.ToString(),
                     ["AsyncResponse__Channel"] = "InMemory",
                     ["AsyncResponse__Transport"] = "InMemory",
+                    // A published binary runs as Production, where the sample's simulation and
+                    // ledger routes (GET /durable-flow/{id} below) are gated off; opt in like
+                    // the integration AppHost does.
+                    ["Sample__EnableTestEndpoints"] = "true",
                 },
             };
             var appLog = new StringBuilder();

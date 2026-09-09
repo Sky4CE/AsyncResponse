@@ -26,6 +26,31 @@ internal sealed record KafkaDelivery(
 /// with bounded backoff; a message that exhausts its attempts is produced to the dead-letter topic
 /// and its offset stored so the partition keeps moving.
 /// </summary>
+/// <summary>
+/// A message exhausted its handling and its dead-letter publish failed for good, so it is
+/// neither buried nor committable. Thrown out of the poll loop ON PURPOSE: Kafka commits a
+/// partition <em>position</em>, not per-record acknowledgements, so merely leaving this message's
+/// offset unstored (the previous behavior) protected nothing — the next successful settlement on
+/// the same partition stored a higher offset, the auto-committer committed past the failed
+/// message, and a restart skipped it with no dead-letter copy anywhere. Faulting the subscriber
+/// instead stops the partition at the unresolved message: the consumer closes without ever
+/// storing past it, the supervisor rebuilds it after its backoff, and the message is re-consumed
+/// and its burial retried until the dead-letter topic is back. That is a loud, bounded-rate loop
+/// (every restart logs this failure) and a stalled subscriber — the at-least-once outcome — rather
+/// than a silent loss.
+/// </summary>
+internal sealed class KafkaDeadLetterPublishFailedException(string topic, int partition, long offset, Exception innerException)
+    : Exception(
+        $"Kafka message {topic}[{partition}]@{offset} could not be dead-lettered after exhausting its handling attempts. " +
+        "Its offset is left unstored and the subscriber is restarted so no later settlement on the partition commits past it; " +
+        "fix the dead-letter topic to let the partition advance.",
+        innerException)
+{
+    public string Topic { get; } = topic;
+    public int Partition { get; } = partition;
+    public long Offset { get; } = offset;
+}
+
 internal abstract class KafkaMessageDispatcher : IAsyncDisposable
 {
     private readonly Func<KafkaDelivery, CancellationToken, Task> _handler;
@@ -372,10 +397,11 @@ internal abstract class KafkaMessageDispatcher : IAsyncDisposable
 
         // Settlement ignores the stopping token, as every sibling settlement path does: a shutdown
         // landing between the dead-letter publish and the offset store would abort the publish
-        // mid-flight and leave the poison message neither buried nor committed. Guarded for the
-        // same reason as the at-the-cap publish: this runs inside the poll loop, and a permanently
-        // failing dead-letter topic would otherwise fault the subscriber into a restart loop with
-        // the offset unstored.
+        // mid-flight and leave the poison message neither buried nor committed. A burial that
+        // fails for good FAULTS the poll loop (see KafkaDeadLetterPublishFailedException): an
+        // earlier round swallowed it and left the offset unstored, which looked safe but was not —
+        // the next settlement on the same partition committed past this message. The restart loop
+        // it replaces is bounded by the supervisor's backoff and is the at-least-once outcome.
         try
         {
             await DeadLetterCoreAsync(
@@ -394,11 +420,11 @@ internal abstract class KafkaMessageDispatcher : IAsyncDisposable
         {
             Logger.LogError(
                 deadLetterException,
-                "Failed to dead-letter unprocessable Kafka message {Topic}[{Partition}]@{Offset}; its offset is left unstored so the burial is retried after a restart or rebalance, but later settlements on the partition can commit past it — fix the dead-letter topic promptly.",
+                "Failed to dead-letter unprocessable Kafka message {Topic}[{Partition}]@{Offset}; its offset is left unstored and the subscriber restarts so no later settlement commits past it. The partition is stalled until the dead-letter topic is fixed.",
                 message.Topic,
                 message.Partition,
                 message.Offset);
-            return;
+            throw new KafkaDeadLetterPublishFailedException(message.Topic, message.Partition, message.Offset, deadLetterException);
         }
 
         // Guarded like every other settlement: a rebalance revoking this partition makes
@@ -531,14 +557,17 @@ internal sealed class AwaitingKafkaMessageDispatcher(
                         delivery.Partition,
                         delivery.Offset,
                         MaxDeliveryAttempts);
-                    // Guarded like the queued dispatcher's identical publish: this runs inside the
-                    // poll loop, and an unguarded throw (a permanently failing dead-letter topic —
-                    // UnknownTopicOrPart with auto-create off, an over-sized payload — burns the
-                    // publish retries and then rethrows) faulted the whole subscriber with the
-                    // offset unstored, so the supervisor rebuilt the consumer and re-executed the
-                    // handler MaxDeliveryAttempts more times per restart, forever. Swallow and
-                    // leave the offset unstored: the message is re-consumed after restart or
-                    // rebalance and the burial retried.
+                    // A permanently failing dead-letter topic (UnknownTopicOrPart with auto-create
+                    // off, an over-sized payload) burns the publish retries and then throws. That
+                    // throw is deliberately NOT swallowed: an earlier round swallowed it, leaving
+                    // the offset unstored and consumption running, and the next successful
+                    // settlement on the same partition then stored a higher offset — the
+                    // auto-committer committed past this message and a restart skipped it with no
+                    // dead-letter copy. Faulting the subscriber (KafkaDeadLetterPublishFailedException)
+                    // stalls the partition AT this message: the consumer closes without storing
+                    // past it, the supervisor restarts it after its backoff, and the handler and
+                    // burial are retried per restart — a loud, bounded-rate loop until the
+                    // dead-letter topic is fixed, which is the at-least-once outcome.
                     try
                     {
                         await DeadLetterAsync(
@@ -552,11 +581,11 @@ internal sealed class AwaitingKafkaMessageDispatcher(
                     {
                         Logger.LogError(
                             deadLetterException,
-                            "Failed to dead-letter Kafka message {Topic}[{Partition}]@{Offset} at the delivery cap; its offset is left unstored so the burial is retried after a restart or rebalance, but later settlements on the partition can commit past it — fix the dead-letter topic promptly.",
+                            "Failed to dead-letter Kafka message {Topic}[{Partition}]@{Offset} at the delivery cap; its offset is left unstored and the subscriber restarts so no later settlement commits past it. The partition is stalled until the dead-letter topic is fixed.",
                             delivery.Topic,
                             delivery.Partition,
                             delivery.Offset);
-                        return;
+                        throw new KafkaDeadLetterPublishFailedException(delivery.Topic, delivery.Partition, delivery.Offset, deadLetterException);
                     }
 
                     StoreOffsetAfterSettlement(delivery);

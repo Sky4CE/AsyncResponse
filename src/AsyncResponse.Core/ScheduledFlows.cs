@@ -65,16 +65,17 @@ internal sealed class ScheduledFlowRegistration
 /// is already due are skipped.
 /// </para>
 /// <para>
-/// <b>A committed occurrence is never abandoned.</b> Skipping applies only to occurrences whose
-/// ledger was never created. An occurrence whose ledger IS committed but whose worker job could
-/// not be published (<see cref="DurableFlowNotDispatchedException"/>: the broker outage outlasted
-/// the start's retry ladder) is a <em>Running</em> run nothing would ever execute — so the loop
-/// keeps it in an in-process re-drive queue and repeats the idempotent start every
-/// <see cref="ScheduledFlowOptions.RedriveInterval"/> until the wake-up is published. Because
-/// that queue dies with the process, each loop also probes
+/// <b>A due occurrence whose start could not be published is never abandoned.</b> Skipping
+/// applies only to occurrences the loop never reached. An occurrence whose start job could not be
+/// published (<see cref="DurableFlowNotDispatchedException"/>: the broker outage outlasted the
+/// start's retry ladder — nothing was persisted, the publish is the start's commit point) is kept
+/// in an in-process re-drive queue and its idempotent start repeated every
+/// <see cref="ScheduledFlowOptions.RedriveInterval"/> until the job is published. Because that
+/// queue dies with the process, each loop also probes
 /// <see cref="ScheduledFlowOptions.StartupRedriveWindow"/> of recent occurrences at startup and
-/// re-drives any whose ledger is Running with zero attempts — the same signature a crash between
-/// the ledger commit and the publish leaves behind.
+/// re-drives any whose ledger is Running with zero attempts — a run whose wake-up was lost in
+/// transit (an early-ACK worker subscriber, a broker that dropped it) and that nothing else will
+/// find.
 /// </para>
 /// </summary>
 internal sealed class ScheduledFlowService(
@@ -287,13 +288,14 @@ internal sealed class ScheduledFlowService(
         }
         catch (DurableFlowNotDispatchedException ex)
         {
-            // Worse than a failed start: the occurrence's ledger IS committed and Running, and only
-            // its wake-up was lost. Nothing else will retry it — IFlowStateStore has no
-            // enumeration for a reconciler to find it — so the loop re-drives it itself: the id is
-            // deterministic and the start idempotent, so repeating it only re-publishes the job.
+            // The start's publish failed after retries, so the occurrence was NOT started (the
+            // publish is the start's commit point; nothing was persisted). Unlike a plain failure
+            // this one is worth re-driving on its own: the id is deterministic and the start
+            // idempotent, so repeating it publishes the job once the broker is back — and if the
+            // publish had landed ambiguously, the same id dedupes against the run it created.
             _logger.LogError(
                 ex,
-                "Scheduled flow '{Schedule}' persisted occurrence {FlowId} but could not publish its worker job; the run exists with no wake-up and will be re-driven every {RedriveInterval} until it is published.",
+                "Scheduled flow '{Schedule}' could not publish the start job for occurrence {FlowId}; the occurrence is not started and will be re-driven every {RedriveInterval} until it is published.",
                 registration.Name, flowId, registration.Options.RedriveInterval);
             return false;
         }

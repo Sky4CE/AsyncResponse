@@ -14,12 +14,35 @@ internal static class FlowStateConcurrency
         TimeSpan ttl,
         CancellationToken cancellationToken = default)
     {
-        if (FlowIdNotPortable(flowId) is { } rejection)
-            throw new ArgumentException(rejection, nameof(flowId));
+        EnsurePortableFlowId(flowId);
 
         state.Revision = 0;
         return store.TryCreateAsync(flowId, state, ttl, cancellationToken);
     }
+
+    /// <summary>
+    /// Throws <see cref="ArgumentException"/> for an id that fails <see cref="FlowIdNotPortable"/>.
+    /// Called by every create, and by <c>IDurableFlows.StartAsync</c> BEFORE it publishes the start
+    /// job — the publish is the start's commit point, so a job for an id no store would accept must
+    /// never leave the process.
+    /// </summary>
+    internal static void EnsurePortableFlowId(string flowId)
+    {
+        if (FlowIdNotPortable(flowId) is { } rejection)
+            throw new ArgumentException(rejection, nameof(flowId));
+    }
+
+    /// <summary>
+    /// Whether an existing ledger describes the same start as the requested one: same flow type,
+    /// same input type (both ordinal), and semantically identical input JSON. The one idempotency
+    /// test for flow ids, shared by the starter (which reports a mismatch to its caller as
+    /// <see cref="DurableFlowIdConflictException"/>) and the executor's start target (which drops
+    /// the job on a mismatch) so the two can never disagree about what "the same run" means.
+    /// </summary>
+    internal static bool IsSameStart(FlowState existing, string? flowTypeName, string? inputTypeName, string? inputJson)
+        => string.Equals(existing.FlowTypeName, flowTypeName, StringComparison.Ordinal)
+            && string.Equals(existing.InputTypeName, inputTypeName, StringComparison.Ordinal)
+            && FlowStateJson.JsonEquivalent(existing.InputJson, inputJson ?? string.Empty);
 
     /// <summary>
     /// Enforces the portable flow-id contract on every final id at creation — the single door all
@@ -183,6 +206,11 @@ internal static class FlowStateConcurrency
             AsyncResponseChannelOptions.EnsureTimerBacked(defaultStepTimeout, nameof(DurableFlowOptions), nameof(options.DefaultStepTimeout));
         AsyncResponseChannelOptions.EnsurePersistedTtl(options.ExecutionLeaseDuration, nameof(DurableFlowOptions), nameof(options.ExecutionLeaseDuration));
         AsyncResponseChannelOptions.EnsureTimerBacked(options.ExecutionLeaseRenewInterval, nameof(DurableFlowOptions), nameof(options.ExecutionLeaseRenewInterval));
+        if (options.LedgerSizeWarningBytes is { } ledgerWarning && ledgerWarning <= 0)
+        {
+            throw new InvalidOperationException(
+                $"{nameof(DurableFlowOptions)}.{nameof(options.LedgerSizeWarningBytes)} must be positive, or null to disable the warning (got {ledgerWarning}).");
+        }
         if (options.ExecutionLeaseRenewInterval >= options.ExecutionLeaseDuration)
         {
             throw new InvalidOperationException(

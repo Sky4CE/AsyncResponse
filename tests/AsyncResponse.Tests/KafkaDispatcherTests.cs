@@ -492,7 +492,7 @@ public class KafkaDispatcherTests
     }
 
     [Fact]
-    public async Task Awaiting_DeadLetterPublishFailsPermanently_SwallowsWithoutStoringOffset()
+    public async Task Awaiting_DeadLetterPublishFailsPermanently_FaultsTheDispatch_SoNoLaterSettlementCommitsPastIt()
     {
         var consumer = new FakeKafkaConsumerClient();
         var producer = new FakeKafkaProducerClient { PublishException = new InvalidOperationException("broker gone") };
@@ -502,14 +502,20 @@ public class KafkaDispatcherTests
             consumer: consumer,
             producer: producer);
 
-        // A failed burial must NOT escape: this call runs inside the poll loop, and a propagated
-        // throw faulted the whole subscriber with the offset unstored — the supervisor rebuilt
-        // the consumer, re-consumed the message, and re-executed the failing handler
-        // MaxDeliveryAttempts more times per restart, forever.
-        await dispatcher.HandleAsync(KafkaTestData.Delivery(Topic, offset: 1), CancellationToken.None);
+        // Round 35: round 31 swallowed this burial failure and merely left the offset unstored —
+        // which protects nothing on Kafka, because a later successful settlement on the same
+        // partition stores a HIGHER offset and the auto-committer commits past the failed message
+        // (see the subscriber-level pin in KafkaSubscriberTests). The failure now faults the
+        // dispatch so the poll loop stops at this message and the supervisor restarts the
+        // consumer after its backoff. Pre-fix failure: HandleAsync returned normally.
+        var ex = await Assert.ThrowsAsync<KafkaDeadLetterPublishFailedException>(
+            () => dispatcher.HandleAsync(KafkaTestData.Delivery(Topic, offset: 1), CancellationToken.None));
 
-        // The offset stays unstored so a restart or rebalance redelivers the message and the
-        // burial is retried.
+        Assert.Equal(Topic, ex.Topic);
+        Assert.Equal(1, ex.Offset);
+        Assert.IsType<InvalidOperationException>(ex.InnerException);
+        // The offset stays unstored so the restarted consumer re-consumes the message and retries
+        // the burial.
         Assert.Empty(consumer.StoredOffsets);
     }
 
@@ -1035,12 +1041,13 @@ public class KafkaDispatcherTests
     }
 
     [Fact]
-    public async Task DiscardUnprocessable_WhenTheDeadLetterPublishFailsPermanently_DoesNotFaultThePollLoop()
+    public async Task DiscardUnprocessable_WhenTheDeadLetterPublishFailsPermanently_FaultsTheDispatch_SoNoLaterSettlementCommitsPastIt()
     {
-        // Regression (round 31): the burial itself was unguarded on this path (only the offset
-        // store was wrapped), and this call originates inside the poll loop's own catch arm — a
-        // permanently failing dead-letter topic burned the publish retries, rethrew, faulted the
-        // subscriber with the offset unstored, and the restart re-ran the same discard forever.
+        // Round 31 guarded this burial and swallowed its failure with the offset unstored; round
+        // 35 reverses the swallow (the malformed-message path reproduced the same commit-past
+        // loss as the handler-failure path). The typed fault is what the poll loop lets escape so
+        // the supervisor restarts the consumer with backoff and the partition stays parked at
+        // this message. Pre-fix failure: DiscardUnprocessableAsync returned normally.
         var consumer = new FakeKafkaConsumerClient();
         var producer = new FakeKafkaProducerClient { PublishException = new InvalidOperationException("broker gone") };
         await using var dispatcher = CreateDispatcher(
@@ -1051,12 +1058,13 @@ public class KafkaDispatcherTests
 
         var message = KafkaTestData.Message(Topic, offset: 4, payload: "", ("correlationId", "corr-x"));
 
-        await dispatcher.DiscardUnprocessableAsync(
+        var ex = await Assert.ThrowsAsync<KafkaDeadLetterPublishFailedException>(() => dispatcher.DiscardUnprocessableAsync(
             message,
             new InvalidDataException("no payload"),
-            CancellationToken.None);
+            CancellationToken.None));
 
-        // No burial and no commit: the offset stays unstored so a restart or rebalance retries
+        Assert.Equal(4, ex.Offset);
+        // No burial and no commit: the offset stays unstored so the restarted consumer retries
         // the burial instead of dropping the message with no record.
         Assert.Empty(consumer.StoredOffsets);
     }
@@ -1129,8 +1137,9 @@ public class KafkaDispatcherTests
         // produce to an undeliverable topic waits out librdkafka's message.timeout.ms (5 min by
         // default) PER attempt — past max.poll.interval.ms, evicting the consumer mid-burial and
         // rebalancing the partition to a peer that hit the same message: a rebalance storm. The
-        // ladder is now bounded to a quarter of the poll interval and the caller keeps treating a
-        // failed burial as "offset left unstored, retried later".
+        // ladder is now bounded to a quarter of the poll interval; once it runs out the caller
+        // faults the dispatch (round 35) with the offset left unstored, so the supervisor restarts
+        // the consumer instead of a later settlement committing past the message.
         var producer = new HangingKafkaProducerClient();
         await using var dispatcher = KafkaMessageDispatcher.Create(
             (_, _) => Task.CompletedTask,
@@ -1148,10 +1157,10 @@ public class KafkaDispatcherTests
             Group,
             KafkaSubscriberRole.Worker);
 
-        await dispatcher.DiscardUnprocessableAsync(
+        await Assert.ThrowsAsync<KafkaDeadLetterPublishFailedException>(() => dispatcher.DiscardUnprocessableAsync(
             KafkaTestData.Message(Topic, offset: 4, payload: ""),
             new InvalidDataException("no payload"),
-            CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(5));
+            CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(5)));
 
         Assert.True(producer.SawCancellation);
     }

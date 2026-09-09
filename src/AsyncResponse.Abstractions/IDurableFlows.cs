@@ -11,6 +11,10 @@ public interface IDurableFlows
 {
     /// <summary>
     /// Creates a flow run and enqueues its execution on the worker transport. Returns the flow id.
+    /// The publish of the start job is the commit point: the job carries the initial ledger and its
+    /// execution creates the run if the starter's own ledger write never happened, so a process that
+    /// dies mid-start leaves either nothing or a run that executes — never a committed ledger that
+    /// nothing will ever wake. The ledger exists by the time this method returns.
     /// <para>
     /// Pass a non-empty <paramref name="flowId"/> to make the start idempotent: starting an id that
     /// already exists with the same flow type and semantically identical input re-enqueues the
@@ -22,10 +26,11 @@ public interface IDurableFlows
     /// <exception cref="ArgumentException"><paramref name="flowId"/> is empty or whitespace.</exception>
     /// <exception cref="InvalidOperationException"><paramref name="flowId"/> already belongs to different work.</exception>
     /// <exception cref="DurableFlowNotDispatchedException">
-    /// The ledger was committed but the worker job could not be published, even after retries — the
-    /// run exists as <see cref="FlowRunStatus.Running"/> with nothing scheduled to execute it.
-    /// <see cref="DurableFlowNotDispatchedException.FlowId"/> carries the id (including a generated
-    /// one) so the orphan can be re-driven:
+    /// The start job could not be published to the worker transport, even after retries. Nothing
+    /// was persisted — the publish is the start's commit point (the job carries the initial ledger
+    /// and its execution creates the run), so no orphaned <see cref="FlowRunStatus.Running"/> ledger
+    /// is left behind. <see cref="DurableFlowNotDispatchedException.FlowId"/> carries the id the
+    /// start would have used (including a generated one) so a retry can stay idempotent:
     /// <code>
     /// try
     /// {
@@ -33,7 +38,7 @@ public interface IDurableFlows
     /// }
     /// catch (DurableFlowNotDispatchedException ex)
     /// {
-    ///     // Idempotent: the atomic create dedupes and re-enqueues the SAME run.
+    ///     // Idempotent: if the publish did land after all, the same id dedupes against that run.
     ///     return await flows.StartAsync&lt;ProvisioningFlow, ProvisionRequest&gt;(request, ex.FlowId);
     /// }
     /// </code>

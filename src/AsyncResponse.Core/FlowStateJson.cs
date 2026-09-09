@@ -45,6 +45,46 @@ internal static class FlowStateJson
         return state;
     }
 
+    /// <summary>
+    /// A cheap lower-bound estimate of the serialized ledger size in UTF-16 code units: the sum of
+    /// every string the ledger carries (input, messages, step results, values, context). O(steps +
+    /// values) string-length reads, against a serialization that is O(bytes) — used to decide
+    /// whether to warn about ledger growth without paying a second serialization per checkpoint.
+    /// JSON escaping and property names only add to the real size, so "over the threshold" here
+    /// is never a false positive.
+    /// </summary>
+    public static long EstimateLedgerChars(FlowState state)
+    {
+        long size = (state.InputJson?.Length ?? 0) + (state.LastMessage?.Length ?? 0);
+
+        if (state.Steps is { } steps)
+        {
+            foreach (var (name, step) in steps)
+            {
+                size += name.Length
+                    + (step.ResultJson?.Length ?? 0)
+                    + (step.Message?.Length ?? 0)
+                    + (step.PendingCorrelationId?.Length ?? 0)
+                    + (step.PendingPayloadTypeFullName?.Length ?? 0)
+                    + (step.ChildFlowId?.Length ?? 0);
+            }
+        }
+
+        if (state.Values is { } values)
+        {
+            foreach (var (key, value) in values)
+                size += key.Length + (value?.Length ?? 0);
+        }
+
+        if (state.Context is { } context)
+        {
+            foreach (var (key, value) in context)
+                size += key.Length + (value?.Length ?? 0);
+        }
+
+        return size;
+    }
+
     public static bool JsonEquivalent(string? left, string right)
     {
         if (string.Equals(left, right, StringComparison.Ordinal))
