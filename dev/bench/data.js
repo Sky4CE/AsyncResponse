@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1789029766970,
+  "lastUpdate": 1789029794280,
   "repoUrl": "https://github.com/Sky4CE/AsyncResponse",
   "entries": {
     "AsyncResponse Microbenchmarks": [
@@ -104924,6 +104924,140 @@ window.BENCHMARK_DATA = {
           {
             "name": "durable-flow-storm throughput",
             "value": 1334.6061561218012,
+            "unit": "flows/s"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "tyunisov@gmail.com",
+            "name": "Sky4CE",
+            "username": "Sky4CE"
+          },
+          "committer": {
+            "email": "tyunisov@gmail.com",
+            "name": "Sky4CE",
+            "username": "Sky4CE"
+          },
+          "distinct": true,
+          "id": "22586748ca7f0a0d389ca2b649863ddd93bf9d09",
+          "message": "fix: keep the envelope reader's own diagnostics out of the body-free scrub\n\nRound 36's F3 fix routed every channel and ledger reader through JsonSafety and let it replace\nEVERY JsonException. But AsyncResponseEnvelopeConverter authors six of its own — \"SchemaVersion is\nrequired.\", \"Payload is null or absent on a Success envelope\", \"Success must be a boolean.\" — which\nname only the wire contract's own property names and never a byte of the inbound body. Scrubbing\nthose to \"Failed to parse JSON payload (2 UTF-16 code units) at line 0, byte position 2\" cost the\nprimary operator diagnosis for the commonest malformed-envelope cause in production, a foreign or\nmismatched producer writing to the response channel, and protected nothing.\n\nJsonSafety.WireContractFailure now builds those as a plain JsonException marked body-free, and every\nSafeDeserialize catch is filtered on !IsBodyFree, so a marked failure propagates untouched while the\nreader's own messages are still replaced by size and position. Marked rather than subtyped so the\nexception stays exactly the JsonException it always was: the ingress still classifies it as\npermanent, and every catch and exact-type assertion is unchanged.\n\nTests: a theory over all seven contract violations pinning that the reason survives, its counterpart\npinning that a payload-key failure is still scrubbed, and the Mongo integration pin extended to cover\nboth halves. 2850 unit tests green on net10.0 and net8.0; the data (322) and brokers (55) integration\nbatches green against real containers. docs/security.md and CHANGELOG state the distinction.",
+          "timestamp": "2026-09-10T10:31:12+02:00",
+          "tree_id": "99ebc76c9bea5700fb8409a041362eb7c0bbed9f",
+          "url": "https://github.com/Sky4CE/AsyncResponse/commit/22586748ca7f0a0d389ca2b649863ddd93bf9d09"
+        },
+        "date": 1789029793325,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "waiter-storm throughput",
+            "value": 69635.57475392877,
+            "unit": "ops/s"
+          },
+          {
+            "name": "progress-storm throughput",
+            "value": 58579.42549985823,
+            "unit": "ops/s"
+          },
+          {
+            "name": "worker-storm throughput",
+            "value": 58412.08840506027,
+            "unit": "jobs/s"
+          },
+          {
+            "name": "google-pubsub-ack-after-enqueue-dispatch-storm throughput",
+            "value": 195564.5949857238,
+            "unit": "ops/s"
+          },
+          {
+            "name": "rabbitmq-ack-after-enqueue-dispatch-storm throughput",
+            "value": 291528.19077604805,
+            "unit": "ops/s"
+          },
+          {
+            "name": "redis-ack-after-enqueue-dispatch-storm throughput",
+            "value": 233380.94304571464,
+            "unit": "ops/s"
+          },
+          {
+            "name": "nats-ack-after-receive-dispatch-storm throughput",
+            "value": 214922.49894687976,
+            "unit": "ops/s"
+          },
+          {
+            "name": "postgresql-ack-after-receive-dispatch-storm throughput",
+            "value": 211693.9751894661,
+            "unit": "ops/s"
+          },
+          {
+            "name": "sqlserver-ack-after-enqueue-dispatch-storm throughput",
+            "value": 208538.396089488,
+            "unit": "ops/s"
+          },
+          {
+            "name": "mongodb-ack-after-enqueue-dispatch-storm throughput",
+            "value": 207315.75848543402,
+            "unit": "ops/s"
+          },
+          {
+            "name": "azure-servicebus-ack-after-receive-dispatch-storm throughput",
+            "value": 250072.52103109902,
+            "unit": "ops/s"
+          },
+          {
+            "name": "sqs-ack-after-enqueue-dispatch-storm throughput",
+            "value": 255757.09214416516,
+            "unit": "ops/s"
+          },
+          {
+            "name": "kafka-ack-after-enqueue-dispatch-storm throughput",
+            "value": 244920.3519015616,
+            "unit": "ops/s"
+          },
+          {
+            "name": "race-burst throughput",
+            "value": 154588.46386680164,
+            "unit": "ops/s"
+          },
+          {
+            "name": "raw-ingress-storm throughput",
+            "value": 126870.70859828166,
+            "unit": "ops/s"
+          },
+          {
+            "name": "shared-response-fanout throughput",
+            "value": 38024.61805031661,
+            "unit": "ops/s"
+          },
+          {
+            "name": "exception-fanout throughput",
+            "value": 22405.376716834395,
+            "unit": "ops/s"
+          },
+          {
+            "name": "timeout-storm throughput",
+            "value": 4809.0309754494165,
+            "unit": "ops/s"
+          },
+          {
+            "name": "dispose-cleanup-storm throughput",
+            "value": 207496.43106138572,
+            "unit": "ops/s"
+          },
+          {
+            "name": "context-isolation-storm throughput",
+            "value": 65175.622231665446,
+            "unit": "ops/s"
+          },
+          {
+            "name": "watchdog-scan-storm throughput",
+            "value": 1518971.9597776225,
+            "unit": "entries/s"
+          },
+          {
+            "name": "durable-flow-storm throughput",
+            "value": 1515.611709979818,
             "unit": "flows/s"
           }
         ]
