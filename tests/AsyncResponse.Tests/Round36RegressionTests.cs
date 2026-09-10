@@ -344,6 +344,59 @@ public sealed class Round36RegressionTests
     }
 
     // ---------------------------------------------------------------------------------------------
+    // F3 follow-up — the first cut of the body-free reader scrubbed EVERY JsonException, including
+    //      the six the envelope converter authors itself. Those name only the wire contract's own
+    //      properties (SchemaVersion, Success, Payload) and never a byte of the body, and they are
+    //      the primary operator diagnosis for the commonest malformed-envelope cause in production:
+    //      a foreign or mismatched producer writing to the response channel. Replacing
+    //      "SchemaVersion is required." with "failed at line 0, byte position 2" cost the diagnosis
+    //      and protected nothing. (Caught by the integration suite, which pins these messages.)
+
+    public static TheoryData<string, string> WireContractViolations() => new()
+    {
+        { "{}", "SchemaVersion is required." },
+        { """{"SchemaVersion":1,"Success":true}""", "Payload is null or absent" },
+        { """{"SchemaVersion":1,"Success":true,"Payload":null}""", "Payload is null or absent" },
+        { """{"SchemaVersion":"one","Success":true}""", "SchemaVersion must be an integer." },
+        { """{"SchemaVersion":1,"Success":"yes"}""", "Success must be a boolean." },
+        { """{"SchemaVersion":1,"Success":false,"ExceptionMessage":7}""", "ExceptionMessage must be a string or null." },
+        { "[]", "must be a JSON object" },
+    };
+
+    /// <summary>
+    /// Pre-fix failure (of the round-36 F3 fix itself): every one of these came back as
+    /// "Failed to parse JSON payload (N UTF-16 code units) at line …", with the reason gone.
+    /// </summary>
+    [Theory]
+    [MemberData(nameof(WireContractViolations))]
+    public void EnvelopeContractViolation_KeepsItsDiagnosis_BecauseItNamesNoBody(string envelopeJson, string expectedReason)
+    {
+        var ex = Assert.ThrowsAny<JsonException>(
+            () => JsonSafety.SafeDeserialize(envelopeJson, AsyncResponseEnvelopeJson.TypeInfo<OperationResult>()));
+
+        Assert.Contains(expectedReason, ex.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("Failed to parse JSON payload", ex.Message, StringComparison.Ordinal);
+        // Still a JsonException, so the ingress keeps classifying it as permanent (no retry burn)
+        // and application code catching JsonException still catches it.
+        Assert.IsAssignableFrom<JsonException>(ex);
+    }
+
+    /// <summary>
+    /// The other half of the same contract: a failure the READER authored is still scrubbed, even
+    /// though it arrives through the very same call. The discriminator is who wrote the message,
+    /// not which reader threw it.
+    /// </summary>
+    [Fact]
+    public void PayloadConversionFailure_IsStillScrubbed_EvenThoughTheConverterRanFirst()
+    {
+        var ex = Assert.Throws<InvalidDataException>(
+            () => JsonSafety.SafeDeserialize(LeakingEnvelope, AsyncResponseEnvelopeJson.TypeInfo<LeakProbePayload>()));
+
+        Assert.DoesNotContain(Marker, ex.ToString(), StringComparison.Ordinal);
+        Assert.Contains("Failed to parse JSON payload", ex.Message, StringComparison.Ordinal);
+    }
+
+    // ---------------------------------------------------------------------------------------------
     // F4 — an in-job publish that found the queue full spilled into an UNBOUNDED overflow: with
     //      QueueCapacity = 1 a fan-out handler could park ten thousand envelopes (each with its
     //      captured ExecutionContext) with the configured capacity giving no signal at all.

@@ -146,6 +146,15 @@ it reads a stored ledger or the initial state a start job carries — the
 `FlowStateUnreadableException` it raises chains the rebuilt, position-only failure, never the
 reader's own.
 
+**But not our own diagnostics.** The distinction is who wrote the message. `System.Text.Json`'s
+messages quote the body, so they are dropped; the envelope reader's own contract violations —
+`SchemaVersion is required.`, `Payload is null or absent on a Success envelope`, `Success must be
+a boolean.` — name only the wire contract's own property names and are preserved verbatim. They
+are the primary operator diagnosis for the commonest malformed-envelope cause in production, a
+foreign or mismatched producer writing to the response channel, and scrubbing them to "failed at
+line 0, byte position 2" would cost the diagnosis while protecting nothing. Such a failure stays
+a plain `JsonException` (the ingress classifies it as permanent, so it is never retried).
+
 **Nor a hash of one.** A content digest reads like harmless metadata and is not: it is
 deterministic, so two log entries showing the same prefix prove the two payloads were identical —
 across messages, hosts, and days — and a payload drawn from a small set (a status enum, an account

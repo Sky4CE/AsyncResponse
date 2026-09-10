@@ -443,7 +443,11 @@ public sealed class MongoDbDirectIntegrationTests(DataBatchFixture fixture) : In
                 store,
                 """{"SchemaVersion":999,"Success":true,"Payload":{"Status":2}}""",
                 typeof(InvalidOperationException));
-            await AssertUnreadableEnvelopeAsync(subscriber, store, "{not-json", typeof(JsonException));
+            // A malformed BODY is scrubbed to the body-free InvalidDataException (round 36): the
+            // reader's own message quotes what it was reading. A contract violation the LIBRARY
+            // authors keeps its message — pinned on the next line.
+            await AssertUnreadableEnvelopeAsync(subscriber, store, "{not-json", typeof(InvalidDataException));
+            await AssertUnreadableEnvelopeAsync(subscriber, store, "{}", typeof(JsonException), expectedMessageFragment: "SchemaVersion is required.");
             await AssertUnreadableEnvelopeAsync(
                 subscriber,
                 store,
@@ -486,7 +490,8 @@ public sealed class MongoDbDirectIntegrationTests(DataBatchFixture fixture) : In
         MongoDbChannelStore store,
         string envelopeJson,
         Type expectedExceptionType,
-        string? expectedRemoteStack = null)
+        string? expectedRemoteStack = null,
+        string? expectedMessageFragment = null)
     {
         var correlationId = $"mongo-unreadable-{Guid.NewGuid():N}";
         await using var waiter = await subscriber.CreateResponseWaiter<OperationResult>(
@@ -502,6 +507,8 @@ public sealed class MongoDbDirectIntegrationTests(DataBatchFixture fixture) : In
         var exception = await Assert.ThrowsAnyAsync<Exception>(
             () => waiter.ResponseTask.WaitAsync(TimeSpan.FromSeconds(10)));
         Assert.IsAssignableFrom(expectedExceptionType, exception);
+        if (expectedMessageFragment is not null)
+            Assert.Contains(expectedMessageFragment, exception.Message, StringComparison.Ordinal);
         if (expectedRemoteStack is not null)
             Assert.Equal(expectedRemoteStack, exception.Data["RemoteStackTrace"]);
     }
