@@ -129,7 +129,7 @@ internal sealed class AsyncResponseEnvelopeConverter<T> : JsonConverter<AsyncRes
     {
         if (reader.TokenType != JsonTokenType.StartObject)
         {
-            throw new JsonException();
+            throw JsonSafety.WireContractFailure("A response envelope must be a JSON object.");
         }
 
         int schemaVersion = default;
@@ -154,7 +154,7 @@ internal sealed class AsyncResponseEnvelopeConverter<T> : JsonConverter<AsyncRes
                 if (property == EnvelopeProperty.SchemaVersion)
                 {
                     if (reader.TokenType != JsonTokenType.Number || !reader.TryGetInt32(out schemaVersion))
-                        throw new JsonException("SchemaVersion must be an integer.");
+                        throw JsonSafety.WireContractFailure("SchemaVersion must be an integer.");
                     hasSchemaVersion = true;
                 }
                 else if (property == EnvelopeProperty.Success)
@@ -162,8 +162,11 @@ internal sealed class AsyncResponseEnvelopeConverter<T> : JsonConverter<AsyncRes
                     // Guarded token check: GetBoolean on a non-boolean token throws
                     // InvalidOperationException, which the ingress would misread as a TRANSIENT
                     // fault and retry — a malformed envelope must fail fast as a JsonException.
+                    // JsonSafety.WireContractFailure builds one: still a JsonException, so that
+                    // classification is unchanged, but marked body-free so the scrub preserves
+                    // this message — it names only the contract's own property, never the body.
                     if (reader.TokenType is not (JsonTokenType.True or JsonTokenType.False))
-                        throw new JsonException("Success must be a boolean.");
+                        throw JsonSafety.WireContractFailure("Success must be a boolean.");
                     success = reader.GetBoolean();
                 }
                 else if (property == EnvelopeProperty.Payload)
@@ -187,13 +190,13 @@ internal sealed class AsyncResponseEnvelopeConverter<T> : JsonConverter<AsyncRes
                 else if (property == EnvelopeProperty.ExceptionMessage)
                 {
                     if (reader.TokenType is not (JsonTokenType.Null or JsonTokenType.String))
-                        throw new JsonException("ExceptionMessage must be a string or null.");
+                        throw JsonSafety.WireContractFailure("ExceptionMessage must be a string or null.");
                     exceptionMessage = reader.TokenType == JsonTokenType.Null ? null : reader.GetString();
                 }
                 else if (property == EnvelopeProperty.ExceptionStackTrace)
                 {
                     if (reader.TokenType is not (JsonTokenType.Null or JsonTokenType.String))
-                        throw new JsonException("ExceptionStackTrace must be a string or null.");
+                        throw JsonSafety.WireContractFailure("ExceptionStackTrace must be a string or null.");
                     exceptionStackTrace = reader.TokenType == JsonTokenType.Null ? null : reader.GetString();
                 }
                 else
@@ -204,7 +207,7 @@ internal sealed class AsyncResponseEnvelopeConverter<T> : JsonConverter<AsyncRes
         }
 
         if (!hasSchemaVersion)
-            throw new JsonException("SchemaVersion is required.");
+            throw JsonSafety.WireContractFailure("SchemaVersion is required.");
 
         // Every publisher serializes the non-null payload it was handed, so Success=true with a
         // null Payload only arises from a producer-side contract violation — typically a raw
@@ -215,7 +218,7 @@ internal sealed class AsyncResponseEnvelopeConverter<T> : JsonConverter<AsyncRes
         // {"SchemaVersion":1,"Success":true} slipped past this guard and every channel then
         // handed `envelope.Payload!` — null — to the user's Until predicate and TrySetResult.
         if (success && (!hasPayload || payloadIsNull))
-            throw new JsonException("Payload is null or absent on a Success envelope; a successful response must carry a non-null payload.");
+            throw JsonSafety.WireContractFailure("Payload is null or absent on a Success envelope; a successful response must carry a non-null payload.");
 
         return new AsyncResponseEnvelope<T>
         {

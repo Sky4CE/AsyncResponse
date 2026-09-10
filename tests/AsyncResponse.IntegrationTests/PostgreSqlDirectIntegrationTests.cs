@@ -1704,6 +1704,10 @@ public sealed class PostgreSqlDirectIntegrationTests(DataBatchFixture fixture) :
             // proves ProcessUnderCapturedContextAsync ran end to end.
             Assert.False(subscription1.Completion.Task.IsCompleted);
             Assert.False(subscription2.Completion.Task.IsCompleted);
+            // The converter's own contract violations stay a plain JsonException AND keep their
+            // message: JsonSafety's body-free scrub (round 36) skips the failures the library
+            // authored, which name only the contract's own properties, and replaces only the
+            // reader's own — whose messages quote the inbound body.
             var liveError = await Assert.ThrowsAsync<System.Text.Json.JsonException>(
                 () => subscription3.Completion.Task.WaitAsync(TimeSpan.FromSeconds(5)));
             Assert.Contains("SchemaVersion", liveError.Message);

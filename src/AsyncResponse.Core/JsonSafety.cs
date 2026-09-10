@@ -38,7 +38,7 @@ internal static class JsonSafety
         {
             return JsonSerializer.Deserialize(json, typeInfo);
         }
-        catch (JsonException jsonException)
+        catch (JsonException jsonException) when (!IsBodyFree(jsonException))
         {
             throw ParseFailure(json, jsonException);
         }
@@ -57,7 +57,7 @@ internal static class JsonSafety
         {
             return JsonSerializer.Deserialize(utf8Json, typeInfo);
         }
-        catch (JsonException jsonException)
+        catch (JsonException jsonException) when (!IsBodyFree(jsonException))
         {
             throw ParseFailure(utf8Json.Length, "UTF-8 bytes", jsonException);
         }
@@ -75,7 +75,7 @@ internal static class JsonSafety
         {
             return JsonSerializer.Deserialize(json, AsyncResponseJson.GetTypeInfo(returnType, WithResolver(options)));
         }
-        catch (JsonException jsonException)
+        catch (JsonException jsonException) when (!IsBodyFree(jsonException))
         {
             throw ParseFailure(json, jsonException);
         }
@@ -95,12 +95,46 @@ internal static class JsonSafety
         {
             return JsonSerializer.Deserialize(element, AsyncResponseJson.GetTypeInfo(returnType, WithResolver(options)));
         }
-        catch (JsonException jsonException)
+        catch (JsonException jsonException) when (!IsBodyFree(jsonException))
         {
             // GetRawText only on the failure path, and only for its length.
             throw ParseFailure(element.GetRawText(), jsonException);
         }
     }
+
+    /// <summary>
+    /// Key under which a <see cref="JsonException"/> the LIBRARY authored marks itself as
+    /// body-free, so <c>SafeDeserialize</c> preserves its message. Visible on
+    /// <see cref="Exception.Data"/>, harmlessly — the channels already carry
+    /// <c>RemoteStackTrace</c> there.
+    /// </summary>
+    private const string BodyFreeMessageKey = "AsyncResponse.BodyFreeMessage";
+
+    /// <summary>
+    /// A malformed-message failure whose text the library wrote itself: it names only the wire
+    /// contract's own property names — <c>SchemaVersion</c>, <c>Success</c>, <c>Payload</c> — and
+    /// never a byte of the inbound body, so <c>SafeDeserialize</c> lets it through untouched
+    /// instead of replacing it with the position-only failure it builds for the reader's own.
+    /// <para>
+    /// The distinction is the whole point. <c>System.Text.Json</c>'s own messages quote the body
+    /// (<c>Path: $.Payload.Values['…']</c> is built from inbound dictionary keys), so they must be
+    /// dropped; ours are the primary operator diagnosis for the commonest malformed-envelope cause
+    /// in production — a foreign or mismatched producer writing to the response channel — and
+    /// scrubbing them to "failed at line 0, byte position 2" costs the diagnosis while protecting
+    /// nothing. Marked rather than subtyped so the exception REMAINS a plain
+    /// <see cref="JsonException"/>: every classification (the ingress treats it as permanent, no
+    /// retry burn), every <c>catch</c>, and every exact-type assertion keeps working unchanged.
+    /// </para>
+    /// </summary>
+    public static JsonException WireContractFailure(string message)
+    {
+        var failure = new JsonException(message);
+        failure.Data[BodyFreeMessageKey] = true;
+        return failure;
+    }
+
+    /// <summary>Whether <paramref name="jsonException"/> carries a message the library authored (see <see cref="WireContractFailure"/>).</summary>
+    private static bool IsBodyFree(JsonException jsonException) => jsonException.Data.Contains(BodyFreeMessageKey);
 
     /// <summary>
     /// Builds the body-free parse failure: size plus the JSON coordinates the reader stopped at.

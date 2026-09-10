@@ -133,9 +133,15 @@ public class AsyncResponseEnvelopeTests
         Assert.Throws<JsonException>(() => JsonSerializer.Deserialize<AsyncResponseEnvelope<int>>(
             json, AsyncResponseEnvelopeOptions<int>.Instance));
 
-        // The ingress entry point: the parse failure surfaces as the permanently-classified
-        // InvalidDataException, not as an envelope the dispatcher would complete a waiter with.
-        Assert.Throws<InvalidDataException>(() => AsyncResponseEnvelopeJson.SafeDeserialize<OperationResult>(json));
+        // The ingress entry point: the parse failure surfaces as a throw the ingress classifies
+        // as PERMANENT, not as an envelope the dispatcher would complete a waiter with — that is
+        // what this pins. Round 36: it also keeps its reason. The body-free scrub replaces only
+        // the reader's own messages (which quote the inbound body) and leaves the ones the
+        // library authored, which name the contract's own properties, so an operator still learns
+        // WHY a producer's envelope was rejected instead of only where the reader stopped.
+        var ingressFailure = Assert.ThrowsAny<JsonException>(
+            () => AsyncResponseEnvelopeJson.SafeDeserialize<OperationResult>(json));
+        Assert.Contains("Payload is null or absent", ingressFailure.Message, StringComparison.Ordinal);
     }
 
     /// <summary>

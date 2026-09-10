@@ -36,9 +36,13 @@ work that has landed on `main` but not yet shipped. Security reporters credited 
     `JsonException` whose message quotes dictionary keys read off the wire
     (`Path: $.Payload.Values['…']`); the durable-flow ledger reader chained the same raw exception
     into `FlowStateUnreadableException`, reachable through a start job's carrier. All of them go
-    through the body-free `JsonSafety` contract now (size and position only; a malformed envelope
-    faults the waiter with `InvalidDataException` instead of `JsonException`), and
-    `docs/security.md` names the covered readers.
+    through the body-free `JsonSafety` contract now: a failure the *reader* authored is replaced
+    by size and position alone (so a malformed body faults the waiter with `InvalidDataException`
+    instead of `JsonException`), while a violation the *library* authored keeps its message —
+    "SchemaVersion is required.", "Payload is null or absent on a Success envelope" — because
+    those name only the wire contract's own properties and never a byte of the body. They stay
+    plain `JsonException`s, so every classification and `catch` is unchanged. `docs/security.md`
+    names the covered readers and the distinction.
   - *The in-memory transport's in-job overflow is bounded.* A follow-up publish that finds the
     queue full spills into an overflow that was unbounded, so a fan-out handler could retain every
     envelope and captured execution context until the process ran out of memory with

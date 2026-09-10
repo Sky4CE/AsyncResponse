@@ -651,7 +651,7 @@ code pushes to `main`; per-commit trends with regression alerting are published 
 
 ## How it's tested
 
-**8,100+ test executions per CI run** — 5,600+ unit and 2,500+ integration cases against real
+**8,200+ test executions per CI run** — 5,700+ unit and 2,500+ integration cases against real
 servers. The only skips are declared ones: capability-gated conformance facts (the delayed-delivery
 timing contract skips on the five transports without native scheduling — Redis, NATS, Kafka,
 RabbitMQ, and Google Pub/Sub) and two explicit opt-out switches (`ASYNCRESPONSE_SKIP_AOT_GATE` for
