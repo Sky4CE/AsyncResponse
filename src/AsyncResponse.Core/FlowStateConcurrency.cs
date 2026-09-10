@@ -261,6 +261,16 @@ internal sealed class FlowExecutionLease : IAsyncDisposable
     /// </summary>
     private static readonly TimeSpan DisposeJoinLimit = TimeSpan.FromSeconds(30);
 
+    /// <summary>
+    /// Budget for the final lease release on disposal. The release is one conditional write, so
+    /// ten seconds is generous; past it the call is abandoned (cancelled, its outcome observed)
+    /// and the server-side lease expires on its own — the same recovery the abandoned renewal
+    /// loops rely on. Separate from <see cref="DisposeJoinLimit"/> because the two hang for
+    /// different reasons: the loops are joined first and are usually idle, while the release is
+    /// a fresh store call that a wedged connection can hold indefinitely even after a clean join.
+    /// </summary>
+    private static readonly TimeSpan ReleaseLimit = TimeSpan.FromSeconds(10);
+
     /// <param name="store">The flow state store the lease was acquired through.</param>
     /// <param name="flowId">The flow the lease protects.</param>
     /// <param name="leaseId">The identity of this lease within the flow's row.</param>
@@ -527,16 +537,71 @@ internal sealed class FlowExecutionLease : IAsyncDisposable
             return;
         }
 
+        // Bounded release (see ReleaseLimit), with a token the store can honor. An unbounded,
+        // uncancelable release kept a FINISHED execution's disposal — and with it the executor's
+        // `await using`, the job's DI scope, the worker slot, and the transport acknowledgement —
+        // pending for as long as a wedged store took to answer, which can be forever.
+        var releaseCancellation = new CancellationTokenSource();
+        Task? release = null;
         try
         {
-            await _store.ReleaseLeaseAsync(_flowId, _leaseId, CancellationToken.None).ConfigureAwait(false);
+            release = _store.ReleaseLeaseAsync(_flowId, _leaseId, releaseCancellation.Token);
+            await release.WaitAsync(ReleaseLimit, _timeProvider).ConfigureAwait(false);
+            releaseCancellation.Dispose();
+        }
+        catch (TimeoutException) when (release is { IsCompleted: false })
+        {
+            // The budget lapsed with the store still silent (a TimeoutException thrown BY the
+            // store completes the task first and takes the branch below). Cancel what can be
+            // cancelled, observe whatever the abandoned call eventually does, and move on: the
+            // server-side lease expires on its own, exactly as when the renewal loops are abandoned.
+            releaseCancellation.Cancel();
+            _logger.LogWarning(
+                "Durable flow {FlowId} execution lease release did not complete within {ReleaseLimit}; abandoning it (the lease will expire server-side).",
+                _flowId,
+                ReleaseLimit);
+            ObserveAbandonedRelease(release, releaseCancellation);
         }
         catch (Exception ex)
         {
+            releaseCancellation.Dispose();
             _logger.LogWarning(ex, "Failed to release durable flow {FlowId} execution lease; it will expire.", _flowId);
         }
 
         _stop.Dispose();
         _lost.Dispose();
     }
+
+    /// <summary>
+    /// Attaches the one continuation an abandoned release needs: its eventual fault is observed
+    /// (and logged, so a store that finally answers with an error is not an unobserved-task
+    /// event) and the cancellation source it still holds is disposed only once it can no longer
+    /// be touched.
+    /// </summary>
+    private void ObserveAbandonedRelease(Task release, CancellationTokenSource releaseCancellation)
+        => _ = release.ContinueWith(
+            (task, state) =>
+            {
+                var (lease, cancellation) = ((FlowExecutionLease, CancellationTokenSource))state!;
+                if (task.IsFaulted)
+                {
+                    lease._logger.LogWarning(
+                        task.Exception?.GetBaseException(),
+                        "The abandoned release of durable flow {FlowId}'s execution lease eventually failed; the lease expires server-side.",
+                        lease._flowId);
+                }
+                else
+                {
+                    lease._logger.LogDebug(
+                        "The abandoned release of durable flow {FlowId}'s execution lease eventually completed ({Status}).",
+                        lease._flowId,
+                        task.Status);
+                }
+
+                cancellation.Dispose();
+            },
+            (this, releaseCancellation),
+            CancellationToken.None,
+            TaskContinuationOptions.ExecuteSynchronously,
+            TaskScheduler.Default);
 }

@@ -25,9 +25,15 @@ internal static class FlowStateJson
         FlowState? state;
         try
         {
-            state = JsonSerializer.Deserialize(json, TypeInfo);
+            // Body-free failure contract (see JsonSafety): the reader's own message appends
+            // `Path: $.<name>` built from the property names and dictionary keys it was reading —
+            // a ledger's Values or Context keys, or whatever a start job's carrier holds — and this
+            // exception is chained into FlowStateUnreadableException, which the worker ingress
+            // logs in full. Only the size and position are carried across; the raw reader
+            // exception is dropped, not chained.
+            state = JsonSafety.SafeDeserialize(json, TypeInfo);
         }
-        catch (JsonException ex)
+        catch (InvalidDataException ex)
         {
             throw new FlowStateUnreadableException(flowId, "the stored JSON is malformed", ex);
         }

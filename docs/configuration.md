@@ -202,8 +202,9 @@ The in-memory transport is configured directly on registration:
 ```csharp
 .WithInMemoryTransport(options =>
 {
-    options.QueueCapacity = 1_024; // default; PublishAsync waits when full
-    options.WorkerCount = 1;       // default; increase for independent parallel jobs
+    options.QueueCapacity = 1_024;          // default; PublishAsync waits when full
+    options.WorkerCount = 1;                // default; increase for independent parallel jobs
+    options.InJobOverflowCapacity = 4_096;  // default; follow-up publishes held past QueueCapacity, then rejected
 })
 ```
 
@@ -211,8 +212,15 @@ The in-memory transport is configured directly on registration:
 running job — a durable flow starting a child, or a child waking its parent — never waits for
 capacity: the workers are the only consumers, so a worker parking on a full queue would be waiting
 on itself (with the default `WorkerCount = 1`, permanently). Follow-up work is a continuation of a
-job the queue already admitted, so it is accepted past the bound and drains as soon as a worker
-frees a slot; it still counts toward the shutdown drain, so nothing is lost at exit.
+job the queue already admitted, so it is accepted past the bound into an **in-job overflow** and
+drains as soon as a worker frees a slot; it still counts toward the shutdown drain, so nothing is
+lost at exit. The overflow is bounded by `InJobOverflowCapacity` (default 4096; `0` allows none;
+negative is rejected at startup): past it a follow-up publish throws `InvalidOperationException` —
+the publishing job fails and is redelivered by the retry ladder below, so make in-job publishes
+idempotent. Every held job retains its materialized envelope and captured execution context, and an
+unbounded overflow let a runaway fan-out exhaust memory with the configured queue capacity giving
+no signal. The current depth is the `asyncresponse.worker.inmemory_overflow_depth` gauge;
+rejections count on `asyncresponse.worker.inmemory_overflow_rejections`.
 
 Failed jobs retry with backoff (`RetryBaseDelay` 100 ms → `RetryMaxDelay` 5 s) up to
 `MaxDeliveryAttempts` (default 5; `0` = unlimited). Retries keep running during the shutdown drain,

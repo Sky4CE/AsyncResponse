@@ -54,6 +54,7 @@ public sealed class InMemoryWorkerTransport : IWorkerTransport, IDelayedWorkerTr
             FullMode = BoundedChannelFullMode.Wait,
             AllowSynchronousContinuations = false
         });
+        AsyncResponseDiagnostics.TrackInMemoryOverflow(this);
     }
 
     internal ChannelReader<QueuedJob> Reader => _queue.Reader;
@@ -62,9 +63,14 @@ public sealed class InMemoryWorkerTransport : IWorkerTransport, IDelayedWorkerTr
     /// <summary>
     /// Follow-up jobs published from inside a running job that did not fit the bounded queue. They
     /// are already counted in <c>_outstanding</c>, so the drain cannot complete the writer while
-    /// any remain; a worker moves them into the queue as soon as it frees a slot.
+    /// any remain; a worker moves them into the queue as soon as it frees a slot. Bounded by
+    /// <see cref="InMemoryWorkerTransportOptions.InJobOverflowCapacity"/> (tracked in
+    /// <see cref="_overflowDepth"/>): unbounded, a fan-out handler could retain every follow-up
+    /// envelope and its captured ExecutionContext until the process ran out of memory, with the
+    /// configured queue capacity giving no signal at all.
     /// </summary>
     private readonly ConcurrentQueue<QueuedJob> _overflow = new();
+    private int _overflowDepth;
 
     /// <summary>
     /// Serializes <see cref="PumpOverflow"/>: with multiple workers, an unguarded
@@ -72,6 +78,9 @@ public sealed class InMemoryWorkerTransport : IWorkerTransport, IDelayedWorkerTr
     /// a job that was never written — a duplicated execution plus a silently lost job.
     /// </summary>
     private readonly object _overflowPumpGate = new();
+
+    /// <summary>Follow-up jobs currently held past the queue's capacity (the overflow-depth gauge and test inspection).</summary>
+    internal int OverflowDepth => Volatile.Read(ref _overflowDepth);
 
     /// <summary>Moves overflow jobs into the queue while it has room. Called by a worker before it reports a job finished.</summary>
     internal void PumpOverflow()
@@ -84,6 +93,28 @@ public sealed class InMemoryWorkerTransport : IWorkerTransport, IDelayedWorkerTr
                     return;
 
                 _overflow.TryDequeue(out _);
+                Interlocked.Decrement(ref _overflowDepth);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Admits a follow-up job to the overflow if it is under its capacity. The depth is reserved
+    /// with a compare-and-swap BEFORE the enqueue, so concurrent in-job publishers (several
+    /// workers) cannot overshoot the bound between a check and an add.
+    /// </summary>
+    private bool TryEnqueueOverflow(QueuedJob queued)
+    {
+        while (true)
+        {
+            var depth = Volatile.Read(ref _overflowDepth);
+            if (depth >= Options.InJobOverflowCapacity)
+                return false;
+
+            if (Interlocked.CompareExchange(ref _overflowDepth, depth + 1, depth) == depth)
+            {
+                _overflow.Enqueue(queued);
+                return true;
             }
         }
     }
@@ -243,13 +274,21 @@ public sealed class InMemoryWorkerTransport : IWorkerTransport, IDelayedWorkerTr
             //
             // Bypassing the bound for these is the safe side of the trade: the capacity exists as
             // backpressure on EXTERNAL producers, and follow-up work is a continuation of work the
-            // queue already admitted.
+            // queue already admitted. The bypass is itself bounded (InJobOverflowCapacity): past
+            // it the publish is REJECTED, never parked — the publishing job fails and rides the
+            // in-process redelivery ladder, which is the only backpressure a worker can be given
+            // without waiting on itself. The catch below undoes this publish's outstanding count.
             if (InJobScope.IsActive)
             {
-                if (!_queue.Writer.TryWrite(queued))
-                    _overflow.Enqueue(queued);
+                if (_queue.Writer.TryWrite(queued) || TryEnqueueOverflow(queued))
+                    return;
 
-                return;
+                AsyncResponseDiagnostics.RecordInMemoryOverflowRejection();
+                throw new InvalidOperationException(
+                    $"The in-memory worker transport rejected a follow-up job ({job.Call.ServiceInterfaceFullName}.{job.Call.MethodName}) published from inside a running job: " +
+                    $"the queue is full ({nameof(InMemoryWorkerTransportOptions)}.{nameof(InMemoryWorkerTransportOptions.QueueCapacity)} = {Options.QueueCapacity}) and the in-job overflow is at its capacity " +
+                    $"({nameof(InMemoryWorkerTransportOptions)}.{nameof(InMemoryWorkerTransportOptions.InJobOverflowCapacity)} = {Options.InJobOverflowCapacity}). Follow-up publishes never wait for queue room " +
+                    "(a worker waiting on itself would deadlock), so the publishing job fails and is redelivered — make its publishes idempotent, raise the capacities, or add workers to drain the backlog.");
             }
 
             await _queue.Writer.WriteAsync(queued, cancellationToken).ConfigureAwait(false);
@@ -405,6 +444,21 @@ public sealed class InMemoryWorkerTransportOptions
     public int WorkerCount { get; set; } = 1;
 
     /// <summary>
+    /// Maximum number of follow-up jobs — publishes made from <em>inside</em> a running job, such
+    /// as a durable flow starting a child or a child waking its parent — held beyond
+    /// <see cref="QueueCapacity"/>. Follow-up publishes never wait for queue room (the workers are
+    /// the only consumers, so a worker waiting for capacity would be waiting on itself; with the
+    /// default <see cref="WorkerCount"/> of 1, forever) and spill into this overflow instead. Past
+    /// it a follow-up publish throws <see cref="InvalidOperationException"/>: the publishing job
+    /// fails and is redelivered by the in-process retry ladder, so make in-job publishes
+    /// idempotent. Sized so an ordinary fan-out never hits it while a runaway one is bounded —
+    /// every held job retains its materialized envelope and captured execution context. The
+    /// current depth is the <c>asyncresponse.worker.inmemory_overflow_depth</c> gauge; rejections
+    /// count on <c>asyncresponse.worker.inmemory_overflow_rejections</c>. Default: 4096.
+    /// </summary>
+    public int InJobOverflowCapacity { get; set; } = 4096;
+
+    /// <summary>
     /// Maximum number of delivery attempts before a failing job is dropped, with an error log and
     /// a <c>dropped</c> outcome on the worker-jobs counter. The process-local queue has no broker
     /// to redeliver, so retries run in-process with backoff and occupy the worker slot while they
@@ -429,6 +483,8 @@ public sealed class InMemoryWorkerTransportOptions
             throw new InvalidOperationException($"{nameof(QueueCapacity)} must be positive.");
         if (WorkerCount <= 0)
             throw new InvalidOperationException($"{nameof(WorkerCount)} must be positive.");
+        if (InJobOverflowCapacity < 0)
+            throw new InvalidOperationException($"{nameof(InJobOverflowCapacity)} must be zero (no overflow: a follow-up publish that finds the queue full is rejected) or positive.");
         if (MaxDeliveryAttempts < 0)
             throw new InvalidOperationException($"{nameof(MaxDeliveryAttempts)} must be zero (unlimited) or positive.");
         if (RetryBaseDelay <= TimeSpan.Zero)

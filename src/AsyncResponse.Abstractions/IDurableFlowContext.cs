@@ -93,6 +93,16 @@ public interface IDurableFlowContext
     /// <see cref="DurableFlowFailedException"/> is thrown unless
     /// <paramref name="failOnChildFailure"/> is <c>false</c>.
     /// </para>
+    /// <para>
+    /// The returned <see cref="FlowState"/> is that memoized snapshot on <em>every</em> execution —
+    /// the first completion and each replay alike, so a parent cannot branch differently after a
+    /// restart on a step it had already completed. The snapshot carries the child's status,
+    /// message, input, values, and step checkpoints, but not its captured ambient
+    /// <see cref="FlowState.Context"/>, and the <see cref="FlowStepState.ResultJson"/> of the
+    /// child's <em>own</em> child-flow steps is elided (their <see cref="FlowStepState.ChildFlowId"/>,
+    /// completion, and fault marker stay; load a grandchild by that id through
+    /// <see cref="IDurableFlows.GetStateAsync"/> while its ledger lives).
+    /// </para>
     /// </summary>
     Task<FlowState> AwaitChildFlowAsync<[DynamicallyAccessedMembers(DynamicallyAccessedMemberTypes.PublicConstructors | DynamicallyAccessedMemberTypes.PublicMethods | DynamicallyAccessedMemberTypes.Interfaces)] TFlow, TInput>(
         string name,

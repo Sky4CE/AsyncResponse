@@ -506,10 +506,12 @@ public sealed class Round34RegressionTests
     //      be re-driven, in-process and across a restart.
 
     /// <summary>
-    /// Round 34, finding 9: when the worker-job publish failed after the ledger commit, the
-    /// scheduler logged the occurrence and advanced — the Running run had no wake-up and nothing
-    /// ever retried it. It is now re-driven every RedriveInterval until published. Pre-fix
-    /// failure: exactly one start attempt, and the second never comes.
+    /// Round 34, finding 9: when the worker-job publish failed, the scheduler logged the
+    /// occurrence and advanced — nothing ever retried it. It is now re-driven every
+    /// RedriveInterval until published. Pre-fix failure: exactly one start attempt, and the
+    /// second never comes. The fake models the round-35 publish-first start: a failed publish
+    /// persists NOTHING (round 36 — the re-drive used to read that absent ledger as "expired"
+    /// and give up), and the successful re-publish is what creates the ledger.
     /// </summary>
     [Fact]
     public async Task ScheduledFlow_UndispatchedOccurrence_IsRedrivenUntilItsJobIsPublished()
@@ -520,11 +522,13 @@ public sealed class Round34RegressionTests
         var failuresLeft = 1;
         flows.OnStart = flowId =>
         {
-            // The ledger is committed by the time the publish fails — the shape of the finding.
+            // Publish-first: a start whose publish fails leaves no ledger behind; only the
+            // successful publish (the re-drive) creates one.
+            if (Interlocked.Decrement(ref failuresLeft) >= 0)
+                return new DurableFlowNotDispatchedException(flowId, new TimeoutException("broker down"));
+
             flows.States[flowId] = new FlowState { FlowId = flowId, Status = FlowRunStatus.Running, Attempts = 0 };
-            return Interlocked.Decrement(ref failuresLeft) >= 0
-                ? new DurableFlowNotDispatchedException(flowId, new TimeoutException("broker down"))
-                : null;
+            return null;
         };
 
         using var scheduler = new ScheduledFlowService(flows, [HourlyRegistration()], NullLogger<ScheduledFlowService>.Instance, time);

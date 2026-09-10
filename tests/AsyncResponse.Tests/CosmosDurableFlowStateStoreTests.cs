@@ -93,8 +93,8 @@ public sealed class CosmosDurableFlowStateStoreTests
         using var harness = new CosmosHarness();
         var state = CreateState("flow");
         var document = Document(state, DateTime.UtcNow.AddMinutes(5));
-        harness.Reads(document);
-        harness.ReplacesSuccessfully();
+        harness.QueriesLease(document);
+        harness.PatchesSuccessfully();
 
         Assert.True(await harness.Store.TryAcquireLeaseAsync("flow", "owner", TimeSpan.FromMinutes(1)));
 
@@ -107,21 +107,29 @@ public sealed class CosmosDurableFlowStateStoreTests
         document.LeaseId = "owner";
         await harness.Store.ReleaseLeaseAsync("flow", "owner");
 
-        harness.ReadsException(HttpStatusCode.NotFound);
+        harness.QueriesNothing();
         Assert.False(await harness.Store.TryAcquireLeaseAsync("flow", "owner", TimeSpan.FromMinutes(1)));
         await harness.Store.ReleaseLeaseAsync("flow", "owner");
 
-        harness.Reads(document);
-        harness.Container
-            .Setup(container => container.ReplaceItemAsync(
-                It.IsAny<CosmosFlowStateDocument>(),
-                It.IsAny<string>(),
-                It.IsAny<PartitionKey?>(),
-                It.IsAny<ItemRequestOptions>(),
-                It.IsAny<CancellationToken>()))
-            .ThrowsAsync(CosmosError(HttpStatusCode.PreconditionFailed));
+        // The patch's own 404/0: purged between the projection read and the write.
+        harness.QueriesLease(document);
+        harness.PatchesThrowing(CosmosError(HttpStatusCode.NotFound));
         Assert.False(await harness.Store.TryRenewLeaseAsync("flow", "owner", TimeSpan.FromMinutes(1)));
         await harness.Store.ReleaseLeaseAsync("flow", "owner");
+
+        harness.PatchesThrowing(CosmosError(HttpStatusCode.PreconditionFailed));
+        Assert.False(await harness.Store.TryRenewLeaseAsync("flow", "owner", TimeSpan.FromMinutes(1)));
+        await harness.Store.ReleaseLeaseAsync("flow", "owner");
+
+        // The lease paths never touch the document body: no point read, no replace.
+        harness.Container.Verify(
+            container => container.ReadItemAsync<CosmosFlowStateDocument>(
+                It.IsAny<string>(), It.IsAny<PartitionKey>(), It.IsAny<ItemRequestOptions>(), It.IsAny<CancellationToken>()),
+            Times.Never);
+        harness.Container.Verify(
+            container => container.ReplaceItemAsync(
+                It.IsAny<CosmosFlowStateDocument>(), It.IsAny<string>(), It.IsAny<PartitionKey?>(), It.IsAny<ItemRequestOptions>(), It.IsAny<CancellationToken>()),
+            Times.Never);
 
         await Assert.ThrowsAsync<ArgumentException>(() =>
             harness.Store.TryAcquireLeaseAsync(" ", "owner", TimeSpan.FromMinutes(1)));
@@ -241,13 +249,18 @@ public sealed class CosmosDurableFlowStateStoreTests
         Assert.False(await harness.Store.TryUpdateAsync(
             "flow", state, expectedRevision: 0, TimeSpan.FromMinutes(1)));
 
-        harness.ReadsFactory(() =>
+        // The lease paths read a projection and patch; every patch losing its ETag race exhausts
+        // the same bounded loop.
+        harness.QueriesLease(() => new CosmosLeaseProjection
         {
-            var document = Document(CreateState("flow"), DateTime.UtcNow.AddMinutes(5));
-            document.LeaseId = "owner";
-            document.LeaseExpiresAtUtc = DateTime.UtcNow.AddMinutes(1);
-            return document;
+            Id = "flow",
+            ETag = "etag",
+            ExpiresAtUtc = DateTime.UtcNow.AddMinutes(5),
+            Revision = 0,
+            LeaseId = "owner",
+            LeaseExpiresAtUtc = DateTime.UtcNow.AddMinutes(1)
         });
+        harness.PatchesThrowing(CosmosError(HttpStatusCode.PreconditionFailed));
         Assert.False(await harness.Store.TryRenewLeaseAsync(
             "flow", "owner", TimeSpan.FromMinutes(1)));
         await harness.Store.ReleaseLeaseAsync("flow", "owner");
@@ -287,6 +300,7 @@ public sealed class CosmosDurableFlowStateStoreTests
 
         document.Revision = null;
         harness.Reads(document);
+        harness.QueriesLease(document);
         // Present-but-uninterpretable: the document is in the container, so reporting absence here
         // would ack the only wake-up of a run that still exists.
         await Assert.ThrowsAsync<FlowStateUnreadableException>(() => harness.Store.LoadAsync("flow"));
@@ -306,12 +320,13 @@ public sealed class CosmosDurableFlowStateStoreTests
         document.LeaseId = "owner";
         document.LeaseExpiresAtUtc = DateTime.UtcNow.AddMinutes(-1);
         harness.Reads(document);
+        harness.QueriesLease(document);
         Assert.False(await harness.Store.TryUpdateAsync(
             "flow", state, expectedRevision: 0, TimeSpan.FromMinutes(1), leaseId: "owner"));
         Assert.False(await harness.Store.TryRenewLeaseAsync("flow", "owner", TimeSpan.FromMinutes(1)));
 
         document.LeaseId = "other";
-        harness.ReplacesSuccessfully();
+        harness.PatchesSuccessfully();
         Assert.True(await harness.Store.TryAcquireLeaseAsync("flow", "owner", TimeSpan.FromMinutes(1)));
     }
 
@@ -325,31 +340,41 @@ public sealed class CosmosDurableFlowStateStoreTests
         // refreshes _ts (the server TTL anchor), so a lease write persisting that value unchanged
         // would restart the whole physical-retention countdown on each heartbeat.
         document.Ttl = (int)TimeSpan.FromHours(2).TotalSeconds;
-        harness.Reads(document);
-        CosmosFlowStateDocument? replaced = null;
-        harness.ReplacesSuccessfully(written => replaced = written);
+        harness.QueriesLease(document);
+        IReadOnlyList<PatchOperation>? patched = null;
+        PatchItemRequestOptions? requestOptions = null;
+        harness.PatchesSuccessfully((operations, options) => (patched, requestOptions) = (operations, options));
 
         Assert.True(await harness.Store.TryAcquireLeaseAsync("flow", "owner", TimeSpan.FromMinutes(1)));
-        Assert.NotNull(replaced?.Ttl);
-        Assert.InRange(replaced!.Ttl!.Value, 540, 601); // the ~10 minutes left, never the stored 7200
+        Assert.NotNull(patched);
+        Assert.InRange((int)PatchValue(PatchFor(patched!, "/ttl"))!, 540, 601); // the ~10 minutes left, never the stored 7200
+        Assert.Equal("owner", PatchValue(PatchFor(patched!, "/leaseId")));
+        Assert.NotNull(PatchValue(PatchFor(patched!, "/leaseExpiresAtUtc")));
+        // Round 36: conditional on the projection's ETag, and no document body comes back.
+        Assert.Equal("etag", requestOptions!.IfMatchEtag);
+        Assert.False(requestOptions.EnableContentResponseOnWrite);
 
-        // Release replaces too and must realign the same way.
+        // Release patches too and must realign the same way. (The projection is re-read from
+        // `document` on every call, so the acquired state is modeled explicitly.)
+        document.LeaseId = "owner";
+        document.LeaseExpiresAtUtc = DateTime.UtcNow.AddMinutes(1);
         document.ExpiresAtUtc = DateTime.UtcNow.AddMinutes(10);
         document.Ttl = (int)TimeSpan.FromHours(2).TotalSeconds;
-        replaced = null;
+        patched = null;
         await harness.Store.ReleaseLeaseAsync("flow", "owner");
-        Assert.NotNull(replaced);
-        Assert.Null(replaced!.LeaseId);
-        Assert.InRange(replaced.Ttl!.Value, 540, 601);
+        Assert.NotNull(patched);
+        Assert.Null(PatchValue(PatchFor(patched!, "/leaseId")));
+        Assert.Null(PatchValue(PatchFor(patched!, "/leaseExpiresAtUtc")));
+        Assert.InRange((int)PatchValue(PatchFor(patched!, "/ttl"))!, 540, 601);
 
         // An already-due ledger collapses to the 1-second floor (Cosmos rejects 0) instead of the
         // release granting it a fresh retention window.
         document.LeaseId = "owner";
         document.ExpiresAtUtc = DateTime.UtcNow.AddMinutes(-5);
         document.Ttl = (int)TimeSpan.FromHours(2).TotalSeconds;
-        replaced = null;
+        patched = null;
         await harness.Store.ReleaseLeaseAsync("flow", "owner");
-        Assert.Equal(1, replaced!.Ttl);
+        Assert.Equal(1, PatchValue(PatchFor(patched!, "/ttl")));
     }
 
     [Fact]
@@ -409,7 +434,9 @@ public sealed class CosmosDurableFlowStateStoreTests
         current.LeaseId = "owner";
         current.LeaseExpiresAtUtc = null;
         harness.Reads(current);
+        harness.QueriesLease(current);
         harness.ReplacesSuccessfully();
+        harness.PatchesSuccessfully();
 
         Assert.False(await harness.Store.TryUpdateAsync("flow", state, 0, TimeSpan.FromMinutes(1), leaseId: "owner"));
         Assert.False(await harness.Store.TryRenewLeaseAsync("flow", "owner", TimeSpan.FromMinutes(1)));
@@ -485,8 +512,23 @@ public sealed class CosmosDurableFlowStateStoreTests
             return document;
         });
 
-        // The replace after a successful read answers 404/1002.
+        harness.QueriesLease(() =>
+        {
+            var document = Document(CreateState("flow"), DateTime.UtcNow.AddMinutes(5));
+            return new CosmosLeaseProjection
+            {
+                Id = "flow",
+                ETag = "etag",
+                ExpiresAtUtc = document.ExpiresAtUtc,
+                Revision = document.Revision,
+                LeaseId = "owner",
+                LeaseExpiresAtUtc = DateTime.UtcNow.AddMinutes(1)
+            };
+        });
+
+        // The write after a successful read answers 404/1002.
         harness.ReplacesThrowing(ReadSessionNotAvailable());
+        harness.PatchesThrowing(ReadSessionNotAvailable());
         var checkpoint = await Assert.ThrowsAsync<CosmosException>(
             () => harness.Store.TryUpdateAsync("flow", state, 0, TimeSpan.FromMinutes(1), leaseId: "owner"));
         Assert.Equal(1002, checkpoint.SubStatusCode);
@@ -496,6 +538,7 @@ public sealed class CosmosDurableFlowStateStoreTests
 
         // The read itself answers 404/1002 (one filter guards both calls of each path).
         harness.ReadsThrowing(ReadSessionNotAvailable());
+        harness.QueriesThrowing(ReadSessionNotAvailable());
         await Assert.ThrowsAsync<CosmosException>(() => harness.Store.TryUpdateAsync("flow", state, 0, TimeSpan.FromMinutes(1)));
         await Assert.ThrowsAsync<CosmosException>(() => harness.Store.TryAcquireLeaseAsync("flow", "owner", TimeSpan.FromMinutes(1)));
         await Assert.ThrowsAsync<CosmosException>(() => harness.Store.ReleaseLeaseAsync("flow", "owner"));
@@ -505,11 +548,36 @@ public sealed class CosmosDurableFlowStateStoreTests
 
         // Sub-status 0 stays a genuine absence on every path.
         harness.ReadsException(HttpStatusCode.NotFound);
+        harness.QueriesNothing();
         Assert.False(await harness.Store.TryUpdateAsync("flow", state, 0, TimeSpan.FromMinutes(1)));
         Assert.False(await harness.Store.TryAcquireLeaseAsync("flow", "owner", TimeSpan.FromMinutes(1)));
         await harness.Store.ReleaseLeaseAsync("flow", "owner");
         harness.DeletesThrowing(CosmosError(HttpStatusCode.NotFound));
         Assert.False(await harness.Store.TryDeleteAsync("flow"));
+    }
+
+    /// <summary>
+    /// Round 36: the lease paths read a projection and patch. A projection without <c>_etag</c>
+    /// (a serializer that hides system properties) cannot fence a write; silently treating it as
+    /// "not held" would let the executor ack a wake-up as a duplicate against a run nobody holds.
+    /// </summary>
+    [Fact]
+    public async Task LeaseQuery_WithoutAnEtag_ThrowsInsteadOfReportingTheLeaseFree()
+    {
+        using var harness = new CosmosHarness();
+        var document = Document(CreateState("flow"), DateTime.UtcNow.AddMinutes(5));
+        harness.QueriesLease(() => new CosmosLeaseProjection
+        {
+            Id = "flow",
+            ETag = "",
+            ExpiresAtUtc = document.ExpiresAtUtc,
+            Revision = document.Revision
+        });
+        harness.PatchesSuccessfully();
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => harness.Store.TryAcquireLeaseAsync("flow", "owner", TimeSpan.FromMinutes(1)));
+        Assert.Contains("_etag", ex.Message, StringComparison.Ordinal);
     }
 
     private static CosmosException ReadSessionNotAvailable()
@@ -633,6 +701,98 @@ public sealed class CosmosDurableFlowStateStoreTests
                     (document, _, _, _, _) => onReplace?.Invoke(document))
                 .ReturnsAsync(Mock.Of<ItemResponse<CosmosFlowStateDocument>>());
 
+        // ---- Round 36: the lease paths read a projection (no stateJson) and patch the lease fields. ----
+
+        /// <summary>The lease query answers with the lease slice of <paramref name="document"/>, re-read on every call.</summary>
+        public void QueriesLease(CosmosFlowStateDocument document)
+            => QueriesLease(() => new CosmosLeaseProjection
+            {
+                Id = document.Id,
+                ETag = "etag",
+                ExpiresAtUtc = document.ExpiresAtUtc,
+                Revision = document.Revision,
+                LeaseId = document.LeaseId,
+                LeaseExpiresAtUtc = document.LeaseExpiresAtUtc
+            });
+
+        /// <summary>The lease query answers with no rows: the flow does not exist.</summary>
+        public void QueriesNothing() => QueriesLease(() => null);
+
+        public void QueriesLease(Func<CosmosLeaseProjection?> projection)
+            => Container
+                .Setup(item => item.GetItemQueryIterator<CosmosLeaseProjection>(
+                    It.IsAny<QueryDefinition>(),
+                    It.IsAny<string?>(),
+                    It.IsAny<QueryRequestOptions>()))
+                .Returns(() => LeaseIterator(projection()));
+
+        public void QueriesThrowing(CosmosException exception)
+            => Container
+                .Setup(item => item.GetItemQueryIterator<CosmosLeaseProjection>(
+                    It.IsAny<QueryDefinition>(),
+                    It.IsAny<string?>(),
+                    It.IsAny<QueryRequestOptions>()))
+                .Returns(() =>
+                {
+                    var iterator = new Mock<FeedIterator<CosmosLeaseProjection>>();
+                    iterator.SetupGet(item => item.HasMoreResults).Returns(true);
+                    iterator.Setup(item => item.ReadNextAsync(It.IsAny<CancellationToken>())).ThrowsAsync(exception);
+                    return iterator.Object;
+                });
+
+        private static FeedIterator<CosmosLeaseProjection> LeaseIterator(CosmosLeaseProjection? projection)
+        {
+            var page = new Mock<FeedResponse<CosmosLeaseProjection>>();
+            var rows = projection is null ? Array.Empty<CosmosLeaseProjection>() : [projection];
+            page.Setup(item => item.GetEnumerator()).Returns(() => ((IEnumerable<CosmosLeaseProjection>)rows).GetEnumerator());
+            page.SetupGet(item => item.Resource).Returns(rows);
+
+            var iterator = new Mock<FeedIterator<CosmosLeaseProjection>>();
+            var more = true;
+            iterator.SetupGet(item => item.HasMoreResults).Returns(() => more);
+            iterator
+                .Setup(item => item.ReadNextAsync(It.IsAny<CancellationToken>()))
+                .ReturnsAsync(() =>
+                {
+                    more = false;
+                    return page.Object;
+                });
+            return iterator.Object;
+        }
+
+        /// <summary>Every lease patch succeeds; <paramref name="onPatch"/> sees the operations and request options.</summary>
+        public void PatchesSuccessfully(Action<IReadOnlyList<PatchOperation>, PatchItemRequestOptions>? onPatch = null)
+            => Container
+                .Setup(item => item.PatchItemAsync<CosmosFlowStateDocument>(
+                    It.IsAny<string>(),
+                    It.IsAny<PartitionKey>(),
+                    It.IsAny<IReadOnlyList<PatchOperation>>(),
+                    It.IsAny<PatchItemRequestOptions>(),
+                    It.IsAny<CancellationToken>()))
+                .Callback<string, PartitionKey, IReadOnlyList<PatchOperation>, PatchItemRequestOptions, CancellationToken>(
+                    (_, _, operations, requestOptions, _) => onPatch?.Invoke(operations, requestOptions))
+                .ReturnsAsync(Mock.Of<ItemResponse<CosmosFlowStateDocument>>());
+
+        public void PatchesThrowing(CosmosException exception)
+            => Container
+                .Setup(item => item.PatchItemAsync<CosmosFlowStateDocument>(
+                    It.IsAny<string>(),
+                    It.IsAny<PartitionKey>(),
+                    It.IsAny<IReadOnlyList<PatchOperation>>(),
+                    It.IsAny<PatchItemRequestOptions>(),
+                    It.IsAny<CancellationToken>()))
+                .ThrowsAsync(exception);
+
         public void Dispose() => Store.Dispose();
     }
+
+    /// <summary>The value a patch operation carries, read through the SDK's public surface (the value itself is not exposed).</summary>
+    private static object? PatchValue(PatchOperation operation)
+    {
+        var property = operation.GetType().GetProperty("Value", BindingFlags.Instance | BindingFlags.Public);
+        return property?.GetValue(operation);
+    }
+
+    private static PatchOperation PatchFor(IReadOnlyList<PatchOperation> operations, string path)
+        => Assert.Single(operations, operation => operation.Path == path);
 }

@@ -17,12 +17,13 @@ public sealed class ScheduledFlowOptions
     public bool Enabled { get; set; } = true;
 
     /// <summary>
-    /// How long the scheduler waits between attempts to re-drive an occurrence whose ledger was
-    /// committed but whose worker job could not be published (a broker outage outlasting the
-    /// start's own in-process retry ladder). A re-drive is the same idempotent start — the run
-    /// already exists, so only its wake-up is re-published — and repeats at this interval until
-    /// the job is published, the run is seen to have executed (another replica re-drove it), or
-    /// its ledger is gone. Default: 30 seconds.
+    /// How long the scheduler waits between attempts to re-drive an occurrence whose start job
+    /// could not be published (a broker outage outlasting the start's own in-process retry
+    /// ladder). The publish is the start's commit point, so such an occurrence has <em>no
+    /// ledger</em> yet; a re-drive is the same idempotent start — it publishes the job, and the
+    /// executor creates the run from it — and repeats at this interval until the job is published
+    /// or the run is seen to exist and to have executed (another replica started it). Default:
+    /// 30 seconds.
     /// </summary>
     public TimeSpan RedriveInterval { get; set; } = TimeSpan.FromSeconds(30);
 
@@ -171,6 +172,16 @@ internal sealed class ScheduledFlowService(
         public required string FlowId { get; init; }
         public required DateTimeOffset Occurrence { get; init; }
         public required DateTimeOffset DueUtc { get; set; }
+
+        /// <summary>
+        /// <c>true</c> when the occurrence's start job has never been published: the start's
+        /// publish is its commit point, so NO ledger exists for it (the shape a
+        /// <see cref="DurableFlowNotDispatchedException"/> leaves behind). A re-drive that finds no
+        /// ledger must then start the occurrence again, not conclude that its run has expired.
+        /// <c>false</c> for an entry the startup probe queued from an EXISTING never-executed
+        /// ledger, where an absent ledger on re-drive really does mean expired or deleted.
+        /// </summary>
+        public required bool AwaitingFirstPublish { get; init; }
     }
 
     private enum RedriveOutcome
@@ -323,7 +334,7 @@ internal sealed class ScheduledFlowService(
             var dropped = undispatched[0];
             undispatched.RemoveAt(0);
             _logger.LogError(
-                "Scheduled flow '{Schedule}' has {Count} undispatched occurrences queued for re-drive; dropping the oldest, {FlowId}. Its ledger is still Running — re-drive it by starting the same occurrence id again once the worker transport is back.",
+                "Scheduled flow '{Schedule}' has {Count} undispatched occurrences queued for re-drive; dropping the oldest, {FlowId}. Nothing was persisted for it (the publish is the start's commit point) — start the same occurrence id by hand once the worker transport is back.",
                 registration.Name, MaxUndispatchedOccurrences, dropped.FlowId);
         }
 
@@ -331,7 +342,8 @@ internal sealed class ScheduledFlowService(
         {
             FlowId = flowId,
             Occurrence = occurrence,
-            DueUtc = now + registration.Options.RedriveInterval
+            DueUtc = now + registration.Options.RedriveInterval,
+            AwaitingFirstPublish = true
         });
     }
 
@@ -384,11 +396,21 @@ internal sealed class ScheduledFlowService(
 
         if (state is null)
         {
-            _logger.LogWarning("Scheduled flow '{Schedule}' occurrence {FlowId} no longer has a ledger (expired or deleted); giving up its re-drive.", registration.Name, entry.FlowId);
-            return RedriveOutcome.Settled;
-        }
+            if (!entry.AwaitingFirstPublish)
+            {
+                _logger.LogWarning("Scheduled flow '{Schedule}' occurrence {FlowId} no longer has a ledger (expired or deleted); giving up its re-drive.", registration.Name, entry.FlowId);
+                return RedriveOutcome.Settled;
+            }
 
-        if (state.Status != FlowRunStatus.Running || state.Attempts > 0)
+            // Publish-first start: the failed publish persisted NOTHING, so "no ledger" is the
+            // expected shape of an occurrence still waiting for its first successful publish — not
+            // evidence that its run expired. Settling here (the pre-fix reading, written for the
+            // old create-then-publish order) permanently lost every occurrence that fell due during
+            // a broker outage: the queue held the id, the ledger it looked for had never existed,
+            // and the startup probe cannot find a run that was never persisted either.
+            _logger.LogInformation("Scheduled flow '{Schedule}' occurrence {FlowId} has no ledger because its start job was never published; re-driving the start.", registration.Name, entry.FlowId);
+        }
+        else if (state.Status != FlowRunStatus.Running || state.Attempts > 0)
         {
             // Another replica re-drove it (or its own wake-up arrived after all) and the run
             // executed: nothing left to publish.
@@ -425,10 +447,14 @@ internal sealed class ScheduledFlowService(
 
     /// <summary>
     /// Finds recent occurrences whose ledger is committed and Running with zero attempts — never
-    /// executed — and queues them for an immediate re-drive. The in-process queue above does not
-    /// survive a restart, and a crash between the ledger commit and the publish never even reached
-    /// it; this is the only place such a run is ever looked for, because the store has no
-    /// enumeration. Best-effort: a failed load ends the probe (the loop starts regardless).
+    /// executed — and queues them for an immediate re-drive: a start whose job was published and
+    /// then lost in transit (an early-ACK worker subscriber, a broker that dropped it), which
+    /// nothing else would ever look for, because the store has no enumeration. The in-process
+    /// re-drive queue above does not survive a restart, and an occurrence whose publish was still
+    /// failing when the process died left nothing persisted — this probe cannot find it either, so
+    /// it is skipped like any other occurrence missed while no replica was up (documented; the run
+    /// history shows the gap). Best-effort: a failed load ends the probe (the loop starts
+    /// regardless).
     /// </summary>
     private async Task ProbeUndispatchedAtStartupAsync(
         ScheduledFlowRegistration registration,
@@ -476,7 +502,7 @@ internal sealed class ScheduledFlowService(
             _logger.LogWarning(
                 "Scheduled flow '{Schedule}' found occurrence {FlowId} committed but never executed (Running, 0 attempts) — its worker job was lost before publish (a crash or an outage in a previous process). Re-driving it.",
                 registration.Name, flowId);
-            undispatched.Add(new UndispatchedOccurrence { FlowId = flowId, Occurrence = occurrence, DueUtc = now });
+            undispatched.Add(new UndispatchedOccurrence { FlowId = flowId, Occurrence = occurrence, DueUtc = now, AwaitingFirstPublish = false });
         }
     }
 

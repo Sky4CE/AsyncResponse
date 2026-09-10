@@ -142,6 +142,8 @@ AsyncResponse.InMemoryWorkerTransport.PublishAsync(AsyncResponse.WorkerJobEnvelo
 AsyncResponse.InMemoryWorkerTransport.PublishAsync(AsyncResponse.WorkerJobEnvelope! job, System.TimeSpan delay, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task!
 AsyncResponse.InMemoryWorkerTransportOptions
 AsyncResponse.InMemoryWorkerTransportOptions.InMemoryWorkerTransportOptions() -> void
+AsyncResponse.InMemoryWorkerTransportOptions.InJobOverflowCapacity.get -> int
+AsyncResponse.InMemoryWorkerTransportOptions.InJobOverflowCapacity.set -> void
 AsyncResponse.InMemoryWorkerTransportOptions.MaxDeliveryAttempts.get -> int
 AsyncResponse.InMemoryWorkerTransportOptions.MaxDeliveryAttempts.set -> void
 AsyncResponse.InMemoryWorkerTransportOptions.QueueCapacity.get -> int

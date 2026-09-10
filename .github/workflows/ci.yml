@@ -42,6 +42,13 @@ jobs:
       - name: Build
         run: dotnet build --configuration Release --no-restore
 
+      # The one retry classifier both integration legs and auto-retry.yml consult
+      # (scripts/ci-retryable-failure.sh) is plain bash; its fixture logs — including the mixed
+      # "fixture failed to boot AND an executed test failed" log that must never be retried — are
+      # checked here so a signature edit cannot silently widen what CI retries into green.
+      - name: CI retry classifier self-test
+        run: ./scripts/tests/ci-retryable-failure.test.sh
+
       # Coverage runs through coverlet rather than MTP's `--coverage` flag or `dotnet-coverage`:
       # pre-instrumenting with `dotnet-coverage instrument` discards condition data, so the published
       # report measured zero branches, and the only Microsoft mode that keeps it on linux-x64 is the
@@ -215,9 +222,13 @@ jobs:
         run: |
           # The suite runs in batches, each booting its own Aspire AppHost; on 2-core hosted runners a
           # boot intermittently times out or a resource fails to start before any test executes. Retry
-          # once on that exact signature only — genuine test failures never produce it, so they still
-          # fail the job on the first pass. The signature matches the *BatchFixture types in
-          # Batches.cs; keep it in sync if a batch fixture is ever renamed.
+          # once, but only when scripts/ci-retryable-failure.sh — the same classifier auto-retry.yml
+          # applies to whole runs — says the log is a known infrastructure flake AND carries no
+          # executed-test or build failure. Keying on the boot signature alone let a log that also
+          # held an assertion failure into the retry, and a passing second attempt made that
+          # correctness failure a green job. Each attempt's console log is kept in the results
+          # directory (itest-console.attempt<N>.log), so a green re-run is never indistinguishable
+          # from a clean pass.
           run_integration_tests() {
             # The cross-product shards are excluded deliberately. Everything in them builds its hosts
             # in this test process and never touches the sample app, so running them here proves
@@ -228,19 +239,21 @@ jobs:
             # Excluded by trait rather than class name on purpose: the transport contract classes live
             # in the matrix collections too but are not named Matrix*, and a name-based filter would
             # leave them behind to boot a shard fleet here.
+            mkdir -p "${{ github.workspace }}/TestResults/IntegrationAot"
             dotnet test --project tests/AsyncResponse.IntegrationTests/AsyncResponse.IntegrationTests.csproj \
               --configuration Release --no-build \
               --filter-not-trait "batch=matrix-*" \
               --report-trx \
               --results-directory "${{ github.workspace }}/TestResults/IntegrationAot" \
-              2>&1 | tee itest-console.log
+              2>&1 | tee "${{ github.workspace }}/TestResults/IntegrationAot/itest-console.attempt$1.log"
             return "${PIPESTATUS[0]}"
           }
-          if ! run_integration_tests; then
-            if grep -q "BatchFixture' threw in InitializeAsync" itest-console.log; then
-              echo "::warning::Integration fixture failed to boot (known hosted-runner resource flake) — retrying the suite once."
-              run_integration_tests
+          if ! run_integration_tests 1; then
+            if evidence=$(./scripts/ci-retryable-failure.sh "${{ github.workspace }}/TestResults/IntegrationAot/itest-console.attempt1.log"); then
+              echo "::warning::Integration run failed on a known hosted-runner infrastructure flake ($evidence) with no executed-test or build failure — retrying the suite once. A green second attempt is a flake, not a clean pass; attempt 1's log is in the results artifact."
+              run_integration_tests 2
             else
+              echo "::error::Integration run failed and is not retried ($evidence): a correctness failure is never retried into green."
               exit 1
             fi
           fi
@@ -342,27 +355,29 @@ jobs:
         # in docs/operations.md. "none" boots nothing at all — it is the in-memory suite, the Native
         # AOT publish gate, and the batch guards.
         run: |
-          # Same targeted boot-flake retry as the AOT integration job: rerun once only when the
-          # failure signature is a batch fixture failing to initialize, never for test failures.
-          # coverlet returns non-zero when the wrapped command fails, so the retry logic keys off the
-          # same exit code as before; a second attempt re-instruments and overwrites the same output.
+          # Same retry gate as the AOT integration job — scripts/ci-retryable-failure.sh, shared with
+          # auto-retry.yml: rerun once only when the log is a known infrastructure flake AND carries
+          # no executed-test or build failure (a boot flake next to an assertion failure is a real
+          # failure). coverlet returns non-zero when the wrapped command fails, so the retry keys off
+          # the same exit code; a second attempt re-instruments and overwrites the same coverage
+          # output, while each attempt keeps its own console log in the results directory.
           run_integration_tests() {
+            mkdir -p "${{ github.workspace }}/TestResults/Integration"
             ./scripts/coverage-collect.sh \
               "${{ github.workspace }}/TestResults/Integration/integration.${{ matrix.batch }}.cobertura.xml" \
               tests/AsyncResponse.IntegrationTests/bin/Release/net10.0 \
               --share tests/AsyncResponse.IntegrationTests.AppHost/bin/Release/net10.0 \
               --share samples/AsyncResponse.Sample/bin/Release/net10.0 \
               -- dotnet test --project tests/AsyncResponse.IntegrationTests/AsyncResponse.IntegrationTests.csproj --configuration Release --no-build --filter-trait batch=${{ matrix.batch }} --report-trx --results-directory ${{ github.workspace }}/TestResults/Integration \
-              2>&1 | tee itest-console.log
+              2>&1 | tee "${{ github.workspace }}/TestResults/Integration/itest-console.${{ matrix.batch }}.attempt$1.log"
             return "${PIPESTATUS[0]}"
           }
-          if ! run_integration_tests; then
-            # Matches both the original *BatchFixture types and the cross-product shards' fixtures
-            # (MatrixDatabaseLightFixture and friends), which carry no "Batch" infix.
-            if grep -q "Fixture' threw in InitializeAsync" itest-console.log; then
-              echo "::warning::Batch '${{ matrix.batch }}' failed to boot (known hosted-runner resource flake) — retrying once."
-              run_integration_tests
+          if ! run_integration_tests 1; then
+            if evidence=$(./scripts/ci-retryable-failure.sh "${{ github.workspace }}/TestResults/Integration/itest-console.${{ matrix.batch }}.attempt1.log"); then
+              echo "::warning::Batch '${{ matrix.batch }}' failed on a known hosted-runner infrastructure flake ($evidence) with no executed-test or build failure — retrying once. A green second attempt is a flake, not a clean pass; attempt 1's log is in the results artifact."
+              run_integration_tests 2
             else
+              echo "::error::Batch '${{ matrix.batch }}' failed and is not retried ($evidence): a correctness failure is never retried into green."
               exit 1
             fi
           fi

@@ -70,8 +70,62 @@ public static class AsyncResponseDiagnostics
         Meter.CreateCounter<long>("asyncresponse.flow_state.prune_budget_exhausted", unit: "{prune}",
             description: "Opportunistic durable-flow prunes that stopped at PruneBudget with expired rows still remaining — the expired backlog is outgrowing the prune, tagged by provider.");
 
+    private static readonly Counter<long> InMemoryOverflowRejections =
+        Meter.CreateCounter<long>("asyncresponse.worker.inmemory_overflow_rejections", unit: "{job}",
+            description: "Follow-up jobs the in-memory worker transport refused because its queue was full and the in-job overflow was at InJobOverflowCapacity; the publishing job failed and is redelivered.");
+
+    // Every live in-memory transport in the process, for the overflow-depth gauge: the meter is
+    // static and a process may host several transports (test harnesses, host-per-tenant workers),
+    // so the gauge sums them and drops the ones that have been collected. Weak references keep a
+    // disposed host's transport from being pinned for the process lifetime by its own telemetry.
+    private static readonly List<WeakReference<InMemoryWorkerTransport>> _inMemoryTransports = [];
+    private static int _inMemoryOverflowGaugeRegistered;
+
     private static int _watchdogGaugesRegistered;
     private static AsyncResponseWatchdogState? _watchdogState;
+
+    /// <summary>Records one follow-up publish the in-memory transport rejected at its in-job overflow capacity.</summary>
+    internal static void RecordInMemoryOverflowRejection()
+    {
+        if (InMemoryOverflowRejections.Enabled)
+            InMemoryOverflowRejections.Add(1);
+    }
+
+    /// <summary>
+    /// Registers a transport with the <c>asyncresponse.worker.inmemory_overflow_depth</c> gauge
+    /// (created once, process-wide, on first use).
+    /// </summary>
+    internal static void TrackInMemoryOverflow(InMemoryWorkerTransport transport)
+    {
+        lock (_inMemoryTransports)
+        {
+            _inMemoryTransports.RemoveAll(static reference => !reference.TryGetTarget(out _));
+            _inMemoryTransports.Add(new WeakReference<InMemoryWorkerTransport>(transport));
+        }
+
+        if (Interlocked.Exchange(ref _inMemoryOverflowGaugeRegistered, 1) != 0)
+            return;
+
+        Meter.CreateObservableGauge("asyncresponse.worker.inmemory_overflow_depth",
+            static () => ObserveInMemoryOverflowDepth(), unit: "{job}",
+            description: "Follow-up jobs the in-memory worker transport currently holds past QueueCapacity (summed over the process's transports); bounded by InJobOverflowCapacity.");
+    }
+
+    private static long ObserveInMemoryOverflowDepth()
+    {
+        long depth = 0;
+        lock (_inMemoryTransports)
+        {
+            _inMemoryTransports.RemoveAll(static reference => !reference.TryGetTarget(out _));
+            foreach (var reference in _inMemoryTransports)
+            {
+                if (reference.TryGetTarget(out var transport))
+                    depth += transport.OverflowDepth;
+            }
+        }
+
+        return depth;
+    }
 
     internal static Activity? StartActivity(
         string name,
