@@ -315,6 +315,28 @@ public sealed class NatsChannelCoverageTests
         hang.TrySetResult();
     }
 
+    /// <summary>
+    /// Round 36: the reader deserialized the payload directly, so a payload that failed to
+    /// convert faulted the waiter with — and logged — the raw System.Text.Json exception, whose
+    /// message quotes the inbound dictionary key (<c>Path: $.Payload.Values['…']</c>). Pre-fix
+    /// failure: the marker is in the waiter's exception and in the channel's error log.
+    /// </summary>
+    [Fact]
+    public async Task CreateResponseWaiter_MalformedPayload_DoesNotEchoInboundKeysIntoLogsOrTheWaiter()
+    {
+        var logger = new CollectingLogger();
+        var client = new FakeNatsResponseChannelClient();
+        var channel = CreateChannel(client, logger.For<NatsAsyncResponseChannel>());
+
+        await using var waiter = await channel.CreateResponseWaiter<Round36RegressionTests.LeakProbePayload>(
+            "corr-leak",
+            timeout: TimeSpan.FromSeconds(5));
+        client.Push(Round36RegressionTests.LeakingEnvelope);
+
+        var ex = await Assert.ThrowsAnyAsync<Exception>(() => waiter.ResponseTask.WaitAsync(TimeSpan.FromSeconds(2)));
+        Round36RegressionTests.AssertNoMarker(ex, logger);
+    }
+
     private NatsAsyncResponseChannel CreateChannel(
         FakeNatsResponseChannelClient client,
         ILogger<NatsAsyncResponseChannel> logger,

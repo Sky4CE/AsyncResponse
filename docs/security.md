@@ -138,7 +138,13 @@ inner exception the ingress logs (and, on the response path, republishes to the 
 message and path are dropped, not chained. The same scrubbing covers the **second** reader pass —
 converting an already-parsed worker-job argument or recovery payload into the callback's
 parameter type, which walks the payload's own property names and dictionary keys — because the
-exception that escapes it is logged by the worker ingress too.
+exception that escapes it is logged by the worker ingress too. The same contract covers every
+reader that materializes a body the library did not write itself: the Redis, NATS, and database
+(PostgreSQL, SQL Server, MongoDB) channels' response readers, whose parse failure is both logged
+and handed to the waiter (as `InvalidDataException`), and the durable-flow ledger reader, whether
+it reads a stored ledger or the initial state a start job carries — the
+`FlowStateUnreadableException` it raises chains the rebuilt, position-only failure, never the
+reader's own.
 
 **Nor a hash of one.** A content digest reads like harmless metadata and is not: it is
 deterministic, so two log entries showing the same prefix prove the two payloads were identical —

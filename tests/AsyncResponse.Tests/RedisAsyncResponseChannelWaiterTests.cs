@@ -266,7 +266,7 @@ public class RedisAsyncResponseChannelWaiterTests
                 ExceptionMessage = "remote"
             }, AsyncResponseEnvelopeOptions<OperationResult>.Instance),
             typeof(Exception));
-        await DuplicateFaultAsync(channel, "duplicate-malformed", "{not-json", typeof(JsonException));
+        await DuplicateFaultAsync(channel, "duplicate-malformed", "{not-json", typeof(InvalidDataException));
     }
 
     [Fact]
@@ -321,7 +321,34 @@ public class RedisAsyncResponseChannelWaiterTests
 
         await _channelSubscriber.Handler!.Invoke(_channelSubscriber.SubscribedChannel, "{not-json");
 
-        await Assert.ThrowsAsync<JsonException>(() => waiter.ResponseTask.WaitAsync(TimeSpan.FromSeconds(2)));
+        // The body-free parse failure (JsonSafety), not the raw reader's JsonException.
+        await Assert.ThrowsAsync<InvalidDataException>(() => waiter.ResponseTask.WaitAsync(TimeSpan.FromSeconds(2)));
+    }
+
+    /// <summary>
+    /// Round 36: the reader deserialized the wire bytes directly, so a payload that failed to
+    /// convert faulted the waiter with — and logged — the raw System.Text.Json exception, whose
+    /// message quotes the inbound dictionary key (<c>Path: $.Payload.Values['…']</c>). Pre-fix
+    /// failure: the marker is in the waiter's exception and in the channel's error log.
+    /// </summary>
+    [Fact]
+    public async Task CreateResponseWaiter_MalformedPayload_DoesNotEchoInboundKeysIntoLogsOrTheWaiter()
+    {
+        var logger = new CollectingLogger();
+        var channel = CreateChannel(new RedisAsyncResponseOptions
+        {
+            DefaultTimeout = TimeSpan.FromSeconds(5),
+            RecoveryStateExpiry = TimeSpan.FromMinutes(5)
+        }, logger.For<RedisAsyncResponseChannel>());
+
+        await using var waiter = await channel.CreateResponseWaiter<Round36RegressionTests.LeakProbePayload>(
+            "corr-leak",
+            timeout: TimeSpan.FromSeconds(5));
+
+        await _channelSubscriber.Handler!.Invoke(_channelSubscriber.SubscribedChannel, Round36RegressionTests.LeakingEnvelope);
+
+        var ex = await Assert.ThrowsAnyAsync<Exception>(() => waiter.ResponseTask.WaitAsync(TimeSpan.FromSeconds(2)));
+        Round36RegressionTests.AssertNoMarker(ex, logger);
     }
 
     [Fact]

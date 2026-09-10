@@ -420,6 +420,18 @@ being acknowledged against a live run, and so an update or lease call does not m
 lost lease (the same contract point DynamoDB pins with `ConsistentRead` and MongoDB with primary
 reads).
 
+Lease maintenance — acquire, the renewal heartbeat (every `ExecutionLeaseRenewInterval`, 20 seconds
+by default), and release — never moves the ledger body. Each reads a projection of the lease
+fields and the document's `_etag` with a partition-scoped point query, then applies a conditional
+**partial update** (`PatchItemAsync` on `leaseId`, `leaseExpiresAtUtc`, and `ttl`, fenced by
+`IfMatchEtag`, with no content in the response). Earlier versions point-read the whole document
+and replaced it, so an idle execution moved and re-serialized its entire ledger twice per
+heartbeat, proportional to ledger size. Wire and CPU cost are now O(lease fields); the
+request-unit charge still follows the service's accounting for the loaded document, so measure RU
+on your own ledger sizes before sizing throughput. A projection that comes back without `_etag`
+(a serializer that hides system properties) throws rather than reporting the lease free.
+Checkpoints (`TryUpdateAsync`) still replace the document — they carry the new ledger.
+
 ### DynamoDB
 
 The package reuses a registered `IAmazonDynamoDB`; otherwise it uses the normal AWS SDK credential

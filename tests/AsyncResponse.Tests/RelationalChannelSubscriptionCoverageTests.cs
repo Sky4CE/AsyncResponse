@@ -124,7 +124,8 @@ public sealed class RelationalChannelSubscriptionCoverageTests
 
         var malformed = Subscription(channelType, subscriptionTypeName, channel, _ => new ValueTask<bool>(true));
         await ProcessAsync(malformed.Instance, message("{not-json"));
-        await Assert.ThrowsAsync<JsonException>(() => malformed.Completion.Task);
+        // The body-free parse failure (JsonSafety), not the raw reader's JsonException.
+        await Assert.ThrowsAsync<InvalidDataException>(() => malformed.Completion.Task);
 
         var dropped = Subscription(channelType, subscriptionTypeName, channel, _ => new ValueTask<bool>(true));
         SetField(dropped.Instance, "_dropped", true);
@@ -162,10 +163,18 @@ public sealed class RelationalChannelSubscriptionCoverageTests
         string nestedTypeName,
         object channel,
         Func<OperationResult, ValueTask<bool>> predicate)
+        => Subscription<OperationResult>(channelType, nestedTypeName, channel, predicate);
+
+    private static (object Instance, TaskCompletionSource<TPayload> Completion) Subscription<TPayload>(
+        Type channelType,
+        string nestedTypeName,
+        object channel,
+        Func<TPayload, ValueTask<bool>> predicate)
+        where TPayload : IAsyncResponsePayload
     {
-        var completion = new TaskCompletionSource<OperationResult>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var completion = new TaskCompletionSource<TPayload>(TaskCreationOptions.RunContinuationsAsynchronously);
         var type = channelType.BaseType!.GetNestedType(nestedTypeName, BindingFlags.NonPublic)!
-            .MakeGenericType(typeof(OperationResult));
+            .MakeGenericType(typeof(TPayload));
         var instance = Activator.CreateInstance(
             type,
             BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic,
@@ -176,6 +185,43 @@ public sealed class RelationalChannelSubscriptionCoverageTests
         // cover that real cleanup; this focused test keeps the branch exercise isolated from a server.
         SetField(instance, "_cleanupStarted", 1);
         return (instance, completion);
+    }
+
+    /// <summary>
+    /// Round 36, over the shared DbChannelShared source (SQL Server here; PostgreSQL and MongoDB
+    /// compile the same file): the subscription deserialized the stored envelope directly, so a
+    /// payload that failed to convert faulted the waiter with — and logged — the raw
+    /// System.Text.Json exception, whose message quotes the inbound dictionary key. Pre-fix
+    /// failure: the marker is in the waiter's exception and in the channel's error log.
+    /// </summary>
+    [Fact]
+    public async Task DbSubscription_MalformedPayload_DoesNotEchoInboundKeysIntoLogsOrTheWaiter()
+    {
+        var options = Options.Create(new SqlServerAsyncResponseChannelOptions
+        {
+            ConnectionString = "Server=localhost,1;Database=unused;User Id=unused;Password=unused;TrustServerCertificate=true;Connect Timeout=1",
+            AutoCreateSchema = false
+        });
+        var logger = new CollectingLogger();
+        using var provider = new ServiceCollection().BuildServiceProvider();
+        var channel = new SqlServerAsyncResponseChannel(
+            provider.GetRequiredService<IServiceScopeFactory>(),
+            new SqlServerChannelSql(options),
+            MockRecoveryStore(),
+            options,
+            new AsyncResponseContextPropagation([]),
+            logger.For<SqlServerAsyncResponseChannel>());
+
+        var subscription = Subscription<Round36RegressionTests.LeakProbePayload>(
+            typeof(SqlServerAsyncResponseChannel), "DbSubscription`1", channel, _ => new ValueTask<bool>(true));
+        await ProcessAsync(
+            subscription.Instance,
+            new SqlServerChannelMessage(Guid.NewGuid(), "corr", Round36RegressionTests.LeakingEnvelope, DateTimeOffset.UtcNow));
+
+        var ex = await Assert.ThrowsAnyAsync<Exception>(() => subscription.Completion.Task);
+        Round36RegressionTests.AssertNoMarker(ex, logger);
+
+        await channel.DisposeAsync();
     }
 
     private static IRecoveryStateStore MockRecoveryStore()

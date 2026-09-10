@@ -283,9 +283,10 @@ public sealed class CosmosFlowStateStore : IFlowStateStore, IDisposable
             }
             catch (CosmosException ex) when (ex.StatusCode == HttpStatusCode.PreconditionFailed)
             {
-                // Lease renewal also replaces the document and changes its ETag without changing
-                // the ledger revision. Re-read and retry so that benign race is not reported as a
-                // lost execution lease; a real state race fails the revision check above.
+                // Lease acquire/renew/release patch the document's lease fields and change its
+                // ETag without changing the ledger revision. Re-read and retry so that benign
+                // race is not reported as a lost execution lease; a real state race fails the
+                // revision check above.
             }
         }
 
@@ -305,26 +306,24 @@ public sealed class CosmosFlowStateStore : IFlowStateStore, IDisposable
         {
             try
             {
-                var current = await container.ReadItemAsync<CosmosFlowStateDocument>(
-                    flowId,
-                    new PartitionKey(flowId),
-                    cancellationToken: cancellationToken).ConfigureAwait(false);
-                if (current.Resource.LeaseId != leaseId)
+                var current = await ReadLeaseAsync(container, flowId, cancellationToken).ConfigureAwait(false);
+                if (current is null || current.LeaseId != leaseId)
                     return;
 
-                current.Resource.LeaseId = null;
-                current.Resource.LeaseExpiresAtUtc = null;
-                // Every replace refreshes _ts — the anchor the server-side TTL counts from — so
+                // Every write refreshes _ts — the anchor the server-side TTL counts from — so
                 // re-persisting the stored full-window ttl would restart the physical-retention
                 // countdown and decouple it from the logical ExpiresAtUtc. Rewrite it from the
                 // remaining logical window instead. (Checkpoints recompute both together in
-                // TryUpdateAsync; only the lease paths replace without moving ExpiresAtUtc.)
-                current.Resource.Ttl = CosmosTtlSeconds(current.Resource.ExpiresAtUtc, DateTime.UtcNow);
-                await container.ReplaceItemAsync(
-                    current.Resource,
+                // TryUpdateAsync; only the lease paths write without moving ExpiresAtUtc.)
+                await PatchLeaseAsync(
+                    container,
                     flowId,
-                    new PartitionKey(flowId),
-                    new ItemRequestOptions { IfMatchEtag = current.ETag },
+                    current.ETag,
+                    [
+                        PatchOperation.Set<string?>(LeaseIdPath, null),
+                        PatchOperation.Set<DateTime?>(LeaseExpiresAtPath, null),
+                        PatchOperation.Set(TtlPath, CosmosTtlSeconds(current.ExpiresAtUtc, DateTime.UtcNow))
+                    ],
                     cancellationToken).ConfigureAwait(false);
                 return;
             }
@@ -337,6 +336,68 @@ public sealed class CosmosFlowStateStore : IFlowStateStore, IDisposable
             }
         }
     }
+
+    // JSON-pointer paths of the lease fields, matching CosmosFlowStateDocument's property names.
+    private const string LeaseIdPath = "/leaseId";
+    private const string LeaseExpiresAtPath = "/leaseExpiresAtUtc";
+    private const string TtlPath = "/ttl";
+
+    /// <summary>
+    /// The lease-relevant slice of one ledger document, read with a projecting point query so a
+    /// lease acquire, heartbeat, or release never transfers <c>stateJson</c>. A point read has no
+    /// projection — it returned the whole document, StateJson included, and the follow-up
+    /// ReplaceItemAsync sent it all back — so an idle execution's every renewal (default: each
+    /// 20 seconds) moved and re-serialized the full ledger twice, proportional to its size.
+    /// Together with the conditional patches below, lease maintenance now costs O(lease fields)
+    /// on the wire regardless of ledger size. RU cost still depends on the service's accounting
+    /// for the loaded document; measure it (docs/durable-flow-state-stores.md).
+    /// </summary>
+    private static readonly QueryDefinition LeaseProjectionQuery = new(
+        "SELECT c.id, c._etag, c.expiresAtUtc, c.revision, c.leaseId, c.leaseExpiresAtUtc FROM c WHERE c.id = @id");
+
+    private static async Task<CosmosLeaseProjection?> ReadLeaseAsync(Container container, string flowId, CancellationToken cancellationToken)
+    {
+        using var iterator = container.GetItemQueryIterator<CosmosLeaseProjection>(
+            LeaseProjectionQuery.WithParameter("@id", flowId),
+            requestOptions: new QueryRequestOptions { PartitionKey = new PartitionKey(flowId), MaxItemCount = 1 });
+        while (iterator.HasMoreResults)
+        {
+            var page = await iterator.ReadNextAsync(cancellationToken).ConfigureAwait(false);
+            foreach (var projection in page)
+            {
+                if (string.IsNullOrEmpty(projection.ETag))
+                {
+                    // The fence for every lease write. A projection without it cannot be acted
+                    // on safely, and silently treating it as "not held" would let the executor
+                    // acknowledge a wake-up as a duplicate against a run nobody holds.
+                    throw new InvalidOperationException(
+                        $"The Cosmos DB durable-flow store's lease query for '{flowId}' returned no _etag; the registered serializer does not surface system properties, so lease writes cannot be fenced.");
+                }
+
+                return projection;
+            }
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// A conditional partial update of the lease fields: fenced by the projection's ETag exactly
+    /// as the replace was, with no document content in the response (there is nothing the
+    /// caller reads back).
+    /// </summary>
+    private static Task PatchLeaseAsync(
+        Container container,
+        string flowId,
+        string etag,
+        IReadOnlyList<PatchOperation> operations,
+        CancellationToken cancellationToken)
+        => container.PatchItemAsync<CosmosFlowStateDocument>(
+            flowId,
+            new PartitionKey(flowId),
+            operations,
+            new PatchItemRequestOptions { IfMatchEtag = etag, EnableContentResponseOnWrite = false },
+            cancellationToken);
 
     public async Task<bool> TryDeleteAsync(string flowId, CancellationToken cancellationToken = default)
     {
@@ -473,12 +534,8 @@ public sealed class CosmosFlowStateStore : IFlowStateStore, IDisposable
             var now = DateTime.UtcNow;
             try
             {
-                var current = await container.ReadItemAsync<CosmosFlowStateDocument>(
-                    flowId,
-                    new PartitionKey(flowId),
-                    cancellationToken: cancellationToken).ConfigureAwait(false);
-                var document = current.Resource;
-                if (document.ExpiresAtUtc <= now || document.Revision is null)
+                var document = await ReadLeaseAsync(container, flowId, cancellationToken).ConfigureAwait(false);
+                if (document is null || document.ExpiresAtUtc <= now || document.Revision is null)
                     return false;
                 if (acquire)
                 {
@@ -491,17 +548,18 @@ public sealed class CosmosFlowStateStore : IFlowStateStore, IDisposable
                     return false;
                 }
 
-                document.LeaseId = leaseId;
-                document.LeaseExpiresAtUtc = DurableFlowStoreShared.AddSaturating(now, leaseDuration);
-                // Same _ts realignment as ReleaseLeaseAsync: a lease heartbeat replaces the
+                // Same _ts realignment as ReleaseLeaseAsync: a lease heartbeat writes the
                 // document without moving ExpiresAtUtc, so it must not restart the server TTL's
                 // full retention window.
-                document.Ttl = CosmosTtlSeconds(document.ExpiresAtUtc, now);
-                await container.ReplaceItemAsync(
-                    document,
+                await PatchLeaseAsync(
+                    container,
                     flowId,
-                    new PartitionKey(flowId),
-                    new ItemRequestOptions { IfMatchEtag = current.ETag },
+                    document.ETag,
+                    [
+                        PatchOperation.Set(LeaseIdPath, leaseId),
+                        PatchOperation.Set(LeaseExpiresAtPath, DurableFlowStoreShared.AddSaturating(now, leaseDuration)),
+                        PatchOperation.Set(TtlPath, CosmosTtlSeconds(document.ExpiresAtUtc, now))
+                    ],
                     cancellationToken).ConfigureAwait(false);
                 return true;
             }
@@ -602,5 +660,39 @@ internal sealed class CosmosFlowStateDocument
     [System.Text.Json.Serialization.JsonPropertyName("ttl")]
     [System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)]
     public int? Ttl { get; set; }
+}
+
+/// <summary>
+/// The lease slice of <see cref="CosmosFlowStateDocument"/> plus the document's <c>_etag</c>, as
+/// returned by the store's projecting lease query — everything a lease acquire, renewal, or
+/// release decides on and fences with, and nothing else (no <c>stateJson</c>). Attributed for
+/// both serializer stacks for the same reason the document is.
+/// </summary>
+internal sealed class CosmosLeaseProjection
+{
+    [JsonProperty("id")]
+    [System.Text.Json.Serialization.JsonPropertyName("id")]
+    public string Id { get; set; } = "";
+
+    /// <summary>The fence for every lease write; the store refuses to act on a projection without one.</summary>
+    [JsonProperty("_etag")]
+    [System.Text.Json.Serialization.JsonPropertyName("_etag")]
+    public string ETag { get; set; } = "";
+
+    [JsonProperty("expiresAtUtc")]
+    [System.Text.Json.Serialization.JsonPropertyName("expiresAtUtc")]
+    public DateTime ExpiresAtUtc { get; set; }
+
+    [JsonProperty("revision")]
+    [System.Text.Json.Serialization.JsonPropertyName("revision")]
+    public long? Revision { get; set; }
+
+    [JsonProperty("leaseId")]
+    [System.Text.Json.Serialization.JsonPropertyName("leaseId")]
+    public string? LeaseId { get; set; }
+
+    [JsonProperty("leaseExpiresAtUtc")]
+    [System.Text.Json.Serialization.JsonPropertyName("leaseExpiresAtUtc")]
+    public DateTime? LeaseExpiresAtUtc { get; set; }
 }
 }

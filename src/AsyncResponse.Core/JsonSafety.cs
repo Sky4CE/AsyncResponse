@@ -45,6 +45,25 @@ internal static class JsonSafety
     }
 
     /// <summary>
+    /// UTF-8 counterpart of <see cref="SafeDeserialize{T}(string, JsonTypeInfo{T})"/> for readers
+    /// that receive bytes off the wire (the Redis channel), with the same body-free failure
+    /// contract: size in bytes plus the reader's position, never its message or path.
+    /// </summary>
+    public static T? SafeDeserialize<T>(ReadOnlySpan<byte> utf8Json, JsonTypeInfo<T> typeInfo)
+    {
+        ThrowIfClearlyNotJson(utf8Json);
+
+        try
+        {
+            return JsonSerializer.Deserialize(utf8Json, typeInfo);
+        }
+        catch (JsonException jsonException)
+        {
+            throw ParseFailure(utf8Json.Length, "UTF-8 bytes", jsonException);
+        }
+    }
+
+    /// <summary>
     /// Non-generic counterpart for callers that only know the target type at runtime (e.g.
     /// materializing a persisted flow input).
     /// </summary>
@@ -97,8 +116,11 @@ internal static class JsonSafety
     /// </para>
     /// </summary>
     private static InvalidDataException ParseFailure(string json, JsonException jsonException)
+        => ParseFailure(json.Length, "UTF-16 code units", jsonException);
+
+    private static InvalidDataException ParseFailure(int length, string unit, JsonException jsonException)
         => new(
-            $"Failed to parse JSON payload ({json.Length} UTF-16 code units) at line {Describe(jsonException.LineNumber)}, " +
+            $"Failed to parse JSON payload ({length} {unit}) at line {Describe(jsonException.LineNumber)}, " +
             $"byte position {Describe(jsonException.BytePositionInLine)}.",
             new JsonException(
                 $"The JSON payload is malformed at line {Describe(jsonException.LineNumber)}, " +
@@ -151,5 +173,18 @@ internal static class JsonSafety
         // whole diagnosis.
         if (trimmed[0] == '<')
             throw new InvalidDataException($"Received HTML when JSON was expected ({json.Length} UTF-16 code units).");
+    }
+
+    /// <summary>UTF-8 counterpart of <see cref="ThrowIfClearlyNotJson(string)"/>: the same two guards over raw bytes.</summary>
+    public static void ThrowIfClearlyNotJson(ReadOnlySpan<byte> utf8Json)
+    {
+        // JSON whitespace is exactly these four ASCII bytes (RFC 8259 §2), so a byte-level trim
+        // matches what the reader itself would skip.
+        var trimmed = utf8Json.TrimStart("\t\n\r "u8);
+        if (trimmed.IsEmpty)
+            throw new InvalidDataException("Empty message body when JSON was expected.");
+
+        if (trimmed[0] == (byte)'<')
+            throw new InvalidDataException($"Received HTML when JSON was expected ({utf8Json.Length} UTF-8 bytes).");
     }
 }

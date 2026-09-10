@@ -437,8 +437,12 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
             {
                 // The delivered value is UTF-8 bytes; deserializing them directly avoids the
                 // ToString() detour, which paid a payload-sized UTF-16 allocation plus a
-                // transcode both ways on every message.
-                var envelope = JsonSerializer.Deserialize((ReadOnlySpan<byte>)(byte[]?)messageValue, AsyncResponseEnvelopeJson.TypeInfo<T>());
+                // transcode both ways on every message. Through JsonSafety, not the raw reader:
+                // a parse failure lands in the catch below, which logs it AND hands it to the
+                // waiter, and the reader's own message quotes the inbound body — property names
+                // and dictionary keys straight off the wire (docs/security.md, "never logs a
+                // message body"). Only the size and position survive.
+                var envelope = JsonSafety.SafeDeserialize((ReadOnlySpan<byte>)(byte[]?)messageValue, AsyncResponseEnvelopeJson.TypeInfo<T>());
 
                 if (envelope == null)
                 {

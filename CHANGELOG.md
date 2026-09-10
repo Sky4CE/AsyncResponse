@@ -13,6 +13,75 @@ work that has landed on `main` but not yet shipped. Security reporters credited 
 
 ### Changed
 
+- **Round-36 review (2026-09-10): the contracts between scheduling, delivery, checkpoints, and
+  retention that recovery depends on.**
+  - *A scheduled occurrence that fell due during a broker outage is no longer lost.* Round 35
+    made a start publish-first (a failed publish persists nothing), but the scheduler's re-drive
+    still read an absent ledger as "expired or deleted" and settled the entry — so once an outage
+    outlasted the start's own retry ladder the occurrence was never started, and the startup probe
+    could not find a run that was never persisted. The re-drive now distinguishes an occurrence
+    still awaiting its first successful publish (no ledger is the expected shape; start it again)
+    from one the startup probe queued off an existing ledger (absence really is expiry). An
+    occurrence whose publish was still failing when the process died is skipped like any other
+    missed occurrence, as documented.
+  - *`AwaitChildFlowAsync` returns the same object on the first completion as on every replay.*
+    The first completion used to return the fully loaded child (ambient `Context`, grandchild
+    results) while replays returned the reduced memoized snapshot, so a parent could branch
+    differently after a restart on a step it had already completed. Both paths now return the
+    snapshot (no `Context`; the `ResultJson` of the child's own child-flow steps elided); the
+    interface documentation states the shape.
+  - *Response-channel and ledger readers no longer echo inbound property names.* The Redis, NATS,
+    and database (PostgreSQL, SQL Server, MongoDB) channels deserialized envelopes with the raw
+    reader, so a payload that failed to convert faulted the waiter with — and logged — a
+    `JsonException` whose message quotes dictionary keys read off the wire
+    (`Path: $.Payload.Values['…']`); the durable-flow ledger reader chained the same raw exception
+    into `FlowStateUnreadableException`, reachable through a start job's carrier. All of them go
+    through the body-free `JsonSafety` contract now (size and position only; a malformed envelope
+    faults the waiter with `InvalidDataException` instead of `JsonException`), and
+    `docs/security.md` names the covered readers.
+  - *The in-memory transport's in-job overflow is bounded.* A follow-up publish that finds the
+    queue full spills into an overflow that was unbounded, so a fan-out handler could retain every
+    envelope and captured execution context until the process ran out of memory with
+    `QueueCapacity` giving no signal. New `InMemoryWorkerTransportOptions.InJobOverflowCapacity`
+    (default 4096; `0` allows none; negative rejected at startup): past it a follow-up publish
+    throws `InvalidOperationException` and the publishing job is redelivered by the retry ladder —
+    make in-job publishes idempotent. Two new instruments:
+    `asyncresponse.worker.inmemory_overflow_depth` (gauge) and
+    `asyncresponse.worker.inmemory_overflow_rejections` (counter).
+  - *Cosmos DB lease maintenance stops moving the ledger.* Acquire, renew, and release
+    point-read the whole document (`stateJson` included) and replaced it; an idle execution's
+    every 20-second heartbeat therefore transferred and re-serialized its full ledger twice. They
+    now read a projection of the lease fields plus `_etag` with a partition-scoped query and apply
+    a conditional partial update (`PatchItemAsync` on `leaseId`, `leaseExpiresAtUtc`, `ttl`;
+    `IfMatchEtag`; no content response). A projection without `_etag` throws rather than reporting
+    the lease free. Verified against the Cosmos emulator; measure RU before sizing throughput.
+  - *Ancestor retention is part of a child's park.* A descendant parking longer than `StateExpiry`
+    extends its ancestors' ledgers; that walk swallowed store failures and stopped silently after
+    16 levels, so a child could park "successfully" — wake-up published — while the parent it
+    would complete into expired mid-wait, abandoning everything past the parent's child-await. A
+    failed ancestor write now fails the park before any wake-up is published (the delivery is
+    redelivered and retries the chain), the chain is walked to the root with cycle detection, and
+    a chain that revisits an id or is nested more than 256 levels deep fails the run terminally.
+  - *Lease release on disposal is bounded.* The final `ReleaseLeaseAsync` ran unbounded with
+    `CancellationToken.None`, so a store that never answered kept a finished execution's disposal
+    — the executor's `await using`, the job's scope, the worker slot, the acknowledgement —
+    pending indefinitely. It now gets a cancelable token and a 10-second budget; past it the call
+    is cancelled and abandoned with a warning (its eventual outcome observed), and the server-side
+    lease expires on its own.
+  - *CI: one retry classifier.* The integration jobs' in-job retry keyed on the fixture-boot
+    signature alone, so a log carrying both a boot flake and an assertion failure was retried and
+    a passing second attempt made the correctness failure a green job — one `auto-retry.yml`
+    (which already vetoed such logs) never got to see. Both now consult
+    `scripts/ci-retryable-failure.sh`; each attempt's console log is kept in the results
+    artifact; the classifier's fixture logs (the mixed one included) run as a self-test in
+    `build-and-test`.
+  - Tests: 20 behavior pins proven red against 145aa8c in a worktree (the scheduler with the real
+    starter; child-snapshot parity; body-free readers on Redis, NATS, the shared database-channel
+    source, the ledger reader, and the start carrier through the ingress; the in-job overflow;
+    ancestor outage, depth, and cycle; a hanging release), plus new-API pins for the overflow
+    option, its metrics, and the depth ceiling; the Cosmos unit tests rewritten for query + patch
+    and the store contract run against the Cosmos emulator. 2842 unit tests green on net10.0 and
+    net8.0.
 - **Round-35 review (2026-09-09): delivery correctness at the persisted-state / acknowledgement /
   execution handoffs.**
   - *A durable-flow start can no longer be stranded.* `IDurableFlows.StartAsync` publishes its

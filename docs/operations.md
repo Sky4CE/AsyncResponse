@@ -179,6 +179,23 @@ images, which is what the disk-reclaim step in that job exists to fight. Legs up
 `coverage-integration-<batch>`; the coverage job globs `coverage-*` and merges, so the published
 number still covers the whole suite.
 
+#### CI retries
+
+Two mechanisms retry hosted-runner flakes, and both consult the **same classifier**,
+`scripts/ci-retryable-failure.sh`: the integration legs retry their own suite once in-job, and
+`auto-retry.yml` re-runs the failed jobs of a `main` run. A log qualifies only when it matches a
+known infrastructure signature (a batch or matrix fixture that failed to boot, SQLite's "database
+is locked" on a slow runner disk, the runner going away) **and** carries no evidence that a test
+executed and failed on its merits or that the build broke (an xunit assertion message,
+`XunitException`, a `CS`/`MSB`/`NU` error code). A fixture-boot flake next to an assertion failure
+in the same log is a real failure and is never retried — the in-job retry used to key on the boot
+signature alone, so such a log was retried into a green job the standalone workflow never got to
+see. Each attempt's console log is kept in the results artifact
+(`itest-console.<batch>.attempt<N>.log`), and every automatic retry leaves a `::warning::` naming
+its evidence, so a green re-run is never indistinguishable from a clean pass. The classifier's
+fixture logs — the mixed one included — run as a self-test in `build-and-test`
+(`scripts/tests/ci-retryable-failure.test.sh`).
+
 #### The provider cross product
 
 Channels, transports, and durable-flow stores are chosen independently, so "it works" has to mean

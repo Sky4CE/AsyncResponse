@@ -7,16 +7,19 @@ name: Auto-retry failed jobs
 # gave an intermittently failing product bug — a lease race, a timing defect, a watchdog — a free
 # second chance to land green on main, and publish.yml relies on main's check as the reviewed
 # gate):
-#   1. every failed job's log must match a known infrastructure signature (FLAKE_SIGNATURES), and
-#   2. no failed job's log may contain an executed-test assertion failure or a build error
-#      (REAL_FAILURE_SIGNATURES) — a fixture-boot flake alongside a genuine assertion failure in
-#      the same job is a real failure, whatever else the log says.
-# Any-job matching is not enough either: rerun-failed-jobs re-runs ALL failed jobs, so one genuine
-# fixture flake would re-run a co-failing real bug alongside it. A log that cannot be fetched
-# counts as unmatched. Every automatic re-run leaves a ::warning:: annotation on the run naming
-# the flake evidence, so a run that went green on a re-run is never indistinguishable from one
-# that was green on its own. The run_attempt guard is what stops this recursing: each re-run
-# fires `workflow_run: completed` again when it finishes.
+#   1. every failed job's log must match a known infrastructure signature, and
+#   2. no failed job's log may contain an executed-test assertion failure or a build error — a
+#      fixture-boot flake alongside a genuine assertion failure in the same job is a real
+#      failure, whatever else the log says.
+# Both signature sets live in ONE place, scripts/ci-retryable-failure.sh, which ci.yml's in-job
+# integration retry consults too — the in-job retry used to carry a weaker copy (gate 1 only), so a
+# mixed log was retried into a green job this workflow never got to see. Any-job matching is not
+# enough either: rerun-failed-jobs re-runs ALL failed jobs, so one genuine fixture flake would
+# re-run a co-failing real bug alongside it. A log that cannot be fetched counts as unmatched.
+# Every automatic re-run leaves a ::warning:: annotation on the run naming the flake evidence, so
+# a run that went green on a re-run is never indistinguishable from one that was green on its own.
+# The run_attempt guard is what stops this recursing: each re-run fires `workflow_run: completed`
+# again when it finishes.
 on:
   workflow_run:
     workflows: [CI, CodeQL]
@@ -36,6 +39,10 @@ jobs:
       github.event.workflow_run.run_attempt < 5
     runs-on: ubuntu-latest
     steps:
+      # The classifier is repo-tracked (scripts/ci-retryable-failure.sh); a workflow_run job
+      # checks out the default branch's copy, which is the one ci.yml on main runs with.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
       - name: Re-run failed jobs
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -43,18 +50,6 @@ jobs:
           RUN_ID: ${{ github.event.workflow_run.id }}
           ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
           WORKFLOW: ${{ github.event.workflow_run.name }}
-          # ci.yml's own in-job retry gates on the same fixture-boot flake. "database is locked"
-          # is SQLite on a slow runner disk during the EF Core storm tests (see the tests' own
-          # comments); the last two are hosted-runner infrastructure loss.
-          FLAKE_SIGNATURES: >-
-            Fixture' threw in InitializeAsync|SQLite Error 5: 'database is locked'|lost communication with the server|The runner has received a shutdown signal
-          # Evidence that a test EXECUTED and failed on its own merits, or that the build broke:
-          # xunit.v3 assertion messages ("Assert.Equal() Failure: …", "Assert.Fail(): …"), the
-          # assertion exception base type, and compiler/MSBuild/NuGet error codes. A fixture that
-          # throws in InitializeAsync fails its tests through TestPipelineException, which none
-          # of these match, so a pure boot flake still qualifies for a re-run.
-          REAL_FAILURE_SIGNATURES: >-
-            Assert\.[A-Za-z]+\(\) Failure|Assert\.Fail\(\)|Xunit\.Sdk\.XunitException|error CS[0-9]{4}|error MSB[0-9]{4}|error NU[0-9]{4}
         run: |
           set -euo pipefail
           failed_jobs=$(gh api --paginate "repos/$GH_REPO/actions/runs/$RUN_ID/jobs?per_page=100" \
@@ -86,13 +81,15 @@ jobs:
               continue
             fi
             fetched=$((fetched + 1))
-            if grep -Eq "$REAL_FAILURE_SIGNATURES" "job-$job_id.log"; then
-              real="${real:+$real, }$job_id ($job_name: $(grep -Eo "$REAL_FAILURE_SIGNATURES" "job-$job_id.log" | head -n 1))"
-            elif grep -Eq "$FLAKE_SIGNATURES" "job-$job_id.log"; then
-              matched="${matched:+$matched, }$job_id ($job_name: $(grep -Eo "$FLAKE_SIGNATURES" "job-$job_id.log" | head -n 1))"
-            else
-              unmatched="${unmatched:+$unmatched, }$job_id ($job_name)"
-            fi
+            # Exit 0 = flake (retryable), 1 = a real executed-test or build failure, 2 = unmatched,
+            # 3 = unreadable; the first line names the evidence.
+            verdict=0
+            evidence=$(./scripts/ci-retryable-failure.sh "job-$job_id.log") || verdict=$?
+            case "$verdict" in
+              0) matched="${matched:+$matched, }$job_id ($job_name: $evidence)" ;;
+              1) real="${real:+$real, }$job_id ($job_name: $evidence)" ;;
+              *) unmatched="${unmatched:+$unmatched, }$job_id ($job_name: $evidence)" ;;
+            esac
           done <<< "$failed_jobs"
 
           if [ "$fetched" -eq 0 ]; then

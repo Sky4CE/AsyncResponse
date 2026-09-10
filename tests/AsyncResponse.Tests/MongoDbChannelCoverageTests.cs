@@ -191,7 +191,8 @@ public sealed class MongoDbChannelCoverageTests
 
         var malformed = fixture.Subscription(_ => new ValueTask<bool>(true));
         await InvokeTaskAsync(malformed.Instance, "ProcessAsync", Message("{not-json"));
-        await Assert.ThrowsAsync<System.Text.Json.JsonException>(() => malformed.Completion.Task);
+        // The body-free parse failure (JsonSafety), not the raw reader's JsonException.
+        await Assert.ThrowsAsync<InvalidDataException>(() => malformed.Completion.Task);
 
         var dropped = fixture.Subscription(_ => new ValueTask<bool>(true));
         await InvokeValueTaskAsync(dropped.Instance, "DropLocalAsync", CancellationToken.None);

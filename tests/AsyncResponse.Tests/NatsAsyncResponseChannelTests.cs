@@ -393,7 +393,8 @@ public class NatsAsyncResponseChannelTests
 
         _client.Push("{not-json");
 
-        await Assert.ThrowsAsync<JsonException>(() => waiter.ResponseTask.WaitAsync(TimeSpan.FromSeconds(2)));
+        // The body-free parse failure (JsonSafety), not the raw reader's JsonException.
+        await Assert.ThrowsAsync<InvalidDataException>(() => waiter.ResponseTask.WaitAsync(TimeSpan.FromSeconds(2)));
     }
 
     [Fact]

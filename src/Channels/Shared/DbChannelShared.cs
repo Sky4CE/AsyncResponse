@@ -1614,7 +1614,10 @@ internal abstract class DbAsyncResponseChannelBase :
             var finished = false;
             try
             {
-                var envelope = JsonSerializer.Deserialize(message.EnvelopeJson, AsyncResponseEnvelopeJson.TypeInfo<T>());
+                // JsonSafety, not the raw reader: a parse failure is logged below and handed to the
+                // waiter, and the reader's own message quotes inbound property names and dictionary
+                // keys (docs/security.md, "never logs a message body"). Size and position only.
+                var envelope = JsonSafety.SafeDeserialize(message.EnvelopeJson, AsyncResponseEnvelopeJson.TypeInfo<T>());
                 if (envelope is null)
                 {
                     finished = true;

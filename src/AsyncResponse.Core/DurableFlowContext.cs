@@ -38,10 +38,14 @@ internal sealed class DurableFlowContext : IDurableFlowContext
     private long _nextLedgerSizeWarningChars;
 
     /// <summary>
-    /// How many ancestors a long park refreshes (see <see cref="ExtendAncestorLedgersAsync"/>);
-    /// far beyond any sane child-flow nesting, small enough to bound a corrupted parent cycle.
+    /// The deepest child-flow nesting a long park supports (see
+    /// <see cref="ExtendAncestorLedgersAsync"/>): every ancestor up to the root is refreshed, and a
+    /// chain longer than this fails the run terminally instead of being silently truncated — the
+    /// previous 16-level cap stopped walking with the root unrefreshed, so a leaf nested 17 deep
+    /// parked "successfully" while its root expired underneath it. Cycles are detected separately
+    /// (a visited set), so this bounds only the cost of a legitimately absurd nesting.
     /// </summary>
-    private const int MaxAncestorLedgerDepth = 16;
+    internal const int MaxAncestorLedgerDepth = 256;
 
     /// <summary>Creates the context for one execution of the given run.</summary>
     public DurableFlowContext(
@@ -357,19 +361,35 @@ internal sealed class DurableFlowContext : IDurableFlowContext
         // margin: nothing refreshes an ancestor while it waits on this chain (lease renewal only
         // stamps the lease columns), so a descendant parking beyond the ancestor's StateExpiry
         // silently expired the ancestor and the eventual completion wake-up found no state.
+        // Part of the park, not insurance around it: a failure here propagates BEFORE any wake-up
+        // is published (every caller publishes after this save), so the delivery is retried from
+        // the checkpoint above instead of the run parking on an ancestor that will expire under it.
         if (ttl > _options.StateExpiry && _state.ParentFlowId is not null)
             await ExtendAncestorLedgersAsync(ttl, cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>
-    /// Best-effort TTL refresh of the ancestor chain when this run parks for a window its own
-    /// plain <see cref="DurableFlowOptions.StateExpiry"/> would not cover. Only
+    /// TTL refresh of the WHOLE ancestor chain when this run parks for a window its own plain
+    /// <see cref="DurableFlowOptions.StateExpiry"/> would not cover. Only
     /// <see cref="FlowRunStatus.Running"/> ancestors are stamped — a terminal or
     /// operator-suspended run is not waiting on this chain, and an absent row is never
     /// resurrected (the walk stops there and the expired-ancestor failure surfaces on wake-up,
-    /// as before). Failures log and return: this run's own checkpoint already latched, and
-    /// faulting the park over ancestor insurance would re-run the step for a write the next long
-    /// park retries anyway.
+    /// as before). A store failure PROPAGATES: the callers all publish their wake-up only after
+    /// this returns, so the park fails with nothing published and the transport redelivers the
+    /// execution, which replays to the same step and retries the chain. Swallowing it (the
+    /// previous behavior) let the child park "successfully" — wake-up and all — while the parent
+    /// it would eventually complete into expired mid-wait, after which every step past the
+    /// parent's child-await was lost with the parent's checkpoints. The chain is walked to the
+    /// root with cycle detection; a chain that revisits an id or exceeds
+    /// <see cref="MaxAncestorLedgerDepth"/> fails the run terminally (deterministic on every
+    /// replay) rather than being truncated in silence.
+    /// <para>
+    /// The stamp cannot undercut a longer wait an ancestor still needs: a chain is linear — a
+    /// flow body is sequential, so a parked ancestor waits on exactly one descendant at a time,
+    /// and the leaf's current park is the only wait in progress on the whole chain. The
+    /// ancestor's own park windows (timers, awaited deadlines) belong to steps that are not
+    /// pending while it waits on a child.
+    /// </para>
     /// <para>
     /// SINGLE-SHOT per ancestor, deliberately NOT <see cref="FlowStateConcurrency.MutateAsync"/>:
     /// every write here advances the ancestor's <c>Revision</c>, which invalidates the
@@ -386,9 +406,27 @@ internal sealed class DurableFlowContext : IDurableFlowContext
     /// </summary>
     private async Task ExtendAncestorLedgersAsync(TimeSpan ttl, CancellationToken cancellationToken)
     {
+        var visited = new HashSet<string>(StringComparer.Ordinal) { FlowId };
         var ancestorId = _state.ParentFlowId;
-        for (var depth = 0; ancestorId is not null && depth < MaxAncestorLedgerDepth; depth++)
+        while (ancestorId is not null)
         {
+            if (!visited.Add(ancestorId))
+            {
+                // Corrupted ledgers (ParentFlowId loops back into the chain). Deterministic on
+                // every replay, so terminal: parking would leave the run waiting on ancestors
+                // whose retention can never be established.
+                throw new DurableFlowFailedException(
+                    $"Flow '{FlowId}' cannot park for {ttl}: its ancestor chain revisits flow '{ancestorId}' (a cycle in ParentFlowId), " +
+                    "so the ledgers it would wait on cannot be kept alive. The stored ledgers are inconsistent; the run is failed rather than parked.");
+            }
+
+            if (visited.Count > MaxAncestorLedgerDepth + 1)
+            {
+                throw new DurableFlowFailedException(
+                    $"Flow '{FlowId}' cannot park for {ttl}: it is nested more than {MaxAncestorLedgerDepth} child flows deep, and every ancestor's ledger " +
+                    "must be kept alive for the wait. Flatten the nesting.");
+            }
+
             try
             {
                 var ancestor = await _store.LoadAsync(ancestorId, cancellationToken).ConfigureAwait(false);
@@ -421,17 +459,16 @@ internal sealed class DurableFlowContext : IDurableFlowContext
 
                 ancestorId = ancestor.ParentFlowId;
             }
-            catch (OperationCanceledException)
+            catch (Exception ex) when (ex is not OperationCanceledException)
             {
-                throw;
-            }
-            catch (Exception ex)
-            {
+                // Logged with the chain context, then rethrown AS IS: the park is abandoned with
+                // nothing published, the delivery retries, and the store's own exception type
+                // stays visible to whoever classifies it upstream.
                 _logger.LogWarning(
                     ex,
-                    "Flow {FlowId} could not extend ancestor flow {AncestorFlowId}'s ledger TTL for its {Ttl} park; the ancestor keeps its current expiry.",
+                    "Flow {FlowId} could not extend ancestor flow {AncestorFlowId}'s ledger TTL for its {Ttl} park; abandoning the park (no wake-up is published) so the delivery retries it.",
                     FlowId, ancestorId, ttl);
-                return;
+                throw;
             }
         }
     }
@@ -603,15 +640,28 @@ internal sealed class DurableFlowContext : IDurableFlowContext
         {
             // A terminal child snapshot is a settled outcome: memoize it uninterruptibly (local
             // and awaited-step parity) so a cancellation here cannot trip MarkLost on a healthy lease.
+            // The caller gets the SNAPSHOT — the reduced shape the memo holds (no ambient Context,
+            // nested child-step results elided) — on the first completion exactly as on every
+            // replay, which reads it back from the memo above. Returning the loaded child here
+            // handed the first execution a richer object than any re-execution would ever see, so
+            // parent logic could branch differently (or fail) after a restart on a step it had
+            // already completed; the whole point of the memo is that the two are indistinguishable.
             case FlowRunStatus.Succeeded:
-                await CompleteStepAsync(name, checkpoint, FlowStateJson.SerializeSnapshot(child), CancellationToken.None, kind: DurableFlowStepKind.ChildFlow).ConfigureAwait(false);
-                return child;
+            {
+                var snapshotJson = FlowStateJson.SerializeSnapshot(child);
+                await CompleteStepAsync(name, checkpoint, snapshotJson, CancellationToken.None, kind: DurableFlowStepKind.ChildFlow).ConfigureAwait(false);
+                return MaterializeChildSnapshot(name, snapshotJson);
+            }
 
             case FlowRunStatus.Failed:
+            {
                 checkpoint.Message = child.LastMessage;
-                await CompleteStepAsync(name, checkpoint, FlowStateJson.SerializeSnapshot(child), CancellationToken.None, faulted: true, kind: DurableFlowStepKind.ChildFlow).ConfigureAwait(false);
-                ThrowIfChildFailed(child, failOnChildFailure);
-                return child;
+                var snapshotJson = FlowStateJson.SerializeSnapshot(child);
+                await CompleteStepAsync(name, checkpoint, snapshotJson, CancellationToken.None, faulted: true, kind: DurableFlowStepKind.ChildFlow).ConfigureAwait(false);
+                var snapshot = MaterializeChildSnapshot(name, snapshotJson);
+                ThrowIfChildFailed(snapshot, failOnChildFailure);
+                return snapshot;
+            }
 
             default:
                 await NotifyStepAsync(static (o, e) => o.OnStepWaitingAsync(e), name, DurableFlowStepKind.ChildFlow).ConfigureAwait(false);
@@ -1067,6 +1117,16 @@ internal sealed class DurableFlowContext : IDurableFlowContext
         if (_suspended)
             throw new DurableFlowSuspendedException(_state.LastMessage ?? $"Flow {FlowId} is suspended.");
     }
+
+    /// <summary>
+    /// Reads a just-memoized child snapshot back through the SAME deserializer the replay branch
+    /// uses, so the object handed to the first completion is bit-for-bit what every later
+    /// execution receives.
+    /// </summary>
+    private FlowState MaterializeChildSnapshot(string stepName, string snapshotJson)
+        => DeserializeResult<FlowState>(snapshotJson)
+            ?? throw new DurableFlowFailedException(
+                $"Completed child step '{stepName}' of flow '{FlowId}' has no child-state snapshot.");
 
     private static void ThrowIfChildFailed(FlowState child, bool failOnChildFailure)
     {

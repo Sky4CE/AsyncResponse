@@ -120,22 +120,28 @@ The `input` factory receives the occurrence's scheduled UTC instant and **must b
 across replicas** (every replica must produce the same value for the same occurrence — don't put
 `Guid.NewGuid()` in it).
 
-**A due occurrence whose start could not be published is never abandoned.** Starting an
-occurrence publishes its start job first — the job carries the initial ledger and creates the run
-when executed (see [durable-flows.md](durable-flows.md#what-happens-when-things-die)) — so a
-publish that fails after the start's own retry ladder (a broker outage;
-`DurableFlowNotDispatchedException`) leaves nothing persisted. The scheduler keeps such an
-occurrence in an in-process re-drive queue and repeats the idempotent start every
-`ScheduledFlowOptions.RedriveInterval` (default 30 seconds) until the job is published, the run is
-seen to exist (another replica started it), or the occurrence is gone. Because that queue dies with
-the process, each schedule also probes the last `StartupRedriveWindow` (default 1 hour; zero
-disables it; at most the 64 most recent occurrences) at startup and re-drives any occurrence whose
-ledger is Running with zero attempts — a run whose wake-up was lost in transit (an early-ACK worker
-subscriber, a broker that dropped the job) and that nothing else would find. A run that is merely
-queued behind a busy worker looks the same and is re-driven too, harmlessly: the duplicate wake-up
-is absorbed by the execution lease. Every re-drive is logged; a queue that exceeds 256
-undispatched occurrences drops the oldest with an error naming its id, which stays re-drivable by
-starting the same occurrence id again.
+**A due occurrence whose start could not be published is never abandoned while the process
+lives.** Starting an occurrence publishes its start job first — the job carries the initial ledger
+and creates the run when executed (see
+[durable-flows.md](durable-flows.md#what-happens-when-things-die)) — so a publish that fails after
+the start's own retry ladder (a broker outage; `DurableFlowNotDispatchedException`) leaves nothing
+persisted. The scheduler keeps such an occurrence in an in-process re-drive queue and repeats the
+idempotent start every `ScheduledFlowOptions.RedriveInterval` (default 30 seconds) until the job is
+published or the run is seen to have executed (another replica started it). An absent ledger is the
+*expected* shape of an occurrence still waiting for its first successful publish, and the re-drive
+starts it again — an earlier reading treated the absence as "expired" and gave up, which lost every
+occurrence that fell due during an outage longer than the start's retry ladder. The queue dies with
+its process: an occurrence whose publish was still failing at shutdown persisted nothing, so
+nothing can find it after a restart and it is skipped like any occurrence missed while no replica
+was up (the run history shows the gap). Separately, each schedule probes the last
+`StartupRedriveWindow` (default 1 hour; zero disables it; at most the 64 most recent occurrences)
+at startup and re-drives any occurrence whose ledger *exists*, is Running, and has zero attempts —
+a run whose wake-up was published and then lost in transit (an early-ACK worker subscriber, a
+broker that dropped the job) and that nothing else would find. A run that is merely queued behind
+a busy worker looks the same and is re-driven too, harmlessly: the duplicate wake-up is absorbed by
+the execution lease. Every re-drive is logged; a queue that exceeds 256 undispatched occurrences
+drops the oldest with an error naming its id, which stays startable by hand with the same
+occurrence id.
 
 ## Cron syntax
 
@@ -170,9 +176,10 @@ are rejected.
   so editing the code mid-run cannot double- or under-sleep an in-flight run.
 - **Schedules are at-most-once.** Occurrences that pass while *no* replica is up are skipped on
   restart, by design — the run history shows the gap. A late timer fire (seconds) still starts
-  its own occurrence. Skipping applies only to occurrences whose ledger was never created: a
-  committed occurrence whose job was not published is re-driven (see above), in-process and
-  across restarts.
+  its own occurrence. An occurrence the loop did reach but could not publish is re-driven in
+  process until it is (see above); one whose publish was still failing when the process died is
+  skipped like any other missed occurrence, because nothing was persisted for it. A published
+  start whose job was then lost in transit is found by the startup probe.
 - **Renaming a schedule** changes the ids future occurrences dedup on; in-flight runs are
   unaffected.
 - **Suspended-timer wake-ups are broker messages.** Their loss modes are the transport's loss

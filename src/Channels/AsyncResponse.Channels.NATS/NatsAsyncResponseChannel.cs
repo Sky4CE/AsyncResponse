@@ -388,7 +388,10 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
                     return;
                 }
 
-                var envelope = JsonSerializer.Deserialize(payload, AsyncResponseEnvelopeJson.TypeInfo<T>());
+                // JsonSafety, not the raw reader: a parse failure is logged below and handed to the
+                // waiter, and the reader's own message quotes inbound property names and dictionary
+                // keys (docs/security.md, "never logs a message body"). Size and position only.
+                var envelope = JsonSafety.SafeDeserialize(payload, AsyncResponseEnvelopeJson.TypeInfo<T>());
 
                 if (envelope == null)
                 {
