@@ -16,11 +16,13 @@ public interface IFlowStateStore
 
     /// <summary>
     /// Loads the state of one flow run, or <c>null</c> when the run is genuinely gone — unknown,
-    /// pruned, or expired. A row that exists but cannot be interpreted is <em>not</em> absence and
-    /// must throw <see cref="FlowStateUnreadableException"/>: callers acknowledge a wake-up on
-    /// <c>null</c>, so reporting a live-but-unreadable ledger that way strands the run.
+    /// pruned, or expired. A row that exists but cannot be interpreted — malformed JSON, an
+    /// unknown schema version, a revision inside the JSON that disagrees with the stored one, a
+    /// flow id inside the JSON that is not the key — is <em>not</em> absence and must throw
+    /// <see cref="FlowStateUnreadableException"/>: callers acknowledge a wake-up on <c>null</c>,
+    /// so reporting a live-but-unreadable ledger that way strands the run.
     /// </summary>
-    /// <exception cref="FlowStateUnreadableException">The ledger exists but is uninterpretable.</exception>
+    /// <exception cref="FlowStateUnreadableException">The ledger exists but is uninterpretable or inconsistent.</exception>
     Task<FlowState?> LoadAsync(string flowId, CancellationToken cancellationToken = default);
 
     /// <summary>

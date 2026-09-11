@@ -176,12 +176,15 @@ internal static class FlowStateConcurrency
 
             var expectedRevision = state.Revision;
             state.Revision = checked(expectedRevision + 1);
-            state.UpdatedAtUtc = (timeProvider ?? TimeProvider.System).GetUtcNow().UtcDateTime;
+            var nowUtc = (timeProvider ?? TimeProvider.System).GetUtcNow().UtcDateTime;
+            state.UpdatedAtUtc = nowUtc;
             if (await store.TryUpdateAsync(
                     flowId,
                     state,
                     expectedRevision,
-                    ttl,
+                    // A lease-bypassing write (recovery, failure signal, operator) never shrinks a
+                    // live run's ledger under a park it knows nothing about.
+                    FlowStateRetention.EffectiveTtl(state, ttl, nowUtc),
                     leaseId: null,
                     cancellationToken).ConfigureAwait(false))
                 return true;
@@ -351,7 +354,8 @@ internal sealed class FlowExecutionLease : IAsyncDisposable
         ThrowIfLost(cause);
         var expectedRevision = state.Revision;
         state.Revision = checked(expectedRevision + 1);
-        state.UpdatedAtUtc = _timeProvider.GetUtcNow().UtcDateTime;
+        var nowUtc = _timeProvider.GetUtcNow().UtcDateTime;
+        state.UpdatedAtUtc = nowUtc;
 
         try
         {
@@ -359,7 +363,11 @@ internal sealed class FlowExecutionLease : IAsyncDisposable
                     _flowId,
                     state,
                     expectedRevision,
-                    ttl,
+                    // Every checkpoint carries the ledger's retention floor forward (see
+                    // FlowStateRetention): the executor's per-attempt save and an ancestor's
+                    // re-park stamp the plain StateExpiry, and used to shrink a ledger a
+                    // descendant had extended for a wait still in progress.
+                    FlowStateRetention.EffectiveTtl(state, ttl, nowUtc),
                     _leaseId,
                     cancellationToken).ConfigureAwait(false))
                 return;

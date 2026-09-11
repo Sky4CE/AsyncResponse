@@ -202,10 +202,13 @@ public sealed class CosmosDurableFlowStateStoreTests
         harness.Reads(Document(state, DateTime.UtcNow.AddSeconds(-1)));
         Assert.Null(await harness.Store.LoadAsync("flow"));
 
+        // A document whose physical revision disagrees with the one inside its JSON is present
+        // and inconsistent: unreadable, never absent (round 38 — "absent" acked its wake-up).
         var unreadable = Document(state, DateTime.UtcNow.AddMinutes(1));
         unreadable.Revision = state.Revision + 1;
         harness.Reads(unreadable);
-        Assert.Null(await harness.Store.LoadAsync("flow"));
+        var inconsistent = await Assert.ThrowsAsync<FlowStateUnreadableException>(() => harness.Store.LoadAsync("flow"));
+        Assert.Contains("stored revision is 1", inconsistent.Reason, StringComparison.Ordinal);
 
         harness.Reads(Document(state, DateTime.UtcNow.AddMinutes(1)));
         Assert.Equal("flow", (await harness.Store.LoadAsync("flow"))?.FlowId);

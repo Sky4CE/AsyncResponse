@@ -437,20 +437,26 @@ public sealed class Round26RegressionTests
     // -----------------------------------------------------------------------------------------
 
     [Fact]
-    public async Task AncestorLedgerRefresh_AgainstAConcurrentWriter_TriesOnceAndGivesUp()
+    public async Task AncestorLedgerRefresh_AgainstAConcurrentWriter_RetriesBoundedly_ThenAbandonsThePark()
     {
-        // Pre-fix MutateAsync retried the compare-and-swap eight times. Every round that WON
+        // Pre-round-26 MutateAsync retried the compare-and-swap eight times. Every round that WON
         // advanced the ancestor's revision, so a parent that was genuinely executing lost its next
         // checkpoint's CAS, called MarkLost() and abandoned its delivery for redelivery —
-        // re-running everything since its last checkpoint. A lost CAS now means "the ancestor is
-        // alive and re-stamping its own expiry", which is exactly when this insurance is not
-        // needed, so one attempt is enough.
+        // re-running everything since its last checkpoint. Round 26 made a lost CAS mean "the
+        // ancestor is alive and re-stamping its own expiry" and stopped after one attempt; round
+        // 38 found the competing write stamps the plain StateExpiry (it knows nothing about the
+        // park), so ceding the race expired the parent under the child's wait. The extension now
+        // re-reads and retries a small, fixed number of times — a re-read that already carries a
+        // floor reaching the park ends it without a write — and a walk that loses every attempt
+        // abandons the park (nothing published; the delivery retries) instead of either fighting
+        // without end or parking on unproven retention.
         var store = new CasRefusingFlowStateStore("parent");
         var context = CreateContextForAncestorWalk(store, childFlowId: "child", parentFlowId: "parent");
 
-        await InvokeExtendAncestorLedgersAsync(context, TimeSpan.FromDays(30));
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => InvokeExtendAncestorLedgersAsync(context, TimeSpan.FromDays(30)));
 
-        Assert.Equal(1, store.UpdateAttempts);
+        Assert.Equal(DurableFlowContext.MaxAncestorExtensionAttempts, store.UpdateAttempts);
+        Assert.Contains("abandoned", ex.Message, StringComparison.Ordinal);
     }
 
     [Fact]

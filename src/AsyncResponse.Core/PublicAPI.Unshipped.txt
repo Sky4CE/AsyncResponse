@@ -144,6 +144,8 @@ AsyncResponse.InMemoryWorkerTransportOptions
 AsyncResponse.InMemoryWorkerTransportOptions.InMemoryWorkerTransportOptions() -> void
 AsyncResponse.InMemoryWorkerTransportOptions.InJobOverflowCapacity.get -> int
 AsyncResponse.InMemoryWorkerTransportOptions.InJobOverflowCapacity.set -> void
+AsyncResponse.InMemoryWorkerTransportOptions.DelayedJobCapacity.get -> int
+AsyncResponse.InMemoryWorkerTransportOptions.DelayedJobCapacity.set -> void
 AsyncResponse.InMemoryWorkerTransportOptions.MaxDeliveryAttempts.get -> int
 AsyncResponse.InMemoryWorkerTransportOptions.MaxDeliveryAttempts.set -> void
 AsyncResponse.InMemoryWorkerTransportOptions.QueueCapacity.get -> int

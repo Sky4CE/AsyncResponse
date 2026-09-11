@@ -100,6 +100,8 @@ AsyncResponse.FlowState.ParentFlowId.get -> string?
 AsyncResponse.FlowState.ParentFlowId.set -> void
 AsyncResponse.FlowState.ParentStepName.get -> string?
 AsyncResponse.FlowState.ParentStepName.set -> void
+AsyncResponse.FlowState.RetainUntilUtc.get -> System.DateTime?
+AsyncResponse.FlowState.RetainUntilUtc.set -> void
 AsyncResponse.FlowState.Revision.get -> long
 AsyncResponse.FlowState.Revision.set -> void
 AsyncResponse.FlowState.SchemaVersion.get -> int

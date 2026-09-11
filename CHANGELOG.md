@@ -13,6 +13,75 @@ work that has landed on `main` but not yet shipped. Security reporters credited 
 
 ### Changed
 
+- **Round-38 review (2026-09-11): recovery invariants enforced consistently across persistence and settlement.**
+  - *A parked child can no longer lose its parent to a concurrent checkpoint.* Round 36 made a
+    descendant's long park extend every ancestor's ledger, but a lost revision race was treated
+    as success ("a concurrent writer means the ancestor is alive and re-stamping its own
+    expiry"). The competing write was computed without the park in view — the parent replaying
+    its child-await from a snapshot taken before the child persisted its sleep, or the executor's
+    per-attempt save — and stamped the plain `StateExpiry`, so the parent expired under an
+    hour-long wait with the child's wake-up already published, and every step past the parent's
+    child-await was lost. The ledger now carries a **retention floor**, `FlowState.RetainUntilUtc`
+    (additive wire property, omitted when unset): a park stamps it on the run and on every
+    `Running` ancestor, and every ledger write of a non-terminal run — checkpoint, per-attempt
+    save, recovery or operator mutation — raises the TTL it stamps to reach the floor, so no
+    write that knows nothing about a wait can shrink the retention under it. The ancestor
+    extension re-reads after a lost race: a write that already carries a floor reaching the park
+    proves the retention and ends the walk step; otherwise the extension is retried against the
+    new revision, up to four times, and losing every attempt abandons the park with nothing
+    published (the delivery retries it later) instead of parking on unproven retention.
+  - *Kafka: a malformed message behind a detached handler is settled in partition order.* A
+    message that could not be parsed into a delivery was dead-lettered and its offset stored the
+    moment it was consumed. Consumed behind a detached handler of the same partition (a rebalance
+    handing the partition back with its pause reset delivers the next record), that stored the
+    partition **past** the unfinished message, the auto-committer committed it, and a crash
+    skipped the valid job for good — with only the malformed record's copy in the dead-letter
+    topic. Such a message is now held behind the partition's detached handler, exactly like a
+    valid delivery, and buried with its offset stored in its turn once the handler settles. With
+    nothing detached on the partition it is discarded at once, as before.
+  - *Kafka: a poll-loop failure no longer waits without limit for unrelated handlers.* When a
+    consume failed, the fault teardown awaited every detached handler before closing the
+    consumer, so a transient broker failure disabled the subscriber for as long as a durable-flow
+    step awaiting a remote response took — and the configured reconnect policy never ran. The new
+    `KafkaSubscriberOptions.FaultDrainTimeout` (default 5 s; `0` abandons at once) bounds it:
+    handlers that settle within the budget get their offsets stored and committed by the close;
+    the rest are abandoned — offsets unstored, messages redelivered on the rebuilt consumer while
+    the abandoned handler may still be running (handlers are at-least-once), each one's eventual
+    outcome logged — and the session's cancellation token stops their retry ladders. A graceful
+    stop is unchanged (the host's shutdown budget bounds it).
+  - *In-memory transport: delayed jobs are bounded.* Neither `QueueCapacity` nor
+    `InJobOverflowCapacity` covered delayed jobs: every scheduled publish retained its envelope
+    and captured execution context against no limit, and when a burst's timers fired each started
+    a channel write that pended outside the bounded queue. The new
+    `InMemoryWorkerTransportOptions.DelayedJobCapacity` (default 4096) reserves a slot per delayed
+    job from acceptance until the fired job has entered the queue: a delayed publish from outside
+    a job waits for a slot (honoring its cancellation token); one made from inside a running job —
+    a flow parking on a timer — is rejected with `InvalidOperationException` (the publishing job
+    fails and is redelivered), never parked. New gauge `asyncresponse.worker.inmemory_delayed_jobs`
+    and counter `asyncresponse.worker.inmemory_delayed_rejections`.
+  - *Recovery-state readers are body-free.* The Redis, NATS, PostgreSQL, SQL Server, and MongoDB
+    recovery-state stores deserialized stored registrations with the raw reader and logged its
+    `JsonException`, whose `Path` is built from the registration's `Context` keys — tenant and
+    auth baggage — so a malformed blob copied them into the application log. They now go through
+    `JsonSafety` like every other reader of a body the library did not write; the logged failure
+    carries size and position only, and unreadable-state behavior (skip, count, refuse to
+    overwrite) is unchanged.
+  - *A ledger inconsistent with itself is unreadable, not absent.* Every built-in store reads the
+    JSON and the revision from one row or document, so a revision inside the JSON that disagrees
+    with the stored one, or a flow id inside the JSON that is not the key, is a corrupt or
+    mis-restored row that is physically present. Loading it as `null` told the executor to
+    acknowledge the wake-up as belonging to a deleted flow, and the run behind the row lost its
+    only wake-up. `DurableFlowStoreShared.ReadState` and the in-memory store now throw
+    `FlowStateUnreadableException` naming both revisions (or the identity mismatch), which rides
+    the transport's retry and dead-letter path; the `IFlowStateStore.LoadAsync` contract and the
+    custom-store checklist say so.
+  - Tests: 9 red-on-old proofs against 94c3ddb (the lost extension race, the inconsistent
+    in-memory ledger through the store and the executor, five recovery-reader leak probes, the
+    delayed-job bound, the malformed message behind a detached Kafka handler), plus new-API pins
+    for the floor's wire shape and arithmetic, the lease and mutation write paths, the floor on
+    every ancestor, the proven-by-re-read and losing-every-attempt outcomes, the delayed-job
+    capacity (rejection, counter, gauge, drain, validation), and the Kafka fault teardown (abandon
+    and reconnect, settle-within-budget, validation).
 - **Round-37 review (2026-09-11): where provider behavior meets the orchestration guarantees.**
   - *Kafka: a long handler no longer stalls the poll loop.* In `AckAfterHandlerCompletes` mode the
     poll thread awaited the whole handler, so a durable-flow step awaiting a remote response or a

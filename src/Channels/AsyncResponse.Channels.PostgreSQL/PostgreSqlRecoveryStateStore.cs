@@ -1,6 +1,7 @@
 using Microsoft.Extensions.Logging;
 using System.Runtime.CompilerServices;
 using System.Text.Json;
+using System.Text.Json.Serialization.Metadata;
 
 namespace AsyncResponse.Channels.PostgreSQL;
 
@@ -94,11 +95,19 @@ internal sealed class PostgreSqlRecoveryStateStore(
         return states;
     }
 
+    /// <summary>The registration's metadata off the library's resolver — case-sensitive matching, as before.</summary>
+    private static readonly JsonTypeInfo<RecoveryState> _stateTypeInfo =
+        AsyncResponseJson.GetTypeInfo<RecoveryState>(AsyncResponseJson.Default);
+
     private RecoveryState? DeserializeState(string json, string? correlationId, ref int unreadable)
     {
         try
         {
-            var state = AsyncResponseJson.Deserialize<RecoveryState>(json);
+            // Through JsonSafety, not the raw reader: the exception logged below is the body-free
+            // rebuild (size and position). The reader's own appends `Path: $.Context['<key>']`
+            // built from the stored registration's context keys — tenant and auth baggage — which
+            // the warning then carried into the application log.
+            var state = JsonSafety.SafeDeserialize(json, _stateTypeInfo);
             if (state is null)
             {
                 unreadable++;
@@ -136,7 +145,7 @@ internal sealed class PostgreSqlRecoveryStateStore(
 
             return state;
         }
-        catch (JsonException ex)
+        catch (Exception ex) when (ex is JsonException or InvalidDataException)
         {
             _logger.LogWarning(ex, "Unreadable PostgreSQL recovery state for correlationId {CorrelationId}; skipping.", correlationId);
             unreadable++;

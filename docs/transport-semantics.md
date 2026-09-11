@@ -98,7 +98,7 @@ remainder, which is how capped transports chunk long delays with no transport-sp
 
 | Transport | Native delayed delivery | Per-hop cap | Mechanism / caveats |
 |---|---|---|---|
-| **InMemory** | ✅ | — | `TimeProvider` timer wheel (virtual-clock aware in tests); delayed jobs die with the process, logged at shutdown |
+| **InMemory** | ✅ | — | `TimeProvider` timer wheel (virtual-clock aware in tests); delayed jobs die with the process, logged at shutdown; at most `DelayedJobCapacity` (4096) held at once — external publishers wait, in-job publishes are rejected |
 | **AzureServiceBus** | ✅ | — | scheduled messages (`ScheduledEnqueueTime`); broker-held, survives restarts |
 | **SQS** | ✅ | 15 min (chunked) | `DelaySeconds`; standard queues only — a FIFO worker queue advertises no delay capability (`MaxPublishDelay` = zero), so flow timers fall back in process and a delayed enqueue fails fast at publish |
 | **PostgreSQL** | ✅ | — | insert with `available_at = now() + delay` (database clock); pickup latency ≤ `EmptyPollDelay` |
@@ -199,8 +199,26 @@ Only cells that need more than a phrase.
 - A message that cannot be projected at all (empty payload, unresolvable correlation id) is
   produced to the dead-letter topic and its offset stored, ignoring the stopping token like every
   other settlement path — a shutdown landing mid-burial would leave the poison message neither
-  buried nor committed. A `StoreOffset` that throws because a rebalance revoked the partition is
-  logged rather than faulting the poll loop; the message simply redelivers.
+  buried nor committed. **In partition order:** consumed behind a detached handler of the same
+  partition (a rebalance handing the partition back with its pause reset delivers the next
+  record), it is held exactly like a valid delivery and buried in its turn once the handler
+  settles — storing its offset at once committed the partition *past* the unfinished message, and
+  a crash after that commit skipped the valid job for good with only the malformed record's copy
+  in the dead-letter topic. A `StoreOffset` that throws because a rebalance revoked the partition
+  is logged rather than faulting the poll loop; the message simply redelivers.
+- **A poll-loop failure tears down within `FaultDrainTimeout`** (default 5 s; `0` abandons at
+  once). When a consume fails — a dropped broker connection, a burial that failed for good — the
+  consumer is closed and rebuilt by the supervisor after its backoff; detached handlers that
+  settle within the budget get their offsets stored and committed by the close, exactly as after
+  a stop. The rest are abandoned: their offsets stay unstored, their messages redeliver on the
+  rebuilt consumer — possibly while the abandoned handler is still running, which is the
+  at-least-once contract every handler on this transport already carries (a durable flow's lease
+  makes the redelivery a no-op; a plain worker job must be idempotent) — the session's
+  cancellation token stops their retry ladders, and each one's eventual outcome is logged. Before
+  the bound, the teardown waited for every detached handler without limit, so a transient broker
+  failure disabled the whole subscriber for as long as an unrelated long handler took and the
+  configured reconnect policy never ran. A graceful stop is not bounded here; the host's shutdown
+  budget bounds it.
 - Every dead-letter produce's retry ladder is bounded to a quarter of `MaxPollInterval`: the
   malformed-message discard runs it on the poll thread, and an undeliverable dead-letter topic
   (auto-create off, a leaderless partition, an over-sized payload) would otherwise wait out

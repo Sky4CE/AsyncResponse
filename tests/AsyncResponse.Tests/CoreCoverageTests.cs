@@ -324,12 +324,13 @@ public sealed class CoreCoverageTests
         AddRawFlowEntry(store, "revision-mismatch", FlowStateJson.Serialize(State("revision-mismatch")), revision: 1);
         AddRawFlowEntry(store, "flow-mismatch", FlowStateJson.Serialize(State("different-id")), revision: 0);
 
-        // A present-but-unreadable row throws; only genuine absence (and the two benign mismatches)
-        // reads as null, because callers ack on null. See FlowStateUnreadableException.
+        // A present-but-unreadable row throws — malformed, and (since round 38) inconsistent with
+        // its own revision or key; only genuine absence reads as null, because callers ack on
+        // null. See FlowStateUnreadableException.
         await Assert.ThrowsAsync<FlowStateUnreadableException>(() => store.LoadAsync("malformed"));
         await Assert.ThrowsAsync<FlowStateUnreadableException>(() => store.LoadAsync("null-json"));
-        Assert.Null(await store.LoadAsync("revision-mismatch"));
-        Assert.Null(await store.LoadAsync("flow-mismatch"));
+        await Assert.ThrowsAsync<FlowStateUnreadableException>(() => store.LoadAsync("revision-mismatch"));
+        await Assert.ThrowsAsync<FlowStateUnreadableException>(() => store.LoadAsync("flow-mismatch"));
         Assert.Null(await store.LoadAsync("missing"));
         await Assert.ThrowsAsync<ArgumentException>(() => store.LoadAsync(" "));
 

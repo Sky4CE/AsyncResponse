@@ -35,6 +35,21 @@ public sealed class InMemoryWorkerTransport : IWorkerTransport, IDelayedWorkerTr
     private int _outstanding;
     private volatile bool _draining;
 
+    /// <summary>
+    /// One slot per delayed job the transport may hold, from acceptance until the fired job has
+    /// entered the queue (or was dropped). Neither queue bound covered delayed jobs: every
+    /// scheduled publish retained its materialized envelope and captured execution context
+    /// against no limit at all, and when a burst's timers fired, each started an asynchronous
+    /// channel write that pended outside the bounded queue — so a flood of scheduled jobs grew
+    /// the process without either configured capacity giving a signal. Bounded by
+    /// <see cref="InMemoryWorkerTransportOptions.DelayedJobCapacity"/>: an external publisher
+    /// waits for a slot (honoring its cancellation token); a publish from inside a running job
+    /// is rejected instead, as its immediate follow-ups are at the overflow bound — a worker
+    /// waiting for a slot that only a fired timer entering the queue (through that worker) frees
+    /// would be waiting on itself.
+    /// </summary>
+    private readonly SemaphoreSlim _delayedSlots;
+
     /// <summary>Creates a transport with default bounded-queue options.</summary>
     public InMemoryWorkerTransport()
         : this(Microsoft.Extensions.Options.Options.Create(new InMemoryWorkerTransportOptions()))
@@ -54,6 +69,7 @@ public sealed class InMemoryWorkerTransport : IWorkerTransport, IDelayedWorkerTr
             FullMode = BoundedChannelFullMode.Wait,
             AllowSynchronousContinuations = false
         });
+        _delayedSlots = new SemaphoreSlim(Options.DelayedJobCapacity, Options.DelayedJobCapacity);
         AsyncResponseDiagnostics.TrackInMemoryOverflow(this);
     }
 
@@ -144,6 +160,12 @@ public sealed class InMemoryWorkerTransport : IWorkerTransport, IDelayedWorkerTr
     /// <summary>Jobs accepted but not yet finished (queued + executing). Test-harness idle probe.</summary>
     internal int OutstandingJobs => Volatile.Read(ref _outstanding);
 
+    /// <summary>
+    /// Delayed jobs currently held: waiting on their due-time timer, or fired and waiting for
+    /// queue room (the <c>asyncresponse.worker.inmemory_delayed_jobs</c> gauge and test inspection).
+    /// </summary>
+    internal int DelayedJobsHeld => Options.DelayedJobCapacity - _delayedSlots.CurrentCount;
+
     /// <summary>The delayed jobs currently waiting on their due-time timers (test inspection).</summary>
     internal IReadOnlyList<WorkerJobEnvelope> SnapshotDelayedJobs()
     {
@@ -218,6 +240,9 @@ public sealed class InMemoryWorkerTransport : IWorkerTransport, IDelayedWorkerTr
         foreach (var (job, timer) in pending)
         {
             timer.Dispose();
+            // The slot is freed whether the job is retained (it is re-published into the next
+            // incarnation's transport, which has its own slots) or dropped.
+            _delayedSlots.Release();
             if (retention is not null)
                 continue;
 
@@ -324,6 +349,42 @@ public sealed class InMemoryWorkerTransport : IWorkerTransport, IDelayedWorkerTr
         cancellationToken.ThrowIfCancellationRequested();
         job = MaterializeFromWire(job);
 
+        // Capacity is reserved BEFORE the job is accepted, and held until the fired job has
+        // entered the queue (WriteFiredAsync) or the drain dropped it — the delayed set and the
+        // fired-but-pending writes together never exceed DelayedJobCapacity. A publish from
+        // inside a running job never waits (see _delayedSlots): rejected, like an immediate
+        // follow-up at the overflow bound, so the publishing job fails and is redelivered.
+        if (InJobScope.IsActive)
+        {
+            if (!_delayedSlots.Wait(0))
+            {
+                AsyncResponseDiagnostics.RecordInMemoryDelayedRejection();
+                throw new InvalidOperationException(
+                    $"The in-memory worker transport rejected a delayed job ({job.Call.ServiceInterfaceFullName}.{job.Call.MethodName}) published from inside a running job: " +
+                    $"{nameof(InMemoryWorkerTransportOptions)}.{nameof(InMemoryWorkerTransportOptions.DelayedJobCapacity)} ({Options.DelayedJobCapacity}) delayed jobs are already scheduled. " +
+                    "Follow-up publishes never wait for room (a worker waiting on itself would deadlock), so the publishing job fails and is redelivered — " +
+                    "make its publishes idempotent, or raise the capacity.");
+            }
+
+            ScheduleDelayed(job, delay);
+            return Task.CompletedTask;
+        }
+
+        return PublishDelayedFromOutsideAsync(job, delay, cancellationToken);
+    }
+
+    private async Task PublishDelayedFromOutsideAsync(WorkerJobEnvelope job, TimeSpan delay, CancellationToken cancellationToken)
+    {
+        // Backpressure on an external producer, exactly as the bounded queue is for its immediate
+        // publishes: the wait ends when a scheduled job fires and enters the queue, a drain drops
+        // the scheduled set, or the caller's token cancels.
+        await _delayedSlots.WaitAsync(cancellationToken).ConfigureAwait(false);
+        ScheduleDelayed(job, delay);
+    }
+
+    /// <summary>Arms the timer for a job whose slot is already reserved; releases the slot when the job cannot be armed.</summary>
+    private void ScheduleDelayed(WorkerJobEnvelope job, TimeSpan delay)
+    {
         using var activity = AsyncResponseDiagnostics.StartActivity(
             "asyncresponse.worker.publish",
             ActivityKind.Producer,
@@ -338,13 +399,16 @@ public sealed class InMemoryWorkerTransport : IWorkerTransport, IDelayedWorkerTr
         {
             if (_draining)
             {
+                // Nothing is armed here either way, so the reserved slot goes back.
+                _delayedSlots.Release();
+
                 // Harness restart: a flow suspending mid-drain parks its wake-up with "the
                 // broker" instead of faulting the draining job (and stalling the stop on the
                 // redelivery backoff).
                 if (_drainRetention is { } retained)
                 {
                     retained.Add(job);
-                    return Task.CompletedTask;
+                    return;
                 }
 
                 // Same contract as the shutdown drain below: delayed in-memory jobs share the
@@ -361,8 +425,6 @@ public sealed class InMemoryWorkerTransport : IWorkerTransport, IDelayedWorkerTr
             var timer = _timeProvider.CreateTimer(static state => ((DelayedJob)state!).Fire(), delayed, delay, Timeout.InfiniteTimeSpan);
             _delayedJobs.Add(delayed, timer);
         }
-
-        return Task.CompletedTask;
     }
 
     private void FireDelayed(DelayedJob delayed)
@@ -407,6 +469,12 @@ public sealed class InMemoryWorkerTransport : IWorkerTransport, IDelayedWorkerTr
                 "Failed to enqueue fired delayed in-memory worker job {Target}.{Method}.",
                 queued.Job.Call.ServiceInterfaceFullName, queued.Job.Call.MethodName);
         }
+        finally
+        {
+            // Held from acceptance through the pending write: the job is now either in the
+            // bounded queue (counted there) or dropped.
+            _delayedSlots.Release();
+        }
     }
 
     // Wire parity for EVERY job, in-process included: the envelope the worker receives is
@@ -437,7 +505,10 @@ public sealed class InMemoryWorkerTransport : IWorkerTransport, IDelayedWorkerTr
 /// <summary>Capacity and concurrency options for the process-local worker transport.</summary>
 public sealed class InMemoryWorkerTransportOptions
 {
-    /// <summary>Maximum queued jobs before publishers asynchronously wait. Default: 1024.</summary>
+    /// <summary>
+    /// Maximum queued jobs before publishers asynchronously wait. Default: 1024. Delayed jobs
+    /// are bounded separately by <see cref="DelayedJobCapacity"/>.
+    /// </summary>
     public int QueueCapacity { get; set; } = 1024;
 
     /// <summary>Number of jobs that may execute concurrently. Default: 1.</summary>
@@ -457,6 +528,24 @@ public sealed class InMemoryWorkerTransportOptions
     /// count on <c>asyncresponse.worker.inmemory_overflow_rejections</c>. Default: 4096.
     /// </summary>
     public int InJobOverflowCapacity { get; set; } = 4096;
+
+    /// <summary>
+    /// Maximum number of delayed jobs — <c>EnqueueWorkerAsync(..., delay)</c> and the wake-ups
+    /// behind suspended durable-flow timers — the transport holds at once: waiting on their due
+    /// time, or fired and waiting for queue room. Neither <see cref="QueueCapacity"/> nor
+    /// <see cref="InJobOverflowCapacity"/> covers them, and every held job retains its
+    /// materialized envelope and captured execution context. At the bound a delayed publish from
+    /// outside a job waits (honoring its cancellation token) until a scheduled job enters the
+    /// queue; one made from <em>inside</em> a running job — a flow parking on a timer — never
+    /// waits (a worker waiting for room only a fired timer draining through that worker can free
+    /// would be waiting on itself) and throws <see cref="InvalidOperationException"/> instead:
+    /// the publishing job fails and is redelivered by the in-process retry ladder, so make in-job
+    /// publishes idempotent. The current count is the
+    /// <c>asyncresponse.worker.inmemory_delayed_jobs</c> gauge; in-job rejections count on
+    /// <c>asyncresponse.worker.inmemory_delayed_rejections</c>. Size it above the number of
+    /// flows you expect to be sleeping at once on this transport. Default: 4096.
+    /// </summary>
+    public int DelayedJobCapacity { get; set; } = 4096;
 
     /// <summary>
     /// Maximum number of delivery attempts before a failing job is dropped, with an error log and
@@ -485,6 +574,8 @@ public sealed class InMemoryWorkerTransportOptions
             throw new InvalidOperationException($"{nameof(WorkerCount)} must be positive.");
         if (InJobOverflowCapacity < 0)
             throw new InvalidOperationException($"{nameof(InJobOverflowCapacity)} must be zero (no overflow: a follow-up publish that finds the queue full is rejected) or positive.");
+        if (DelayedJobCapacity <= 0)
+            throw new InvalidOperationException($"{nameof(DelayedJobCapacity)} must be positive: durable-flow timers on this transport are delayed jobs.");
         if (MaxDeliveryAttempts < 0)
             throw new InvalidOperationException($"{nameof(MaxDeliveryAttempts)} must be zero (unlimited) or positive.");
         if (RetryBaseDelay <= TimeSpan.Zero)

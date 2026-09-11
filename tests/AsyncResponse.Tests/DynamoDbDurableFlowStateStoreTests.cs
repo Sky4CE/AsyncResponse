@@ -177,8 +177,9 @@ public sealed class DynamoDbDurableFlowStateStoreTests
 
         // The item EXISTS in every case below, so "cannot interpret it" and "it is gone" must not
         // give the same answer: callers ack on null, and acking a ledger that is still in the table
-        // strands a Running flow with no wake-up left. Only real expiry and the deliberate
-        // revision-mismatch race read as absent.
+        // strands a Running flow with no wake-up left. Only real expiry reads as absent — a
+        // revision inside the JSON that disagrees with the item's own is an inconsistent item,
+        // not a deleted flow (round 38).
         await AssertUnreadableAsync("its 'expires_at' attribute is missing");         // no expires_at
         await AssertUnreadableAsync("not an epoch-seconds number");                    // expires_at = "not-a-number"
         Assert.Null(await store.LoadAsync("flow"));                                    // expired: genuinely gone
@@ -186,7 +187,7 @@ public sealed class DynamoDbDurableFlowStateStoreTests
         await AssertUnreadableAsync("'state_json' attribute is missing or empty");     // state_json = ""
         await AssertUnreadableAsync("'revision' attribute is missing");                // no revision
         await AssertUnreadableAsync("not a number");                                   // revision = "bad"
-        Assert.Null(await store.LoadAsync("flow"));                                    // revision mismatch: benign race
+        await AssertUnreadableAsync("stored revision is 1");                           // revision mismatch: inconsistent item
 
         Assert.Equal("flow", (await store.LoadAsync("flow"))?.FlowId);
 

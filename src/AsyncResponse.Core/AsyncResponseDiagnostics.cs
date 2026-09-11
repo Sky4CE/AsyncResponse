@@ -78,6 +78,10 @@ public static class AsyncResponseDiagnostics
         Meter.CreateCounter<long>("asyncresponse.worker.inmemory_overflow_rejections", unit: "{job}",
             description: "Follow-up jobs the in-memory worker transport refused because its queue was full and the in-job overflow was at InJobOverflowCapacity; the publishing job failed and is redelivered.");
 
+    private static readonly Counter<long> InMemoryDelayedRejections =
+        Meter.CreateCounter<long>("asyncresponse.worker.inmemory_delayed_rejections", unit: "{job}",
+            description: "Delayed jobs published from inside a running job that the in-memory worker transport refused because DelayedJobCapacity jobs were already scheduled; the publishing job failed and is redelivered.");
+
     // Every live in-memory transport in the process, for the overflow-depth gauge: the meter is
     // static and a process may host several transports (test harnesses, host-per-tenant workers),
     // so the gauge sums them and drops the ones that have been collected. Weak references keep a
@@ -95,9 +99,17 @@ public static class AsyncResponseDiagnostics
             InMemoryOverflowRejections.Add(1);
     }
 
+    /// <summary>Records one in-job delayed publish the in-memory transport rejected at its delayed-job capacity.</summary>
+    internal static void RecordInMemoryDelayedRejection()
+    {
+        if (InMemoryDelayedRejections.Enabled)
+            InMemoryDelayedRejections.Add(1);
+    }
+
     /// <summary>
-    /// Registers a transport with the <c>asyncresponse.worker.inmemory_overflow_depth</c> gauge
-    /// (created once, process-wide, on first use).
+    /// Registers a transport with the <c>asyncresponse.worker.inmemory_overflow_depth</c> and
+    /// <c>asyncresponse.worker.inmemory_delayed_jobs</c> gauges (created once, process-wide, on
+    /// first use).
     /// </summary>
     internal static void TrackInMemoryOverflow(InMemoryWorkerTransport transport)
     {
@@ -111,24 +123,27 @@ public static class AsyncResponseDiagnostics
             return;
 
         Meter.CreateObservableGauge("asyncresponse.worker.inmemory_overflow_depth",
-            static () => ObserveInMemoryOverflowDepth(), unit: "{job}",
+            static () => SumOverInMemoryTransports(static transport => transport.OverflowDepth), unit: "{job}",
             description: "Follow-up jobs the in-memory worker transport currently holds past QueueCapacity (summed over the process's transports); bounded by InJobOverflowCapacity.");
+        Meter.CreateObservableGauge("asyncresponse.worker.inmemory_delayed_jobs",
+            static () => SumOverInMemoryTransports(static transport => transport.DelayedJobsHeld), unit: "{job}",
+            description: "Delayed jobs the in-memory worker transport currently holds — waiting on their due time, or fired and waiting for queue room (summed over the process's transports); bounded by DelayedJobCapacity.");
     }
 
-    private static long ObserveInMemoryOverflowDepth()
+    private static long SumOverInMemoryTransports(Func<InMemoryWorkerTransport, int> measure)
     {
-        long depth = 0;
+        long total = 0;
         lock (_inMemoryTransports)
         {
             _inMemoryTransports.RemoveAll(static reference => !reference.TryGetTarget(out _));
             foreach (var reference in _inMemoryTransports)
             {
                 if (reference.TryGetTarget(out var transport))
-                    depth += transport.OverflowDepth;
+                    total += measure(transport);
             }
         }
 
-        return depth;
+        return total;
     }
 
     internal static Activity? StartActivity(

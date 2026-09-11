@@ -80,6 +80,23 @@ owns the full story — this page is the map, not the territory.
   the inline budget against it. See [transport options](configuration.md#transport-options) and
   [transport semantics](transport-semantics.md#kafka).
 
+### Kafka: `Abandoning detached Kafka handler …` after a broker failure
+
+- **Symptom:** a warning naming a message whose handler was still running when the poll loop
+  failed, then the subscriber reconnects and the same message is handled again — for a durable
+  flow, a second execution that acknowledges as a duplicate (the lease is held); for a plain
+  worker job, a second run.
+- **Cause:** the consume failed (a dropped connection, a burial that failed for good) and the
+  fault teardown waited `WorkerSubscriber.FaultDrainTimeout` (default 5 s) for the detached
+  handlers; this one did not settle in time, so its offset was left unstored and the rebuilt
+  consumer re-consumed it. The handler's eventual outcome is logged (`Abandoned Kafka handler …
+  completed/failed/stopped …`). Before the bound, the reconnect waited for every detached handler
+  with no limit and a transient broker failure parked the subscriber behind one long step.
+- **Fix:** nothing, if the handler is idempotent — this is the transport's at-least-once
+  contract. Raise `FaultDrainTimeout` when handlers reliably settle within a known window and
+  you would rather delay the reconnect than redeliver; make plain worker jobs idempotent
+  regardless. See [transport semantics](transport-semantics.md#kafka).
+
 ### `WorkerJobTooLargeException` from `EnqueueWorkerAsync` or `StartAsync`
 
 - **Symptom:** the publish throws `WorkerJobTooLargeException` naming the envelope's serialized

@@ -117,14 +117,20 @@ public sealed class DurableFlowStoreSharedTests
         Assert.Contains("exceeding the provider MaxStateBytes limit of 1 bytes", tooLarge.Message);
 
         // ReadState: only a readable ledger whose revision AND identity match loads as present.
-        // The two mismatches still read as absent — a row under the wrong key or at the wrong
-        // revision is a benign race or a misplaced restore, and treating it as this flow would be
-        // worse. An UNREADABLE row is the case that changed: it throws, because reporting it as
-        // absent told the executor to ack a live run's only wake-up.
+        // Everything else THROWS — never null. Unreadable JSON did already (reporting it as absent
+        // told the executor to ack a live run's only wake-up); round 38 extended that to the two
+        // mismatches: the JSON and the revision come from ONE row, so a disagreement inside that
+        // snapshot is an inconsistent row that is physically present, and a row under the wrong
+        // key is a misplaced restore — neither is proof the run is gone, and "absent" acked the
+        // wake-up of a run whose row sat in the table.
         Assert.Equal("flow", Assert.IsType<FlowState>(Invoke(shared, "ReadState", "flow", json, 0L)).FlowId);
         AssertInner<FlowStateUnreadableException>(shared, "ReadState", "flow", "{", 0L);  // unreadable
-        Assert.Null(Invoke(shared, "ReadState", "flow", json, 7L));        // revision mismatch
-        Assert.Null(Invoke(shared, "ReadState", "other", json, 0L));       // identity mismatch
+        var revisionMismatch = AssertInner<FlowStateUnreadableException>(shared, "ReadState", "flow", json, 7L);
+        Assert.Contains("stored revision is 7", revisionMismatch.Reason, StringComparison.Ordinal);
+        Assert.Contains("inside its JSON is 0", revisionMismatch.Reason, StringComparison.Ordinal);
+        var identityMismatch = AssertInner<FlowStateUnreadableException>(shared, "ReadState", "other", json, 0L);
+        Assert.Equal("other", identityMismatch.FlowId);
+        Assert.Contains("not the id it is stored under", identityMismatch.Reason, StringComparison.Ordinal);
 
         // Saturating adds: an absurd expiry means "never" rather than an overflow on every write.
         var instant = new DateTime(2026, 1, 1, 0, 0, 0, DateTimeKind.Utc);

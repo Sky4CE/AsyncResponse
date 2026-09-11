@@ -97,6 +97,18 @@ public sealed class FlowState
     /// which may happen in a different deployment.
     /// </summary>
     public Dictionary<string, string>? Context { get; set; }
+
+    /// <summary>
+    /// Retention floor: the earliest UTC instant this ledger may be allowed to expire, stamped when
+    /// this run — or a descendant flow waiting on this chain — parks for a window longer than the
+    /// ordinary idle <c>StateExpiry</c>. Every ledger write of a non-terminal run honors it: the
+    /// TTL a checkpoint stamps is raised to reach this instant, so a concurrent checkpoint that
+    /// knows nothing about the park (an ancestor's replay, an executor's per-attempt save) cannot
+    /// shrink the retention back under a wait that is still in progress. Additive wire property:
+    /// absent on ledgers written before it existed and on runs that never parked beyond their own
+    /// expiry. Ignored once the run is terminal.
+    /// </summary>
+    public DateTime? RetainUntilUtc { get; set; }
 }
 
 /// <summary>One step's checkpoint inside <see cref="FlowState"/>.</summary>

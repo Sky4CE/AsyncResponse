@@ -83,7 +83,14 @@ internal abstract class KafkaSubscriberService : BackgroundService
         try
         {
             consumer.Subscribe(Topic);
-            await using var dispatcher = KafkaMessageDispatcher.Create(
+
+            // One session token per consumer, linked to the host's: a stop cancels it as before.
+            // A poll-loop FAULT cancels it too — after the bounded fault teardown below — so a
+            // detached handler abandoned by that teardown stops retrying a message whose offset
+            // this session can no longer store, instead of running its whole retry ladder for a
+            // consumer that is gone.
+            using var session = CancellationTokenSource.CreateLinkedTokenSource(stoppingToken);
+            var dispatcher = KafkaMessageDispatcher.Create(
                 HandleMessageAsync,
                 consumer,
                 _producer,
@@ -101,18 +108,42 @@ internal abstract class KafkaSubscriberService : BackgroundService
                 SubscriberRole,
                 SubscriberOptions.AckMode);
 
-            // Consume() blocks the calling thread, so the poll loop runs on a dedicated thread
-            // instead of starving the thread pool; the dispatcher's settlements happen on it too
-            // (the consumer is touched from no other thread while the loop runs).
-            await Task.Factory.StartNew(
-                () => RunPollLoop(consumer, dispatcher, stoppingToken),
-                stoppingToken,
-                TaskCreationOptions.LongRunning,
-                TaskScheduler.Default).ConfigureAwait(false);
-
-            // Leaving the await-using scope drains the ACK-after-enqueue background queue — or
-            // waits for ack-after-handler mode's detached handlers and stores their offsets —
-            // before the consumer commits its final stored offsets below.
+            var faulted = false;
+            try
+            {
+                // Consume() blocks the calling thread, so the poll loop runs on a dedicated thread
+                // instead of starving the thread pool; the dispatcher's settlements happen on it too
+                // (the consumer is touched from no other thread while the loop runs).
+                await Task.Factory.StartNew(
+                    () => RunPollLoop(consumer, dispatcher, session.Token),
+                    stoppingToken,
+                    TaskCreationOptions.LongRunning,
+                    TaskScheduler.Default).ConfigureAwait(false);
+            }
+            catch (Exception) when (!stoppingToken.IsCancellationRequested)
+            {
+                // The poll loop failed (a consume error, a dropped connection, a burial that
+                // failed for good) and the supervisor will rebuild the consumer after its backoff.
+                // Teardown is BOUNDED here, unlike the graceful stop's: waiting for every detached
+                // handler with no limit parked the reconnect behind an unrelated long handler — a
+                // durable-flow step awaiting a remote response — and the configured retry policy
+                // never ran. Handlers that settle within the budget get their offsets stored
+                // (the close below commits them); the rest are abandoned with their offsets
+                // unstored, so their messages redeliver on the rebuilt consumer.
+                faulted = true;
+                await dispatcher.TeardownAfterFaultAsync().ConfigureAwait(false);
+                session.Cancel();
+                throw;
+            }
+            finally
+            {
+                // Graceful stop (or a fault racing one): the drain waits for the ACK-after-enqueue
+                // background queue — or ack-after-handler mode's detached handlers, storing their
+                // offsets — before the consumer commits its final stored offsets below. The host's
+                // shutdown budget bounds it.
+                if (!faulted)
+                    await dispatcher.DisposeAsync().ConfigureAwait(false);
+            }
         }
         finally
         {
@@ -195,7 +226,12 @@ internal abstract class KafkaSubscriberService : BackgroundService
                 // after every supervisor restart and the whole subscriber (all assigned partitions)
                 // stops advancing — MaxDeliveryAttempts cannot help, because it is keyed on a
                 // delivery this path never constructed.
-                dispatcher.DiscardUnprocessableAsync(message, ex, stoppingToken).GetAwaiter().GetResult();
+                //
+                // Through the dispatcher's partition ordering, not a direct discard: storing this
+                // message's offset while an earlier message of the same partition is still being
+                // handled (detached) commits the partition PAST that unfinished message, and a
+                // crash after the commit skips it for good with no dead-letter copy anywhere.
+                dispatcher.AcceptUnprocessable(message, ex, stoppingToken);
                 continue;
             }
 

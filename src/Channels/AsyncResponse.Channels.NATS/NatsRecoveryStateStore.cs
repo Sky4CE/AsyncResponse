@@ -383,9 +383,13 @@ internal sealed class NatsRecoveryStateStore : IRecoveryStateStore, IRecoverySta
     {
         try
         {
-            return JsonSerializer.Deserialize(json, _envelopeTypeInfo);
+            // Through JsonSafety, not the raw reader: the exception logged below is the body-free
+            // rebuild (size and position). The reader's own appends `Path: $.States[0].Context['<key>']`
+            // built from the stored registration's context keys — tenant and auth baggage — which
+            // this warning then carried into the application log.
+            return JsonSafety.SafeDeserialize(json, _envelopeTypeInfo);
         }
-        catch (JsonException ex)
+        catch (Exception ex) when (ex is JsonException or InvalidDataException)
         {
             _logger.LogWarning(ex, "Unreadable recovery state at key {RecoveryKey}; skipping.", key);
             return null;
