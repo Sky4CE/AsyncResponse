@@ -25,6 +25,14 @@ internal sealed class BenchmarkKafkaConsumerClient : IKafkaConsumerClient
     {
     }
 
+    public void PausePartition(string topic, int partition)
+    {
+    }
+
+    public void ResumePartition(string topic, int partition)
+    {
+    }
+
     public void Close()
     {
     }

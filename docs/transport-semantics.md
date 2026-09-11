@@ -172,10 +172,20 @@ Only cells that need more than a phrase.
 
 - Kafka offsets cannot NACK a single message, so redelivery is in-process: a failing handler is
   retried with backoff (`HandlerRetryBaseDelay` 100 ms → `HandlerRetryMaxDelay` 5 s) up to
-  `MaxDeliveryAttempts`, stalling that partition while it retries (classic consumer-group
-  semantics — size `TopicNumPartitions` for parallelism). Keep the worst-case retry budget
-  under the consumer's `max.poll.interval.ms` or the broker evicts the consumer mid-retry
-  ([troubleshooting](troubleshooting.md#kafka-the-broker-evicts-the-consumer-mid-retry)).
+  `MaxDeliveryAttempts`, stalling that partition — and only that partition — while it retries
+  (classic consumer-group semantics — size `TopicNumPartitions` for parallelism).
+- **A long handler never stalls the poll loop.** In ack-after-handler mode a handler is awaited
+  inline for `DetachHandlerAfter` (default 1 s); one still running past that is detached: its
+  partition is paused (Kafka's own ordering primitive — nothing is fetched for it, nothing is
+  buffered in-process), the handler and its retry ladder run on the thread pool, and the poll
+  thread keeps polling — so the consumer's other partitions keep flowing, `max.poll.interval.ms`
+  is honored, and rebalance callbacks fire. The poll thread (the only thread that touches the
+  consumer) stores the offset and resumes the partition once the handler settles, within one
+  `BackpressurePollDelay`; a stop waits for detached handlers and commits their offsets. Detached
+  handlers for different partitions run concurrently. Before this, the poll thread awaited the
+  whole handler, and a durable-flow step awaiting a remote response for longer than the interval
+  got the consumer evicted, its partitions rebalanced, and the same job redelivered to a peer
+  ([troubleshooting](troubleshooting.md#kafka-rebalances-or-duplicate-runs-while-long-handlers-execute)).
 - Attempts are counted per process delivery: a consumer restart before the offset commit
   resets the count. The message that exhausts its attempts is produced to the dead-letter
   topic with failure-detail headers and its offset committed, so the partition keeps moving.
@@ -191,10 +201,12 @@ Only cells that need more than a phrase.
   other settlement path — a shutdown landing mid-burial would leave the poison message neither
   buried nor committed. A `StoreOffset` that throws because a rebalance revoked the partition is
   logged rather than faulting the poll loop; the message simply redelivers.
-- Every dead-letter produce runs on the poll thread, so its retry ladder is bounded to a quarter
-  of `MaxPollInterval`: an undeliverable dead-letter topic (auto-create off, a leaderless
-  partition, an over-sized payload) would otherwise wait out librdkafka's `message.timeout.ms`
-  per attempt, overrun `max.poll.interval.ms`, and evict the consumer mid-burial.
+- Every dead-letter produce's retry ladder is bounded to a quarter of `MaxPollInterval`: the
+  malformed-message discard runs it on the poll thread, and an undeliverable dead-letter topic
+  (auto-create off, a leaderless partition, an over-sized payload) would otherwise wait out
+  librdkafka's `message.timeout.ms` per attempt, overrun `max.poll.interval.ms`, and evict the
+  consumer mid-burial; the ack-after-handler burial runs inside the (possibly detached) handler
+  task and keeps the same bound so a partition is not parked on it either.
 - **A burial that fails for good faults the subscriber** (ack-after-handler mode and the
   malformed-message discard). Kafka commits a partition *position*, not per-record
   acknowledgements, so merely leaving the failed message's offset unstored protects nothing: the
@@ -240,6 +252,18 @@ Only cells that need more than a phrase.
   `BackgroundDrainTimeout` against `HostShutdownTimeout`.
 
 ### Redis
+
+- **The Redis *channel* (pub/sub) is fire-and-forget, and its per-wait buffer is bounded.** A
+  publisher is never backpressured, and the StackExchange.Redis queue behind a subscription is
+  unbounded, so the channel buffers at most `1,024` responses per correlation id behind the wait's
+  serial processing (an `Until` predicate runs one message at a time). A response that finds that
+  buffer full faults the wait with the overload form of
+  `AsyncResponseIndeterminateDeliveryException` (a terminal response may be among the queued or the
+  refused ones), unsubscribes, and counts `asyncresponse.channel.overloaded_waits` — never buffered
+  without bound, never silently dropped. Durable flows treat the fault like the disposal-drain form
+  and restart the (idempotent) step. Where a backlog must be lossless, use a database channel
+  (PostgreSQL, SQL Server, MongoDB): its backlog stays server-side and the dispatch sweep admits it
+  as capacity frees.
 
 - New entries arrive via `XREADGROUP` at attempt 1. A separate reclaim loop scans the
   pending-entries list every `PendingClaimInterval` (5 s) and claims entries idle longer than

@@ -27,6 +27,12 @@ has itself loaded.
   SQL Server), distinct queues (Azure Service Bus, SQS, RabbitMQ), or topic/consumer-group names (Kafka,
   Google Pub/Sub).
 - Enable transport-level TLS and credentials end to end.
+- Mind local conveniences too: the repository's `docker-compose.yml` binds its Redis to
+  `127.0.0.1` on purpose — an unqualified `6379:6379` publishes on every host interface, and the
+  official image runs with protected mode off, so a development Redis reachable from the network
+  segment is an unauthenticated write path into recovery descriptors and response envelopes for
+  any application pointed at it. Anything that must be reachable from another machine needs
+  `requirepass`/ACLs and network isolation, never a wider bind.
 
 The callback authorizer below is a second layer on top of this — not a replacement for it.
 

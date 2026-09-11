@@ -1,5 +1,6 @@
 using AsyncResponse;
 using Microsoft.Extensions.DependencyInjection.Extensions;
+using Microsoft.Extensions.Options;
 using System.Diagnostics.CodeAnalysis;
 
 namespace Microsoft.Extensions.DependencyInjection;
@@ -46,7 +47,9 @@ public static class AsyncResponseCoreServiceCollectionExtensions
             provider.GetService<IWorkerTransport>(),
             provider.GetService<IAsyncResponseReplyTargetProvider>(),
             provider.GetRequiredService<AsyncResponseContextPropagation>(),
-            provider.GetService<TimeProvider>()));
+            provider.GetService<TimeProvider>(),
+            // The producer-side mirror of the ingress's inbound size budget (WorkerJobTooLargeException).
+            provider.GetService<IOptions<AsyncResponseOptions>>()));
 
         // Fail fast before background services do any real work if the required channel,
         // transport, and durable-flow store choices were not made explicitly. TryAddEnumerable
@@ -352,7 +355,9 @@ public static class AsyncResponseCoreServiceCollectionExtensions
             provider.GetService<IWorkerTransport>(),
             provider.GetService<IAsyncResponseReplyTargetProvider>(),
             provider.GetRequiredService<AsyncResponseContextPropagation>(),
-            provider.GetService<TimeProvider>())));
+            provider.GetService<TimeProvider>(),
+            // The producer-side mirror of the ingress's inbound size budget (WorkerJobTooLargeException).
+            provider.GetService<IOptions<AsyncResponseOptions>>())));
         services.Replace(ServiceDescriptor.Singleton<IAsyncResponseBuilder>(provider => provider.GetRequiredService<IRecoverableAsyncResponseBuilder>()));
 
         // The resolved default waiter timeout is declared through the marker so the startup

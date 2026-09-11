@@ -61,14 +61,56 @@ owns the full story — this page is the map, not the territory.
   handlers), and name the queue `*.fifo` to opt into FIFO publishing. See
   [transport options](configuration.md#transport-options).
 
-### Kafka: the broker evicts the consumer mid-retry
+### Kafka: rebalances or duplicate runs while long handlers execute
 
-- **Symptom:** rebalances and consumer evictions while a failing message is being retried.
-- **Cause:** in-process retries happen inside one poll cycle, so the worst-case budget
-  `MaxDeliveryAttempts × HandlerRetryMaxDelay` can exceed the consumer's `max.poll.interval.ms`
-  (default 5 minutes) — the broker then considers the consumer dead.
-- **Fix:** keep the retry budget well under `max.poll.interval.ms`, or raise the interval via
-  `ConfigureConsumer`. See [transport options](configuration.md#transport-options).
+- **Symptom:** `Application maximum poll interval (…ms) exceeded` from librdkafka, rebalances, and
+  a worker job or flow step that ran twice — once here and once on the peer the partition moved
+  to — while a handler was still running.
+- **Cause:** a consumer that stops polling for `max.poll.interval.ms` (default 5 minutes) is
+  evicted from its group. Before round 37 the poll thread awaited the whole handler, so a
+  durable-flow step awaiting a remote response or sleeping on a timer for longer than the
+  interval — or a long in-process retry ladder — did exactly that. Now a handler still running
+  after `WorkerSubscriber.DetachHandlerAfter` (default 1 s) is detached: its partition is paused,
+  the handler runs on, and the poll thread keeps polling; the offset is stored once the handler
+  settles. The symptom can therefore only remain when the inline budget itself is raised toward
+  the interval (validation allows up to half of it, minus `PollTimeout`), or when a
+  `ConfigureConsumer` hook overrides `MaxPollIntervalMs` below what the library configured.
+- **Fix:** leave `DetachHandlerAfter` at its default and do not override `MaxPollIntervalMs` in
+  `ConfigureConsumer`; set `MaxPollInterval` on the subscriber options instead, which validates
+  the inline budget against it. See [transport options](configuration.md#transport-options) and
+  [transport semantics](transport-semantics.md#kafka).
+
+### `WorkerJobTooLargeException` from `EnqueueWorkerAsync` or `StartAsync`
+
+- **Symptom:** the publish throws `WorkerJobTooLargeException` naming the envelope's serialized
+  length and `AsyncResponseOptions.MaxInboundMessageChars`; nothing was published, no ledger exists.
+- **Cause:** the serialized worker envelope — arguments, captured context, and for a flow start
+  the whole initial ledger, input included — exceeds what the consuming ingress accepts. The
+  ingress acknowledges such a message *without executing it* (an oversized message never gets
+  smaller, so redelivering it would hot-loop), so before this check the transport took the job,
+  the ingress dropped it, and the caller held a flow id for a `Running` run nothing would ever
+  execute. JSON escaping counts: quotes, non-ASCII and control characters serialize to several
+  times their length.
+- **Fix:** put the large argument behind a claim check — persist it yourself and pass a reference
+  (see the [durable-flows ledger budgets](durable-flows.md#supported-ledger-budgets)) — rather
+  than raising the limit; if you do raise it, raise it identically on every producer and consumer
+  of the deployment.
+
+### Redis: a wait faults with `AsyncResponseIndeterminateDeliveryException` saying responses "arrived faster than the wait could process them"
+
+- **Symptom:** the waiter faults with the overload form of the exception (`BufferedMessages` =
+  1,024), the log carries `Wait for correlationId … is overloaded`, and
+  `asyncresponse.channel.overloaded_waits` counts up for `channel=redis`.
+- **Cause:** responses for one correlation id — typically a progress-message flood — arrived
+  faster than the wait's serial processing (its `Until` predicate) consumed them, and the bounded
+  per-wait buffer filled. Redis pub/sub cannot backpressure the publisher, and the SDK queue
+  behind the subscription is unbounded, so the channel refuses the next response instead of
+  buffering it without bound. The refused or queued responses may include the terminal one, which
+  is why the wait is faulted as indeterminate rather than completed or timed out.
+- **Fix:** make the predicate cheap (no I/O per progress message), publish fewer progress
+  messages, or move the wait to a database channel, whose backlog stays server-side and is
+  admitted as capacity frees. Durable flows restart the awaiting step on this fault automatically;
+  plain waiters should treat the step as indeterminate and restart it rather than re-attach.
 
 ### Kafka: the subscriber restarts repeatedly, each time naming a message it "could not dead-letter"
 

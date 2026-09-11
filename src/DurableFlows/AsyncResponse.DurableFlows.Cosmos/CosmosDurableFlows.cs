@@ -351,14 +351,22 @@ public sealed class CosmosFlowStateStore : IFlowStateStore, IDisposable
     /// Together with the conditional patches below, lease maintenance now costs O(lease fields)
     /// on the wire regardless of ledger size. RU cost still depends on the service's accounting
     /// for the loaded document; measure it (docs/durable-flow-state-stores.md).
+    /// <para>
+    /// Only the SQL text is shared. A <see cref="QueryDefinition"/> is a mutable parameter bag —
+    /// <c>WithParameter</c> replaces the named parameter in place and returns the same instance —
+    /// so one static definition parameterized per call handed concurrent lease operations each
+    /// other's ids: flow A's query could execute with <c>@id = B</c> under A's partition key,
+    /// return no document, and fail a healthy renewal (which abandons and replays the run). Every
+    /// call builds its own definition.
+    /// </para>
     /// </summary>
-    private static readonly QueryDefinition LeaseProjectionQuery = new(
-        "SELECT c.id, c._etag, c.expiresAtUtc, c.revision, c.leaseId, c.leaseExpiresAtUtc FROM c WHERE c.id = @id");
+    private const string LeaseProjectionSql =
+        "SELECT c.id, c._etag, c.expiresAtUtc, c.revision, c.leaseId, c.leaseExpiresAtUtc FROM c WHERE c.id = @id";
 
     private static async Task<CosmosLeaseProjection?> ReadLeaseAsync(Container container, string flowId, CancellationToken cancellationToken)
     {
         using var iterator = container.GetItemQueryIterator<CosmosLeaseProjection>(
-            LeaseProjectionQuery.WithParameter("@id", flowId),
+            new QueryDefinition(LeaseProjectionSql).WithParameter("@id", flowId),
             requestOptions: new QueryRequestOptions { PartitionKey = new PartitionKey(flowId), MaxItemCount = 1 });
         while (iterator.HasMoreResults)
         {

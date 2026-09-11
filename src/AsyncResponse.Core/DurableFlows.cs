@@ -158,13 +158,30 @@ internal sealed class DurableFlowService : IDurableFlows
                 // whose token is not the caller's is a transport or SDK timeout — brokers surface
                 // those as TaskCanceledException all the time — and that is exactly the transient
                 // shape this retry exists for. Excluding the whole exception type meant the most
-                // common recoverable publish failure got zero retries.
-                isTransient: ex => ex is not OperationCanceledException || !cancellationToken.IsCancellationRequested,
+                // common recoverable publish failure got zero retries. An envelope over the
+                // ingress's size budget is deterministic (the same input serializes to the same
+                // length): no attempt can succeed, so it is not retried either.
+                isTransient: ex => ex is not WorkerJobTooLargeException
+                    && (ex is not OperationCanceledException || !cancellationToken.IsCancellationRequested),
                 maxAttempts: 4,
                 baseDelay: TimeSpan.FromMilliseconds(250),
                 maxDelay: TimeSpan.FromSeconds(2),
                 cancellationToken,
                 _timeProvider).ConfigureAwait(false);
+        }
+        catch (WorkerJobTooLargeException ex)
+        {
+            // Not a dispatch failure to retry: the start job carries the initial ledger, and this
+            // input serializes past what the consuming ingress accepts — it would be acknowledged
+            // there without ever executing. Surfaced as itself (nothing was persisted) so the
+            // caller can shrink the input or move it behind a claim check.
+            _logger.LogError(
+                ex,
+                "Durable flow {FlowId} could not be started: its start job ({SerializedLength} UTF-16 code units) exceeds the ingress budget of {Limit}. Nothing was persisted.",
+                flowId,
+                ex.SerializedLength,
+                ex.Limit);
+            throw;
         }
         catch (Exception ex)
         {

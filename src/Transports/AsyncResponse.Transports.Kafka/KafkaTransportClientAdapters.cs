@@ -41,7 +41,9 @@ internal interface IKafkaProducerClient : IDisposable
 
 /// <summary>
 /// Adapter seam over one Kafka consumer. Not thread-safe: each hosted subscriber owns one
-/// consumer and touches it only from its own poll loop.
+/// consumer and touches it only from its own poll loop — detached handlers never call it; their
+/// completions are settled by the poll thread (and, after the loop has exited, by the
+/// dispatcher's disposal, sequentially).
 /// </summary>
 internal interface IKafkaConsumerClient : IDisposable
 {
@@ -66,6 +68,16 @@ internal interface IKafkaConsumerClient : IDisposable
 
     /// <summary>Resumes fetching on all currently assigned partitions.</summary>
     void ResumeAssignment();
+
+    /// <summary>
+    /// Pauses fetching on one partition while a detached handler runs its message, so the
+    /// partition's order holds with nothing buffered in-process. Throws when the partition is not
+    /// currently assigned (revoked by a rebalance); callers treat that as informational.
+    /// </summary>
+    void PausePartition(string topic, int partition);
+
+    /// <summary>Resumes fetching on one partition once its detached handler has settled. Throws when it is no longer assigned.</summary>
+    void ResumePartition(string topic, int partition);
 
     /// <summary>Leaves the group cleanly, committing stored offsets.</summary>
     void Close();
@@ -235,6 +247,14 @@ internal sealed class KafkaConsumerClientAdapter(IConsumer<string?, byte[]> _con
     public void ResumeAssignment()
         => _consumer.Resume(_consumer.Assignment);
 
+    /// <summary>Pauses fetching on one partition.</summary>
+    public void PausePartition(string topic, int partition)
+        => _consumer.Pause([new TopicPartition(topic, new Partition(partition))]);
+
+    /// <summary>Resumes fetching on one partition.</summary>
+    public void ResumePartition(string topic, int partition)
+        => _consumer.Resume([new TopicPartition(topic, new Partition(partition))]);
+
     /// <summary>Leaves the group cleanly, committing stored offsets.</summary>
     public void Close()
         => _consumer.Close();
@@ -278,9 +298,9 @@ internal sealed class KafkaConsumerClientFactory(KafkaAsyncResponseTransportOpti
             EnableAutoCommit = true,
             EnableAutoOffsetStore = false,
             AutoCommitIntervalMs = (int)Math.Max(1, _options.OffsetCommitInterval.TotalMilliseconds),
-            // The dispatcher's in-process retry delays run on the poll thread, so the eviction
-            // deadline they must fit within is set explicitly and validated against the retry
-            // budget instead of trusting the librdkafka default to line up.
+            // The poll thread's longest gap (one inline handler wait of DetachHandlerAfter plus
+            // one poll) is validated against this deadline at startup, so it is set explicitly
+            // instead of trusting the librdkafka default to line up.
             MaxPollIntervalMs = (int)Math.Max(1, subscriberOptions.MaxPollInterval.TotalMilliseconds),
             // Start new consumer groups at the beginning of the topic so messages published before
             // the first subscriber starts are not skipped (mirrors the other transports).

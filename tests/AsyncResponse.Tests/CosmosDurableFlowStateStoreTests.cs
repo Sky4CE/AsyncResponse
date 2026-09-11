@@ -593,6 +593,92 @@ public sealed class CosmosDurableFlowStateStoreTests
         return response;
     }
 
+    [Fact]
+    public async Task Round37_ConcurrentLeaseOperations_NeverExecuteWithEachOthersId()
+    {
+        // Regression (round 37, F1): the lease projection query was ONE static QueryDefinition
+        // parameterized per call. WithParameter replaces the named parameter in place and returns
+        // the same instance, so two flows' lease operations interleaving on one store instance
+        // raced on that one parameter bag: flow A built its query with @id = A, flow B then set
+        // @id = B on the same object, and A's query EXECUTED under A's partition key asking for
+        // B — no such document in A's partition, "no rows", and a healthy renewal reported false
+        // (the executor abandons the run and it replays). The mocks that hand back a fixed document
+        // for any query could never see it. This one answers what the query ASKS FOR, as the
+        // service does, observes the @id each query carries when it executes, and forces the
+        // interleaving: A's query is built first, B's is built before A's executes.
+        using var harness = new CosmosHarness();
+        var documents = new Dictionary<string, CosmosFlowStateDocument>(StringComparer.Ordinal)
+        {
+            ["flow-a"] = Document(CreateState("flow-a"), DateTime.UtcNow.AddMinutes(5)),
+            ["flow-b"] = Document(CreateState("flow-b"), DateTime.UtcNow.AddMinutes(5))
+        };
+        var aQueried = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var bQueried = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var executedWith = new System.Collections.Concurrent.ConcurrentDictionary<string, string?>(StringComparer.Ordinal);
+
+        harness.Container
+            .Setup(item => item.GetItemQueryIterator<CosmosLeaseProjection>(
+                It.IsAny<QueryDefinition>(),
+                It.IsAny<string?>(),
+                It.IsAny<QueryRequestOptions>()))
+            .Returns((QueryDefinition query, string? _, QueryRequestOptions options) =>
+            {
+                // PartitionKey renders as a JSON array of its components: ["flow-a"].
+                var partition = JsonSerializer.Deserialize<string[]>(options.PartitionKey!.Value.ToString())![0];
+                if (partition == "flow-a")
+                    aQueried.TrySetResult();
+                else
+                    bQueried.TrySetResult();
+
+                var more = true;
+                var iterator = new Mock<FeedIterator<CosmosLeaseProjection>>();
+                iterator.SetupGet(item => item.HasMoreResults).Returns(() => more);
+                iterator
+                    .Setup(item => item.ReadNextAsync(It.IsAny<CancellationToken>()))
+                    .Returns(async () =>
+                    {
+                        // A executes only once B's query has been built.
+                        if (partition == "flow-a")
+                            await bQueried.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+                        more = false;
+                        var requestedId = (string?)query.GetQueryParameters().Single(parameter => parameter.Name == "@id").Value;
+                        executedWith[partition] = requestedId;
+
+                        // WHERE c.id = @id under this partition key: a row only when the id asked
+                        // for lives in the partition queried.
+                        var rows = requestedId == partition && documents.TryGetValue(requestedId, out var document)
+                            ? new[]
+                            {
+                                new CosmosLeaseProjection
+                                {
+                                    Id = document.Id,
+                                    ETag = "etag",
+                                    ExpiresAtUtc = document.ExpiresAtUtc,
+                                    Revision = document.Revision,
+                                    LeaseId = document.LeaseId,
+                                    LeaseExpiresAtUtc = document.LeaseExpiresAtUtc
+                                }
+                            }
+                            : [];
+                        var page = new Mock<FeedResponse<CosmosLeaseProjection>>();
+                        page.Setup(item => item.GetEnumerator()).Returns(() => ((IEnumerable<CosmosLeaseProjection>)rows).GetEnumerator());
+                        return page.Object;
+                    });
+                return iterator.Object;
+            });
+        harness.PatchesSuccessfully();
+
+        var acquireA = harness.Store.TryAcquireLeaseAsync("flow-a", "owner-a", TimeSpan.FromMinutes(1));
+        await aQueried.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        var acquireB = harness.Store.TryAcquireLeaseAsync("flow-b", "owner-b", TimeSpan.FromMinutes(1));
+
+        Assert.True(await acquireB.WaitAsync(TimeSpan.FromSeconds(5)));
+        Assert.True(await acquireA.WaitAsync(TimeSpan.FromSeconds(5)));
+        Assert.Equal("flow-a", executedWith["flow-a"]);
+        Assert.Equal("flow-b", executedWith["flow-b"]);
+    }
+
     private sealed class CosmosHarness : IDisposable
     {
         private readonly Mock<ContainerResponse> _containerResponse;

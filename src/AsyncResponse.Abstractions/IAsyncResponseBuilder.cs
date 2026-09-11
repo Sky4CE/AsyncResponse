@@ -48,7 +48,15 @@ public interface IAsyncResponseBuilder
     /// Publishes a work descriptor to the configured <see cref="IWorkerTransport"/>. Prefer the
     /// expression-based overloads: they keep the target service's methods rooted under trimming,
     /// which a hand-written descriptor cannot.
+    /// <para>
+    /// Every overload measures the serialized envelope against
+    /// <c>AsyncResponseOptions.MaxInboundMessageChars</c> before publishing and throws
+    /// <see cref="WorkerJobTooLargeException"/> when it would exceed what the consuming ingress
+    /// accepts — the ingress acknowledges an oversized message without executing it, so a
+    /// publish that succeeded would have been a job that silently never ran.
+    /// </para>
     /// </summary>
+    /// <exception cref="WorkerJobTooLargeException">The serialized envelope exceeds the ingress budget; nothing was published.</exception>
     [RequiresUnreferencedCode("The descriptor names its target service and method as strings, resolved by reflection when the " +
                               "job executes; trimming may have removed them. Use the expression-based EnqueueWorkerAsync<TService> " +
                               "overloads, which root the service's public methods automatically.")]

@@ -102,15 +102,17 @@ internal abstract class KafkaSubscriberService : BackgroundService
                 SubscriberOptions.AckMode);
 
             // Consume() blocks the calling thread, so the poll loop runs on a dedicated thread
-            // instead of starving the thread pool; the dispatcher's async work is awaited from it.
+            // instead of starving the thread pool; the dispatcher's settlements happen on it too
+            // (the consumer is touched from no other thread while the loop runs).
             await Task.Factory.StartNew(
                 () => RunPollLoop(consumer, dispatcher, stoppingToken),
                 stoppingToken,
                 TaskCreationOptions.LongRunning,
                 TaskScheduler.Default).ConfigureAwait(false);
 
-            // Leaving the await-using scope drains the ACK-after-enqueue background queue before
-            // the consumer commits its final stored offsets below.
+            // Leaving the await-using scope drains the ACK-after-enqueue background queue — or
+            // waits for ack-after-handler mode's detached handlers and stores their offsets —
+            // before the consumer commits its final stored offsets below.
         }
         finally
         {
@@ -127,6 +129,11 @@ internal abstract class KafkaSubscriberService : BackgroundService
         var paused = false;
         while (!stoppingToken.IsCancellationRequested)
         {
+            // Handlers that outlived their inline budget are settled here, on the poll thread —
+            // the only thread that touches the consumer — before the next poll: offset stored,
+            // partition resumed. A settlement that failed for good throws and faults the loop.
+            dispatcher.SettleCompleted();
+
             KafkaIncomingMessage? message;
             if (!dispatcher.CanAcceptMore)
             {
@@ -161,7 +168,12 @@ internal abstract class KafkaSubscriberService : BackgroundService
                         Topic);
                 }
 
-                message = consumer.Consume(SubscriberOptions.PollTimeout);
+                // With detached handlers in flight, poll in short slices so a completion is
+                // settled within BackpressurePollDelay instead of after a full PollTimeout; the
+                // slice is what bounds the resume latency of the paused partition.
+                message = consumer.Consume(dispatcher.HasDetachedWork
+                    ? SubscriberOptions.BackpressurePollDelay
+                    : SubscriberOptions.PollTimeout);
             }
 
             if (message is null)
@@ -187,7 +199,10 @@ internal abstract class KafkaSubscriberService : BackgroundService
                 continue;
             }
 
-            dispatcher.HandleAsync(delivery, stoppingToken).GetAwaiter().GetResult();
+            // Settles inline (queued mode, and ack-after-handler mode within DetachHandlerAfter)
+            // or detaches the handler and returns; either way the poll thread is back here within
+            // the validated poll gap.
+            dispatcher.Accept(delivery, stoppingToken);
         }
     }
 
