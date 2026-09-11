@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1789141336477,
+  "lastUpdate": 1789141366188,
   "repoUrl": "https://github.com/Sky4CE/AsyncResponse",
   "entries": {
     "AsyncResponse Microbenchmarks": [
@@ -106248,6 +106248,140 @@ window.BENCHMARK_DATA = {
           {
             "name": "durable-flow-storm throughput",
             "value": 1455.5630572040939,
+            "unit": "flows/s"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "tyunisov@gmail.com",
+            "name": "Sky4CE",
+            "username": "Sky4CE"
+          },
+          "committer": {
+            "email": "tyunisov@gmail.com",
+            "name": "Sky4CE",
+            "username": "Sky4CE"
+          },
+          "distinct": true,
+          "id": "f92f1e7163be4bc2d2fedda39620789d086bf3b3",
+          "message": "fix: apply round-38 review — 6 findings with red-on-old regression tests, docs and CHANGELOG synced\nDurable flows: the ledger carries a retention floor (FlowState.RetainUntilUtc, additive)\nthat every write of a non-terminal run honors, so a concurrent checkpoint can no longer\nshrink a parent's retention under a descendant's park; the ancestor extension re-reads\nafter a lost revision race, treats an already-covering floor as proof, retries up to four\ntimes, and abandons the park with nothing published if it loses them all. A ledger whose\nJSON disagrees with its stored revision or key is unreadable (FlowStateUnreadableException),\nnever absent, in the shared reader and the in-memory store.\nKafka: a message that cannot be projected is held behind a detached handler of its\npartition and buried in order, so its offset is never stored ahead of unfinished work; a\npoll-loop failure tears down within the new KafkaSubscriberOptions.FaultDrainTimeout\n(default 5 s) — settled handlers are committed, the rest abandoned with offsets unstored,\nretry ladders cancelled and outcomes logged.\nIn-memory transport: delayed jobs are bounded by the new\nInMemoryWorkerTransportOptions.DelayedJobCapacity (default 4096); external publishers\nwait, in-job publishes are rejected; new gauge asyncresponse.worker.inmemory_delayed_jobs\nand counter asyncresponse.worker.inmemory_delayed_rejections.\nRecovery state: the Redis, NATS, PostgreSQL, SQL Server, and MongoDB readers go through\nJsonSafety, so a malformed registration logs size and position only, never its Context keys.\nTests: 10 red-on-old proofs against 94c3ddb plus new-API pins; 2915 unit tests green on\nnet10.0 and net8.0.",
+          "timestamp": "2026-09-11T17:24:31+02:00",
+          "tree_id": "4f803c33c456f288a1f043ceb75bfcf090efbed7",
+          "url": "https://github.com/Sky4CE/AsyncResponse/commit/f92f1e7163be4bc2d2fedda39620789d086bf3b3"
+        },
+        "date": 1789141365509,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "waiter-storm throughput",
+            "value": 62219.793161497204,
+            "unit": "ops/s"
+          },
+          {
+            "name": "progress-storm throughput",
+            "value": 32407.683472859215,
+            "unit": "ops/s"
+          },
+          {
+            "name": "worker-storm throughput",
+            "value": 32400.9002266119,
+            "unit": "jobs/s"
+          },
+          {
+            "name": "google-pubsub-ack-after-enqueue-dispatch-storm throughput",
+            "value": 182248.9520685256,
+            "unit": "ops/s"
+          },
+          {
+            "name": "rabbitmq-ack-after-enqueue-dispatch-storm throughput",
+            "value": 243531.79551122195,
+            "unit": "ops/s"
+          },
+          {
+            "name": "redis-ack-after-enqueue-dispatch-storm throughput",
+            "value": 267660.22140853514,
+            "unit": "ops/s"
+          },
+          {
+            "name": "nats-ack-after-receive-dispatch-storm throughput",
+            "value": 193796.94731048596,
+            "unit": "ops/s"
+          },
+          {
+            "name": "postgresql-ack-after-receive-dispatch-storm throughput",
+            "value": 227431.9296234637,
+            "unit": "ops/s"
+          },
+          {
+            "name": "sqlserver-ack-after-enqueue-dispatch-storm throughput",
+            "value": 210474.91559955885,
+            "unit": "ops/s"
+          },
+          {
+            "name": "mongodb-ack-after-enqueue-dispatch-storm throughput",
+            "value": 223535.61816539848,
+            "unit": "ops/s"
+          },
+          {
+            "name": "azure-servicebus-ack-after-receive-dispatch-storm throughput",
+            "value": 231280.1820637593,
+            "unit": "ops/s"
+          },
+          {
+            "name": "sqs-ack-after-enqueue-dispatch-storm throughput",
+            "value": 281979.26888415165,
+            "unit": "ops/s"
+          },
+          {
+            "name": "kafka-ack-after-enqueue-dispatch-storm throughput",
+            "value": 303019.28414724313,
+            "unit": "ops/s"
+          },
+          {
+            "name": "race-burst throughput",
+            "value": 85142.23691815072,
+            "unit": "ops/s"
+          },
+          {
+            "name": "raw-ingress-storm throughput",
+            "value": 71822.36318558037,
+            "unit": "ops/s"
+          },
+          {
+            "name": "shared-response-fanout throughput",
+            "value": 40266.85651147283,
+            "unit": "ops/s"
+          },
+          {
+            "name": "exception-fanout throughput",
+            "value": 18732.080891419268,
+            "unit": "ops/s"
+          },
+          {
+            "name": "timeout-storm throughput",
+            "value": 4758.338274074575,
+            "unit": "ops/s"
+          },
+          {
+            "name": "dispose-cleanup-storm throughput",
+            "value": 229011.1299409151,
+            "unit": "ops/s"
+          },
+          {
+            "name": "context-isolation-storm throughput",
+            "value": 71757.42545838644,
+            "unit": "ops/s"
+          },
+          {
+            "name": "watchdog-scan-storm throughput",
+            "value": 1474317.3910479448,
+            "unit": "entries/s"
+          },
+          {
+            "name": "durable-flow-storm throughput",
+            "value": 1414.2215247910206,
             "unit": "flows/s"
           }
         ]
