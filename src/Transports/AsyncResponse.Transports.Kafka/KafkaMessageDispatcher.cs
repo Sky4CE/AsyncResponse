@@ -161,6 +161,7 @@ internal abstract class KafkaMessageDispatcher : IAsyncDisposable
 
         KafkaTransportOptionsValidator.EnsureMaxPollInterval(subscriberOptions.MaxPollInterval, optionPath, nameof(KafkaSubscriberOptions.MaxPollInterval));
         AsyncResponseChannelOptions.EnsureTimerBackedAllowZero(subscriberOptions.DetachHandlerAfter, optionPath, nameof(KafkaSubscriberOptions.DetachHandlerAfter));
+        AsyncResponseChannelOptions.EnsureTimerBackedAllowZero(subscriberOptions.FaultDrainTimeout, optionPath, nameof(KafkaSubscriberOptions.FaultDrainTimeout));
 
         switch (subscriberOptions.AckMode)
         {
@@ -232,6 +233,18 @@ internal abstract class KafkaMessageDispatcher : IAsyncDisposable
         => HandleAsync(delivery, subscriberCancellationToken).GetAwaiter().GetResult();
 
     /// <summary>
+    /// The poll thread's entry point for a consumed message that could not be turned into a
+    /// delivery (<see cref="DiscardUnprocessableAsync"/> describes the settlement). Default:
+    /// settled at once — the queued dispatcher stores every offset at enqueue, in consumption
+    /// order, so nothing earlier on the partition is still unresolved. The awaiting dispatcher
+    /// overrides it to hold the message behind a detached handler of the same partition: its
+    /// offset must not be stored — and so committed — ahead of a message consumed before it that
+    /// is still being handled.
+    /// </summary>
+    public virtual void AcceptUnprocessable(KafkaIncomingMessage message, Exception failure, CancellationToken subscriberCancellationToken)
+        => DiscardUnprocessableAsync(message, failure, subscriberCancellationToken).GetAwaiter().GetResult();
+
+    /// <summary>
     /// Poll-thread tick: settles detached handlers that have finished — offset stored, partition
     /// resumed, the next held message started. Throws when one of them failed for good (the poll
     /// loop faults, exactly as an inline failure would).
@@ -239,6 +252,14 @@ internal abstract class KafkaMessageDispatcher : IAsyncDisposable
     public virtual void SettleCompleted()
     {
     }
+
+    /// <summary>
+    /// The poll loop FAILED (as opposed to a stop) and the consumer is about to be closed and
+    /// rebuilt by the supervisor. Default: the graceful drain. The awaiting dispatcher overrides
+    /// it with a bounded wait (<see cref="KafkaSubscriberOptions.FaultDrainTimeout"/>) so the
+    /// reconnect is not parked behind an unrelated long handler.
+    /// </summary>
+    public virtual ValueTask TeardownAfterFaultAsync() => DisposeAsync();
 
     /// <summary>
     /// Whether detached handlers are in flight. The poll loop then polls in
@@ -538,6 +559,7 @@ internal abstract class KafkaMessageDispatcher : IAsyncDisposable
 internal sealed class AwaitingKafkaMessageDispatcher : KafkaMessageDispatcher
 {
     private readonly TimeSpan _detachAfter;
+    private readonly TimeSpan _faultDrainTimeout;
     private readonly string _topic;
 
     // Poll-thread-only: the loop is the sole caller of Accept/SettleCompleted, and DisposeAsync
@@ -558,6 +580,7 @@ internal sealed class AwaitingKafkaMessageDispatcher : KafkaMessageDispatcher
         : base(handler, consumer, producer, transportOptions, subscriberOptions, logger, topic, consumerGroup, role)
     {
         _detachAfter = subscriberOptions.DetachHandlerAfter;
+        _faultDrainTimeout = subscriberOptions.FaultDrainTimeout;
         _topic = topic;
     }
 
@@ -584,7 +607,7 @@ internal sealed class AwaitingKafkaMessageDispatcher : KafkaMessageDispatcher
             // the running one — the partition's order is the contract — and re-assert the pause
             // so nothing more arrives; the hold is therefore bounded by what was already in
             // flight, never a queue that grows.
-            (inFlight.Held ??= new Queue<KafkaDelivery>()).Enqueue(delivery);
+            (inFlight.Held ??= new Queue<HeldMessage>()).Enqueue(HeldMessage.For(delivery));
             PausePartition(delivery.Partition);
             return;
         }
@@ -611,6 +634,32 @@ internal sealed class AwaitingKafkaMessageDispatcher : KafkaMessageDispatcher
     }
 
     /// <inheritdoc />
+    public override void AcceptUnprocessable(KafkaIncomingMessage message, Exception failure, CancellationToken subscriberCancellationToken)
+    {
+        if (_detached.TryGetValue(message.Partition, out var inFlight))
+        {
+            // Same rule as a valid delivery for the partition: the message consumed before it is
+            // still being handled, so this one waits its turn. Settling it now would store — and
+            // let the auto-committer commit — an offset PAST the unfinished message; a crash
+            // after that commit skipped the unfinished message for good, and the dead-letter
+            // copy this discard produces is of the malformed record, not of the work that was
+            // lost. Held, it is buried and its offset stored in order, once the handler settles.
+            (inFlight.Held ??= new Queue<HeldMessage>()).Enqueue(HeldMessage.Unprocessable(message, failure));
+            PausePartition(message.Partition);
+            Logger.LogDebug(
+                "Kafka message {Topic}[{Partition}]@{Offset} could not be parsed into a delivery and is held behind the partition's detached handler; it is dead-lettered in order once that handler settles.",
+                message.Topic,
+                message.Partition,
+                message.Offset);
+            return;
+        }
+
+        // Nothing earlier on the partition is unresolved (every earlier message settled inline
+        // or would be in _detached), so the discard is safe to settle at once.
+        base.AcceptUnprocessable(message, failure, subscriberCancellationToken);
+    }
+
+    /// <inheritdoc />
     public override void SettleCompleted()
     {
         if (_detached.Count == 0)
@@ -634,18 +683,35 @@ internal sealed class AwaitingKafkaMessageDispatcher : KafkaMessageDispatcher
             _detached.Remove(partition);
             work.Settlement.GetAwaiter().GetResult();
             StoreOffsetAfterSettlement(work.Delivery);
+            ContinueHeld(partition, work.Held, work.SubscriberCancellationToken);
+        }
+    }
 
-            if (work.Held is { Count: > 0 } held)
+    /// <summary>
+    /// Works through the messages held behind a settled handler, in consumption order: an
+    /// unprocessable one is dead-lettered and its offset stored right here (its turn has come —
+    /// never ahead of the handler it was consumed behind); the first valid delivery is started
+    /// detached with the rest still held behind it (the partition stays paused); an empty hold
+    /// resumes the partition.
+    /// </summary>
+    private void ContinueHeld(int partition, Queue<HeldMessage>? held, CancellationToken subscriberCancellationToken)
+    {
+        while (held is { Count: > 0 })
+        {
+            var next = held.Dequeue();
+            if (next.Delivery is { } delivery)
             {
-                // The partition stays paused while the message held behind this one runs.
-                var next = held.Dequeue();
-                var settlement = Task.Run(() => SettleAsync(next, work.SubscriberCancellationToken), CancellationToken.None);
-                _detached[partition] = new DetachedPartition(next, settlement, work.SubscriberCancellationToken) { Held = held.Count > 0 ? held : null };
-                continue;
+                var settlement = Task.Run(() => SettleAsync(delivery, subscriberCancellationToken), CancellationToken.None);
+                _detached[partition] = new DetachedPartition(delivery, settlement, subscriberCancellationToken) { Held = held.Count > 0 ? held : null };
+                return;
             }
 
-            ResumePartition(partition);
+            // A burial that fails for good throws out of here and faults the poll loop, exactly
+            // as an inline discard would; whatever is still held redelivers with the partition.
+            DiscardUnprocessableAsync(next.Message!, next.Failure!, subscriberCancellationToken).GetAwaiter().GetResult();
         }
+
+        ResumePartition(partition);
     }
 
     /// <summary>
@@ -669,30 +735,142 @@ internal sealed class AwaitingKafkaMessageDispatcher : KafkaMessageDispatcher
         foreach (var (partition, work) in _detached.ToArray())
         {
             _detached.Remove(partition);
-            try
-            {
-                await work.Settlement.ConfigureAwait(false);
-                StoreOffsetAfterSettlement(work.Delivery);
-            }
-            catch (OperationCanceledException)
-            {
-                Logger.LogInformation(
-                    "Detached Kafka handler for {Topic}[{Partition}]@{Offset} was canceled by the stop; its offset is left unstored and the message redelivers.",
-                    work.Delivery.Topic,
-                    work.Delivery.Partition,
-                    work.Delivery.Offset);
-            }
-            catch (Exception ex)
-            {
-                Logger.LogError(
-                    ex,
-                    "Detached Kafka handler for {Topic}[{Partition}]@{Offset} failed while the subscriber was stopping; its offset is left unstored and the message redelivers.",
-                    work.Delivery.Topic,
-                    work.Delivery.Partition,
-                    work.Delivery.Offset);
-            }
+            await SettleAfterLoopExitAsync(work).ConfigureAwait(false);
         }
     }
+
+    /// <summary>
+    /// The poll loop FAILED and the consumer is about to be closed and rebuilt. Waits at most
+    /// <see cref="KafkaSubscriberOptions.FaultDrainTimeout"/> for the detached handlers: those
+    /// that settled get their offsets stored, exactly as the poll thread would have (the close
+    /// that follows commits them); the rest are abandoned — offsets unstored, so their messages
+    /// redeliver on the rebuilt consumer while the abandoned handler may still be running — and
+    /// observed, so each one's eventual outcome is logged instead of vanishing. Messages held
+    /// behind a detached handler are dropped unstarted, as on a stop. The unbounded wait this
+    /// replaces on the fault path let one long handler (a durable-flow step awaiting a remote
+    /// response) hold the subscriber's reconnect for its whole duration, so a transient broker
+    /// failure disabled every partition of the subscriber for as long as that step took and the
+    /// configured reconnect policy never ran.
+    /// </summary>
+    public override async ValueTask TeardownAfterFaultAsync()
+    {
+        if (_detached.Count == 0)
+            return;
+
+        Logger.LogInformation(
+            "Kafka poll loop for {Topic} failed with {Count} detached handler(s) still running; waiting up to {FaultDrainTimeout} for them before the consumer is rebuilt.",
+            _topic,
+            _detached.Count,
+            _faultDrainTimeout);
+
+        if (_faultDrainTimeout > TimeSpan.Zero)
+        {
+            var settlements = new Task[_detached.Count];
+            var index = 0;
+            foreach (var work in _detached.Values)
+                settlements[index++] = work.Settlement;
+
+            try
+            {
+                await Task.WhenAll(settlements).WaitAsync(_faultDrainTimeout).ConfigureAwait(false);
+            }
+            catch (Exception)
+            {
+                // A timeout, or a settlement that faulted or was canceled: each one is observed
+                // individually below.
+            }
+        }
+
+        foreach (var (partition, work) in _detached.ToArray())
+        {
+            _detached.Remove(partition);
+            if (work.Settlement.IsCompleted)
+            {
+                await SettleAfterLoopExitAsync(work).ConfigureAwait(false);
+                continue;
+            }
+
+            Logger.LogWarning(
+                "Abandoning detached Kafka handler for {Topic}[{Partition}]@{Offset}: still running {FaultDrainTimeout} after the poll loop failed. Its offset is left unstored, so the message redelivers on the rebuilt consumer — possibly while this handler is still running; its outcome is logged when it settles.",
+                work.Delivery.Topic,
+                work.Delivery.Partition,
+                work.Delivery.Offset,
+                _faultDrainTimeout);
+            ObserveAbandoned(work);
+        }
+    }
+
+    /// <summary>
+    /// Settles a detached handler after the poll loop has exited (a stop, or a fault whose budget
+    /// it finished within): its offset is stored for the consumer close to commit, a cancellation
+    /// or failure leaves it unstored so the message redelivers.
+    /// </summary>
+    private async Task SettleAfterLoopExitAsync(DetachedPartition work)
+    {
+        try
+        {
+            await work.Settlement.ConfigureAwait(false);
+            StoreOffsetAfterSettlement(work.Delivery);
+        }
+        catch (OperationCanceledException)
+        {
+            Logger.LogInformation(
+                "Detached Kafka handler for {Topic}[{Partition}]@{Offset} was canceled by the stop; its offset is left unstored and the message redelivers.",
+                work.Delivery.Topic,
+                work.Delivery.Partition,
+                work.Delivery.Offset);
+        }
+        catch (Exception ex)
+        {
+            Logger.LogError(
+                ex,
+                "Detached Kafka handler for {Topic}[{Partition}]@{Offset} failed while the subscriber was stopping; its offset is left unstored and the message redelivers.",
+                work.Delivery.Topic,
+                work.Delivery.Partition,
+                work.Delivery.Offset);
+        }
+    }
+
+    /// <summary>
+    /// Logs the eventual outcome of a handler the fault teardown abandoned. It never touches the
+    /// consumer — the one it was consumed on is closed by then — so the outcome is informational:
+    /// the message has already been handed back to the group for redelivery.
+    /// </summary>
+    private void ObserveAbandoned(DetachedPartition work)
+        => _ = work.Settlement.ContinueWith(
+            static (settlement, state) =>
+            {
+                var (logger, delivery) = ((ILogger, KafkaDelivery))state!;
+                if (settlement.IsCanceled)
+                {
+                    logger.LogInformation(
+                        "Abandoned Kafka handler for {Topic}[{Partition}]@{Offset} stopped on the session's cancellation; the message redelivers on the rebuilt consumer.",
+                        delivery.Topic,
+                        delivery.Partition,
+                        delivery.Offset);
+                }
+                else if (settlement.IsFaulted)
+                {
+                    logger.LogWarning(
+                        settlement.Exception!.GetBaseException(),
+                        "Abandoned Kafka handler for {Topic}[{Partition}]@{Offset} failed after the consumer it was consumed on was rebuilt; the message redelivers there.",
+                        delivery.Topic,
+                        delivery.Partition,
+                        delivery.Offset);
+                }
+                else
+                {
+                    logger.LogInformation(
+                        "Abandoned Kafka handler for {Topic}[{Partition}]@{Offset} completed after the consumer it was consumed on was rebuilt; its offset was never stored, so the message redelivers there (handlers are at-least-once).",
+                        delivery.Topic,
+                        delivery.Partition,
+                        delivery.Offset);
+                }
+            },
+            (Logger, work.Delivery),
+            CancellationToken.None,
+            TaskContinuationOptions.ExecuteSynchronously,
+            TaskScheduler.Default);
 
     /// <summary>
     /// Runs the handler with the in-process retry ladder and, at the delivery cap, the dead-letter
@@ -832,7 +1010,18 @@ internal sealed class AwaitingKafkaMessageDispatcher : KafkaMessageDispatcher
         public CancellationToken SubscriberCancellationToken { get; } = subscriberCancellationToken;
 
         /// <summary>Messages consumed for the partition while its handler was detached, in order.</summary>
-        public Queue<KafkaDelivery>? Held { get; set; }
+        public Queue<HeldMessage>? Held { get; set; }
+    }
+
+    /// <summary>
+    /// One message consumed behind a detached handler: a valid delivery, or one that could not
+    /// be projected (kept with the failure that rejected it, for the dead-letter headers).
+    /// </summary>
+    private readonly record struct HeldMessage(KafkaDelivery? Delivery, KafkaIncomingMessage? Message, Exception? Failure)
+    {
+        public static HeldMessage For(KafkaDelivery delivery) => new(delivery, null, null);
+
+        public static HeldMessage Unprocessable(KafkaIncomingMessage message, Exception failure) => new(null, message, failure);
     }
 }
 

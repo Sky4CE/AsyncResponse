@@ -164,27 +164,38 @@ internal static class DurableFlowStoreShared
     /// <summary>
     /// Materializes a loaded ledger row.
     /// <para>
-    /// A revision that does not match the stored row, and an identity-mismatched ledger
-    /// (<c>state.FlowId != flowId</c>), load as absent — the read-side mirror of the write-side
-    /// key/identity validation in <see cref="ValidateCreate"/>, so a row copied or restored under
-    /// the wrong key can never resurrect as that flow.
+    /// The row is never executed as anything but what it consistently says it is: a revision
+    /// inside the JSON that disagrees with the row's own revision column, or a ledger whose
+    /// <c>FlowId</c> is not the key it was loaded under (a row copied or restored under the
+    /// wrong key), is refused — the read-side mirror of the write-side key/identity validation
+    /// in <see cref="ValidateCreate"/>.
     /// </para>
     /// <para>
-    /// Unreadable JSON and an unknown schema version do NOT: they say the row is there and this
-    /// build cannot interpret it, so they throw
-    /// <see cref="FlowStateUnreadableException"/> rather than impersonating a deleted flow. That
-    /// distinction is what stops a rolling deployment from acknowledging a live flow's only
-    /// wake-up (see the exception's remarks).
+    /// Refused means <see cref="FlowStateUnreadableException"/>, never <c>null</c>. Every built-in
+    /// store reads the JSON and the revision from ONE row or document, so a disagreement inside
+    /// that snapshot is an inconsistent — corrupt, hand-edited, mis-restored — ledger that is
+    /// physically present, not proof the run is gone. A <c>null</c> here told the executor to
+    /// acknowledge the wake-up as belonging to a deleted flow, and the run behind the row lost
+    /// its only wake-up while its row sat in the table. Unreadable JSON and an unknown schema
+    /// version throw for the same reason (see the exception's remarks); the delivery rides the
+    /// transport's retry and dead-letter path, which is the operator alarm.
     /// </para>
     /// </summary>
-    /// <exception cref="FlowStateUnreadableException">The row is present but uninterpretable.</exception>
+    /// <exception cref="FlowStateUnreadableException">The row is present but uninterpretable or inconsistent.</exception>
     public static FlowState? ReadState(string flowId, string stateJson, long revision)
     {
         var state = Deserialize(stateJson, flowId);
-        return state.Revision == revision
-            && string.Equals(state.FlowId, flowId, StringComparison.Ordinal)
-                ? state
-                : null;
+        if (state.Revision != revision)
+        {
+            throw new FlowStateUnreadableException(
+                flowId,
+                $"its stored revision is {revision} but the revision inside its JSON is {state.Revision}");
+        }
+
+        if (!string.Equals(state.FlowId, flowId, StringComparison.Ordinal))
+            throw new FlowStateUnreadableException(flowId, "the flow id inside its JSON is not the id it is stored under");
+
+        return state;
     }
 
     /// <summary>

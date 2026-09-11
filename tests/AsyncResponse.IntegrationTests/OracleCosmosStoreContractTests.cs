@@ -68,7 +68,8 @@ public sealed class OracleCosmosStoreContractTests(OracleCosmosBatchFixture fixt
             revisionCommand.CommandText = $"UPDATE {table} SET revision = revision + 1 WHERE flow_id = :flow_id";
             revisionCommand.Parameters.Add(new OracleParameter("flow_id", mismatchedRevisionFlowId));
             Assert.Equal(1, await revisionCommand.ExecuteNonQueryAsync());
-            Assert.Null(await store.LoadAsync(mismatchedRevisionFlowId));
+            // The row is present and inconsistent with itself: unreadable, never "gone" (round 38).
+            await Assert.ThrowsAsync<FlowStateUnreadableException>(() => store.LoadAsync(mismatchedRevisionFlowId));
         }
         finally
         {

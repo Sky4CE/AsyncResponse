@@ -110,3 +110,5 @@ Microsoft.Extensions.DependencyInjection.KafkaAsyncResponseTransportServiceColle
 static Microsoft.Extensions.DependencyInjection.KafkaAsyncResponseTransportServiceCollectionExtensions.WithKafkaTransport(this Microsoft.Extensions.DependencyInjection.AsyncResponseRegistrationBuilder! builder, System.Action<AsyncResponse.Transports.Kafka.KafkaAsyncResponseTransportOptions!>! configure) -> Microsoft.Extensions.DependencyInjection.AsyncResponseRegistrationBuilder!
 AsyncResponse.Transports.Kafka.KafkaSubscriberOptions.DetachHandlerAfter.get -> System.TimeSpan
 AsyncResponse.Transports.Kafka.KafkaSubscriberOptions.DetachHandlerAfter.set -> void
+AsyncResponse.Transports.Kafka.KafkaSubscriberOptions.FaultDrainTimeout.get -> System.TimeSpan
+AsyncResponse.Transports.Kafka.KafkaSubscriberOptions.FaultDrainTimeout.set -> void

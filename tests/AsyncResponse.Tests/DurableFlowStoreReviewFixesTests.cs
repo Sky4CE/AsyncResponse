@@ -293,11 +293,12 @@ public sealed class DurableFlowStoreReviewFixesTests
     }
 
     // ---------------------------------------------------------------------------------------
-    // P3-2: identity-mismatched ledgers load as absent
+    // P3-2: identity-mismatched ledgers are refused — as UNREADABLE since round 38, never as
+    //       absent: the row is physically present, and "absent" acknowledged its wake-up.
     // ---------------------------------------------------------------------------------------
 
     [Fact]
-    public async Task SqliteStore_LoadsIdentityMismatchedRowAsAbsent()
+    public async Task SqliteStore_RefusesAnIdentityMismatchedRowAsUnreadable()
     {
         await using var database = new TempSqliteDatabase();
         var store = new SqliteFlowStateStore(Options.Create(new SqliteDurableFlowOptions
@@ -307,7 +308,7 @@ public sealed class DurableFlowStoreReviewFixesTests
         Assert.True(await store.TryCreateAsync("provision", CreateState("provision"), TimeSpan.FromMinutes(5)));
 
         // A row copied/restored under the wrong key: state_json says "other-flow" but the row key
-        // is "hijacked-flow". Docs promise identity-mismatched records load as absent.
+        // is "hijacked-flow". Docs promise identity-mismatched records are refused as unreadable.
         await using (var connection = new SqliteConnection(database.ConnectionString))
         {
             await connection.OpenAsync();
@@ -323,11 +324,13 @@ public sealed class DurableFlowStoreReviewFixesTests
             await command.ExecuteNonQueryAsync();
         }
 
-        Assert.Null(await store.LoadAsync("hijacked-flow"));
+        var ex = await Assert.ThrowsAsync<FlowStateUnreadableException>(() => store.LoadAsync("hijacked-flow"));
+        Assert.Equal("hijacked-flow", ex.FlowId);
+        Assert.Contains("not the id it is stored under", ex.Reason, StringComparison.Ordinal);
     }
 
     [Fact]
-    public async Task DynamoDbStore_LoadsIdentityMismatchedItemAsAbsent()
+    public async Task DynamoDbStore_RefusesAnIdentityMismatchedItemAsUnreadable()
     {
         var client = new Mock<IAmazonDynamoDB>();
         client
@@ -351,7 +354,9 @@ public sealed class DurableFlowStoreReviewFixesTests
             EnableTimeToLive = false
         }));
 
-        Assert.Null(await store.LoadAsync("hijacked-flow"));
+        var ex = await Assert.ThrowsAsync<FlowStateUnreadableException>(() => store.LoadAsync("hijacked-flow"));
+        Assert.Equal("hijacked-flow", ex.FlowId);
+        Assert.Contains("not the id it is stored under", ex.Reason, StringComparison.Ordinal);
     }
 
     // ---------------------------------------------------------------------------------------

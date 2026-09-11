@@ -147,10 +147,12 @@ parameter type, which walks the payload's own property names and dictionary keys
 exception that escapes it is logged by the worker ingress too. The same contract covers every
 reader that materializes a body the library did not write itself: the Redis, NATS, and database
 (PostgreSQL, SQL Server, MongoDB) channels' response readers, whose parse failure is both logged
-and handed to the waiter (as `InvalidDataException`), and the durable-flow ledger reader, whether
+and handed to the waiter (as `InvalidDataException`), the durable-flow ledger reader, whether
 it reads a stored ledger or the initial state a start job carries — the
 `FlowStateUnreadableException` it raises chains the rebuilt, position-only failure, never the
-reader's own.
+reader's own — and the recovery-state readers (Redis, NATS, PostgreSQL, SQL Server, MongoDB),
+on the delivery path and the watchdog scan alike: a stored registration's `Context` carries the
+same propagated tenant and auth keys a worker envelope does, and the reader's `Path` names them.
 
 **But not our own diagnostics.** The distinction is who wrote the message. `System.Text.Json`'s
 messages quote the body, so they are dropped; the envelope reader's own contract violations —

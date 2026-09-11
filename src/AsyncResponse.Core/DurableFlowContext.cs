@@ -355,6 +355,13 @@ internal sealed class DurableFlowContext : IDurableFlowContext
             : remaining >= margin
                 ? AsyncResponseChannelOptions.MaxPersistenceTtl
                 : remaining + _options.StateExpiry;
+
+        // The wait outlives this save's own TTL stamp only if every later write of this ledger
+        // carries it forward — a spurious early redelivery of the parked run stamps the plain
+        // StateExpiry in the executor's per-attempt save before it replays back here. The floor
+        // in the ledger is what those writes honor (FlowStateRetention.EffectiveTtl).
+        if (ttl > _options.StateExpiry)
+            FlowStateRetention.RaiseFloor(_state, UtcNow, ttl);
         await SaveAsync(cancellationToken, ttl: ttl).ConfigureAwait(false);
 
         // A parked ancestor's row must survive this run's whole wait, not just its own idle
@@ -369,39 +376,43 @@ internal sealed class DurableFlowContext : IDurableFlowContext
     }
 
     /// <summary>
-    /// TTL refresh of the WHOLE ancestor chain when this run parks for a window its own plain
-    /// <see cref="DurableFlowOptions.StateExpiry"/> would not cover. Only
-    /// <see cref="FlowRunStatus.Running"/> ancestors are stamped — a terminal or
-    /// operator-suspended run is not waiting on this chain, and an absent row is never
-    /// resurrected (the walk stops there and the expired-ancestor failure surfaces on wake-up,
-    /// as before). A store failure PROPAGATES: the callers all publish their wake-up only after
-    /// this returns, so the park fails with nothing published and the transport redelivers the
-    /// execution, which replays to the same step and retries the chain. Swallowing it (the
-    /// previous behavior) let the child park "successfully" — wake-up and all — while the parent
-    /// it would eventually complete into expired mid-wait, after which every step past the
-    /// parent's child-await was lost with the parent's checkpoints. The chain is walked to the
-    /// root with cycle detection; a chain that revisits an id or exceeds
-    /// <see cref="MaxAncestorLedgerDepth"/> fails the run terminally (deterministic on every
-    /// replay) rather than being truncated in silence.
+    /// Retention extension of the WHOLE ancestor chain when this run parks for a window its own
+    /// plain <see cref="DurableFlowOptions.StateExpiry"/> would not cover. Each
+    /// <see cref="FlowRunStatus.Running"/> ancestor gets its <see cref="FlowState.RetainUntilUtc"/>
+    /// floor raised to cover the wait and its row re-stamped with the wait's TTL — a terminal or
+    /// operator-suspended run is not waiting on this chain, and an absent row is never resurrected
+    /// (the walk stops there and the expired-ancestor failure surfaces on wake-up, as before). A
+    /// store failure PROPAGATES: the callers all publish their wake-up only after this returns, so
+    /// the park fails with nothing published and the transport redelivers the execution, which
+    /// replays to the same step and retries the chain. Swallowing it (an earlier behavior) let the
+    /// child park "successfully" — wake-up and all — while the parent it would eventually complete
+    /// into expired mid-wait, after which every step past the parent's child-await was lost with
+    /// the parent's checkpoints. The chain is walked to the root with cycle detection; a chain
+    /// that revisits an id or exceeds <see cref="MaxAncestorLedgerDepth"/> fails the run terminally
+    /// (deterministic on every replay) rather than being truncated in silence.
     /// <para>
-    /// The stamp cannot undercut a longer wait an ancestor still needs: a chain is linear — a
-    /// flow body is sequential, so a parked ancestor waits on exactly one descendant at a time,
-    /// and the leaf's current park is the only wait in progress on the whole chain. The
-    /// ancestor's own park windows (timers, awaited deadlines) belong to steps that are not
-    /// pending while it waits on a child.
+    /// A LOST compare-and-swap is not success. The previous design treated it as one — "a
+    /// concurrent writer means the ancestor is alive and re-stamping its own expiry" — but the
+    /// competing write was computed without this park in view: the parent replaying its
+    /// child-await from a snapshot taken before this run persisted its sleep stamps the plain
+    /// StateExpiry, and the executor's per-attempt save always does. Either one left the parent's
+    /// row expiring under a wait this run had just parked into, with its wake-up published. So the
+    /// ancestor is re-read after a lost race: when the write that won already carries a floor
+    /// reaching this park (another extension of the same chain, or an earlier attempt of this
+    /// one), the retention is proven and the walk moves on; otherwise the extension is retried
+    /// against the new revision, a bounded number of times. Every write here still advances the
+    /// ancestor's revision — it has to, the floor lives in the ledger — so a retry can cost an
+    /// actively-executing ancestor one checkpoint (its next save loses the compare-and-swap and
+    /// its delivery replays from the last one, now carrying the floor). That is the price of the
+    /// guarantee; the earlier eight-attempt <see cref="FlowStateConcurrency.MutateAsync"/> fight
+    /// was avoided by ceding the race, and ceding it is what lost the parent. The attempt bound
+    /// keeps the fight finite: losing every attempt abandons the park (nothing published) so the
+    /// delivery retries it later, exactly like a store failure.
     /// </para>
     /// <para>
-    /// SINGLE-SHOT per ancestor, deliberately NOT <see cref="FlowStateConcurrency.MutateAsync"/>:
-    /// every write here advances the ancestor's <c>Revision</c>, which invalidates the
-    /// compare-and-swap of an ancestor execution that currently holds a lease. MutateAsync's
-    /// eight-attempt retry turned one such collision into a fight — each winning round killed
-    /// another of the live ancestor's checkpoints, abandoning its delivery for redelivery and
-    /// re-running everything since its last checkpoint, all for a write whose only purpose was a
-    /// TTL stamp. Losing the CAS is therefore treated as SUCCESS, not as something to retry: a
-    /// concurrent writer means the ancestor is alive and checkpointing, and every checkpoint
-    /// re-stamps its expiry — this insurance exists only for an ancestor that is parked and
-    /// therefore silent. The walk still continues upward, because a grandparent can be parked
-    /// behind an actively-executing parent.
+    /// Every write of the ancestor after this one carries the floor forward (see
+    /// <see cref="FlowStateRetention"/>), so the extension has to land once, not win every race
+    /// from here to the wake-up.
     /// </para>
     /// </summary>
     private async Task ExtendAncestorLedgersAsync(TimeSpan ttl, CancellationToken cancellationToken)
@@ -429,35 +440,7 @@ internal sealed class DurableFlowContext : IDurableFlowContext
 
             try
             {
-                var ancestor = await _store.LoadAsync(ancestorId, cancellationToken).ConfigureAwait(false);
-                if (ancestor is null)
-                {
-                    _logger.LogWarning(
-                        "Flow {FlowId} parked for {Ttl} but ancestor flow {AncestorFlowId} has no state (expired or deleted); its chain keeps the current expiry.",
-                        FlowId, ttl, ancestorId);
-                    return;
-                }
-
-                if (ancestor.Status != FlowRunStatus.Running)
-                    return;
-
-                var expectedRevision = ancestor.Revision;
-                ancestor.Revision = checked(expectedRevision + 1);
-                ancestor.UpdatedAtUtc = UtcNow;
-                if (!await _store.TryUpdateAsync(
-                        ancestorId,
-                        ancestor,
-                        expectedRevision,
-                        ttl,
-                        leaseId: null,
-                        cancellationToken).ConfigureAwait(false))
-                {
-                    _logger.LogDebug(
-                        "Flow {FlowId} skipped extending ancestor flow {AncestorFlowId}'s ledger TTL: a concurrent write won the revision, so the ancestor is live and re-stamping its own expiry.",
-                        FlowId, ancestorId);
-                }
-
-                ancestorId = ancestor.ParentFlowId;
+                ancestorId = await ExtendOneAncestorAsync(ancestorId, ttl, cancellationToken).ConfigureAwait(false);
             }
             catch (Exception ex) when (ex is not OperationCanceledException)
             {
@@ -466,10 +449,76 @@ internal sealed class DurableFlowContext : IDurableFlowContext
                 // stays visible to whoever classifies it upstream.
                 _logger.LogWarning(
                     ex,
-                    "Flow {FlowId} could not extend ancestor flow {AncestorFlowId}'s ledger TTL for its {Ttl} park; abandoning the park (no wake-up is published) so the delivery retries it.",
+                    "Flow {FlowId} could not extend ancestor flow {AncestorFlowId}'s ledger retention for its {Ttl} park; abandoning the park (no wake-up is published) so the delivery retries it.",
                     FlowId, ancestorId, ttl);
                 throw;
             }
+        }
+    }
+
+    /// <summary>
+    /// How many times one ancestor's extension is retried against a revision a concurrent write
+    /// took. Each attempt re-reads the ancestor first, and a floor already reaching the park ends
+    /// the attempt without a write.
+    /// </summary>
+    internal const int MaxAncestorExtensionAttempts = 4;
+
+    /// <summary>
+    /// Extends one ancestor (see <see cref="ExtendAncestorLedgersAsync"/>) and returns the id of
+    /// the next ancestor up, or <c>null</c> when the walk stops here: the row is gone, the run is
+    /// not <see cref="FlowRunStatus.Running"/>, or it has no parent.
+    /// </summary>
+    private async Task<string?> ExtendOneAncestorAsync(string ancestorId, TimeSpan ttl, CancellationToken cancellationToken)
+    {
+        for (var attempt = 1; ; attempt++)
+        {
+            var ancestor = await _store.LoadAsync(ancestorId, cancellationToken).ConfigureAwait(false);
+            if (ancestor is null)
+            {
+                _logger.LogWarning(
+                    "Flow {FlowId} parked for {Ttl} but ancestor flow {AncestorFlowId} has no state (expired or deleted); its chain keeps the current expiry.",
+                    FlowId, ttl, ancestorId);
+                return null;
+            }
+
+            if (ancestor.Status != FlowRunStatus.Running)
+                return null;
+
+            var now = UtcNow;
+            var until = FlowStateRetention.FloorAt(now, ttl);
+            if (FlowStateRetention.Covers(ancestor, until))
+            {
+                // Proven by the re-read: whoever wrote last carried a floor reaching this park
+                // (the write that beat a previous attempt, or a sibling park on the same chain).
+                return ancestor.ParentFlowId;
+            }
+
+            FlowStateRetention.RaiseFloor(ancestor, now, ttl);
+            var expectedRevision = ancestor.Revision;
+            ancestor.Revision = checked(expectedRevision + 1);
+            ancestor.UpdatedAtUtc = now;
+            if (await _store.TryUpdateAsync(
+                    ancestorId,
+                    ancestor,
+                    expectedRevision,
+                    FlowStateRetention.EffectiveTtl(ancestor, ttl, now),
+                    leaseId: null,
+                    cancellationToken).ConfigureAwait(false))
+                return ancestor.ParentFlowId;
+
+            if (attempt >= MaxAncestorExtensionAttempts)
+            {
+                // Not terminal: the ancestor is being written continuously right now, and the
+                // next replay of this step may find it quiet. The park is abandoned with nothing
+                // published, so the delivery retries it — the same route a store failure takes.
+                throw new InvalidOperationException(
+                    $"Flow '{FlowId}' could not extend ancestor flow '{ancestorId}'s ledger retention for its {ttl} park: " +
+                    $"a concurrent write advanced the ancestor's revision on each of {attempt} attempts. The park is abandoned so the delivery retries it.");
+            }
+
+            _logger.LogDebug(
+                "Flow {FlowId} lost the revision race extending ancestor flow {AncestorFlowId}'s ledger retention (attempt {Attempt}); re-reading it.",
+                FlowId, ancestorId, attempt);
         }
     }
 

@@ -86,7 +86,7 @@ flow, prefer `flow.DelayAsync(...)` followed by a normal enqueue — that works 
 
 | Transport | Native mechanism | Per-hop cap | Notes |
 |---|---|---|---|
-| In-memory | `TimeProvider` timer wheel | none | Delayed jobs share the process lifetime; dropped (loudly) at shutdown. Virtual-clock aware in tests. |
+| In-memory | `TimeProvider` timer wheel | none | Delayed jobs share the process lifetime; dropped (loudly) at shutdown. Bounded by `DelayedJobCapacity` (default 4096): an external publisher waits for a slot, a flow parking from inside a job is rejected and redelivered. Virtual-clock aware in tests. |
 | Azure Service Bus | scheduled messages (`ScheduledEnqueueTime`) | none | The broker holds the message; survives restarts. |
 | AWS SQS | `DelaySeconds` | 15 min (chunked) | Standard queues only — SQS rejects per-message delays on FIFO queues, so a FIFO worker queue advertises **no** delay capability (`MaxPublishDelay` = zero): flow timers fall back to the in-process path, and a bare delayed enqueue fails fast at the publish call site. |
 | PostgreSQL | `available_at` gate on the claim query | none | Due time computed on the **database** clock (`now() + delay`); precision bounded by the subscriber's `EmptyPollDelay`. |

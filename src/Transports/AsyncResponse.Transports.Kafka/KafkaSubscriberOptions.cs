@@ -117,6 +117,23 @@ public sealed class KafkaSubscriberOptions
     public TimeSpan DetachHandlerAfter { get; set; } = TimeSpan.FromSeconds(1);
 
     /// <summary>
+    /// In <see cref="KafkaAckMode.AckAfterHandlerCompletes"/> mode, how long a subscriber whose
+    /// poll loop <em>failed</em> (a consume error, a dropped broker connection) waits for its
+    /// detached handlers to settle before it closes the consumer and rebuilds it. Handlers that
+    /// settle within the budget get their offsets stored and committed by the close, exactly as
+    /// after a stop; the rest are abandoned — their offsets stay unstored, the messages redeliver
+    /// on the rebuilt consumer (an abandoned handler may still be running then; see the
+    /// at-least-once notes in transport-semantics.md), and each one's eventual outcome is logged.
+    /// Without the bound the fault teardown waited for every detached handler with no limit, so a
+    /// transient broker failure disabled the subscriber for as long as an unrelated long handler
+    /// — a durable-flow step awaiting a remote response — took, and the configured reconnect
+    /// policy (<c>SubscriberRetryBaseDelay</c> → <c>SubscriberRetryMaxDelay</c>) never ran. A
+    /// graceful stop is not bounded here; the host's shutdown budget bounds it. <see cref="TimeSpan.Zero"/>
+    /// abandons detached handlers at once. Default: <c>5s</c>.
+    /// </summary>
+    public TimeSpan FaultDrainTimeout { get; set; } = TimeSpan.FromSeconds(5);
+
+    /// <summary>
     /// Maximum number of in-process delivery attempts before a failing message is produced to the
     /// dead-letter topic and its offset committed. Kafka offsets cannot NACK a single message, so
     /// retries run in-process with backoff and stall the message's partition while they run (per

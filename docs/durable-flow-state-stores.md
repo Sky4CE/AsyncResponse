@@ -135,8 +135,11 @@ The required invariants are:
    executor therefore cannot checkpoint after another replica takes over.
 4. Acquire succeeds only for an unowned or expired lease. Renew succeeds only for the current,
    unexpired owner. Release never clears another owner's lease.
-5. Loads treat expired, malformed, identity-mismatched, revision-mismatched, and unrecognized-schema
-   records as absent.
+5. Loads treat expired records as absent (`null`). A record that is present but cannot be trusted
+   — malformed JSON, an unrecognized schema version, a revision inside the JSON that disagrees
+   with the stored one, a flow id inside the JSON that is not the key — is **not** absent: it
+   throws `FlowStateUnreadableException`, because callers acknowledge a wake-up on `null` and an
+   acknowledged wake-up strands the run that is still in the table.
 
 There is no weaker compatibility path and no process-local fallback for an incomplete custom
 store. That keeps single-node tests and multi-replica production on the same correctness model.
@@ -580,9 +583,12 @@ The library does not silently upgrade an incomplete concurrency schema:
   `ConfigureAsyncResponseDurableFlows()`.
 
 Persisted state has two revision copies: the indexed/provider field and the value inside
-`state_json`. Loads require them to match. MongoDB, Cosmos DB, and DynamoDB records without a
-physical revision are rejected. This prevents a malformed or partially migrated record from
-entering execution with a fabricated revision.
+`state_json`. Loads require them to match; a record where they disagree, like one whose
+`state_json` names a different flow id than its key, is refused as unreadable
+(`FlowStateUnreadableException` naming both revisions) — never reported as absent, since the
+record is physically there and "absent" acknowledges its wake-up. MongoDB, Cosmos DB, and DynamoDB
+records without a physical revision are rejected the same way. This prevents a malformed or
+partially migrated record from entering execution with a fabricated revision.
 
 ## Expiry and cleanup
 
@@ -614,12 +620,15 @@ a custom store in production, test all of these against the real backend:
 - a lease cannot be renewed or released by another owner;
 - takeover works after lease expiry;
 - TTL refresh and expired-record replacement are atomic;
-- a wrong `flowId` and a missing/mismatched revision load as `null` — the row does not belong to
-  this flow, so it is absent;
-- **unreadable is not missing:** malformed JSON and an unknown schema version instead throw
-  `FlowStateUnreadableException`. Returning `null` there says "this flow was deleted", and the
-  caller acknowledges the wake-up that was a live flow's only one — the failure mode a rolling
-  deployment hits when an older replica reads a row a newer one wrote;
+- **unreadable is not missing:** malformed JSON, an unknown schema version, a revision inside
+  the JSON that disagrees with the stored one, and a stored `flowId` that is not the key all throw
+  `FlowStateUnreadableException` — never `null`. Returning `null` there says "this flow was
+  deleted", and the caller acknowledges the wake-up that was a live flow's only one — the failure
+  mode a rolling deployment hits when an older replica reads a row a newer one wrote, and the one
+  a corrupt or mis-restored row hits on any deployment;
+- a ledger write honors the run's retention floor: the engine raises the TTL it passes to
+  `TryUpdateAsync` to reach `FlowState.RetainUntilUtc` for non-terminal runs, so a store needs
+  no special handling — but it must stamp the TTL it is given, not one of its own;
 - `flow_id` compares **ordinally**: a case- or accent-insensitive column collation folds distinct
   runs onto one row. The built-in stores verify the deployed collation at startup and refuse a
   folding one rather than corrupting state silently;

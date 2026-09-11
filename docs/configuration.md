@@ -205,6 +205,7 @@ The in-memory transport is configured directly on registration:
     options.QueueCapacity = 1_024;          // default; PublishAsync waits when full
     options.WorkerCount = 1;                // default; increase for independent parallel jobs
     options.InJobOverflowCapacity = 4_096;  // default; follow-up publishes held past QueueCapacity, then rejected
+    options.DelayedJobCapacity = 4_096;     // default; delayed jobs held at once — external publishers wait, in-job ones are rejected
 })
 ```
 
@@ -221,6 +222,19 @@ idempotent. Every held job retains its materialized envelope and captured execut
 unbounded overflow let a runaway fan-out exhaust memory with the configured queue capacity giving
 no signal. The current depth is the `asyncresponse.worker.inmemory_overflow_depth` gauge;
 rejections count on `asyncresponse.worker.inmemory_overflow_rejections`.
+
+**Delayed jobs** — `EnqueueWorkerAsync(..., delay)` and the wake-ups behind suspended flow timers
+— are neither queued nor overflow while they wait on their due time, so neither bound covered
+them: every scheduled publish retained its envelope and captured execution context against no
+limit, and a burst's timers firing at once started that many channel writes pending outside the
+bounded queue. `DelayedJobCapacity` (default 4096; must be positive) bounds the jobs held at once
+— waiting on their timer, or fired and waiting for queue room. At the bound a delayed publish from
+outside a job waits (honoring its cancellation token) until a scheduled job enters the queue; one
+made from inside a running job — a flow parking on a timer — never waits, for the same reason as
+the overflow, and throws `InvalidOperationException` instead: the publishing job fails and is
+redelivered, so make it idempotent. Size it above the number of flows you expect to be sleeping
+at once on this transport. The current count is the `asyncresponse.worker.inmemory_delayed_jobs`
+gauge; in-job rejections count on `asyncresponse.worker.inmemory_delayed_rejections`.
 
 Failed jobs retry with backoff (`RetryBaseDelay` 100 ms → `RetryMaxDelay` 5 s) up to
 `MaxDeliveryAttempts` (default 5; `0` = unlimited). Retries keep running during the shutdown drain,
@@ -241,6 +255,7 @@ it still drain.
 | `BackpressurePollDelay` | Kafka | The short poll slice used while the poll thread waits on in-process work: capacity re-checks while consumption is paused under a full `AckAfterEnqueue` queue, and completion checks while `AckAfterHandlerCompletes` handlers run detached (a finished handler's offset is stored and its partition resumed within one slice). Default 50 ms. |
 | `MaxPollInterval` | Kafka | Maximum gap between consumer polls before the broker evicts the consumer from its group and rebalances its partitions (the librdkafka `max.poll.interval.ms`); default 5 minutes. The poll thread's longest gap is `DetachHandlerAfter` plus `PollTimeout`, and startup validation requires that sum to fit within half of it. Handler execution time and the in-process retry ladder no longer count: a handler that outlives `DetachHandlerAfter` runs detached while polling continues. |
 | `DetachHandlerAfter` | Kafka | In `AckAfterHandlerCompletes` mode, how long the poll thread waits for a message's handler inline before detaching it. Within the budget a fast handler settles as before (offset stored, next message consumed, no pause). Past it the message's partition is paused — its order holds with nothing buffered in-process — the handler and its retry ladder continue on the thread pool, and the poll thread keeps polling: the consumer's other partitions keep flowing, `MaxPollInterval` is honored, rebalance callbacks fire. The poll thread stores the offset and resumes the partition once the handler settles (checked every `BackpressurePollDelay`); a stop waits for detached handlers so their offsets are committed. This is what lets a durable-flow step await a remote response or sleep on a timer for minutes without the consumer being evicted from its group. Default 1 s; `0` detaches every handler at once. |
+| `FaultDrainTimeout` | Kafka | In `AckAfterHandlerCompletes` mode, how long a subscriber whose poll loop *failed* (a consume error, a dropped broker connection, a burial that failed for good) waits for its detached handlers before it closes the consumer and the supervisor rebuilds it. Handlers that settle within the budget get their offsets stored and committed by the close, as after a stop; the rest are abandoned — offsets unstored, messages redelivered on the rebuilt consumer (possibly while the abandoned handler still runs: handlers are at-least-once), retry ladders stopped, outcomes logged. Without it the teardown waited for every detached handler with no limit, so a transient broker failure disabled the subscriber for as long as an unrelated long handler took and the reconnect policy (`SubscriberRetryBaseDelay` → `SubscriberRetryMaxDelay`) never ran. A graceful stop is bounded by the host's shutdown budget instead. Default 5 s; `0` abandons at once. |
 | `DeadLetterTopic` / `DeadLetterTopicSuffix` | Kafka | Explicit dead-letter topic, or the suffix appended per source topic (default `.deadletter` → `{topic}.deadletter`). |
 | `ConfigureProducer` / `ConfigureConsumer` / `ConfigureAdminClient` | Kafka | Last-chance hooks over the Confluent client configs (security, compression, fetch tuning, …). |
 | `WorkerQueue` / `ResponseQueue` | Azure Service Bus | Service Bus queues used for worker jobs and response ingress; they must be distinct. |

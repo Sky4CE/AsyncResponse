@@ -253,11 +253,11 @@ internal sealed class RedisRecoveryStateStore : IRecoveryStateStore, IRecoverySt
             if (IsLegacyShape(json))
             {
                 // Legacy blobs carry no per-entry expiry; every element is a live registration.
-                stored = AsyncResponseJson.Deserialize<List<RecoveryState>>(json)?.Count ?? 0;
+                stored = JsonSafety.SafeDeserialize(json, _legacyTypeInfo)?.Count ?? 0;
                 return true;
             }
 
-            var parsed = JsonSerializer.Deserialize(json, _envelopeTypeInfo);
+            var parsed = JsonSafety.SafeDeserialize(json, _envelopeTypeInfo);
             var registrations = parsed?.Registrations;
             if (registrations is null)
             {
@@ -274,7 +274,7 @@ internal sealed class RedisRecoveryStateStore : IRecoveryStateStore, IRecoverySt
 
             return true;
         }
-        catch (JsonException)
+        catch (Exception ex) when (ex is JsonException or InvalidDataException)
         {
             // Unparseable at the top level: the blob exists and holds an unknown number of
             // registrations, all of them unreadable. One is enough to fail the delivery.
@@ -299,6 +299,10 @@ internal sealed class RedisRecoveryStateStore : IRecoveryStateStore, IRecoverySt
     };
 
     /// <summary>The envelope's metadata off the chained options — the JsonTypeInfo overloads keep this trim/AOT-clean.</summary>
+    /// <summary>Legacy bare-array blobs, read with the same case-sensitive matching as before.</summary>
+    private static readonly JsonTypeInfo<List<RecoveryState>> _legacyTypeInfo =
+        AsyncResponseJson.GetTypeInfo<List<RecoveryState>>(AsyncResponseJson.Default);
+
     private static readonly JsonTypeInfo<StoredRecoveryState> _envelopeTypeInfo =
         AsyncResponseJson.GetTypeInfo<StoredRecoveryState>(_envelopeOptions);
 
@@ -343,7 +347,7 @@ internal sealed class RedisRecoveryStateStore : IRecoveryStateStore, IRecoverySt
             // first significant character tells the shapes apart without a speculative parse.
             if (IsLegacyShape(json))
             {
-                var states = AsyncResponseJson.Deserialize<List<RecoveryState>>(json) ?? [];
+                var states = JsonSafety.SafeDeserialize(json, _legacyTypeInfo) ?? [];
                 var legacyEntries = new List<StoredRegistration>(states.Count);
                 foreach (var state in states)
                 {
@@ -356,7 +360,7 @@ internal sealed class RedisRecoveryStateStore : IRecoveryStateStore, IRecoverySt
                 return (legacyEntries, true);
             }
 
-            var stored = JsonSerializer.Deserialize(json, _envelopeTypeInfo);
+            var stored = JsonSafety.SafeDeserialize(json, _envelopeTypeInfo);
             var entries = stored?.Registrations ?? [];
             entries.RemoveAll(entry => entry is null || (!preserveUnreadable && !IsStateReadable(entry.State, recoveryKey, correlationId)));
             // An entry past its per-entry expiry is logically gone even while a longer-lived
@@ -365,8 +369,12 @@ internal sealed class RedisRecoveryStateStore : IRecoveryStateStore, IRecoverySt
             entries.RemoveAll(entry => entry.ExpiresAtUtc <= nowUtc);
             return (entries, false);
         }
-        catch (JsonException ex)
+        catch (Exception ex) when (ex is JsonException or InvalidDataException)
         {
+            // Through JsonSafety, so `ex` is the body-free rebuild (size and position), never the
+            // reader's own message: that one appends `Path: $.States[0].Context['<key>']` built
+            // from the stored registration's context keys — tenant and auth baggage — and this
+            // log line is what carried them into the application log.
             if (logAsError)
                 _logger.LogError(ex, "Failed to deserialize recovery state at {RecoveryKey}.", recoveryKey);
             else
