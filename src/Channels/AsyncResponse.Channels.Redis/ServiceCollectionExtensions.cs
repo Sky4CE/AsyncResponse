@@ -1,6 +1,7 @@
 using AsyncResponse;
 using AsyncResponse.Channels.Redis;
 using Microsoft.Extensions.DependencyInjection.Extensions;
+using Microsoft.Extensions.Options;
 
 namespace Microsoft.Extensions.DependencyInjection;
 
@@ -57,7 +58,9 @@ public static class RedisAsyncResponseServiceCollectionExtensions
             provider.GetService<IWorkerTransport>(),
             provider.GetService<IAsyncResponseReplyTargetProvider>(),
             provider.GetRequiredService<AsyncResponseContextPropagation>(),
-            provider.GetService<TimeProvider>())));
+            provider.GetService<TimeProvider>(),
+            // The producer-side mirror of the ingress's inbound size budget (WorkerJobTooLargeException).
+            provider.GetService<IOptions<AsyncResponseOptions>>())));
         services.Replace(ServiceDescriptor.Singleton<IAsyncResponseBuilder>(provider => provider.GetRequiredService<IRecoverableAsyncResponseBuilder>()));
 
         // The resolved default waiter timeout is declared through the marker so the startup

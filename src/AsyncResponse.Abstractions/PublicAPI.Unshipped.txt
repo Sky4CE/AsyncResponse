@@ -362,3 +362,9 @@ static AsyncResponse.WorkerJobEnvelopeSchema.IsReadable(int entryVersion) -> boo
 ~override AsyncResponse.DurableFlowRunEvent.ToString() -> string
 ~override AsyncResponse.DurableFlowStepEvent.Equals(object obj) -> bool
 ~override AsyncResponse.DurableFlowStepEvent.ToString() -> string
+AsyncResponse.WorkerJobTooLargeException
+AsyncResponse.WorkerJobTooLargeException.Limit.get -> int
+AsyncResponse.WorkerJobTooLargeException.SerializedLength.get -> int
+AsyncResponse.WorkerJobTooLargeException.WorkerJobTooLargeException(int serializedLength, int limit) -> void
+AsyncResponse.AsyncResponseIndeterminateDeliveryException.AsyncResponseIndeterminateDeliveryException(string? correlationId, int bufferedMessages) -> void
+AsyncResponse.AsyncResponseIndeterminateDeliveryException.BufferedMessages.get -> int

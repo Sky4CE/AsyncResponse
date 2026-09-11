@@ -1,4 +1,5 @@
 using AsyncResponse.Transports.Kafka;
+using System.Diagnostics;
 using Microsoft.Extensions.Logging.Abstractions;
 using Xunit;
 
@@ -92,56 +93,83 @@ public class KafkaDispatcherTests
     }
 
     [Fact]
-    public void ValidateOptions_RejectsRetryDelayBudgetThatCannotFitTheMaxPollInterval()
+    public void ValidateOptions_RejectsDetachHandlerAfterThatCannotFitTheMaxPollInterval()
     {
-        // The in-process retry delays run on the poll thread: 4 completed attempts back off
-        // 20+40+80+160 = 300s of pure delay, which cannot fit within half of a 5-minute
-        // max.poll.interval.ms — the broker would evict the consumer mid-retry.
-        var subscriberOptions = new KafkaSubscriberOptions
-        {
-            MaxDeliveryAttempts = 5,
-            HandlerRetryBaseDelay = TimeSpan.FromSeconds(20),
-            HandlerRetryMaxDelay = TimeSpan.FromSeconds(160)
-        };
-
+        // Round 37: the poll thread's longest gap is one inline handler wait plus one poll. A
+        // 3-minute inline budget plus a 200 ms poll cannot fit within half of a 5-minute
+        // max.poll.interval.ms — the broker would evict the consumer while it waited inline.
         var ex = Assert.Throws<InvalidOperationException>(() =>
             KafkaMessageDispatcher.ValidateOptions(
                 KafkaTestData.NewOptions(),
-                subscriberOptions,
+                new KafkaSubscriberOptions { DetachHandlerAfter = TimeSpan.FromMinutes(3) },
                 KafkaSubscriberRole.Worker));
 
+        Assert.Contains(nameof(KafkaSubscriberOptions.DetachHandlerAfter), ex.Message, StringComparison.Ordinal);
         Assert.Contains(nameof(KafkaSubscriberOptions.MaxPollInterval), ex.Message, StringComparison.Ordinal);
         Assert.Contains("evicted", ex.Message, StringComparison.Ordinal);
     }
 
     [Fact]
-    public void ValidateOptions_AcceptsRetryBudgetOnceMaxPollIntervalIsRaised()
+    public void ValidateOptions_AcceptsDetachHandlerAfterOnceMaxPollIntervalIsRaised()
     {
-        // The same budget passes when the operator raises the poll interval to hold it.
+        // The same inline budget passes when the operator raises the poll interval to hold it.
         KafkaMessageDispatcher.ValidateOptions(
             KafkaTestData.NewOptions(),
             new KafkaSubscriberOptions
             {
-                MaxDeliveryAttempts = 5,
-                HandlerRetryBaseDelay = TimeSpan.FromSeconds(20),
-                HandlerRetryMaxDelay = TimeSpan.FromSeconds(160),
+                DetachHandlerAfter = TimeSpan.FromMinutes(3),
                 MaxPollInterval = TimeSpan.FromMinutes(15)
             },
             KafkaSubscriberRole.Worker);
     }
 
     [Fact]
-    public void ValidateOptions_UnlimitedRetries_SkipTheRetryBudgetCheck()
+    public void ValidateOptions_RetryDelaysNoLongerCountAgainstTheMaxPollInterval()
     {
-        // MaxDeliveryAttempts = 0 has no finite delay budget; the option's doc pins staying
-        // under the ceiling as the operator's responsibility.
+        // The retry ladder runs inside the (detached) handler task, so a delay budget of 300 s
+        // against a 5-minute interval — rejected before round 37 — is accepted: it stalls only the
+        // message's partition, never the poll thread.
         KafkaMessageDispatcher.ValidateOptions(
             KafkaTestData.NewOptions(),
             new KafkaSubscriberOptions
             {
-                MaxDeliveryAttempts = 0,
-                HandlerRetryBaseDelay = TimeSpan.FromMinutes(2),
-                HandlerRetryMaxDelay = TimeSpan.FromMinutes(10)
+                MaxDeliveryAttempts = 5,
+                HandlerRetryBaseDelay = TimeSpan.FromSeconds(20),
+                HandlerRetryMaxDelay = TimeSpan.FromSeconds(160)
+            },
+            KafkaSubscriberRole.Worker);
+    }
+
+    [Fact]
+    public void ValidateOptions_DetachHandlerAfter_AllowsZero_RejectsNegative()
+    {
+        // Zero detaches every handler immediately; negative is meaningless.
+        KafkaMessageDispatcher.ValidateOptions(
+            KafkaTestData.NewOptions(),
+            new KafkaSubscriberOptions { DetachHandlerAfter = TimeSpan.Zero },
+            KafkaSubscriberRole.Worker);
+
+        var ex = Assert.Throws<InvalidOperationException>(() =>
+            KafkaMessageDispatcher.ValidateOptions(
+                KafkaTestData.NewOptions(),
+                new KafkaSubscriberOptions { DetachHandlerAfter = TimeSpan.FromMilliseconds(-1) },
+                KafkaSubscriberRole.Worker));
+        Assert.Contains(nameof(KafkaSubscriberOptions.DetachHandlerAfter), ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void ValidateOptions_EarlyAck_DoesNotApplyTheInlineGapRule()
+    {
+        // Under AckAfterEnqueue the handler never runs on the poll thread, so DetachHandlerAfter
+        // has no gap to bound; only its own range is validated.
+        KafkaMessageDispatcher.ValidateOptions(
+            KafkaTestData.NewOptions(),
+            new KafkaSubscriberOptions
+            {
+                DetachHandlerAfter = TimeSpan.FromMinutes(3),
+                BackgroundWorkerCount = 1,
+                BackgroundQueueCapacity = 1,
+                AckMode = KafkaAckMode.AckAfterEnqueue
             },
             KafkaSubscriberRole.Worker);
     }
@@ -1150,6 +1178,7 @@ public class KafkaDispatcherTests
             {
                 MaxDeliveryAttempts = 0,
                 PollTimeout = TimeSpan.FromMilliseconds(10),
+                DetachHandlerAfter = TimeSpan.FromMilliseconds(50),
                 MaxPollInterval = TimeSpan.FromMilliseconds(400)
             },
             NullLogger.Instance,
@@ -1219,6 +1248,259 @@ public class KafkaDispatcherTests
         public void Dispose()
         {
         }
+    }
+
+    // ---------- Round 37: ack-after-handler detachment (the poll-thread API) ----------
+
+    [Fact]
+    public async Task Awaiting_Accept_SettlesInlineWithinTheBudget_WithoutPausing()
+    {
+        var consumer = new FakeKafkaConsumerClient();
+        await using var dispatcher = CreateDispatcher(
+            (_, _) => Task.CompletedTask,
+            new KafkaSubscriberOptions { DetachHandlerAfter = TimeSpan.FromSeconds(5) },
+            consumer: consumer);
+
+        dispatcher.Accept(KafkaTestData.Delivery(Topic, offset: 3), CancellationToken.None);
+
+        Assert.Equal(new FakeKafkaConsumerClient.StoredOffset(Topic, 0, 3), Assert.Single(consumer.StoredOffsets));
+        Assert.False(dispatcher.HasDetachedWork);
+        Assert.Empty(consumer.PartitionPauses);
+    }
+
+    [Fact]
+    public async Task Awaiting_Accept_DetachesAHandlerPastTheBudget_PausesItsPartition_AndSettlesOnATick()
+    {
+        var consumer = new FakeKafkaConsumerClient();
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        await using var dispatcher = CreateDispatcher(
+            async (_, _) => await release.Task,
+            new KafkaSubscriberOptions { DetachHandlerAfter = TimeSpan.FromMilliseconds(20) },
+            consumer: consumer);
+
+        var accepted = Stopwatch.StartNew();
+        dispatcher.Accept(KafkaTestData.Delivery(Topic, offset: 9, partition: 4), CancellationToken.None);
+        accepted.Stop();
+
+        // Back on the poll thread within the budget (generous bound for a slow runner), the
+        // partition paused, nothing stored: the handler is still running.
+        Assert.True(accepted.Elapsed < TimeSpan.FromSeconds(2), $"Accept blocked for {accepted.Elapsed}.");
+        Assert.True(dispatcher.HasDetachedWork);
+        Assert.Equal(4, Assert.Single(consumer.PartitionPauses));
+        Assert.True(consumer.IsPartitionPaused(4));
+        Assert.Empty(consumer.StoredOffsets);
+
+        // A tick with the handler still running settles nothing.
+        dispatcher.SettleCompleted();
+        Assert.Empty(consumer.StoredOffsets);
+        Assert.True(dispatcher.HasDetachedWork);
+
+        release.SetResult();
+        await KafkaTestData.WaitUntilAsync(() =>
+        {
+            dispatcher.SettleCompleted();
+            return !dispatcher.HasDetachedWork;
+        });
+
+        Assert.Equal(new FakeKafkaConsumerClient.StoredOffset(Topic, 4, 9), Assert.Single(consumer.StoredOffsets));
+        Assert.Equal(4, Assert.Single(consumer.PartitionResumes));
+        Assert.False(consumer.IsPartitionPaused(4));
+    }
+
+    [Fact]
+    public async Task Awaiting_Accept_ZeroBudget_DetachesImmediately()
+    {
+        var consumer = new FakeKafkaConsumerClient();
+        var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        await using var dispatcher = CreateDispatcher(
+            async (_, _) =>
+            {
+                started.TrySetResult();
+                await release.Task;
+            },
+            new KafkaSubscriberOptions { DetachHandlerAfter = TimeSpan.Zero },
+            consumer: consumer);
+
+        dispatcher.Accept(KafkaTestData.Delivery(Topic, offset: 1), CancellationToken.None);
+
+        Assert.True(dispatcher.HasDetachedWork);
+        await started.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        release.SetResult();
+        await KafkaTestData.WaitUntilAsync(() =>
+        {
+            dispatcher.SettleCompleted();
+            return !dispatcher.HasDetachedWork;
+        });
+        Assert.Single(consumer.StoredOffsets);
+    }
+
+    [Fact]
+    public async Task Awaiting_SettleCompleted_RethrowsADetachedBurialFailure_WithoutStoringTheOffset()
+    {
+        // The detached path keeps the round-35 contract: a message that exhausted its attempts and
+        // could not be dead-lettered faults the poll loop (through the tick) with its offset
+        // unstored, so no later settlement on the partition commits past it.
+        var consumer = new FakeKafkaConsumerClient();
+        var producer = new FakeKafkaProducerClient { PublishException = new InvalidOperationException("dead-letter topic gone") };
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        await using var dispatcher = CreateDispatcher(
+            async (_, _) =>
+            {
+                await release.Task;
+                throw new InvalidOperationException("handler boom");
+            },
+            new KafkaSubscriberOptions
+            {
+                DetachHandlerAfter = TimeSpan.FromMilliseconds(20),
+                MaxDeliveryAttempts = 1
+            },
+            consumer: consumer,
+            producer: producer);
+
+        dispatcher.Accept(KafkaTestData.Delivery(Topic, offset: 7), CancellationToken.None);
+        Assert.True(dispatcher.HasDetachedWork);
+
+        release.SetResult();
+        Exception? faulted = null;
+        await KafkaTestData.WaitUntilAsync(() =>
+        {
+            try
+            {
+                dispatcher.SettleCompleted();
+                return false;
+            }
+            catch (Exception ex)
+            {
+                faulted = ex;
+                return true;
+            }
+        });
+
+        Assert.IsType<KafkaDeadLetterPublishFailedException>(faulted);
+        Assert.Empty(consumer.StoredOffsets);
+        Assert.False(dispatcher.HasDetachedWork);
+    }
+
+    [Fact]
+    public async Task Awaiting_Dispose_WaitsForDetachedHandlers_AndStoresTheirOffsets()
+    {
+        // A stop lets a detached handler finish and stores its offset before the consumer's close
+        // commits, so a routine deploy does not redeliver work that completed.
+        var consumer = new FakeKafkaConsumerClient();
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var dispatcher = CreateDispatcher(
+            async (_, _) => await release.Task,
+            new KafkaSubscriberOptions { DetachHandlerAfter = TimeSpan.FromMilliseconds(20) },
+            consumer: consumer);
+
+        dispatcher.Accept(KafkaTestData.Delivery(Topic, offset: 11), CancellationToken.None);
+        Assert.True(dispatcher.HasDetachedWork);
+
+        var disposal = dispatcher.DisposeAsync().AsTask();
+        await Task.Delay(100);
+        Assert.False(disposal.IsCompleted);
+        Assert.Empty(consumer.StoredOffsets);
+
+        release.SetResult();
+        await disposal.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal(new FakeKafkaConsumerClient.StoredOffset(Topic, 0, 11), Assert.Single(consumer.StoredOffsets));
+    }
+
+    [Fact]
+    public async Task Awaiting_Dispose_CanceledDetachedHandler_LeavesTheOffsetUnstored()
+    {
+        var consumer = new FakeKafkaConsumerClient();
+        using var stopping = new CancellationTokenSource();
+        var dispatcher = CreateDispatcher(
+            async (_, token) => await Task.Delay(Timeout.InfiniteTimeSpan, token),
+            new KafkaSubscriberOptions { DetachHandlerAfter = TimeSpan.FromMilliseconds(20) },
+            consumer: consumer);
+
+        dispatcher.Accept(KafkaTestData.Delivery(Topic, offset: 2), stopping.Token);
+        Assert.True(dispatcher.HasDetachedWork);
+
+        stopping.Cancel();
+        await dispatcher.DisposeAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.Empty(consumer.StoredOffsets);
+    }
+
+    [Fact]
+    public async Task Awaiting_AMessageArrivingForADetachedPartition_IsHeldAndRunsAfterIt_InOrder()
+    {
+        // A rebalance can hand a paused partition back with its pause reset; a message that
+        // arrives for a partition whose handler is detached is held behind it — order preserved —
+        // and the pause re-asserted so the hold never grows.
+        var consumer = new FakeKafkaConsumerClient();
+        var order = new List<long>();
+        var releaseFirst = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        await using var dispatcher = CreateDispatcher(
+            async (delivery, _) =>
+            {
+                lock (order)
+                {
+                    order.Add(delivery.Offset);
+                }
+
+                if (delivery.Offset == 1)
+                    await releaseFirst.Task;
+            },
+            new KafkaSubscriberOptions { DetachHandlerAfter = TimeSpan.FromMilliseconds(20) },
+            consumer: consumer);
+
+        dispatcher.Accept(KafkaTestData.Delivery(Topic, offset: 1), CancellationToken.None);
+        dispatcher.Accept(KafkaTestData.Delivery(Topic, offset: 2), CancellationToken.None);
+
+        // Held, not started: the second handler must not run while the first is in flight.
+        await Task.Delay(100);
+        lock (order)
+        {
+            Assert.Equal([1], order);
+        }
+
+        Assert.Equal(2, consumer.PartitionPauses.Count); // re-asserted on the held message
+        Assert.Empty(consumer.StoredOffsets);
+
+        releaseFirst.SetResult();
+        await KafkaTestData.WaitUntilAsync(() =>
+        {
+            dispatcher.SettleCompleted();
+            return consumer.StoredOffsets.Count == 2;
+        });
+
+        lock (order)
+        {
+            Assert.Equal([1, 2], order);
+        }
+
+        Assert.Equal([1L, 2L], consumer.StoredOffsets.Select(stored => stored.Offset));
+        Assert.Single(consumer.PartitionResumes); // resumed only once the hold was drained
+    }
+
+    [Fact]
+    public async Task Awaiting_PauseFailureOfARevokedPartition_DoesNotFaultTheDetach()
+    {
+        var consumer = new FakeKafkaConsumerClient
+        {
+            PartitionPauseException = new Confluent.Kafka.KafkaException(new Confluent.Kafka.Error(Confluent.Kafka.ErrorCode.Local_UnknownPartition))
+        };
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        await using var dispatcher = CreateDispatcher(
+            async (_, _) => await release.Task,
+            new KafkaSubscriberOptions { DetachHandlerAfter = TimeSpan.FromMilliseconds(20) },
+            consumer: consumer);
+
+        dispatcher.Accept(KafkaTestData.Delivery(Topic, offset: 5), CancellationToken.None);
+        Assert.True(dispatcher.HasDetachedWork);
+
+        release.SetResult();
+        await KafkaTestData.WaitUntilAsync(() =>
+        {
+            dispatcher.SettleCompleted();
+            return !dispatcher.HasDetachedWork;
+        });
+        Assert.Single(consumer.StoredOffsets);
     }
 
     private static KafkaMessageDispatcher CreateDispatcher(

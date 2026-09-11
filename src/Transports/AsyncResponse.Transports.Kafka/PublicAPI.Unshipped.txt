@@ -108,3 +108,5 @@ AsyncResponse.Transports.Kafka.KafkaWorkerTransport.PublishAsync(AsyncResponse.W
 const AsyncResponse.Transports.Kafka.KafkaAsyncResponseTransportOptions.TransportName = "kafka" -> string!
 Microsoft.Extensions.DependencyInjection.KafkaAsyncResponseTransportServiceCollectionExtensions
 static Microsoft.Extensions.DependencyInjection.KafkaAsyncResponseTransportServiceCollectionExtensions.WithKafkaTransport(this Microsoft.Extensions.DependencyInjection.AsyncResponseRegistrationBuilder! builder, System.Action<AsyncResponse.Transports.Kafka.KafkaAsyncResponseTransportOptions!>! configure) -> Microsoft.Extensions.DependencyInjection.AsyncResponseRegistrationBuilder!
+AsyncResponse.Transports.Kafka.KafkaSubscriberOptions.DetachHandlerAfter.get -> System.TimeSpan
+AsyncResponse.Transports.Kafka.KafkaSubscriberOptions.DetachHandlerAfter.set -> void

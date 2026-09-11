@@ -88,6 +88,7 @@ internal abstract class KafkaMessageDispatcher : IAsyncDisposable
 
     protected KafkaAsyncResponseTransportOptions TransportOptions { get; }
     protected ILogger Logger { get; }
+    protected IKafkaConsumerClient Consumer => _consumer;
 
     protected int MaxDeliveryAttempts => _subscriberOptions.MaxDeliveryAttempts;
 
@@ -143,10 +144,10 @@ internal abstract class KafkaMessageDispatcher : IAsyncDisposable
             ? $"{nameof(KafkaAsyncResponseTransportOptions)}.{nameof(KafkaAsyncResponseTransportOptions.WorkerSubscriber)}"
             : $"{nameof(KafkaAsyncResponseTransportOptions)}.{nameof(KafkaAsyncResponseTransportOptions.ResponseSubscriber)}";
 
-        // PollTimeout goes to Consume(TimeSpan), which librdkafka takes as 32-bit milliseconds;
-        // the backpressure and handler-retry delays arm in-process Task.Delay timers.
+        // PollTimeout and BackpressurePollDelay both go to Consume(TimeSpan), which librdkafka
+        // takes as 32-bit milliseconds; the handler-retry delays arm in-process Task.Delay timers.
         KafkaTransportOptionsValidator.EnsureIntMilliseconds(subscriberOptions.PollTimeout, optionPath, nameof(KafkaSubscriberOptions.PollTimeout));
-        AsyncResponseChannelOptions.EnsureTimerBacked(subscriberOptions.BackpressurePollDelay, optionPath, nameof(KafkaSubscriberOptions.BackpressurePollDelay));
+        KafkaTransportOptionsValidator.EnsureIntMilliseconds(subscriberOptions.BackpressurePollDelay, optionPath, nameof(KafkaSubscriberOptions.BackpressurePollDelay));
         if (subscriberOptions.MaxDeliveryAttempts < 0)
             throw new InvalidOperationException($"{optionPath}.{nameof(KafkaSubscriberOptions.MaxDeliveryAttempts)} cannot be negative.");
         AsyncResponseChannelOptions.EnsureTimerBacked(subscriberOptions.HandlerRetryBaseDelay, optionPath, nameof(KafkaSubscriberOptions.HandlerRetryBaseDelay));
@@ -159,32 +160,29 @@ internal abstract class KafkaMessageDispatcher : IAsyncDisposable
         }
 
         KafkaTransportOptionsValidator.EnsureMaxPollInterval(subscriberOptions.MaxPollInterval, optionPath, nameof(KafkaSubscriberOptions.MaxPollInterval));
-
-        // The in-process retry loop runs on the poll thread, so its delays suspend Consume();
-        // a poll gap reaching max.poll.interval.ms gets the consumer evicted from its group
-        // mid-retry and its partitions redelivered elsewhere. The retry DELAY budget (handler
-        // execution time is the operator's responsibility) plus one poll must fit within half
-        // the interval so real handler time has the other half. Unlimited retries
-        // (MaxDeliveryAttempts = 0) have no finite budget and stay the operator's call.
-        if (subscriberOptions.MaxDeliveryAttempts > 0)
-        {
-            var retryDelayBudgetMs = WorstCaseRetryDelayBudgetMs(subscriberOptions);
-            var pollGapMs = retryDelayBudgetMs + subscriberOptions.PollTimeout.TotalMilliseconds;
-            if (pollGapMs * 2 > subscriberOptions.MaxPollInterval.TotalMilliseconds)
-            {
-                throw new InvalidOperationException(
-                    $"{optionPath}: the worst-case in-process handler retry delay budget plus one poll " +
-                    $"({DescribeMilliseconds(pollGapMs)} across {subscriberOptions.MaxDeliveryAttempts} delivery attempts) must fit within half of " +
-                    $"{nameof(KafkaSubscriberOptions.MaxPollInterval)} ({subscriberOptions.MaxPollInterval}) — these delays run on the poll thread, and a " +
-                    "poll gap reaching max.poll.interval.ms gets the consumer evicted from its group mid-retry. Reduce " +
-                    $"{nameof(KafkaSubscriberOptions.MaxDeliveryAttempts)}, {nameof(KafkaSubscriberOptions.HandlerRetryBaseDelay)}, or " +
-                    $"{nameof(KafkaSubscriberOptions.HandlerRetryMaxDelay)}, or raise {nameof(KafkaSubscriberOptions.MaxPollInterval)}.");
-            }
-        }
+        AsyncResponseChannelOptions.EnsureTimerBackedAllowZero(subscriberOptions.DetachHandlerAfter, optionPath, nameof(KafkaSubscriberOptions.DetachHandlerAfter));
 
         switch (subscriberOptions.AckMode)
         {
             case KafkaAckMode.AckAfterHandlerCompletes:
+                // The poll thread's longest gap in this mode is one inline handler wait plus one
+                // poll; a gap reaching max.poll.interval.ms gets the consumer evicted from its
+                // group and its partitions redelivered elsewhere. Half the interval is the margin.
+                // Handler execution time and the in-process retry ladder no longer count: past
+                // DetachHandlerAfter the handler runs detached while the poll thread keeps polling
+                // (the earlier rule bounded the retry DELAYS for that reason, and left real handler
+                // time — a flow step awaiting a remote response — to overrun the interval anyway).
+                var pollGapMs = subscriberOptions.DetachHandlerAfter.TotalMilliseconds + subscriberOptions.PollTimeout.TotalMilliseconds;
+                if (pollGapMs * 2 > subscriberOptions.MaxPollInterval.TotalMilliseconds)
+                {
+                    throw new InvalidOperationException(
+                        $"{optionPath}: {nameof(KafkaSubscriberOptions.DetachHandlerAfter)} ({subscriberOptions.DetachHandlerAfter}) plus " +
+                        $"{nameof(KafkaSubscriberOptions.PollTimeout)} ({subscriberOptions.PollTimeout}) must fit within half of " +
+                        $"{nameof(KafkaSubscriberOptions.MaxPollInterval)} ({subscriberOptions.MaxPollInterval}) — that sum is the poll thread's " +
+                        "longest gap, and a gap reaching max.poll.interval.ms gets the consumer evicted from its group. Lower " +
+                        $"{nameof(KafkaSubscriberOptions.DetachHandlerAfter)} or raise {nameof(KafkaSubscriberOptions.MaxPollInterval)}.");
+                }
+
                 return;
 
             case KafkaAckMode.AckAfterEnqueue:
@@ -220,43 +218,40 @@ internal abstract class KafkaMessageDispatcher : IAsyncDisposable
         }
     }
 
-    /// <summary>
-    /// Ceiling of the retry delays a failing message can spend on the poll thread: one backoff per
-    /// completed attempt except the last. Mirrors <see cref="AsyncResponseRetry.Backoff"/>'s
-    /// pre-jitter shape — <c>min(max, base * 2^min(attempt-1, 10))</c>; jitter only ever shrinks a
-    /// step — and is computed in milliseconds because a large attempt count times the capped step
-    /// overflows <see cref="TimeSpan"/>.
-    /// </summary>
-    private static double WorstCaseRetryDelayBudgetMs(KafkaSubscriberOptions subscriberOptions)
-    {
-        var baseMs = subscriberOptions.HandlerRetryBaseDelay.TotalMilliseconds;
-        var maxMs = subscriberOptions.HandlerRetryMaxDelay.TotalMilliseconds;
-        var delays = subscriberOptions.MaxDeliveryAttempts - 1;
-
-        var totalMs = 0d;
-        for (var attempt = 1; attempt <= Math.Min(delays, 11); attempt++)
-            totalMs += Math.Min(maxMs, baseMs * (1 << (attempt - 1)));
-
-        // The multiplier saturates at 2^10, so every later delay is the same capped step.
-        if (delays > 11)
-            totalMs += (delays - 11) * Math.Min(maxMs, baseMs * 1024);
-
-        return totalMs;
-    }
-
-    private static string DescribeMilliseconds(double milliseconds)
-        => milliseconds <= TimeSpan.MaxValue.TotalMilliseconds
-            ? TimeSpan.FromMilliseconds(milliseconds).ToString()
-            : $"more than {TimeSpan.MaxValue}";
-
-    /// <summary>Handles the delivered message.</summary>
+    /// <summary>Handles the delivered message through to settlement, offset store included.</summary>
     public abstract Task HandleAsync(KafkaDelivery delivery, CancellationToken subscriberCancellationToken);
 
     /// <summary>
+    /// The poll thread's entry point for a consumed message. Returns once the message is settled
+    /// (offset stored, or dead-lettered and stored) or — for the awaiting dispatcher — once its
+    /// handler has been detached to run on while polling continues. Throws when the message cannot
+    /// be settled (a permanently failing burial, cancellation), which faults the poll loop so the
+    /// subscriber is rebuilt without ever committing past the message.
+    /// </summary>
+    public virtual void Accept(KafkaDelivery delivery, CancellationToken subscriberCancellationToken)
+        => HandleAsync(delivery, subscriberCancellationToken).GetAwaiter().GetResult();
+
+    /// <summary>
+    /// Poll-thread tick: settles detached handlers that have finished — offset stored, partition
+    /// resumed, the next held message started. Throws when one of them failed for good (the poll
+    /// loop faults, exactly as an inline failure would).
+    /// </summary>
+    public virtual void SettleCompleted()
+    {
+    }
+
+    /// <summary>
+    /// Whether detached handlers are in flight. The poll loop then polls in
+    /// <see cref="KafkaSubscriberOptions.BackpressurePollDelay"/> slices so a completion is settled
+    /// promptly instead of after a full <see cref="KafkaSubscriberOptions.PollTimeout"/>.
+    /// </summary>
+    public virtual bool HasDetachedWork => false;
+
+    /// <summary>
     /// Whether the dispatcher can accept more deliveries right now. Awaiting dispatchers always can
-    /// (handlers run inline); the queued dispatcher returns <c>false</c> while its bounded queue is
-    /// saturated so the subscriber pauses partition fetching instead of buffering an unbounded
-    /// backlog in-process.
+    /// (a partition with a detached handler is paused, so nothing arrives for it); the queued
+    /// dispatcher returns <c>false</c> while its bounded queue is saturated so the subscriber
+    /// pauses partition fetching instead of buffering an unbounded backlog in-process.
     /// </summary>
     public virtual bool CanAcceptMore => true;
 
@@ -462,12 +457,15 @@ internal abstract class KafkaMessageDispatcher : IAsyncDisposable
         headers.Add(KafkaTransportHeader.Utf8("exceptionMessage", exception.Message));
         headers.Add(KafkaTransportHeader.Utf8("occurredAtUtc", DateTimeOffset.UtcNow.ToString("O")));
 
-        // Both burial callers block the poll thread on this, and a produce to an undeliverable
-        // dead-letter topic waits out librdkafka's message.timeout.ms (5 min by default) PER
-        // attempt — past max.poll.interval.ms, which evicted the consumer mid-burial and
-        // rebalanced the partition to a peer that hit the same message: a rebalance storm at
-        // zero throughput. Bound the whole ladder to a quarter of the poll interval; every caller
-        // already treats a failed burial as "offset left unstored, retried after restart/rebalance".
+        // The unprocessable-message discard blocks the poll thread on this (the awaiting
+        // dispatcher's burial runs inside the detached handler task now, but keeps the same bound
+        // so a partition is not parked on an undeliverable dead-letter topic for message.timeout.ms
+        // per attempt either): a produce to an undeliverable dead-letter topic waits out
+        // librdkafka's message.timeout.ms (5 min by default) PER attempt — past
+        // max.poll.interval.ms, which evicted the consumer mid-burial and rebalanced the partition
+        // to a peer that hit the same message: a rebalance storm at zero throughput. Bound the whole
+        // ladder to a quarter of the poll interval; every caller already treats a failed burial as
+        // "offset left unstored, retried after restart/rebalance".
         using var pollBudget = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         pollBudget.CancelAfter(TimeSpan.FromTicks(_subscriberOptions.MaxPollInterval.Ticks / 4));
 
@@ -516,22 +514,194 @@ internal abstract class KafkaMessageDispatcher : IAsyncDisposable
     }
 }
 
-internal sealed class AwaitingKafkaMessageDispatcher(
-    Func<KafkaDelivery, CancellationToken, Task> handler,
-    IKafkaConsumerClient consumer,
-    IKafkaProducerClient producer,
-    KafkaAsyncResponseTransportOptions transportOptions,
-    KafkaSubscriberOptions subscriberOptions,
-    ILogger logger,
-    string topic,
-    string consumerGroup,
-    KafkaSubscriberRole role)
-    : KafkaMessageDispatcher(handler, consumer, producer, transportOptions, subscriberOptions, logger, topic, consumerGroup, role)
+/// <summary>
+/// Ack-after-handler mode. A message's handler is started the moment it is consumed and awaited
+/// inline for up to <see cref="KafkaSubscriberOptions.DetachHandlerAfter"/>; a handler still
+/// running past that is <em>detached</em>: its partition is paused (Kafka's own ordering primitive
+/// — nothing for it is fetched, nothing is buffered in-process), the handler and its retry ladder
+/// run on, and the poll thread returns to polling. The earlier design awaited the whole handler on
+/// the poll thread: a durable-flow step awaiting a remote response or a timer for longer than
+/// <c>max.poll.interval.ms</c> (5 minutes by default) got the consumer evicted from its group, its
+/// partitions rebalanced, the message redelivered to a peer that started the same work again,
+/// and every other partition assigned to this consumer stalled behind it.
+/// <para>
+/// The consumer is touched only from the poll thread: detached handlers never store offsets or
+/// resume partitions themselves. The poll loop calls <see cref="SettleCompleted"/> every tick,
+/// which observes finished handlers exactly as the inline path would — success stores the offset,
+/// cancellation leaves it unstored for redelivery, a burial that failed for good faults the poll
+/// loop so nothing is ever committed past the message — then starts the next message held for the
+/// partition, or resumes it. Disposal (the poll loop has exited by then) waits for the remaining
+/// detached handlers and settles them before the consumer's close commits, so finished work is
+/// not redelivered by a routine stop.
+/// </para>
+/// </summary>
+internal sealed class AwaitingKafkaMessageDispatcher : KafkaMessageDispatcher
 {
-    /// <summary>Handles the delivered message.</summary>
-    public override async Task HandleAsync(
-        KafkaDelivery delivery,
-        CancellationToken subscriberCancellationToken)
+    private readonly TimeSpan _detachAfter;
+    private readonly string _topic;
+
+    // Poll-thread-only: the loop is the sole caller of Accept/SettleCompleted, and DisposeAsync
+    // runs after it has exited. No lock.
+    private readonly Dictionary<int, DetachedPartition> _detached = [];
+
+    /// <summary>Runs the AwaitingKafkaMessageDispatcher operation.</summary>
+    public AwaitingKafkaMessageDispatcher(
+        Func<KafkaDelivery, CancellationToken, Task> handler,
+        IKafkaConsumerClient consumer,
+        IKafkaProducerClient producer,
+        KafkaAsyncResponseTransportOptions transportOptions,
+        KafkaSubscriberOptions subscriberOptions,
+        ILogger logger,
+        string topic,
+        string consumerGroup,
+        KafkaSubscriberRole role)
+        : base(handler, consumer, producer, transportOptions, subscriberOptions, logger, topic, consumerGroup, role)
+    {
+        _detachAfter = subscriberOptions.DetachHandlerAfter;
+        _topic = topic;
+    }
+
+    /// <summary>Partitions whose handler is currently detached (test observability).</summary>
+    internal int DetachedCount => _detached.Count;
+
+    public override bool HasDetachedWork => _detached.Count > 0;
+
+    /// <summary>Handles the delivered message inline through to the offset store (the unit-test and inline-path contract).</summary>
+    public override async Task HandleAsync(KafkaDelivery delivery, CancellationToken subscriberCancellationToken)
+    {
+        await SettleAsync(delivery, subscriberCancellationToken).ConfigureAwait(false);
+        StoreOffsetAfterSettlement(delivery);
+    }
+
+    /// <inheritdoc />
+    public override void Accept(KafkaDelivery delivery, CancellationToken subscriberCancellationToken)
+    {
+        if (_detached.TryGetValue(delivery.Partition, out var inFlight))
+        {
+            // A message for a partition whose handler is still running: a rebalance handed the
+            // partition back with its pause reset (librdkafka resets pause state on assignment),
+            // or the client delivered a message it had fetched before the pause. Hold it behind
+            // the running one — the partition's order is the contract — and re-assert the pause
+            // so nothing more arrives; the hold is therefore bounded by what was already in
+            // flight, never a queue that grows.
+            (inFlight.Held ??= new Queue<KafkaDelivery>()).Enqueue(delivery);
+            PausePartition(delivery.Partition);
+            return;
+        }
+
+        // Started on the pool, not inline: the inline wait below is a real bound on the poll
+        // thread's gap even for a handler whose synchronous prefix is long.
+        var settlement = Task.Run(() => SettleAsync(delivery, subscriberCancellationToken), CancellationToken.None);
+        if (WaitInline(settlement))
+        {
+            // The fast path, unchanged: settle in place and consume the next message.
+            settlement.GetAwaiter().GetResult();
+            StoreOffsetAfterSettlement(delivery);
+            return;
+        }
+
+        PausePartition(delivery.Partition);
+        _detached[delivery.Partition] = new DetachedPartition(delivery, settlement, subscriberCancellationToken);
+        Logger.LogDebug(
+            "Kafka handler for {Topic}[{Partition}]@{Offset} is still running after {DetachAfter}; detached it and paused the partition while polling continues.",
+            delivery.Topic,
+            delivery.Partition,
+            delivery.Offset,
+            _detachAfter);
+    }
+
+    /// <inheritdoc />
+    public override void SettleCompleted()
+    {
+        if (_detached.Count == 0)
+            return;
+
+        List<int>? finished = null;
+        foreach (var (partition, work) in _detached)
+        {
+            if (work.Settlement.IsCompleted)
+                (finished ??= []).Add(partition);
+        }
+
+        if (finished is null)
+            return;
+
+        foreach (var partition in finished)
+        {
+            var work = _detached[partition];
+            // Removed BEFORE it is observed: a settlement that throws faults the poll loop, and the
+            // entry must not be settled a second time by disposal.
+            _detached.Remove(partition);
+            work.Settlement.GetAwaiter().GetResult();
+            StoreOffsetAfterSettlement(work.Delivery);
+
+            if (work.Held is { Count: > 0 } held)
+            {
+                // The partition stays paused while the message held behind this one runs.
+                var next = held.Dequeue();
+                var settlement = Task.Run(() => SettleAsync(next, work.SubscriberCancellationToken), CancellationToken.None);
+                _detached[partition] = new DetachedPartition(next, settlement, work.SubscriberCancellationToken) { Held = held.Count > 0 ? held : null };
+                continue;
+            }
+
+            ResumePartition(partition);
+        }
+    }
+
+    /// <summary>
+    /// The poll loop has exited (a stop, or a fault). Detached handlers run on — the handler takes
+    /// no cancellation token the ingress would honor — so wait for each and settle it exactly as the
+    /// poll thread would have: an offset stored here is committed by the consumer close that
+    /// follows, and finished work is not redelivered by a routine stop. Unbounded, as the inline
+    /// path was (the host's shutdown budget bounds the stop as a whole). Messages still held behind
+    /// a detached handler are dropped unstarted: their offsets are unstored, so they redeliver.
+    /// </summary>
+    public override async ValueTask DisposeAsync()
+    {
+        if (_detached.Count == 0)
+            return;
+
+        Logger.LogInformation(
+            "Waiting for {Count} detached Kafka handler(s) on {Topic} to settle before the consumer closes.",
+            _detached.Count,
+            _topic);
+
+        foreach (var (partition, work) in _detached.ToArray())
+        {
+            _detached.Remove(partition);
+            try
+            {
+                await work.Settlement.ConfigureAwait(false);
+                StoreOffsetAfterSettlement(work.Delivery);
+            }
+            catch (OperationCanceledException)
+            {
+                Logger.LogInformation(
+                    "Detached Kafka handler for {Topic}[{Partition}]@{Offset} was canceled by the stop; its offset is left unstored and the message redelivers.",
+                    work.Delivery.Topic,
+                    work.Delivery.Partition,
+                    work.Delivery.Offset);
+            }
+            catch (Exception ex)
+            {
+                Logger.LogError(
+                    ex,
+                    "Detached Kafka handler for {Topic}[{Partition}]@{Offset} failed while the subscriber was stopping; its offset is left unstored and the message redelivers.",
+                    work.Delivery.Topic,
+                    work.Delivery.Partition,
+                    work.Delivery.Offset);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Runs the handler with the in-process retry ladder and, at the delivery cap, the dead-letter
+    /// burial — everything but the offset store, which the poll thread performs once this returns.
+    /// Returns normally when the message is settled (handled, or buried); throws on cancellation
+    /// (offset not stored: redelivered after restart or rebalance) and when the burial fails for
+    /// good (<see cref="KafkaDeadLetterPublishFailedException"/>).
+    /// </summary>
+    private async Task SettleAsync(KafkaDelivery delivery, CancellationToken subscriberCancellationToken)
     {
         var attempt = 0;
         while (true)
@@ -588,13 +758,13 @@ internal sealed class AwaitingKafkaMessageDispatcher(
                         throw new KafkaDeadLetterPublishFailedException(delivery.Topic, delivery.Partition, delivery.Offset, deadLetterException);
                     }
 
-                    StoreOffsetAfterSettlement(delivery);
                     return;
                 }
 
                 // Kafka offsets cannot NACK one message, so retry in-process with backoff. This
                 // stalls the message's partition (head-of-line), which is inherent to classic
-                // consumer groups.
+                // consumer groups — and only that partition: past DetachHandlerAfter the ladder
+                // runs detached from the poll thread.
                 await Task.Delay(RetryBackoff(attempt), subscriberCancellationToken).ConfigureAwait(false);
                 continue;
             }
@@ -603,9 +773,66 @@ internal sealed class AwaitingKafkaMessageDispatcher(
             // sibling transport): a StoreOffset failure after a successful handler — routine when a
             // rebalance revoked the partition mid-handler — must not be misread as a handler
             // failure that re-runs, or dead-letters, work that already succeeded.
-            StoreOffsetAfterSettlement(delivery);
             return;
         }
+    }
+
+    /// <summary>
+    /// Blocks the poll thread for at most the inline budget. <c>true</c> when the settlement task
+    /// finished (in any state — the caller observes it); <c>false</c> when it is still running.
+    /// </summary>
+    private bool WaitInline(Task settlement)
+    {
+        if (settlement.IsCompleted)
+            return true;
+        if (_detachAfter <= TimeSpan.Zero)
+            return false;
+
+        try
+        {
+            return settlement.Wait(_detachAfter);
+        }
+        catch (AggregateException)
+        {
+            // Completed, faulted: the caller re-awaits it and gets the original exception.
+            return true;
+        }
+    }
+
+    private void PausePartition(int partition)
+    {
+        try
+        {
+            Consumer.PausePartition(_topic, partition);
+        }
+        catch (Exception ex)
+        {
+            // Not assigned any more (a rebalance took it): nothing to pause, nothing arrives for it,
+            // and the running handler's outcome is settled like any other when it finishes.
+            Logger.LogDebug(ex, "Could not pause {Topic}[{Partition}] behind its detached handler; the partition is no longer assigned to this consumer.", _topic, partition);
+        }
+    }
+
+    private void ResumePartition(int partition)
+    {
+        try
+        {
+            Consumer.ResumePartition(_topic, partition);
+        }
+        catch (Exception ex)
+        {
+            Logger.LogDebug(ex, "Could not resume {Topic}[{Partition}] after its detached handler settled; the partition is no longer assigned to this consumer.", _topic, partition);
+        }
+    }
+
+    private sealed class DetachedPartition(KafkaDelivery delivery, Task settlement, CancellationToken subscriberCancellationToken)
+    {
+        public KafkaDelivery Delivery { get; } = delivery;
+        public Task Settlement { get; } = settlement;
+        public CancellationToken SubscriberCancellationToken { get; } = subscriberCancellationToken;
+
+        /// <summary>Messages consumed for the partition while its handler was detached, in order.</summary>
+        public Queue<KafkaDelivery>? Held { get; set; }
     }
 }
 

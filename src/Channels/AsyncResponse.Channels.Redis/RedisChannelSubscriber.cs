@@ -8,10 +8,16 @@ internal interface IRedisChannelSubscription : IAsyncDisposable;
 /// <summary>
 /// Async-capable subscribe seam over StackExchange.Redis pub/sub. The channel consumes this instead
 /// of <see cref="ISubscriber.Subscribe(RedisChannel, Action{RedisChannel, RedisValue}, CommandFlags)"/>'s
-/// synchronous callback so message handling can await the per-channel serial executor (bounded
-/// backpressure) without sync-over-async blocking a Redis reader thread. Also the unit-test seam:
-/// <see cref="ChannelMessageQueue"/> is sealed with no public constructor, so tests fake this
-/// interface rather than the queue.
+/// synchronous callback — whose handlers the SDK runs on pool threads with no ordering — so
+/// messages reach the channel one at a time, in order, off any Redis reader thread. Also the
+/// unit-test seam: <see cref="ChannelMessageQueue"/> is sealed with no public constructor, so
+/// tests fake this interface rather than the queue.
+/// <para>
+/// The handler must not wait for downstream capacity: the SDK queue behind this seam is
+/// unbounded, so a handler parked on admission does not backpressure the publisher (Redis
+/// pub/sub has none), it only lets that queue grow. The channel admits non-blockingly and faults
+/// the wait as indeterminate when its bounded buffer is full.
+/// </para>
 /// </summary>
 internal interface IRedisChannelSubscriber
 {
@@ -25,8 +31,8 @@ internal interface IRedisChannelSubscriber
 /// <summary>
 /// Production <see cref="IRedisChannelSubscriber"/> over <see cref="ISubscriber"/>: a
 /// <see cref="ChannelMessageQueue"/> per subscription, whose <c>OnMessage(Func&lt;…, Task&gt;)</c>
-/// loop awaits the handler — preserving per-channel ordering while propagating executor
-/// backpressure to the queue instead of blocking a reader thread.
+/// loop awaits the handler — preserving per-channel ordering off the reader thread. The queue
+/// itself is unbounded (an SDK detail), which is why the channel's handler never waits in it.
 /// </summary>
 internal sealed class RedisChannelMessageQueueSubscriber(ISubscriber _subscriber) : IRedisChannelSubscriber
 {

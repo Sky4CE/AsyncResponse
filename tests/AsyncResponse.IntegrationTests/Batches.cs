@@ -242,6 +242,9 @@ public sealed class BrokersBatchFixture : IntegrationFixture
             "itest-app-redis",
             "itest-app-redis-early-ack");
 
+        // The in-process Kafka host of KafkaLongHandlerIntegrationTests addresses the broker itself.
+        await WireBrokerConnectionStringsAsync();
+
         Client = clients[0];
         EarlyAckClient = clients[1];
         RabbitMqClient = clients[2];

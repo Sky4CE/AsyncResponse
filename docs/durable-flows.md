@@ -469,6 +469,44 @@ transparently), partition a long history into [child flows](#child-flows) (a par
 only a compact snapshot of each child), and lower the threshold on DynamoDB, whose 350 KB item
 cap sits under the default.
 
+#### Supported ledger budgets
+
+The full-ledger checkpoint is a deliberate design: one document, one revision check, one lease
+fence, readable on any store and byte-identical across providers. Its cost is quadratic in the
+number of retained step results, and these are the budgets the library is built and tested for —
+outside them the persistence cost arrives well before the size cap does:
+
+| Budget | Supported | What happens past it |
+|---|---|---|
+| Ledger size | ≤ `LedgerSizeWarningBytes` (512 KiB by default; ≤ 350 KB on DynamoDB) | The warning fires at the threshold and each doubling; `MaxStateBytes` fails the run. |
+| Retained step results per run | a few hundred (≈ 250 steps of 100-byte results ≈ 5 MB written over the run; 1,000 ≈ 87 MB) | Every further checkpoint re-serializes the whole history; latency and transaction-log volume grow with each step. |
+| Size of one step result | a few KiB | One large result is paid again on every later checkpoint of the run. |
+| Flow input | must fit the worker envelope: `AsyncResponseOptions.MaxInboundMessageChars` (8 Mi characters) — the start job carries the initial ledger | `StartAsync` throws `WorkerJobTooLargeException` before publishing (nothing is persisted). |
+
+Two patterns keep a long-running or data-heavy flow inside them. **Store large results by
+reference**: the step persists its payload where it belongs (blob storage, a table, a cache) and
+returns only the key, so the ledger retains a few dozen bytes per step:
+
+```csharp
+// The step's checkpoint holds the key, not the report.
+var reportKey = await flow.StepAsync("render-report", async () =>
+{
+    var report = await renderer.RenderAsync(input, ct);
+    var key = $"reports/{flow.FlowId}/{Guid.NewGuid():N}";
+    await blobs.UploadAsync(key, report, ct);
+    return key;
+});
+
+// A later step re-reads it by key; a replay after a restart re-reads the same key.
+await flow.StepAsync("publish", () => publisher.PublishAsync(blobs.OpenRead(reportKey), ct));
+```
+
+**Partition a long history into child flows**: a parent that fans out or loops for hundreds of
+steps starts a [child flow](#child-flows) per batch and memoizes only each child's compact
+snapshot, so neither ledger grows past a bounded number of steps. Incremental (append-only)
+checkpoint persistence for workloads that genuinely need thousands of retained results is on the
+[roadmap](roadmap.md) and will keep the same revision and lease fences.
+
 For tests, development, or a deliberately one-process application:
 
 ```csharp

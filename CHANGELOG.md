@@ -13,6 +13,83 @@ work that has landed on `main` but not yet shipped. Security reporters credited 
 
 ### Changed
 
+- **Round-37 review (2026-09-11): where provider behavior meets the orchestration guarantees.**
+  - *Kafka: a long handler no longer stalls the poll loop.* In `AckAfterHandlerCompletes` mode the
+    poll thread awaited the whole handler, so a durable-flow step awaiting a remote response or a
+    timer for longer than `max.poll.interval.ms` (5 minutes by default) got the consumer evicted
+    from its group, its partitions rebalanced, the same job redelivered to a peer that started it
+    again, and every other partition assigned to the consumer stalled behind it. A handler still
+    running after the new `KafkaSubscriberOptions.DetachHandlerAfter` (default 1 s; `0` detaches
+    at once) is now detached: its partition is paused (Kafka's own ordering primitive — nothing
+    buffered in-process), the handler and its retry ladder run on the thread pool, and the poll
+    thread keeps polling. The poll thread — the only thread that touches the consumer — stores the
+    offset and resumes the partition once the handler settles (within one `BackpressurePollDelay`),
+    starts a message held behind it in order, and surfaces a burial that failed for good exactly
+    as the inline path did (`KafkaDeadLetterPublishFailedException`, offset unstored). A stop
+    waits for detached handlers and commits their offsets before the consumer closes. Detached
+    handlers for different partitions run concurrently. Startup validation now bounds
+    `DetachHandlerAfter + PollTimeout` to half of `MaxPollInterval` and no longer bounds the
+    retry-delay budget, which never overran the poll thread on its own once detached. Verified
+    against the real broker: a 12-second handler under an 8-second `max.poll.interval.ms` runs
+    exactly once (`KafkaLongHandlerIntegrationTests`, brokers batch).
+  - *Cosmos DB lease operations no longer share a mutable query.* Round 36's lease projection was
+    one static `QueryDefinition` parameterized per call, and `WithParameter` replaces the named
+    parameter in place — so two flows' lease operations interleaving on one store instance could
+    execute flow A's query under A's partition key asking for flow B's id, read "no document", and
+    fail a healthy renewal (abandoning and replaying the run). Only the SQL text is shared now;
+    every call builds its own definition.
+  - *An oversized worker job fails at the producer.* The ingress acknowledges a message over
+    `AsyncResponseOptions.MaxInboundMessageChars` without executing it (redelivering it would
+    hot-loop), but nothing stopped the producer from publishing one: the transport took it, the
+    ingress dropped it, and `StartAsync` returned a flow id for a `Running` ledger with
+    `Attempts = 0` that nothing would execute. Every `EnqueueWorkerAsync` overload and
+    `IDurableFlows.StartAsync` now measure the serialized envelope — the transports' own
+    serialization, in the UTF-16 units the ingress compares, escaping included — and throw the new
+    `WorkerJobTooLargeException` (`SerializedLength`, `Limit`) before publishing. A flow start
+    surfaces it unwrapped and unretried (nothing persisted). The hot path pays no second
+    serialization: a cheap upper bound (every string fully escaped, scalars at a fixed allowance)
+    skips the exact measurement for envelopes that provably fit.
+  - *Redis channel: a progress flood behind a slow predicate faults the wait instead of growing
+    memory.* The subscription handler awaited admission to the bounded per-correlation-id
+    executor, which never backpressured the publisher (Redis pub/sub is fire-and-forget) — it only
+    parked the SDK's message loop while the SDK's unbounded `ChannelMessageQueue` behind it filled
+    (20,000 messages held against an executor of 1,024). Admission is non-blocking now; a response
+    that finds the buffer full faults the wait with the new overload form of
+    `AsyncResponseIndeterminateDeliveryException` (`BufferedMessages`), tears the subscription
+    down, and counts the new `asyncresponse.channel.overloaded_waits` counter (`channel` tag) —
+    never buffered without bound, never silently dropped (a terminal response may be among the
+    queued or refused ones). Messages queued behind the fault are skipped unprocessed. Durable
+    flows restart the awaiting step on the fault as they do for the disposal-drain form.
+  - *CI retry classifier: per-test classification, no `grep | head`.* Two gaps let a real
+    failure be retried into green: an executed test dying with a non-assertion exception (a
+    `NullReferenceException`) was invisible to the whole-log assertion scan, so a fixture-boot
+    flake elsewhere in the same log retried the job; and `grep -o … | head -n 1` under `pipefail`
+    failed with SIGPIPE on a log of thousands of assertion failures, which skipped the real-failure
+    branch entirely. `scripts/ci-retryable-failure.sh` now splits the log into failed-test blocks
+    and judges each — assertion or `XunitException` is real, a flake signature explains it, and a
+    block with neither is an executed test that failed for an unrecognized reason, which is real
+    too — and every signature match is a single `grep -m 1` trimmed in bash. A block-less log with
+    no signature is still `unmatched`. Both reproduced inputs are in the self-test, which the old
+    script answers `flake` and the new one `real`.
+  - *Local Redis binds to loopback.* `docker-compose.yml` published `6379:6379` on every host
+    interface with protected mode off — an unauthenticated write path into recovery descriptors
+    and response envelopes for anyone on the segment. It is `127.0.0.1:6379:6379` now;
+    `docs/security.md` says why.
+  - *Documented ledger budgets.* Every checkpoint rewrites the whole ledger (quadratic cumulative
+    cost over a run), which the size warning detects but does not reduce. `docs/durable-flows.md`
+    now states the supported budgets — ledger ≤ `LedgerSizeWarningBytes`, a few hundred retained
+    step results of a few KiB each, an input that fits the worker envelope — with the measured
+    curve, the store-large-results-by-reference pattern in code, and child flows as the partition
+    strategy; incremental persistence stays on the roadmap under the same revision and lease
+    fences.
+  - Tests: 9 red-on-old proofs against ba63beb (the Cosmos parameter race with a query mock that
+    answers what it is asked; the producer-side budget, escaping included, and the flow start; the
+    Redis flood; the Kafka poll loop under a long handler and the other partitions behind it; both
+    classifier inputs), plus new-API pins for the exception, the estimator's upper-bound property,
+    the overload constructor and counter, the detach knob's validation and the dispatcher's detach
+    path (inline settle, detach and pause, zero budget, held message order, burial fault, disposal
+    with and without cancellation, revoked-partition pause). 2886 unit tests green on net10.0 and
+    net8.0; the classifier self-test grew from 13 to 20 logs.
 - **Round-36 review (2026-09-10): the contracts between scheduling, delivery, checkpoints, and
   retention that recovery depends on.**
   - *A scheduled occurrence that fell due during a broker outage is no longer lost.* Round 35

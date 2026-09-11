@@ -319,6 +319,9 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
         // Ensures unsubscribe, recovery-state delete, timeout disposal, and executor cleanup
         // happen once no matter whether completion, timeout, or waiter disposal got there first.
         private int _cleanupStarted;
+
+        // Set by the overload fault: every message still queued behind it is skipped unprocessed.
+        private int _overloaded;
         private readonly object _cleanupGate = new();
         private Task? _cleanupTask;
 
@@ -391,19 +394,60 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
             });
 
         /// <summary>
-        /// Receives pub/sub messages from the async subscription and enqueues them on the
-        /// per-channel executor, awaiting admission so executor backpressure reaches the
-        /// subscription's message loop instead of blocking a Redis reader thread.
+        /// Receives pub/sub messages from the async subscription and admits them to the
+        /// per-channel serial executor WITHOUT waiting for capacity. Redis pub/sub is
+        /// fire-and-forget: the publisher is never backpressured, and the SDK's
+        /// <c>ChannelMessageQueue</c> behind this callback is unbounded — so an earlier version
+        /// that awaited executor admission here did not slow anything down, it only moved the
+        /// backlog from the bounded executor into that unbounded SDK queue, where a progress-message
+        /// burst behind a slow <c>Until</c> predicate could grow process memory until failure. The
+        /// executor's capacity (<see cref="ChannelSerialExecutor.DefaultCapacity"/> messages per
+        /// correlation id) is now the whole buffer: a message that finds it full faults the wait
+        /// as indeterminate (<see cref="OnOverloadedAsync"/>) instead of being buffered without
+        /// bound — and never silently dropped, since a terminal response may be among the queued ones.
         /// </summary>
         public Task HandleMessageAsync(RedisChannel messageChannel, RedisValue messageValue)
         {
             // The registry coordinates create/enqueue/retire under one lock, so the message is never
             // enqueued onto an executor that is concurrently being torn down (no lost messages) and a
             // correlation-id reused mid-drain never produces two live executors for one channel.
-            var enqueue = _owner._executors.EnqueueAsync(
-                ChannelName,
-                () => ProcessUnderCapturedContextAsync(messageValue));
-            return enqueue.IsCompletedSuccessfully ? Task.CompletedTask : enqueue.AsTask();
+            return _owner._executors.TryEnqueue(ChannelName, () => ProcessUnderCapturedContextAsync(messageValue)) switch
+            {
+                // Suppressed = a tombstoned channel with no registration left: the wait is gone and
+                // the message would run against nobody (EnqueueAsync dropped these the same way).
+                SerialExecutorRegistry.TryEnqueueOutcome.Accepted or SerialExecutorRegistry.TryEnqueueOutcome.Suppressed
+                    => Task.CompletedTask,
+                _ => OnOverloadedAsync()
+            };
+        }
+
+        /// <summary>
+        /// The overload outcome: the bounded per-correlation-id buffer is full and the next response
+        /// cannot be admitted. Faults the wait with the explicit indeterminate contract (a terminal
+        /// response may be queued or may be the one refused) and tears the subscription down so the
+        /// flood stops here. Deliberately <see cref="CleanupOnceAsync"/> rather than the drain: the
+        /// executor is full, and parking on a drain marker would block the subscriber's message
+        /// loop — exactly the unbounded buffering this refuses. A full executor that is merely
+        /// mid-retirement means cleanup already settled the task, and the message is a straggler.
+        /// </summary>
+        private async Task OnOverloadedAsync()
+        {
+            var overload = new AsyncResponseIndeterminateDeliveryException(_correlationId, ChannelSerialExecutor.DefaultCapacity);
+            Interlocked.Exchange(ref _overloaded, 1);
+            if (!_tcs.TrySetException(overload))
+            {
+                if (_owner._logger.IsEnabled(LogLevel.Debug))
+                    _owner._logger.LogDebug("Dropped a late message on channel {Channel}: the wait for correlationId {CorrelationId} is already settled and its executor retiring.", ChannelName, _correlationId);
+                return;
+            }
+
+            _owner._logger.LogError(
+                "Wait for correlationId {CorrelationId} is overloaded: {Buffered} responses are queued behind its serial processing and the next could not be admitted. Faulting it as indeterminate and unsubscribing; the queued responses are discarded with it.",
+                _correlationId,
+                ChannelSerialExecutor.DefaultCapacity);
+            AsyncResponseDiagnostics.SetError(_activity, "overloaded", "The wait's bounded response buffer overflowed.");
+            AsyncResponseDiagnostics.RecordWaiterOverload("redis");
+            await CleanupOnceAsync().ConfigureAwait(false);
         }
 
         /// <summary>
@@ -430,6 +474,18 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
         /// <summary>Deserializes and handles a single incoming envelope, completes the TCS when terminal.</summary>
         private async Task ProcessMessageAsync(RedisValue messageValue)
         {
+            if (Volatile.Read(ref _overloaded) != 0)
+            {
+                // Queued behind the overload fault: the wait is settled as indeterminate and the
+                // subscription torn down, so running the predicate would spend user code — up to a
+                // full executor's worth of it — on an outcome that cannot change. Only the overload
+                // skips: a message admitted ahead of an ordinary terminal settlement still runs, as
+                // the retirement drain expects.
+                if (_owner._logger.IsEnabled(LogLevel.Debug))
+                    _owner._logger.LogDebug("Dropped a queued message on channel {Channel}: the wait for correlationId {CorrelationId} was faulted as overloaded.", ChannelName, _correlationId);
+                return;
+            }
+
             _owner._logger.LogDebug("Received message on channel {Channel}.", ChannelName);
 
             bool finished = false;

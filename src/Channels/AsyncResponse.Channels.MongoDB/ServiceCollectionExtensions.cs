@@ -77,7 +77,9 @@ public static class MongoDbAsyncResponseChannelServiceCollectionExtensions
             provider.GetService<IWorkerTransport>(),
             provider.GetService<IAsyncResponseReplyTargetProvider>(),
             provider.GetRequiredService<AsyncResponseContextPropagation>(),
-            provider.GetService<TimeProvider>())));
+            provider.GetService<TimeProvider>(),
+            // The producer-side mirror of the ingress's inbound size budget (WorkerJobTooLargeException).
+            provider.GetService<IOptions<AsyncResponseOptions>>())));
         services.Replace(ServiceDescriptor.Singleton<IAsyncResponseBuilder>(provider => provider.GetRequiredService<IRecoverableAsyncResponseBuilder>()));
 
         // The resolved default waiter timeout is declared through the marker so the startup

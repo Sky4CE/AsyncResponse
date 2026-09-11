@@ -363,7 +363,7 @@ execution leases. They are independent axes — combine any one of each.
 | Azure Service Bus | peek-lock ACKs; reuses your own `ServiceBusClient` (e.g. Azure Identity) if registered |
 | Google Pub/Sub | streaming pull; redelivery bounds via the subscription's DeadLetterPolicy |
 | AWS SQS | long-poll `ReceiveMessage` (up to 10/batch), visibility-timeout redelivery, native dead-letter via redrive policies (provisionable with `CreateQueues`), opt-in FIFO ordering per flow; reuses your own `IAmazonSQS` if registered |
-| Kafka | classic consumer groups, manual offset management, in-process bounded retry, `{topic}.deadletter` topics; also covers Redpanda / Amazon MSK / WarpStream / Aiven / Confluent Cloud |
+| Kafka | classic consumer groups, manual offset management, in-process bounded retry, `{topic}.deadletter` topics; a handler that outlives `DetachHandlerAfter` runs detached with its partition paused, so long flow steps never overrun `max.poll.interval.ms`; also covers Redpanda / Amazon MSK / WarpStream / Aiven / Confluent Cloud |
 | NATS | JetStream explicit ACKs, NAK-with-delay redelivery, dead-lettering |
 | PostgreSQL | queue table claimed with `FOR UPDATE SKIP LOCKED`, idempotent publish, dead-lettering |
 | SQL Server | queue table claimed with `UPDLOCK, ROWLOCK, READPAST` (the `SKIP LOCKED` equivalent), idempotent publish, dead-lettering |
@@ -570,7 +570,7 @@ is reused automatically; otherwise the AWS SDK credential and region chain is us
 
 | Existing infrastructure | Typical registration | Important behavior |
 |---|---|---|
-| Kafka / Redpanda / MSK / Confluent | durable channel + `.WithKafkaTransport(...)` + one flow store | Correlation id is the partition key; partition count bounds consumer parallelism and a retry delays that partition. |
+| Kafka / Redpanda / MSK / Confluent | durable channel + `.WithKafkaTransport(...)` + one flow store | Correlation id is the partition key; partition count bounds consumer parallelism and a retry delays that partition — only that partition: long handlers are detached from the poll thread. |
 | PostgreSQL | `.WithPostgreSqlChannel()` + `.WithPostgreSqlTransport(...)` + `.WithPostgreSqlDurableFlows(...)` | `LISTEN/NOTIFY` wakes response readers; workers claim queue rows with `FOR UPDATE SKIP LOCKED`. |
 | SQL Server | `.WithSqlServerChannel(...)` + `.WithSqlServerTransport(...)` + `.WithSqlServerDurableFlows(...)` | Adaptive response polling; workers claim rows with `UPDLOCK, ROWLOCK, READPAST`. |
 | AWS | Redis/PostgreSQL channel + `.WithSqsTransport(...)` + `.WithDynamoDbDurableFlows(...)` | Native visibility-timeout redelivery and redrive-policy dead letters; FIFO queues order by correlation id. |

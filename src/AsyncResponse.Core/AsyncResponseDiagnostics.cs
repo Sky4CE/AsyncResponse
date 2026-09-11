@@ -70,6 +70,10 @@ public static class AsyncResponseDiagnostics
         Meter.CreateCounter<long>("asyncresponse.flow_state.prune_budget_exhausted", unit: "{prune}",
             description: "Opportunistic durable-flow prunes that stopped at PruneBudget with expired rows still remaining — the expired backlog is outgrowing the prune, tagged by provider.");
 
+    private static readonly Counter<long> OverloadedWaitsCounter =
+        Meter.CreateCounter<long>("asyncresponse.channel.overloaded_waits", unit: "{wait}",
+            description: "Waits faulted as indeterminate because responses for their correlation id arrived faster than the wait could process them and the bounded per-wait buffer was full (fire-and-forget channels), tagged by channel.");
+
     private static readonly Counter<long> InMemoryOverflowRejections =
         Meter.CreateCounter<long>("asyncresponse.worker.inmemory_overflow_rejections", unit: "{job}",
             description: "Follow-up jobs the in-memory worker transport refused because its queue was full and the in-job overflow was at InJobOverflowCapacity; the publishing job failed and is redelivered.");
@@ -214,6 +218,18 @@ public static class AsyncResponseDiagnostics
             new KeyValuePair<string, object?>("kind", kind),
             new KeyValuePair<string, object?>("route", LostSubscriberRouteName(action, mixed)),
             new KeyValuePair<string, object?>("invoked", callbackInvoked));
+    }
+
+    /// <summary>
+    /// Records one wait faulted as indeterminate because its bounded buffer overflowed: the channel
+    /// is fire-and-forget, the publisher was never backpressured, and admitting the next response
+    /// would have meant buffering without bound. Every occurrence is a saturated consumer worth
+    /// alerting on.
+    /// </summary>
+    internal static void RecordWaiterOverload(string channel)
+    {
+        if (OverloadedWaitsCounter.Enabled)
+            OverloadedWaitsCounter.Add(1, new KeyValuePair<string, object?>("channel", channel));
     }
 
     /// <summary>Records one waiter timeout on the given channel kind.</summary>

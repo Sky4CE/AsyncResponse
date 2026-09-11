@@ -1,3 +1,4 @@
+using Microsoft.Extensions.Options;
 using System.Diagnostics;
 using System.Diagnostics.CodeAnalysis;
 using System.Linq.Expressions;
@@ -8,9 +9,101 @@ internal abstract class AsyncResponseBuilderBase(
     IWorkerTransport? _workerTransport = null,
     IAsyncResponseReplyTargetProvider? _replyTargetProvider = null,
     AsyncResponseContextPropagation? _propagation = null,
-    TimeProvider? _timeProvider = null)
+    TimeProvider? _timeProvider = null,
+    IOptions<AsyncResponseOptions>? _options = null)
 {
     protected IAsyncResponseReplyTargetProvider? ReplyTargetProvider => _replyTargetProvider;
+
+    // ---------------------------------------------------------------------------------------
+    // Producer-side size budget — the ingress's MaxInboundMessageChars, enforced before publish.
+
+    /// <summary>
+    /// Worst-case UTF-16 growth of a string under System.Text.Json's default encoder: any code
+    /// unit can become a six-character <c>\uXXXX</c> escape (non-ASCII, HTML-sensitive and
+    /// control characters all do), and no character ever shrinks.
+    /// </summary>
+    private const int MaxJsonEscapeFactor = 6;
+
+    /// <summary>Property names, punctuation and the fixed-width members of one envelope, generously.</summary>
+    private const int EnvelopeFixedOverhead = 1024;
+    private const int PerParamOverhead = 64;
+    private const int PerEntryOverhead = 16;
+    private const int ScalarOverhead = 64;
+
+    /// <summary>
+    /// Refuses an envelope the consuming ingress would acknowledge without executing. The ingress
+    /// compares the delivered JSON's UTF-16 length against <see cref="AsyncResponseOptions.MaxInboundMessageChars"/>
+    /// and drops what exceeds it (an oversized message never gets smaller, so redelivery would
+    /// hot-loop); without this check the publish succeeded, the caller kept a flow id or a
+    /// fire-and-forget "success", and the work silently never ran. Measured exactly — the same
+    /// serialization the transports perform — but only when a cheap upper bound says it might
+    /// matter, so the hot path of small jobs pays no extra serialization.
+    /// </summary>
+    /// <exception cref="WorkerJobTooLargeException">The serialized envelope exceeds the budget.</exception>
+    protected void ThrowIfOverInboundBudget(WorkerJobEnvelope envelope)
+    {
+        if (_options?.Value.MaxInboundMessageChars is not { } limit)
+            return;
+
+        if (TryEstimateUpperBound(envelope, out var upperBound) && upperBound <= limit)
+            return;
+
+        var serialized = AsyncResponseJson.Serialize(envelope);
+        if (serialized.Length > limit)
+            throw new WorkerJobTooLargeException(serialized.Length, limit);
+    }
+
+    /// <summary>
+    /// An upper bound on the envelope's serialized UTF-16 length that never undercounts: every
+    /// string at its fully-escaped size, every scalar at a fixed allowance, fixed overhead for
+    /// the property names and punctuation. Returns <c>false</c> when an argument is an arbitrary
+    /// object whose size cannot be bounded without serializing it.
+    /// </summary>
+    internal static bool TryEstimateUpperBound(WorkerJobEnvelope envelope, out long upperBound)
+    {
+        long total = EnvelopeFixedOverhead;
+        total += Escaped(envelope.CorrelationId);
+        total += Escaped(envelope.Call.ServiceInterfaceFullName) + Escaped(envelope.Call.MethodName);
+
+        if (envelope.ReplyTarget is { } target)
+        {
+            total += Escaped(target.Name) + Escaped(target.Transport) + Escaped(target.Address);
+            foreach (var (key, value) in target.Properties)
+                total += Escaped(key) + Escaped(value) + PerEntryOverhead;
+        }
+
+        if (envelope.Context is { } context)
+        {
+            foreach (var (key, value) in context)
+                total += Escaped(key) + Escaped(value) + PerEntryOverhead;
+        }
+
+        foreach (var param in envelope.Call.Params)
+        {
+            total += PerParamOverhead;
+            switch (param.Value)
+            {
+                case null:
+                    break;
+                case string text:
+                    total += Escaped(text);
+                    break;
+                case bool or byte or sbyte or short or ushort or int or uint or long or ulong
+                    or float or double or decimal or char or Guid or DateTime or DateTimeOffset or TimeSpan:
+                    total += ScalarOverhead;
+                    break;
+                default:
+                    upperBound = 0;
+                    return false;
+            }
+        }
+
+        upperBound = total;
+        return true;
+    }
+
+    private static long Escaped(string? value)
+        => value is null ? 8 : (long)value.Length * MaxJsonEscapeFactor + 2;
 
     /// <summary>Validates the supplied options.</summary>
     protected static string ValidateCorrelationId(string correlationId)
@@ -76,6 +169,7 @@ internal abstract class AsyncResponseBuilderBase(
 
             if (delay <= TimeSpan.Zero)
             {
+                ThrowIfOverInboundBudget(envelope);
                 await transport.PublishAsync(envelope, cancellationToken).ConfigureAwait(false);
                 return;
             }
@@ -110,6 +204,8 @@ internal abstract class AsyncResponseBuilderBase(
             // by the worker-job executor for the remainder, so the due time holds end to end.
             envelope.NotBeforeUtc = (_timeProvider ?? TimeProvider.System).GetUtcNow().UtcDateTime.Add(delay);
             var hop = delay <= delayedTransport.MaxPublishDelay ? delay : delayedTransport.MaxPublishDelay;
+            // After the due-time stamp: the check measures the envelope exactly as it is published.
+            ThrowIfOverInboundBudget(envelope);
             await delayedTransport.PublishAsync(envelope, hop, cancellationToken).ConfigureAwait(false);
         }
         catch (Exception ex)
@@ -168,8 +264,9 @@ internal sealed class AsyncResponseBuilder(
     IWorkerTransport? workerTransport = null,
     IAsyncResponseReplyTargetProvider? replyTargetProvider = null,
     AsyncResponseContextPropagation? propagation = null,
-    TimeProvider? timeProvider = null)
-    : AsyncResponseBuilderBase(workerTransport, replyTargetProvider, propagation, timeProvider),
+    TimeProvider? timeProvider = null,
+    IOptions<AsyncResponseOptions>? options = null)
+    : AsyncResponseBuilderBase(workerTransport, replyTargetProvider, propagation, timeProvider, options),
         IAsyncResponseBuilder
 {
     /// <inheritdoc />
@@ -187,8 +284,9 @@ internal sealed class RecoverableAsyncResponseBuilder(
     IWorkerTransport? workerTransport = null,
     IAsyncResponseReplyTargetProvider? replyTargetProvider = null,
     AsyncResponseContextPropagation? propagation = null,
-    TimeProvider? timeProvider = null)
-    : AsyncResponseBuilderBase(workerTransport, replyTargetProvider, propagation, timeProvider),
+    TimeProvider? timeProvider = null,
+    IOptions<AsyncResponseOptions>? options = null)
+    : AsyncResponseBuilderBase(workerTransport, replyTargetProvider, propagation, timeProvider, options),
         IRecoverableAsyncResponseBuilder
 {
     /// <inheritdoc />

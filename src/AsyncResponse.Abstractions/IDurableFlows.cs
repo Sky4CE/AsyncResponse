@@ -43,6 +43,12 @@ public interface IDurableFlows
     /// }
     /// </code>
     /// </exception>
+    /// <exception cref="WorkerJobTooLargeException">
+    /// The start job — which carries the serialized initial ledger, input included — exceeds the
+    /// ingress's <c>AsyncResponseOptions.MaxInboundMessageChars</c> budget; the consuming ingress
+    /// would acknowledge it without ever executing it. Deterministic, so not retried and not
+    /// wrapped; nothing was persisted. Shrink the input or pass a reference to it.
+    /// </exception>
     Task<string> StartAsync<[DynamicallyAccessedMembers(DynamicallyAccessedMemberTypes.PublicConstructors | DynamicallyAccessedMemberTypes.PublicMethods | DynamicallyAccessedMemberTypes.Interfaces)] TFlow, TInput>(
         TInput input,
         string? flowId = null,

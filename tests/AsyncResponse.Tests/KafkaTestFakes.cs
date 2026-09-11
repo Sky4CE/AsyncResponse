@@ -58,7 +58,9 @@ internal sealed class FakeKafkaProducerClient : IKafkaProducerClient
 internal sealed class FakeKafkaConsumerClient : IKafkaConsumerClient
 {
     private readonly object _gate = new();
-    private readonly Queue<KafkaIncomingMessage> _messages = new();
+    private readonly List<KafkaIncomingMessage> _messages = [];
+    private readonly HashSet<int> _pausedPartitions = [];
+    private int _consumeCalls;
 
     public List<string> Subscriptions { get; } = [];
     public List<StoredOffset> StoredOffsets { get; } = [];
@@ -67,6 +69,31 @@ internal sealed class FakeKafkaConsumerClient : IKafkaConsumerClient
     public bool Paused { get; private set; }
     public bool Closed { get; private set; }
     public bool Disposed { get; private set; }
+
+    /// <summary>How many times Consume was called — the poll loop's liveness, as the broker sees it.</summary>
+    public int ConsumeCalls => Volatile.Read(ref _consumeCalls);
+
+    /// <summary>Per-partition pause/resume calls (the ack-after-handler detach path).</summary>
+    public List<int> PartitionPauses { get; } = [];
+    public List<int> PartitionResumes { get; } = [];
+
+    public bool IsPartitionPaused(int partition)
+    {
+        lock (_gate)
+        {
+            return _pausedPartitions.Contains(partition);
+        }
+    }
+
+    /// <summary>
+    /// When set, a paused partition still delivers — what a rebalance does when it hands the
+    /// partition back with its pause state reset, or a client delivering a message it had already
+    /// fetched before the pause.
+    /// </summary>
+    public bool IgnorePartitionPause { get; set; }
+
+    /// <summary>When set, PausePartition/ResumePartition throw it (the partition is no longer assigned).</summary>
+    public Exception? PartitionPauseException { get; set; }
 
     /// <summary>When set, the next Consume call throws this exception once.</summary>
     public Exception? NextConsumeException { get; set; }
@@ -81,7 +108,7 @@ internal sealed class FakeKafkaConsumerClient : IKafkaConsumerClient
     {
         lock (_gate)
         {
-            _messages.Enqueue(message);
+            _messages.Add(message);
         }
     }
 
@@ -95,6 +122,7 @@ internal sealed class FakeKafkaConsumerClient : IKafkaConsumerClient
 
     public KafkaIncomingMessage? Consume(TimeSpan maxWait)
     {
+        Interlocked.Increment(ref _consumeCalls);
         lock (_gate)
         {
             if (NextConsumeException is { } consumeException)
@@ -103,9 +131,20 @@ internal sealed class FakeKafkaConsumerClient : IKafkaConsumerClient
                 throw consumeException;
             }
 
-            // Paused partitions deliver nothing, mirroring librdkafka semantics.
-            if (!Paused && _messages.Count > 0)
-                return _messages.Dequeue();
+            // Paused partitions deliver nothing, mirroring librdkafka semantics; the rest deliver
+            // in the order they were enqueued.
+            if (!Paused)
+            {
+                for (var i = 0; i < _messages.Count; i++)
+                {
+                    var candidate = _messages[i];
+                    if (!IgnorePartitionPause && _pausedPartitions.Contains(candidate.Partition))
+                        continue;
+
+                    _messages.RemoveAt(i);
+                    return candidate;
+                }
+            }
         }
 
         // Keep the poll loop from spinning hot in tests while staying responsive.
@@ -139,6 +178,30 @@ internal sealed class FakeKafkaConsumerClient : IKafkaConsumerClient
         {
             Paused = false;
             ResumeCount++;
+        }
+    }
+
+    public void PausePartition(string topic, int partition)
+    {
+        if (PartitionPauseException is not null)
+            throw PartitionPauseException;
+
+        lock (_gate)
+        {
+            _pausedPartitions.Add(partition);
+            PartitionPauses.Add(partition);
+        }
+    }
+
+    public void ResumePartition(string topic, int partition)
+    {
+        if (PartitionPauseException is not null)
+            throw PartitionPauseException;
+
+        lock (_gate)
+        {
+            _pausedPartitions.Remove(partition);
+            PartitionResumes.Add(partition);
         }
     }
 
@@ -212,9 +275,17 @@ internal static class KafkaTestData
         long offset,
         string payload,
         params (string Key, string Value)[] headers)
+        => MessageOn(topic, partition: 0, offset, payload, headers);
+
+    public static KafkaIncomingMessage MessageOn(
+        string topic,
+        int partition,
+        long offset,
+        string payload,
+        params (string Key, string Value)[] headers)
         => new(
             topic,
-            Partition: 0,
+            partition,
             offset,
             Encoding.UTF8.GetBytes(payload),
             headers.Select(header => KafkaTransportHeader.Utf8(header.Key, header.Value)).ToArray());
@@ -223,10 +294,11 @@ internal static class KafkaTestData
         string topic,
         long offset,
         string payload = "payload-json",
-        string? correlationId = "corr")
+        string? correlationId = "corr",
+        int partition = 0)
         => new(
             topic,
-            Partition: 0,
+            partition,
             offset,
             payload,
             correlationId,

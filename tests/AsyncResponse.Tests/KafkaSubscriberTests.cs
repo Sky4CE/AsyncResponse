@@ -397,6 +397,256 @@ public class KafkaSubscriberTests
         ingress.Verify(i => i.HandleWorkerMessageAsync("fine"), Times.Never);
     }
 
+    // ---------- Round 37: a long handler no longer stalls the poll loop (F7) ----------
+
+    [Fact]
+    public async Task WorkerSubscriber_KeepsPollingWhileAHandlerRunsLong()
+    {
+        // Regression (round 37, F7): the poll thread awaited the whole handler, so a durable-flow
+        // step awaiting a remote response or a timer stopped every Consume() call for its duration
+        // — past max.poll.interval.ms the broker evicted the consumer, rebalanced its partitions,
+        // and redelivered the message to a peer that started the same work again. Past
+        // DetachHandlerAfter (the default second here) the handler is detached and the loop must
+        // keep calling Consume, which is what the broker counts as liveness.
+        var consumer = new FakeKafkaConsumerClient();
+        consumer.Enqueue(KafkaTestData.Message("workers", offset: 1, payload: "slow-job"));
+
+        var handlerStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseHandler = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var ingress = new Mock<IAsyncResponseIngress>();
+        ingress.Setup(i => i.HandleWorkerMessageAsync("slow-job"))
+            .Returns(async () =>
+            {
+                handlerStarted.TrySetResult();
+                await releaseHandler.Task.ConfigureAwait(false);
+            });
+
+        var subscriber = CreateWorkerSubscriber(consumer, ingress.Object, options => options.WorkerTopic = "workers");
+        await subscriber.StartAsync(CancellationToken.None);
+        try
+        {
+            await handlerStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+            // Past the inline budget: with the handler still parked, the poll count must keep
+            // climbing. The old loop was blocked inside the handler and froze it here.
+            await Task.Delay(TimeSpan.FromMilliseconds(1500));
+            var pollsAfterDetach = consumer.ConsumeCalls;
+            await Task.Delay(TimeSpan.FromMilliseconds(500));
+            Assert.True(
+                consumer.ConsumeCalls > pollsAfterDetach + 5,
+                $"Consume was called {consumer.ConsumeCalls - pollsAfterDetach} time(s) in 500 ms while the handler ran; the poll loop is stalled.");
+            Assert.Empty(consumer.StoredOffsets); // not settled yet
+
+            releaseHandler.SetResult();
+            await KafkaTestData.WaitUntilAsync(() => consumer.StoredOffsets.Count == 1);
+            Assert.Equal(new FakeKafkaConsumerClient.StoredOffset("workers", 0, 1), Assert.Single(consumer.StoredOffsets));
+        }
+        finally
+        {
+            releaseHandler.TrySetResult();
+            await subscriber.StopAsync(CancellationToken.None);
+        }
+
+        ingress.Verify(i => i.HandleWorkerMessageAsync("slow-job"), Times.Once);
+    }
+
+    [Fact]
+    public async Task WorkerSubscriber_OtherPartitionsKeepFlowing_WhileOneHandlerIsDetached()
+    {
+        // Same finding, the other consequence: with the poll thread parked in one partition's
+        // handler, every other partition assigned to the consumer stalled behind it.
+        var consumer = new FakeKafkaConsumerClient();
+        consumer.Enqueue(KafkaTestData.MessageOn("workers", partition: 0, offset: 1, payload: "slow-job"));
+        consumer.Enqueue(KafkaTestData.MessageOn("workers", partition: 1, offset: 1, payload: "quick-job"));
+
+        var slowStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseSlow = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var quickHandled = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var ingress = new Mock<IAsyncResponseIngress>();
+        ingress.Setup(i => i.HandleWorkerMessageAsync("slow-job"))
+            .Returns(async () =>
+            {
+                slowStarted.TrySetResult();
+                await releaseSlow.Task.ConfigureAwait(false);
+            });
+        ingress.Setup(i => i.HandleWorkerMessageAsync("quick-job"))
+            .Returns(() =>
+            {
+                quickHandled.TrySetResult();
+                return Task.CompletedTask;
+            });
+
+        var subscriber = CreateWorkerSubscriber(consumer, ingress.Object, options => options.WorkerTopic = "workers");
+        await subscriber.StartAsync(CancellationToken.None);
+        try
+        {
+            await slowStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+            // Partition 1's message is handled while partition 0's handler is still running.
+            await quickHandled.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            await KafkaTestData.WaitUntilAsync(() => consumer.StoredOffsets.Count == 1);
+            Assert.Equal(new FakeKafkaConsumerClient.StoredOffset("workers", 1, 1), Assert.Single(consumer.StoredOffsets));
+            Assert.False(releaseSlow.Task.IsCompleted);
+
+            releaseSlow.SetResult();
+            await KafkaTestData.WaitUntilAsync(() => consumer.StoredOffsets.Count == 2);
+        }
+        finally
+        {
+            releaseSlow.TrySetResult();
+            await subscriber.StopAsync(CancellationToken.None);
+        }
+    }
+
+    [Fact]
+    public async Task WorkerSubscriber_DetachedHandler_PausesItsPartition_AndResumesItOnceSettled()
+    {
+        var consumer = new FakeKafkaConsumerClient();
+        consumer.Enqueue(KafkaTestData.MessageOn("workers", partition: 3, offset: 5, payload: "slow-job"));
+        consumer.Enqueue(KafkaTestData.MessageOn("workers", partition: 3, offset: 6, payload: "next-job"));
+
+        var slowStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseSlow = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var handled = new List<string>();
+        var ingress = new Mock<IAsyncResponseIngress>();
+        ingress.Setup(i => i.HandleWorkerMessageAsync(It.IsAny<string>()))
+            .Returns(async (string payload) =>
+            {
+                lock (handled)
+                {
+                    handled.Add(payload);
+                }
+
+                if (payload == "slow-job")
+                {
+                    slowStarted.TrySetResult();
+                    await releaseSlow.Task.ConfigureAwait(false);
+                }
+            });
+
+        var subscriber = CreateWorkerSubscriber(consumer, ingress.Object, options =>
+        {
+            options.WorkerTopic = "workers";
+            options.WorkerSubscriber.DetachHandlerAfter = TimeSpan.FromMilliseconds(20);
+        });
+        await subscriber.StartAsync(CancellationToken.None);
+        try
+        {
+            await slowStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            await KafkaTestData.WaitUntilAsync(() => consumer.IsPartitionPaused(3));
+
+            // Paused: the next message on the partition is NOT consumed behind the running one.
+            await Task.Delay(200);
+            lock (handled)
+            {
+                Assert.Equal(["slow-job"], handled);
+            }
+
+            Assert.Empty(consumer.StoredOffsets);
+
+            releaseSlow.SetResult();
+            await KafkaTestData.WaitUntilAsync(() => consumer.StoredOffsets.Count == 2);
+            Assert.Equal([5L, 6L], consumer.StoredOffsets.Select(stored => stored.Offset));
+            Assert.Equal(3, Assert.Single(consumer.PartitionPauses));
+            Assert.Equal(3, Assert.Single(consumer.PartitionResumes));
+            lock (handled)
+            {
+                Assert.Equal(["slow-job", "next-job"], handled);
+            }
+        }
+        finally
+        {
+            releaseSlow.TrySetResult();
+            await subscriber.StopAsync(CancellationToken.None);
+        }
+    }
+
+    [Fact]
+    public async Task WorkerSubscriber_StopWaitsForADetachedHandler_AndStoresItsOffsetBeforeClosing()
+    {
+        var consumer = new FakeKafkaConsumerClient();
+        consumer.Enqueue(KafkaTestData.Message("workers", offset: 8, payload: "slow-job"));
+
+        var slowStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseSlow = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var ingress = new Mock<IAsyncResponseIngress>();
+        ingress.Setup(i => i.HandleWorkerMessageAsync("slow-job"))
+            .Returns(async () =>
+            {
+                slowStarted.TrySetResult();
+                await releaseSlow.Task.ConfigureAwait(false);
+            });
+
+        var subscriber = CreateWorkerSubscriber(consumer, ingress.Object, options =>
+        {
+            options.WorkerTopic = "workers";
+            options.WorkerSubscriber.DetachHandlerAfter = TimeSpan.FromMilliseconds(20);
+        });
+        await subscriber.StartAsync(CancellationToken.None);
+        await slowStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await KafkaTestData.WaitUntilAsync(() => consumer.IsPartitionPaused(0));
+
+        var stopping = subscriber.StopAsync(CancellationToken.None);
+        await Task.Delay(200);
+        Assert.False(stopping.IsCompleted);
+        Assert.False(consumer.Closed);
+
+        releaseSlow.SetResult();
+        await stopping.WaitAsync(TimeSpan.FromSeconds(10));
+
+        Assert.Equal(new FakeKafkaConsumerClient.StoredOffset("workers", 0, 8), Assert.Single(consumer.StoredOffsets));
+        Assert.True(consumer.Closed);
+    }
+
+    [Fact]
+    public async Task WorkerSubscriber_DetachedHandlerThatCannotBeDeadLettered_RestartsWithoutCommittingPastIt()
+    {
+        // The round-35 contract through the detached path: the burial failure surfaces from the
+        // poll thread's settlement tick, the consumer closes without storing the offset, and the
+        // supervisor rebuilds it.
+        var first = new FakeKafkaConsumerClient();
+        first.Enqueue(KafkaTestData.Message("workers", offset: 10, payload: "poison"));
+        var second = new FakeKafkaConsumerClient();
+        var factory = new FakeKafkaConsumerClientFactory(first, second);
+
+        var ingress = new Mock<IAsyncResponseIngress>();
+        ingress.Setup(i => i.HandleWorkerMessageAsync("poison"))
+            .Returns(async () =>
+            {
+                await Task.Delay(100);
+                throw new InvalidOperationException("handler boom");
+            });
+
+        var options = NewOptions(o =>
+        {
+            o.WorkerTopic = "workers";
+            o.WorkerSubscriber.MaxDeliveryAttempts = 1;
+            o.WorkerSubscriber.DetachHandlerAfter = TimeSpan.FromMilliseconds(20);
+            o.PublishRetryBaseDelay = TimeSpan.FromMilliseconds(1);
+            o.PublishRetryMaxDelay = TimeSpan.FromMilliseconds(2);
+        });
+        var subscriber = new KafkaWorkerSubscriber(
+            Options.Create(options),
+            factory,
+            new FakeKafkaProducerClient { PublishException = new InvalidOperationException("dead-letter topic gone") },
+            new FakeKafkaAdminClient(),
+            ingress.Object,
+            NullLogger<KafkaWorkerSubscriber>.Instance);
+
+        await subscriber.StartAsync(CancellationToken.None);
+        try
+        {
+            await KafkaTestData.WaitUntilAsync(() => factory.CreatedRoles.Count >= 2, TimeSpan.FromSeconds(10));
+        }
+        finally
+        {
+            await subscriber.StopAsync(CancellationToken.None);
+        }
+
+        Assert.Empty(first.StoredOffsets);
+        Assert.True(first.Closed);
+    }
+
     // ---------- Helpers ----------
 
     private static readonly Dictionary<KafkaSubscriberService, FakeKafkaConsumerClientFactory> Factories = [];

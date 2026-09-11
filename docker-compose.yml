@@ -1,7 +1,13 @@
 # Local Redis for running the sample and experimenting with the library:
 #   docker compose up -d
+#
+# Bound to loopback on purpose. Docker publishes an unqualified port on every host interface, and
+# the official image runs with protected mode off, so "6379:6379" exposed an unauthenticated Redis
+# to the whole network segment — and AsyncResponse trusts what that Redis holds (recovery
+# descriptors, response envelopes). Anything that must be reachable from another machine needs
+# `requirepass`/ACLs and network isolation, not a wider bind (docs/security.md).
 services:
   redis:
     image: redis:8-alpine
     ports:
-      - "6379:6379"
+      - "127.0.0.1:6379:6379"

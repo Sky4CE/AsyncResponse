@@ -10,7 +10,13 @@ public enum KafkaAckMode
     /// message is retried in-process with backoff (Kafka offsets cannot NACK a single message);
     /// after <see cref="KafkaSubscriberOptions.MaxDeliveryAttempts"/> the message is produced to
     /// the dead-letter topic and its offset is committed so the partition keeps moving. Messages
-    /// are processed serially per assignment, preserving per-partition ordering.
+    /// are processed serially per partition. A handler still running after
+    /// <see cref="KafkaSubscriberOptions.DetachHandlerAfter"/> is detached: its partition is
+    /// paused, the handler (retries included) runs on while the poll thread keeps polling — the
+    /// consumer's other partitions, its <c>max.poll.interval.ms</c> liveness, and rebalance
+    /// callbacks all continue — and the offset is stored once the handler settles. A durable flow
+    /// awaiting a remote step or sleeping on a timer for minutes therefore no longer gets the
+    /// consumer evicted from its group.
     /// </summary>
     AckAfterHandlerCompletes = 0,
 
@@ -86,10 +92,29 @@ public sealed class KafkaSubscriberOptions
     public TimeSpan PollTimeout { get; set; } = TimeSpan.FromMilliseconds(200);
 
     /// <summary>
-    /// Delay between capacity re-checks while consumption is paused because the
-    /// <see cref="KafkaAckMode.AckAfterEnqueue"/> background queue is full. Default: <c>50ms</c>.
+    /// The short poll slice used while the poll thread is waiting on in-process work: capacity
+    /// re-checks while consumption is paused because the <see cref="KafkaAckMode.AckAfterEnqueue"/>
+    /// background queue is full, and completion checks while
+    /// <see cref="KafkaAckMode.AckAfterHandlerCompletes"/> handlers run detached (a finished
+    /// handler's offset is stored and its partition resumed within one slice). Default: <c>50ms</c>.
     /// </summary>
     public TimeSpan BackpressurePollDelay { get; set; } = TimeSpan.FromMilliseconds(50);
+
+    /// <summary>
+    /// In <see cref="KafkaAckMode.AckAfterHandlerCompletes"/> mode, how long the poll thread waits
+    /// for a message's handler inline before detaching it. Within the budget a fast handler settles
+    /// exactly as before — offset stored, next message consumed, no pause. Past it the message's
+    /// partition is paused (its order holds, nothing is buffered in-process), the handler and its
+    /// in-process retries continue on the thread pool, and the poll thread goes back to polling:
+    /// the consumer's other partitions keep flowing, <see cref="MaxPollInterval"/> is honored, and
+    /// rebalance callbacks fire. The poll thread stores the offset and resumes the partition once
+    /// the handler settles (checked every <see cref="BackpressurePollDelay"/>). Detached handlers
+    /// for different partitions run concurrently; a stop waits for them so their offsets are
+    /// committed. <see cref="TimeSpan.Zero"/> detaches every handler immediately. Plus
+    /// <see cref="PollTimeout"/> this is the poll thread's longest gap, and startup validation
+    /// requires it to fit within half of <see cref="MaxPollInterval"/>. Default: <c>1s</c>.
+    /// </summary>
+    public TimeSpan DetachHandlerAfter { get; set; } = TimeSpan.FromSeconds(1);
 
     /// <summary>
     /// Maximum number of in-process delivery attempts before a failing message is produced to the
@@ -109,20 +134,21 @@ public sealed class KafkaSubscriberOptions
     public TimeSpan HandlerRetryBaseDelay { get; set; } = TimeSpan.FromMilliseconds(100);
 
     /// <summary>
-    /// Maximum delay between in-process handler retry attempts. Keep the total retry budget well
-    /// below <see cref="MaxPollInterval"/> or the broker will evict the consumer from its group
-    /// mid-retry. Default: <c>5s</c>.
+    /// Maximum delay between in-process handler retry attempts. The retry ladder runs inside the
+    /// message's handler task — detached from the poll thread past <see cref="DetachHandlerAfter"/>
+    /// — so it stalls only that message's partition, never the consumer's group membership.
+    /// Default: <c>5s</c>.
     /// </summary>
     public TimeSpan HandlerRetryMaxDelay { get; set; } = TimeSpan.FromSeconds(5);
 
     /// <summary>
     /// Maximum gap between consumer polls before the broker evicts this consumer from its group
-    /// and rebalances its partitions (the librdkafka <c>max.poll.interval.ms</c>). The in-process
-    /// handler retry delays run on the poll thread, so validation requires the worst-case retry
-    /// delay budget plus <see cref="PollTimeout"/> to fit within half this interval; handler
-    /// execution time itself is not bounded by the library and remains the operator's
-    /// responsibility, as does the unlimited-retry mode (<see cref="MaxDeliveryAttempts"/> =
-    /// <c>0</c>). Default: <c>5 minutes</c> (the librdkafka default).
+    /// and rebalances its partitions (the librdkafka <c>max.poll.interval.ms</c>). The poll thread's
+    /// longest gap is one inline handler wait (<see cref="DetachHandlerAfter"/>) plus one poll
+    /// (<see cref="PollTimeout"/>), and validation requires that sum to fit within half this
+    /// interval; handler execution time itself is unbounded and no longer counts, because a
+    /// handler that outlives the inline budget is detached while polling continues. Default:
+    /// <c>5 minutes</c> (the librdkafka default).
     /// </summary>
     public TimeSpan MaxPollInterval { get; set; } = TimeSpan.FromMinutes(5);
 
