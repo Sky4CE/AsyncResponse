@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1789406037188,
+  "lastUpdate": 1789406057744,
   "repoUrl": "https://github.com/Sky4CE/AsyncResponse",
   "entries": {
     "AsyncResponse Microbenchmarks": [
@@ -106928,6 +106928,140 @@ window.BENCHMARK_DATA = {
           {
             "name": "durable-flow-storm throughput",
             "value": 1414.2215247910206,
+            "unit": "flows/s"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "tyunisov@gmail.com",
+            "name": "Sky4CE",
+            "username": "Sky4CE"
+          },
+          "committer": {
+            "email": "tyunisov@gmail.com",
+            "name": "Sky4CE",
+            "username": "Sky4CE"
+          },
+          "distinct": true,
+          "id": "db20f500f71ea5e7a6e9fb27a7b60fcab1a7b161",
+          "message": "fix: apply round-39 review — 8 findings with red-on-old regression tests, docs and CHANGELOG synced\nLost-subscriber dispatch settles over every failed registration: deterministic\nfailures are logged and kept for the watchdog, any transient failure propagates as\nRecoveryCallbackFailedException so the transport redelivers, and the message is\nacknowledged only when every failure was deterministic; with no success an exhausted\nsibling's exception propagates ahead of an earlier deterministic fault. Typed\nin-memory delivery materializes through JsonSafety (body-free InvalidDataException).\nMySQL confirms a 1062 duplicate on the connection the create holds. The PostgreSQL,\nSQL Server and MongoDB sweep pages ship envelope_json only for unacknowledged rows;\nacknowledged rows are header-only and hydrated by id (LoadMessagesByIdAsync) only when\na live subscription still needs them. Cosmos enforces MaxStateBytes on the complete\ndocument through the client's serializer. AsyncResponseTestHarness.SimulateRestartAsync\nrefuses user code still running after the stop lapsed unless\nAbandonLingeringExecutionsOnRestart is set. NATS in-progress heartbeats carry the\nbatch's cancellation token and the renewal join is bounded by one heartbeat interval.\nLedgerGrowthBenchmarks measures the documented ledger cost curve.\nTests: red-on-old proofs against f92f1e7 plus new-API pins; 2938 unit tests green on\nnet10.0 and net8.0; data integration batch 325/325 against real containers.",
+          "timestamp": "2026-09-14T19:01:19+02:00",
+          "tree_id": "37e31c2723434545d9d25da2e0f71e9c1ca8c925",
+          "url": "https://github.com/Sky4CE/AsyncResponse/commit/db20f500f71ea5e7a6e9fb27a7b60fcab1a7b161"
+        },
+        "date": 1789406056786,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "waiter-storm throughput",
+            "value": 103975.87094348537,
+            "unit": "ops/s"
+          },
+          {
+            "name": "progress-storm throughput",
+            "value": 54847.77548392192,
+            "unit": "ops/s"
+          },
+          {
+            "name": "worker-storm throughput",
+            "value": 60927.25432059531,
+            "unit": "jobs/s"
+          },
+          {
+            "name": "google-pubsub-ack-after-enqueue-dispatch-storm throughput",
+            "value": 291545.1895043732,
+            "unit": "ops/s"
+          },
+          {
+            "name": "rabbitmq-ack-after-enqueue-dispatch-storm throughput",
+            "value": 457875.4578754579,
+            "unit": "ops/s"
+          },
+          {
+            "name": "redis-ack-after-enqueue-dispatch-storm throughput",
+            "value": 362928.98205679114,
+            "unit": "ops/s"
+          },
+          {
+            "name": "nats-ack-after-receive-dispatch-storm throughput",
+            "value": 376591.0973864578,
+            "unit": "ops/s"
+          },
+          {
+            "name": "postgresql-ack-after-receive-dispatch-storm throughput",
+            "value": 299609.3094604636,
+            "unit": "ops/s"
+          },
+          {
+            "name": "sqlserver-ack-after-enqueue-dispatch-storm throughput",
+            "value": 290964.9561806776,
+            "unit": "ops/s"
+          },
+          {
+            "name": "mongodb-ack-after-enqueue-dispatch-storm throughput",
+            "value": 294027.7091713123,
+            "unit": "ops/s"
+          },
+          {
+            "name": "azure-servicebus-ack-after-receive-dispatch-storm throughput",
+            "value": 368698.93519747513,
+            "unit": "ops/s"
+          },
+          {
+            "name": "sqs-ack-after-enqueue-dispatch-storm throughput",
+            "value": 432017.69544480543,
+            "unit": "ops/s"
+          },
+          {
+            "name": "kafka-ack-after-enqueue-dispatch-storm throughput",
+            "value": 354107.64872521244,
+            "unit": "ops/s"
+          },
+          {
+            "name": "race-burst throughput",
+            "value": 141961.56816426656,
+            "unit": "ops/s"
+          },
+          {
+            "name": "raw-ingress-storm throughput",
+            "value": 144255.68107723218,
+            "unit": "ops/s"
+          },
+          {
+            "name": "shared-response-fanout throughput",
+            "value": 47535.27687967795,
+            "unit": "ops/s"
+          },
+          {
+            "name": "exception-fanout throughput",
+            "value": 44365.383359503,
+            "unit": "ops/s"
+          },
+          {
+            "name": "timeout-storm throughput",
+            "value": 4844.591558541439,
+            "unit": "ops/s"
+          },
+          {
+            "name": "dispose-cleanup-storm throughput",
+            "value": 321518.5966356294,
+            "unit": "ops/s"
+          },
+          {
+            "name": "context-isolation-storm throughput",
+            "value": 129679.48418688368,
+            "unit": "ops/s"
+          },
+          {
+            "name": "watchdog-scan-storm throughput",
+            "value": 2175142.471831905,
+            "unit": "entries/s"
+          },
+          {
+            "name": "durable-flow-storm throughput",
+            "value": 2222.986534392447,
             "unit": "flows/s"
           }
         ]
