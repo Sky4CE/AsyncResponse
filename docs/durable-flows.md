@@ -505,7 +505,11 @@ await flow.StepAsync("publish", () => publisher.PublishAsync(blobs.OpenRead(repo
 steps starts a [child flow](#child-flows) per batch and memoizes only each child's compact
 snapshot, so neither ledger grows past a bounded number of steps. Incremental (append-only)
 checkpoint persistence for workloads that genuinely need thousands of retained results is on the
-[roadmap](roadmap.md) and will keep the same revision and lease fences.
+[roadmap](roadmap.md) and will keep the same revision and lease fences. The curve itself is
+measured, not inferred: `LedgerGrowthBenchmarks` in `benchmarks/AsyncResponse.Benchmarks` runs a
+complete N-step run through the process-local store (N = 50, 200, 400 checkpoints of 1 KiB
+results) and reports the time and allocations per run, so a change to the checkpoint path — or
+to your own step-result sizes — can be checked against the budgets above.
 
 For tests, development, or a deliberately one-process application:
 

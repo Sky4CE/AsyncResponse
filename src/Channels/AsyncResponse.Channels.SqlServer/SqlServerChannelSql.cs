@@ -4,10 +4,17 @@ using System.Data;
 
 namespace AsyncResponse.Channels.SqlServer;
 
+/// <summary>One stored response envelope row/document as the channel store returns it.</summary>
+/// <remarks>
+/// <c>EnvelopeJson</c> is the stored envelope, or <c>null</c> for a row the dispatch sweep loaded header-only (an
+/// already-acknowledged row — see <see cref="SqlServerChannelSql.LoadMessagesAsync"/>); the
+/// sweep hydrates the few such rows it still has to deliver through
+/// <see cref="SqlServerChannelSql.LoadMessagesByIdAsync"/> before handing them to a waiter.
+/// </remarks>
 internal readonly record struct SqlServerChannelMessage(
     Guid Id,
     string CorrelationId,
-    string EnvelopeJson,
+    string? EnvelopeJson,
     DateTimeOffset CreatedAtUtc,
     DateTimeOffset? AckedAtUtc = null,
     long? AckedSeq = null);
@@ -488,9 +495,15 @@ internal sealed class SqlServerChannelSql
         await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
         await using var connection = await OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         await using var command = connection.CreateCommand();
+        // The envelope travels only for rows nobody has acknowledged yet. Acknowledged rows are
+        // the consumed history the sweep re-reads on every tick (they stay in the result set so a
+        // fan-out waiter in ANOTHER process still receives them): shipping their bodies with each
+        // sweep made a long-lived progress subscription's cost grow with its whole retained
+        // history. The shared sweep fetches the envelope by id for the rare acknowledged row a
+        // live subscription has not seen.
         command.CommandText =
             $"""
-            SELECT id, correlation_id, envelope_json, created_at, acked_at, acked_seq
+            SELECT id, correlation_id, CASE WHEN acked_at IS NULL THEN envelope_json END, created_at, acked_at, acked_seq
             FROM {MessageTable}
             WHERE correlation_id = @correlation_id
               AND created_at >= @since
@@ -512,13 +525,57 @@ internal sealed class SqlServerChannelSql
             command.Parameters.AddWithValue("@after_id", afterId ?? throw new ArgumentNullException(nameof(afterId)));
         }
 
-        var messages = new List<SqlServerChannelMessage>(batchSize);
+        return await ReadMessagesAsync(command, batchSize, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// The full rows (envelope included) for <paramref name="ids"/> under
+    /// <paramref name="correlationId"/>, in sweep order — how the dispatch sweep hydrates the
+    /// header-only acknowledged rows it still has to deliver. A row pruned between the sweep's
+    /// page and this read is simply absent.
+    /// </summary>
+    public async Task<IReadOnlyList<SqlServerChannelMessage>> LoadMessagesByIdAsync(
+        string correlationId,
+        IReadOnlyList<Guid> ids,
+        CancellationToken cancellationToken)
+    {
+        if (ids.Count == 0)
+            return [];
+
+        await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
+        await using var connection = await OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
+        await using var command = connection.CreateCommand();
+        // One parameter per id (the sweep hands over at most a page): a joined literal list
+        // would put ids into SQL text, and SQL Server has no array parameter to bind instead.
+        var placeholders = new string[ids.Count];
+        for (var i = 0; i < ids.Count; i++)
+        {
+            placeholders[i] = $"@id{i}";
+            command.Parameters.Add(placeholders[i], SqlDbType.UniqueIdentifier).Value = ids[i];
+        }
+
+        command.CommandText =
+            $"""
+            SELECT id, correlation_id, envelope_json, created_at, acked_at, acked_seq
+            FROM {MessageTable}
+            WHERE correlation_id = @correlation_id
+              AND id IN ({string.Join(", ", placeholders)})
+              AND expires_at > SYSUTCDATETIME()
+            ORDER BY created_at, id;
+            """;
+        command.Parameters.AddWithValue("@correlation_id", correlationId);
+        return await ReadMessagesAsync(command, ids.Count, cancellationToken).ConfigureAwait(false);
+    }
+
+    private static async Task<IReadOnlyList<SqlServerChannelMessage>> ReadMessagesAsync(SqlCommand command, int capacity, CancellationToken cancellationToken)
+    {
+        var messages = new List<SqlServerChannelMessage>(capacity);
         await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
         while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
             messages.Add(new SqlServerChannelMessage(
                 reader.GetGuid(0),
                 reader.GetString(1),
-                reader.GetString(2),
+                reader.IsDBNull(2) ? null : reader.GetString(2),
                 new DateTimeOffset(reader.GetDateTime(3), TimeSpan.Zero),
                 reader.IsDBNull(4) ? null : new DateTimeOffset(reader.GetDateTime(4), TimeSpan.Zero),
                 reader.IsDBNull(5) ? null : reader.GetInt64(5)));

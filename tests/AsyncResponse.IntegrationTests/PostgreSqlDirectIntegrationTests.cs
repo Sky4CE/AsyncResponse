@@ -1382,6 +1382,44 @@ public sealed class PostgreSqlDirectIntegrationTests(DataBatchFixture fixture) :
         return services.BuildServiceProvider();
     }
 
+    /// <summary>
+    /// Round 39: the sweep's page carries the envelope only for rows nobody has acknowledged; an
+    /// acknowledged row comes back header-only and is hydrated by id when a live subscription
+    /// still has to receive it. Pre-fix both reads returned the body for every row (and the
+    /// by-id read did not exist).
+    /// </summary>
+    [Fact]
+    public async Task LoadMessages_ShipsTheEnvelopeOnlyForUnacknowledgedRows_AndHydratesById()
+    {
+        await WithDataSourceAsync("sweep_header_only", async (schema, dataSource) =>
+        {
+            var sql = new PostgreSqlChannelSql(dataSource, Options.Create(ChannelOptions(schema)));
+            await sql.EnsureCreatedAsync();
+            var correlationId = $"header-only-{Guid.NewGuid():N}";
+            var since = (await sql.GetServerTimeUtcAsync(CancellationToken.None)).AddSeconds(-1);
+            var pending = Guid.NewGuid();
+            var acked = Guid.NewGuid();
+            await sql.InsertMessageAsync(pending, correlationId, """{"Success":true,"Payload":"pending"}""", TimeSpan.FromMinutes(5), CancellationToken.None);
+            await sql.InsertMessageAsync(acked, correlationId, """{"Success":true,"Payload":"acked"}""", TimeSpan.FromMinutes(5), CancellationToken.None);
+            Assert.True(await sql.TryClaimForDeliveryAsync(acked, CancellationToken.None));
+
+            var page = await sql.LoadMessagesAsync(correlationId, since, 16, null, null, CancellationToken.None);
+            Assert.Equal(2, page.Count);
+            Assert.Contains("\"pending\"", Assert.Single(page, m => m.Id == pending).EnvelopeJson, StringComparison.Ordinal);
+            var ackedRow = Assert.Single(page, m => m.Id == acked);
+            Assert.Null(ackedRow.EnvelopeJson);
+            Assert.NotNull(ackedRow.AckedAtUtc);
+            Assert.NotNull(ackedRow.AckedSeq);
+
+            var hydrated = await sql.LoadMessagesByIdAsync(correlationId, [acked, Guid.NewGuid()], CancellationToken.None);
+            var full = Assert.Single(hydrated);
+            Assert.Equal(acked, full.Id);
+            Assert.Contains("\"acked\"", full.EnvelopeJson, StringComparison.Ordinal);
+            Assert.Equal(ackedRow.AckedSeq, full.AckedSeq);
+            Assert.Empty(await sql.LoadMessagesByIdAsync("some-other-correlation", [acked], CancellationToken.None));
+        });
+    }
+
     private async Task WithDataSourceAsync(string prefix, Func<string, NpgsqlDataSource, Task> body)
     {
         var schema = NewSchema(prefix);

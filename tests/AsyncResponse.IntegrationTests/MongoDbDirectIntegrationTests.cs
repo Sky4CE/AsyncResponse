@@ -149,11 +149,25 @@ public sealed class MongoDbDirectIntegrationTests(DataBatchFixture fixture) : In
         var message = Assert.Single(messages);
         Assert.Equal(messageId, message.Id);
         Assert.Equal(firstCreatedAt, message.CreatedAtUtc);
+        Assert.Equal("""{"Success":true}""", message.EnvelopeJson); // unacknowledged: the page carries the body
 
         // Live delivery claims the message; recovery must then lose the arbitration.
         Assert.True(await store.TryClaimForDeliveryAsync(messageId, CancellationToken.None));
         Assert.True(await store.IsMessageAcknowledgedAsync(messageId, CancellationToken.None));
         Assert.False(await store.TryClaimForRecoveryAsync(messageId, CancellationToken.None));
+
+        // Round 39: once acknowledged, the sweep's page carries the document header-only (the
+        // $cond projection nulls the envelope) and the by-id read hydrates it in full.
+        var ackedPage = await store.LoadMessagesAsync(messageCorrelation, since.AddSeconds(-1), 16, null, null, CancellationToken.None);
+        var ackedHeader = Assert.Single(ackedPage);
+        Assert.Null(ackedHeader.EnvelopeJson);
+        Assert.NotNull(ackedHeader.AckedAtUtc);
+        Assert.NotNull(ackedHeader.AckedSeq);
+        var hydrated = Assert.Single(await store.LoadMessagesByIdAsync(messageCorrelation, [messageId, Guid.NewGuid()], CancellationToken.None));
+        Assert.Equal(messageId, hydrated.Id);
+        Assert.Equal("""{"Success":true}""", hydrated.EnvelopeJson);
+        Assert.Equal(ackedHeader.AckedSeq, hydrated.AckedSeq);
+        Assert.Empty(await store.LoadMessagesByIdAsync("some-other-correlation", [messageId], CancellationToken.None));
 
         // And the reverse: once recovery owns a message, live delivery must not double-handle it.
         var recoveryMessageId = Guid.NewGuid();

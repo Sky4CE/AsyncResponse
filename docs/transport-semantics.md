@@ -334,7 +334,13 @@ Only cells that need more than a phrase.
   unsettled message roughly every `AckWait`/3 (two chances to land a renewal inside every `AckWait`
   window even when one sweep is delayed), so `AckWait` (30 s) only has to survive one heartbeat
   round-trip — it no longer needs to exceed the slowest handler, and before batching this was
-  effectively the slowest handler **× `BatchSize`** (16 by default).
+  effectively the slowest handler **× `BatchSize`** (16 by default). The heartbeat is advisory,
+  unlike the settlements (which stay deliberately uncancelable): it carries the batch's
+  cancellation token into the SDK call, so a heartbeat still in flight when the batch settles is
+  aborted, and the batch joins the heartbeat loop for at most one heartbeat interval — a heartbeat
+  wedged on a dead socket is abandoned with a warning rather than holding the loop after every
+  message in the batch has settled (which left no further batch fetched and a stop never
+  completing); unsettled deliveries then fall back to the server's own `AckWait`.
 
 ### SQS
 

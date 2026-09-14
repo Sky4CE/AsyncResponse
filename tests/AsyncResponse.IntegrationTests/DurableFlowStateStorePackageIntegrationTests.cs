@@ -352,6 +352,48 @@ public sealed class DurableFlowStateStorePackageIntegrationTests(DataBatchFixtur
         }
     }
 
+    /// <summary>
+    /// Round 39: a duplicate create handled MySQL's 1062 by opening a SECOND pooled connection
+    /// for the existence check while still holding the first — on a pool of one that timed out
+    /// with "All pooled connections are in use", and under concurrent idempotent starts the pool
+    /// starved at any size. The check now runs on the connection the create already holds.
+    /// Pre-fix: the second TryCreateAsync throws MySqlException after the connection timeout.
+    /// </summary>
+    [Fact]
+    public async Task MySqlPackageStore_DuplicateCreate_CompletesOnAOneConnectionPool()
+    {
+        await WaitForMySqlAsync();
+        var table = NewIdentifier("df_mysql_pool1", 64);
+        var connectionString = new MySqlConnectionStringBuilder(Fixture.MySqlConnectionString)
+        {
+            MaximumPoolSize = 1,
+            ConnectionTimeout = 5
+        }.ConnectionString;
+        try
+        {
+            var store = new MySqlFlowStateStore(
+                Options.Create(new MySqlDurableFlowOptions
+                {
+                    ConnectionString = connectionString,
+                    TableName = table
+                }));
+            var state = new FlowState { FlowId = "dup", FlowTypeName = "T", InputTypeName = "I", Status = FlowRunStatus.Running, CreatedAtUtc = DateTime.UtcNow, UpdatedAtUtc = DateTime.UtcNow };
+
+            Assert.True(await store.TryCreateAsync("dup", state, TimeSpan.FromMinutes(5)));
+            var duplicate = await store.TryCreateAsync("dup", state, TimeSpan.FromMinutes(5)).WaitAsync(TimeSpan.FromSeconds(20));
+            Assert.False(duplicate);
+        }
+        finally
+        {
+            MySqlConnection.ClearAllPools();
+            await using var connection = new MySqlConnection(Fixture.MySqlConnectionString);
+            await connection.OpenAsync();
+            await using var command = connection.CreateCommand();
+            command.CommandText = $"DROP TABLE IF EXISTS `{table}`;";
+            await command.ExecuteNonQueryAsync();
+        }
+    }
+
     [Theory]
     [InlineData(true)]
     [InlineData(false)]

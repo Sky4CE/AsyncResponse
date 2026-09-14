@@ -314,6 +314,8 @@ public sealed class RelationalChannelSubscriptionCoverageTests
         await Assert.ThrowsAnyAsync<Exception>(() => sql.GetServerTimeUtcAsync(CancellationToken.None));
         await Assert.ThrowsAnyAsync<Exception>(() => sql.IsMessageAcknowledgedAsync(Guid.NewGuid(), CancellationToken.None));
         await Assert.ThrowsAnyAsync<Exception>(() => sql.LoadMessagesAsync("corr", DateTimeOffset.UtcNow, 10, null, null, CancellationToken.None));
+        Assert.Empty(await sql.LoadMessagesByIdAsync("corr", [], CancellationToken.None)); // no ids, no round trip
+        await Assert.ThrowsAnyAsync<Exception>(() => sql.LoadMessagesByIdAsync("corr", [Guid.NewGuid(), Guid.NewGuid()], CancellationToken.None));
         await Assert.ThrowsAnyAsync<Exception>(() => sql.HeartbeatSubscribersAsync("instance", [("corr", Guid.NewGuid())], TimeSpan.FromMinutes(1), CancellationToken.None));
         await Assert.ThrowsAnyAsync<Exception>(() => sql.CountActiveSubscribersAsync("corr", CancellationToken.None));
         await Assert.ThrowsAnyAsync<Exception>(() => sql.SaveRecoveryStateAsync("corr", new RecoveryState { RegistrationId = Guid.NewGuid(), CorrelationId = "corr" }, TimeSpan.FromMinutes(1), CancellationToken.None));
@@ -345,6 +347,8 @@ public sealed class RelationalChannelSubscriptionCoverageTests
         await Assert.ThrowsAnyAsync<Exception>(() => sql.GetServerTimeUtcAsync(CancellationToken.None));
         await Assert.ThrowsAnyAsync<Exception>(() => sql.IsMessageAcknowledgedAsync(Guid.NewGuid(), CancellationToken.None));
         await Assert.ThrowsAnyAsync<Exception>(() => sql.LoadMessagesAsync("corr", DateTimeOffset.UtcNow, 10, null, null, CancellationToken.None));
+        Assert.Empty(await sql.LoadMessagesByIdAsync("corr", [], CancellationToken.None)); // no ids, no round trip
+        await Assert.ThrowsAnyAsync<Exception>(() => sql.LoadMessagesByIdAsync("corr", [Guid.NewGuid()], CancellationToken.None));
         await Assert.ThrowsAnyAsync<Exception>(() => sql.HeartbeatSubscribersAsync("instance", [("corr", Guid.NewGuid())], TimeSpan.FromMinutes(1), CancellationToken.None));
         await Assert.ThrowsAnyAsync<Exception>(() => sql.CountActiveSubscribersAsync("corr", CancellationToken.None));
 

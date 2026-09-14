@@ -5,7 +5,9 @@ using Microsoft.Azure.Cosmos;
 using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Options;
 using Newtonsoft.Json;
+using System.Buffers;
 using System.Net;
+using System.Text;
 
 namespace Microsoft.Extensions.DependencyInjection
 {
@@ -67,10 +69,14 @@ public sealed class CosmosDurableFlowOptions : DurableFlowOptions
     public int? Throughput { get; set; }
 
     /// <summary>
-    /// Maximum serialized flow-state size in bytes accepted by writes; oversized ledgers fail fast
-    /// with an actionable error instead of the raw Cosmos 413 the executor would retry into the
-    /// dead-letter queue. Default: 1.9 MB (headroom under Cosmos's 2 MB item cap for the sibling
-    /// fields); <c>null</c> disables the guard.
+    /// Maximum size in bytes of the COMPLETE ledger document accepted by writes — the item as it
+    /// is serialized for Cosmos, with the ledger JSON embedded (and therefore escaped a second
+    /// time) as its <c>stateJson</c> string and the sibling fields beside it. Cosmos caps the item
+    /// as a whole at 2 MB, not the ledger inside it: a ledger whose own JSON is well under the
+    /// budget can escape into a document over it, so the budget is enforced on what is actually
+    /// sent. Oversized ledgers fail fast with an actionable error instead of the raw Cosmos 413
+    /// the executor would retry into the dead-letter queue. Default: 1.9 MB (headroom under the
+    /// item cap); <c>null</c> disables the guard.
     /// </summary>
     public long? MaxStateBytes { get; set; } = 1_900_000;
 
@@ -187,6 +193,8 @@ public sealed class CosmosFlowStateStore : IFlowStateStore, IDisposable
 
             var now = DateTime.UtcNow;
             var document = CreateDocument(flowId, stateJson, state.Revision, ttl, now);
+            if (attempt == 0)
+                ThrowIfDocumentTooLarge(flowId, document);
             try
             {
                 await container.CreateItemAsync(document, new PartitionKey(flowId), cancellationToken: cancellationToken).ConfigureAwait(false);
@@ -264,6 +272,7 @@ public sealed class CosmosFlowStateStore : IFlowStateStore, IDisposable
                 document.UpdatedAtUtc = now;
                 document.Revision = state.Revision;
                 document.Ttl = CosmosTtlSeconds(ttl);
+                ThrowIfDocumentTooLarge(flowId, document);
                 await container.ReplaceItemAsync(
                     document,
                     flowId,
@@ -581,6 +590,54 @@ public sealed class CosmosFlowStateStore : IFlowStateStore, IDisposable
         }
 
         return false;
+    }
+
+    /// <summary>
+    /// Enforces <see cref="CosmosDurableFlowOptions.MaxStateBytes"/> on the document as Cosmos
+    /// will receive it. <see cref="DurableFlowStoreShared.SerializeBounded"/> already refused a
+    /// ledger whose own JSON is over the budget — a cheap first check, since the document can only
+    /// be larger — but the ledger travels inside the document as a string value, so every quote
+    /// and backslash in it is escaped again: a 1.2 MB ledger made of escaped quotes is a 2.4 MB
+    /// document, accepted by the inner check and refused by Cosmos's 2 MB item cap on every
+    /// retry. Measured through the host's own serializer when one is registered (its escaping
+    /// and property naming are what go on the wire), else through the SDK default's
+    /// Newtonsoft-based shape.
+    /// </summary>
+    private void ThrowIfDocumentTooLarge(string flowId, CosmosFlowStateDocument document)
+    {
+        if (_options.MaxStateBytes is not { } limit)
+            return;
+
+        var size = MeasureDocumentBytes(document);
+        if (size > limit)
+            throw new FlowStateTooLargeException(flowId, size, limit, "Cosmos DB");
+    }
+
+    private long MeasureDocumentBytes(CosmosFlowStateDocument document)
+    {
+        if (_client.ClientOptions?.Serializer is { } serializer)
+        {
+            using var stream = serializer.ToStream(document);
+            if (stream.CanSeek)
+                return stream.Length;
+
+            long total = 0;
+            var buffer = ArrayPool<byte>.Shared.Rent(16 * 1024);
+            try
+            {
+                int read;
+                while ((read = stream.Read(buffer, 0, buffer.Length)) > 0)
+                    total += read;
+            }
+            finally
+            {
+                ArrayPool<byte>.Shared.Return(buffer);
+            }
+
+            return total;
+        }
+
+        return Encoding.UTF8.GetByteCount(JsonConvert.SerializeObject(document));
     }
 
     private static CosmosFlowStateDocument CreateDocument(string flowId, string stateJson, long revision, TimeSpan ttl, DateTime now)

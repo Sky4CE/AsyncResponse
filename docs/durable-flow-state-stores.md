@@ -235,6 +235,11 @@ Without the shared data source, set `options.ConnectionString = connectionString
 
 ### MySQL or MariaDB
 
+A duplicate-key failure on create (`1062`) is confirmed as "this flow id exists" on the connection
+the create already holds, so an idempotent re-start never needs a second pooled connection — a
+pool of one serves it, and concurrent identical starts cannot starve the pool waiting on each
+other.
+
 ```csharp
 var connectionString = builder.Configuration.GetConnectionString("MySql")
     ?? throw new InvalidOperationException("ConnectionStrings:MySql is required.");
@@ -413,6 +418,13 @@ builder.Services.AddAsyncResponse()
 
 An application-registered `CosmosClient` is reused automatically; omit `ConnectionString` in that
 case. Existing containers must already use the configured partition key and have TTL enabled.
+
+`MaxStateBytes` (1.9 MB by default) bounds the **document** Cosmos receives, measured through the
+registered client's serializer: the ledger JSON travels inside it as the `stateJson` string, so
+every quote and backslash in the ledger is escaped a second time and a 1.2 MB ledger of escaped
+characters is a 2.4 MB document — over the 2 MB item cap, and refused by Cosmos on every retry.
+An oversized document fails the write with `FlowStateTooLargeException` naming the document size
+instead; the ledger JSON alone is checked first, as the cheap pre-check it can only understate.
 
 Every ledger operation — loads, updates, lease acquire/renew/release, and deletes — treats only a
 `404` with sub-status `0` as a genuinely absent flow. Cosmos also answers `404` for conditions

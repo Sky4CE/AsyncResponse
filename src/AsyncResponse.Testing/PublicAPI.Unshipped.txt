@@ -89,3 +89,5 @@ static AsyncResponse.Testing.FlowTestHarness.StartAsync(System.Action<AsyncRespo
 static readonly AsyncResponse.Testing.VirtualTimeProvider.DefaultStartTime -> System.DateTimeOffset
 ~override AsyncResponse.Testing.FlowProbeEvent.Equals(object obj) -> bool
 ~override AsyncResponse.Testing.FlowProbeEvent.ToString() -> string
+AsyncResponse.Testing.AsyncResponseTestHarnessOptions.AbandonLingeringExecutionsOnRestart.get -> bool
+AsyncResponse.Testing.AsyncResponseTestHarnessOptions.AbandonLingeringExecutionsOnRestart.set -> void

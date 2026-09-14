@@ -173,6 +173,14 @@ Recommended Npgsql connection-string settings:
   performs one update for the process's current active-registration snapshot. Rows no longer in that
   snapshot are allowed to expire even if cleanup deletion failed. A failed batch is logged and the
   next interval retries, so leave enough timeout headroom for multiple attempts.
+- The sweep re-reads a subscribed correlation id's retained rows on every tick (and on every
+  targeted signal): acknowledged rows stay in the result so a fan-out waiter in another process
+  still receives a response this one already consumed. Their **bodies** do not travel: the page
+  query ships `envelope_json` only for rows nobody has acknowledged, an acknowledged row comes back
+  header-only (id, timestamps, `acked_seq`), and the sweep fetches the envelope by id only for the
+  rare acknowledged row a live subscription has not seen. A long-lived progress subscription's
+  sweep cost therefore no longer grows with its whole retained history. (Until round 39 every
+  sweep re-transferred and re-materialized every retained body just to drop it in the pre-filter.)
 - `PendingMessageBatchSize` is a page-size tuning knob, not a cap per sweep. Smaller pages lower
   peak materialization; larger pages reduce round trips when one correlation id carries heavy
   progress traffic.

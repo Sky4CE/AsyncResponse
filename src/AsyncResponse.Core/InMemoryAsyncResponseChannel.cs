@@ -1225,11 +1225,18 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
         // deserializes its own instance case-insensitively — the same property matching the
         // string conversion path and every broker ingress apply. JsonElement/string/null payloads
         // keep the existing conversion path.
+        //
+        // Through JsonSafety, like every other reader of a body the waiter did not write: a
+        // publisher's payload that does not fit the waiter's type (a string-valued dictionary
+        // published to an int-valued waiter) fails INSIDE the payload, and the reader's own
+        // JsonException names the offending key ("Path: $.Values['<customer id>']"). That message
+        // reached the waiter's task and, through SetError, the wait activity's status — the
+        // in-process exception to the body-free rule the broker channels enforce.
         private static T MaterializeAs(object? response, byte[]? wireBytes)
         {
             var payload = wireBytes is null
                 ? response.As<T>()
-                : AsyncResponseJson.DeserializeCaseInsensitive<T>(wireBytes);
+                : JsonSafety.SafeDeserialize(wireBytes, AsyncResponseJson.GetTypeInfo<T>(AsyncResponseJson.CaseInsensitive));
 
             // A null (a published null object, a JSON-null JsonElement, a "null" string body)
             // must fault the waiter, never complete it — the broker channels reject the same

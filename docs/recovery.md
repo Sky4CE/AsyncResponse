@@ -368,12 +368,20 @@ same type the failure-callback ladder uses — and the broker ingress passes it 
 no second retry ladder, no `SetException` escalation (which would fail flows whose resume merely
 blipped), so the transport **redelivers** the terminal signal under its own `MaxDeliveryAttempts`
 and dead-letter policy. Because the successful registrations are already gone, the redelivery
-reaches only the one that failed and settles it when the dependency is back (the same holds for a
-direct `SetResponse`/`SetException` caller that retries). A sibling failure that is *deterministic*
-— an unauthorized or unresolvable target, a method that no longer binds — is logged and the
-message acknowledged, since redelivery cannot fix it; that registration stays for the watchdog to
-surface. (Until round 35 a partial success was swallowed outright, which returned success to the
-broker for a payload the failed registration never received.)
+reaches only the ones that failed and settles them when the dependency is back (the same holds for
+a direct `SetResponse`/`SetException` caller that retries). A sibling failure that is
+*deterministic* — an unauthorized or unresolvable target, a method that no longer binds — is
+logged, since redelivery cannot fix it; that registration stays for the watchdog to surface. The
+verdict is taken over **every** failed registration, not the first one the store returned: the
+message is acknowledged only when every failure was deterministic, and one transient failure
+anywhere in the set keeps it unacknowledged whatever precedes it. When no callback succeeded at
+all, a sibling whose failure-callback ladder was exhausted (`RecoveryCallbackFailedException`)
+propagates ahead of any other sibling's fault, so the ingress does not burn its own retry ladder on
+a deterministic fault and then escalate through `SetException` into the very callback that just
+gave up. (Until round 35 a partial success was swallowed outright, which returned success to the
+broker for a payload the failed registration never received; until round 39 the verdict came from
+the first failure alone, so a deterministic fault ahead of a transient sibling acknowledged the
+message and the transient registration lost its only copy of the payload.)
 
 The watchdog reports shared-correlation recovery state once per correlation id, not once per stored
 waiter registration.

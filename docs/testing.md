@@ -174,6 +174,21 @@ anyone still holding them, and disposing one afterwards (a flow disposes its wai
 cancelled wait; an `await using` caller does the same) is a no-op that leaves the recovery
 registration in place — exactly what a crashed process leaves behind.
 
+**The restart is cooperative.** It discards everything a crash would lose and breaks the dead
+incarnation's execution leases, but there is no process to kill: a step body that outlives the
+graceful stop (bounded by `options.RealTimeGuard`) — it ignored its cancellation and is blocked
+on something the test controls — keeps running beside the new incarnation and performs its side
+effects *after* the restart returned, which is less than a "restart" claims. `SimulateRestartAsync`
+therefore refuses with `InvalidOperationException` when user code is still executing after the
+stop lapsed (engine-owned parks — an awaited step or an in-process timer holding its worker slot
+on the virtual clock — are expected and never trip this). Let the step observe its cancellation
+token or finish before restarting; for crash-*at-a-checkpoint* semantics use
+`FlowTestHarness.CrashBeforeStep` / `CrashAfterStep`, which fail the attempt at the exact
+boundary with nothing left running. A test that deliberately wants the overlap sets
+`options.AbandonLingeringExecutionsOnRestart = true` and then owns it: the abandoned execution's
+side effects land whenever it unblocks. Nothing in the harness is a subprocess kill; a guarantee
+that must hold against abrupt termination needs a real process and a real broker.
+
 This is the recovery tri-state (`Resume` / `Fail` / `KeepWaiting`) — the part of the API teams
 most need to test and previously could not without a broker. Waiter tasks obtained before the
 restart never carry a response or a timeout: the restart abandons them exactly as a crash does —

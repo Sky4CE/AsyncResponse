@@ -161,18 +161,45 @@ internal abstract class NatsSubscriberService : BackgroundService
         finally
         {
             renewalCancellation.Cancel();
-            await renewalTask.ConfigureAwait(false);
+            try
+            {
+                // Cancellation exits the sweep between messages and aborts the in-flight
+                // heartbeat (the token reaches the SDK call), so this normally completes at once.
+                // The bound is the hard backstop for a heartbeat the client cannot abort — a
+                // write wedged on a dead socket: an unbounded join here held the loop after every
+                // message in the batch had settled, so no further batch was fetched and a stop
+                // never completed, with nothing for the supervisor to restart. Past one heartbeat
+                // interval the loop is abandoned; the server's AckWait settles whatever it left.
+                await renewalTask.WaitAsync(RenewalInterval).ConfigureAwait(false);
+            }
+            catch (TimeoutException)
+            {
+                Logger.LogWarning(
+                    "NATS in-progress heartbeat for {Role} did not stop within {RenewalInterval} after its batch settled; abandoning it — unsettled deliveries fall back to the server-side AckWait.",
+                    Role,
+                    RenewalInterval);
+                _ = renewalTask.ContinueWith(
+                    static (task, state) => ((ILogger)state!).LogWarning(task.Exception, "Abandoned NATS in-progress heartbeat faulted."),
+                    Logger,
+                    CancellationToken.None,
+                    TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously,
+                    TaskScheduler.Default);
+            }
         }
     }
+
+    /// <summary>
+    /// ~AckWait/3: two chances to land a renewal inside every AckWait window even when one sweep
+    /// is delayed by a slow round trip. Also the bound on joining the renewal loop after a batch.
+    /// </summary>
+    private TimeSpan RenewalInterval => TimeSpan.FromMilliseconds(Math.Max(1, Options.AckWait.TotalMilliseconds / 3));
 
     private async Task RenewInProgressLoopAsync(
         List<NatsJobDelivery> batch,
         BatchProgress progress,
         CancellationToken cancellationToken)
     {
-        // ~AckWait/3: two chances to land a renewal inside every AckWait window even when one
-        // sweep is delayed by a slow round trip.
-        var interval = TimeSpan.FromMilliseconds(Math.Max(1, Options.AckWait.TotalMilliseconds / 3));
+        var interval = RenewalInterval;
         try
         {
             while (true)
@@ -198,7 +225,7 @@ internal abstract class NatsSubscriberService : BackgroundService
                     var delivery = batch[i];
                     try
                     {
-                        await delivery.ProgressAsync().ConfigureAwait(false);
+                        await delivery.ProgressAsync(cancellationToken).ConfigureAwait(false);
                     }
                     catch (Exception ex) when (ex is not OperationCanceledException)
                     {
