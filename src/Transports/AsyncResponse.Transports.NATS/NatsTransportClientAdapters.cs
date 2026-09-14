@@ -28,9 +28,11 @@ internal sealed record NatsJobDelivery(
     /// Signals "working on it" (JetStream in-progress) so the server resets this delivery's
     /// AckWait window without settling it or bumping its delivery count. An init property with a
     /// no-op default rather than a positional parameter so out-of-package constructions stay
-    /// source-compatible.
+    /// source-compatible. The token is the batch's renewal cancellation: a heartbeat still in
+    /// flight when the batch settles (or the subscriber stops) must abort with it, not hold the
+    /// batch — the SDK call it wraps takes the token for exactly that.
     /// </summary>
-    public Func<ValueTask> ProgressAsync { get; init; } = static () => ValueTask.CompletedTask;
+    public Func<CancellationToken, ValueTask> ProgressAsync { get; init; } = static _ => ValueTask.CompletedTask;
 }
 
 /// <summary>
@@ -235,7 +237,10 @@ internal sealed class NatsJetStreamTransportAdapter(INatsJSContext _jetStream, I
             delay => captured.NakAsync(delay: delay, cancellationToken: CancellationToken.None),
             () => captured.AckTerminateAsync(cancellationToken: CancellationToken.None))
         {
-            ProgressAsync = () => captured.AckProgressAsync(cancellationToken: CancellationToken.None)
+            // Unlike the settlements above (deliberately uncancelable: a settlement decision
+            // already taken must reach the server), a progress heartbeat is advisory — the
+            // renewal loop's token cancels one that stalls, so the batch never waits on it.
+            ProgressAsync = cancellationToken => captured.AckProgressAsync(cancellationToken: cancellationToken)
         };
     }
 

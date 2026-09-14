@@ -546,14 +546,18 @@ public class NatsJetStreamTransportAdapterTests
 
         await single.AckAsync();
         await single.TermAsync();
-        await single.ProgressAsync();
+        // Round 39: the heartbeat's token reaches the SDK call (the settlements above stay
+        // deliberately uncancelable — a decision already taken must reach the server).
+        using var progressCancellation = new CancellationTokenSource();
+        await single.ProgressAsync(progressCancellation.Token);
         // NakAsync(delay) is a NATS.Net extension over the message (not a mockable member), so it
         // cannot be Moq-verified; invoking the delegate still exercises the adapter's nak path, and the
         // extension's internal member call on the loose mock is tolerated.
         try { await single.NakAsync(TimeSpan.FromSeconds(2)); } catch (Exception) { /* extension-over-mock */ }
         message.Verify(m => m.AckAsync(It.IsAny<AckOpts?>(), It.IsAny<CancellationToken>()), Times.Once);
         message.Verify(m => m.AckTerminateAsync(It.IsAny<AckOpts?>(), It.IsAny<CancellationToken>()), Times.Once);
-        message.Verify(m => m.AckProgressAsync(It.IsAny<AckOpts?>(), It.IsAny<CancellationToken>()), Times.Once);
+        message.Verify(m => m.AckProgressAsync(It.IsAny<AckOpts?>(), progressCancellation.Token), Times.Once);
+        message.Verify(m => m.AckAsync(It.IsAny<AckOpts?>(), CancellationToken.None), Times.Once);
     }
 
     [Fact]

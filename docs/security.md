@@ -153,6 +153,12 @@ it reads a stored ledger or the initial state a start job carries — the
 reader's own — and the recovery-state readers (Redis, NATS, PostgreSQL, SQL Server, MongoDB),
 on the delivery path and the watchdog scan alike: a stored registration's `Context` carries the
 same propagated tenant and auth keys a worker envelope does, and the reader's `Path` names them.
+The in-memory channel's typed delivery is covered too: every waiter re-materializes the published
+payload from its wire bytes, and a payload that does not fit the waiter's type (a string-valued
+dictionary published to an int-valued waiter) fails *inside* the payload, where the reader's own
+message would name the offending dictionary key — into the waiter's exception and, through the
+wait activity's error status, into telemetry. It faults the waiter with the same body-free
+`InvalidDataException` the broker channels use.
 
 **But not our own diagnostics.** The distinction is who wrote the message. `System.Text.Json`'s
 messages quote the body, so they are dropped; the envelope reader's own contract violations —

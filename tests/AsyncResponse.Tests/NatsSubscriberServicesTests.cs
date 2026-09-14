@@ -199,6 +199,96 @@ public class NatsSubscriberServicesTests
         Assert.Contains("BackgroundWorkerCount", ex.Message, StringComparison.Ordinal);
     }
 
+    /// <summary>
+    /// Round 39: the in-progress heartbeat ran with <c>CancellationToken.None</c> and the batch's
+    /// cleanup joined the renewal loop without a bound, so ONE heartbeat wedged on a dead socket
+    /// kept the batch pending after every message in it had settled — no further batch was
+    /// fetched, a stop never completed, and the supervisor had nothing to restart. The token now
+    /// reaches the heartbeat: a client-side stall aborts with it and the batch completes at once.
+    /// Pre-fix: the second delivery is never fetched.
+    /// </summary>
+    [Fact]
+    public async Task WorkerSubscriber_AHeartbeatThatHonorsCancellation_IsAbortedWhenTheBatchSettles()
+    {
+        var ingress = new GatedIngress();
+        var first = new RecordingDelivery
+        {
+            // The heartbeat stalls until its token is cancelled.
+            ProgressBehavior = async cancellationToken =>
+            {
+                var stalled = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                using var registration = cancellationToken.Register(() => stalled.TrySetCanceled(cancellationToken));
+                await stalled.Task;
+            }
+        };
+        var second = new RecordingDelivery();
+        _jetStream.EnqueueDelivery(first.Create("p1", numDelivered: 1));
+        var subscriber = new NatsWorkerSubscriber(
+            Options(o => o.AckWait = TimeSpan.FromMilliseconds(150)),
+            _jetStream,
+            ingress,
+            new TestLogger<NatsWorkerSubscriber>());
+
+        await subscriber.StartAsync(CancellationToken.None);
+        try
+        {
+            await ingress.Started.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            await Eventually(() => first.Progresses >= 1); // the heartbeat is now wedged
+            ingress.Release.TrySetResult();
+            await Eventually(() => first.Acks == 1);
+
+            // The batch settled; the wedged heartbeat must not hold the loop: the next batch is
+            // fetched and settled.
+            _jetStream.EnqueueDelivery(second.Create("p2", numDelivered: 1));
+            await Eventually(() => second.Acks == 1);
+        }
+        finally
+        {
+            await subscriber.StopAsync(CancellationToken.None);
+            subscriber.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// The backstop for a heartbeat the client cannot abort at all (it ignores its token): the
+    /// join is bounded by one heartbeat interval, after which the renewal loop is abandoned with
+    /// a warning and the loop moves on — unsettled deliveries fall back to the server's AckWait.
+    /// </summary>
+    [Fact]
+    public async Task WorkerSubscriber_AHeartbeatThatIgnoresCancellation_IsAbandonedAfterOneInterval()
+    {
+        var ingress = new GatedIngress();
+        var never = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var first = new RecordingDelivery { ProgressBehavior = async _ => await never.Task };
+        var second = new RecordingDelivery();
+        _jetStream.EnqueueDelivery(first.Create("p1", numDelivered: 1));
+        var logger = new RecordingThrowingLogger<NatsWorkerSubscriber>();
+        var subscriber = new NatsWorkerSubscriber(
+            Options(o => o.AckWait = TimeSpan.FromMilliseconds(150)),
+            _jetStream,
+            ingress,
+            logger);
+
+        await subscriber.StartAsync(CancellationToken.None);
+        try
+        {
+            await ingress.Started.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            await Eventually(() => first.Progresses >= 1);
+            ingress.Release.TrySetResult();
+            await Eventually(() => first.Acks == 1);
+
+            _jetStream.EnqueueDelivery(second.Create("p2", numDelivered: 1));
+            await Eventually(() => second.Acks == 1);
+            Assert.True(logger.HasEntry(Microsoft.Extensions.Logging.LogLevel.Warning, "did not stop within"), "the abandoned heartbeat must be logged");
+        }
+        finally
+        {
+            never.TrySetResult();
+            await subscriber.StopAsync(CancellationToken.None);
+            subscriber.Dispose();
+        }
+    }
+
     private static async Task Eventually(Func<bool> condition)
     {
         using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(5));

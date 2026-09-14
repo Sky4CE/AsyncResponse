@@ -445,6 +445,96 @@ public sealed class CosmosDurableFlowStateStoreTests
         Assert.False(await harness.Store.TryRenewLeaseAsync("flow", "owner", TimeSpan.FromMinutes(1)));
     }
 
+    // ---- Round 39: the size budget is enforced on the DOCUMENT Cosmos receives, not the ledger inside it. ----
+
+    /// <summary>
+    /// A ledger of escaped backslashes: its own JSON is 1.2 MB (under the 1.9 MB default), but
+    /// embedded as the document's <c>stateJson</c> string every <c>\\</c> escapes again to
+    /// <c>\\\\</c> — a 2.4 MB document Cosmos's 2 MB item cap refuses on every retry. Pre-fix the
+    /// guard measured the inner JSON only and the create went to the container. (Backslashes
+    /// rather than quotes so the arithmetic does not depend on either serializer's encoder.)
+    /// </summary>
+    private static FlowState EscapeHeavyState(string flowId)
+    {
+        var state = CreateState(flowId);
+        state.Steps = new Dictionary<string, FlowStepState>
+        {
+            ["blob"] = new FlowStepState
+            {
+                Completed = true,
+                // A JSON string literal of 300k escaped backslashes: ResultJson is JSON text.
+                ResultJson = "\"" + new string('\\', 600_000) + "\""
+            }
+        };
+        return state;
+    }
+
+    [Fact]
+    public async Task TryCreate_RejectsALedgerWhoseEscapedDocumentExceedsTheBudget()
+    {
+        using var harness = new CosmosHarness();
+        var state = EscapeHeavyState("flow");
+        var innerBytes = System.Text.Encoding.UTF8.GetByteCount(JsonSerializer.Serialize(state));
+        Assert.InRange(innerBytes, 1_000_000, 1_900_000);
+
+        // The shared source's FlowStateTooLargeException is internal to each store assembly (one
+        // copy per package), so it is matched by name, as the other store suites do.
+        var ex = await Assert.ThrowsAnyAsync<Exception>(
+            () => harness.Store.TryCreateAsync("flow", state, TimeSpan.FromMinutes(1)));
+
+        Assert.Equal("FlowStateTooLargeException", ex.GetType().Name);
+        Assert.Equal("flow", ex.GetType().GetProperty("FlowId")!.GetValue(ex));
+        var reported = (long)ex.GetType().GetProperty("SerializedSizeBytes")!.GetValue(ex)!;
+        Assert.True(reported > 1_900_000, $"reported size {reported} should be the escaped document's");
+        harness.Container.Verify(container => container.CreateItemAsync(
+            It.IsAny<CosmosFlowStateDocument>(),
+            It.IsAny<PartitionKey?>(),
+            It.IsAny<ItemRequestOptions>(),
+            It.IsAny<CancellationToken>()), Times.Never);
+    }
+
+    [Fact]
+    public async Task TryUpdate_RejectsALedgerWhoseEscapedDocumentExceedsTheBudget()
+    {
+        using var harness = new CosmosHarness();
+        var state = EscapeHeavyState("flow");
+        state.Revision = 1;
+        harness.Reads(Document(CreateState("flow"), DateTime.UtcNow.AddMinutes(5)));
+        harness.ReplacesSuccessfully();
+
+        var ex = await Assert.ThrowsAnyAsync<Exception>(
+            () => harness.Store.TryUpdateAsync("flow", state, 0, TimeSpan.FromMinutes(1)));
+        Assert.Equal("FlowStateTooLargeException", ex.GetType().Name);
+
+        harness.Container.Verify(container => container.ReplaceItemAsync(
+            It.IsAny<CosmosFlowStateDocument>(),
+            It.IsAny<string>(),
+            It.IsAny<PartitionKey?>(),
+            It.IsAny<ItemRequestOptions>(),
+            It.IsAny<CancellationToken>()), Times.Never);
+    }
+
+    /// <summary>A ledger that fits as a document still writes (the guard is not just "smaller").</summary>
+    [Fact]
+    public async Task TryCreate_AcceptsALedgerWhoseDocumentFitsTheBudget()
+    {
+        using var harness = new CosmosHarness();
+        var state = CreateState("flow");
+        state.Steps = new Dictionary<string, FlowStepState>
+        {
+            ["blob"] = new FlowStepState { Completed = true, ResultJson = "\"" + new string('x', 500_000) + "\"" }
+        };
+        harness.Container
+            .Setup(container => container.CreateItemAsync(
+                It.IsAny<CosmosFlowStateDocument>(),
+                It.IsAny<PartitionKey?>(),
+                It.IsAny<ItemRequestOptions>(),
+                It.IsAny<CancellationToken>()))
+            .ReturnsAsync(Mock.Of<ItemResponse<CosmosFlowStateDocument>>());
+
+        Assert.True(await harness.Store.TryCreateAsync("flow", state, TimeSpan.FromMinutes(1)));
+    }
+
     private static FlowState CreateState(string flowId) => new()
     {
         FlowId = flowId,

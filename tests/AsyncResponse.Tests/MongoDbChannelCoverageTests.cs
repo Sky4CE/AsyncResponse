@@ -5,6 +5,7 @@ using Microsoft.Extensions.Logging.Abstractions;
 using System.Collections;
 using Microsoft.Extensions.Options;
 using MongoDB.Bson;
+using MongoDB.Bson.Serialization;
 using MongoDB.Driver;
 using MongoDB.Driver.Core.Clusters;
 using MongoDB.Driver.Core.Connections;
@@ -1354,6 +1355,115 @@ public sealed class MongoDbChannelCoverageTests
         var delivered = await subscription.Completion.Task.WaitAsync(TimeSpan.FromSeconds(10));
         Assert.Equal("swept", delivered.Message);
     }
+
+    /// <summary>
+    /// Round 39: the sweep re-read every retained row's envelope on every tick, acknowledged
+    /// history included, only to drop it in the pre-filter — a long-lived progress subscription's
+    /// sweep cost grew with its whole history. The store now ships the envelope only for
+    /// unacknowledged rows; an acknowledged row a live subscription has not seen (cross-process
+    /// fan-out) comes back header-only and is hydrated by id before delivery. Pre-fix: the
+    /// header-only row was handed to the waiter as-is and its delivery faulted on a null body.
+    /// </summary>
+    [Fact]
+    public async Task DispatchPendingMessagesAsync_HydratesAHeaderOnlyAcknowledgedRow_BeforeDeliveringIt()
+    {
+        var fixture = new ChannelFixture();
+        var channel = fixture.Channel;
+        var subscription = fixture.Subscription(_ => new ValueTask<bool>(true), "hydrate-corr");
+        AddSubscription(channel, "hydrate-corr", subscription.Instance);
+
+        // Acknowledged by another process AFTER this waiter registered: inside the watermark,
+        // unseen here, so it must be delivered — but the sweep's page carries no envelope for it.
+        var id = Guid.NewGuid();
+        var createdAt = DateTime.UtcNow;
+        var ackedAt = DateTime.UtcNow.AddSeconds(2);
+        MongoChannelMessageDocument HeaderOnly() => new()
+        {
+            Id = id,
+            CorrelationId = "hydrate-corr",
+            EnvelopeJson = null,
+            CreatedAtUtc = createdAt,
+            AckedAtUtc = ackedAt,
+            AckedSeq = 42
+        };
+        MongoChannelMessageDocument Full() => new()
+        {
+            Id = id,
+            CorrelationId = "hydrate-corr",
+            EnvelopeJson = """{"SchemaVersion":1,"Success":true,"Payload":{"Status":2,"Message":"hydrated"}}""",
+            CreatedAtUtc = createdAt,
+            AckedAtUtc = ackedAt,
+            AckedSeq = 42
+        };
+        var byIdReads = 0;
+        fixture.Messages
+            .Setup(c => c.FindAsync(
+                It.IsAny<FilterDefinition<MongoChannelMessageDocument>>(),
+                It.IsAny<FindOptions<MongoChannelMessageDocument, MongoChannelMessageDocument>>(),
+                It.IsAny<CancellationToken>()))
+            .Returns((FilterDefinition<MongoChannelMessageDocument> filter, FindOptions<MongoChannelMessageDocument, MongoChannelMessageDocument> _, CancellationToken _) =>
+            {
+                // The sweep page (correlation + keyset) vs the hydration read (id $in ...).
+                var byId = RenderFilter(filter).Contains("$in", StringComparison.Ordinal);
+                if (byId)
+                    Interlocked.Increment(ref byIdReads);
+                return Task.FromResult<IAsyncCursor<MongoChannelMessageDocument>>(
+                    new DummyCursor<MongoChannelMessageDocument>([byId ? Full() : HeaderOnly()]));
+            });
+        fixture.Messages
+            .Setup(c => c.FindOneAndUpdateAsync(
+                It.IsAny<FilterDefinition<MongoChannelMessageDocument>>(),
+                It.IsAny<UpdateDefinition<MongoChannelMessageDocument>>(),
+                It.IsAny<FindOneAndUpdateOptions<MongoChannelMessageDocument, MongoChannelMessageDocument>>(),
+                It.IsAny<CancellationToken>()))
+            .ReturnsAsync(Full());
+
+        var dispatchMethod = typeof(MongoDbAsyncResponseChannel)
+            .GetMethod("DispatchPendingMessagesAsync", BindingFlags.Instance | BindingFlags.NonPublic)!;
+        await (Task)dispatchMethod.Invoke(channel, [new HashSet<string> { "hydrate-corr" }, CancellationToken.None])!;
+
+        var delivered = await subscription.Completion.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        Assert.Equal("hydrated", delivered.Message);
+        Assert.Equal(1, byIdReads);
+    }
+
+    /// <summary>The sweep's page query projects the envelope only for documents nobody has acknowledged.</summary>
+    [Fact]
+    public async Task LoadMessagesAsync_ProjectsTheEnvelopeOnlyForUnacknowledgedDocuments()
+    {
+        var fixture = new ChannelFixture();
+        FindOptions<MongoChannelMessageDocument, MongoChannelMessageDocument>? captured = null;
+        fixture.Messages
+            .Setup(c => c.FindAsync(
+                It.IsAny<FilterDefinition<MongoChannelMessageDocument>>(),
+                It.IsAny<FindOptions<MongoChannelMessageDocument, MongoChannelMessageDocument>>(),
+                It.IsAny<CancellationToken>()))
+            .Callback<FilterDefinition<MongoChannelMessageDocument>, FindOptions<MongoChannelMessageDocument, MongoChannelMessageDocument>, CancellationToken>(
+                (_, options, _) => captured = options)
+            .ReturnsAsync(new DummyCursor<MongoChannelMessageDocument>([]));
+
+        await fixture.Store.LoadMessagesAsync("corr", DateTimeOffset.UtcNow, 16, null, null, CancellationToken.None);
+
+        Assert.NotNull(captured?.Projection);
+        var rendered = captured!.Projection!.Render(new RenderArgs<MongoChannelMessageDocument>(
+            BsonSerializer.LookupSerializer<MongoChannelMessageDocument>(),
+            BsonSerializer.SerializerRegistry)).Document;
+        var envelope = rendered["envelope_json"].AsBsonDocument;
+        Assert.True(envelope.Contains("$cond"), rendered.ToJson());
+        Assert.Contains("$acked_at", rendered.ToJson(), StringComparison.Ordinal);
+        Assert.Equal(1, rendered["acked_seq"].AsInt32);
+
+        // The hydration read carries no projection: it must return the envelope.
+        captured = null;
+        await fixture.Store.LoadMessagesByIdAsync("corr", [Guid.NewGuid()], CancellationToken.None);
+        Assert.NotNull(captured);
+        Assert.Null(captured!.Projection);
+    }
+
+    private static string RenderFilter(FilterDefinition<MongoChannelMessageDocument> filter)
+        => filter.Render(new RenderArgs<MongoChannelMessageDocument>(
+            BsonSerializer.LookupSerializer<MongoChannelMessageDocument>(),
+            BsonSerializer.SerializerRegistry)).ToJson();
 
     [Fact]
     public async Task MongoDbRecoveryStateStore_ThrowsOnMismatchedCorrelationId()

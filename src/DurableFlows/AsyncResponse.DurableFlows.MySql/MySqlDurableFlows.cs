@@ -152,7 +152,7 @@ public sealed class MySqlFlowStateStore : IFlowStateStore
             // verification refuses such tables, but this store also runs against schemas it did not
             // get to inspect first (AutoCreateSchema off, table created later), so confirm the row
             // is actually there before believing the error.
-            if (!await ExistsAsync(flowId, cancellationToken).ConfigureAwait(false))
+            if (!await ExistsAsync(connection, flowId, cancellationToken).ConfigureAwait(false))
                 throw;
 
             // The id already exists. Only an expired row may be replaced below; do not use
@@ -178,11 +178,15 @@ public sealed class MySqlFlowStateStore : IFlowStateStore
 
     /// <summary>
     /// Whether a row with EXACTLY this flow id exists, expired or not — the question a 1062 does
-    /// not answer on its own. Opens its own connection so it is safe to call mid-operation.
+    /// not answer on its own. Runs on the caller's already-open connection: <c>TryCreateAsync</c>
+    /// holds its connection across the 1062 handling, and opening a SECOND one from inside that
+    /// window meant every duplicate create occupied one pooled connection while waiting for
+    /// another — with <c>MaximumPoolSize=1</c> a single duplicate start timed out with "All pooled
+    /// connections are in use", and under concurrent idempotent starts the pool starved whatever
+    /// size it had.
     /// </summary>
-    private async Task<bool> ExistsAsync(string flowId, CancellationToken cancellationToken)
+    private async Task<bool> ExistsAsync(MySqlConnection connection, string flowId, CancellationToken cancellationToken)
     {
-        await using var connection = await OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         await using var command = connection.CreateCommand();
         command.CommandText = $"SELECT 1 FROM {Table} WHERE flow_id = @flow_id LIMIT 1;";
         command.Parameters.AddWithValue("@flow_id", flowId);

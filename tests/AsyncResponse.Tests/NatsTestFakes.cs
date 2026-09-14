@@ -352,6 +352,13 @@ internal sealed class RecordingDelivery
     /// <summary>When set, every in-progress attempt is recorded and then fails with this exception.</summary>
     public Exception? ProgressException { get; set; }
 
+    /// <summary>
+    /// When set, every in-progress attempt is recorded and then runs this instead (a heartbeat
+    /// that stalls, honors or ignores its cancellation token, …). Takes precedence over
+    /// <see cref="ProgressException"/>.
+    /// </summary>
+    public Func<CancellationToken, ValueTask>? ProgressBehavior { get; set; }
+
     public NatsJobDelivery Create(string payload, long numDelivered, string subject = "asyncresponse.transport.worker", IReadOnlyDictionary<string, string>? headers = null)
         => new(
             subject,
@@ -374,9 +381,11 @@ internal sealed class RecordingDelivery
                 return TermException is null ? ValueTask.CompletedTask : ValueTask.FromException(TermException);
             })
         {
-            ProgressAsync = () =>
+            ProgressAsync = cancellationToken =>
             {
                 Interlocked.Increment(ref _progresses);
+                if (ProgressBehavior is { } behavior)
+                    return behavior(cancellationToken);
                 return ProgressException is null ? ValueTask.CompletedTask : ValueTask.FromException(ProgressException);
             }
         };

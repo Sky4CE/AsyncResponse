@@ -6,10 +6,17 @@ using AsyncResponse.Internal;
 
 namespace AsyncResponse.Channels.PostgreSQL;
 
+/// <summary>One stored response envelope row/document as the channel store returns it.</summary>
+/// <remarks>
+/// <c>EnvelopeJson</c> is the stored envelope, or <c>null</c> for a row the dispatch sweep loaded header-only (an
+/// already-acknowledged row — see <see cref="PostgreSqlChannelSql.LoadMessagesAsync"/>); the
+/// sweep hydrates the few such rows it still has to deliver through
+/// <see cref="PostgreSqlChannelSql.LoadMessagesByIdAsync"/> before handing them to a waiter.
+/// </remarks>
 internal readonly record struct PostgreSqlChannelMessage(
     Guid Id,
     string CorrelationId,
-    string EnvelopeJson,
+    string? EnvelopeJson,
     DateTimeOffset CreatedAtUtc,
     DateTimeOffset? AckedAtUtc = null,
     long? AckedSeq = null);
@@ -471,9 +478,15 @@ internal sealed class PostgreSqlChannelSql
         await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
         await using var connection = await _dataSource.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         await using var command = connection.CreateCommand();
+        // The envelope travels only for rows nobody has acknowledged yet. Acknowledged rows are
+        // the consumed history the sweep re-reads on every tick (they stay in the result set so a
+        // fan-out waiter in ANOTHER process still receives them): shipping their bodies with each
+        // sweep made a long-lived progress subscription's cost grow with its whole retained
+        // history. The shared sweep fetches the envelope by id for the rare acknowledged row a
+        // live subscription has not seen.
         command.CommandText =
             $"""
-            SELECT id, correlation_id, envelope_json::text, created_at, acked_at, acked_seq
+            SELECT id, correlation_id, CASE WHEN acked_at IS NULL THEN envelope_json::text END, created_at, acked_at, acked_seq
             FROM {MessageTable}
             WHERE correlation_id = @correlation_id
               AND created_at >= @since
@@ -491,13 +504,49 @@ internal sealed class PostgreSqlChannelSql
             command.Parameters.AddWithValue("after_id", afterId ?? throw new ArgumentNullException(nameof(afterId)));
         }
 
-        var messages = new List<PostgreSqlChannelMessage>(batchSize);
+        return await ReadMessagesAsync(command, batchSize, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// The full rows (envelope included) for <paramref name="ids"/> under
+    /// <paramref name="correlationId"/>, in sweep order — how the dispatch sweep hydrates the
+    /// header-only acknowledged rows it still has to deliver. A row pruned between the sweep's
+    /// page and this read is simply absent.
+    /// </summary>
+    public async Task<IReadOnlyList<PostgreSqlChannelMessage>> LoadMessagesByIdAsync(
+        string correlationId,
+        IReadOnlyList<Guid> ids,
+        CancellationToken cancellationToken)
+    {
+        if (ids.Count == 0)
+            return [];
+
+        await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
+        await using var connection = await _dataSource.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
+        await using var command = connection.CreateCommand();
+        command.CommandText =
+            $"""
+            SELECT id, correlation_id, envelope_json::text, created_at, acked_at, acked_seq
+            FROM {MessageTable}
+            WHERE correlation_id = @correlation_id
+              AND id = ANY(@ids)
+              AND expires_at > now()
+            ORDER BY created_at, id;
+            """;
+        command.Parameters.AddWithValue("correlation_id", correlationId);
+        command.Parameters.AddWithValue("ids", ids is Guid[] array ? array : [.. ids]);
+        return await ReadMessagesAsync(command, ids.Count, cancellationToken).ConfigureAwait(false);
+    }
+
+    private static async Task<IReadOnlyList<PostgreSqlChannelMessage>> ReadMessagesAsync(NpgsqlCommand command, int capacity, CancellationToken cancellationToken)
+    {
+        var messages = new List<PostgreSqlChannelMessage>(capacity);
         await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
         while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
             messages.Add(new PostgreSqlChannelMessage(
                 reader.GetGuid(0),
                 reader.GetString(1),
-                reader.GetString(2),
+                reader.IsDBNull(2) ? null : reader.GetString(2),
                 reader.GetFieldValue<DateTimeOffset>(3),
                 reader.IsDBNull(4) ? null : reader.GetFieldValue<DateTimeOffset>(4),
                 reader.IsDBNull(5) ? null : reader.GetInt64(5)));

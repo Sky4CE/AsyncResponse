@@ -957,6 +957,18 @@ internal abstract class DbAsyncResponseChannelBase :
                 afterCreatedAtUtc,
                 afterId,
                 cancellationToken).ConfigureAwait(false);
+
+            // Two passes over the page. The store ships the envelope only for rows nobody has
+            // acknowledged; an acknowledged row — the consumed history this sweep re-reads on
+            // every tick and every targeted signal, retained so a fan-out waiter in ANOTHER
+            // process still receives it — comes back header-only. Before the split, every sweep
+            // re-transferred and re-materialized a long-lived progress subscription's whole
+            // retained history just to drop it in the pre-filter below. The first pass decides
+            // which rows a live subscription would actually take; the second hydrates the
+            // envelopes of the (rare) acknowledged rows among them in one store read and enqueues
+            // in page order, so nothing later is admitted ahead of an earlier row.
+            List<DbChannelMessage>? eligible = null;
+            List<Guid>? headerOnly = null;
             foreach (var message in messages)
             {
                 // The store was asked for ONE exact correlation id, but "exact" is the
@@ -984,30 +996,13 @@ internal abstract class DbAsyncResponseChannelBase :
                 if (!WouldDeliverToAnySubscription(message, subscriptions))
                     continue;
 
-                // Work-item class, not a lambda: a queued closure would chain display classes
-                // pinning this paging frame (batch list, cursors, watermark) for as long as the
-                // item sits in the executor's bounded queue.
-                //
-                // NON-BLOCKING admission. This loop is the process-wide dispatch sweep and walks
-                // correlation ids sequentially, so waiting for ONE correlation id's executor
-                // capacity here (the old EnqueueAsync) parked delivery for every other waiter in
-                // the process: a waiter wedged in a slow Until predicate, fed a backlog of NEW
-                // progress messages (the pre-filter above only screens consumed history), filled
-                // its 1024-slot executor and the sweep then blocked on slot 1025 without ever
-                // querying the next correlation id. Its per-correlation backpressure became shared
-                // delivery blockage — unrelated remote/polled responses timed out behind it. At
-                // capacity the rest of this correlation id's messages are left unclaimed in the
-                // store, in order (nothing later is enqueued ahead of them), and a rescan of just
-                // this id is scheduled for when the executor has had a poll interval to drain.
-                var outcome = _executors.TryEnqueue(
-                    ChannelName(correlationId),
-                    new LocalDispatchWorkItem(this, message, subscriptions, cancellationToken).InvokeAsync);
-                if (outcome == SerialExecutorRegistry.TryEnqueueOutcome.Full)
-                {
-                    ScheduleBackpressureRescan(correlationId, cancellationToken);
-                    return;
-                }
+                (eligible ??= []).Add(message);
+                if (message.EnvelopeJson is null)
+                    (headerOnly ??= []).Add(message.Id);
             }
+
+            if (eligible is not null && !await EnqueueEligibleAsync(correlationId, eligible, headerOnly, subscriptions, cancellationToken).ConfigureAwait(false))
+                return;
 
             if (messages.Count < _options.PendingMessageBatchSize)
                 break;
@@ -1016,6 +1011,72 @@ internal abstract class DbAsyncResponseChannelBase :
             afterCreatedAtUtc = last.CreatedAtUtc;
             afterId = last.Id;
         }
+    }
+
+    /// <summary>
+    /// Second pass of one sweep page: hydrates the header-only rows among <paramref name="eligible"/>
+    /// and admits every row to the correlation id's executor in page order. Returns <c>false</c>
+    /// when the executor is full (the page's remaining rows are left in the store, in order, and
+    /// a rescan is scheduled), which ends the correlation id's scan for this sweep.
+    /// </summary>
+    private async Task<bool> EnqueueEligibleAsync(
+        string correlationId,
+        List<DbChannelMessage> eligible,
+        List<Guid>? headerOnly,
+        List<IDbSubscription> subscriptions,
+        CancellationToken cancellationToken)
+    {
+        Dictionary<Guid, DbChannelMessage>? hydrated = null;
+        if (headerOnly is not null)
+        {
+            var loaded = await _store.LoadMessagesByIdAsync(correlationId, headerOnly, cancellationToken).ConfigureAwait(false);
+            hydrated = new Dictionary<Guid, DbChannelMessage>(loaded.Count);
+            foreach (var message in loaded)
+            {
+                // The by-id read is exact on the id (unique), but a hydrated row must carry its
+                // envelope: a store that answered header-only here would hand the waiter nothing.
+                if (message.EnvelopeJson is not null)
+                    hydrated[message.Id] = message;
+            }
+        }
+
+        foreach (var message in eligible)
+        {
+            var deliverable = message;
+            if (message.EnvelopeJson is null)
+            {
+                // Pruned or expired between the page read and the hydration: nothing to deliver
+                // now; a row that is still there is re-evaluated by the next sweep.
+                if (hydrated is null || !hydrated.TryGetValue(message.Id, out deliverable))
+                    continue;
+            }
+
+            // Work-item class, not a lambda: a queued closure would chain display classes
+            // pinning this paging frame (batch list, cursors, watermark) for as long as the
+            // item sits in the executor's bounded queue.
+            //
+            // NON-BLOCKING admission. This loop is the process-wide dispatch sweep and walks
+            // correlation ids sequentially, so waiting for ONE correlation id's executor
+            // capacity here (the old EnqueueAsync) parked delivery for every other waiter in
+            // the process: a waiter wedged in a slow Until predicate, fed a backlog of NEW
+            // progress messages (the pre-filter above only screens consumed history), filled
+            // its 1024-slot executor and the sweep then blocked on slot 1025 without ever
+            // querying the next correlation id. Its per-correlation backpressure became shared
+            // delivery blockage — unrelated remote/polled responses timed out behind it. At
+            // capacity the rest of this correlation id's messages are left unclaimed in the
+            // store, in order (nothing later is enqueued ahead of them), and a rescan of just
+            // this id is scheduled for when the executor has had a poll interval to drain.
+            var outcome = _executors.TryEnqueue(
+                ChannelName(correlationId),
+                new LocalDispatchWorkItem(this, deliverable, subscriptions, cancellationToken).InvokeAsync);
+            if (outcome == SerialExecutorRegistry.TryEnqueueOutcome.Full)
+            {
+                ScheduleBackpressureRescan(correlationId, cancellationToken);
+                return false;
+            }
+        }
+
+        return true;
     }
 
     /// <summary>
@@ -1617,7 +1678,10 @@ internal abstract class DbAsyncResponseChannelBase :
                 // JsonSafety, not the raw reader: a parse failure is logged below and handed to the
                 // waiter, and the reader's own message quotes inbound property names and dictionary
                 // keys (docs/security.md, "never logs a message body"). Size and position only.
-                var envelope = JsonSafety.SafeDeserialize(message.EnvelopeJson, AsyncResponseEnvelopeJson.TypeInfo<T>());
+                // A header-only sweep row never reaches delivery: the sweep hydrates it first.
+                var envelopeJson = message.EnvelopeJson
+                    ?? throw new InvalidOperationException($"The {_owner._providerName} channel message {message.Id} reached delivery without its envelope.");
+                var envelope = JsonSafety.SafeDeserialize(envelopeJson, AsyncResponseEnvelopeJson.TypeInfo<T>());
                 if (envelope is null)
                 {
                     finished = true;

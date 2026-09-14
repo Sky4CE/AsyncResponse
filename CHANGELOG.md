@@ -13,6 +13,75 @@ work that has landed on `main` but not yet shipped. Security reporters credited 
 
 ### Changed
 
+- **Round-39 review (2026-09-14): settlement over the whole failure set, storage-side history costs, and honest test claims.**
+  - *A transient sibling failure keeps the message for redelivery whatever precedes it.* The
+    lost-subscriber dispatcher settled a shared-correlation fan-out on the FIRST failure it saw:
+    with a deterministic fault (an unresolvable target) ahead of a transient one (a resume whose
+    dependency was briefly down) and a sibling that succeeded, the residual was classified as
+    deterministic, the message was acknowledged, and the transient registration — a valid waiter
+    — lost the only copy of its payload; the opposite order propagated for redelivery. The verdict
+    is now taken over every failed registration, on the response and the exception route alike:
+    deterministic failures are logged and their registrations kept for the watchdog, any transient
+    failure in the set propagates as `RecoveryCallbackFailedException` so the transport redelivers
+    to the registrations still armed, and the message is acknowledged only when every failure was
+    deterministic. With no success at all, a sibling whose failure-callback ladder was exhausted
+    propagates ahead of an earlier sibling's fault, so the ingress no longer burns its own retry
+    ladder and escalates through `SetException` into the callback that just gave up.
+  - *Typed in-memory delivery is body-free.* Each waiter re-materializes the published payload
+    from its wire bytes through the raw reader; a payload that did not fit the waiter's type failed
+    inside the payload with the reader's own `JsonException`, whose `Path` named the offending
+    dictionary key — into the waiter's task and, through `SetError`, the wait activity's status.
+    The materialization now goes through `JsonSafety`: the waiter faults with the same position-only
+    `InvalidDataException` every broker channel uses.
+  - *MySQL: a duplicate create no longer needs a second pooled connection.* The 1062 handling
+    confirmed "this flow id exists" on a freshly opened connection while the create still held its
+    own, so on a pool of one a single duplicate start timed out with "All pooled connections are in
+    use", and concurrent idempotent starts starved any pool waiting on each other. The check runs
+    on the connection the create holds.
+  - *Database channels: acknowledged history no longer travels with every sweep.* The sweep
+    re-reads a subscribed correlation id's retained rows on every tick and every targeted signal,
+    acknowledged rows included (a fan-out waiter in another process still needs them), and every
+    row came back with its body only to be dropped by the pre-filter — a long-lived progress
+    subscription's sweep cost grew with its whole retained history. The PostgreSQL, SQL Server, and
+    MongoDB page queries now ship `envelope_json` only for rows nobody has acknowledged;
+    acknowledged rows come back header-only and the sweep hydrates, in one by-id read
+    (`LoadMessagesByIdAsync`), only the rare acknowledged row a live subscription has not seen,
+    then admits the page in order as before. Same delivery semantics, same watermark, no schema
+    change.
+  - *Cosmos: the size budget is enforced on the document Cosmos receives.* `MaxStateBytes`
+    measured the ledger JSON, but the document embeds it as a string and escapes it again, so a
+    1.2 MB ledger of escaped characters was a 2.4 MB document — accepted by the guard, refused by
+    the 2 MB item cap on every retry. Creates and checkpoints now measure the complete document
+    through the registered client's serializer (or the SDK default's shape) and fail with
+    `FlowStateTooLargeException` naming the document size; the ledger-only check stays as the
+    cheap pre-check.
+  - *Testing: a simulated restart refuses to overstate what it proved.* `SimulateRestartAsync`
+    proceeded past user code that outlived the graceful stop — the "dead" execution kept running
+    beside the new incarnation and performed its side effect after the restart had returned. The
+    restart is cooperative (there is no process to kill), so it now fails with
+    `InvalidOperationException` when user code is still executing after the stop lapsed; the new
+    `AsyncResponseTestHarnessOptions.AbandonLingeringExecutionsOnRestart` accepts the overlap
+    explicitly. Engine-owned parks (awaited steps, in-process timers) are unaffected. The
+    testing guide documents what a restart can and cannot claim and points crash-at-checkpoint
+    assertions at `CrashBeforeStep`/`CrashAfterStep`.
+  - *NATS: a stalled in-progress heartbeat cannot strand the subscriber loop.* The heartbeat ran
+    with `CancellationToken.None` and the batch joined the renewal loop without a bound, so one
+    heartbeat wedged on a dead socket held the batch after every message in it had settled — no
+    further batch was fetched, a stop never completed, and the supervisor had nothing to restart.
+    The heartbeat now carries the batch's cancellation token into the SDK call and the join is
+    bounded by one heartbeat interval (`AckWait`/3), after which the loop is abandoned with a
+    warning and unsettled deliveries fall back to the server's `AckWait`.
+  - *Durable flows: the ledger cost curve is benchmarked.* Every checkpoint rewrites the whole
+    ledger (about N²/2 step-results over an N-step run — documented under "Supported ledger
+    budgets"); the new `LedgerGrowthBenchmarks` measures a complete run at 50/200/400 steps so the
+    curve is checked, not inferred. Incremental checkpoint persistence stays on the roadmap.
+  - Tests: red-on-old proofs against f92f1e7 for every code change — six orderings × two routes
+    of the settlement verdict plus the exhausted-sibling precedence, the typed in-memory leak
+    probe, the escaped-Cosmos-document guard, the header-only sweep hydration (Mongo harness) and
+    the three providers' direct integration tests, the MySQL pool-of-one duplicate create, the
+    stalled-heartbeat NATS batch, and the harness refusing a lingering execution — plus new-API
+    pins.
+
 - **Round-38 review (2026-09-11): recovery invariants enforced consistently across persistence and settlement.**
   - *A parked child can no longer lose its parent to a concurrent checkpoint.* Round 36 made a
     descendant's long park extend every ancestor's ledger, but a lost revision race was treated

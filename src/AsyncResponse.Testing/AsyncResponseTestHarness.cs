@@ -38,6 +38,22 @@ public sealed class AsyncResponseTestHarnessOptions
     public TimeSpan RealTimeGuard { get; set; } = TimeSpan.FromSeconds(10);
 
     /// <summary>
+    /// What <see cref="AsyncResponseTestHarness.SimulateRestartAsync"/> does when user code is
+    /// still executing after the old incarnation's graceful stop lapsed
+    /// (<see cref="RealTimeGuard"/>): a step body that ignored its cancellation and is blocked on
+    /// something the test controls, for example. A simulated restart is <b>cooperative</b> — it
+    /// discards the process-bound state a crash would lose, but it cannot terminate a running
+    /// delegate the way a process kill does — so such an execution would keep running beside the
+    /// new incarnation and perform its side effects after the "restart" returned, proving less
+    /// than the test claims. Default (<c>false</c>): the restart fails with
+    /// <see cref="InvalidOperationException"/> naming the count. <c>true</c>: the executions are
+    /// abandoned (their leases broken, their provider disposed) and the restart proceeds; the
+    /// test then owns the overlap. Engine-owned parks — an awaited step or an in-process timer
+    /// holding its worker slot on the virtual clock — are not user code and never trip this.
+    /// </summary>
+    public bool AbandonLingeringExecutionsOnRestart { get; set; }
+
+    /// <summary>
     /// Flow-execution observers installed into every incarnation (the current one and each
     /// simulated restart). <see cref="FlowTestHarness"/> installs its probe here.
     /// </summary>
@@ -195,6 +211,12 @@ public sealed class AsyncResponseTestHarness : IAsyncDisposable
     /// makes cron schedules skip the occurrences that fell into the downtime, exactly as a real
     /// outage would.
     /// </param>
+    /// <exception cref="InvalidOperationException">
+    /// User code of the old incarnation was still executing after the graceful stop lapsed and
+    /// <see cref="AsyncResponseTestHarnessOptions.AbandonLingeringExecutionsOnRestart"/> is off:
+    /// the restart is cooperative and cannot kill that code, so it refuses to report a restart
+    /// the surviving execution would contradict.
+    /// </exception>
     public async Task SimulateRestartAsync(Action? whileDown = null)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
@@ -206,6 +228,29 @@ public sealed class AsyncResponseTestHarness : IAsyncDisposable
         // Resolved BEFORE the provider goes away; abandoned after, once nothing can add to it.
         var dyingChannel = _provider.GetService<InMemoryAsyncResponseChannel>();
         await StopHostedServicesAsync().ConfigureAwait(false);
+
+        // Quiescence check BEFORE the provider is discarded. Jobs still outstanding after the
+        // bounded stop are executions the stop could not end. Engine-owned parks (an awaited step
+        // or an in-process timer holding its worker slot on the virtual clock) are expected —
+        // their leases are broken below and the new incarnation takes them over, as after a real
+        // crash. Anything beyond them is USER code still running: this restart cannot terminate
+        // it (there is no process to kill), so reporting a restart while it keeps executing —
+        // and performs side effects after the restart "completed" — would prove less than the
+        // test claims. Refuse unless the test opted into owning that overlap.
+        var lingering = Transport.OutstandingJobs + _quiesce.DirectRunsInFlight - _quiesce.ParkedCount;
+        if (lingering > 0 && !_options.AbandonLingeringExecutionsOnRestart)
+        {
+            throw new InvalidOperationException(
+                $"{nameof(SimulateRestartAsync)} could not establish quiescence: {lingering} execution(s) of the old incarnation " +
+                $"were still running user code after the graceful stop lapsed ({_options.RealTimeGuard} of real time). A simulated " +
+                "restart is cooperative — it cannot terminate a running delegate the way a process kill does — so that code would " +
+                "keep running beside the new incarnation and perform its side effects after the restart. Let the step observe its " +
+                "cancellation token or finish before restarting, inject a crash at the checkpoint boundary with " +
+                "FlowTestHarness.CrashBeforeStep/CrashAfterStep, or set " +
+                $"{nameof(AsyncResponseTestHarnessOptions)}.{nameof(AsyncResponseTestHarnessOptions.AbandonLingeringExecutionsOnRestart)} " +
+                "to accept the overlap.");
+        }
+
         await _provider.DisposeAsync().ConfigureAwait(false);
 
         // Hard-crash semantics for whatever survived the graceful stop: a parked execution's

@@ -9,10 +9,17 @@ using AsyncResponse.Internal;
 
 namespace AsyncResponse.Channels.MongoDB;
 
+/// <summary>One stored response envelope row/document as the channel store returns it.</summary>
+/// <remarks>
+/// <c>EnvelopeJson</c> is the stored envelope, or <c>null</c> for a document the dispatch sweep loaded header-only (an
+/// already-acknowledged one — see <see cref="MongoDbChannelStore.LoadMessagesAsync"/>); the
+/// sweep hydrates the few such documents it still has to deliver through
+/// <see cref="MongoDbChannelStore.LoadMessagesByIdAsync"/> before handing them to a waiter.
+/// </remarks>
 internal readonly record struct MongoDbChannelMessage(
     Guid Id,
     string CorrelationId,
-    string EnvelopeJson,
+    string? EnvelopeJson,
     DateTimeOffset CreatedAtUtc,
     DateTimeOffset? AckedAtUtc = null,
     long? AckedSeq = null);
@@ -441,11 +448,74 @@ internal sealed class MongoDbChannelStore : IDisposable
                     Builders<MongoChannelMessageDocument>.Filter.Gt(item => item.Id, cursorId)));
         }
         var documents = await _messages.Find(filter)
+            .Project(SweepProjection)
             .Sort(Builders<MongoChannelMessageDocument>.Sort
                 .Ascending(item => item.CreatedAtUtc)
                 .Ascending(item => item.Id))
             .Limit(batchSize)
             .ToListAsync(cancellationToken).ConfigureAwait(false);
+        return ToMessages(documents);
+    }
+
+    /// <summary>
+    /// The sweep's projection: every field but the envelope, and the envelope only for a document
+    /// nobody has acknowledged yet. Acknowledged documents are the consumed history the sweep
+    /// re-reads on every tick (they stay in the result so a fan-out waiter in ANOTHER process
+    /// still receives them): shipping their bodies with each sweep made a long-lived progress
+    /// subscription's cost grow with its whole retained history. The shared sweep fetches the
+    /// envelope by id for the rare acknowledged document a live subscription has not seen.
+    /// <c>$ifNull</c> folds a missing <c>acked_at</c> (a pre-settlement document) into null.
+    /// </summary>
+    internal static readonly ProjectionDefinition<MongoChannelMessageDocument, MongoChannelMessageDocument> SweepProjection =
+        new BsonDocumentProjectionDefinition<MongoChannelMessageDocument, MongoChannelMessageDocument>(new BsonDocument
+        {
+            ["_id"] = 1,
+            ["correlation_id"] = 1,
+            ["created_at"] = 1,
+            ["expires_at"] = 1,
+            ["acked_at"] = 1,
+            ["acked_seq"] = 1,
+            ["recovery_claimed"] = 1,
+            ["envelope_json"] = new BsonDocument("$cond", new BsonArray
+            {
+                new BsonDocument("$eq", new BsonArray
+                {
+                    new BsonDocument("$ifNull", new BsonArray { "$acked_at", BsonNull.Value }),
+                    BsonNull.Value
+                }),
+                "$envelope_json",
+                BsonNull.Value
+            })
+        });
+
+    /// <summary>
+    /// The full documents (envelope included) for <paramref name="ids"/> under
+    /// <paramref name="correlationId"/>, in sweep order — how the dispatch sweep hydrates the
+    /// header-only acknowledged documents it still has to deliver. A document reaped between the
+    /// sweep's page and this read is simply absent.
+    /// </summary>
+    public async Task<IReadOnlyList<MongoDbChannelMessage>> LoadMessagesByIdAsync(
+        string correlationId,
+        IReadOnlyList<Guid> ids,
+        CancellationToken cancellationToken)
+    {
+        if (ids.Count == 0)
+            return [];
+
+        await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
+        var filter = Builders<MongoChannelMessageDocument>.Filter.Eq(item => item.CorrelationId, correlationId)
+                     & Builders<MongoChannelMessageDocument>.Filter.In(item => item.Id, ids)
+                     & NotExpiredOnServerClock<MongoChannelMessageDocument>();
+        var documents = await _messages.Find(filter)
+            .Sort(Builders<MongoChannelMessageDocument>.Sort
+                .Ascending(item => item.CreatedAtUtc)
+                .Ascending(item => item.Id))
+            .ToListAsync(cancellationToken).ConfigureAwait(false);
+        return ToMessages(documents);
+    }
+
+    private static List<MongoDbChannelMessage> ToMessages(List<MongoChannelMessageDocument> documents)
+    {
         var messages = new List<MongoDbChannelMessage>(documents.Count);
         foreach (var document in documents)
             messages.Add(new MongoDbChannelMessage(
@@ -804,8 +874,9 @@ internal sealed class MongoChannelMessageDocument
     [BsonElement("correlation_id")]
     public string CorrelationId { get; set; } = "";
 
+    /// <summary>Null only on a sweep projection of an acknowledged document (<see cref="MongoDbChannelStore.SweepProjection"/>).</summary>
     [BsonElement("envelope_json")]
-    public string EnvelopeJson { get; set; } = "";
+    public string? EnvelopeJson { get; set; } = "";
 
     [BsonElement("created_at")]
     public DateTime CreatedAtUtc { get; set; }
