@@ -3,20 +3,20 @@
 
 |||
 |:---|:---|
-| Generated on: | 09/11/2026 - 15:44:16 |
-| Coverage date: | 09/11/2026 - 15:28:51 - 09/11/2026 - 15:43:35 |
+| Generated on: | 09/17/2026 - 16:39:40 |
+| Coverage date: | 09/17/2026 - 16:24:31 - 09/17/2026 - 16:35:47 |
 | Parser: | MultiReport (16x Cobertura) |
 | Assemblies: | 27 |
 | Classes: | 461 |
 | Files: | 228 |
-| **Line coverage:** | 94.8% (26919 of 28382) |
-| Covered lines: | 26919 |
-| Uncovered lines: | 1463 |
-| Coverable lines: | 28382 |
-| Total lines: | 55135 |
-| **Branch coverage:** | 88.6% (9255 of 10440) |
-| Covered branches: | 9255 |
-| Total branches: | 10440 |
+| **Line coverage:** | 94.9% (27201 of 28659) |
+| Covered lines: | 27201 |
+| Uncovered lines: | 1458 |
+| Coverable lines: | 28659 |
+| Total lines: | 55689 |
+| **Branch coverage:** | 88.7% (9409 of 10600) |
+| Covered branches: | 9409 |
+| Total branches: | 10600 |
 | **Method coverage:** | [Feature is only available for sponsors](https://reportgenerator.io/pro) |
 
 </details>
@@ -62,14 +62,14 @@
 |**Name**|**Line**|**Branch**|
 |:---|---:|---:|
 |**AsyncResponse.Channels.MongoDB**|**95.6%**|**89.5%**|
-|AsyncResponse.Channels.DbAsyncResponseChannelBase|95%|90.7%|
+|AsyncResponse.Channels.DbAsyncResponseChannelBase|95%|90.9%|
 |AsyncResponse.Channels.MongoDB.MongoChannelMessageDocument|100%||
 |AsyncResponse.Channels.MongoDB.MongoChannelSubscriberDocument|0%||
 |AsyncResponse.Channels.MongoDB.MongoDbAsyncResponseChannel|68.8%|70%|
 |AsyncResponse.Channels.MongoDB.MongoDbAsyncResponseChannelOptions|100%|95.8%|
 |AsyncResponse.Channels.MongoDB.MongoDbAsyncResponseWaiter`1|100%||
 |AsyncResponse.Channels.MongoDB.MongoDbChannelMessage|100%||
-|AsyncResponse.Channels.MongoDB.MongoDbChannelStore|99.2%|82.8%|
+|AsyncResponse.Channels.MongoDB.MongoDbChannelStore|99%|82%|
 |AsyncResponse.Channels.MongoDB.MongoDbRecoveryStateStore|100%|90%|
 |AsyncResponse.Channels.MongoDB.MongoRecoveryStateDocument|0%||
 |AsyncResponse.Internal.MongoNamespaceRegistry|100%|100%|
@@ -82,8 +82,8 @@
 
 |**Name**|**Line**|**Branch**|
 |:---|---:|---:|
-|**AsyncResponse.Channels.NATS**|**98.3%**|**94.3%**|
-|AsyncResponse.Channels.NATS.NatsAsyncResponseChannel|97.6%|92.1%|
+|**AsyncResponse.Channels.NATS**|**98.3%**|**94%**|
+|AsyncResponse.Channels.NATS.NatsAsyncResponseChannel|97.6%|91.5%|
 |AsyncResponse.Channels.NATS.NatsAsyncResponseChannelOptions|100%|100%|
 |AsyncResponse.Channels.NATS.NatsAsyncResponseWaiter`1|100%||
 |AsyncResponse.Channels.NATS.NatsConsumeLoopException|100%||
@@ -97,17 +97,17 @@
 |Microsoft.Extensions.DependencyInjection.NatsAsyncResponseChannelServiceCol<br/>lectionExtensions|100%|75%|
 
 </details>
-<details><summary>AsyncResponse.Channels.PostgreSQL - 93.6%</summary>
+<details><summary>AsyncResponse.Channels.PostgreSQL - 94.5%</summary>
 
 |**Name**|**Line**|**Branch**|
 |:---|---:|---:|
-|**AsyncResponse.Channels.PostgreSQL**|**93.6%**|**83%**|
-|AsyncResponse.Channels.DbAsyncResponseChannelBase|90.9%|83.6%|
-|AsyncResponse.Channels.PostgreSQL.PostgreSqlAsyncResponseChannel|94.2%|75%|
+|**AsyncResponse.Channels.PostgreSQL**|**94.5%**|**84.2%**|
+|AsyncResponse.Channels.DbAsyncResponseChannelBase|92.6%|86%|
+|AsyncResponse.Channels.PostgreSQL.PostgreSqlAsyncResponseChannel|100%|75%|
 |AsyncResponse.Channels.PostgreSQL.PostgreSqlAsyncResponseChannelOptions|100%|100%|
 |AsyncResponse.Channels.PostgreSQL.PostgreSqlAsyncResponseWaiter`1|100%||
 |AsyncResponse.Channels.PostgreSQL.PostgreSqlChannelMessage|100%||
-|AsyncResponse.Channels.PostgreSQL.PostgreSqlChannelSql|98.7%|88.7%|
+|AsyncResponse.Channels.PostgreSQL.PostgreSqlChannelSql|98.9%|89%|
 |AsyncResponse.Channels.PostgreSQL.PostgreSqlRecoveryStateStore|100%|90%|
 |AsyncResponse.Internal.PostgreSqlRelationVerifier|85%|70.3%|
 |AsyncResponse.Internal.PostgreSqlTransientFaults|100%|100%|
@@ -129,17 +129,17 @@
 |Microsoft.Extensions.DependencyInjection.RedisAsyncResponseServiceCollectio<br/>nExtensions|100%|75%|
 
 </details>
-<details><summary>AsyncResponse.Channels.SqlServer - 94.3%</summary>
+<details><summary>AsyncResponse.Channels.SqlServer - 95%</summary>
 
 |**Name**|**Line**|**Branch**|
 |:---|---:|---:|
-|**AsyncResponse.Channels.SqlServer**|**94.3%**|**83.8%**|
-|AsyncResponse.Channels.DbAsyncResponseChannelBase|91%|83.6%|
+|**AsyncResponse.Channels.SqlServer**|**95%**|**84.9%**|
+|AsyncResponse.Channels.DbAsyncResponseChannelBase|92.7%|86%|
 |AsyncResponse.Channels.SqlServer.SqlServerAsyncResponseChannel|100%|100%|
 |AsyncResponse.Channels.SqlServer.SqlServerAsyncResponseChannelOptions|100%|100%|
 |AsyncResponse.Channels.SqlServer.SqlServerAsyncResponseWaiter`1|100%||
 |AsyncResponse.Channels.SqlServer.SqlServerChannelMessage|100%||
-|AsyncResponse.Channels.SqlServer.SqlServerChannelSql|98.5%|88.9%|
+|AsyncResponse.Channels.SqlServer.SqlServerChannelSql|98.5%|89.3%|
 |AsyncResponse.Channels.SqlServer.SqlServerRecoveryStateStore|100%|90%|
 |AsyncResponse.Internal.RelationalNamePlan|73.3%|83.3%|
 |AsyncResponse.Internal.SqlServerRelationVerifier|91.3%|78.3%|
@@ -151,7 +151,7 @@
 
 |**Name**|**Line**|**Branch**|
 |:---|---:|---:|
-|**AsyncResponse.Core**|**95.3%**|**91%**|
+|**AsyncResponse.Core**|**95.3%**|**91.1%**|
 |AsyncResponse.AsyncResponseBuilder|100%||
 |AsyncResponse.AsyncResponseBuilder`1|100%|100%|
 |AsyncResponse.AsyncResponseBuilderBase|96%|98.7%|
@@ -180,14 +180,14 @@
 |AsyncResponse.AsyncResponseWatchdogOptions|100%|100%|
 |AsyncResponse.AsyncResponseWatchdogReport|100%|100%|
 |AsyncResponse.AsyncResponseWatchdogSnapshot|100%||
-|AsyncResponse.AsyncResponseWatchdogState|100%|66.6%|
+|AsyncResponse.AsyncResponseWatchdogState|100%|83.3%|
 |AsyncResponse.CallbackExpressionConverter|98.3%|88.4%|
 |AsyncResponse.CallbackTargetUnresolvableException|100%||
 |AsyncResponse.ChannelSerialExecutor|100%|100%|
 |AsyncResponse.CorrelationIdGuard|96.2%|95%|
 |AsyncResponse.CronSchedule|96.8%|95.8%|
 |AsyncResponse.DurableAsyncResponseChannelOptions|100%||
-|AsyncResponse.DurableFlowContext|91.9%|83.6%|
+|AsyncResponse.DurableFlowContext|91.9%|83.9%|
 |AsyncResponse.DurableFlowExecutor|97.9%|93.6%|
 |AsyncResponse.DurableFlowObserverLifetimeAudit|60%|28.5%|
 |AsyncResponse.DurableFlowOptions|100%||
@@ -195,19 +195,19 @@
 |AsyncResponse.DurableFlowService|93.7%|94.4%|
 |AsyncResponse.DurableFlowSuspendedException|100%||
 |AsyncResponse.FlowExecutionLease|96%|85%|
-|AsyncResponse.FlowStateConcurrency|100%|98.3%|
+|AsyncResponse.FlowStateConcurrency|100%|98.4%|
 |AsyncResponse.FlowStateJson|100%|96.1%|
 |AsyncResponse.FlowStateRetention|100%|94.4%|
 |AsyncResponse.InMemoryAsyncResponseChannel|94.5%|91.4%|
 |AsyncResponse.InMemoryAsyncResponseOptions|100%|100%|
 |AsyncResponse.InMemoryAsyncResponseWaiter`1|100%||
 |AsyncResponse.InMemoryFlowStateStore|99.1%|90.2%|
-|AsyncResponse.InMemoryRecoveryStateStore|96.7%|89.6%|
+|AsyncResponse.InMemoryRecoveryStateStore|96.7%|91.2%|
 |AsyncResponse.InMemoryWorkerHost|93.4%|88.2%|
 |AsyncResponse.InMemoryWorkerTransport|91.1%|85.9%|
 |AsyncResponse.InMemoryWorkerTransportOptions|100%|100%|
-|AsyncResponse.JsonSafety|96%|72.2%|
-|AsyncResponse.LostSubscriberCallbackDispatcher|98.3%|89.8%|
+|AsyncResponse.JsonSafety|96.7%|72.2%|
+|AsyncResponse.LostSubscriberCallbackDispatcher|97.2%|89.4%|
 |AsyncResponse.LostSubscriberDispatchResult|100%||
 |AsyncResponse.PayloadRecoveryClassifier|100%|96.4%|
 |AsyncResponse.PortableText|100%|100%|
@@ -222,7 +222,7 @@
 |AsyncResponse.ScheduledFlowOptions|100%||
 |AsyncResponse.ScheduledFlowRegistration|100%||
 |AsyncResponse.ScheduledFlowService|70.6%|70.5%|
-|AsyncResponse.SerialExecutorRegistry|93.2%|94.1%|
+|AsyncResponse.SerialExecutorRegistry|93.9%|95.5%|
 |AsyncResponse.ShutdownBudgetValidator|100%|100%|
 |AsyncResponse.UnresolvableTypeNames|95%|75%|
 |AsyncResponse.WorkerJobExecutor|95.9%|80.9%|
@@ -235,14 +235,14 @@
 |Microsoft.Extensions.Logging.AsyncResponseLoggerExtensions|100%|100%|
 
 </details>
-<details><summary>AsyncResponse.DurableFlows.Cosmos - 91.4%</summary>
+<details><summary>AsyncResponse.DurableFlows.Cosmos - 90.3%</summary>
 
 |**Name**|**Line**|**Branch**|
 |:---|---:|---:|
-|**AsyncResponse.DurableFlows.Cosmos**|**91.4%**|**89.1%**|
+|**AsyncResponse.DurableFlows.Cosmos**|**90.3%**|**87%**|
 |AsyncResponse.DurableFlows.Cosmos.CosmosDurableFlowOptions|82.6%|81.2%|
 |AsyncResponse.DurableFlows.Cosmos.CosmosFlowStateDocument|100%||
-|AsyncResponse.DurableFlows.Cosmos.CosmosFlowStateStore|96.3%|93.4%|
+|AsyncResponse.DurableFlows.Cosmos.CosmosFlowStateStore|93.7%|88.7%|
 |AsyncResponse.DurableFlows.Cosmos.CosmosLeaseProjection|100%||
 |AsyncResponse.DurableFlows.Internal.DurableFlowStoreShared|80.6%|84.7%|
 |AsyncResponse.DurableFlows.Internal.FlowStateTooLargeException|100%||
@@ -353,12 +353,12 @@
 |Microsoft.Extensions.DependencyInjection.SqlServerDurableFlowServiceCollect<br/>ionExtensions|100%||
 
 </details>
-<details><summary>AsyncResponse.Testing - 89.3%</summary>
+<details><summary>AsyncResponse.Testing - 89.6%</summary>
 
 |**Name**|**Line**|**Branch**|
 |:---|---:|---:|
-|**AsyncResponse.Testing**|**89.3%**|**83.6%**|
-|AsyncResponse.Testing.AsyncResponseTestHarness|93.3%|84.2%|
+|**AsyncResponse.Testing**|**89.6%**|**83.9%**|
+|AsyncResponse.Testing.AsyncResponseTestHarness|93.7%|85.1%|
 |AsyncResponse.Testing.AsyncResponseTestHarnessOptions|100%||
 |AsyncResponse.Testing.FlowProbe|85.8%|80.2%|
 |AsyncResponse.Testing.FlowProbeEvent|100%||
@@ -372,14 +372,14 @@
 
 |**Name**|**Line**|**Branch**|
 |:---|---:|---:|
-|**AsyncResponse.Transports.AzureServiceBus**|**96.6%**|**90%**|
+|**AsyncResponse.Transports.AzureServiceBus**|**96.6%**|**92.8%**|
 |AsyncResponse.Transports.AzureServiceBus.AwaitingAzureServiceBusMessageDisp<br/>atcher|100%|100%|
 |AsyncResponse.Transports.AzureServiceBus.AzureServiceBusAsyncResponseOption<br/>s|100%||
 |AsyncResponse.Transports.AzureServiceBus.AzureServiceBusBackgroundFailureCo<br/>ntext|90%||
 |AsyncResponse.Transports.AzureServiceBus.AzureServiceBusClientAdapter|100%|100%|
 |AsyncResponse.Transports.AzureServiceBus.AzureServiceBusClientResolver|100%|100%|
 |AsyncResponse.Transports.AzureServiceBus.AzureServiceBusCorrelationIdExtrac<br/>tor|90.9%|90.9%|
-|AsyncResponse.Transports.AzureServiceBus.AzureServiceBusMessageDispatcher|98.8%|76.4%|
+|AsyncResponse.Transports.AzureServiceBus.AzureServiceBusMessageDispatcher|98.8%|97%|
 |AsyncResponse.Transports.AzureServiceBus.AzureServiceBusOptionsValidator|100%|100%|
 |AsyncResponse.Transports.AzureServiceBus.AzureServiceBusOutboundMessage|100%||
 |AsyncResponse.Transports.AzureServiceBus.AzureServiceBusReceiverAdapter|100%|100%|
@@ -428,9 +428,9 @@
 
 |**Name**|**Line**|**Branch**|
 |:---|---:|---:|
-|**AsyncResponse.Transports.Kafka**|**97.3%**|**95.2%**|
+|**AsyncResponse.Transports.Kafka**|**97.3%**|**95.5%**|
 |AsyncResponse.Transports.CorrelationIdJsonPaths|99%|93.1%|
-|AsyncResponse.Transports.Kafka.AwaitingKafkaMessageDispatcher|90.4%|88.8%|
+|AsyncResponse.Transports.Kafka.AwaitingKafkaMessageDispatcher|90.8%|90.7%|
 |AsyncResponse.Transports.Kafka.KafkaAsyncResponseTransportOptions|100%||
 |AsyncResponse.Transports.Kafka.KafkaBackgroundFailureContext|95.6%||
 |AsyncResponse.Transports.Kafka.KafkaConsumerClientAdapter|100%|100%|
@@ -492,11 +492,11 @@
 |Microsoft.Extensions.DependencyInjection.MongoDbAsyncResponseTransportServi<br/>ceCollectionExtensions|97.9%|87.5%|
 
 </details>
-<details><summary>AsyncResponse.Transports.NATS - 97.5%</summary>
+<details><summary>AsyncResponse.Transports.NATS - 97.6%</summary>
 
 |**Name**|**Line**|**Branch**|
 |:---|---:|---:|
-|**AsyncResponse.Transports.NATS**|**97.5%**|**95.3%**|
+|**AsyncResponse.Transports.NATS**|**97.6%**|**95%**|
 |AsyncResponse.Transports.CorrelationIdJsonPaths|99%|93.1%|
 |AsyncResponse.Transports.NATS.INatsJetStreamTransport|0%||
 |AsyncResponse.Transports.NATS.NatsAsyncResponseTransportOptions|100%||
@@ -509,7 +509,7 @@
 |AsyncResponse.Transports.NATS.NatsReplyTargetProvider|100%|100%|
 |AsyncResponse.Transports.NATS.NatsResponseIngressSubscriber|100%|50%|
 |AsyncResponse.Transports.NATS.NatsSubscriberOptions|100%|100%|
-|AsyncResponse.Transports.NATS.NatsSubscriberService|90.4%|95.4%|
+|AsyncResponse.Transports.NATS.NatsSubscriberService|91.8%|91.6%|
 |AsyncResponse.Transports.NATS.NatsTransportOptionsValidator|100%|100%|
 |AsyncResponse.Transports.NATS.NatsTransportRetry|100%|100%|
 |AsyncResponse.Transports.NATS.NatsTransportSubjectSchema|100%|100%|
@@ -550,13 +550,13 @@
 |Microsoft.Extensions.DependencyInjection.PostgreSqlAsyncResponseTransportSe<br/>rviceCollectionExtensions|100%||
 
 </details>
-<details><summary>AsyncResponse.Transports.RabbitMQ - 96.3%</summary>
+<details><summary>AsyncResponse.Transports.RabbitMQ - 95.6%</summary>
 
 |**Name**|**Line**|**Branch**|
 |:---|---:|---:|
-|**AsyncResponse.Transports.RabbitMQ**|**96.3%**|**89.2%**|
+|**AsyncResponse.Transports.RabbitMQ**|**95.6%**|**89.2%**|
 |AsyncResponse.Transports.CorrelationIdJsonPaths|99%|93.1%|
-|AsyncResponse.Transports.RabbitMQ.AwaitingRabbitMqMessageDispatcher|82.6%|86.3%|
+|AsyncResponse.Transports.RabbitMQ.AwaitingRabbitMqMessageDispatcher|75%|86.3%|
 |AsyncResponse.Transports.RabbitMQ.QueuedRabbitMqMessageDispatcher|88.1%|83.3%|
 |AsyncResponse.Transports.RabbitMQ.RabbitMqAsyncResponseOptions|100%||
 |AsyncResponse.Transports.RabbitMQ.RabbitMqBackgroundFailureContext|100%||
@@ -580,11 +580,11 @@
 |Microsoft.Extensions.DependencyInjection.RabbitMqAsyncResponseServiceCollec<br/>tionExtensions|100%||
 
 </details>
-<details><summary>AsyncResponse.Transports.Redis - 96.9%</summary>
+<details><summary>AsyncResponse.Transports.Redis - 97%</summary>
 
 |**Name**|**Line**|**Branch**|
 |:---|---:|---:|
-|**AsyncResponse.Transports.Redis**|**96.9%**|**95.9%**|
+|**AsyncResponse.Transports.Redis**|**97%**|**96.4%**|
 |AsyncResponse.Transports.CorrelationIdJsonPaths|99%|94.8%|
 |AsyncResponse.Transports.Redis.AwaitingRedisMessageDispatcher|100%|100%|
 |AsyncResponse.Transports.Redis.IRedisStreamDatabase|0%||
@@ -599,7 +599,7 @@
 |AsyncResponse.Transports.Redis.RedisStreamDatabaseAdapter|100%|100%|
 |AsyncResponse.Transports.Redis.RedisStreamDelivery|100%||
 |AsyncResponse.Transports.Redis.RedisSubscriberOptions|100%|100%|
-|AsyncResponse.Transports.Redis.RedisSubscriberService|92.3%|93.1%|
+|AsyncResponse.Transports.Redis.RedisSubscriberService|92.8%|95.4%|
 |AsyncResponse.Transports.Redis.RedisTransportKeySchema|100%|100%|
 |AsyncResponse.Transports.Redis.RedisTransportOptionsValidator|92.3%|96.1%|
 |AsyncResponse.Transports.Redis.RedisTransportRetry|100%|100%|
@@ -640,11 +640,11 @@
 |Microsoft.Extensions.DependencyInjection.SqlServerAsyncResponseTransportSer<br/>viceCollectionExtensions|100%||
 
 </details>
-<details><summary>AsyncResponse.Transports.SQS - 99.3%</summary>
+<details><summary>AsyncResponse.Transports.SQS - 99.1%</summary>
 
 |**Name**|**Line**|**Branch**|
 |:---|---:|---:|
-|**AsyncResponse.Transports.SQS**|**99.3%**|**92.8%**|
+|**AsyncResponse.Transports.SQS**|**99.1%**|**90.1%**|
 |AsyncResponse.Transports.CorrelationIdJsonPaths|99%|93.1%|
 |AsyncResponse.Transports.SQS.AwaitingSqsMessageDispatcher|100%|100%|
 |AsyncResponse.Transports.SQS.QueuedSqsMessageDispatcher|99.1%|92.8%|
@@ -654,7 +654,7 @@
 |AsyncResponse.Transports.SQS.SqsClientFactory|100%|70%|
 |AsyncResponse.Transports.SQS.SqsClientResolver|100%|100%|
 |AsyncResponse.Transports.SQS.SqsCorrelationIdExtractor|100%|100%|
-|AsyncResponse.Transports.SQS.SqsMessageDispatcher|98.9%|89.2%|
+|AsyncResponse.Transports.SQS.SqsMessageDispatcher|98.9%|64.2%|
 |AsyncResponse.Transports.SQS.SqsOptionsValidator|100%|96.9%|
 |AsyncResponse.Transports.SQS.SqsOutboundMessage|100%||
 |AsyncResponse.Transports.SQS.SqsQueueAddress|100%|87.5%|
@@ -664,7 +664,7 @@
 |AsyncResponse.Transports.SQS.SqsReplyTargetProvider|100%|91.6%|
 |AsyncResponse.Transports.SQS.SqsResponseIngressSubscriber|100%|50%|
 |AsyncResponse.Transports.SQS.SqsSubscriberOptions|100%|100%|
-|AsyncResponse.Transports.SQS.SqsSubscriberService|100%|96.4%|
+|AsyncResponse.Transports.SQS.SqsSubscriberService|98.6%|88.8%|
 |AsyncResponse.Transports.SQS.SqsTransportDelivery|100%||
 |AsyncResponse.Transports.SQS.SqsWorkerSubscriber|100%||
 |AsyncResponse.Transports.SQS.SqsWorkerTransport|96.7%|88%|
