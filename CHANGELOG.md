@@ -13,6 +13,17 @@ work that has landed on `main` but not yet shipped. Security reporters credited 
 
 ### Changed
 
+- Redis worker publication records deduplication only after a successful append; a lost error
+  reply cannot acknowledge missing work. The Redis Streams transport now requires Lua execution
+  (`EVAL`/`EVALSHA`) in broker ACLs. Successful retries still append only once.
+- JSON diagnostics also sanitize serializer `NotSupportedException` paths. SQS retry visibility
+  changes wait for in-flight renewals, with bounded cleanup. Redis test acknowledgments use
+  concurrent snapshots. Cosmos document sizing no longer uses reflection-based serialization.
+- Durable flows enforce `MaxRetainedSteps = 256` before starting a new step. Existing steps still
+  replay; larger workloads must use bounded child flows or explicitly raise/disable the limit.
+  Added fault, concurrency, serializer-parity, and checkpoint-cost regressions and guidance.
+
+
 - **Round-39 review (2026-09-14): settlement over the whole failure set, storage-side history costs, and honest test claims.**
   - *A transient sibling failure keeps the message for redelivery whatever precedes it.* The
     lost-subscriber dispatcher settled a shared-correlation fan-out on the FIRST failure it saw:

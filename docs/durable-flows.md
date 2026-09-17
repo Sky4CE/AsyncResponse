@@ -457,6 +457,21 @@ Supported packages:
 | DynamoDB | `WithDynamoDbDurableFlows(...)` |
 | Entity Framework Core (any relational provider) | `WithEFCoreDurableFlows<TDbContext>(...)` |
 
+**Enforced history budget.** `DurableFlowOptions.MaxRetainedSteps` defaults to **256 distinct
+steps per run**, including local, awaited, timer, and child steps. Attempting to add step 257
+fails the run terminally before that step's side effects or external trigger. Replays of existing
+checkpoints remain valid, including ledgers written before the limit was introduced. This is a
+new default: deployments with larger histories must partition them or explicitly configure a
+higher value (or `null` to disable) before upgrading. Do not delete checkpoints to make room:
+doing so replays their side effects.
+
+Use bounded child flows for large workloads. A hierarchy of small child batches keeps every
+ledger bounded; parent snapshots omit grandchildren's result bodies. The regression suite
+measures cumulative serialized checkpoints for 64 and 128 results through the real child-flow
+engine and requires approximately linear growth. This limits the workload rather than changing
+the storage format: checkpoint cost within each ledger remains quadratic. Keep large values and
+results outside the ledger and retain references; `MaxStateBytes` remains the provider byte cap.
+
 **Ledger growth is the cost model to watch.** Every checkpoint rewrites the *whole* ledger —
 input, every completed step's result, values, context — so a run of N steps with similar result
 sizes serializes about N²/2 step-results over its lifetime (100 steps of 1 KiB: ~6 MB written for a
@@ -479,7 +494,7 @@ outside them the persistence cost arrives well before the size cap does:
 | Budget | Supported | What happens past it |
 |---|---|---|
 | Ledger size | ≤ `LedgerSizeWarningBytes` (512 KiB by default; ≤ 350 KB on DynamoDB) | The warning fires at the threshold and each doubling; `MaxStateBytes` fails the run. |
-| Retained step results per run | a few hundred (≈ 250 steps of 100-byte results ≈ 5 MB written over the run; 1,000 ≈ 87 MB) | Every further checkpoint re-serializes the whole history; latency and transaction-log volume grow with each step. |
+| Retained steps per run | 256 by default (`MaxRetainedSteps`) | A new step fails before side effects. Explicitly raising the budget increases serialization and write amplification. |
 | Size of one step result | a few KiB | One large result is paid again on every later checkpoint of the run. |
 | Flow input | must fit the worker envelope: `AsyncResponseOptions.MaxInboundMessageChars` (8 Mi characters) — the start job carries the initial ledger | `StartAsync` throws `WorkerJobTooLargeException` before publishing (nothing is persisted). |
 

@@ -216,6 +216,7 @@ public sealed class BrokersBatchFixture : IntegrationFixture
 
     protected override async ValueTask WireAsync()
     {
+        await WireRedisConnectionStringAsync();
         // The Redis-compatibility profile replaces this batch's fleet with Redis alone; CI filters the
         // run to the two Redis classes, so nothing else in the batch is touched.
         if (string.Equals(Env("ASYNCRESPONSE_ITEST_PROFILE", ""), "redis-compat", StringComparison.OrdinalIgnoreCase))

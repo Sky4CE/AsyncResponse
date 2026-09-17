@@ -141,7 +141,14 @@ dictionary keys read straight off the wire, such as a worker envelope's propagat
 for a malformed literal it quotes several raw body characters. Both the message and the chained
 inner exception the ingress logs (and, on the response path, republishes to the waiter through
 `SetException`) are rebuilt from position only: line, byte position, and size. The reader's own
-message and path are dropped, not chained. The same scrubbing covers the **second** reader pass —
+message and path are dropped, not chained.
+
+`NotSupportedException` from the reader is scrubbed too: missing polymorphic discriminators
+also cause the serializer to append inbound dictionary keys to that exception. Its original
+message and inner exception are discarded; size and a safe failure category remain. Metadata
+resolution errors raised before reading the body retain their configuration guidance.
+
+The same scrubbing covers the **second** reader pass —
 converting an already-parsed worker-job argument or recovery payload into the callback's
 parameter type, which walks the payload's own property names and dictionary keys — because the
 exception that escapes it is logged by the worker ingress too. The same contract covers every

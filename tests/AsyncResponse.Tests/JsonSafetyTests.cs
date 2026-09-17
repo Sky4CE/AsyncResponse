@@ -112,6 +112,37 @@ public class JsonSafetyTests
     /// renders inner exceptions too, so a body smuggled into an inner message leaks just as
     /// surely as one in the outer.
     /// </summary>
+    [Theory]
+    [InlineData(0)]
+    [InlineData(1)]
+    [InlineData(2)]
+    [InlineData(3)]
+    [InlineData(4)]
+    public void UnsupportedPolymorphicValue_DoesNotExposeDictionaryKeys(int reader)
+    {
+        var json = "{\"" + Secret + "\":{}}";
+        using var document = JsonDocument.Parse(json);
+        var metadata = AsyncResponseJson.GetTypeInfo<Dictionary<string, AbstractInput>>(AsyncResponseJson.Default);
+        Action read = reader switch
+        {
+            0 => () => JsonSafety.SafeDeserialize<Dictionary<string, AbstractInput>>(json),
+            1 => () => JsonSafety.SafeDeserialize(json, metadata),
+            2 => () => JsonSafety.SafeDeserialize(json, typeof(Dictionary<string, AbstractInput>)),
+            3 => () => JsonSafety.SafeDeserialize(System.Text.Encoding.UTF8.GetBytes(json), metadata),
+            _ => () => JsonSafety.SafeDeserialize(document.RootElement, typeof(Dictionary<string, AbstractInput>))
+        };
+
+        var ex = Assert.Throws<InvalidDataException>(read);
+        AssertNoBodyAnywhereIn(ex);
+        Assert.Null(ex.InnerException);
+        Assert.Contains("unsupported value", ex.Message, StringComparison.Ordinal);
+    }
+
+    [System.Text.Json.Serialization.JsonPolymorphic]
+    [System.Text.Json.Serialization.JsonDerivedType(typeof(ConcreteInput), "concrete")]
+    public abstract class AbstractInput;
+    public sealed class ConcreteInput : AbstractInput;
+
     private static void AssertNoBodyAnywhereIn(Exception exception)
     {
         for (Exception? current = exception; current is not null; current = current.InnerException)

@@ -12,6 +12,20 @@ transport's options, dispatcher, and subscriber source rather than from broker d
 Per-option defaults and registration syntax live in the
 [configuration guide](configuration.md#transport-options); this page covers behavior.
 
+## Publication and visibility failure boundaries
+
+Redis worker publication uses a same-slot Lua operation (`EVAL`/`EVALSHA` must be permitted
+by the broker ACL). It appends with `XADD` before writing a TTL-bound success marker containing
+the stream entry ID. A failed append leaves no marker, so a timeout hiding that error cannot
+turn the retry into success. A lost successful reply reuses the marker without a second append.
+The operation uses the portable `MAXLEN` syntax; Redis and Valkey run the integration regression.
+This does not provide exactly-once execution: handlers must still tolerate redelivery.
+
+For SQS with visibility renewal enabled, renewal and failure-path visibility changes serialize
+per receipt. The retry delay is applied after any already-started renewal, so it remains the
+last change. Waiting for a wedged renewal is bounded by `ShutdownTimeout` and host cancellation;
+if the wait fails, the failure is logged and the original visibility timeout governs redelivery.
+
 ## Identical everywhere
 
 These hold for every transport in the matrix, verified per package:

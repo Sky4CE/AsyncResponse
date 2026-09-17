@@ -88,6 +88,29 @@ internal interface IRedisStreamDatabase
 
 internal sealed class RedisStreamDatabaseAdapter(IDatabase _database, TimeSpan _operationTimeout) : IRedisStreamDatabase
 {
+    // Redis MULTI/EXEC does not roll back a successful SET when XADD fails. Record the
+    // success marker only AFTER XADD succeeds, in the same server-side operation.
+    internal const string AppendOnceScript = """
+        local previous = redis.call('GET', KEYS[2])
+        if previous then
+            if previous == '' then
+                return redis.error_reply('Invalid worker publish success marker')
+            end
+            return false
+        end
+        local command = {KEYS[1]}
+        if ARGV[2] ~= '' then
+            table.insert(command, 'MAXLEN')
+            table.insert(command, ARGV[3])
+            table.insert(command, ARGV[2])
+        end
+        table.insert(command, '*')
+        for i = 4, #ARGV do table.insert(command, ARGV[i]) end
+        local id = redis.call('XADD', unpack(command))
+        redis.call('SET', KEYS[2], id, 'PX', ARGV[1])
+        return id
+        """;
+
     /// <summary>Runs the StreamAddAsync operation.</summary>
     public Task<RedisValue> StreamAddAsync(
         RedisKey stream,
@@ -127,25 +150,20 @@ internal sealed class RedisStreamDatabaseAdapter(IDatabase _database, TimeSpan _
         bool useApproximateMaxLength,
         CancellationToken cancellationToken)
     {
-        // MULTI/EXEC guarded by KeyNotExists: the dedup marker and the append commit atomically,
-        // so a retried publish whose earlier attempt DID land (an ambiguous timeout) finds the
-        // marker and appends nothing. The XADD wire shape matches StreamAddAsync above (classic
-        // overload, no Redis 8 trim tokens).
-        var transaction = _database.CreateTransaction();
-        transaction.AddCondition(Condition.KeyNotExists(dedupKey));
-        _ = transaction.StringSetAsync(dedupKey, RedisValue.EmptyString, dedupTtl, flags: CommandFlags.FireAndForget);
-        var add = transaction.StreamAddAsync(
-            stream,
-            values,
-            messageId: (RedisValue?)null,
-            maxLength: ToInt32MaxLength(maxLength),
-            useApproximateMaxLength: useApproximateMaxLength,
-            flags: CommandFlags.None);
+        ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(dedupTtl, TimeSpan.Zero);
+        var args = new RedisValue[3 + values.Length * 2];
+        args[0] = checked((long)Math.Ceiling(dedupTtl.TotalMilliseconds));
+        args[1] = ToInt32MaxLength(maxLength) is { } cap ? cap : RedisValue.EmptyString;
+        args[2] = useApproximateMaxLength ? "~" : "=";
+        for (var i = 0; i < values.Length; i++)
+        {
+            args[3 + i * 2] = values[i].Name;
+            args[4 + i * 2] = values[i].Value;
+        }
 
-        var committed = await WithCancellation(transaction.ExecuteAsync(), cancellationToken).ConfigureAwait(false);
-
-        // On a failed condition the queued tasks complete as canceled — do not await them.
-        return committed ? await add.ConfigureAwait(false) : RedisValue.Null;
+        return (RedisValue)await WithCancellation(
+            _database.ScriptEvaluateAsync(AppendOnceScript, [stream, dedupKey], args),
+            cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>Runs the StreamCreateConsumerGroupAsync operation.</summary>

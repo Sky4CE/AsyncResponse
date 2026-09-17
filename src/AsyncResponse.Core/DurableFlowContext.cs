@@ -1230,6 +1230,10 @@ internal sealed class DurableFlowContext : IDurableFlowContext
         var steps = _state.Steps ??= new Dictionary<string, FlowStepState>(StringComparer.Ordinal);
         if (!steps.TryGetValue(name, out var step))
         {
+            if (_options.MaxRetainedSteps is { } limit && steps.Count >= limit)
+                throw new DurableFlowFailedException(
+                    $"Flow '{FlowId}' cannot add step '{name}': its {limit}-step MaxRetainedSteps budget is exhausted. " +
+                    "No side effects of this step were started. Partition the work into bounded child flows, or explicitly raise the budget after measuring checkpoint costs.");
             step = new FlowStepState();
             steps[name] = step;
         }

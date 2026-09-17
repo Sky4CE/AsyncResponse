@@ -42,6 +42,10 @@ internal static class JsonSafety
         {
             throw ParseFailure(json, jsonException);
         }
+        catch (NotSupportedException)
+        {
+            throw UnsupportedPayload(json.Length, "UTF-16 code units");
+        }
     }
 
     /// <summary>
@@ -61,6 +65,10 @@ internal static class JsonSafety
         {
             throw ParseFailure(utf8Json.Length, "UTF-8 bytes", jsonException);
         }
+        catch (NotSupportedException)
+        {
+            throw UnsupportedPayload(utf8Json.Length, "UTF-8 bytes");
+        }
     }
 
     /// <summary>
@@ -70,14 +78,19 @@ internal static class JsonSafety
     public static object? SafeDeserialize(string json, Type returnType, JsonSerializerOptions? options = null)
     {
         ThrowIfClearlyNotJson(json);
+        var typeInfo = AsyncResponseJson.GetTypeInfo(returnType, WithResolver(options));
 
         try
         {
-            return JsonSerializer.Deserialize(json, AsyncResponseJson.GetTypeInfo(returnType, WithResolver(options)));
+            return JsonSerializer.Deserialize(json, typeInfo);
         }
         catch (JsonException jsonException) when (!IsBodyFree(jsonException))
         {
             throw ParseFailure(json, jsonException);
+        }
+        catch (NotSupportedException)
+        {
+            throw UnsupportedPayload(json.Length, "UTF-16 code units");
         }
     }
 
@@ -91,16 +104,27 @@ internal static class JsonSafety
     /// </summary>
     public static object? SafeDeserialize(JsonElement element, Type returnType, JsonSerializerOptions? options = null)
     {
+        var typeInfo = AsyncResponseJson.GetTypeInfo(returnType, WithResolver(options));
         try
         {
-            return JsonSerializer.Deserialize(element, AsyncResponseJson.GetTypeInfo(returnType, WithResolver(options)));
+            return JsonSerializer.Deserialize(element, typeInfo);
         }
         catch (JsonException jsonException) when (!IsBodyFree(jsonException))
         {
             // GetRawText only on the failure path, and only for its length.
             throw ParseFailure(element.GetRawText(), jsonException);
         }
+        catch (NotSupportedException)
+        {
+            throw UnsupportedPayload(element.GetRawText().Length, "UTF-16 code units");
+        }
     }
+
+    // STJ appends body-derived paths to NotSupportedException too (for example a missing
+    // polymorphic discriminator). Never chain it. Resolve metadata before the reader's try
+    // block so safe AOT registration guidance remains actionable.
+    private static InvalidDataException UnsupportedPayload(int length, string unit)
+        => new($"Cannot deserialize JSON payload ({length} {unit}): an unsupported value or missing type discriminator was encountered. The reader's message and path are omitted.");
 
     /// <summary>
     /// Key under which a <see cref="JsonException"/> the LIBRARY authored marks itself as

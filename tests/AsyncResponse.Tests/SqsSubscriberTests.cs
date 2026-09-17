@@ -549,6 +549,55 @@ public sealed class SqsSubscriberTests
         Assert.All(firstCalls.VisibilityChanges, delay => Assert.Equal(TimeSpan.FromSeconds(45), delay));
     }
 
+    [Fact]
+    public async Task RetryDelay_IsAppliedAfterAnAlreadyInFlightRenewalOfTheSameMessage()
+    {
+        var client = new FakeSqsClient();
+        var renewing = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var failed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var appliedRetry = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var applied = new System.Collections.Concurrent.ConcurrentQueue<TimeSpan>();
+        var ingress = new Mock<IAsyncResponseIngress>();
+        ingress.Setup(i => i.HandleWorkerMessageAsync("body")).Returns(async () =>
+        {
+            await renewing.Task;
+            failed.TrySetResult();
+            throw new InvalidOperationException("handler failed");
+        });
+        var options = new SqsAsyncResponseOptions { WorkerQueue = "workers", ResponseQueue = "responses" };
+        options.WorkerSubscriber.VisibilityTimeout = TimeSpan.FromSeconds(45);
+        options.WorkerSubscriber.VisibilityRenewalInterval = TimeSpan.FromMilliseconds(20);
+        options.WorkerSubscriber.RedeliveryDelay = TimeSpan.FromSeconds(3);
+        client.Enqueue(new SqsTransportDelivery(FakeSqsClient.UrlFor("workers"), "body", "m1", "receipt", 1,
+            new Dictionary<string, string>(), () => ValueTask.CompletedTask, async (delay, _) =>
+            {
+                if (delay == TimeSpan.FromSeconds(45))
+                {
+                    renewing.TrySetResult();
+                    await release.Task;
+                }
+                applied.Enqueue(delay);
+                if (delay == TimeSpan.FromSeconds(3)) appliedRetry.TrySetResult();
+            }));
+        using var subscriber = new SqsWorkerSubscriber(Options.Create(options), client, ingress.Object, NullLogger<SqsWorkerSubscriber>.Instance);
+        await subscriber.StartAsync(default);
+        try
+        {
+            await failed.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            // The old implementation applies the retry here while the renewal is still blocked.
+            Assert.False(await Task.WhenAny(appliedRetry.Task, Task.Delay(100)) == appliedRetry.Task);
+            release.TrySetResult();
+            await appliedRetry.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            Assert.Equal(new[] { TimeSpan.FromSeconds(45), TimeSpan.FromSeconds(3) }, applied.ToArray());
+        }
+        finally
+        {
+            release.TrySetResult();
+            await subscriber.StopAsync(default);
+        }
+    }
+
     private static async Task WaitUntilAsync(Func<bool> condition)
     {
         using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(5));

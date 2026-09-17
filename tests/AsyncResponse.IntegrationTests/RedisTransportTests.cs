@@ -1,3 +1,5 @@
+using AsyncResponse.Transports.Redis;
+using StackExchange.Redis;
 using AsyncResponse.Sample;
 using System.Net.Http.Json;
 using Xunit;
@@ -12,6 +14,78 @@ namespace AsyncResponse.IntegrationTests;
 [Trait(Batches.Trait, Batches.Brokers)]
 public sealed class RedisTransportTests(BrokersBatchFixture fixture) : IntegrationTestBase(fixture)
 {
+    [Fact]
+    public async Task WorkerPublish_FailedAppendWithLostErrorReply_CannotBecomeDeduplicatedSuccess()
+    {
+        using var connection = await ConnectionMultiplexer.ConnectAsync(Fixture.RedisConnectionString);
+        var db = connection.GetDatabase();
+        var stream = "review-publish:" + Guid.NewGuid().ToString("N");
+        var marker = "{" + stream + "}:publish:retry";
+        var adapter = new RedisStreamDatabaseAdapter(db, TimeSpan.FromSeconds(5));
+        await db.StringSetAsync(stream, "wrong type");
+        var lostReply = true;
+        try
+        {
+            // The server executes the operation; only its first error reply is lost. The retry
+            // must fail too, never accept a marker written before the failed XADD.
+            await Assert.ThrowsAsync<RedisServerException>(() => RedisTransportRetry.ExecuteAsync(async token =>
+            {
+                try
+                {
+                    return await adapter.StreamAddOnceAsync(stream, marker, TimeSpan.FromMinutes(1),
+                        [new NameValueEntry("payload", "work")], null, true, token);
+                }
+                catch (RedisServerException) when (lostReply)
+                {
+                    lostReply = false;
+                    throw new TimeoutException("Simulated loss of the executed command's error reply.");
+                }
+            }, 3, TimeSpan.FromMilliseconds(1), TimeSpan.FromMilliseconds(1), default));
+            Assert.False(await db.KeyExistsAsync(marker));
+
+            await db.KeyDeleteAsync(stream);
+            Assert.False((await adapter.StreamAddOnceAsync(stream, marker, TimeSpan.FromMinutes(1),
+                [new NameValueEntry("payload", "work")], null, true, default)).IsNull);
+            Assert.Equal(1, await db.StreamLengthAsync(stream));
+        }
+        finally
+        {
+            await db.KeyDeleteAsync(new RedisKey[] { stream, marker });
+        }
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task WorkerPublish_SuccessfulAppendWithLostReply_IsStoredOnlyOnce(bool approximate)
+    {
+        using var connection = await ConnectionMultiplexer.ConnectAsync(Fixture.RedisConnectionString);
+        var db = connection.GetDatabase();
+        var stream = "review-publish:" + Guid.NewGuid().ToString("N");
+        var marker = "{" + stream + "}:publish:retry";
+        var adapter = new RedisStreamDatabaseAdapter(db, TimeSpan.FromSeconds(5));
+        var first = true;
+        try
+        {
+            var result = await RedisTransportRetry.ExecuteAsync(async token =>
+            {
+                var id = await adapter.StreamAddOnceAsync(stream, marker, TimeSpan.FromMinutes(1),
+                    [new NameValueEntry("payload", "unicode-雪")], 100, approximate, token);
+                if (first) { first = false; throw new TimeoutException("Lost successful reply."); }
+                return id;
+            }, 3, TimeSpan.FromMilliseconds(1), TimeSpan.FromMilliseconds(1), default);
+            Assert.True(result.IsNull);
+            var entry = Assert.Single(await db.StreamRangeAsync(stream));
+            Assert.Equal("unicode-雪", entry.Values[0].Value.ToString());
+            Assert.Equal(entry.Id, await db.StringGetAsync(marker));
+            Assert.True(await db.KeyTimeToLiveAsync(marker) > TimeSpan.Zero);
+        }
+        finally
+        {
+            await db.KeyDeleteAsync(new RedisKey[] { stream, marker });
+        }
+    }
+
     [Fact]
     public async Task Config_ReportsDefaultAndEarlyAckRedisModes()
     {

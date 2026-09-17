@@ -387,6 +387,45 @@ public class AsyncResponseIngressErrorTests
         Assert.Null(publisher.Exception);
     }
 
+    [Fact]
+    public async Task WorkerArgument_UnsupportedPolymorphicValue_DoesNotLeakIntoLogs()
+    {
+        const string secret = "private-customer-review-marker";
+        var logger = new CollectingLogger();
+        var services = new ServiceCollection();
+        services.AddLogging();
+        services.AddSingleton<IUnsupportedArgumentWorker, UnsupportedArgumentWorker>();
+        services.AddAsyncResponse().AuthorizeCallbacks(a => a.Allow<IUnsupportedArgumentWorker>())
+            .WithInMemoryChannel().WithInMemoryTransport();
+        services.AddSingleton(logger.For<AsyncResponseIngress>());
+        await using var provider = services.BuildServiceProvider();
+        using var argument = System.Text.Json.JsonDocument.Parse("{\"" + secret + "\":{}}");
+        var job = new WorkerJobEnvelope
+        {
+            Call = new ReflectionCallDto
+            {
+                ServiceInterfaceFullName = typeof(IUnsupportedArgumentWorker).FullName!,
+                MethodName = nameof(IUnsupportedArgumentWorker.Run),
+                Params = [CallbackParam.ForValue(argument.RootElement.Clone())]
+            }
+        };
+
+        await Assert.ThrowsAsync<InvalidDataException>(() => provider.GetRequiredService<IAsyncResponseIngress>()
+            .HandleWorkerMessageAsync(AsyncResponseJson.Serialize(job)));
+        Assert.Contains(logger.Entries, e => e.Exception is InvalidDataException);
+        Assert.All(logger.Entries, e => Assert.DoesNotContain(secret, e.Message + e.Exception, StringComparison.Ordinal));
+    }
+
+    public interface IUnsupportedArgumentWorker
+    {
+        Task Run(Dictionary<string, JsonSafetyTests.AbstractInput> input);
+    }
+
+    private sealed class UnsupportedArgumentWorker : IUnsupportedArgumentWorker
+    {
+        public Task Run(Dictionary<string, JsonSafetyTests.AbstractInput> input) => throw new InvalidOperationException("Must fail before dispatch.");
+    }
+
     private static AsyncResponseIngress CreateIngress(
         IRawAsyncResponsePublisher rawPublisher,
         IAsyncResponsePublisher publisher,
