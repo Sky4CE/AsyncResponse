@@ -218,3 +218,13 @@ dead incarnation's task.
 - Call `services.AddLogging(...)` in `ConfigureServices` to see the engine's own diagnostics — it
   now wins over the harness's `NullLogger<>` fallback, which previously always registered first and
   swallowed them regardless of what the test configured.
+
+### Concurrency and publication regressions
+
+Fake call collections observed while subscribers run must support concurrent snapshots; the
+Redis acknowledgment fake uses `ConcurrentQueue` and pins snapshot behavior in a regression.
+Use completion signals to coordinate races. SQS tests block an already-started renewal of the
+same message before its failure schedules a retry. Redis integration tests execute the actual
+publish operation, replace the first executed command's reply with a simulated timeout, and
+check both failed-append and successful-append outcomes. These tests run in the existing Redis
+compatibility job, including Valkey; a mocked successful transaction cannot prove that contract.

@@ -652,3 +652,11 @@ Execution leases use absolute UTC expiry. Keep hosts time-synchronized and set
 
 The built-in stores run the same atomic create/revision/lease contract suite against their real
 providers in integration tests. Reusing one of them is the shortest path to a replica-safe store.
+
+### Cosmos sizing and Native AOT
+
+The complete-document size guard uses the host's custom Cosmos serializer when configured.
+For the SDK default it writes the known scalar document fields with `JsonTextWriter`, including
+Newtonsoft escaping, date formatting, indentation and null handling, without reflective object
+serialization. Tests compare the size against the default serializer for Unicode, escaped
+payloads and lease fields. The package's strict trimming/AOT analyzer build must remain clean.

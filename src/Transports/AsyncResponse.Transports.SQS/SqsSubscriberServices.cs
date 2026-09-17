@@ -143,14 +143,26 @@ internal abstract class SqsSubscriberService : BackgroundService
                 // The dispatcher's failure path shortens visibility to RedeliveryDelay while the
                 // heartbeat still counts the message as unsettled (MarkSettled runs only after
                 // HandleAsync returns). Routing the dispatcher's visibility changes through a
-                // suppression mark — set before the change itself — keeps a racing heartbeat from
-                // stretching that fast retry back out to the full visibility timeout.
+                // suppression mark blocks future renewals; the per-message gate joins any renewal
+                // already in flight before applying the shorter retry delay.
                 var tracked = delivery with
                 {
-                    ChangeVisibilityAsync = (timeout, token) =>
+                    ChangeVisibilityAsync = async (timeout, token) =>
                     {
                         progress.SuppressRenewal(batchIndex);
-                        return delivery.ChangeVisibilityAsync(timeout, token);
+                        // A renewal may already be in flight. Its reply must settle before the
+                        // retry delay is applied, otherwise it can overwrite that shorter delay.
+                        var gate = progress.VisibilityGate(batchIndex);
+                        if (!await gate.WaitAsync(Options.ShutdownTimeout, stoppingToken).ConfigureAwait(false))
+                            throw new TimeoutException("SQS visibility renewal did not settle before the retry-delay update budget elapsed.");
+                        try
+                        {
+                            await delivery.ChangeVisibilityAsync(timeout, token).ConfigureAwait(false);
+                        }
+                        finally
+                        {
+                            gate.Release();
+                        }
                     }
                 };
                 try
@@ -223,7 +235,18 @@ internal abstract class SqsSubscriberService : BackgroundService
                     var delivery = deliveries[i];
                     try
                     {
-                        await delivery.ChangeVisibilityAsync(visibilityTimeout, cancellationToken).ConfigureAwait(false);
+                        var gate = progress.VisibilityGate(i);
+                        await gate.WaitAsync(cancellationToken).ConfigureAwait(false);
+                        try
+                        {
+                            if (i < progress.SettledCount || progress.IsRenewalSuppressed(i))
+                                continue;
+                            await delivery.ChangeVisibilityAsync(visibilityTimeout, cancellationToken).ConfigureAwait(false);
+                        }
+                        finally
+                        {
+                            gate.Release();
+                        }
                     }
                     catch (Exception ex) when (ex is not OperationCanceledException || !cancellationToken.IsCancellationRequested)
                     {
@@ -251,13 +274,19 @@ internal abstract class SqsSubscriberService : BackgroundService
 
     private sealed class BatchProgress
     {
-        // One slot per batch message. Settled and suppressed only ever transition false→true, so
-        // monotonic volatile writes/reads are enough — no lock, and a stale read only delays a
-        // skip by one sweep pass.
+        // Gates are per message: a stuck renewal for one receipt cannot block another receipt's
+        // retry. Do not dispose gates while an abandoned SDK call may still release one.
         private readonly bool[] _renewalSuppressed;
+        private readonly SemaphoreSlim[] _visibilityGates;
         private int _settledCount;
 
-        public BatchProgress(int batchSize) => _renewalSuppressed = new bool[batchSize];
+        public BatchProgress(int batchSize)
+        {
+            _renewalSuppressed = new bool[batchSize];
+            _visibilityGates = Enumerable.Range(0, batchSize).Select(_ => new SemaphoreSlim(1, 1)).ToArray();
+        }
+
+        public SemaphoreSlim VisibilityGate(int index) => _visibilityGates[index];
 
         public int SettledCount => Volatile.Read(ref _settledCount);
 

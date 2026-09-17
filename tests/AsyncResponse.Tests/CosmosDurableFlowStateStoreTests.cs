@@ -535,6 +535,28 @@ public sealed class CosmosDurableFlowStateStoreTests
         Assert.True(await harness.Store.TryCreateAsync("flow", state, TimeSpan.FromMinutes(1)));
     }
 
+    [Theory]
+    [InlineData(false, false, false)]
+    [InlineData(false, true, false)]
+    [InlineData(true, false, true)]
+    [InlineData(true, true, true)]
+    public void DefaultDocumentMeasurement_MatchesSdkJsonWithoutReflection(bool indented, bool ignoreNull, bool leased)
+    {
+        var document = Document(CreateState("unicode-雪"), DateTime.UtcNow.AddMinutes(5));
+        document.StateJson = "\"\\\n雪\t\u2028<>";
+        document.Revision = leased ? 3 : null;
+        document.LeaseId = leased ? "lease-\"雪" : null;
+        document.LeaseExpiresAtUtc = leased ? DateTime.UtcNow : null;
+        document.Ttl = leased ? 300 : null;
+        var expected = Newtonsoft.Json.JsonConvert.SerializeObject(document, new Newtonsoft.Json.JsonSerializerSettings
+        {
+            Formatting = indented ? Newtonsoft.Json.Formatting.Indented : Newtonsoft.Json.Formatting.None,
+            NullValueHandling = ignoreNull ? Newtonsoft.Json.NullValueHandling.Ignore : Newtonsoft.Json.NullValueHandling.Include
+        });
+        Assert.Equal(System.Text.Encoding.UTF8.GetByteCount(expected), CosmosFlowStateStore.MeasureDefaultDocumentBytes(
+            document, new CosmosSerializationOptions { Indented = indented, IgnoreNullValues = ignoreNull }));
+    }
+
     private static FlowState CreateState(string flowId) => new()
     {
         FlowId = flowId,

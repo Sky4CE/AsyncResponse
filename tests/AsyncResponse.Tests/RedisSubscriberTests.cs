@@ -11,6 +11,18 @@ namespace AsyncResponse.Tests;
 public class RedisSubscriberTests
 {
     [Fact]
+    public async Task AcknowledgmentObservation_UsesAStableSnapshotWhileTheSubscriberAppends()
+    {
+        var database = new RedisTransportTests.FakeRedisStreamDatabase();
+        await database.StreamAcknowledgeAsync("stream", "group", "1-0", default);
+        using var snapshot = database.Acks.GetEnumerator();
+        Assert.True(snapshot.MoveNext());
+        await database.StreamAcknowledgeAsync("stream", "group", "2-0", default);
+        Assert.False(snapshot.MoveNext());
+        Assert.Equal(2, database.Acks.Count);
+    }
+
+    [Fact]
     public async Task WorkerSubscriber_ForwardsPayloadAndAcks()
     {
         var database = new RedisTransportTests.FakeRedisStreamDatabase

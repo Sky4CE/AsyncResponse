@@ -97,6 +97,15 @@ public class DurableFlowOptions
     public long? LedgerSizeWarningBytes { get; set; } = 512 * 1024;
 
     /// <summary>
+    /// Maximum distinct steps retained in one run. Default: 256. A new step beyond this budget
+    /// fails terminally BEFORE its side effects; replay of existing steps is always allowed.
+    /// Bound long histories with child flows and keep large results in external storage.
+    /// Every checkpoint still writes the whole ledger: this bounds history growth, it does not
+    /// make checkpoints incremental. Set null to opt out after measuring the workload.
+    /// </summary>
+    public int? MaxRetainedSteps { get; set; } = 256;
+
+    /// <summary>
     /// Accepts the risk of running the worker subscriber in early ACK (<c>AckAfterEnqueue</c>)
     /// while durable flows are registered, suppressing the startup error. Durable-flow wake-ups
     /// ride the worker queue and rely on broker redelivery for crash recovery; with early ACK, a

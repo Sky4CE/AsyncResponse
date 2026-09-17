@@ -214,6 +214,8 @@ internal static class FlowStateConcurrency
             throw new InvalidOperationException(
                 $"{nameof(DurableFlowOptions)}.{nameof(options.LedgerSizeWarningBytes)} must be positive, or null to disable the warning (got {ledgerWarning}).");
         }
+        if (options.MaxRetainedSteps is <= 0)
+            throw new InvalidOperationException($"{nameof(DurableFlowOptions)}.{nameof(options.MaxRetainedSteps)} must be positive, or null to disable the budget.");
         if (options.ExecutionLeaseRenewInterval >= options.ExecutionLeaseDuration)
         {
             throw new InvalidOperationException(

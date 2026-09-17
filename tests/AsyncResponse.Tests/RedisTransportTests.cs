@@ -576,8 +576,8 @@ public class RedisTransportTests
     {
         public List<AddCall> Adds { get; } = [];
         public List<CancellationToken> AddTokens { get; } = [];
-        public List<AckCall> Acks { get; } = [];
-        public List<CancellationToken> AckTokens { get; } = [];
+        public System.Collections.Concurrent.ConcurrentQueue<AckCall> Acks { get; } = new();
+        public System.Collections.Concurrent.ConcurrentQueue<CancellationToken> AckTokens { get; } = new();
         public Queue<StreamEntry[]> ReadBatches { get; } = new();
         public List<CreateGroupCall> CreateGroupCalls { get; } = [];
         public List<ReadGroupCall> ReadGroupCalls { get; } = [];
@@ -695,8 +695,8 @@ public class RedisTransportTests
             if (AckException is not null)
                 throw AckException;
 
-            Acks.Add(new AckCall(stream.ToString(), groupName.ToString(), messageId.ToString()));
-            AckTokens.Add(cancellationToken);
+            Acks.Enqueue(new AckCall(stream.ToString(), groupName.ToString(), messageId.ToString()));
+            AckTokens.Enqueue(cancellationToken);
             return Task.FromResult(1L);
         }
 

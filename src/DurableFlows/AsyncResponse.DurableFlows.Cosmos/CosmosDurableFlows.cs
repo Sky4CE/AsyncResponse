@@ -637,7 +637,40 @@ public sealed class CosmosFlowStateStore : IFlowStateStore, IDisposable
             return total;
         }
 
-        return Encoding.UTF8.GetByteCount(JsonConvert.SerializeObject(document));
+        return MeasureDefaultDocumentBytes(document, _client.ClientOptions?.SerializerOptions);
+    }
+
+    // The SDK's default wire shape, written as scalars rather than by reflecting over the
+    // document. JsonTextWriter preserves Newtonsoft's escaping/date rules without IL2026/3050.
+    internal static long MeasureDefaultDocumentBytes(CosmosFlowStateDocument document, CosmosSerializationOptions? options = null)
+    {
+        using var text = new StringWriter(System.Globalization.CultureInfo.InvariantCulture);
+        using var writer = new JsonTextWriter(text) { Formatting = options?.Indented == true ? Formatting.Indented : Formatting.None };
+        writer.WriteStartObject();
+        writer.WritePropertyName("id"); writer.WriteValue(document.Id);
+        writer.WritePropertyName("flowId"); writer.WriteValue(document.FlowId);
+        writer.WritePropertyName("stateJson"); writer.WriteValue(document.StateJson);
+        writer.WritePropertyName("expiresAtUtc"); writer.WriteValue(document.ExpiresAtUtc);
+        writer.WritePropertyName("updatedAtUtc"); writer.WriteValue(document.UpdatedAtUtc);
+        if (document.Revision is not null || options?.IgnoreNullValues != true)
+        {
+            writer.WritePropertyName("revision"); writer.WriteValue(document.Revision);
+        }
+        if (document.LeaseId is not null)
+        {
+            writer.WritePropertyName("leaseId"); writer.WriteValue(document.LeaseId);
+        }
+        if (document.LeaseExpiresAtUtc is not null)
+        {
+            writer.WritePropertyName("leaseExpiresAtUtc"); writer.WriteValue(document.LeaseExpiresAtUtc);
+        }
+        if (document.Ttl is not null)
+        {
+            writer.WritePropertyName("ttl"); writer.WriteValue(document.Ttl);
+        }
+        writer.WriteEndObject();
+        writer.Flush();
+        return Encoding.UTF8.GetByteCount(text.ToString());
     }
 
     private static CosmosFlowStateDocument CreateDocument(string flowId, string stateJson, long revision, TimeSpan ttl, DateTime now)
