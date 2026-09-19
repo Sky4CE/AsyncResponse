@@ -362,26 +362,3 @@ internal static class DurableFlowStoreShared
             throw new ArgumentOutOfRangeException(nameof(ttl), "TTL must be greater than zero.");
     }
 }
-
-/// <summary>
-/// Thrown when a serialized durable-flow ledger exceeds the store's configured
-/// <c>MaxStateBytes</c> budget. Internal on purpose: this shared source is compiled into every
-/// store package, so a public type here would surface as identically-named colliding public types
-/// when a host references two store packages. Callers catch it as its
-/// <see cref="InvalidOperationException"/> base; the message carries the diagnosis.
-/// </summary>
-internal sealed class FlowStateTooLargeException(string flowId, long serializedSizeBytes, long maxStateBytes, string providerName)
-    : InvalidOperationException(
-        $"Flow '{flowId}' state serialized to {serializedSizeBytes} bytes, exceeding the {providerName} MaxStateBytes limit of {maxStateBytes} bytes — " +
-        "flow state exceeded the provider's size limit. Keep large payloads in your own storage and pass references in flow state; " +
-        "see docs/durable-flows.md (ledger-size note).")
-{
-    /// <summary>The flow whose ledger write was rejected.</summary>
-    public string FlowId { get; } = flowId;
-
-    /// <summary>Serialized ledger size in UTF-8 bytes.</summary>
-    public long SerializedSizeBytes { get; } = serializedSizeBytes;
-
-    /// <summary>The configured budget the write exceeded.</summary>
-    public long MaxStateBytes { get; } = maxStateBytes;
-}

@@ -477,8 +477,8 @@ public sealed class CosmosDurableFlowStateStoreTests
         var innerBytes = System.Text.Encoding.UTF8.GetByteCount(JsonSerializer.Serialize(state));
         Assert.InRange(innerBytes, 1_000_000, 1_900_000);
 
-        // The shared source's FlowStateTooLargeException is internal to each store assembly (one
-        // copy per package), so it is matched by name, as the other store suites do.
+        // Preflight must measure the escaped document, not just the inner ledger, without I/O.
+        Assert.Throws<FlowStateTooLargeException>(() => harness.Store.ValidateCreate("flow", state, TimeSpan.FromMinutes(1)));
         var ex = await Assert.ThrowsAnyAsync<Exception>(
             () => harness.Store.TryCreateAsync("flow", state, TimeSpan.FromMinutes(1)));
 

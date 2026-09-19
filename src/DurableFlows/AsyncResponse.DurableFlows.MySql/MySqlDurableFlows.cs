@@ -118,6 +118,14 @@ public sealed class MySqlFlowStateStore : IFlowStateStore
         return DurableFlowStoreShared.ReadState(flowId, reader.GetString(0), reader.GetInt64(1));
     }
 
+    /// <inheritdoc />
+    public void ValidateCreate(string flowId, FlowState state, TimeSpan ttl)
+    {
+        DurableFlowStoreShared.ValidateCreate(flowId, state, ttl);
+        if (_options.MaxStateBytes is not null)
+            _ = DurableFlowStoreShared.SerializeBounded(flowId, state, _options.MaxStateBytes, "MySQL");
+    }
+
     public async Task<bool> TryCreateAsync(string flowId, FlowState state, TimeSpan ttl, CancellationToken cancellationToken = default)
     {
         DurableFlowStoreShared.ValidateCreate(flowId, state, ttl);

@@ -708,6 +708,223 @@ public sealed class DbChannelSharedCoverageTests
         }
     }
 
+    [Fact]
+    public async Task DispatchSweep_IdleAndNewMessages_DoNotReloadConsumedHistory()
+    {
+        var clock = new AsyncResponse.Testing.VirtualTimeProvider();
+        await using var harness = Harness.Create(Provider.MongoDb, false, TimeSpan.FromSeconds(30), timeProvider: clock);
+        var started = clock.GetUtcNow();
+        var rows = Enumerable.Range(0, 200).Select(i => HistoryRow(started, i)).ToList();
+        var delivered = 0;
+        var subscription = harness.Subscription("corr", started).Instance;
+        harness.SetProcessHook(subscription, () => { Interlocked.Increment(ref delivered); return Task.CompletedTask; });
+        harness.AddSubscription("corr", subscription);
+        var reads = new List<int>();
+        ServeHistory(harness, rows, reads);
+        await SweepAndDrainAsync(harness);
+        Assert.Equal(200, delivered);
+        reads.Clear();
+        for (var i = 0; i < 20; i++) await SweepAndDrainAsync(harness);
+        Assert.Equal(20, reads.Sum()); // Only the last database-clock tick, not 200 rows per poll.
+        Assert.Equal(20, reads.Count);
+
+        rows.Add(HistoryRow(started, 200));
+        reads.Clear();
+        await SweepAndDrainAsync(harness);
+        Assert.Equal(2, reads.Sum()); // Last tick plus the new row.
+        Assert.Equal(201, delivered);
+        var sameTick = HistoryRow(started, 201);
+        sameTick.Id = Guid.Empty;
+        sameTick.CreatedAtUtc = rows[^1].CreatedAtUtc;
+        rows.Add(sameTick);
+        await SweepAndDrainAsync(harness);
+        Assert.Equal(202, delivered); // No reconciliation delay for a lower random id in the last tick.
+    }
+
+    [Fact]
+    public async Task DispatchSweep_ReconcilesLateAcknowledgedCommit_AndResetsForNewSubscriber()
+    {
+        var clock = new AsyncResponse.Testing.VirtualTimeProvider();
+        await using var harness = Harness.Create(Provider.MongoDb, false, TimeSpan.FromSeconds(30), pendingMessageBatchSize: 2, timeProvider: clock);
+        var started = clock.GetUtcNow();
+        var rows = Enumerable.Range(1, 5).Select(i => HistoryRow(started, i)).ToList();
+        var delivered = 0;
+        var subscription = harness.Subscription("corr", started).Instance;
+        harness.SetProcessHook(subscription, () => { Interlocked.Increment(ref delivered); return Task.CompletedTask; });
+        harness.AddSubscription("corr", subscription);
+        var reads = new List<int>();
+        ServeHistory(harness, rows, reads);
+        await SweepAndDrainAsync(harness);
+        Assert.Equal(5, delivered);
+
+        // An insert committed behind the cursor and was already ACKed by another process.
+        var late = HistoryRow(started, 0);
+        late.Id = Guid.Empty;
+        late.CreatedAtUtc = rows[0].CreatedAtUtc; // Historical timestamp, lower id than its existing peer.
+        rows.Add(late);
+        await SweepAndDrainAsync(harness);
+        Assert.Equal(5, delivered);
+        clock.Advance(TimeSpan.FromSeconds(5));
+        reads.Clear();
+        await SweepAndDrainAsync(harness);
+        Assert.Equal(6, delivered);
+        Assert.Equal(3, reads.Sum()); // Last tick plus one history page, not a scan to exhaustion.
+        await SweepAndDrainAsync(harness);
+        await SweepAndDrainAsync(harness);
+        Assert.Equal(6, delivered);
+        reads.Clear();
+        await SweepAndDrainAsync(harness);
+        Assert.Equal(1, reads.Sum());
+
+        // A second local fan-out registration has its OWN watermark and no seen history.
+        var joined = 0;
+        var other = harness.Subscription("corr", started, startedSeq: 0).Instance;
+        harness.SetProcessHook(other, () => { Interlocked.Increment(ref joined); return Task.CompletedTask; });
+        harness.AddSubscription("corr", other);
+        await SweepAndDrainAsync(harness);
+        Assert.Equal(6, joined);
+        Assert.Equal(6, delivered);
+    }
+
+    [Fact]
+    public async Task DispatchSweep_ClaimFailure_RewindsWithoutWaitingForReconciliation()
+    {
+        var clock = new AsyncResponse.Testing.VirtualTimeProvider();
+        await using var harness = Harness.Create(Provider.MongoDb, false, TimeSpan.FromSeconds(30), timeProvider: clock);
+        var rows = new List<MongoChannelMessageDocument> { HistoryRow(clock.GetUtcNow(), 1) };
+        var delivered = 0;
+        var subscription = harness.Subscription("corr", clock.GetUtcNow()).Instance;
+        harness.SetProcessHook(subscription, () => { Interlocked.Increment(ref delivered); return Task.CompletedTask; });
+        harness.AddSubscription("corr", subscription);
+        ServeHistory(harness, rows, []);
+        harness.MongoMessages!.SetupSequence(collection => collection.FindOneAndUpdateAsync(
+                It.IsAny<FilterDefinition<MongoChannelMessageDocument>>(),
+                It.IsAny<UpdateDefinition<MongoChannelMessageDocument>>(),
+                It.IsAny<FindOneAndUpdateOptions<MongoChannelMessageDocument, MongoChannelMessageDocument>>(),
+                It.IsAny<CancellationToken>()))
+            .ThrowsAsync(new IOException("claim unavailable"))
+            .ReturnsAsync(rows[0]);
+        await SweepAndDrainAsync(harness);
+        Assert.Equal(0, delivered);
+        await SweepAndDrainAsync(harness);
+        Assert.Equal(1, delivered);
+    }
+
+    [Fact]
+    public async Task DispatchSweep_OneTimestampAcrossManyPages_ContinuesPastThePerPassBudget()
+    {
+        var clock = new AsyncResponse.Testing.VirtualTimeProvider();
+        await using var harness = Harness.Create(Provider.MongoDb, false, TimeSpan.FromSeconds(30), timeProvider: clock);
+        var rows = Enumerable.Range(0, 1100).Select(i => HistoryRow(clock.GetUtcNow(), i)).ToList();
+        foreach (var row in rows) row.CreatedAtUtc = clock.GetUtcNow().UtcDateTime;
+        var delivered = 0;
+        var subscription = harness.Subscription("corr", clock.GetUtcNow()).Instance;
+        harness.SetProcessHook(subscription, () => { Interlocked.Increment(ref delivered); return Task.CompletedTask; });
+        harness.AddSubscription("corr", subscription);
+        var reads = new List<int>();
+        ServeHistory(harness, rows, reads);
+        await SweepAndDrainAsync(harness);
+        Assert.InRange(delivered, 1, 1024);
+        Assert.Equal(16, reads.Count);
+        await SweepAndDrainAsync(harness);
+        Assert.Equal(1100, delivered);
+    }
+
+    [Fact]
+    public async Task DispatchSweep_PrunedTail_DoesNotWalkBackwardThroughHistory()
+    {
+        var clock = new AsyncResponse.Testing.VirtualTimeProvider();
+        await using var harness = Harness.Create(Provider.MongoDb, false, TimeSpan.FromSeconds(30), timeProvider: clock);
+        var rows = Enumerable.Range(1, 5).Select(i => HistoryRow(clock.GetUtcNow(), i)).ToList();
+        var subscription = harness.Subscription("corr", clock.GetUtcNow()).Instance;
+        harness.SetProcessHook(subscription, () => Task.CompletedTask);
+        harness.AddSubscription("corr", subscription);
+        var reads = new List<int>();
+        ServeHistory(harness, rows, reads);
+        await SweepAndDrainAsync(harness);
+        rows.RemoveAt(rows.Count - 1);
+        reads.Clear();
+        for (var i = 0; i < 20; i++) await SweepAndDrainAsync(harness);
+        Assert.Equal(0, reads.Sum());
+    }
+
+    [Theory]
+    [InlineData(Provider.PostgreSql)]
+    [InlineData(Provider.SqlServer)]
+    [InlineData(Provider.MongoDb)]
+    public void HistoryReconciliationInterval_RejectsZero(Provider provider)
+    {
+        Assert.Throws<InvalidOperationException>(() =>
+        {
+            switch (provider)
+            {
+                case Provider.PostgreSql:
+                    new PostgreSqlAsyncResponseChannelOptions { HistoryReconciliationInterval = TimeSpan.Zero }.Validate();
+                    break;
+                case Provider.SqlServer:
+                    new SqlServerAsyncResponseChannelOptions { ConnectionString = "Server=unused", HistoryReconciliationInterval = TimeSpan.Zero }.Validate();
+                    break;
+                default:
+                    new MongoDbAsyncResponseChannelOptions { HistoryReconciliationInterval = TimeSpan.Zero }.Validate();
+                    break;
+            }
+        });
+    }
+
+    private static MongoChannelMessageDocument HistoryRow(DateTimeOffset started, int index) => new()
+    {
+        Id = Guid.NewGuid(), CorrelationId = "corr", EnvelopeJson = StaleEnvelope,
+        CreatedAtUtc = started.AddMilliseconds(index).UtcDateTime,
+        AckedAtUtc = started.AddSeconds(1).UtcDateTime,
+        ExpiresAtUtc = started.AddHours(1).UtcDateTime
+    };
+
+    private static async Task SweepAndDrainAsync(Harness harness)
+    {
+        await harness.InvokeAsync("DispatchPendingMessagesAsync", new HashSet<string> { "corr" }, CancellationToken.None);
+        var drained = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        await harness.Executors.EnqueueAsync(harness.ChannelName("corr"), () => { drained.TrySetResult(); return Task.CompletedTask; });
+        await drained.Task.WaitAsync(TimeSpan.FromSeconds(5));
+    }
+
+    private static void ServeHistory(Harness harness, List<MongoChannelMessageDocument> rows, List<int> reads)
+    {
+        harness.MongoMessages!.Setup(collection => collection.FindAsync(
+                It.IsAny<FilterDefinition<MongoChannelMessageDocument>>(),
+                It.IsAny<FindOptions<MongoChannelMessageDocument, MongoChannelMessageDocument>>(),
+                It.IsAny<CancellationToken>()))
+            .Returns((FilterDefinition<MongoChannelMessageDocument> filter, FindOptions<MongoChannelMessageDocument, MongoChannelMessageDocument> options, CancellationToken _) =>
+            {
+                var bson = filter.Render(new RenderArgs<MongoChannelMessageDocument>(BsonSerializer.LookupSerializer<MongoChannelMessageDocument>(), BsonSerializer.SerializerRegistry));
+                var found = rows.Where(row => Matches(row.ToBsonDocument(), bson)).OrderBy(row => row.CreatedAtUtc).ThenBy(row => row.ToBsonDocument()["_id"]).Take(options.Limit ?? int.MaxValue).ToList();
+                reads.Add(found.Count);
+                return Task.FromResult(Cursor(found));
+            });
+        harness.MongoMessages.Setup(collection => collection.FindOneAndUpdateAsync(
+                It.IsAny<FilterDefinition<MongoChannelMessageDocument>>(),
+                It.IsAny<UpdateDefinition<MongoChannelMessageDocument>>(),
+                It.IsAny<FindOneAndUpdateOptions<MongoChannelMessageDocument, MongoChannelMessageDocument>>(),
+                It.IsAny<CancellationToken>())).ReturnsAsync(rows[0]);
+
+        static bool Matches(BsonDocument row, BsonDocument filter)
+        {
+            foreach (var entry in filter)
+            {
+                if (entry.Name == "$expr") continue; // Every fixture row is unexpired.
+                if (entry.Name == "$and") { if (!entry.Value.AsBsonArray.All(item => Matches(row, item.AsBsonDocument))) return false; continue; }
+                if (entry.Name == "$or") { if (!entry.Value.AsBsonArray.Any(item => Matches(row, item.AsBsonDocument))) return false; continue; }
+                var value = row[entry.Name];
+                if (entry.Value is not BsonDocument conditions) { if (!value.Equals(entry.Value)) return false; continue; }
+                foreach (var condition in conditions)
+                {
+                    var comparison = value.CompareTo(condition.Value);
+                    if (condition.Name == "$gt" && comparison <= 0 || condition.Name == "$gte" && comparison < 0) return false;
+                }
+            }
+            return true;
+        }
+    }
+
     /// <summary>A one-batch cursor over <paramref name="items"/>, for the mocked collection's <c>FindAsync</c>.</summary>
     private static IAsyncCursor<T> Cursor<T>(IReadOnlyList<T> items)
     {
@@ -888,7 +1105,7 @@ public sealed class DbChannelSharedCoverageTests
         /// <summary>Mongo harness only: the messages-collection mock, for arranging what the store's upsert and claim return.</summary>
         public Mock<IMongoCollection<MongoChannelMessageDocument>>? MongoMessages { get; private set; }
 
-        public static Harness Create(Provider provider, bool failing, TimeSpan pollInterval, TimeSpan? fullSweepInterval = null, bool useChangeStreams = false, int? pendingMessageBatchSize = null)
+        public static Harness Create(Provider provider, bool failing, TimeSpan pollInterval, TimeSpan? fullSweepInterval = null, bool useChangeStreams = false, int? pendingMessageBatchSize = null, TimeProvider? timeProvider = null)
         {
             var logger = new CollectingLogger();
             var recoveryState = new Mock<IRecoveryStateStore>();
@@ -928,7 +1145,7 @@ public sealed class DbChannelSharedCoverageTests
                         recoveryState.Object,
                         options,
                         new AsyncResponseContextPropagation([]),
-                        logger.For<SqlServerAsyncResponseChannel>());
+                        logger.For<SqlServerAsyncResponseChannel>(), timeProvider: timeProvider);
                     return new Harness(
                         channel,
                         typeof(SqlServerAsyncResponseChannel),
@@ -959,7 +1176,7 @@ public sealed class DbChannelSharedCoverageTests
                         recoveryState.Object,
                         options,
                         new AsyncResponseContextPropagation([]),
-                        logger.For<PostgreSqlAsyncResponseChannel>());
+                        logger.For<PostgreSqlAsyncResponseChannel>(), timeProvider: timeProvider);
                     return new Harness(
                         channel,
                         typeof(PostgreSqlAsyncResponseChannel),
@@ -1042,7 +1259,7 @@ public sealed class DbChannelSharedCoverageTests
                         recoveryState.Object,
                         options,
                         new AsyncResponseContextPropagation([]),
-                        logger.For<MongoDbAsyncResponseChannel>());
+                        logger.For<MongoDbAsyncResponseChannel>(), timeProvider: timeProvider);
                     var harness = new Harness(
                         channel,
                         typeof(MongoDbAsyncResponseChannel),

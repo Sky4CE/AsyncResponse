@@ -173,6 +173,14 @@ public sealed class CosmosFlowStateStore : IFlowStateStore, IDisposable
         }
     }
 
+    /// <inheritdoc />
+    public void ValidateCreate(string flowId, FlowState state, TimeSpan ttl)
+    {
+        DurableFlowStoreShared.ValidateCreate(flowId, state, ttl);
+        var stateJson = DurableFlowStoreShared.SerializeBounded(flowId, state, _options.MaxStateBytes, "Cosmos DB");
+        ThrowIfDocumentTooLarge(flowId, CreateDocument(flowId, stateJson, state.Revision, ttl, DateTime.UtcNow));
+    }
+
     public async Task<bool> TryCreateAsync(string flowId, FlowState state, TimeSpan ttl, CancellationToken cancellationToken = default)
     {
         DurableFlowStoreShared.ValidateCreate(flowId, state, ttl);

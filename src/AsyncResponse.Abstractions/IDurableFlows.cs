@@ -14,7 +14,9 @@ public interface IDurableFlows
     /// The publish of the start job is the commit point: the job carries the initial ledger and its
     /// execution creates the run if the starter's own ledger write never happened, so a process that
     /// dies mid-start leaves either nothing or a run that executes — never a committed ledger that
-    /// nothing will ever wake. The ledger exists by the time this method returns.
+    /// nothing will ever wake. Built-in stores validate deterministic creation constraints before
+    /// publication. Normally the ledger exists when this method returns; after a transient store
+    /// fault it may remain absent until the published job creates it.
     /// <para>
     /// Pass a non-empty <paramref name="flowId"/> to make the start idempotent: starting an id that
     /// already exists with the same flow type and semantically identical input re-enqueues the
@@ -42,6 +44,10 @@ public interface IDurableFlows
     ///     return await flows.StartAsync&lt;ProvisioningFlow, ProvisionRequest&gt;(request, ex.FlowId);
     /// }
     /// </code>
+    /// </exception>
+    /// <exception cref="FlowStateTooLargeException">
+    /// The initial ledger exceeds the selected store's size budget. Built-in stores reject this
+    /// before the start job is published. Keep large inputs in application storage and pass keys.
     /// </exception>
     /// <exception cref="WorkerJobTooLargeException">
     /// The start job — which carries the serialized initial ledger, input included — exceeds the

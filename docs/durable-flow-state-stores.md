@@ -660,3 +660,16 @@ For the SDK default it writes the known scalar document fields with `JsonTextWri
 Newtonsoft escaping, date formatting, indentation and null handling, without reflective object
 serialization. Tests compare the size against the default serializer for Unicode, escaped
 payloads and lease fields. The package's strict trimming/AOT analyzer build must remain clean.
+
+## Initial-state preflight
+
+`IDurableFlows.StartAsync` calls `IFlowStateStore.ValidateCreate` before publishing the start job.
+All bundled stores check the same deterministic state/size constraints as their creation path,
+without contacting the database. Cosmos measures the complete escaped document. An oversized
+initial ledger raises the shared `FlowStateTooLargeException` before enqueueing work.
+
+Custom stores remain source-compatible because the interface supplies a no-op default. Override
+it for deterministic limits, leave transient connection checks in the actual write, and continue
+to enforce validation in `TryCreateAsync` for callers that bypass the starter. The preflight is
+not a reservation or a transaction; the published job still creates the ledger if the starter
+crashes or its subsequent write encounters a transient outage.

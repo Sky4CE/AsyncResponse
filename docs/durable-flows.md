@@ -283,7 +283,7 @@ property makes every failure mode collapse into "run it again":
 | Process is down when a **failed** response arrives | `OnRecovery() == Fail` routes to the auto-registered **failure** callback: the run is marked `Failed` — a failure is never resumed as a success |
 | The **terminal** response itself was the lost message | Its payload is already the step result. The resumed run skips that completed await and continues; it does not wait for a consumed correlation id or re-send the remote request |
 | The same flow job is delivered to two replicas | Atomic start preserves the first input, and the execution lease lets one worker run. The duplicate delivery returns without entering flow code; if the owner disappears, the lease expires and another worker resumes from the last compare-and-swap checkpoint |
-| The process **dies mid-`StartAsync`** | The publish of the start job is the start's commit point, and the job carries the initial ledger: `IDurableFlowExecutor.CreateAndExecuteAsync` creates the run (insert-if-absent) before executing it. A crash **before** the publish leaves nothing behind; a crash **after** it leaves a job whose execution creates and runs the flow. There is no window in which a committed `Running` ledger exists that nothing will ever execute (the pre-1.0 order — create, then publish — had exactly that window, and `IFlowStateStore` has no enumeration a reconciler could use to find such a run). The starter still writes the ledger itself after the publish, so `GetStateAsync`/`ResumeAsync` right after a start see the run; losing that write to the executor (or to a concurrent identical start) is the expected shape, not an error |
+| The process **dies mid-`StartAsync`** | The publish of the start job is the start's commit point, and the job carries the initial ledger: `IDurableFlowExecutor.CreateAndExecuteAsync` creates the run (insert-if-absent) before executing it. A crash **before** the publish leaves nothing behind; a crash **after** it leaves a job whose execution creates and runs the flow. There is no window in which a committed `Running` ledger exists that nothing will ever execute (the pre-1.0 order — create, then publish — had exactly that window, and `IFlowStateStore` has no enumeration a reconciler could use to find such a run). The starter also writes the ledger after publishing; a transient failure of that write may leave `GetStateAsync` returning null until the worker creates it; losing that write to the executor (or to a concurrent identical start) is the expected shape, not an error |
 | `StartAsync`'s **publish fails** | After the start's own retry ladder, `StartAsync` throws **`DurableFlowNotDispatchedException`** and **nothing was persisted**. Its `FlowId` carries the id the start would have used — including a generated one — so the retry stays idempotent: if the publish had in fact landed (the ambiguous case is deliberately included), the same id dedupes against the run the job created; a retry with a fresh generated id would start a second, independent run. Supply deterministic ids wherever the caller may retry |
 | A child flow is running | The parent run is parked as `Running`; the child terminal state re-enqueues the parent, which reloads the child state and continues |
 | A **child run dead-letters** (a retriable failure exhausts the transport's delivery attempts) | The child stays `Running` and the parent stays suspended — **the child's DLQ entry is the alarm**. Replay the DLQ entry or call `ResumeAsync(childFlowId)`; re-enqueueing the parent (`ResumeAsync(parentFlowId)`) also works — it re-enqueues the child. The parent resumes automatically once the child reaches a terminal state |
@@ -484,6 +484,16 @@ transparently), partition a long history into [child flows](#child-flows) (a par
 only a compact snapshot of each child), and lower the threshold on DynamoDB, whose 350 KB item
 cap sits under the default.
 
+**Start acceptance and size errors.** `IFlowStateStore.ValidateCreate` checks deterministic
+creation constraints without I/O before the start job is published. Every bundled durable store
+implements it; Cosmos checks the complete escaped document. `FlowStateTooLargeException` is a
+shared public exception in `AsyncResponse.Abstractions`, with `FlowId`, `SerializedSizeBytes`, and
+`MaxStateBytes`. Actual writes still enforce the budget. Application-owned stores should override
+the default no-op preflight; a deterministic size/argument error during the starter's subsequent
+write is propagated even if a custom store did not preflight it. Transient store faults after
+publication still leave the accepted job responsible for creating the ledger; state queries may
+return null until that happens. Publication remains the durable start commit point.
+
 #### Supported ledger budgets
 
 The full-ledger checkpoint is a deliberate design: one document, one revision check, one lease
@@ -496,7 +506,7 @@ outside them the persistence cost arrives well before the size cap does:
 | Ledger size | ≤ `LedgerSizeWarningBytes` (512 KiB by default; ≤ 350 KB on DynamoDB) | The warning fires at the threshold and each doubling; `MaxStateBytes` fails the run. |
 | Retained steps per run | 256 by default (`MaxRetainedSteps`) | A new step fails before side effects. Explicitly raising the budget increases serialization and write amplification. |
 | Size of one step result | a few KiB | One large result is paid again on every later checkpoint of the run. |
-| Flow input | must fit the worker envelope: `AsyncResponseOptions.MaxInboundMessageChars` (8 Mi characters) — the start job carries the initial ledger | `StartAsync` throws `WorkerJobTooLargeException` before publishing (nothing is persisted). |
+| Flow input | Must fit both the worker-envelope budget and the selected store's `MaxStateBytes`, including provider document overhead | Built-in stores reject oversized initial state with `FlowStateTooLargeException` before publication; oversized envelopes throw `WorkerJobTooLargeException`. Nothing is persisted. |
 
 Two patterns keep a long-running or data-heavy flow inside them. **Store large results by
 reference**: the step persists its payload where it belongs (blob storage, a table, a cache) and
@@ -522,9 +532,11 @@ snapshot, so neither ledger grows past a bounded number of steps. Incremental (a
 checkpoint persistence for workloads that genuinely need thousands of retained results is on the
 [roadmap](roadmap.md) and will keep the same revision and lease fences. The curve itself is
 measured, not inferred: `LedgerGrowthBenchmarks` in `benchmarks/AsyncResponse.Benchmarks` runs a
-complete N-step run through the process-local store (N = 50, 200, 400 checkpoints of 1 KiB
-results) and reports the time and allocations per run, so a change to the checkpoint path — or
-to your own step-result sizes — can be checked against the budgets above.
+raw store writes for N = 50, 200, 400 results of 1 KiB, both in one ledger and in bounded
+8-step ledgers, and reports time and allocations. It deliberately bypasses the engine's step
+budget to expose the unbounded baseline; a 400-step single ledger is not the default supported
+flow shape. `LedgerBudgetTests` separately verifies the real engine's 256-step default boundary,
+replay at the limit, and approximately linear total checkpoint bytes for a bounded child tree.
 
 For tests, development, or a deliberately one-process application:
 

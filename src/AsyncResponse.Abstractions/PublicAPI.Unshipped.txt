@@ -370,3 +370,9 @@ AsyncResponse.WorkerJobTooLargeException.SerializedLength.get -> int
 AsyncResponse.WorkerJobTooLargeException.WorkerJobTooLargeException(int serializedLength, int limit) -> void
 AsyncResponse.AsyncResponseIndeterminateDeliveryException.AsyncResponseIndeterminateDeliveryException(string? correlationId, int bufferedMessages) -> void
 AsyncResponse.AsyncResponseIndeterminateDeliveryException.BufferedMessages.get -> int
+AsyncResponse.IFlowStateStore.ValidateCreate(string! flowId, AsyncResponse.FlowState! state, System.TimeSpan ttl) -> void
+AsyncResponse.FlowStateTooLargeException
+AsyncResponse.FlowStateTooLargeException.FlowStateTooLargeException(string! flowId, long serializedSizeBytes, long maxStateBytes, string! providerName) -> void
+AsyncResponse.FlowStateTooLargeException.FlowId.get -> string!
+AsyncResponse.FlowStateTooLargeException.SerializedSizeBytes.get -> long
+AsyncResponse.FlowStateTooLargeException.MaxStateBytes.get -> long

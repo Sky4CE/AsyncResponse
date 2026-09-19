@@ -104,6 +104,12 @@ reusing step names — pass the flow id to pin the one-shot crash to its run
 (`harness.CrashAfterStep("create-workspace", flowId: run.FlowId)`); an unscoped crash fires on
 whichever run gets there first.
 
+For awaited steps, `CrashAfterStep("remote-step")` also stops the attempt after the response is
+checkpointed. Completion observers run outside response-settlement recovery, so their exception
+cannot be swallowed by checkpointing the same response a second time. Assert that the next step
+has not run before retry, that the completion event occurred once, and that the resumed run's
+`Attempts` increased. Include both before/after cases for awaited steps in a crash matrix.
+
 Run it as a `[Theory]` over every step of your flow — the crash-at-every-checkpoint matrix from
 the library's own suite ([FlowTestHarnessShowcaseTests](../tests/AsyncResponse.Tests/FlowTestHarnessShowcaseTests.cs)),
 now three lines per row.

@@ -71,6 +71,34 @@ public sealed class DurableFlowStoreReviewFixesTests
             Options.Create(new EFCoreDurableFlowOptions { MaxStateBytes = 0 })));
     }
 
+    [Theory]
+    [InlineData("sqlite")]
+    [InlineData("sqlserver")]
+    [InlineData("postgresql")]
+    [InlineData("mysql")]
+    [InlineData("oracle")]
+    [InlineData("efcore")]
+    public void RelationalPreflight_RejectsSizeWithoutOpeningAConnection(string providerName)
+    {
+        using var services = new ServiceCollection().BuildServiceProvider();
+        using var postgres = Npgsql.NpgsqlDataSource.Create("Host=unused;Database=unused;Username=unused");
+        IFlowStateStore store = providerName switch
+        {
+            "sqlite" => new SqliteFlowStateStore(Options.Create(new SqliteDurableFlowOptions { ConnectionString = "Data Source=unused", MaxStateBytes = 1024 })),
+            "sqlserver" => new SqlServerFlowStateStore(Options.Create(new SqlServerDurableFlowOptions { ConnectionString = "Server=unused", MaxStateBytes = 1024 })),
+            "postgresql" => new PostgreSqlFlowStateStore(postgres, Options.Create(new PostgreSqlDurableFlowOptions { MaxStateBytes = 1024 })),
+            "mysql" => new MySqlFlowStateStore(Options.Create(new MySqlDurableFlowOptions { ConnectionString = "Server=unused", MaxStateBytes = 1024 })),
+            "oracle" => new OracleFlowStateStore(Options.Create(new OracleDurableFlowOptions { ConnectionString = "Data Source=unused", MaxStateBytes = 1024 })),
+            _ => new EFCoreFlowStateStore<TestFlowDbContext>(services.GetRequiredService<IServiceScopeFactory>(), Options.Create(new EFCoreDurableFlowOptions { MaxStateBytes = 1024 }))
+        };
+        try
+        {
+            Assert.Throws<FlowStateTooLargeException>(() => store.ValidateCreate("preflight", CreateState("preflight", payloadBytes: 4096), TimeSpan.FromMinutes(1)));
+            store.ValidateCreate("preflight", CreateState("preflight"), TimeSpan.FromMinutes(1));
+        }
+        finally { (store as IDisposable)?.Dispose(); }
+    }
+
     [Fact]
     public async Task DynamoDbStore_RejectsOversizedState_WithDiagnosableError_BeforeWriting()
     {
@@ -86,6 +114,8 @@ public sealed class DurableFlowStoreReviewFixesTests
 
         // Default limit (350 KB) with a ~400 KB payload: the raw provider 400 KB item-cap error
         // would be retried into DLQ; the guard must fail fast and name the real cause.
+        Assert.Throws<FlowStateTooLargeException>(() => store.ValidateCreate("outsized-flow", CreateState("outsized-flow", payloadBytes: 400000), TimeSpan.FromMinutes(5)));
+
         var exception = await Assert.ThrowsAnyAsync<InvalidOperationException>(() =>
             store.TryCreateAsync("outsized-flow", CreateState("outsized-flow", payloadBytes: 400_000), TimeSpan.FromMinutes(5)));
 
@@ -112,6 +142,8 @@ public sealed class DurableFlowStoreReviewFixesTests
             AutoCreateContainer = false,
             MaxStateBytes = 1024
         }));
+
+        Assert.Throws<FlowStateTooLargeException>(() => store.ValidateCreate("outsized-flow", CreateState("outsized-flow", payloadBytes: 4096), TimeSpan.FromMinutes(5)));
 
         var exception = await Assert.ThrowsAnyAsync<InvalidOperationException>(() =>
             store.TryCreateAsync("outsized-flow", CreateState("outsized-flow", payloadBytes: 4096), TimeSpan.FromMinutes(5)));
@@ -142,6 +174,8 @@ public sealed class DurableFlowStoreReviewFixesTests
             AutoCreateIndexes = false,
             MaxStateBytes = 1024
         }));
+
+        Assert.Throws<FlowStateTooLargeException>(() => store.ValidateCreate("outsized-flow", CreateState("outsized-flow", payloadBytes: 4096), TimeSpan.FromMinutes(5)));
 
         var exception = await Assert.ThrowsAnyAsync<InvalidOperationException>(() =>
             store.TryCreateAsync("outsized-flow", CreateState("outsized-flow", payloadBytes: 4096), TimeSpan.FromMinutes(5)));

@@ -1,4 +1,5 @@
 #nullable enable
+AsyncResponse.DurableFlows.Sqlite.SqliteFlowStateStore.ValidateCreate(string! flowId, AsyncResponse.FlowState! state, System.TimeSpan ttl) -> void
 AsyncResponse.DurableFlows.Sqlite.SqliteDurableFlowOptions
 AsyncResponse.DurableFlows.Sqlite.SqliteDurableFlowOptions.AutoCreateSchema.get -> bool
 AsyncResponse.DurableFlows.Sqlite.SqliteDurableFlowOptions.AutoCreateSchema.set -> void

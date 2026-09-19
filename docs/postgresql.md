@@ -18,8 +18,9 @@ subscriptions; this stays under PostgreSQL's 8 KB notification payload limit.
 
 `NOTIFY` is only a wake hint. Signals are deliberately coalesced in a bounded in-process channel,
 and the periodic safety scan remains authoritative. For each subscribed correlation id the reader
-uses a stable `created_at, id` keyset cursor until the retained result set is exhausted; a terminal
-response therefore cannot sit forever behind the oldest `PendingMessageBatchSize` progress rows.
+keeps a stable `created_at, id` keyset cursor across dispatch passes, with bounded pages per
+pass and periodic reconciliation for late commits. Continued paging reaches terminal responses
+beyond the first progress batch without monopolizing other correlations.
 
 Active waiters write rows to `asyncresponse_channel_subscribers`; one channel-level loop snapshots
 the registrations that are still active locally and extends only those rows with one statement per
@@ -173,17 +174,21 @@ Recommended Npgsql connection-string settings:
   performs one update for the process's current active-registration snapshot. Rows no longer in that
   snapshot are allowed to expire even if cleanup deletion failed. A failed batch is logged and the
   next interval retries, so leave enough timeout headroom for multiple attempts.
-- The sweep re-reads a subscribed correlation id's retained rows on every tick (and on every
-  targeted signal): acknowledged rows stay in the result so a fan-out waiter in another process
-  still receives a response this one already consumed. Their **bodies** do not travel: the page
-  query ships `envelope_json` only for rows nobody has acknowledged, an acknowledged row comes back
-  header-only (id, timestamps, `acked_seq`), and the sweep fetches the envelope by id only for the
-  rare acknowledged row a live subscription has not seen. A long-lived progress subscription's
-  sweep cost therefore no longer grows with its whole retained history. (Until round 39 every
-  sweep re-transferred and re-materialized every retained body just to drop it in the pre-filter.)
-- `PendingMessageBatchSize` is a page-size tuning knob, not a cap per sweep. Smaller pages lower
-  peak materialization; larger pages reduce round trips when one correlation id carries heavy
-  progress traffic.
+- Normal scans retain a forward `created_at, id` cursor per local subscription group. Caught-up
+  polls revisit only the last database-clock tick, so a new message with the same timestamp and
+  a lower random id is picked up promptly. Older consumed headers are not read on every poll. New
+  subscriptions reset the cursor to apply each waiter's own watermark; acknowledged messages
+  remain eligible for legitimate cross-process fan-out.
+- A late transaction can commit behind a creation-time cursor. `HistoryReconciliationInterval`
+  (default 5 seconds after the last completed reconciliation) starts a retained-history pass;
+  one page is reconciled per dispatch pass, with continuation after a poll interval. Large
+  histories therefore add polling intervals to discovery of late commits. Size waiter timeouts
+  and message retention accordingly. History reconciliation is still linear in retained rows;
+  it is separate from normal forward delivery, not a claim that all history I/O disappears.
+- `PendingMessageBatchSize` controls page size. A correlation receives at most 16 forward pages
+  plus one reconciliation page per pass before yielding to other correlations. Full executor
+  queues leave the refused page's cursor unchanged for retry. Failed delivery claims request
+  an immediate rewind. Acknowledged payload bodies are hydrated only when a waiter needs them.
 - Delivery is serialized per correlation id on a bounded (1024-item) executor. The sweep admits
   work to it **without waiting**: when one correlation id's executor is full — a waiter wedged in
   a slow `Until` predicate under a progress flood — the rest of that id's messages stay unclaimed

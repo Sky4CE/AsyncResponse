@@ -327,8 +327,11 @@ public class FlowTestHarnessShowcaseTests
     [InlineData("create-workspace", true)]
     [InlineData("create-workspace", false)]
     [InlineData("run-migration", true)]
+    [InlineData("run-migration", false)]
     [InlineData("import-data", true)]
+    [InlineData("import-data", false)]
     [InlineData("settle", true)]
+    [InlineData("settle", false)]
     [InlineData("send-welcome", true)]
     [InlineData("send-welcome", false)]
     public async Task CrashMatrix_AtEveryCheckpoint_ResumesWithExactlyOnceSideEffects(string crashStep, bool beforeStep)
