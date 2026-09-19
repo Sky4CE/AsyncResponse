@@ -12,8 +12,9 @@ namespace AsyncResponse.Tests;
 /// Regression tests for the at-most-once wake-up hole: a worker-job delivery that found the
 /// execution lease held used to be acked and dropped immediately, so a wake delivered during a
 /// DEAD holder's unexpired lease window was lost forever and the Running flow stranded. The
-/// executor now retries the acquire for a full lease window (a dead holder's lease must expire
-/// within it), and only proves-alive holders let the delivery ack as a duplicate.
+/// executor now retries the acquire until the holder's PERSISTED lease has expired, and only
+/// proves-alive holders (a lease renewed or taken over while it waits) let the delivery ack as a
+/// duplicate.
 /// </summary>
 public sealed class DurableFlowWakeRetryTests
 {
@@ -42,7 +43,7 @@ public sealed class DurableFlowWakeRetryTests
     }
 
     [Fact]
-    public async Task ExecuteAsync_LeaseHeldByLiveRenewingHolder_GivesUpAfterCeilingWithoutExecuting()
+    public async Task ExecuteAsync_LeaseHeldByLiveRenewingHolder_AcksOnObservedRenewalWithoutExecuting()
     {
         var store = new InMemoryFlowStateStore();
         var state = RunnableState("live-holder-flow");
@@ -69,11 +70,13 @@ public sealed class DurableFlowWakeRetryTests
             ExecutionLeaseRenewInterval = TimeSpan.FromMilliseconds(200)
         });
 
-        var waited = System.Diagnostics.Stopwatch.StartNew();
         try
         {
-            // A lease that stays held for duration + renew interval proves the holder alive; the
-            // delivery is then a true duplicate and must ack without executing the flow.
+            // A lease that is RENEWED while the delivery waits proves the holder alive; the
+            // delivery is then a true duplicate and must ack without executing the flow. (It used
+            // to be "held for this host's duration + renew interval", which a dead holder's lease
+            // from a longer-lease deployment satisfied too — see Round40RegressionTests. The
+            // at-most-once hole this file guards against is pinned by the dead-holder test above.)
             await harness.Executor.ExecuteAsync(state.FlowId!).WaitAsync(TimeSpan.FromSeconds(10));
         }
         finally
@@ -81,13 +84,6 @@ public sealed class DurableFlowWakeRetryTests
             renewals.Cancel();
             await renewLoop;
         }
-        waited.Stop();
-
-        // The give-up must come AFTER the full proving window (duration 1s + renew 200ms), not
-        // instantly — an instant return is the old at-most-once hole this file guards against.
-        Assert.True(
-            waited.Elapsed >= TimeSpan.FromSeconds(1),
-            $"Gave up after {waited.ElapsedMilliseconds}ms; expected to poll through the ~1.2s lease-proving window.");
 
         var final = await store.LoadAsync(state.FlowId!);
         Assert.Equal(FlowRunStatus.Running, final!.Status);

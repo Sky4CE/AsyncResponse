@@ -840,46 +840,74 @@ internal abstract class DbAsyncResponseChannelBase :
     /// periodic poll that is the missed-wake / cross-process-delivery safety net. A non-null set
     /// scans only the signaled correlation ids, so a flood of wake signals never forces a scan of
     /// every waiter.
+    /// <para>
+    /// The poll deadline is ABSOLUTE and judged after either wake source. It used to be a fresh
+    /// <c>Task.Delay</c> per pass that only counted when it won the race, so a steady stream of
+    /// targeted signals cancelled every delay and the full sweep never ran: a response published
+    /// from another process with no local signal — every cross-process response on SQL Server,
+    /// any missed or dropped notification elsewhere (the signal channel itself drops its oldest
+    /// entry when full) — sat undelivered for as long as unrelated local traffic continued.
+    /// </para>
     /// </summary>
-    /// <summary>Returned for a poll tick whose full sweep is not yet due: scan nothing. Never mutated.</summary>
-    private static readonly HashSet<string> EmptyDispatchScope = [];
-
-    private DateTimeOffset _lastFullSweepUtc;
-
     private protected async Task<HashSet<string>?> CollectDispatchScopeAsync(CancellationToken cancellationToken)
     {
-        // The WhenAny loser is cancelled via the per-iteration linked source: an abandoned
-        // WaitToReadAsync would otherwise stay parked in the channel's blocked-reader list until
-        // the next signal — one per poll interval, accumulating without bound on an idle channel.
-        using var iteration = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-        var delay = Task.Delay(CurrentPollInterval(), iteration.Token);
-        var signal = _signals.Reader.WaitToReadAsync(iteration.Token).AsTask();
-        var completed = await Task.WhenAny(delay, signal).ConfigureAwait(false);
-        iteration.Cancel();
-        if (completed == delay)
-        {
-            // The timer sweep costs one store query per subscribed correlation id, so with W
-            // waiters an idle channel pays W queries per poll tick. FullSweepInterval bounds that:
-            // a tick whose sweep is not yet due scans nothing (signaled scans are unaffected —
-            // they arrive through the signal branch below with their own scope). Provider-
-            // resolved: a provider whose push wake is off or unavailable has no other
-            // cross-process delivery path and must sweep every tick.
-            if (CurrentFullSweepInterval() is { } fullSweepInterval)
-            {
-                var now = DateTimeOffset.UtcNow;
-                if (now - _lastFullSweepUtc < fullSweepInterval)
-                    return EmptyDispatchScope;
-                _lastFullSweepUtc = now;
-            }
+        // Armed on the first pass rather than at construction: the loop starts lazily, and a
+        // deadline measured from the constructor would already be overdue by then.
+        _pollArmedAt ??= Stopwatch.GetTimestamp();
 
-            return null;
+        var signalled = false;
+        var untilPoll = CurrentPollInterval() - Stopwatch.GetElapsedTime(_pollArmedAt.Value);
+        var pollDue = untilPoll <= TimeSpan.Zero;
+        if (!pollDue)
+        {
+            // The WhenAny loser is cancelled via the per-iteration linked source: an abandoned
+            // WaitToReadAsync would otherwise stay parked in the channel's blocked-reader list until
+            // the next signal — one per poll interval, accumulating without bound on an idle channel.
+            using var iteration = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            var delay = Task.Delay(untilPoll, iteration.Token);
+            var signal = _signals.Reader.WaitToReadAsync(iteration.Token).AsTask();
+            var completed = await Task.WhenAny(delay, signal).ConfigureAwait(false);
+            iteration.Cancel();
+            if (completed == signal)
+            {
+                await signal.ConfigureAwait(false);
+                signalled = true;
+            }
+            else
+            {
+                // The timer is the authority for its own tick: it may fire a hair before the
+                // stopwatch agrees, and that tick must not degrade into an empty pass.
+                pollDue = true;
+            }
         }
 
-        await signal.ConfigureAwait(false);
+        // A signal does not excuse the poll. Re-read the interval while judging it: a signal from
+        // a new waiter is what re-arms SQL Server's tight active cadence, and that waiter's first
+        // poll must not wait out the idle interval.
+        if (pollDue || Stopwatch.GetElapsedTime(_pollArmedAt.Value) >= CurrentPollInterval())
+        {
+            _pollArmedAt = Stopwatch.GetTimestamp();
+
+            // The timer sweep costs one store query per subscribed correlation id, so with W
+            // waiters an idle channel pays W queries per poll tick. FullSweepInterval bounds that:
+            // a tick whose sweep is not yet due scans only what was signalled (possibly nothing).
+            // Provider-resolved: a provider whose push wake is off or unavailable has no other
+            // cross-process delivery path and must sweep every tick.
+            if (CurrentFullSweepInterval() is not { } fullSweepInterval
+                || _lastFullSweepAt is not { } lastFullSweepAt
+                || Stopwatch.GetElapsedTime(lastFullSweepAt) >= fullSweepInterval)
+            {
+                // Queued signals stay queued: the sweep covers their correlation ids, and the
+                // next pass re-scans them as a cheap targeted scope instead of this pass having
+                // to reason about signals written while the sweep was running.
+                _lastFullSweepAt = Stopwatch.GetTimestamp();
+                return null;
+            }
+        }
 
         var scope = new HashSet<string>(StringComparer.Ordinal);
         var fullSweep = false;
-        while (_signals.Reader.TryRead(out var correlationId))
+        for (var read = 0; read < MaxSignalsPerPass && _signals.Reader.TryRead(out var correlationId); read++)
         {
             if (string.IsNullOrEmpty(correlationId))
                 fullSweep = true;
@@ -887,16 +915,32 @@ internal abstract class DbAsyncResponseChannelBase :
                 scope.Add(correlationId);
         }
 
-        if (fullSweep || scope.Count == 0)
+        if (fullSweep || (signalled && scope.Count == 0))
         {
             // A signal-driven full sweep does the timer sweep's work; stamping it defers the next
             // timer sweep by a full interval instead of re-scanning everything twice in a row.
-            _lastFullSweepUtc = DateTimeOffset.UtcNow;
+            _lastFullSweepAt = Stopwatch.GetTimestamp();
             return null;
         }
 
-        return scope;
+        return scope.Count == 0 ? EmptyDispatchScope : scope;
     }
+
+    /// <summary>Returned for a poll tick whose full sweep is not yet due: scan nothing. Never mutated.</summary>
+    private static readonly HashSet<string> EmptyDispatchScope = [];
+
+    /// <summary>
+    /// Most signals one pass folds into its scope. The channel holds this many, so a pass still
+    /// takes everything that was queued when it started; the bound only stops it from chasing
+    /// writers that refill the channel as fast as it drains, which would keep the dispatch — and
+    /// the poll deadline behind it — waiting on the drain.
+    /// </summary>
+    private const int MaxSignalsPerPass = 1024;
+
+    // Stopwatch timestamps, not wall-clock stamps: both are interval deadlines, and a system
+    // clock stepping backwards must not postpone a sweep. Touched only by the dispatch loop.
+    private long? _pollArmedAt;
+    private long? _lastFullSweepAt;
 
     private protected async Task DispatchPendingMessagesAsync(HashSet<string>? scope, CancellationToken cancellationToken)
     {

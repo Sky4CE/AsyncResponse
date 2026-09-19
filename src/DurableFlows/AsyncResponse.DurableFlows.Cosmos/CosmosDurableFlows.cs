@@ -354,6 +354,28 @@ public sealed class CosmosFlowStateStore : IFlowStateStore, IDisposable
         }
     }
 
+    /// <inheritdoc />
+    public async Task<FlowLeaseObservation?> ObserveLeaseAsync(string flowId, CancellationToken cancellationToken = default)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(flowId);
+        var container = await GetContainerAsync(cancellationToken).ConfigureAwait(false);
+
+        // The same projecting point query the lease writes read through, so stateJson never
+        // crosses the wire — and, unlike them, nothing here is compared with a clock: an expired
+        // lease nobody has taken over must keep reading as the same lease, because the engine's
+        // proof of a live holder is that two observations DIFFER. Whether it has lapsed stays
+        // UpdateLeaseAsync's call.
+        try
+        {
+            var current = await ReadLeaseAsync(container, flowId, cancellationToken).ConfigureAwait(false);
+            return DurableFlowStoreShared.LeaseObservation(current?.LeaseId, current?.LeaseExpiresAtUtc);
+        }
+        catch (CosmosException ex) when (ex.StatusCode == HttpStatusCode.NotFound && ex.SubStatusCode == 0)
+        {
+            return FlowLeaseObservation.Unheld;
+        }
+    }
+
     // JSON-pointer paths of the lease fields, matching CosmosFlowStateDocument's property names.
     private const string LeaseIdPath = "/leaseId";
     private const string LeaseExpiresAtPath = "/leaseExpiresAtUtc";

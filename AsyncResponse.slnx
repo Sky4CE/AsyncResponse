@@ -50,6 +50,9 @@
     <Project Path="src/Transports/AsyncResponse.Transports.SQS/AsyncResponse.Transports.SQS.csproj" />
   </Folder>
   <Folder Name="/tests/">
+    <!-- Subprocess of the abrupt-crash recovery suite. A solution member for the same reason as the
+         AppHost below: referenced-but-not-listed projects are left stale by IDE solution builds. -->
+    <Project Path="tests/AsyncResponse.IntegrationTests.CrashWorker/AsyncResponse.IntegrationTests.CrashWorker.csproj" />
     <Project Path="tests/AsyncResponse.IntegrationTests/AsyncResponse.IntegrationTests.csproj" />
     <!-- The integration AppHost must be a solution member, not just a ProjectReference. Left out, an
          IDE "build solution + run all tests" rebuilds the test assembly but leaves this one stale, so

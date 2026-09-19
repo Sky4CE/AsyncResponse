@@ -182,9 +182,28 @@ owns the full story — this page is the map, not the territory.
   expired yet. A run with `Attempts == 0` was never picked up: its wake-up is queued behind a busy
   worker, or was lost in transit (an early-ACK worker subscriber, a broker that dropped it).
 - **Fix:** check the transport's dead-letter queue first — the DLQ entry is the alarm. Replay it
-  or call `ResumeAsync(flowId)` to re-enqueue the run. After a crash, expect up to
-  `ExecutionLeaseDuration` before another replica may take the run over. See
+  or call `ResumeAsync(flowId)` to re-enqueue the run. After a crash, expect up to the crashed
+  owner's `ExecutionLeaseDuration` — the value it was *running with*, which a later deployment may
+  have changed — before another replica may take the run over; the redelivered wake-up waits for
+  that persisted expiry on its own. See
   [what happens when things die](durable-flows.md#what-happens-when-things-die).
+
+### A flow job fails with `DurableFlowLeaseContendedException`
+
+- **Symptom:** a worker job for a flow retries (and may dead-letter) with *"could not acquire the
+  execution lease and cannot prove the run is executing elsewhere"*.
+- **Cause:** the wake-up found the execution lease held, waited, and saw neither the lease come
+  free nor proof of a live holder (the lease being renewed or taken over). The engine never
+  acknowledges a wake-up in that state — it may be the run's only one. The reason in the message
+  says which case it is: *"the flow state store does not report leases"* — an application-owned
+  `IFlowStateStore` that does not implement `ObserveLeaseAsync`, so a duplicate of a long-running
+  execution cannot be recognized as one; or *"neither changed nor became acquirable … past that
+  expiry"* — the store still refuses the lease a full lease window after the expiry it reports,
+  which points at clock skew between this host and the store (or a store bug).
+- **Fix:** implement `ObserveLeaseAsync` in the custom store (and forward it from any decorator
+  around a built-in one); fix time synchronization. The redelivered job completes the run once
+  the lease is free — a dead-lettered one needs a replay or `ResumeAsync(flowId)`. See
+  [lease contention](durable-flow-state-stores.md#lease-contention-and-deployments-that-change-the-lease-duration).
 
 ### A flow logs a `LedgerSizeWarningBytes` warning
 

@@ -328,19 +328,14 @@ public sealed class MongoDbChannelCoverageTests
         var resultSweepNull = await (Task<HashSet<string>?>)collectMethod.Invoke(channel, [CancellationToken.None])!;
         Assert.Null(resultSweepNull);
 
-        // The scoped-collect branch is timing-sensitive by design: CollectDispatchScopeAsync races
-        // its poll delay (1ms here) against the signal reader, and under parallel-suite load a
-        // descheduled thread can let the delay win with signals still buffered (that is benign in
-        // production — a null scope means "sweep everything", a superset). It can also leave the
-        // previous assertion's null signal buffered, which reads as a full-sweep marker. Retry
-        // until a collect observes the targeted scope; the branch under test is still exercised.
-        HashSet<string>? resultScope = null;
-        for (var attempt = 0; attempt < 20 && resultScope is null; attempt++)
-        {
-            signalMethod.Invoke(channel, ["corr-id-1"]);
-            signalMethod.Invoke(channel, ["corr-id-2"]);
-            resultScope = await (Task<HashSet<string>?>)collectMethod.Invoke(channel, [CancellationToken.None])!;
-        }
+        // The scoped branch needs a poll that is NOT due. The poll deadline is absolute (round 40:
+        // a queued signal no longer postpones it), so against the 1 ms interval above nearly every
+        // collect is a due sweep — which used to be papered over here with a 20-attempt retry
+        // loop. A long interval makes the branch deterministic: the signal wins, the scope is it.
+        var scopedChannel = new ChannelFixture(listenerPollInterval: TimeSpan.FromSeconds(30)).Channel;
+        signalMethod.Invoke(scopedChannel, ["corr-id-1"]);
+        signalMethod.Invoke(scopedChannel, ["corr-id-2"]);
+        var resultScope = await (Task<HashSet<string>?>)collectMethod.Invoke(scopedChannel, [CancellationToken.None])!;
 
         Assert.NotNull(resultScope);
         Assert.Contains("corr-id-1", resultScope);

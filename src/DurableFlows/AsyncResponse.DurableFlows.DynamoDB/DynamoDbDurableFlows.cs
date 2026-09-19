@@ -295,6 +295,57 @@ public sealed class DynamoDbFlowStateStore : IFlowStateStore, IDisposable
         }
     }
 
+    /// <inheritdoc />
+    public async Task<FlowLeaseObservation?> ObserveLeaseAsync(string flowId, CancellationToken cancellationToken = default)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(flowId);
+        await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
+
+        // The two lease attributes exactly as stored — deliberately never compared with a clock,
+        // unlike every other operation in this store: an expired lease nobody has taken over must
+        // keep reading as the same lease, because the engine's proof of a live holder is that two
+        // observations DIFFER. Whether it has lapsed stays UpdateLeaseAsync's call. Consistent
+        // for the reason LoadAsync is — an eventually consistent read can replay a lease a renewal
+        // has already moved, and "unchanged" is the one answer that must never be stale — and
+        // projected, so state_json (up to the 400 KB item cap) stays off the wire.
+        var response = await _client.GetItemAsync(new GetItemRequest
+        {
+            TableName = _options.TableName,
+            Key = Key(flowId),
+            ConsistentRead = true,
+            ProjectionExpression = "#lease_id, #lease_expires",
+            ExpressionAttributeNames = new Dictionary<string, string>
+            {
+                ["#lease_id"] = LeaseIdAttribute,
+                ["#lease_expires"] = LeaseExpiresAtAttribute
+            }
+        }, cancellationToken).ConfigureAwait(false);
+
+        // No item and an item with neither attribute both come back empty under a projection;
+        // either way nobody holds the lease.
+        if (response.Item is null
+            || !response.Item.TryGetValue(LeaseIdAttribute, out var leaseId)
+            || string.IsNullOrEmpty(leaseId.S))
+            return FlowLeaseObservation.Unheld;
+
+        // lease_expires_at_ms is epoch milliseconds (UpdateLeaseAsync writes it that way). A holder
+        // whose expiry is missing or unreadable is still a holder: the owner is reported and the
+        // expiry left null, which the engine reads as "no persisted deadline to wait out".
+        return DurableFlowStoreShared.LeaseObservation(
+            leaseId.S,
+            response.Item.TryGetValue(LeaseExpiresAtAttribute, out var leaseExpires)
+            && long.TryParse(leaseExpires.N, NumberStyles.Integer, CultureInfo.InvariantCulture, out var expiresAtMs)
+            && expiresAtMs >= MinUnixMilliseconds
+            && expiresAtMs <= MaxUnixMilliseconds
+                ? DateTimeOffset.FromUnixTimeMilliseconds(expiresAtMs).UtcDateTime
+                : null);
+    }
+
+    // The range DateTimeOffset.FromUnixTimeMilliseconds accepts; a hand-edited attribute outside
+    // it would otherwise throw ArgumentOutOfRangeException out of an observation.
+    private static readonly long MinUnixMilliseconds = DateTimeOffset.MinValue.ToUnixTimeMilliseconds();
+    private static readonly long MaxUnixMilliseconds = DateTimeOffset.MaxValue.ToUnixTimeMilliseconds();
+
     public async Task<bool> TryDeleteAsync(string flowId, CancellationToken cancellationToken = default)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(flowId);

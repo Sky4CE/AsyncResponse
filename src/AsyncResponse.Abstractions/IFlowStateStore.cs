@@ -67,6 +67,25 @@ public interface IFlowStateStore
         string leaseId,
         CancellationToken cancellationToken = default);
 
+    /// <summary>
+    /// Reports the execution lease currently persisted for <paramref name="flowId"/> — the raw
+    /// owner and expiry, without judging whether it has lapsed. Returns
+    /// <see cref="FlowLeaseObservation.Unheld"/> when no lease is held (or the ledger is absent),
+    /// and <c>null</c> when this store cannot report leases at all, which is the default for
+    /// compatibility with application-owned stores.
+    /// <para>
+    /// A wake-up that finds the lease held uses this to tell a live holder from a dead one: a
+    /// lease whose owner or expiry changes while the wake-up waits was acquired or renewed by a
+    /// live worker, so the wake-up is a duplicate; a lease that never changes belongs to a dead
+    /// holder and is waited out to its <em>persisted</em> expiry, whatever lease duration issued
+    /// it. A store that returns <c>null</c> gives the engine no such evidence, so a wake-up that
+    /// cannot acquire the lease within its own lease window is never acknowledged: it fails with
+    /// <see cref="DurableFlowLeaseContendedException"/> and the worker transport redelivers it.
+    /// </para>
+    /// </summary>
+    Task<FlowLeaseObservation?> ObserveLeaseAsync(string flowId, CancellationToken cancellationToken = default)
+        => Task.FromResult<FlowLeaseObservation?>(null);
+
     /// <summary>Deletes the state of one flow run; <c>true</c> when an entry was removed.</summary>
     Task<bool> TryDeleteAsync(string flowId, CancellationToken cancellationToken = default);
 }

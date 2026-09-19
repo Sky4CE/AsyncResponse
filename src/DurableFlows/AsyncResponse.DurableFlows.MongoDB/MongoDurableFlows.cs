@@ -281,6 +281,29 @@ public sealed class MongoDbFlowStateStore : IFlowStateStore, IDisposable
         await _collection.UpdateOneAsync(filter, update, cancellationToken: cancellationToken).ConfigureAwait(false);
     }
 
+    /// <inheritdoc />
+    public async Task<FlowLeaseObservation?> ObserveLeaseAsync(string flowId, CancellationToken cancellationToken = default)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(flowId);
+        await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
+
+        // The two lease fields exactly as stored — deliberately an id-only filter with no $$NOW
+        // comparison, unlike every other read and write in this store: an expired lease nobody has
+        // taken over must keep reading as the same lease, because the engine's proof of a live
+        // holder is that two observations DIFFER. Whether it has lapsed stays BuildLeaseFilter's
+        // call, on the server clock. Read from the primary like every ledger read (the collection
+        // handle is pinned at construction), so a lagging secondary can never replay a stale
+        // lease as "unchanged"; the projection keeps state_json off the wire.
+        var document = await _collection
+            .Find(Builders<MongoFlowStateDocument>.Filter.Eq(item => item.FlowId, flowId))
+            .Project<MongoFlowStateDocument>(BuildLeaseProjection())
+            .FirstOrDefaultAsync(cancellationToken)
+            .ConfigureAwait(false);
+
+        // BSON dates are UTC milliseconds and the driver materializes them as DateTimeKind.Utc.
+        return DurableFlowStoreShared.LeaseObservation(document?.LeaseId, document?.LeaseExpiresAtUtc);
+    }
+
     public async Task<bool> TryDeleteAsync(string flowId, CancellationToken cancellationToken = default)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(flowId);
@@ -514,6 +537,16 @@ public sealed class MongoDbFlowStateStore : IFlowStateStore, IDisposable
                 })
             })
         });
+
+    /// <summary>
+    /// Projection for <see cref="ObserveLeaseAsync"/>: only <c>lease_id</c> and
+    /// <c>lease_expires_at_utc</c> (plus the implicit <c>_id</c>) leave the server, so observing a
+    /// lease costs the same whatever the ledger's size.
+    /// </summary>
+    internal static ProjectionDefinition<MongoFlowStateDocument> BuildLeaseProjection()
+        => Builders<MongoFlowStateDocument>.Projection
+            .Include(item => item.LeaseId)
+            .Include(item => item.LeaseExpiresAtUtc);
 
     private static FilterDefinition<MongoFlowStateDocument> ServerClockExpr(BsonDocument comparison)
         => new BsonDocumentFilterDefinition<MongoFlowStateDocument>(new BsonDocument("$expr", comparison));

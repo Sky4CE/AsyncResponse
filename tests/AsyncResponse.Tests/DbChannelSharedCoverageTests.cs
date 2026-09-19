@@ -161,6 +161,75 @@ public sealed class DbChannelSharedCoverageTests
     }
 
     /// <summary>
+    /// Round 40 (HIGH): the poll deadline is absolute. Each pass used to arm a FRESH poll delay
+    /// and only honoured it when the delay beat the signal channel, so a dispatcher that always
+    /// had a targeted signal waiting never ran a full sweep — the only thing that delivers a
+    /// response nobody signalled (every cross-process response on SQL Server; a missed or dropped
+    /// notification on PostgreSQL and MongoDB). Proven red on ca58de0: zero full sweeps in every
+    /// row below, however long the traffic ran.
+    /// </summary>
+    [Theory]
+    [InlineData(Provider.SqlServer, null)]
+    [InlineData(Provider.PostgreSql, null)]
+    [InlineData(Provider.MongoDb, null)]
+    [InlineData(Provider.SqlServer, 100)]
+    [InlineData(Provider.PostgreSql, 100)]
+    public async Task CollectDispatchScope_SustainedTargetedSignals_DoNotStarveTheFullSweep(Provider provider, int? fullSweepIntervalMs)
+    {
+        await using var harness = Harness.Create(
+            provider,
+            failing: false,
+            pollInterval: TimeSpan.FromMilliseconds(40),
+            fullSweepInterval: fullSweepIntervalMs is { } ms ? TimeSpan.FromMilliseconds(ms) : null);
+
+        var fullSweeps = 0;
+        var targetedPasses = 0;
+        var traffic = System.Diagnostics.Stopwatch.StartNew();
+        while (traffic.Elapsed < TimeSpan.FromMilliseconds(800))
+        {
+            // Unrelated local traffic: a targeted signal is already queued before every pass.
+            harness.Invoke("SignalDispatcher", "corr-busy");
+            if (await harness.CollectDispatchScopeAsync() is null)
+                fullSweeps++;
+            else
+                targetedPasses++;
+
+            // The dispatch a real pass performs between two collects.
+            await Task.Delay(5);
+        }
+
+        Assert.True(targetedPasses > 0, "The signals must still be served as targeted scans between sweeps.");
+        Assert.True(
+            fullSweeps >= 2,
+            $"{fullSweeps} full sweep(s) in {traffic.ElapsedMilliseconds} ms of sustained targeted signals ({targetedPasses} targeted passes); the 40 ms poll and its sweep were starved.");
+    }
+
+    /// <summary>
+    /// The signals a due sweep leaves queued are not lost: the sweep covered their correlation
+    /// ids, and the next pass still serves them as a targeted scope.
+    /// </summary>
+    [Theory]
+    [InlineData(Provider.SqlServer)]
+    [InlineData(Provider.PostgreSql)]
+    [InlineData(Provider.MongoDb)]
+    public async Task CollectDispatchScope_ADueSweepOutranksQueuedSignals_AndLeavesThemForTheNextPass(Provider provider)
+    {
+        // 250 ms: long enough that the third collect below lands inside the re-armed interval
+        // even on a stalled runner, short enough to lapse on purpose.
+        await using var harness = Harness.Create(provider, failing: false, pollInterval: TimeSpan.FromMilliseconds(250));
+
+        // Arms the poll deadline (the loop starts lazily), then lets it lapse with a signal queued.
+        harness.Invoke("SignalDispatcher", "corr-arm");
+        Assert.IsType<HashSet<string>>(await harness.CollectDispatchScopeAsync());
+        harness.Invoke("SignalDispatcher", "corr-late");
+        await Task.Delay(TimeSpan.FromMilliseconds(350));
+
+        Assert.Null(await harness.CollectDispatchScopeAsync());
+        var targeted = Assert.IsType<HashSet<string>>(await harness.CollectDispatchScopeAsync());
+        Assert.Single(targeted, "corr-late");
+    }
+
+    /// <summary>
     /// MongoDB honours the throttle only while change streams carry delivery: with them on (and
     /// not reported unsupported) a not-yet-due tick scans nothing, exactly as the relational
     /// providers above.

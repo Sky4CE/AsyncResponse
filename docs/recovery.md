@@ -262,6 +262,27 @@ some entries (a probe outage, or no `IActiveSubscriberProbe` registered): those 
 is unknown and never flagged stale by themselves, so without this the check would attest a clean
 pass it never actually computed.
 
+A scan that **fails** reports `Degraded` with the failure — and "could not read part of the store"
+is a failure, not an empty result. That is a contract on `IRecoveryStateScanner.ScanAsync`: a
+scanner that cannot inspect some of its storage must throw, never complete with the reachable
+subset. The Redis scanner enforces it on topology: it scans connected primaries only and fails the
+scan when **no primary is connected**, or when the deployment is a **cluster and any primary is
+disconnected** (its slots hold registrations no other node has). Outside a cluster one connected
+primary is the whole keyspace, so a failed-over deployment that still lists its old primary as
+disconnected scans normally, and a disconnected replica never matters. Earlier versions skipped
+disconnected servers silently: with Redis down the scan enumerated nothing, published "0
+registrations, no error", and the health check went from `Degraded` to `Healthy` *because of* the
+outage. Expect the opposite now — a Redis outage shows up here as
+`Async-response watchdog scan failed: …` until the connection is back. On a cluster that has
+failed a primary over, the old primary keeps the scan failing until it rejoins (as a replica) or
+is removed from the cluster: the multiplexer still reports it as a primary it cannot reach.
+
+The Redis scan streams: keys come from `SCAN` asynchronously, and registration blobs are read in
+pipelined batches of 128 (individual `GET`s, so a cluster routes each to its shard) rather than
+one awaited round trip per key — a 100,000-registration keyspace at 2 ms per round trip used to
+spend over three minutes on latency alone before the first liveness probe. `ProbeConcurrency`
+still governs the probe phase that follows.
+
 ## Recovery-state durability
 
 Recovery state lives in the durable channel's store and survives a redeploy:

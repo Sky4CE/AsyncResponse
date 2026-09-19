@@ -238,9 +238,18 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
     /// A held lease alone is NOT proof this delivery is a duplicate: the holder may have died
     /// inside its unexpired lease window, and acking would drop the only wake-up the flow has —
     /// wake-ups would silently become at-most-once and the <see cref="FlowRunStatus.Running"/> run
-    /// would strand. A dead holder's lease expires within <see cref="DurableFlowOptions.ExecutionLeaseDuration"/>,
-    /// so polling for one full duration + renew interval guarantees this delivery either takes over
-    /// (checkpoints make the re-run idempotent) or proves the holder alive.
+    /// would strand. Neither is a lease that outlasts THIS host's lease window: the lease in the
+    /// way may have been issued by another deployment with a longer
+    /// <see cref="DurableFlowOptions.ExecutionLeaseDuration"/>, so a successor configured with a
+    /// shorter one used to give up — and ack — before the dead holder's lease had even expired.
+    /// </para>
+    /// <para>
+    /// Proof therefore comes from the store, not from elapsed local configuration
+    /// (<see cref="IFlowStateStore.ObserveLeaseAsync"/>): a lease whose owner or expiry changes
+    /// while this delivery waits was acquired or renewed by a live worker in the meantime; a lease
+    /// that never changes is a dead holder's, and is waited out to its PERSISTED expiry. When the
+    /// wait ends with neither proof nor the lease, the delivery is not acknowledged —
+    /// <see cref="DurableFlowLeaseContendedException"/> hands it back to the transport.
     /// </para>
     /// </summary>
     private async Task<FlowExecutionLease?> AcquireExecutionLeaseWithRetryAsync(IFlowStateStore store, string flowId)
@@ -254,13 +263,16 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
         if (lease is not null)
             return lease;
 
-        // Poll ceiling: a lease can only stay held past its duration if the holder renewed it, so
-        // one full duration + renew interval of failed acquires proves the holder is alive. The 2s
-        // poll delay is capped by the renew interval so short test-sized leases still get polled.
-        var deadline = _timeProvider.GetUtcNow().UtcDateTime + _options.ExecutionLeaseDuration + _options.ExecutionLeaseRenewInterval;
+        // This host's lease window bounds the wait only until the store says otherwise: the first
+        // observation of the lease in the way moves the deadline to a full window past ITS expiry.
+        // The 2s poll delay is capped by the renew interval so short test-sized leases still get polled.
+        var window = _options.ExecutionLeaseDuration + _options.ExecutionLeaseRenewInterval;
+        var deadline = AddSaturating(_timeProvider.GetUtcNow().UtcDateTime, window);
         var pollDelay = _options.ExecutionLeaseRenewInterval < TimeSpan.FromSeconds(2)
             ? _options.ExecutionLeaseRenewInterval
             : TimeSpan.FromSeconds(2);
+        FlowLeaseObservation? baseline = null;
+        var storeReportsLeases = true;
 
         while (true)
         {
@@ -293,6 +305,46 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
             if (lease is not null)
                 return lease;
 
+            var observed = storeReportsLeases
+                ? await store.ObserveLeaseAsync(flowId).ConfigureAwait(false)
+                : null;
+            if (observed is null)
+            {
+                storeReportsLeases = false;
+            }
+            else if (observed.LeaseId is not null)
+            {
+                if (baseline is null)
+                {
+                    baseline = observed;
+                    if (observed.ExpiresAtUtc is { } persistedExpiry)
+                    {
+                        // A dead holder's lease is acquirable once ITS expiry passes, whichever
+                        // deployment's lease duration issued it; the extra window absorbs clock
+                        // skew between this host and the store before the wait is declared stuck.
+                        var persistedDeadline = AddSaturating(persistedExpiry, window);
+                        if (persistedDeadline > deadline)
+                            deadline = persistedDeadline;
+                    }
+                }
+                else if (!string.Equals(observed.LeaseId, baseline.LeaseId, StringComparison.Ordinal)
+                         || observed.ExpiresAtUtc > baseline.ExpiresAtUtc)
+                {
+                    // Only a worker that acquired or renewed the lease AFTER this delivery started
+                    // waiting can have written that. Every execution is driven by a worker job that
+                    // stays unacked until its handler completes, so if that live holder crashes
+                    // later the broker redelivers its own job — this delivery is genuinely
+                    // redundant and safe to ack. The retry loop exists purely to cover deliveries
+                    // that arrive inside a DEAD holder's unexpired lease window, which broker
+                    // redelivery alone cannot cover.
+                    _logger.LogDebug(
+                        "Durable flow {FlowId} is executing on another live worker (its lease was {Evidence} while this delivery waited); skipping duplicate delivery.",
+                        flowId,
+                        string.Equals(observed.LeaseId, baseline.LeaseId, StringComparison.Ordinal) ? "renewed" : "taken over");
+                    return null;
+                }
+            }
+
             if (_timeProvider.GetUtcNow().UtcDateTime >= deadline)
                 break;
 
@@ -310,17 +362,19 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
             }
         }
 
-        // The lease survived a full duration + renew window, so the holder is alive and renewing.
-        // Every execution is driven by a worker job that stays unacked until its handler completes,
-        // so if that live holder crashes later the broker redelivers its own job — this delivery is
-        // genuinely redundant and safe to ack. The retry loop above exists purely to cover
-        // deliveries that arrive inside a DEAD holder's unexpired lease window, which broker
-        // redelivery alone cannot cover.
-        _logger.LogDebug(
-            "Durable flow {FlowId} is executing on another live worker (lease renewed through the full wait window); skipping duplicate delivery.",
-            flowId);
-        return null;
+        // No lease and no proof of a live holder. Acknowledging here is what stranded runs behind
+        // a lease issued under a longer configuration; the transport keeps the wake-up instead.
+        throw new DurableFlowLeaseContendedException(
+            flowId,
+            !storeReportsLeases
+                ? $"the flow state store does not report leases ({nameof(IFlowStateStore)}.{nameof(IFlowStateStore.ObserveLeaseAsync)} returned null), and the lease stayed held through this host's whole lease window of {window}"
+                : baseline is null
+                    ? $"the lease stayed unacquirable through this host's whole lease window of {window} although the store reports no holder"
+                    : $"the lease held by '{baseline.LeaseId}' (persisted expiry {baseline.ExpiresAtUtc:O}) neither changed nor became acquirable within a full lease window past that expiry; check for clock skew between this host and the store");
     }
+
+    private static DateTime AddSaturating(DateTime instant, TimeSpan span)
+        => span > DateTime.MaxValue - instant ? DateTime.MaxValue : instant + span;
 
     /// <inheritdoc />
     public async Task CreateAndExecuteAsync(string flowId, string initialStateJson)

@@ -54,6 +54,11 @@
          point for the in-process WebApplicationFactory tests. -->
     <ProjectReference Include="..\AsyncResponse.IntegrationTests.AppHost\AsyncResponse.IntegrationTests.AppHost.csproj" />
     <ProjectReference Include="..\..\samples\AsyncResponse.Sample\AsyncResponse.Sample.csproj" />
+    <!-- The abrupt-crash suite's subprocess (DurableFlowAbruptCrashRecoveryTests). A plain reference on
+         purpose: referencing an Exe copies its dll, runtimeconfig.json and deps.json next to this
+         assembly, which is where the suite launches it from — no bin/<Configuration>/<TFM> path to
+         guess — and it shares CrashWorkerContract (env vars, crash points, table names) with the tests. -->
+    <ProjectReference Include="..\AsyncResponse.IntegrationTests.CrashWorker\AsyncResponse.IntegrationTests.CrashWorker.csproj" />
     <ProjectReference Include="..\..\src\Channels\AsyncResponse.Channels.MongoDB\AsyncResponse.Channels.MongoDB.csproj" />
     <ProjectReference Include="..\..\src\Channels\AsyncResponse.Channels.NATS\AsyncResponse.Channels.NATS.csproj" />
     <ProjectReference Include="..\..\src\Channels\AsyncResponse.Channels.PostgreSQL\AsyncResponse.Channels.PostgreSQL.csproj" />

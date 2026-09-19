@@ -253,6 +253,35 @@ public sealed class MySqlFlowStateStore : IFlowStateStore
         await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
     }
 
+    /// <inheritdoc />
+    public async Task<FlowLeaseObservation?> ObserveLeaseAsync(string flowId, CancellationToken cancellationToken = default)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(flowId);
+        await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
+
+        // The two lease columns exactly as stored — deliberately no UTC_TIMESTAMP(6) predicate,
+        // unlike every other statement in this store: an expired lease nobody has taken over must
+        // keep reading as the same lease, because the engine's proof of a live holder is that two
+        // observations DIFFER. Whether it has lapsed stays UpdateLeaseAsync's call, on the
+        // database clock.
+        await using var connection = await OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
+        await using var command = connection.CreateCommand();
+        command.CommandText = $"SELECT lease_id, lease_expires_at_utc FROM {Table} WHERE flow_id = @flow_id;";
+        command.Parameters.AddWithValue("@flow_id", flowId);
+
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+        if (!await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+            return FlowLeaseObservation.Unheld;
+
+        // datetime(6) carries no zone and the value is UTC_TIMESTAMP(6) arithmetic, so it IS UTC
+        // whatever kind the connection labels it with: MySqlConnector's DateTimeKind=Local option
+        // relabels the same digits as local time without converting them, and the shared shaper
+        // would then shift a Local value by the host's offset. Strip the label first.
+        return DurableFlowStoreShared.LeaseObservation(
+            reader.IsDBNull(0) ? null : reader.GetString(0),
+            reader.IsDBNull(1) ? null : DateTime.SpecifyKind(reader.GetDateTime(1), DateTimeKind.Unspecified));
+    }
+
     public async Task<bool> TryDeleteAsync(string flowId, CancellationToken cancellationToken = default)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(flowId);

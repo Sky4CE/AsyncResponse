@@ -176,21 +176,16 @@ internal sealed class RedisRecoveryStateStore : IRecoveryStateStore, IRecoverySt
     /// <inheritdoc />
     public async IAsyncEnumerable<RecoveryState> ScanAsync([EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
-        // Primaries only. Every replica holds a copy of the same keys, so scanning them too walked
-        // the keyspace once per node and produced nothing the primary had not already yielded —
-        // the dedupe below hid the duplicate entries but not the round trips. It also aimed a full
-        // keyspace scan at nodes that exist to serve reads cheaply. On a single-node deployment
-        // this changes nothing: that node is the primary.
-        var connectedServers = _multiplexer.GetEndPoints()
-            .Select(endPoint => _multiplexer.GetServer(endPoint))
-            .Where(server => server.IsConnected && !server.IsReplica)
-            .ToList();
-
         var seenKeys = new HashSet<string>(StringComparer.Ordinal);
+        var batch = new List<string>(ScanReadBatchSize);
 
-        foreach (var server in connectedServers)
+        foreach (var server in ResolveScanTargets())
         {
-            foreach (var key in server.Keys(pattern: _keys.RecoveryKeyPattern, pageSize: 250))
+            // KeysAsync, not Keys: the synchronous enumerator blocked its thread on every SCAN
+            // page of what is, by definition, a walk of the whole keyspace.
+            await foreach (var key in server.KeysAsync(pattern: _keys.RecoveryKeyPattern, pageSize: ScanPageSize)
+                               .WithCancellation(cancellationToken)
+                               .ConfigureAwait(false))
             {
                 cancellationToken.ThrowIfCancellationRequested();
 
@@ -198,17 +193,120 @@ internal sealed class RedisRecoveryStateStore : IRecoveryStateStore, IRecoverySt
                 if (!seenKeys.Add(recoveryKey))
                     continue;
 
-                var value = await _database.StringGetAsync(recoveryKey).ConfigureAwait(false);
-                if (value.IsNullOrEmpty)
+                batch.Add(recoveryKey);
+                if (batch.Count < ScanReadBatchSize)
                     continue;
 
-                var correlationId = _keys.CorrelationIdFromRecoveryKey(recoveryKey);
-                var (entries, _) = DeserializeEntries(value, recoveryKey, correlationId, logAsError: false, _timeProvider.GetUtcNow());
-                foreach (var entry in entries)
-                    yield return entry.State!;
+                foreach (var state in await ReadScanBatchAsync(batch, cancellationToken).ConfigureAwait(false))
+                    yield return state;
+                batch.Clear();
             }
+
+            if (batch.Count == 0)
+                continue;
+
+            foreach (var state in await ReadScanBatchAsync(batch, cancellationToken).ConfigureAwait(false))
+                yield return state;
+            batch.Clear();
         }
     }
+
+    private const int ScanPageSize = 250;
+
+    /// <summary>
+    /// Values read per pipelined batch. Each registration blob used to be awaited before the next
+    /// GET was even sent — one network round trip per key, so a 100,000-key scan at 2 ms spent
+    /// over three minutes on latency alone. The reads are independent, so a batch is issued
+    /// back to back on the multiplexer's pipeline and awaited together; the bound keeps the scan
+    /// streaming (the watchdog buffers only the fields it classifies on) instead of holding the
+    /// keyspace's values in memory. Individual GETs rather than one MGET: on a cluster the keys of
+    /// a batch hash to different slots, and the multiplexer routes each GET to its own shard.
+    /// </summary>
+    private const int ScanReadBatchSize = 128;
+
+    private async Task<List<RecoveryState>> ReadScanBatchAsync(List<string> recoveryKeys, CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+
+        var reads = new Task<RedisValue>[recoveryKeys.Count];
+        for (var i = 0; i < reads.Length; i++)
+            reads[i] = _database.StringGetAsync(recoveryKeys[i]);
+
+        // A failed read fails the scan (see ResolveScanTargets): skipping the key would report
+        // the registrations behind it as absent.
+        var values = await Task.WhenAll(reads).ConfigureAwait(false);
+
+        var states = new List<RecoveryState>(values.Length);
+        var nowUtc = _timeProvider.GetUtcNow();
+        for (var i = 0; i < values.Length; i++)
+        {
+            if (values[i].IsNullOrEmpty)
+                continue;
+
+            var recoveryKey = recoveryKeys[i];
+            var correlationId = _keys.CorrelationIdFromRecoveryKey(recoveryKey);
+            var (entries, _) = DeserializeEntries(values[i], recoveryKey, correlationId, logAsError: false, nowUtc);
+            foreach (var entry in entries)
+                states.Add(entry.State!);
+        }
+
+        return states;
+    }
+
+    /// <summary>
+    /// The servers whose keyspaces make up a complete scan — or an exception when that set cannot
+    /// be inspected. Disconnected servers used to be filtered out silently, so with Redis down
+    /// the scan "succeeded" over zero servers: the watchdog published an empty report with no
+    /// error and the recovery health check went from Degraded to Healthy BECAUSE of the outage.
+    /// An empty keyspace and an unreadable one are different answers; only the first is a scan.
+    /// <para>
+    /// Primaries only. Every replica holds a copy of the same keys, so scanning them too walked
+    /// the keyspace once per node and produced nothing the primary had not already yielded —
+    /// the dedupe hid the duplicate entries but not the round trips. It also aimed a full
+    /// keyspace scan at nodes that exist to serve reads cheaply. On a single-node deployment
+    /// this changes nothing: that node is the primary.
+    /// </para>
+    /// </summary>
+    private List<IServer> ResolveScanTargets()
+    {
+        var primaries = new List<IServer>();
+        List<IServer>? unreachable = null;
+        foreach (var endPoint in _multiplexer.GetEndPoints())
+        {
+            var server = _multiplexer.GetServer(endPoint);
+            if (server.IsReplica)
+                continue;
+
+            if (server.IsConnected)
+                primaries.Add(server);
+            else
+                (unreachable ??= []).Add(server);
+        }
+
+        if (primaries.Count == 0)
+        {
+            throw ScanUnavailable(
+                "Recovery-state scan failed: no Redis primary is connected, so the persisted registrations cannot be read. " +
+                "This is an unavailable scan, not an empty keyspace.");
+        }
+
+        // A cluster shards the keyspace: every primary holds registrations no other primary has,
+        // so one that cannot be inspected makes the scan partial. Outside a cluster every primary
+        // the multiplexer knows serves the same dataset (a failed-over deployment lists the old
+        // primary as disconnected until it rejoins as a replica), and one connected primary is
+        // the whole keyspace.
+        if (unreachable is not null && primaries.Exists(static primary => primary.ServerType == ServerType.Cluster))
+        {
+            throw ScanUnavailable(
+                $"Recovery-state scan failed: Redis cluster primary {string.Join(", ", unreachable.Select(static server => server.EndPoint?.ToString() ?? "(unknown endpoint)"))} is not connected, " +
+                "so the registrations in its slots cannot be read. A partial scan is reported as failed rather than as a verdict over the reachable shards.");
+        }
+
+        return primaries;
+    }
+
+    private static RedisConnectionException ScanUnavailable(string message)
+        => new(ConnectionFailureType.UnableToConnect, CommandFlags.None, message, innerException: null, CommandStatus.Unknown);
 
     private const int MaxCasAttempts = 4;
 

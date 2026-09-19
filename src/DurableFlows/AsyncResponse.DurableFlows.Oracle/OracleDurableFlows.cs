@@ -247,6 +247,33 @@ public sealed class OracleFlowStateStore : IFlowStateStore
         await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
     }
 
+    /// <inheritdoc />
+    public async Task<FlowLeaseObservation?> ObserveLeaseAsync(string flowId, CancellationToken cancellationToken = default)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(flowId);
+        await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
+
+        // The two lease columns exactly as stored — deliberately no SYS_EXTRACT_UTC(SYSTIMESTAMP)
+        // predicate, unlike every other statement in this store: an expired lease nobody has taken
+        // over must keep reading as the same lease, because the engine's proof of a live holder is
+        // that two observations DIFFER. Whether it has lapsed stays UpdateLeaseAsync's call, on the
+        // database clock. TIMESTAMP(6) carries no zone and reads back Unspecified; the value is
+        // SYS_EXTRACT_UTC arithmetic, and the shared shaper stamps it UTC.
+        await using var connection = await OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
+        await using var command = connection.CreateCommand();
+        command.BindByName = true;
+        command.CommandText = $"SELECT lease_id, lease_expires_at_utc FROM {Table} WHERE flow_id = :flow_id";
+        command.Parameters.Add(NationalId("flow_id", flowId));
+
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+        if (!await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+            return FlowLeaseObservation.Unheld;
+
+        return DurableFlowStoreShared.LeaseObservation(
+            reader.IsDBNull(0) ? null : reader.GetString(0),
+            reader.IsDBNull(1) ? null : reader.GetDateTime(1));
+    }
+
     public async Task<bool> TryDeleteAsync(string flowId, CancellationToken cancellationToken = default)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(flowId);

@@ -395,6 +395,31 @@ public sealed class EFCoreFlowStateStore<[DynamicallyAccessedMembers(Dynamically
             .ConfigureAwait(false);
     }
 
+    /// <inheritdoc />
+    public async Task<FlowLeaseObservation?> ObserveLeaseAsync(string flowId, CancellationToken cancellationToken = default)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(flowId);
+        await using var lease = await LeaseContextAsync(cancellationToken).ConfigureAwait(false);
+
+        // The two lease columns exactly as stored — deliberately no comparison with `now`, unlike
+        // every other query in this store: an expired lease nobody has taken over must keep
+        // reading as the same lease, because the engine's proof of a live holder is that two
+        // observations DIFFER. Whether it has lapsed stays UpdateLeaseAsync's call. A no-tracking
+        // named-record projection (see LoadAsync for why not an anonymous type), so state_json is
+        // never selected and nothing is cached on the per-operation context.
+        var row = await Records(lease.Context)
+            .AsNoTracking()
+            .Where(r => r.FlowId == flowId)
+            .Select(r => new LeaseRow(r.LeaseId, r.LeaseExpiresAtUtc))
+            .FirstOrDefaultAsync(cancellationToken)
+            .ConfigureAwait(false);
+
+        // Providers disagree on the kind a zone-less column reads back with (SQLite and SQL Server:
+        // Unspecified; Npgsql timestamptz: Utc). UpdateLeaseAsync wrote a UTC instant, and the
+        // shared shaper stamps it so.
+        return DurableFlowStoreShared.LeaseObservation(row?.LeaseId, row?.LeaseExpiresAtUtc);
+    }
+
     public async Task<bool> TryDeleteAsync(string flowId, CancellationToken cancellationToken = default)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(flowId);
@@ -571,5 +596,8 @@ public sealed class EFCoreFlowStateStore<[DynamicallyAccessedMembers(Dynamically
     /// off the anonymous-type Expression.New overload that Native AOT trim analysis rejects.
     /// </summary>
     private sealed record StateRow(string StateJson, long Revision);
+
+    /// <summary>Lease-column projection for <see cref="ObserveLeaseAsync"/>; named for the same AOT reason as <see cref="StateRow"/>.</summary>
+    private sealed record LeaseRow(string? LeaseId, DateTime? LeaseExpiresAtUtc);
 }
 }

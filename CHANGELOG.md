@@ -36,6 +36,82 @@ work that has landed on `main` but not yet shipped. Security reporters credited 
   Added fault, concurrency, serializer-parity, and checkpoint-cost regressions and guidance.
 
 
+- **Round-40 review (2026-09-19): incomplete evidence is not completion — lease proof, sweep deadlines, and scan coverage.**
+  - *A contended flow wake-up is acknowledged on evidence from the store, never on the waiting
+    host's own lease window.* The executor polled a held lease for ITS `ExecutionLeaseDuration +
+    ExecutionLeaseRenewInterval` and then acknowledged the delivery as "executing on another live
+    worker". A lease written by a previous deployment with a longer duration outlives that window
+    without anyone renewing it, so a successor configured with a shorter lease acknowledged the
+    crashed owner's only redelivery and the run stayed `Running`, `Attempts` unchanged, forever —
+    even after the old lease expired. New optional store member
+    `IFlowStateStore.ObserveLeaseAsync` returns the persisted owner and expiry
+    (`FlowLeaseObservation`, raw — the store still judges expiry in `TryAcquireLeaseAsync`). The
+    executor compares observations with each other: a different owner, or the same owner with a
+    later expiry, proves a worker acquired or renewed in the meantime and the delivery is
+    acknowledged — typically within one renewal interval instead of a full lease window; a lease
+    that never changes is a dead owner's and is waited out to its *persisted* expiry, then taken
+    over. If neither happens within one local lease window past that expiry the delivery fails
+    with the new `DurableFlowLeaseContendedException` and the transport redelivers it. All ten
+    built-in stores implement the member. **Application-owned stores:** the interface default
+    returns `null` ("cannot report leases"); such a store still takes over a dead owner's lease
+    inside its own window, but a wake-up that stays contended through it now throws instead of
+    being acknowledged — implement the member (one read of two columns) and forward it from any
+    decorator. Changing `ExecutionLeaseDuration` between deployments is now safe and documented.
+  - *Database channels: targeted signals no longer starve the sweep.* Every dispatch pass armed a
+    fresh poll delay and honoured it only when the delay beat the signal channel, so a process
+    with steady local traffic (each publish and each new waiter is a targeted signal) never ran a
+    full sweep — the only thing that delivers a response nobody signalled: every cross-process
+    response on SQL Server, a missed or dropped notification on PostgreSQL and MongoDB (the signal
+    queue itself drops its oldest entry when full). Remote publishers' delivery confirmations
+    lapsed and live waiters' responses were routed into lost-subscriber recovery. The poll deadline
+    is now absolute and judged after either wake source, on a monotonic clock; a due sweep runs
+    and leaves queued signals for the next pass; a pass folds at most 1,024 signals.
+  - *Redis: an outage is a failed scan, not an empty one.* The recovery scanner filtered
+    disconnected servers out before scanning, so with Redis down it enumerated nothing and
+    completed: the watchdog published "0 registrations, no error" and the recovery health check
+    went from `Degraded` to `Healthy` because of the outage. The scan now fails
+    (`RedisConnectionException`, reported as `Degraded: scan failed`) when no primary is connected,
+    and on a cluster when any primary is disconnected — its slots hold registrations no other node
+    has. Outside a cluster one connected primary is the whole keyspace, and a disconnected replica
+    never matters. `IRecoveryStateScanner.ScanAsync` documents the rule for custom scanners: best
+    effort covers consistency, not coverage.
+  - *Redis: the recovery scan is asynchronous and pipelined.* Keys came from the synchronous
+    `SCAN` enumerator (a blocked thread per page) and each registration blob was awaited before the
+    next `GET` was sent — one round trip per key, minutes of pure latency on a large keyspace
+    before the first liveness probe. The scan uses `KeysAsync` and reads values in pipelined
+    batches of 128 individual `GET`s (cluster-routable, bounded memory); a failed read fails the
+    scan rather than skipping the key.
+  - *Tests now kill a process.* The restart harness stops gracefully and expires leases by hand,
+    and the sample's `/crash` endpoint drops subscriptions in a live process — neither exercises an
+    unexpired persisted lease behind a dead owner, which is where the first finding lived.
+    `DurableFlowAbruptCrashRecoveryTests` (batch `data`) launches the new
+    `tests/AsyncResponse.IntegrationTests.CrashWorker` as a subprocess on the PostgreSQL transport
+    and flow store, and the worker SIGKILLs itself at an armed point — after lease acquisition,
+    after a step checkpoint, after a publish but before its checkpoint, after a child checkpoint
+    but before the child is published. A successor process then runs against the unchanged
+    database, in one scenario with a much shorter `ExecutionLeaseDuration` than the dead owner's,
+    on the transport's default retry budget. The suite only reads the database: it asserts the
+    ledger is `Running` behind a persisted, unexpired lease after the kill, that the run and its
+    child reach `Succeeded` with nothing dead-lettered, and — from a lease journal on the database
+    clock — that the successor was refused before the owner's expiry, took over only after it, and
+    never handed the wake-up back to the queue. No lease deletion, no `ResumeAsync`, no extra
+    wake-up. Against `ca58de0` the shorter-lease scenario fails in five seconds with the run
+    stranded.
+  - *Redis scan cost is measured.* New `RedisRecoveryScanBenchmarks` injects a round-trip latency
+    into fake `IServer`/`IDatabase` commands (the existing recovery benchmark measures the
+    in-memory store): at 1 ms per round trip, 8,192 registrations scan in ≈0.2 s against ≈10.4 s
+    for one round trip per key, and 1,024 in ≈67 ms against ≈1.3 s (one dry iteration on an Apple
+    Silicon laptop — latency-bound, so indicative rather than statistical).
+  - Tests: red-on-old proofs against `ca58de0` — 16 unit pins (the shorter-lease successor, five
+    sustained-signal rows and three queued-signal rows across the three database channels, seven
+    Redis scan pins including the watchdog-to-health-check reproduction) and three against real
+    infrastructure (a cross-process SQL Server response under sustained local traffic, a real
+    multiplexer with Redis unreachable, the killed-process shorter-lease takeover) — plus new-API
+    pins for the lease contract, a lease-observation section in the shared store contract run
+    against every built-in store's real backend, and a real-Redis scan over 300 registrations.
+    `MongoDbChannelCoverageTests.CollectDispatchScopeAsync_CoversAllBranches` lost its 20-attempt
+    retry loop: it papered over the racy poll delay this round removed.
+
 - **Round-39 review (2026-09-14): settlement over the whole failure set, storage-side history costs, and honest test claims.**
   - *A transient sibling failure keeps the message for redelivery whatever precedes it.* The
     lost-subscriber dispatcher settled a shared-correlation fan-out on the FIRST failure it saw:

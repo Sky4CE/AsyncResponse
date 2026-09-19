@@ -133,6 +133,7 @@ internal static class FlowStoreContract
         Assert.False(await store.TryDeleteAsync(state.FlowId!));
 
         await AssertLeaseExpiryContractAsync(store);
+        await AssertLeaseObservationContractAsync(store);
         await AssertMissingFlowContractAsync(store);
         await AssertLargeStateContractAsync(store);
         await AssertCaseSensitiveFlowIdContractAsync(store);
@@ -206,6 +207,112 @@ internal static class FlowStoreContract
 
         await store.ReleaseLeaseAsync(flowId, "live-worker");
         Assert.True(await store.TryDeleteAsync(flowId));
+    }
+
+    /// <summary>
+    /// <see cref="IFlowStateStore.ObserveLeaseAsync"/> reports the lease exactly as persisted. A
+    /// wake-up that finds the lease held compares two observations: a different owner, or a later
+    /// expiry under the same owner, proves a live worker acquired or renewed in between; a lease
+    /// that never changes is a dead holder's and is waited out to its persisted expiry. So the
+    /// store must (a) answer at all — <c>null</c> means "cannot report leases", which no built-in
+    /// store may say, (b) say <see cref="FlowLeaseObservation.Unheld"/> when nobody holds it, (c)
+    /// keep reporting a LAPSED lease unchanged rather than judging it against a clock, and (d)
+    /// make every renewal visible as a strictly later UTC expiry.
+    /// <para>
+    /// Most stores stamp the expiry on the SERVER clock, so observations are compared with each
+    /// other; the local clock is only ever used as a ±1 minute sanity bound.
+    /// </para>
+    /// </summary>
+    internal static async Task AssertLeaseObservationContractAsync(IFlowStateStore store)
+    {
+        // A flow that was never created is Unheld — not null, and not an exception.
+        AssertUnheld(await store.ObserveLeaseAsync($"flow-observe-missing-{Guid.NewGuid():N}"), "a flow that does not exist");
+
+        var flowId = $"flow-observe-{Guid.NewGuid():N}";
+        Assert.True(await store.TryCreateAsync(flowId, CreateState(flowId), TimeSpan.FromMinutes(5)));
+        AssertUnheld(await store.ObserveLeaseAsync(flowId), "a ledger nobody has leased");
+
+        // Acquire: the owner, and a UTC expiry about one lease duration ahead.
+        var before = DateTime.UtcNow;
+        Assert.True(await store.TryAcquireLeaseAsync(flowId, "owner-a", TimeSpan.FromMinutes(1)));
+        var acquired = AssertHeld(await store.ObserveLeaseAsync(flowId), "owner-a");
+        Assert.InRange(acquired.ExpiresAtUtc!.Value, before, DateTime.UtcNow.AddMinutes(2));
+
+        // Untouched means unchanged: two observations of the same lease are identical. This is
+        // the "dead holder" reading, so nothing may drift between reads (no re-rounding, no
+        // clock-derived value).
+        var unchanged = AssertHeld(await store.ObserveLeaseAsync(flowId), "owner-a");
+        Assert.Equal(acquired.ExpiresAtUtc, unchanged.ExpiresAtUtc);
+
+        // A heartbeat with the SAME duration moves the expiry strictly forward. The pause clears
+        // the coarsest expiry precision any store keeps (MongoDB and DynamoDB: one millisecond).
+        await Task.Delay(50);
+        Assert.True(await store.TryRenewLeaseAsync(flowId, "owner-a", TimeSpan.FromMinutes(1)));
+        var heartbeat = AssertHeld(await store.ObserveLeaseAsync(flowId), "owner-a");
+        Assert.True(
+            heartbeat.ExpiresAtUtc > acquired.ExpiresAtUtc,
+            $"a renewal must move the persisted expiry strictly forward ({acquired.ExpiresAtUtc:O} -> {heartbeat.ExpiresAtUtc:O})");
+
+        // A renewal with a longer duration: same owner, later by the difference between the two
+        // durations — measured between observations, so store clock skew cancels out.
+        Assert.True(await store.TryRenewLeaseAsync(flowId, "owner-a", TimeSpan.FromMinutes(5)));
+        var renewed = AssertHeld(await store.ObserveLeaseAsync(flowId), "owner-a");
+        Assert.InRange(
+            renewed.ExpiresAtUtc!.Value - heartbeat.ExpiresAtUtc!.Value,
+            TimeSpan.FromMinutes(4) - TimeSpan.FromSeconds(1),
+            TimeSpan.FromMinutes(5));
+
+        // A refused acquire writes nothing, so it must not read as a change either.
+        Assert.False(await store.TryAcquireLeaseAsync(flowId, "owner-b", TimeSpan.FromMinutes(1)));
+        var afterRefusal = AssertHeld(await store.ObserveLeaseAsync(flowId), "owner-a");
+        Assert.Equal(renewed.ExpiresAtUtc, afterRefusal.ExpiresAtUtc);
+
+        await store.ReleaseLeaseAsync(flowId, "owner-a");
+        AssertUnheld(await store.ObserveLeaseAsync(flowId), "a released lease");
+
+        // A LAPSED lease is still reported, raw. "Lapsed" is the store's own verdict — its holder
+        // can no longer renew it — never this test's clock. (A renewal that does land leaves a
+        // 1 ms lease behind, so the next poll fails.)
+        Assert.True(await store.TryAcquireLeaseAsync(flowId, "dead-worker", TimeSpan.FromMilliseconds(250)));
+        await EventuallyAsync(async () =>
+            Assert.False(
+                await store.TryRenewLeaseAsync(flowId, "dead-worker", TimeSpan.FromMilliseconds(1)),
+                "a lapsed lease must stop being renewable"),
+            TimeSpan.FromSeconds(15));
+
+        var lapsed = AssertHeld(await store.ObserveLeaseAsync(flowId), "dead-worker");
+        Assert.True(lapsed.ExpiresAtUtc < DateTime.UtcNow.AddMinutes(1), "a lapsed lease's persisted expiry is not in the future");
+        var stillLapsed = AssertHeld(await store.ObserveLeaseAsync(flowId), "dead-worker");
+        Assert.Equal(lapsed.ExpiresAtUtc, stillLapsed.ExpiresAtUtc);
+
+        // The takeover is visible as a different owner with a later expiry — the "live" reading.
+        Assert.True(await store.TryAcquireLeaseAsync(flowId, "live-worker", TimeSpan.FromMinutes(1)));
+        var takenOver = AssertHeld(await store.ObserveLeaseAsync(flowId), "live-worker");
+        Assert.True(takenOver.ExpiresAtUtc > lapsed.ExpiresAtUtc);
+
+        await store.ReleaseLeaseAsync(flowId, "live-worker");
+        Assert.True(await store.TryDeleteAsync(flowId));
+        AssertUnheld(await store.ObserveLeaseAsync(flowId), "a deleted ledger");
+
+        static FlowLeaseObservation AssertHeld(FlowLeaseObservation? observation, string expectedOwner)
+        {
+            Assert.True(
+                observation is not null,
+                "ObserveLeaseAsync returned null, which means \"this store cannot report leases\" — every built-in store must (a decorator that does not forward the call downgrades its inner store the same way)");
+            Assert.Equal(expectedOwner, observation!.LeaseId);
+            Assert.NotNull(observation.ExpiresAtUtc);
+            Assert.Equal(DateTimeKind.Utc, observation.ExpiresAtUtc!.Value.Kind);
+            return observation;
+        }
+
+        static void AssertUnheld(FlowLeaseObservation? observation, string what)
+        {
+            Assert.True(
+                observation is not null,
+                $"ObserveLeaseAsync returned null for {what}; null means \"this store cannot report leases\" — nobody holding it is FlowLeaseObservation.Unheld");
+            Assert.Null(observation!.LeaseId);
+            Assert.Null(observation.ExpiresAtUtc);
+        }
     }
 
     /// <summary>
