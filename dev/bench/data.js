@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1789860223853,
+  "lastUpdate": 1789860252496,
   "repoUrl": "https://github.com/Sky4CE/AsyncResponse",
   "entries": {
     "AsyncResponse Microbenchmarks": [
@@ -109750,6 +109750,140 @@ window.BENCHMARK_DATA = {
           {
             "name": "durable-flow-storm throughput",
             "value": 1416.5956102308576,
+            "unit": "flows/s"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "tyunisov@gmail.com",
+            "name": "Sky4CE",
+            "username": "Sky4CE"
+          },
+          "committer": {
+            "email": "tyunisov@gmail.com",
+            "name": "Sky4CE",
+            "username": "Sky4CE"
+          },
+          "distinct": true,
+          "id": "5532cd9fc040a9babae7b120383d9df047f8d225",
+          "message": "fix: apply round-40 review — 5 findings with red-on-old regression tests, docs and CHANGELOG synced\n\nDurable flows: a contended wake-up is acknowledged on evidence from the store, never on the waiting host's own lease window. New optional IFlowStateStore.ObserveLeaseAsync (FlowLeaseObservation: persisted owner + expiry, raw) is implemented by all ten built-in stores; the executor acks when the lease is renewed or taken over while it waits, waits a dead owner's lease out to its PERSISTED expiry and takes over, and otherwise throws the new DurableFlowLeaseContendedException so the transport redelivers. A deployment that shortens ExecutionLeaseDuration can no longer strand runs behind a crashed owner's longer lease. Stores that cannot report leases never get contention acknowledged.\n\nDatabase channels: the dispatch loop's poll deadline is absolute (monotonic clock) and judged after either wake source, so sustained targeted signals can no longer starve the full sweep that delivers cross-process responses on SQL Server and reconciles missed notifications on PostgreSQL and MongoDB; signal draining is bounded per pass.\n\nRedis recovery scan: fails (RedisConnectionException -> Degraded \"scan failed\") when no primary is connected, or when a cluster primary is disconnected, instead of enumerating an empty keyspace that turned an outage into a Healthy recovery check; uses KeysAsync and pipelined batches of 128 GETs. IRecoveryStateScanner documents that best effort covers consistency, not coverage. New latency-injected RedisRecoveryScanBenchmarks.\n\nTests: DurableFlowAbruptCrashRecoveryTests + tests/AsyncResponse.IntegrationTests.CrashWorker kill a real worker process (SIGKILL) at lease acquisition, step-checkpoint, publish and child-publish boundaries on the PostgreSQL transport and store, restart a successor (including one with a much shorter lease) on the default retry budget, and only read the database. Red-on-old proofs against ca58de0: 16 unit pins plus three on real infrastructure (SQL Server cross-process delivery under local traffic, Redis unreachable, killed-process shorter-lease takeover); lease-observation section added to the shared store contract; 3029 unit tests green on net10.0 and net8.0; Release build 0 warnings; AOT smoke OK.",
+          "timestamp": "2026-09-20T00:40:20+02:00",
+          "tree_id": "71dd2ca92345c600b03490be423715b8d362bae2",
+          "url": "https://github.com/Sky4CE/AsyncResponse/commit/5532cd9fc040a9babae7b120383d9df047f8d225"
+        },
+        "date": 1789860251892,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "waiter-storm throughput",
+            "value": 53245.3578034799,
+            "unit": "ops/s"
+          },
+          {
+            "name": "progress-storm throughput",
+            "value": 36448.94013771867,
+            "unit": "ops/s"
+          },
+          {
+            "name": "worker-storm throughput",
+            "value": 30843.920509048065,
+            "unit": "jobs/s"
+          },
+          {
+            "name": "google-pubsub-ack-after-enqueue-dispatch-storm throughput",
+            "value": 170587.91418745564,
+            "unit": "ops/s"
+          },
+          {
+            "name": "rabbitmq-ack-after-enqueue-dispatch-storm throughput",
+            "value": 275154.6369059411,
+            "unit": "ops/s"
+          },
+          {
+            "name": "redis-ack-after-enqueue-dispatch-storm throughput",
+            "value": 225586.97731497354,
+            "unit": "ops/s"
+          },
+          {
+            "name": "nats-ack-after-receive-dispatch-storm throughput",
+            "value": 218895.01794939145,
+            "unit": "ops/s"
+          },
+          {
+            "name": "postgresql-ack-after-receive-dispatch-storm throughput",
+            "value": 178663.31256074554,
+            "unit": "ops/s"
+          },
+          {
+            "name": "sqlserver-ack-after-enqueue-dispatch-storm throughput",
+            "value": 172580.42247687423,
+            "unit": "ops/s"
+          },
+          {
+            "name": "mongodb-ack-after-enqueue-dispatch-storm throughput",
+            "value": 180557.56175068612,
+            "unit": "ops/s"
+          },
+          {
+            "name": "azure-servicebus-ack-after-receive-dispatch-storm throughput",
+            "value": 253169.68444930532,
+            "unit": "ops/s"
+          },
+          {
+            "name": "sqs-ack-after-enqueue-dispatch-storm throughput",
+            "value": 245355.42186411234,
+            "unit": "ops/s"
+          },
+          {
+            "name": "kafka-ack-after-enqueue-dispatch-storm throughput",
+            "value": 254196.78898616153,
+            "unit": "ops/s"
+          },
+          {
+            "name": "race-burst throughput",
+            "value": 105817.86628854416,
+            "unit": "ops/s"
+          },
+          {
+            "name": "raw-ingress-storm throughput",
+            "value": 75891.44366471888,
+            "unit": "ops/s"
+          },
+          {
+            "name": "shared-response-fanout throughput",
+            "value": 38995.96313789597,
+            "unit": "ops/s"
+          },
+          {
+            "name": "exception-fanout throughput",
+            "value": 20636.829443373532,
+            "unit": "ops/s"
+          },
+          {
+            "name": "timeout-storm throughput",
+            "value": 4772.56918137314,
+            "unit": "ops/s"
+          },
+          {
+            "name": "dispose-cleanup-storm throughput",
+            "value": 221109.7942794474,
+            "unit": "ops/s"
+          },
+          {
+            "name": "context-isolation-storm throughput",
+            "value": 68265.35014663397,
+            "unit": "ops/s"
+          },
+          {
+            "name": "watchdog-scan-storm throughput",
+            "value": 1637009.511025259,
+            "unit": "entries/s"
+          },
+          {
+            "name": "durable-flow-storm throughput",
+            "value": 1430.1684772790277,
             "unit": "flows/s"
           }
         ]
