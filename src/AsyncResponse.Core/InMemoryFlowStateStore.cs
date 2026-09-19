@@ -166,6 +166,19 @@ internal sealed class InMemoryFlowStateStore : IFlowStateStore
         return Task.CompletedTask;
     }
 
+    public Task<FlowLeaseObservation?> ObserveLeaseAsync(string flowId, CancellationToken cancellationToken = default)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(flowId);
+        cancellationToken.ThrowIfCancellationRequested();
+
+        // Raw, like every other store: an expired lease is reported as persisted. Whether it has
+        // lapsed is TryAcquireLeaseAsync's call, on this store's clock.
+        return Task.FromResult<FlowLeaseObservation?>(
+            _entries.TryGetValue(flowId, out var current) && current.LeaseId is not null
+                ? new FlowLeaseObservation(current.LeaseId, current.LeaseExpiresAtUtc)
+                : FlowLeaseObservation.Unheld);
+    }
+
     /// <summary>
     /// Breaks every held execution lease — the test harness's crash semantics for a simulated
     /// restart. A crashed process goes silent and its leases expire; a simulated restart shares

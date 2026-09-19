@@ -132,6 +132,38 @@ internal static class DurableFlowStoreShared
     }
 
     /// <summary>
+    /// Shapes one persisted lease pair into the <see cref="IFlowStateStore.ObserveLeaseAsync"/>
+    /// answer, identically in all nine stores. The pair is reported RAW: nothing here (or in the
+    /// reads that feed it) compares the expiry with a clock, because the engine's liveness proof
+    /// is that two observations differ, and an expired lease that nobody took over must keep
+    /// reading as the same lease until someone acquires or releases it.
+    /// <para>
+    /// A <c>null</c> <paramref name="leaseId"/> — never leased, released, or no row at all — is
+    /// <see cref="FlowLeaseObservation.Unheld"/>, never <c>null</c>: <c>null</c> is reserved for
+    /// "this store cannot report leases".
+    /// </para>
+    /// <para>
+    /// Every store persists the lease expiry as a UTC instant, but the drivers disagree about the
+    /// <see cref="DateTimeKind"/> they hand back (zone-less SQL columns read as
+    /// <see cref="DateTimeKind.Unspecified"/>; a legacy-timestamp Npgsql or a custom Cosmos
+    /// serializer can produce <see cref="DateTimeKind.Local"/>). The observation always carries
+    /// <see cref="DateTimeKind.Utc"/> with the ticks the store kept, so two renewals compare
+    /// strictly increasing whichever driver read them.
+    /// </para>
+    /// </summary>
+    public static FlowLeaseObservation LeaseObservation(string? leaseId, DateTime? leaseExpiresAt)
+    {
+        if (leaseId is null)
+            return FlowLeaseObservation.Unheld;
+
+        return new FlowLeaseObservation(
+            leaseId,
+            leaseExpiresAt is { } expiry
+                ? expiry.Kind == DateTimeKind.Local ? expiry.ToUniversalTime() : DateTime.SpecifyKind(expiry, DateTimeKind.Utc)
+                : null);
+    }
+
+    /// <summary>
     /// The ledger has exactly ONE wire format: Core's <c>FlowStateJson</c> (source-generated
     /// metadata, nulls omitted on write, resolved through the <c>AsyncResponseJson</c> chain so
     /// <c>AsyncResponseJsonSerialization.RegisterResolver</c> — the documented trim/AOT seam —

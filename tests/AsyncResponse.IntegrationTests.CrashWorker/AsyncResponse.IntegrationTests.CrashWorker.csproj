@@ -1,0 +1,29 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- Test asset, not a product: the subprocess the abrupt-crash recovery suite
+       (tests/AsyncResponse.IntegrationTests/DurableFlowAbruptCrashRecoveryTests.cs) starts, kills
+       mid-delivery, and replaces. It hosts AsyncResponse on a durable broker/store pair that needs a
+       single container — the PostgreSQL worker transport plus the PostgreSQL flow-state store — and
+       terminates itself WITHOUT cleanup at a configured crash point. Single-targeted like the
+       integration tests that launch it (they copy this project's output next to their own).
+       Named AsyncResponse.IntegrationTests.* like the AppHost, and for a reason: that prefix is what
+       scripts/coverage-report.sh filters out (-AsyncResponse.IntegrationTests*), so this asset never
+       counts as product code in the coverage report. -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <IsPackable>false</IsPackable>
+    <RootNamespace>AsyncResponse.IntegrationTests.CrashWorker</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Extensions.Hosting" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\AsyncResponse.Core\AsyncResponse.Core.csproj" />
+    <ProjectReference Include="..\..\src\DurableFlows\AsyncResponse.DurableFlows.PostgreSQL\AsyncResponse.DurableFlows.PostgreSQL.csproj" />
+    <ProjectReference Include="..\..\src\Transports\AsyncResponse.Transports.PostgreSQL\AsyncResponse.Transports.PostgreSQL.csproj" />
+  </ItemGroup>
+
+</Project>

@@ -1261,6 +1261,94 @@ public sealed class SqlServerDirectIntegrationTests(DataBatchFixture fixture) : 
         }
     }
 
+    /// <summary>
+    /// Round 40: SQL Server has no push wake, so the poll sweep IS cross-process delivery. The
+    /// dispatch loop used to re-arm a fresh poll delay on every pass and sweep only when that
+    /// delay won the race against the signal channel — so while this process kept publishing to
+    /// its own waiters (each publish is a targeted signal), a response published from ANOTHER
+    /// process was never scanned, the remote publisher's delivery confirmation lapsed, and a
+    /// live waiter's response was routed into lost-subscriber recovery.
+    /// </summary>
+    [Fact]
+    public async Task Channel_DeliversACrossProcessResponse_WhileLocalTrafficKeepsSignallingTheDispatcher()
+    {
+        var schema = NewSchema("starve");
+        ServiceProvider? local = null;
+        ServiceProvider? remote = null;
+        IAsyncResponseWaiter<OperationResult>? quietWaiter = null;
+        using var traffic = new CancellationTokenSource();
+        var trafficLoops = new List<Task>();
+        try
+        {
+            void Configure(SqlServerAsyncResponseChannelOptions options)
+            {
+                // A poll interval far above one local publish round trip: before the fix every
+                // pass was woken by a signal long before its private delay could elapse.
+                options.ActivePollInterval = TimeSpan.FromMilliseconds(250);
+                options.IdlePollInterval = TimeSpan.FromMilliseconds(250);
+                options.DeliveryConfirmationTimeout = TimeSpan.FromSeconds(20);
+                options.DefaultTimeout = TimeSpan.FromSeconds(60);
+            }
+
+            // Two providers on one schema are two processes as far as the channel can tell.
+            local = BuildProvider(schema, Configure);
+            remote = BuildProvider(schema, Configure);
+            var localPublisher = local.GetRequiredService<IAsyncResponsePublisher>();
+            var localSubscriber = local.GetRequiredService<IAsyncResponseSubscriber>();
+
+            var quietId = NewId("starve-quiet");
+            quietWaiter = await localSubscriber.CreateResponseWaiter<OperationResult>(quietId, timeout: TimeSpan.FromSeconds(60));
+
+            var localRoundTrips = 0;
+            for (var loop = 0; loop < 4; loop++)
+            {
+                trafficLoops.Add(Task.Run(async () =>
+                {
+                    while (!traffic.IsCancellationRequested)
+                    {
+                        var busyId = NewId("starve-busy");
+                        await using var busy = await localSubscriber.CreateResponseWaiter<OperationResult>(busyId, timeout: TimeSpan.FromSeconds(30));
+                        await localPublisher.SetResponse(new OperationResult { Status = OperationStatus.Completed }, busyId);
+                        await busy.ResponseTask.WaitAsync(TimeSpan.FromSeconds(30));
+                        Interlocked.Increment(ref localRoundTrips);
+                    }
+                }));
+            }
+
+            // Let the local traffic reach a steady state before the remote publish.
+            await EventuallyAsync(() => Task.FromResult(Volatile.Read(ref localRoundTrips) >= 8));
+
+            var remotePublish = remote.GetRequiredService<IAsyncResponsePublisher>()
+                .SetResponse(new OperationResult { Status = OperationStatus.Completed, Message = "cross-process" }, quietId);
+
+            var delivered = await quietWaiter.ResponseTask.WaitAsync(TimeSpan.FromSeconds(15));
+            Assert.Equal("cross-process", delivered.Message);
+            Assert.False(traffic.IsCancellationRequested);
+            Assert.All(trafficLoops, loop => Assert.False(loop.IsCompleted, "The local traffic stopped before the cross-process response arrived; the test proved nothing."));
+            await remotePublish.WaitAsync(TimeSpan.FromSeconds(30));
+        }
+        finally
+        {
+            traffic.Cancel();
+            try
+            {
+                await Task.WhenAll(trafficLoops).WaitAsync(TimeSpan.FromSeconds(60));
+            }
+            catch (Exception)
+            {
+                // Teardown only: a loop interrupted mid-round-trip is not what this test asserts.
+            }
+
+            if (quietWaiter is not null)
+                await quietWaiter.DisposeAsync();
+            if (remote is not null)
+                await remote.DisposeAsync();
+            if (local is not null)
+                await local.DisposeAsync();
+            await DropSchemaAsync(schema);
+        }
+    }
+
     [Fact]
     public async Task Channel_RegressionEdges_HandleFallbacksFaultedEnvelopesAndSetupFailures()
     {

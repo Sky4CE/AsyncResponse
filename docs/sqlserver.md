@@ -27,6 +27,13 @@ mode can be added later behind the same options if demand appears):
   can add intervals. An idle app avoids full retained-history reads on every tick.
 - A new waiter re-arms the tight interval immediately and triggers a targeted scan of its own
   correlation id, so a response stored before the waiter subscribed is picked up at once.
+- The poll deadline is **absolute**: local publishes and new waiters wake the loop for a targeted
+  scan of their own correlation id, but they do not postpone the next sweep. A process that keeps
+  publishing to its own waiters still sweeps every `ActivePollInterval`, so a response written by
+  another process lands on schedule. (Earlier versions restarted the poll timer on every wake-up
+  and swept only when that timer won the race, so sustained local traffic held cross-process
+  responses back until the publisher's delivery confirmation lapsed and routed them to
+  lost-subscriber recovery.)
 - The sweep keeps a stable `created_at, id` cursor across passes. Each correlation yields after
   16 pages and continues on a later pass; periodic history reconciliation catches late commits
   behind the cursor, including responses already acknowledged by another process.

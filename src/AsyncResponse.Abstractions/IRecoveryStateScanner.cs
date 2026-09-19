@@ -17,6 +17,14 @@ public interface IRecoveryStateScanner
     /// Streams a point-in-time view of the persisted recovery entries. Implementations skip
     /// entries that have already expired and may yield a best-effort snapshot rather than a
     /// transactionally consistent one.
+    /// <para>
+    /// "Best effort" covers consistency, not coverage: an implementation that cannot inspect part
+    /// of its storage — a disconnected server, an unreachable shard — must <em>throw</em>, never
+    /// complete with the reachable subset. The watchdog reports a failed scan as
+    /// <c>Degraded</c>, and a completed one as a verdict over everything that exists: an outage
+    /// that enumerates as "no registrations" would clear the stuck-flow alarm exactly when the
+    /// evidence became unavailable.
+    /// </para>
     /// </summary>
     IAsyncEnumerable<RecoveryState> ScanAsync(CancellationToken cancellationToken = default);
 }

@@ -195,6 +195,46 @@ boundary with nothing left running. A test that deliberately wants the overlap s
 side effects land whenever it unblocks. Nothing in the harness is a subprocess kill; a guarantee
 that must hold against abrupt termination needs a real process and a real broker.
 
+It also breaks the dead incarnation's leases *for* the new one. A process that really dies leaves
+its execution lease persisted and unexpired, and whatever redelivers the run's wake-up has to get
+past that lease by itself — the window in which a wake-up can be acknowledged as a "duplicate" of
+an execution that no longer exists. The harness cannot reach that window; the library's own
+suite for it is below.
+
+### The abrupt-crash suite (how the library tests what the harness cannot)
+
+`DurableFlowAbruptCrashRecoveryTests` (integration batch `data`) is the one suite that kills a real
+process. It launches `tests/AsyncResponse.IntegrationTests.CrashWorker` as a subprocess on the
+PostgreSQL worker transport and PostgreSQL flow-state store (one container, a private schema per
+scenario). The worker SIGKILLs itself at an armed crash point — after lease acquisition, after a
+step checkpoint, after a publish but before its checkpoint, or after a child checkpoint but before
+the child is published. No `finally` runs, the lease is not released, and the queue claim is not
+settled. A successor process then starts against the unchanged database; one scenario gives it a
+much shorter `ExecutionLeaseDuration` than the dead owner's, which is the deployment change that
+used to strand runs (see
+[lease contention](durable-flow-state-stores.md#lease-contention-and-deployments-that-change-the-lease-duration)).
+
+The suite only ever *reads* the database. After the kill it asserts the ledger is `Running`
+behind a persisted, unexpired lease; at the end, that the run and its child are `Succeeded`, the
+queue has drained, and nothing was dead-lettered on the transport's default retry budget. A lease
+journal written on the database clock proves the premise instead of assuming it: the successor was
+refused while the owner's lease was unexpired, took over only after it expired, and never handed
+the wake-up back to the queue. No lease deletion, no `ResumeAsync`, no extra wake-up. Step
+re-execution counts pin checkpoint and at-least-once semantics at each boundary (a step behind a
+persisted checkpoint never re-runs; a publish that died before its checkpoint runs twice).
+
+```bash
+dotnet run --project tests/AsyncResponse.IntegrationTests -f net10.0 -- --filter-class "*DurableFlowAbruptCrashRecoveryTests"
+```
+
+About 100 seconds plus the data fleet's boot. Every worker's stdout and stderr is attached to the
+test output, and crash points, environment variables, and table names live in
+`CrashWorkerContract`. To model your own crash points against your own broker and store, copy the
+shape: a store wrapped in a `DispatchProxy` (a hand-written decorator silently drops
+default-interface members such as `ObserveLeaseAsync`), `IDurableFlowExecutionObserver` for step
+boundaries, `Process.GetCurrentProcess().Kill()` rather than `Environment.Exit`, and a transport
+claim timeout shorter than the execution lease so the redelivery arrives while the lease is held.
+
 This is the recovery tri-state (`Resume` / `Fail` / `KeepWaiting`) — the part of the API teams
 most need to test and previously could not without a broker. Waiter tasks obtained before the
 restart never carry a response or a timeout: the restart abandons them exactly as a crash does —

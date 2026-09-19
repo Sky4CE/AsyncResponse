@@ -376,3 +376,13 @@ AsyncResponse.FlowStateTooLargeException.FlowStateTooLargeException(string! flow
 AsyncResponse.FlowStateTooLargeException.FlowId.get -> string!
 AsyncResponse.FlowStateTooLargeException.SerializedSizeBytes.get -> long
 AsyncResponse.FlowStateTooLargeException.MaxStateBytes.get -> long
+AsyncResponse.DurableFlowLeaseContendedException
+AsyncResponse.DurableFlowLeaseContendedException.DurableFlowLeaseContendedException(string! flowId, string! reason) -> void
+AsyncResponse.DurableFlowLeaseContendedException.FlowId.get -> string!
+AsyncResponse.DurableFlowLeaseContendedException.Reason.get -> string!
+AsyncResponse.FlowLeaseObservation
+AsyncResponse.FlowLeaseObservation.ExpiresAtUtc.get -> System.DateTime?
+AsyncResponse.FlowLeaseObservation.FlowLeaseObservation(string? leaseId, System.DateTime? expiresAtUtc) -> void
+AsyncResponse.FlowLeaseObservation.LeaseId.get -> string?
+AsyncResponse.IFlowStateStore.ObserveLeaseAsync(string! flowId, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task<AsyncResponse.FlowLeaseObservation?>!
+static AsyncResponse.FlowLeaseObservation.Unheld.get -> AsyncResponse.FlowLeaseObservation!

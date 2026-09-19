@@ -695,6 +695,152 @@ public sealed class CosmosDurableFlowStateStoreTests
         Assert.Contains("_etag", ex.Message, StringComparison.Ordinal);
     }
 
+    // ---- Round 40: ObserveLeaseAsync (see Round40LeaseObservationTests for the other stores). ----
+
+    [Fact]
+    public async Task Round40_ObserveLease_ReportsTheRawPersistedLease_WithoutJudgingExpiry()
+    {
+        using var harness = new CosmosHarness();
+        var document = Document(CreateState("flow"), DateTime.UtcNow.AddMinutes(5));
+        harness.QueriesLease(document);
+
+        // Present, never leased (or released: the release patches both fields to null).
+        Assert.Same(FlowLeaseObservation.Unheld, await harness.Store.ObserveLeaseAsync("flow"));
+
+        // Held: owner and expiry exactly as stored, in UTC.
+        var live = new DateTime(2031, 3, 14, 9, 26, 53, DateTimeKind.Utc).AddTicks(1_234_567);
+        document.LeaseId = "owner-a";
+        document.LeaseExpiresAtUtc = live;
+        var held = await harness.Store.ObserveLeaseAsync("flow");
+        Assert.Equal("owner-a", held!.LeaseId);
+        Assert.Equal(live, held.ExpiresAtUtc);
+        Assert.Equal(DateTimeKind.Utc, held.ExpiresAtUtc!.Value.Kind);
+
+        // Long lapsed — and the LEDGER itself past its logical expiry too: still reported as
+        // stored. The lease writes compare both with the app clock; the observation compares
+        // neither, because the executor's proof of a live holder is that two observations differ.
+        document.ExpiresAtUtc = DateTime.UtcNow.AddMinutes(-5);
+        document.LeaseId = "dead-worker";
+        document.LeaseExpiresAtUtc = new DateTime(2001, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+        var lapsed = await harness.Store.ObserveLeaseAsync("flow");
+        Assert.Equal("dead-worker", lapsed!.LeaseId);
+        Assert.Equal(new DateTime(2001, 1, 1, 0, 0, 0, DateTimeKind.Utc), lapsed.ExpiresAtUtc);
+
+        // A serializer that drops the zone designator hands back Unspecified; the digits are UTC
+        // (every lease write stamps DateTime.UtcNow), so they are stamped, not shifted.
+        document.LeaseExpiresAtUtc = DateTime.SpecifyKind(live, DateTimeKind.Unspecified);
+        var unspecified = await harness.Store.ObserveLeaseAsync("flow");
+        Assert.Equal(live.Ticks, unspecified!.ExpiresAtUtc!.Value.Ticks);
+        Assert.Equal(DateTimeKind.Utc, unspecified.ExpiresAtUtc.Value.Kind);
+
+        // A holder with no deadline is still a holder.
+        document.LeaseExpiresAtUtc = null;
+        var noExpiry = await harness.Store.ObserveLeaseAsync("flow");
+        Assert.Equal("dead-worker", noExpiry!.LeaseId);
+        Assert.Null(noExpiry.ExpiresAtUtc);
+
+        // Read through the lease projection only: no point read (which would transfer stateJson)
+        // and no write of any kind.
+        harness.Container.Verify(
+            item => item.ReadItemAsync<CosmosFlowStateDocument>(
+                It.IsAny<string>(),
+                It.IsAny<PartitionKey>(),
+                It.IsAny<ItemRequestOptions>(),
+                It.IsAny<CancellationToken>()),
+            Times.Never);
+        harness.Container.Verify(
+            item => item.PatchItemAsync<CosmosFlowStateDocument>(
+                It.IsAny<string>(),
+                It.IsAny<PartitionKey>(),
+                It.IsAny<IReadOnlyList<PatchOperation>>(),
+                It.IsAny<PatchItemRequestOptions>(),
+                It.IsAny<CancellationToken>()),
+            Times.Never);
+    }
+
+    [Fact]
+    public async Task Round40_ObserveLease_QueriesTheFlowsOwnPartitionById()
+    {
+        using var harness = new CosmosHarness();
+        QueryDefinition? sentQuery = null;
+        QueryRequestOptions? sentOptions = null;
+        harness.Container
+            .Setup(item => item.GetItemQueryIterator<CosmosLeaseProjection>(
+                It.IsAny<QueryDefinition>(),
+                It.IsAny<string?>(),
+                It.IsAny<QueryRequestOptions>()))
+            .Returns((QueryDefinition query, string? _, QueryRequestOptions options) =>
+            {
+                sentQuery = query;
+                sentOptions = options;
+                var iterator = new Mock<FeedIterator<CosmosLeaseProjection>>();
+                iterator.SetupGet(item => item.HasMoreResults).Returns(false);
+                return iterator.Object;
+            });
+
+        // No rows: the flow does not exist. Unheld, never null (null = "cannot report leases").
+        Assert.Same(FlowLeaseObservation.Unheld, await harness.Store.ObserveLeaseAsync("flow-1"));
+
+        Assert.NotNull(sentQuery);
+        Assert.DoesNotContain("stateJson", sentQuery!.QueryText, StringComparison.Ordinal);
+        Assert.Contains("c.leaseId", sentQuery.QueryText, StringComparison.Ordinal);
+        Assert.Contains("c.leaseExpiresAtUtc", sentQuery.QueryText, StringComparison.Ordinal);
+        Assert.Equal("flow-1", Assert.Single(sentQuery.GetQueryParameters()).Value);
+        Assert.Equal("[\"flow-1\"]", sentOptions!.PartitionKey!.Value.ToString());
+    }
+
+    [Fact]
+    public async Task Round40_ObserveLease_OnlyAGenuineNotFoundReadsAsUnheld()
+    {
+        using var harness = new CosmosHarness();
+
+        // Sub-status 0 is the only 404 that means "nothing there" — the store-wide rule.
+        harness.QueriesThrowing(CosmosError(HttpStatusCode.NotFound));
+        Assert.Same(FlowLeaseObservation.Unheld, await harness.Store.ObserveLeaseAsync("flow"));
+
+        // 1002 ReadSessionNotAvailable: the ledger may well exist and be held. Reporting Unheld
+        // would hide a live holder from the waiting delivery, so it propagates.
+        harness.QueriesThrowing(ReadSessionNotAvailable());
+        var sessionLag = await Assert.ThrowsAsync<CosmosException>(() => harness.Store.ObserveLeaseAsync("flow"));
+        Assert.Equal(1002, sessionLag.SubStatusCode);
+
+        harness.QueriesThrowing(CosmosError(HttpStatusCode.ServiceUnavailable));
+        await Assert.ThrowsAsync<CosmosException>(() => harness.Store.ObserveLeaseAsync("flow"));
+
+        await Assert.ThrowsAsync<ArgumentException>(() => harness.Store.ObserveLeaseAsync(" "));
+    }
+
+    [Fact]
+    public async Task Round40_ObserveLease_SeesWhatTheLeaseWritesPatched()
+    {
+        // Acquire, renew and release through the store's own patches, replayed onto the document
+        // the lease query reads: the observation inverts exactly what UpdateLeaseAsync wrote.
+        using var harness = new CosmosHarness();
+        var document = Document(CreateState("flow"), DateTime.UtcNow.AddMinutes(5));
+        harness.QueriesLease(document);
+        harness.PatchesSuccessfully((operations, _) =>
+        {
+            document.LeaseId = (string?)PatchValue(PatchFor(operations, "/leaseId"));
+            document.LeaseExpiresAtUtc = (DateTime?)PatchValue(PatchFor(operations, "/leaseExpiresAtUtc"));
+        });
+
+        var before = DateTime.UtcNow;
+        Assert.True(await harness.Store.TryAcquireLeaseAsync("flow", "owner-a", TimeSpan.FromSeconds(30)));
+        var after = DateTime.UtcNow;
+        var acquired = await harness.Store.ObserveLeaseAsync("flow");
+        Assert.Equal("owner-a", acquired!.LeaseId);
+        Assert.InRange(acquired.ExpiresAtUtc!.Value, before.AddSeconds(30), after.AddSeconds(30));
+        Assert.Equal(DateTimeKind.Utc, acquired.ExpiresAtUtc.Value.Kind);
+
+        Assert.True(await harness.Store.TryRenewLeaseAsync("flow", "owner-a", TimeSpan.FromMinutes(5)));
+        var renewed = await harness.Store.ObserveLeaseAsync("flow");
+        Assert.Equal("owner-a", renewed!.LeaseId);
+        Assert.True(renewed.ExpiresAtUtc > acquired.ExpiresAtUtc);
+
+        await harness.Store.ReleaseLeaseAsync("flow", "owner-a");
+        Assert.Same(FlowLeaseObservation.Unheld, await harness.Store.ObserveLeaseAsync("flow"));
+    }
+
     private static CosmosException ReadSessionNotAvailable()
         => new("read session not available", HttpStatusCode.NotFound, 1002, "activity", 0);
 

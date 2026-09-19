@@ -1,4 +1,5 @@
 using AsyncResponse.Channels.Redis;
+using Microsoft.Extensions.Diagnostics.HealthChecks;
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
 using Moq;
@@ -680,22 +681,7 @@ public class RedisRecoveryStateStoreTests
         var server = new Mock<IServer>();
         server.SetupGet(s => s.IsConnected).Returns(true);
         RedisKey[] keys = [(RedisKey)"ar:recovery:corr-a", (RedisKey)"ar:recovery:corr-legacy"];
-        server
-            .Setup(s => s.Keys(
-                It.IsAny<int>(),
-                It.IsAny<RedisValue>(),
-                It.IsAny<int>(),
-                It.IsAny<CommandFlags>()))
-            .Returns(keys);
-        server
-            .Setup(s => s.Keys(
-                It.IsAny<int>(),
-                It.IsAny<RedisValue>(),
-                It.IsAny<int>(),
-                It.IsAny<long>(),
-                It.IsAny<int>(),
-                It.IsAny<CommandFlags>()))
-            .Returns(keys);
+        SetupKeys(server, keys);
         _multiplexer.Setup(m => m.GetEndPoints(It.IsAny<bool>())).Returns([endpoint]);
         _multiplexer.Setup(m => m.GetServer(It.IsAny<EndPoint>(), It.IsAny<object?>())).Returns(server.Object);
 
@@ -805,29 +791,7 @@ public class RedisRecoveryStateStoreTests
 
         connected.SetupGet(s => s.IsConnected).Returns(true);
         disconnected.SetupGet(s => s.IsConnected).Returns(false);
-        connected
-            .Setup(s => s.Keys(
-                It.IsAny<int>(),
-                It.IsAny<RedisValue>(),
-                It.IsAny<int>(),
-                It.IsAny<CommandFlags>()))
-            .Returns([
-                (RedisKey)"ar:recovery:corr-a",
-                (RedisKey)"ar:recovery:corr-b",
-                (RedisKey)"ar:recovery:corr-a",
-                (RedisKey)"ar:recovery:empty",
-                (RedisKey)"ar:recovery:broken",
-                (RedisKey)"ar:recovery:null-state"
-            ]);
-        connected
-            .Setup(s => s.Keys(
-                It.IsAny<int>(),
-                It.IsAny<RedisValue>(),
-                It.IsAny<int>(),
-                It.IsAny<long>(),
-                It.IsAny<int>(),
-                It.IsAny<CommandFlags>()))
-            .Returns([
+        SetupKeys(connected, [
                 (RedisKey)"ar:recovery:corr-a",
                 (RedisKey)"ar:recovery:corr-b",
                 (RedisKey)"ar:recovery:corr-a",
@@ -884,22 +848,7 @@ public class RedisRecoveryStateStoreTests
         var endpoint = new DnsEndPoint("redis-a", 6379);
         var server = new Mock<IServer>();
         server.SetupGet(s => s.IsConnected).Returns(true);
-        server
-            .Setup(s => s.Keys(
-                It.IsAny<int>(),
-                It.IsAny<RedisValue>(),
-                It.IsAny<int>(),
-                It.IsAny<CommandFlags>()))
-            .Returns([(RedisKey)"ar:recovery:corr-a"]);
-        server
-            .Setup(s => s.Keys(
-                It.IsAny<int>(),
-                It.IsAny<RedisValue>(),
-                It.IsAny<int>(),
-                It.IsAny<long>(),
-                It.IsAny<int>(),
-                It.IsAny<CommandFlags>()))
-            .Returns([(RedisKey)"ar:recovery:corr-a"]);
+        SetupKeys(server, [(RedisKey)"ar:recovery:corr-a"]);
 
         _multiplexer.Setup(m => m.GetEndPoints(It.IsAny<bool>())).Returns([endpoint]);
         _multiplexer.Setup(m => m.GetServer(It.IsAny<EndPoint>(), It.IsAny<object?>())).Returns(server.Object);
@@ -913,5 +862,355 @@ public class RedisRecoveryStateStoreTests
             {
             }
         });
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Round 40: scan completeness and scan cost. Each test arranges BOTH key enumerations (the
+    // synchronous one the old scanner used and KeysAsync), so the behavioural ones are red on
+    // ca58de0 for what they assert rather than for a missing mock.
+    // ---------------------------------------------------------------------------------------
+
+    /// <summary>
+    /// With Redis down the old scanner filtered the disconnected server out, enumerated nothing
+    /// and completed: the watchdog published "0 registrations, no error" and the recovery health
+    /// check flipped from Degraded to Healthy because of the outage.
+    /// </summary>
+    [Fact]
+    public async Task ScanAsync_NoConnectedPrimary_FailsInsteadOfReportingAnEmptyKeyspace()
+    {
+        var server = new Mock<IServer>();
+        server.SetupGet(s => s.IsConnected).Returns(false);
+        SetupKeys(server, [(RedisKey)"ar:recovery:corr-a"]);
+        _multiplexer.Setup(m => m.GetEndPoints(It.IsAny<bool>())).Returns([new DnsEndPoint("redis-a", 6379)]);
+        _multiplexer.Setup(m => m.GetServer(It.IsAny<EndPoint>(), It.IsAny<object?>())).Returns(server.Object);
+
+        var failure = await Assert.ThrowsAsync<RedisConnectionException>(() => DrainScanAsync());
+
+        Assert.Contains("no Redis primary is connected", failure.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain(_database.Invocations, invocation => invocation.Method.Name == nameof(IDatabase.StringGetAsync));
+    }
+
+    [Fact]
+    public async Task ScanAsync_OnlyAReplicaConnected_FailsBecauseThePrimaryIsTheScanTarget()
+    {
+        var primary = new Mock<IServer>();
+        primary.SetupGet(s => s.IsConnected).Returns(false);
+        var replica = new Mock<IServer>();
+        replica.SetupGet(s => s.IsConnected).Returns(true);
+        replica.SetupGet(s => s.IsReplica).Returns(true);
+        SetupKeys(replica, [(RedisKey)"ar:recovery:corr-a"]);
+        SetupServers(primary, replica);
+
+        await Assert.ThrowsAsync<RedisConnectionException>(() => DrainScanAsync());
+    }
+
+    /// <summary>
+    /// A cluster shards the keyspace, so the reachable primaries are not the whole answer: the
+    /// old scanner returned shard A's registrations as if they were every registration.
+    /// </summary>
+    [Fact]
+    public async Task ScanAsync_ClusterWithAnUnreachablePrimary_FailsInsteadOfReportingThePartialKeyspace()
+    {
+        var shardA = new Mock<IServer>();
+        shardA.SetupGet(s => s.IsConnected).Returns(true);
+        shardA.SetupGet(s => s.ServerType).Returns(ServerType.Cluster);
+        SetupKeys(shardA, [(RedisKey)"ar:recovery:corr-a"]);
+        var shardB = new Mock<IServer>();
+        shardB.SetupGet(s => s.IsConnected).Returns(false);
+        shardB.SetupGet(s => s.ServerType).Returns(ServerType.Cluster);
+        shardB.SetupGet(s => s.EndPoint).Returns(new DnsEndPoint("redis-shard-b", 6379));
+        SetupServers(shardA, shardB);
+        _database
+            .Setup(d => d.StringGetAsync((RedisKey)"ar:recovery:corr-a", It.IsAny<CommandFlags>()))
+            .ReturnsAsync(EnvelopeBlob((new RecoveryState { RegistrationId = Guid.NewGuid(), CorrelationId = "corr-a" }, _time.Now + TimeSpan.FromMinutes(10))));
+
+        var failure = await Assert.ThrowsAsync<RedisConnectionException>(() => DrainScanAsync());
+
+        Assert.Contains("redis-shard-b", failure.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The same topology once the shard is back: the scan is complete again and covers both
+    /// shards. A disconnected REPLICA never made it incomplete in the first place.
+    /// </summary>
+    [Fact]
+    public async Task ScanAsync_ClusterAfterReconnection_ScansEveryPrimary_AndIgnoresADisconnectedReplica()
+    {
+        var shardA = new Mock<IServer>();
+        shardA.SetupGet(s => s.IsConnected).Returns(true);
+        shardA.SetupGet(s => s.ServerType).Returns(ServerType.Cluster);
+        SetupKeys(shardA, [(RedisKey)"ar:recovery:corr-a"]);
+        var shardB = new Mock<IServer>();
+        var shardBConnected = false;
+        shardB.SetupGet(s => s.IsConnected).Returns(() => shardBConnected);
+        shardB.SetupGet(s => s.ServerType).Returns(ServerType.Cluster);
+        SetupKeys(shardB, [(RedisKey)"ar:recovery:corr-b"]);
+        var downReplica = new Mock<IServer>();
+        downReplica.SetupGet(s => s.IsConnected).Returns(false);
+        downReplica.SetupGet(s => s.IsReplica).Returns(true);
+        SetupServers(shardA, shardB, downReplica);
+        foreach (var correlationId in new[] { "corr-a", "corr-b" })
+        {
+            _database
+                .Setup(d => d.StringGetAsync((RedisKey)$"ar:recovery:{correlationId}", It.IsAny<CommandFlags>()))
+                .ReturnsAsync(EnvelopeBlob((new RecoveryState { RegistrationId = Guid.NewGuid(), CorrelationId = correlationId }, _time.Now + TimeSpan.FromMinutes(10))));
+        }
+
+        await Assert.ThrowsAsync<RedisConnectionException>(() => DrainScanAsync());
+
+        shardBConnected = true;
+        var states = await DrainScanAsync();
+
+        Assert.Equal(["corr-a", "corr-b"], states.Select(state => state.CorrelationId).OrderBy(id => id, StringComparer.Ordinal));
+    }
+
+    /// <summary>
+    /// Outside a cluster every primary serves the same dataset: after a failover the multiplexer
+    /// still lists the old primary (disconnected, last known as a primary) next to the promoted
+    /// one, and that must not read as an incomplete scan.
+    /// </summary>
+    [Fact]
+    public async Task ScanAsync_StandaloneFailover_AConnectedPrimaryIsTheWholeKeyspace()
+    {
+        var oldPrimary = new Mock<IServer>();
+        oldPrimary.SetupGet(s => s.IsConnected).Returns(false);
+        var promoted = new Mock<IServer>();
+        promoted.SetupGet(s => s.IsConnected).Returns(true);
+        SetupKeys(promoted, [(RedisKey)"ar:recovery:corr-a"]);
+        SetupServers(oldPrimary, promoted);
+        _database
+            .Setup(d => d.StringGetAsync((RedisKey)"ar:recovery:corr-a", It.IsAny<CommandFlags>()))
+            .ReturnsAsync(EnvelopeBlob((new RecoveryState { RegistrationId = Guid.NewGuid(), CorrelationId = "corr-a" }, _time.Now + TimeSpan.FromMinutes(10))));
+
+        Assert.Single(await DrainScanAsync());
+    }
+
+    /// <summary>A value read that fails mid-scan fails the scan: a skipped key would read as "no registration".</summary>
+    [Fact]
+    public async Task ScanAsync_AFailedValueRead_FailsTheScan()
+    {
+        var server = new Mock<IServer>();
+        server.SetupGet(s => s.IsConnected).Returns(true);
+        SetupKeys(server, [(RedisKey)"ar:recovery:corr-a", (RedisKey)"ar:recovery:corr-b"]);
+        SetupServers(server);
+        _database
+            .Setup(d => d.StringGetAsync((RedisKey)"ar:recovery:corr-a", It.IsAny<CommandFlags>()))
+            .ReturnsAsync(EnvelopeBlob((new RecoveryState { RegistrationId = Guid.NewGuid(), CorrelationId = "corr-a" }, _time.Now + TimeSpan.FromMinutes(10))));
+        _database
+            .Setup(d => d.StringGetAsync((RedisKey)"ar:recovery:corr-b", It.IsAny<CommandFlags>()))
+            .ThrowsAsync(new RedisTimeoutException(CommandFlags.None, "GET timed out", CommandStatus.Sent));
+
+        await Assert.ThrowsAsync<RedisTimeoutException>(() => DrainScanAsync());
+    }
+
+    /// <summary>
+    /// The registration reads of one batch are issued back to back and awaited together. The old
+    /// scanner awaited each GET before sending the next — one network round trip per key — so
+    /// here it would wait forever on the first read: none completes until all five are in flight.
+    /// </summary>
+    [Fact]
+    public async Task ScanAsync_PipelinesTheValueReadsOfABatch_InsteadOfOneRoundTripPerKey()
+    {
+        var keys = Enumerable.Range(0, 5).Select(index => (RedisKey)$"ar:recovery:corr-{index}").ToArray();
+        var server = new Mock<IServer>();
+        server.SetupGet(s => s.IsConnected).Returns(true);
+        SetupKeys(server, keys);
+        SetupServers(server);
+
+        var pending = new List<(TaskCompletionSource<RedisValue> Completion, string CorrelationId)>();
+        _database
+            .Setup(d => d.StringGetAsync(It.IsAny<RedisKey>(), It.IsAny<CommandFlags>()))
+            .Returns<RedisKey, CommandFlags>((key, _) =>
+            {
+                var completion = new TaskCompletionSource<RedisValue>(TaskCreationOptions.RunContinuationsAsynchronously);
+                lock (pending)
+                {
+                    pending.Add((completion, key.ToString()["ar:recovery:".Length..]));
+                    if (pending.Count == keys.Length)
+                    {
+                        foreach (var (read, correlationId) in pending)
+                        {
+                            read.SetResult(EnvelopeBlob((
+                                new RecoveryState { RegistrationId = Guid.NewGuid(), CorrelationId = correlationId },
+                                _time.Now + TimeSpan.FromMinutes(10))));
+                        }
+                    }
+                }
+
+                return completion.Task;
+            });
+
+        var states = await DrainScanAsync().WaitAsync(TimeSpan.FromSeconds(10));
+
+        Assert.Equal(keys.Length, states.Count);
+    }
+
+    /// <summary>The pipeline is bounded: a keyspace of any size is read a batch at a time.</summary>
+    [Fact]
+    public async Task ScanAsync_BoundsTheReadsInFlight_AndStillYieldsEveryRegistration()
+    {
+        var keys = Enumerable.Range(0, 300).Select(index => (RedisKey)$"ar:recovery:corr-{index}").ToArray();
+        var server = new Mock<IServer>();
+        server.SetupGet(s => s.IsConnected).Returns(true);
+        SetupKeys(server, keys);
+        SetupServers(server);
+
+        var inFlight = 0;
+        var maxInFlight = 0;
+        _database
+            .Setup(d => d.StringGetAsync(It.IsAny<RedisKey>(), It.IsAny<CommandFlags>()))
+            .Returns<RedisKey, CommandFlags>(async (key, _) =>
+            {
+                var now = Interlocked.Increment(ref inFlight);
+                int seen;
+                while (now > (seen = Volatile.Read(ref maxInFlight)))
+                    Interlocked.CompareExchange(ref maxInFlight, now, seen);
+
+                await Task.Delay(20);
+                Interlocked.Decrement(ref inFlight);
+                return EnvelopeBlob((
+                    new RecoveryState { RegistrationId = Guid.NewGuid(), CorrelationId = key.ToString()["ar:recovery:".Length..] },
+                    _time.Now + TimeSpan.FromMinutes(10)));
+            });
+
+        var states = await DrainScanAsync().WaitAsync(TimeSpan.FromSeconds(30));
+
+        Assert.Equal(300, states.Select(state => state.CorrelationId).Distinct(StringComparer.Ordinal).Count());
+        Assert.InRange(maxInFlight, 2, 128);
+    }
+
+    /// <summary>
+    /// The reviewer's reproduction end to end — real store, real watchdog, real health check:
+    /// one stale registration reads Degraded, and losing Redis must not turn that into Healthy.
+    /// </summary>
+    [Fact]
+    public async Task RedisOutage_KeepsRecoveryHealthDegraded_InsteadOfClearingTheStuckFlowAlarm()
+    {
+        var connected = true;
+        var server = new Mock<IServer>();
+        server.SetupGet(s => s.IsConnected).Returns(() => connected);
+        SetupKeys(server, [(RedisKey)"ar:recovery:corr-stuck"]);
+        SetupServers(server);
+        _database
+            .Setup(d => d.StringGetAsync((RedisKey)"ar:recovery:corr-stuck", It.IsAny<CommandFlags>()))
+            .ReturnsAsync(EnvelopeBlob((
+                new RecoveryState
+                {
+                    RegistrationId = Guid.NewGuid(),
+                    CorrelationId = "corr-stuck",
+                    PayloadTypeFullName = typeof(OperationResult).FullName,
+                    RegisteredAtUtc = DateTime.UtcNow.AddHours(-1)
+                },
+                _time.Now + TimeSpan.FromMinutes(10))));
+
+        var whileConnected = await ScanHealthAsync();
+        Assert.Equal(HealthStatus.Degraded, whileConnected.Status);
+        Assert.Contains("look stuck", whileConnected.Description, StringComparison.Ordinal);
+
+        connected = false;
+        var duringOutage = await ScanHealthAsync();
+        Assert.Equal(HealthStatus.Degraded, duringOutage.Status);
+        Assert.Contains("scan failed", duringOutage.Description, StringComparison.Ordinal);
+
+        connected = true;
+        Assert.Contains("look stuck", (await ScanHealthAsync()).Description, StringComparison.Ordinal);
+    }
+
+    /// <summary>One watchdog scan over <see cref="_store"/>, judged by the recovery health check.</summary>
+    private async Task<HealthCheckResult> ScanHealthAsync()
+    {
+        var state = new AsyncResponseWatchdogState();
+        var noLiveWaiter = new Mock<IActiveSubscriberProbe>();
+        noLiveWaiter
+            .Setup(probe => probe.CountActiveSubscribersAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .Returns(ValueTask.FromResult(0L));
+        using var watchdog = new AsyncResponseWatchdog(
+            [_store],
+            [noLiveWaiter.Object],
+            state,
+            Options.Create(new AsyncResponseOptions
+            {
+                Watchdog = new AsyncResponseWatchdogOptions
+                {
+                    Enabled = true,
+                    StartupDelay = TimeSpan.Zero,
+                    Interval = TimeSpan.FromMinutes(1),
+                    StaleAfter = TimeSpan.FromMinutes(1)
+                }
+            }),
+            NullLogger<AsyncResponseWatchdog>.Instance);
+
+        await watchdog.StartAsync(CancellationToken.None);
+        try
+        {
+            var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(10);
+            while (state.Latest is null)
+            {
+                Assert.True(DateTime.UtcNow < deadline, "The watchdog did not publish a snapshot in time.");
+                await Task.Delay(20);
+            }
+        }
+        finally
+        {
+            await watchdog.StopAsync(CancellationToken.None);
+        }
+
+        return await new AsyncResponseRecoveryHealthCheck(state).CheckHealthAsync(new HealthCheckContext());
+    }
+
+    private async Task<List<RecoveryState>> DrainScanAsync()
+    {
+        var states = new List<RecoveryState>();
+        await foreach (var state in _store.ScanAsync())
+            states.Add(state);
+        return states;
+    }
+
+    private void SetupServers(params Mock<IServer>[] servers)
+    {
+        var endPoints = servers.Select((_, index) => (EndPoint)new DnsEndPoint($"redis-{index}", 6379)).ToArray();
+        _multiplexer.Setup(m => m.GetEndPoints(It.IsAny<bool>())).Returns(endPoints);
+        _multiplexer
+            .Setup(m => m.GetServer(It.IsAny<EndPoint>(), It.IsAny<object?>()))
+            .Returns<EndPoint, object?>((endPoint, _) => servers[Array.IndexOf(endPoints, endPoint)].Object);
+    }
+
+    /// <summary>Arranges one keyspace for the asynchronous enumeration and both synchronous overloads.</summary>
+    private static void SetupKeys(Mock<IServer> server, RedisKey[] keys)
+    {
+        server
+            .Setup(s => s.Keys(
+                It.IsAny<int>(),
+                It.IsAny<RedisValue>(),
+                It.IsAny<int>(),
+                It.IsAny<CommandFlags>()))
+            .Returns(keys);
+        server
+            .Setup(s => s.Keys(
+                It.IsAny<int>(),
+                It.IsAny<RedisValue>(),
+                It.IsAny<int>(),
+                It.IsAny<long>(),
+                It.IsAny<int>(),
+                It.IsAny<CommandFlags>()))
+            .Returns(keys);
+        server
+            .Setup(s => s.KeysAsync(
+                It.IsAny<int>(),
+                It.IsAny<RedisValue>(),
+                It.IsAny<int>(),
+                It.IsAny<long>(),
+                It.IsAny<int>(),
+                It.IsAny<CommandFlags>()))
+            .Returns(() => ToAsyncEnumerable(keys));
+    }
+
+    private static async IAsyncEnumerable<RedisKey> ToAsyncEnumerable(RedisKey[] keys)
+    {
+        foreach (var key in keys)
+        {
+            await Task.Yield();
+            yield return key;
+        }
     }
 }

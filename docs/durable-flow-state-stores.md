@@ -119,6 +119,11 @@ public interface IFlowStateStore
         string flowId, string leaseId,
         CancellationToken cancellationToken = default);
 
+    // Optional (default: null, "this store cannot report leases"). See invariant 6.
+    Task<FlowLeaseObservation?> ObserveLeaseAsync(
+        string flowId,
+        CancellationToken cancellationToken = default);
+
     Task<bool> TryDeleteAsync(
         string flowId,
         CancellationToken cancellationToken = default);
@@ -140,6 +145,11 @@ The required invariants are:
    with the stored one, a flow id inside the JSON that is not the key — is **not** absent: it
    throws `FlowStateUnreadableException`, because callers acknowledge a wake-up on `null` and an
    acknowledged wake-up strands the run that is still in the table.
+6. `ObserveLeaseAsync` reports the lease **as persisted** — owner and absolute UTC expiry — without
+   judging whether it has lapsed: an expired lease nobody has re-acquired is still reported, a
+   ledger nobody holds (or an absent one) is `FlowLeaseObservation.Unheld`, and `null` means only
+   "this store cannot report leases". Every built-in store implements it. See
+   [Lease contention and deployments that change the lease duration](#lease-contention-and-deployments-that-change-the-lease-duration).
 
 There is no weaker compatibility path and no process-local fallback for an incomplete custom
 store. That keeps single-node tests and multi-replica production on the same correctness model.
@@ -149,6 +159,44 @@ state survive or coordinate a different process.
 Durable-flow fencing prevents two healthy workers from checkpointing one run concurrently. It does
 not make an external side effect and the following checkpoint one transaction. Steps and triggers
 must still be idempotent.
+
+### Lease contention and deployments that change the lease duration
+
+A wake-up that finds the execution lease held cannot tell, from the failed acquire alone, whether
+the holder is executing or died inside its unexpired lease window. Acknowledging it in the second
+case drops the run's only wake-up, so the engine acknowledges a contended wake-up as a duplicate
+**only on evidence from the store**, never because its own lease window elapsed:
+
+- it records the first `ObserveLeaseAsync` result and keeps polling (every
+  `ExecutionLeaseRenewInterval`, at most every 2 seconds);
+- a later observation with a **different owner**, or the **same owner and a later expiry**, can
+  only have been written by a worker that acquired or renewed the lease in the meantime — a live
+  holder whose own unacknowledged job covers the run. The wake-up is acknowledged, typically within
+  one renewal interval of the holder rather than after a full lease window;
+- an observation that **never changes** is a dead holder's lease. The wake-up waits for the
+  *persisted* expiry, then acquires the lease and executes from the last checkpoint;
+- if neither happens within one local lease window past the persisted expiry (a store clock far
+  from this host's, or a store that reports a lease it will not hand over), the wake-up fails with
+  `DurableFlowLeaseContendedException` and the worker transport redelivers it.
+
+This is what makes **changing `ExecutionLeaseDuration` between deployments safe**. The wait is
+bounded by the lease the previous deployment actually wrote, not by the new deployment's
+configuration: a successor configured with a 30-second lease that meets a crashed owner's
+10-minute lease waits out the 10 minutes. (Earlier versions waited only
+`ExecutionLeaseDuration + ExecutionLeaseRenewInterval` of the *waiting* host and then acknowledged
+the wake-up as a duplicate, so shortening the lease could strand every run whose redelivery
+arrived before the old lease expired — `Running`, `Attempts` unchanged, nothing left to wake it.)
+
+Two operational consequences:
+
+- the handler of a contended wake-up can stay parked for as long as the longest lease still
+  persisted. Transports redeliver a job whose visibility or lock lapses meanwhile; the extra
+  delivery waits the same way and the first one to acquire the lease wins;
+- an application-owned store that leaves `ObserveLeaseAsync` at its default gives the engine no
+  evidence. It still takes over a dead holder's lease inside its own lease window, but a wake-up
+  that stays contended through that window is **never acknowledged**: it throws
+  `DurableFlowLeaseContendedException`, so duplicates of a long-running execution burn transport
+  delivery attempts and can dead-letter. Implement the method — it is one read of two columns.
 
 ## Registration and client lifetimes
 
@@ -631,6 +679,11 @@ a custom store in production, test all of these against the real backend:
 - an update carrying the wrong or expired lease returns `false`;
 - a lease cannot be renewed or released by another owner;
 - takeover works after lease expiry;
+- `ObserveLeaseAsync` returns the persisted owner and expiry raw: `Unheld` before any acquire,
+  after a release, and for a missing flow (never `null`); a strictly later expiry after every
+  renewal; and the old owner, unchanged, for a lease that has expired but not been re-acquired.
+  A decorator around a store must forward it — the interface default silently downgrades the
+  inner store to "cannot report leases";
 - TTL refresh and expired-record replacement are atomic;
 - **unreadable is not missing:** malformed JSON, an unknown schema version, a revision inside
   the JSON that disagrees with the stored one, and a stored `flowId` that is not the key all throw
