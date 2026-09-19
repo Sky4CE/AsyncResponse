@@ -128,6 +128,14 @@ public sealed class SqliteFlowStateStore : IFlowStateStore
         return DurableFlowStoreShared.ReadState(flowId, reader.GetString(0), reader.GetInt64(1));
     }
 
+    /// <inheritdoc />
+    public void ValidateCreate(string flowId, FlowState state, TimeSpan ttl)
+    {
+        DurableFlowStoreShared.ValidateCreate(flowId, state, ttl);
+        if (_options.MaxStateBytes is not null)
+            _ = DurableFlowStoreShared.SerializeBounded(flowId, state, _options.MaxStateBytes, "SQLite");
+    }
+
     public async Task<bool> TryCreateAsync(
         string flowId,
         FlowState state,

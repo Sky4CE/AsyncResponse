@@ -283,6 +283,14 @@ public sealed class EFCoreFlowStateStore<[DynamicallyAccessedMembers(Dynamically
         return DurableFlowStoreShared.ReadState(flowId, record.StateJson, record.Revision);
     }
 
+    /// <inheritdoc />
+    public void ValidateCreate(string flowId, FlowState state, TimeSpan ttl)
+    {
+        DurableFlowStoreShared.ValidateCreate(flowId, state, ttl);
+        if (_options.MaxStateBytes is not null)
+            _ = DurableFlowStoreShared.SerializeBounded(flowId, state, _options.MaxStateBytes, "EF Core");
+    }
+
     public async Task<bool> TryCreateAsync(string flowId, FlowState state, TimeSpan ttl, CancellationToken cancellationToken = default)
     {
         DurableFlowStoreShared.ValidateCreate(flowId, state, ttl);

@@ -81,17 +81,17 @@ internal sealed class DurableFlowService : IDurableFlows
         // good surfaces the id (DurableFlowNotDispatchedException) — now with nothing persisted.
         var id = flowId;
         var initialStateJson = FlowStateJson.Serialize(state);
+        store.ValidateCreate(flowId, state, _options.StateExpiry);
         await PublishStartAsync(
             executor => executor.CreateAndExecuteAsync(id, initialStateJson),
             id,
             cancellationToken).ConfigureAwait(false);
 
-        // The starter's own create keeps the caller-facing contract: the ledger exists by the time
-        // StartAsync returns (GetStateAsync / ResumeAsync right after a start see it), and a
-        // conflicting reuse of an explicit id is reported to THIS caller. Losing the create race —
-        // to the executor that already picked the job up, or to a concurrent identical start — is
-        // the expected shape, not an error. A store fault here no longer matters for the run: the
-        // job is published and the executor creates the ledger; the caller gets the id.
+        // Normally the starter's own create makes state immediately queryable and reports an
+        // explicit-id conflict to this caller. Losing the race to the executor or an identical
+        // start is expected. After a transient store fault the published job creates the ledger;
+        // a query can return null until it does. Deterministic size/argument rejection still
+        // propagates, including from custom stores whose preflight uses the no-op default.
         bool created;
         try
         {
@@ -102,7 +102,8 @@ internal sealed class DurableFlowService : IDurableFlows
                 _options.StateExpiry,
                 cancellationToken).ConfigureAwait(false);
         }
-        catch (Exception ex) when (ex is not OperationCanceledException || !cancellationToken.IsCancellationRequested)
+        catch (Exception ex) when (ex is not (FlowStateTooLargeException or ArgumentException)
+            && (ex is not OperationCanceledException || !cancellationToken.IsCancellationRequested))
         {
             _logger.LogWarning(
                 ex,

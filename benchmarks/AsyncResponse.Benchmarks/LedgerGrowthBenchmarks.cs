@@ -6,9 +6,9 @@ namespace AsyncResponse.Benchmarks;
 /// <summary>
 /// The durable-flow ledger's cost curve: every checkpoint rewrites the WHOLE ledger, so a run of
 /// N steps with similar result sizes serializes about N²/2 step-results over its lifetime. This
-/// measures one full run — N checkpoints through the process-local store, each carrying every
-/// earlier result — so the cumulative bytes written and the time per run can be compared
-/// against the step count instead of inferred (docs/durable-flows.md, "Supported ledger budgets").
+/// compares raw single-ledger rewrites with bounded groups through the process-local store.
+/// This deliberately bypasses the engine's MaxRetainedSteps budget to expose the unbounded
+/// baseline; real-engine bounded-child-tree byte scaling is asserted in LedgerBudgetTests.
 /// </summary>
 [MemoryDiagnoser]
 public class LedgerGrowthBenchmarks
@@ -25,6 +25,10 @@ public class LedgerGrowthBenchmarks
     /// <summary>Size of each step's result (a JSON string), in bytes.</summary>
     [Params(1024)]
     public int ResultBytes { get; set; }
+
+    /// <summary>Zero keeps one unbounded baseline ledger; eight models bounded result groups.</summary>
+    [Params(0, 8)]
+    public int StepsPerLedger { get; set; }
 
     [GlobalSetup]
     public void Setup()
@@ -45,12 +49,18 @@ public class LedgerGrowthBenchmarks
         => await _serviceProvider.DisposeAsync();
 
     /// <summary>
-    /// One complete run: create, then one checkpoint per step, each rewriting the ledger with
-    /// every result so far. Returns the bytes the LAST checkpoint serialized, so the growth is
-    /// visible beside the per-run time and allocations.
+    /// Measures all writes and cleanup for the requested results. Grouped ledgers cap the
+    /// retained history in each write; the single-ledger baseline keeps every preceding result.
     /// </summary>
     [Benchmark]
-    public async Task<long> RunOfNSteps()
+    public async Task RunOfNSteps()
+    {
+        var batchSize = StepsPerLedger > 0 ? StepsPerLedger : Steps;
+        for (var offset = 0; offset < Steps; offset += batchSize)
+            await WriteLedgerAsync(Math.Min(batchSize, Steps - offset));
+    }
+
+    private async Task WriteLedgerAsync(int count)
     {
         var flowId = $"ledger-growth-{Interlocked.Increment(ref _sequence)}";
         var state = new FlowState
@@ -66,18 +76,15 @@ public class LedgerGrowthBenchmarks
         };
         await _store.TryCreateAsync(flowId, state, TimeSpan.FromMinutes(30));
 
-        long lastLedgerChars = 0;
-        for (var step = 0; step < Steps; step++)
+        for (var step = 0; step < count; step++)
         {
             state.Steps![$"step-{step}"] = new FlowStepState { Completed = true, ResultJson = _resultJson, CompletedAtUtc = DateTime.UtcNow };
             var expected = state.Revision;
             state.Revision = expected + 1;
             state.UpdatedAtUtc = DateTime.UtcNow;
             await _store.TryUpdateAsync(flowId, state, expected, TimeSpan.FromMinutes(30));
-            lastLedgerChars += _resultJson.Length; // the ledger retains every result so far
         }
 
         await _store.TryDeleteAsync(flowId);
-        return lastLedgerChars;
     }
 }

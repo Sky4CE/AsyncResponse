@@ -783,6 +783,7 @@ internal sealed class DurableFlowContext : IDurableFlowContext
 
         var waiter = await CreateWaiterAsync(correlationId, until, stepTimeout, name).ConfigureAwait(false);
         var triggerCompleted = reattach;
+        var notifyCompletion = false;
         try
         {
             if (reattach && await TryShortCircuitRecoveredCheckpointAsync(name, checkpoint).ConfigureAwait(false))
@@ -855,7 +856,8 @@ internal sealed class DurableFlowContext : IDurableFlowContext
             // it exists nowhere else, so the completion checkpoint must not be interruptible — a
             // cancellation here used to leave `pending` set with the response already consumed,
             // and the redelivered execution re-attached to a correlation id nothing could answer.
-            await CompleteStepAsync(name, checkpoint, AsyncResponseJson.Serialize(response), CancellationToken.None, kind: DurableFlowStepKind.Awaited, correlationId: correlationId).ConfigureAwait(false);
+            await CompleteStepAsync(name, checkpoint, AsyncResponseJson.Serialize(response), CancellationToken.None, kind: DurableFlowStepKind.Awaited, correlationId: correlationId, notify: false).ConfigureAwait(false);
+            notifyCompletion = true;
             return response;
         }
         catch (OperationCanceledException ex) when (triggerCompleted)
@@ -893,7 +895,8 @@ internal sealed class DurableFlowContext : IDurableFlowContext
                     _lease.ThrowIfLost(ex);
                 }
 
-                await CompleteStepAsync(name, checkpoint, AsyncResponseJson.Serialize(received), CancellationToken.None, kind: DurableFlowStepKind.Awaited, correlationId: correlationId).ConfigureAwait(false);
+                await CompleteStepAsync(name, checkpoint, AsyncResponseJson.Serialize(received), CancellationToken.None, kind: DurableFlowStepKind.Awaited, correlationId: correlationId, notify: false).ConfigureAwait(false);
+                notifyCompletion = true;
                 return received;
             }
 
@@ -959,7 +962,8 @@ internal sealed class DurableFlowContext : IDurableFlowContext
                         _lease.ThrowIfLost(ex);
                     }
 
-                    await CompleteStepAsync(name, checkpoint, AsyncResponseJson.Serialize(received), CancellationToken.None, kind: DurableFlowStepKind.Awaited, correlationId: correlationId).ConfigureAwait(false);
+                    await CompleteStepAsync(name, checkpoint, AsyncResponseJson.Serialize(received), CancellationToken.None, kind: DurableFlowStepKind.Awaited, correlationId: correlationId, notify: false).ConfigureAwait(false);
+                    notifyCompletion = true;
                     return received;
                 }
 
@@ -990,6 +994,10 @@ internal sealed class DurableFlowContext : IDurableFlowContext
         finally
         {
             await waiter.DisposeAsync().ConfigureAwait(false);
+            // Notification is outside the response-settlement catches: an observer failure
+            // must end this attempt after its durable checkpoint, not checkpoint and notify twice.
+            if (notifyCompletion)
+                await NotifyStepAsync(static (o, e) => o.OnStepCompletedAsync(e), name, DurableFlowStepKind.Awaited, correlationId, checkpoint.WakeAtUtc).ConfigureAwait(false);
         }
     }
 
@@ -1248,7 +1256,8 @@ internal sealed class DurableFlowContext : IDurableFlowContext
         CancellationToken cancellationToken,
         bool faulted = false,
         DurableFlowStepKind kind = DurableFlowStepKind.Local,
-        string? correlationId = null)
+        string? correlationId = null,
+        bool notify = true)
     {
         step.Completed = true;
         step.ResultJson = resultJson;
@@ -1266,7 +1275,8 @@ internal sealed class DurableFlowContext : IDurableFlowContext
         if (_logger.IsEnabled(LogLevel.Debug))
             _logger.LogDebug("Flow {FlowId} step '{Step}' completed.", FlowId, name);
 
-        await NotifyStepAsync(static (o, e) => o.OnStepCompletedAsync(e), name, kind, correlationId, step.WakeAtUtc).ConfigureAwait(false);
+        if (notify)
+            await NotifyStepAsync(static (o, e) => o.OnStepCompletedAsync(e), name, kind, correlationId, step.WakeAtUtc).ConfigureAwait(false);
     }
 
     /// <summary>

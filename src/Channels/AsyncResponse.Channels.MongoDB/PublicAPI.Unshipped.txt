@@ -43,3 +43,5 @@ const AsyncResponse.Channels.MongoDB.MongoDbAsyncResponseChannelOptions.ChannelN
 static Microsoft.Extensions.DependencyInjection.MongoDbAsyncResponseChannelServiceCollectionExtensions.WithMongoDbChannel(this Microsoft.Extensions.DependencyInjection.AsyncResponseRegistrationBuilder! builder, System.Action<AsyncResponse.Channels.MongoDB.MongoDbAsyncResponseChannelOptions!>? configure = null) -> Microsoft.Extensions.DependencyInjection.AsyncResponseRegistrationBuilder!
 AsyncResponse.Channels.MongoDB.MongoDbAsyncResponseChannelOptions.FullSweepInterval.get -> System.TimeSpan?
 AsyncResponse.Channels.MongoDB.MongoDbAsyncResponseChannelOptions.FullSweepInterval.set -> void
+AsyncResponse.Channels.MongoDB.MongoDbAsyncResponseChannelOptions.HistoryReconciliationInterval.get -> System.TimeSpan
+AsyncResponse.Channels.MongoDB.MongoDbAsyncResponseChannelOptions.HistoryReconciliationInterval.set -> void

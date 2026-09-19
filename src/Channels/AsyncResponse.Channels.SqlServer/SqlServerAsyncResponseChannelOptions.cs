@@ -97,6 +97,16 @@ public sealed class SqlServerAsyncResponseChannelOptions : DurableAsyncResponseC
     public int PendingMessageBatchSize { get; set; } = 64;
 
     /// <summary>
+    /// Minimum interval between incremental reconciliation passes over retained message history.
+    /// Normal scans keep their forward cursor; reconciliation catches late commits behind it,
+    /// including rows already acknowledged by another process. One history page is read per
+    /// dispatch pass so a long history cannot monopolize delivery to other correlations.
+    /// Default: 5 seconds; large histories take additional poll intervals to reconcile.
+    /// </summary>
+    public TimeSpan HistoryReconciliationInterval { get; set; } = TimeSpan.FromSeconds(5);
+
+
+    /// <summary>
     /// How often a live waiter refreshes its subscriber heartbeat row. Default: 10 seconds.
     /// </summary>
     public TimeSpan SubscriberHeartbeatInterval { get; set; } = TimeSpan.FromSeconds(10);
@@ -151,6 +161,7 @@ public sealed class SqlServerAsyncResponseChannelOptions : DurableAsyncResponseC
         EnsureTimerBacked(DeliveryConfirmationPollInterval, nameof(SqlServerAsyncResponseChannelOptions), nameof(DeliveryConfirmationPollInterval));
         EnsureTimerBacked(ActivePollInterval, nameof(SqlServerAsyncResponseChannelOptions), nameof(ActivePollInterval));
         EnsureTimerBacked(IdlePollInterval, nameof(SqlServerAsyncResponseChannelOptions), nameof(IdlePollInterval));
+        EnsureTimerBacked(HistoryReconciliationInterval, nameof(SqlServerAsyncResponseChannelOptions), nameof(HistoryReconciliationInterval));
         if (FullSweepInterval is { } fullSweepInterval)
             EnsureTimerBacked(fullSweepInterval, nameof(SqlServerAsyncResponseChannelOptions), nameof(FullSweepInterval));
         EnsureTimerBacked(SubscriberHeartbeatInterval, nameof(SqlServerAsyncResponseChannelOptions), nameof(SubscriberHeartbeatInterval));

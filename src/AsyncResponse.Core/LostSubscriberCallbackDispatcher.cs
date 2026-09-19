@@ -143,7 +143,7 @@ internal sealed class LostSubscriberCallbackDispatcher(
         if (failures is not null)
         {
             if (!callbackInvoked)
-                ThrowUnsettled(failures);
+                ThrowUnsettled(failures, correlationId);
 
             SettleResidualFailures(failures, correlationId, channel, "response");
         }
@@ -203,7 +203,7 @@ internal sealed class LostSubscriberCallbackDispatcher(
         if (failures is not null)
         {
             if (!callbackInvoked)
-                ThrowUnsettled(failures);
+                ThrowUnsettled(failures, correlationId);
 
             SettleResidualFailures(failures, correlationId, channel, "exception");
         }
@@ -219,15 +219,25 @@ internal sealed class LostSubscriberCallbackDispatcher(
     /// transport redelivers the still-unacknowledged signal to every registration — instead of
     /// the ingress burning its own retry ladder on an earlier sibling's failure and then escalating
     /// through <c>SetException</c>, which re-invokes the very failure callback that just gave up.
-    /// Otherwise the first failure propagates as before, stack trace intact, for the ingress's
-    /// retry-then-escalate handling.
+    /// Any other transient failure is wrapped for the same redelivery path. Only an entirely
+    /// deterministic set retains the ingress's retry-then-escalate handling.
     /// </summary>
-    private static void ThrowUnsettled(List<ExceptionDispatchInfo> failures)
+    private static void ThrowUnsettled(List<ExceptionDispatchInfo> failures, string correlationId)
     {
         foreach (var failure in failures)
         {
             if (failure.SourceException is RecoveryCallbackFailedException)
                 failure.Throw();
+        }
+
+        // No successful sibling does not make a transient resume failure a business failure.
+        // In particular, RecoverAsync may have checkpointed the response before its wake-up
+        // publish failed. Escalating through SetException then consumes its registration without
+        // publishing that wake-up. Preserve the original signal for transport redelivery.
+        foreach (var failure in failures)
+        {
+            if (!IsPermanentCallbackFailure(failure.SourceException))
+                throw new RecoveryCallbackFailedException(correlationId, attempts: 1, failure.SourceException);
         }
 
         failures[0].Throw();
@@ -395,9 +405,9 @@ internal sealed class LostSubscriberCallbackDispatcher(
                 correlationId: recoveryState.CorrelationId
             );
 
-            // Deliberately not swallowed: a failing resume propagates to the publisher's caller,
-            // which can escalate it through SetException to the failure callback (the ingress does
-            // exactly that). The catch below only marks the activity before rethrowing.
+            // The outer fan-out settlement wraps transient failures for transport redelivery,
+            // including a single failed resume. Infrastructure failure must not become a
+            // business-failure callback. This catch only marks the activity before rethrowing.
             await InvokeAsync(invocation, recoveryState.Context).ConfigureAwait(false);
 
             _logger.LogInformation("Resume callback invoked for channel {Channel}.", channel);

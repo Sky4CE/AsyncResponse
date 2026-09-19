@@ -361,27 +361,20 @@ waiters are lost, the recovery store keeps one registration per waiter and a
 late response/exception dispatches to every stored callback for that correlation id. A waiter that
 completes normally removes only its own registration, so a still-active sibling remains recoverable.
 
-Each registration keeps its own delivery guarantee through that fan-out. A registration whose
-callback succeeds is consumed (deleted) immediately. If a **sibling's** callback then fails
-*transiently* (its dependency blipped), the publish throws `RecoveryCallbackFailedException` — the
-same type the failure-callback ladder uses — and the broker ingress passes it through untouched:
-no second retry ladder, no `SetException` escalation (which would fail flows whose resume merely
-blipped), so the transport **redelivers** the terminal signal under its own `MaxDeliveryAttempts`
-and dead-letter policy. Because the successful registrations are already gone, the redelivery
-reaches only the ones that failed and settles them when the dependency is back (the same holds for
-a direct `SetResponse`/`SetException` caller that retries). A sibling failure that is
-*deterministic* — an unauthorized or unresolvable target, a method that no longer binds — is
-logged, since redelivery cannot fix it; that registration stays for the watchdog to surface. The
-verdict is taken over **every** failed registration, not the first one the store returned: the
-message is acknowledged only when every failure was deterministic, and one transient failure
-anywhere in the set keeps it unacknowledged whatever precedes it. When no callback succeeded at
-all, a sibling whose failure-callback ladder was exhausted (`RecoveryCallbackFailedException`)
-propagates ahead of any other sibling's fault, so the ingress does not burn its own retry ladder on
-a deterministic fault and then escalate through `SetException` into the very callback that just
-gave up. (Until round 35 a partial success was swallowed outright, which returned success to the
-broker for a payload the failed registration never received; until round 39 the verdict came from
-the first failure alone, so a deterministic fault ahead of a transient sibling acknowledged the
-message and the transient registration lost its only copy of the payload.)
+Each registration keeps its own delivery guarantee. A successful callback consumes only its own
+registration. **Any transient callback failure** throws `RecoveryCallbackFailedException`,
+including a single registration and a fan-out in which no callback succeeded. Ingress propagates
+it without `SetException` escalation; broker redelivery and the configured dead-letter policy own
+the retry. This matters when `RecoverAsync` has saved a successful response but cannot publish its
+resume job: the registration survives, and redelivery publishes the missing wake-up without
+repeating the completed remote step. Direct publishers must also retry this exception.
+
+The classification examines every failed sibling. A transient failure preserves redelivery even
+when a deterministic failure came first. Deterministic binding/authorization failures are not
+wrapped: after partial success they are logged and retained for watchdog visibility; if all
+callbacks fail deterministically, the original exception follows ingress's exception-routing
+policy. A failure callback that exhausts its own retry ladder preserves its existing
+`RecoveryCallbackFailedException` and attempt count.
 
 The watchdog reports shared-correlation recovery state once per correlation id, not once per stored
 waiter registration.

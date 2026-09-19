@@ -408,10 +408,10 @@ public class LostSubscriberRoutingTests
         ArmRecoveryState();
         _spy.FailureCallbackError = new InvalidOperationException("handler exploded");
 
-        var thrown = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+        var thrown = await Assert.ThrowsAsync<RecoveryCallbackFailedException>(() =>
             Publisher.SetException(new InvalidOperationException("technical error"), CorrelationId));
 
-        Assert.Equal("handler exploded", thrown.Message);
+        Assert.Equal("handler exploded", Assert.IsType<InvalidOperationException>(thrown.InnerException).Message);
         Assert.Single(_spy.Failures);
         _database.Verify(d => d.KeyDeleteAsync(It.IsAny<RedisKey>(), It.IsAny<CommandFlags>()), Times.Never);
     }
@@ -419,18 +419,15 @@ public class LostSubscriberRoutingTests
     [Fact]
     public async Task SetException_FailureCallbackThrows_PreservesOriginalStackTrace()
     {
-        // Regression guard: the multi-registration dispatcher captures the first callback exception
-        // and re-throws it after dispatching the rest. It must do so with ExceptionDispatchInfo so
-        // the original throw site survives; a bare `throw capturedVariable;` would reset the stack
-        // trace to the dispatcher and drop the throwing frame.
+        // The retryable wrapper must preserve the exact original exception and its throw site.
         ArmRecoveryState();
         _spy.FailureCallbackError = CaptureExceptionThrownAt();
 
-        var thrown = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+        var thrown = await Assert.ThrowsAsync<RecoveryCallbackFailedException>(() =>
             Publisher.SetException(new InvalidOperationException("technical error"), CorrelationId));
 
-        Assert.NotNull(thrown.StackTrace);
-        Assert.Contains(nameof(ThrowMarkerSite), thrown.StackTrace);
+        Assert.Same(_spy.FailureCallbackError, thrown.InnerException);
+        Assert.Contains(nameof(ThrowMarkerSite), thrown.InnerException!.StackTrace);
     }
 
     [Fact]
@@ -441,11 +438,11 @@ public class LostSubscriberRoutingTests
         ArmRecoveryState();
         _spy.ResumeCallbackError = CaptureExceptionThrownAt();
 
-        var thrown = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+        var thrown = await Assert.ThrowsAsync<RecoveryCallbackFailedException>(() =>
             Publisher.SetResponse(new OperationResult { Status = OperationStatus.Completed }, CorrelationId));
 
-        Assert.NotNull(thrown.StackTrace);
-        Assert.Contains(nameof(ThrowMarkerSite), thrown.StackTrace);
+        Assert.Same(_spy.ResumeCallbackError, thrown.InnerException);
+        Assert.Contains(nameof(ThrowMarkerSite), thrown.InnerException!.StackTrace);
     }
 
     [Fact]

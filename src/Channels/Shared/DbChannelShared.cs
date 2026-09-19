@@ -3,6 +3,7 @@ using Microsoft.Extensions.Logging;
 using System.Buffers;
 using System.Collections.Concurrent;
 using System.Diagnostics;
+using System.Runtime.CompilerServices;
 using System.Text;
 using System.Text.Json;
 using System.Threading.Channels;
@@ -918,6 +919,31 @@ internal abstract class DbAsyncResponseChannelBase :
             await DispatchPendingCorrelationAsync(correlationId, group, cancellationToken).ConfigureAwait(false);
     }
 
+    // The group owns its scan progress: removing the last subscription also makes the cursor
+    // collectible, without another per-correlation registry or a cleanup race on reused ids.
+    private readonly ConditionalWeakTable<ConcurrentDictionary<Guid, IDbSubscription>, DispatchScan> _dispatchScans = new();
+    private const int MaxForwardPagesPerPass = 16;
+    private static readonly Guid LastMessageId = new("ffffffff-ffff-ffff-ffff-ffffffffffff");
+
+    private sealed class MessageCursor
+    {
+        public DateTimeOffset? CreatedAtUtc;
+        public Guid? Id;
+        public void Advance(DbChannelMessage message) { CreatedAtUtc = message.CreatedAtUtc; Id = message.Id; }
+    }
+
+    private sealed class DispatchScan
+    {
+        public HashSet<Guid> Registrations = [];
+        public MessageCursor Forward = new();
+        public bool ForwardCaughtUp;
+        public MessageCursor? Reconciliation;
+        public DateTimeOffset? ReconciliationEndUtc;
+        public Guid? ReconciliationEndId;
+        public DateTimeOffset ReconcileAfter;
+        public int RewindRequested;
+    }
+
     private async Task DispatchPendingCorrelationAsync(
         string correlationId,
         ConcurrentDictionary<Guid, IDbSubscription> group,
@@ -946,27 +972,78 @@ internal abstract class DbAsyncResponseChannelBase :
         foreach (var subscription in subscriptions)
             subscription.PruneSeen(seenCutoff);
 
-        DateTimeOffset? afterCreatedAtUtc = null;
-        Guid? afterId = null;
-        while (true)
+        var scan = _dispatchScans.GetOrCreateValue(group);
+        var registrations = subscriptions.Select(subscription => subscription.Id).ToHashSet();
+        var now = _timeProvider.GetUtcNow();
+        if (!scan.Registrations.SetEquals(registrations) || Interlocked.Exchange(ref scan.RewindRequested, 0) != 0)
+        {
+            scan.Registrations = registrations;
+            scan.Forward = new MessageCursor();
+            scan.ForwardCaughtUp = false;
+            scan.Reconciliation = null;
+            scan.ReconcileAfter = now + _options.HistoryReconciliationInterval;
+        }
+
+        // Normal polls and targeted signals continue after the last admitted page. A new waiter
+        // resets progress so its own watermark, not another waiter's seen set, decides fan-out.
+        var previousForward = scan.Forward;
+        if (scan.ForwardCaughtUp && scan.Forward.CreatedAtUtc is { } lastTick && lastTick > DateTimeOffset.MinValue)
+        {
+            // A database clock tick can contain several random ids. A newly committed message
+            // in the LAST tick must not wait for historical reconciliation merely because its
+            // id sorts before the previous message. Revisit that tick, not the entire history.
+            // The provider may truncate the sub-tick timestamp to milliseconds/microseconds;
+            // the maximum id excludes rows at that preceding, truncated timestamp.
+            scan.Forward = new MessageCursor { CreatedAtUtc = lastTick.AddTicks(-1), Id = LastMessageId };
+        }
+        scan.ForwardCaughtUp = false;
+        var forwardReadAny = false;
+        for (var page = 0; page < MaxForwardPagesPerPass; page++)
+        {
+            var (more, admitted, _) = await DispatchPageAsync(scan.Forward).ConfigureAwait(false);
+            if (!admitted)
+                return;
+            if (!more)
+            {
+                scan.ForwardCaughtUp = true;
+                break;
+            }
+            if (page == MaxForwardPagesPerPass - 1)
+                ScheduleBackpressureRescan(correlationId, cancellationToken);
+        }
+        if (!forwardReadAny)
+            scan.Forward = previousForward; // Expired/pruned tail: do not walk backward on idle polls.
+
+        // Creation keys are NOT commit order: a transaction can become visible behind the
+        // cursor, even with the same timestamp and a lower id, and another process may already
+        // have acknowledged it. Reconcile retained history periodically, one page per pass.
+        // Both unacked and acked rows participate; filtering acked rows would break fan-out.
+        if (scan.Reconciliation is null && now >= scan.ReconcileAfter && scan.Forward.Id is not null)
+        {
+            scan.Reconciliation = new MessageCursor();
+            scan.ReconciliationEndUtc = scan.Forward.CreatedAtUtc;
+            scan.ReconciliationEndId = scan.Forward.Id;
+        }
+        if (scan.Reconciliation is { } reconciliation)
+        {
+            var (more, admitted, reachedEnd) = await DispatchPageAsync(reconciliation, reconcile: true).ConfigureAwait(false);
+            if (admitted && (!more || reachedEnd))
+            {
+                scan.Reconciliation = null;
+                scan.ReconcileAfter = _timeProvider.GetUtcNow() + _options.HistoryReconciliationInterval;
+            }
+            else
+                ScheduleBackpressureRescan(correlationId, cancellationToken);
+        }
+
+        async Task<(bool More, bool Admitted, bool ReachedEnd)> DispatchPageAsync(MessageCursor cursor, bool reconcile = false)
         {
             var messages = await _store.LoadMessagesAsync(
-                correlationId,
-                since,
-                _options.PendingMessageBatchSize,
-                afterCreatedAtUtc,
-                afterId,
-                cancellationToken).ConfigureAwait(false);
+                correlationId, since, _options.PendingMessageBatchSize,
+                cursor.CreatedAtUtc, cursor.Id, cancellationToken).ConfigureAwait(false);
 
-            // Two passes over the page. The store ships the envelope only for rows nobody has
-            // acknowledged; an acknowledged row — the consumed history this sweep re-reads on
-            // every tick and every targeted signal, retained so a fan-out waiter in ANOTHER
-            // process still receives it — comes back header-only. Before the split, every sweep
-            // re-transferred and re-materialized a long-lived progress subscription's whole
-            // retained history just to drop it in the pre-filter below. The first pass decides
-            // which rows a live subscription would actually take; the second hydrates the
-            // envelopes of the (rare) acknowledged rows among them in one store read and enqueues
-            // in page order, so nothing later is admitted ahead of an earlier row.
+            // Acknowledged rows stay eligible for fan-out, but travel header-only. Hydrate
+            // only those a live subscription still needs, then enqueue in page order.
             List<DbChannelMessage>? eligible = null;
             List<Guid>? headerOnly = null;
             foreach (var message in messages)
@@ -988,11 +1065,8 @@ internal abstract class DbAsyncResponseChannelBase :
                     continue;
                 }
 
-                // Pre-filter BEFORE enqueueing. The work item re-checks this anyway, but the store
-                // deliberately keeps returning acked rows (cross-process fan-out), so every sweep
-                // tick and every targeted signal re-enqueued one item per retained message.
-                // Skipping messages no live subscription would take keeps the already-consumed
-                // history out of the executor queue.
+                // Reconciliation and last-tick overlap revisit seen headers; keep those out of
+                // the executor queue. The work item re-checks after admission as well.
                 if (!WouldDeliverToAnySubscription(message, subscriptions))
                     continue;
 
@@ -1002,14 +1076,17 @@ internal abstract class DbAsyncResponseChannelBase :
             }
 
             if (eligible is not null && !await EnqueueEligibleAsync(correlationId, eligible, headerOnly, subscriptions, cancellationToken).ConfigureAwait(false))
-                return;
+                return (false, false, false); // Retry this page: never advance past refused work.
 
-            if (messages.Count < _options.PendingMessageBatchSize)
-                break;
-
-            var last = messages[^1];
-            afterCreatedAtUtc = last.CreatedAtUtc;
-            afterId = last.Id;
+            if (messages.Count > 0)
+            {
+                cursor.Advance(messages[^1]);
+                if (!reconcile)
+                    forwardReadAny = true;
+            }
+            var reachedEnd = reconcile && messages.Any(message =>
+                message.Id == scan.ReconciliationEndId || message.CreatedAtUtc > scan.ReconciliationEndUtc);
+            return (messages.Count == _options.PendingMessageBatchSize, true, reachedEnd);
         }
     }
 
@@ -1494,6 +1571,12 @@ internal abstract class DbAsyncResponseChannelBase :
             }
             catch (Exception ex) when (ex is not OperationCanceledException || !cancellationToken.IsCancellationRequested)
             {
+                if (owner._subscriptions.TryGetValue(message.CorrelationId, out var group)
+                    && owner._dispatchScans.TryGetValue(group, out var scan))
+                {
+                    Interlocked.Exchange(ref scan.RewindRequested, 1);
+                    owner.ScheduleBackpressureRescan(message.CorrelationId, cancellationToken);
+                }
                 owner._logger.LogDebug(
                     ex,
                     "Local {Provider} response dispatch failed for correlationId {CorrelationId}; {RetryHint}.",

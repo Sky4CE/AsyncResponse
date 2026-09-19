@@ -173,8 +173,8 @@ somebody has to make the call. Full model: [docs/recovery.md](docs/recovery.md).
 - Completion predicates for one waiter never run concurrently. Internal overload is backpressured through
   bounded in-process queues instead of growing an unbounded delegate or job backlog.
 - PostgreSQL, SQL Server, and MongoDB treat notifications and change streams as wake hints:
-  retained messages are keyset-paged to exhaustion, so a terminal response cannot be stranded
-  behind one full progress batch. Subscriber heartbeats are batched by channel instance and
+  retained messages use forward keyset paging across bounded passes, with periodic reconciliation
+  for late commits, so one full progress batch cannot permanently hide a terminal response. Subscriber heartbeats are batched by channel instance and
   interval instead of scheduling one timer and write per waiter.
 - A durable channel persists waiter recovery metadata. It does **not** make every response path
   exactly-once: Redis pub/sub is at-most-once, while broker and queue transports can redeliver.

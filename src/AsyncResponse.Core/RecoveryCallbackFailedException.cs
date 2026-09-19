@@ -14,17 +14,15 @@ namespace AsyncResponse;
 /// <list type="bullet">
 /// <item><description>the <b>failure</b> callback failed on every attempt of its in-process retry
 /// ladder (<see cref="Attempts"/> is that ladder's length);</description></item>
-/// <item><description>a <b>fan-out</b> over several registrations sharing the correlation id
-/// partially failed: at least one registration's callback succeeded and was consumed, another's
-/// failed transiently (<see cref="Attempts"/> is 1 — the redelivery is the retry). Because the
-/// successful registrations are deleted, the redelivery reaches only the one that failed, and a
-/// caller that retries the publish once the dependency recovers completes exactly that
-/// registration.</description></item>
+/// <item><description>any resume or exception callback failed transiently, including a single
+/// registration or a fan-out in which none succeeded (<see cref="Attempts"/> is 1 — transport
+/// redelivery owns the retry). Successful siblings are deleted; failed registrations stay armed.</description></item>
 /// </list>
 /// <para>
 /// Deterministic callback faults — an unauthorized or unresolvable target, a method that no longer
-/// binds — are never wrapped in this type: redelivery cannot fix them, so they are logged and the
-/// message is acknowledged (the registration stays for the watchdog to surface).
+/// binds — are never wrapped in this type. In a partially successful fan-out they are logged
+/// and retained for watchdog visibility; when every callback fails deterministically, the
+/// original failure propagates to the ingress's exception-routing policy.
 /// </para>
 /// <para>
 /// A direct caller of <c>IAsyncResponsePublisher.SetResponse</c>/<c>SetException</c> (an HTTP
@@ -48,6 +46,6 @@ public sealed class RecoveryCallbackFailedException : Exception
     /// <summary>The correlation id whose recovery callback could not be invoked.</summary>
     public string CorrelationId { get; }
 
-    /// <summary>How many in-process invocations were attempted before handing the delivery back to the transport (1 for a partially failed fan-out).</summary>
+    /// <summary>How many in-process invocations were attempted before handing the delivery back to the transport (1 when transport redelivery owns the retry).</summary>
     public int Attempts { get; }
 }

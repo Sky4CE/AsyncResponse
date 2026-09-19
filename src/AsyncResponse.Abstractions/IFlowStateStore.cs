@@ -7,6 +7,15 @@ namespace AsyncResponse;
 /// </summary>
 public interface IFlowStateStore
 {
+    /// <summary>
+    /// Checks deterministic creation constraints, including the serialized state-size budget,
+    /// without writing state or contacting external infrastructure. The starter calls this before
+    /// publishing its start job. Implementations must still validate actual writes; this is not a
+    /// reservation. The default is a no-op for compatibility with application-owned stores.
+    /// </summary>
+    /// <exception cref="FlowStateTooLargeException">The initial state exceeds the store's budget.</exception>
+    void ValidateCreate(string flowId, FlowState state, TimeSpan ttl) { }
+
     /// <summary>Atomically creates a new flow ledger; returns false when the id already exists.</summary>
     Task<bool> TryCreateAsync(
         string flowId,

@@ -43,6 +43,21 @@ public sealed class LedgerBudgetTests
     }
 
     [Fact]
+    public async Task DefaultBudget_StopsAt256StepsBeforeTheNextSideEffect()
+    {
+        var calls = new Calls();
+        await using var harness = await FlowTestHarness.StartAsync(options =>
+        {
+            options.ConfigureServices = services => services.AddSingleton(calls);
+            options.ConfigureAsyncResponse = builder => builder.WithDurableFlow<BudgetFlow, int>();
+        });
+        var run = await harness.StartFlowAsync<BudgetFlow, int>(257);
+        Assert.Equal(FlowRunStatus.Failed, await run.WaitForFinishedAsync());
+        Assert.Equal(256, calls.Count);
+        Assert.Equal(256, (await run.GetStateAsync())!.Steps!.Count);
+    }
+
+    [Fact]
     public async Task ExplicitOptOutAllowsLargerHistories()
     {
         await using var harness = await FlowTestHarness.StartAsync(options =>

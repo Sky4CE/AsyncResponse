@@ -186,6 +186,14 @@ public sealed class MongoDbFlowStateStore : IFlowStateStore, IDisposable
         return DurableFlowStoreShared.ReadState(flowId, document.StateJson, revision);
     }
 
+    /// <inheritdoc />
+    public void ValidateCreate(string flowId, FlowState state, TimeSpan ttl)
+    {
+        DurableFlowStoreShared.ValidateCreate(flowId, state, ttl);
+        if (_options.MaxStateBytes is not null)
+            _ = DurableFlowStoreShared.SerializeBounded(flowId, state, _options.MaxStateBytes, "MongoDB");
+    }
+
     public async Task<bool> TryCreateAsync(string flowId, FlowState state, TimeSpan ttl, CancellationToken cancellationToken = default)
     {
         DurableFlowStoreShared.ValidateCreate(flowId, state, ttl);

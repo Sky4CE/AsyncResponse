@@ -23,12 +23,13 @@ mode can be added later behind the same options if demand appears):
 - A single dispatch loop sweeps the message table for the subscribed correlation ids every
   `ActivePollInterval` (default 250 ms) **while any waiter is subscribed**, and backs off to
   `IdlePollInterval` (default 2 s) while the channel is idle. Cross-process deliveries therefore
-  land within one active poll interval; an idle app costs one cheap query every idle interval.
+  normally land on the next active poll; backlog, backpressure, and late-commit reconciliation
+  can add intervals. An idle app avoids full retained-history reads on every tick.
 - A new waiter re-arms the tight interval immediately and triggers a targeted scan of its own
   correlation id, so a response stored before the waiter subscribed is picked up at once.
-- The sweep advances a stable `created_at, id` keyset cursor until every retained row for that
-  correlation id is considered. `PendingMessageBatchSize` controls page shape; it no longer limits
-  one sweep to the oldest batch, so sustained progress cannot starve a later terminal response.
+- The sweep keeps a stable `created_at, id` cursor across passes. Each correlation yields after
+  16 pages and continues on a later pass; periodic history reconciliation catches late commits
+  behind the cursor, including responses already acknowledged by another process.
 - Delivery is serialized per correlation id on a bounded (1024-item) executor, and the sweep
   admits work to it **without waiting**: a correlation id whose executor is full (a waiter wedged
   in a slow `Until` predicate under a progress flood) has the rest of its rows left unclaimed, in
@@ -249,16 +250,21 @@ Connection-string notes:
   updates the process's current active-registration snapshot in bounded batches. Rows no longer in
   that snapshot are allowed to expire even if cleanup deletion failed. A failed batch is logged and
   the next interval retries, so leave enough timeout headroom for multiple attempts.
-- The sweep re-reads a subscribed correlation id's retained rows on every tick (and on every
-  targeted signal): acknowledged rows stay in the result so a fan-out waiter in another process
-  still receives a response this one already consumed. Their **bodies** do not travel: the page
-  query ships `envelope_json` only for rows nobody has acknowledged, an acknowledged row comes back
-  header-only (id, timestamps, `acked_seq`), and the sweep fetches the envelope by id only for the
-  rare acknowledged row a live subscription has not seen. A long-lived progress subscription's
-  sweep cost therefore no longer grows with its whole retained history. (Until round 39 every
-  sweep re-transferred and re-materialized every retained body just to drop it in the pre-filter.)
-- `PendingMessageBatchSize` is a page-size tuning knob, not a cap per sweep. Smaller pages lower
-  peak materialization; larger pages reduce round trips under progress-heavy correlations.
+- Normal scans retain a forward `created_at, id` cursor per local subscription group. Caught-up
+  polls revisit only the last database-clock tick, so a new message with the same timestamp and
+  a lower random id is picked up promptly. Older consumed headers are not read on every poll. New
+  subscriptions reset the cursor to apply each waiter's own watermark; acknowledged messages
+  remain eligible for legitimate cross-process fan-out.
+- A late transaction can commit behind a creation-time cursor. `HistoryReconciliationInterval`
+  (default 5 seconds after the last completed reconciliation) starts a retained-history pass;
+  one page is reconciled per dispatch pass, with continuation after a poll interval. Large
+  histories therefore add polling intervals to discovery of late commits. Size waiter timeouts
+  and message retention accordingly. History reconciliation is still linear in retained rows;
+  it is separate from normal forward delivery, not a claim that all history I/O disappears.
+- `PendingMessageBatchSize` controls page size. A correlation receives at most 16 forward pages
+  plus one reconciliation page per pass before yielding to other correlations. Full executor
+  queues leave the refused page's cursor unchanged for retry. Failed delivery claims request
+  an immediate rewind. Acknowledged payload bodies are hydrated only when a waiter needs them.
 - Keep `DeliveryConfirmationTimeout` long enough for the slowest expected live delivery (including
   one cross-process `ActivePollInterval`), but short enough that a truly lost subscriber routes to
   recovery promptly.

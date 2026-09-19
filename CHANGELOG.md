@@ -13,6 +13,18 @@ work that has landed on `main` but not yet shipped. Security reporters credited 
 
 ### Changed
 
+- Recovery preserves broker redelivery for transient callback failures even when no callback
+  succeeded. A checkpointed response whose resume publish fails keeps its recovery registration.
+- All durable stores preflight initial state before start publication. The shared public
+  `FlowStateTooLargeException` reports deterministic rejection to the caller; transient store
+  outages retain publish-first recovery semantics.
+- Awaited-step completion observers run outside response-settlement catches. Crash-after-step
+  and cancellation failures end the attempt without duplicate completion events or downstream work.
+- Database response channels retain forward scan cursors and reconcile late commits in bounded
+  historical pages (`HistoryReconciliationInterval`, default 5 seconds), preserving fan-out while
+  avoiding a complete history read on each normal poll. Regression coverage includes cursor
+  reset, claim failure, late acknowledged commits, and the existing default ledger-step budget.
+
 - Redis worker publication records deduplication only after a successful append; a lost error
   reply cannot acknowledge missing work. The Redis Streams transport now requires Lua execution
   (`EVAL`/`EVALSHA`) in broker ACLs. Successful retries still append only once.
