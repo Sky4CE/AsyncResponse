@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1790028459084,
+  "lastUpdate": 1790028489254,
   "repoUrl": "https://github.com/Sky4CE/AsyncResponse",
   "entries": {
     "AsyncResponse Microbenchmarks": [
@@ -112638,6 +112638,140 @@ window.BENCHMARK_DATA = {
           {
             "name": "durable-flow-storm throughput",
             "value": 3123.2697085814457,
+            "unit": "flows/s"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "tyunisov@gmail.com",
+            "name": "Sky4CE",
+            "username": "Sky4CE"
+          },
+          "committer": {
+            "email": "tyunisov@gmail.com",
+            "name": "Sky4CE",
+            "username": "Sky4CE"
+          },
+          "distinct": true,
+          "id": "5d8f6350738fcf789f70424c1da4c7c951d72942",
+          "message": "fix: apply round-42 review — a live holder is no longer proof that a second delivery is redundant\n\nDurable flows: round 40 acknowledged a contended wake-up once the store showed the lease\nrenewed or taken over, on the premise that the holder's own job stays unacknowledged at the\nbroker and comes back if the holder dies. That premise fails when the contending delivery IS\nthe holder's own job, redelivered because a broker in-flight ceiling lapsed under a handler\nthat is still running (Pub/Sub MaxTotalAckExtension, RabbitMQ consumer_timeout, the SQS\n12-hour visibility cap, a Kafka rebalance): acknowledging it left nothing to redeliver and the\nrun stayed Running with no queued job and no dead letter — the stranding round 40 set out to\nfix, reached by a different road. Jobs now carry an identity (WorkerJobEnvelope.JobId,\nadditive, minted once and preserved by every redelivery and re-publish hop), the execution\nlease records it inside the lease id (55 chars, fits every 64-wide column — no store or schema\nchange), and a delivery carrying the holder's own id is never acknowledged: re-published as\nthe same job past the lease where the transport can delay, otherwise handed back with\nDurableFlowLeaseContendedException. A transport can advertise its ceiling\n(IWorkerTransportInFlightLimit; Pub/Sub, RabbitMQ and SQS do) and in-process timer waits park\nin hops inside it (DurableFlowOptions.MaxInProcessParkDuration); in-process waits also observe\nhost shutdown instead of being killed mid-wait.\n\nSecurity: persisted type names are bounded in shape — length, generic nesting, bracket count,\nno by-ref or pointer decorations — before any resolver or the caches in front of them. The\nruntime's type-name parser recurses per generic argument, so a few hundred kilobytes of\nA`1[[A`1[[… overflowed the parsing thread's stack, and StackOverflowException cannot be\ncaught: the process exited with the message still unacknowledged and every worker it reached\ndied the same way. The recovery path resolves the payload type name before any callback is\nchosen, so no authorizer stood in front of it.\n\nRedis channel: PUBSUB NUMSUB is node-local and the response channels are key-routed, so a\nprobe that skipped an unreachable node and collected its siblings' zeros returned a definitive\n\"no live waiter\" — consuming a live waiter's recovery registration or dropping its response.\nZero is now conclusive only when every node that could hold the subscription answered.\n\nTransports: the early-ACK background queue belongs to the hosted service instead of one\nsupervised attempt, so a routine receive-loop fault on a healthy host no longer runs the\nstop-time drain and dead-letters already-acknowledged work. A stopping host stops starting new\nhandlers, and the visibility/lock/AckWait heartbeat ends with the batch rather than with the\nstop, so handlers no longer outlive their own invisibility on every rolling deploy. Database\nlease renewal beats at a third of the lock timeout and retries a failed beat on a short\nbackoff. Ack-after-handler modes read one message at a time (Redis, NATS) so a poison message\ncannot bury its prefetched batch-mates unexecuted. NATS streams are created, never overwritten\n(new StreamReplicas). RabbitMQ releases the prefetch credit of a failed park (new ParkQueue,\nBrokerConsumerTimeout). SQS hashes non-conforming correlation ids into a valid FIFO\nMessageGroupId. Pub/Sub exposes ClientCount, MaxOutstandingMessages, MaxOutstandingBytes and\nMaxTotalAckExtension. Mongo flow state writes with majority concern; Cosmos no longer treats a\nsession-consistent read as proof a ledger is absent.\n\nFlows: a completed child step answers from its memo — input equality is compared by value, and\na mismatch on an already-completed child is a warning rather than a terminal failure of the\nparent (a running child still fails fast). Reusing a step name in one execution is rejected\ninstead of silently returning the first step's result. DurableFlowInterruptedException\nseparates \"this attempt was interrupted\" from \"the step failed\", so a catch-all no longer runs\ncompensation because of a deploy. In-memory follow-up work runs before new external work, so\nchild starts and parent wake-ups no longer starve behind a bounded channel's parked producers.\n\nPackaging and CI: sibling AsyncResponse.* dependencies are packed as exact versions — the\npackages share internals, so an open range let a restore pair mismatched versions that fail\nwith MissingMethodException at the first call across the seam — verified from outside by\nscripts/verify-package-dependencies.sh, and pushed in dependency order. The retry classifier\nnow strips the timestamp prefix the jobs/logs API returns, so its per-test-block logic engages\ninstead of silently degrading to a whole-log scan that retried real failures toward green.\n\nNot included: Kafka's partition-scoped burial stall, the Redis Streams work-queue semantics,\nthe database-channel late-commit timing interlock, and the NATS NoReply mapping — reported,\nnot half-fixed.\n\nTests: 3279 unit tests green on net10.0 and net8.0 (204 new cases); R1, the Redis probe, the\ntype-name bounds, the harness stop and the package pinning proven red against 718dffdc;\nRelease build 0 warnings with --no-incremental; integration suite compiles and discovers; 29\nclassifier self-tests pass. Docs and CHANGELOG synced.",
+          "timestamp": "2026-09-21T23:47:28+02:00",
+          "tree_id": "d3b309c5ffbd9f92617eb6bb94666baf4bc8b7ca",
+          "url": "https://github.com/Sky4CE/AsyncResponse/commit/5d8f6350738fcf789f70424c1da4c7c951d72942"
+        },
+        "date": 1790028488585,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "waiter-storm throughput",
+            "value": 63464.40509989805,
+            "unit": "ops/s"
+          },
+          {
+            "name": "progress-storm throughput",
+            "value": 35217.51747493217,
+            "unit": "ops/s"
+          },
+          {
+            "name": "worker-storm throughput",
+            "value": 29274.25834837445,
+            "unit": "jobs/s"
+          },
+          {
+            "name": "google-pubsub-ack-after-enqueue-dispatch-storm throughput",
+            "value": 179751.3679079098,
+            "unit": "ops/s"
+          },
+          {
+            "name": "rabbitmq-ack-after-enqueue-dispatch-storm throughput",
+            "value": 285779.60676726105,
+            "unit": "ops/s"
+          },
+          {
+            "name": "redis-ack-after-enqueue-dispatch-storm throughput",
+            "value": 214736.04645170158,
+            "unit": "ops/s"
+          },
+          {
+            "name": "nats-ack-after-receive-dispatch-storm throughput",
+            "value": 227396.76187011096,
+            "unit": "ops/s"
+          },
+          {
+            "name": "postgresql-ack-after-receive-dispatch-storm throughput",
+            "value": 193323.38362318953,
+            "unit": "ops/s"
+          },
+          {
+            "name": "sqlserver-ack-after-enqueue-dispatch-storm throughput",
+            "value": 188831.73581684832,
+            "unit": "ops/s"
+          },
+          {
+            "name": "mongodb-ack-after-enqueue-dispatch-storm throughput",
+            "value": 198035.48795944234,
+            "unit": "ops/s"
+          },
+          {
+            "name": "azure-servicebus-ack-after-receive-dispatch-storm throughput",
+            "value": 219454.17357947314,
+            "unit": "ops/s"
+          },
+          {
+            "name": "sqs-ack-after-enqueue-dispatch-storm throughput",
+            "value": 258785.7771336887,
+            "unit": "ops/s"
+          },
+          {
+            "name": "kafka-ack-after-enqueue-dispatch-storm throughput",
+            "value": 306846.3558926774,
+            "unit": "ops/s"
+          },
+          {
+            "name": "race-burst throughput",
+            "value": 102729.35458433855,
+            "unit": "ops/s"
+          },
+          {
+            "name": "raw-ingress-storm throughput",
+            "value": 80841.21427384218,
+            "unit": "ops/s"
+          },
+          {
+            "name": "shared-response-fanout throughput",
+            "value": 29904.42068677775,
+            "unit": "ops/s"
+          },
+          {
+            "name": "exception-fanout throughput",
+            "value": 29087.869567200425,
+            "unit": "ops/s"
+          },
+          {
+            "name": "timeout-storm throughput",
+            "value": 4788.174740606619,
+            "unit": "ops/s"
+          },
+          {
+            "name": "dispose-cleanup-storm throughput",
+            "value": 237561.29081302977,
+            "unit": "ops/s"
+          },
+          {
+            "name": "context-isolation-storm throughput",
+            "value": 68590.30462326089,
+            "unit": "ops/s"
+          },
+          {
+            "name": "watchdog-scan-storm throughput",
+            "value": 1669672.076404194,
+            "unit": "entries/s"
+          },
+          {
+            "name": "durable-flow-storm throughput",
+            "value": 1407.5758660870606,
             "unit": "flows/s"
           }
         ]
