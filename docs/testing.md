@@ -227,13 +227,20 @@ persisted checkpoint never re-runs; a publish that died before its checkpoint ru
 dotnet run --project tests/AsyncResponse.IntegrationTests -f net10.0 -- --filter-class "*DurableFlowAbruptCrashRecoveryTests"
 ```
 
-About 100 seconds plus the data fleet's boot. Every worker's stdout and stderr is attached to the
+About two minutes plus the data fleet's boot (each scenario waits out a 20-second owner lease). Every worker's stdout and stderr is attached to the
 test output, and crash points, environment variables, and table names live in
 `CrashWorkerContract`. To model your own crash points against your own broker and store, copy the
 shape: a store wrapped in a `DispatchProxy` (a hand-written decorator silently drops
 default-interface members such as `ObserveLeaseAsync`), `IDurableFlowExecutionObserver` for step
 boundaries, `Process.GetCurrentProcess().Kill()` rather than `Environment.Exit`, and a transport
 claim timeout shorter than the execution lease so the redelivery arrives while the lease is held.
+Launch the worker from **its own** build output, not from the copy a `ProjectReference` drops next
+to the test assembly: a test project that references ASP.NET Core has the package assemblies the
+shared framework also ships (`Microsoft.Extensions.Hosting.Abstractions`, …) removed from its
+output whenever the SDK's framework is at least as new as the package, while the worker's
+`runtimeconfig.json` lists `Microsoft.NETCore.App` only — so the copy runs on one SDK and dies at
+startup with `FileNotFoundException` on the next. The integration test project stamps the worker's
+exact `TargetPath` into its assembly metadata (`EmbedCrashWorkerPath` in its csproj) for this.
 
 This is the recovery tri-state (`Resume` / `Fail` / `KeepWaiting`) — the part of the API teams
 most need to test and previously could not without a broker. Waiter tasks obtained before the

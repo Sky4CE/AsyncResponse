@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Globalization;
+using System.Reflection;
 using System.Text;
 using System.Text.Json;
 using AsyncResponse.IntegrationTests.CrashWorker;
@@ -37,7 +38,11 @@ public sealed class DurableFlowAbruptCrashRecoveryTests(DataBatchFixture fixture
     // asserts from the lease journal that the collision really happened.
     private static readonly TimeSpan LockTimeout = TimeSpan.FromSeconds(2);
 
-    private static readonly LeaseSettings DefaultLease = new(TimeSpan.FromSeconds(10), TimeSpan.FromSeconds(2));
+    // 20 s, not the 10 s this started with: the scenario's premise is that the redelivery reaches
+    // the successor BEFORE this lease expires, and on a CI runner sharing four cores with the data
+    // fleet a cold `dotnet` start plus the 2 s claim lapse can eat most of ten seconds. Each
+    // scenario waits the lease out, so this is also most of the suite's running time.
+    private static readonly LeaseSettings DefaultLease = new(TimeSpan.FromSeconds(20), TimeSpan.FromSeconds(5));
 
     // The configuration-change pair: the owner's deployment issued a 20 s lease; the successor's
     // deployment is configured with 1 s / 300 ms. A successor that judges a held lease by its OWN
@@ -258,12 +263,11 @@ public sealed class DurableFlowAbruptCrashRecoveryTests(DataBatchFixture fixture
             var scenario = new CrashScenario(fixture.PostgreSqlConnectionString, output, name);
 
             // Fail here, by name, rather than as an opaque "process exited with 150".
-            var assembly = typeof(CrashWorkerContract).Assembly.Location;
-            var runtimeConfig = Path.ChangeExtension(assembly, ".runtimeconfig.json");
+            var assembly = CrashWorkerProcess.WorkerAssemblyPath;
             Assert.True(
-                File.Exists(runtimeConfig),
-                $"The crash worker is not runnable from '{Path.GetDirectoryName(assembly)}': '{Path.GetFileName(runtimeConfig)}' is missing. " +
-                "It is copied there by the ProjectReference to tests/AsyncResponse.IntegrationTests.CrashWorker; rebuild the integration tests.");
+                File.Exists(assembly) && File.Exists(Path.ChangeExtension(assembly, ".runtimeconfig.json")),
+                $"The crash worker is not runnable: '{assembly}' or its runtimeconfig.json is missing. " +
+                "That path is the worker project's own build output, stamped into this assembly at build time; rebuild the integration tests.");
 
             return scenario;
         }
@@ -543,9 +547,24 @@ public sealed class DurableFlowAbruptCrashRecoveryTests(DataBatchFixture fixture
         public bool HasExited => _process.HasExited;
         public int? ExitCodeOrNull => _process.HasExited ? _process.ExitCode : null;
 
+        /// <summary>
+        /// The worker in ITS OWN build output, stamped into this assembly by the EmbedCrashWorkerPath
+        /// target — never <c>typeof(CrashWorkerContract).Assembly.Location</c>. The copy next to this
+        /// test assembly shares a directory whose contents were decided by THIS project's conflict
+        /// resolution against the ASP.NET Core shared framework, which the worker does not run on:
+        /// on an SDK whose framework is as new as the Microsoft.Extensions packages, that directory
+        /// lacks assemblies the worker needs, and every scenario died at startup on CI only.
+        /// </summary>
+        public static string WorkerAssemblyPath { get; } =
+            typeof(DurableFlowAbruptCrashRecoveryTests).Assembly
+                .GetCustomAttributes<AssemblyMetadataAttribute>()
+                .FirstOrDefault(attribute => attribute.Key == "AsyncResponse.CrashWorkerPath")?.Value
+            ?? throw new InvalidOperationException(
+                "The integration test assembly carries no AsyncResponse.CrashWorkerPath metadata; the EmbedCrashWorkerPath target in its csproj did not run.");
+
         public static CrashWorkerProcess Start(string label, IReadOnlyDictionary<string, string> environment)
         {
-            var assembly = typeof(CrashWorkerContract).Assembly.Location;
+            var assembly = WorkerAssemblyPath;
             var startInfo = new ProcessStartInfo
             {
                 // The muxer that launched this test run when it says so, PATH otherwise.

@@ -96,7 +96,10 @@ work that has landed on `main` but not yet shipped. Security reporters credited 
     clock — that the successor was refused before the owner's expiry, took over only after it, and
     never handed the wake-up back to the queue. No lease deletion, no `ResumeAsync`, no extra
     wake-up. Against `ca58de0` the shorter-lease scenario fails in five seconds with the run
-    stranded.
+    stranded. The worker is launched from its own build output (its path is stamped into the test
+    assembly at build time): the copy next to the test assembly lost
+    `Microsoft.Extensions.Hosting.Abstractions` to framework conflict resolution on CI's newer SDK
+    and died at startup there, and only there.
   - *Redis scan cost is measured.* New `RedisRecoveryScanBenchmarks` injects a round-trip latency
     into fake `IServer`/`IDatabase` commands (the existing recovery benchmark measures the
     in-memory store): at 1 ms per round trip, 8,192 registrations scan in ≈0.2 s against ≈10.4 s

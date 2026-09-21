@@ -54,10 +54,10 @@
          point for the in-process WebApplicationFactory tests. -->
     <ProjectReference Include="..\AsyncResponse.IntegrationTests.AppHost\AsyncResponse.IntegrationTests.AppHost.csproj" />
     <ProjectReference Include="..\..\samples\AsyncResponse.Sample\AsyncResponse.Sample.csproj" />
-    <!-- The abrupt-crash suite's subprocess (DurableFlowAbruptCrashRecoveryTests). A plain reference on
-         purpose: referencing an Exe copies its dll, runtimeconfig.json and deps.json next to this
-         assembly, which is where the suite launches it from — no bin/<Configuration>/<TFM> path to
-         guess — and it shares CrashWorkerContract (env vars, crash points, table names) with the tests. -->
+    <!-- The abrupt-crash suite's subprocess (DurableFlowAbruptCrashRecoveryTests). Referenced for the
+         build order and for CrashWorkerContract (env vars, crash points, table names), which the tests
+         share with it. The suite does NOT launch the copy this reference drops next to the test
+         assembly — see EmbedCrashWorkerPath below. -->
     <ProjectReference Include="..\AsyncResponse.IntegrationTests.CrashWorker\AsyncResponse.IntegrationTests.CrashWorker.csproj" />
     <ProjectReference Include="..\..\src\Channels\AsyncResponse.Channels.MongoDB\AsyncResponse.Channels.MongoDB.csproj" />
     <ProjectReference Include="..\..\src\Channels\AsyncResponse.Channels.NATS\AsyncResponse.Channels.NATS.csproj" />
@@ -84,5 +84,25 @@
     <ProjectReference Include="..\..\src\Transports\AsyncResponse.Transports.SQS\AsyncResponse.Transports.SQS.csproj" />
     <ProjectReference Include="..\..\src\Transports\AsyncResponse.Transports.SqlServer\AsyncResponse.Transports.SqlServer.csproj" />
   </ItemGroup>
+
+  <!-- The crash worker is launched from ITS OWN output directory, whose path is stamped into this
+       assembly here. The copy the ProjectReference places next to the test assembly is not
+       runnable in general: this project references ASP.NET Core, so MSBuild's conflict resolution
+       drops any package assembly the shared framework also ships at an equal or higher version
+       (Microsoft.Extensions.Hosting.Abstractions, ...) from THIS output — while the worker's
+       runtimeconfig.json lists Microsoft.NETCore.App only. Whether the file survives depends on
+       the SDK: with SDK 10.0.101 (framework 10.0.1 < package 10.0.12) the package wins and the copy
+       runs; with SDK 10.0.401 (framework 10.0.12) the framework wins and the subprocess dies at
+       startup with FileNotFoundException, which is how round 40's suite failed on CI only. The
+       worker's own output has no such conflict and is self-consistent on every SDK. GetTargetPath
+       returns the exact path for the current Configuration/layout, so nothing is guessed. -->
+  <Target Name="EmbedCrashWorkerPath" BeforeTargets="GetAssemblyAttributes">
+    <MSBuild Projects="..\AsyncResponse.IntegrationTests.CrashWorker\AsyncResponse.IntegrationTests.CrashWorker.csproj" Targets="GetTargetPath">
+      <Output TaskParameter="TargetOutputs" PropertyName="CrashWorkerTargetPath" />
+    </MSBuild>
+    <ItemGroup>
+      <AssemblyMetadata Include="AsyncResponse.CrashWorkerPath" Value="$(CrashWorkerTargetPath)" />
+    </ItemGroup>
+  </Target>
 
 </Project>
