@@ -41,7 +41,7 @@
 <table>
 <tr>
 <th>Covered lines:</th>
-<td class="limit-width right" title="1">1</td>
+<td class="limit-width right" title="2">2</td>
 </tr>
 <tr>
 <th>Uncovered lines:</th>
@@ -49,15 +49,15 @@
 </tr>
 <tr>
 <th>Coverable lines:</th>
-<td class="limit-width right" title="1">1</td>
+<td class="limit-width right" title="2">2</td>
 </tr>
 <tr>
 <th>Total lines:</th>
-<td class="limit-width right" title="72">72</td>
+<td class="limit-width right" title="91">91</td>
 </tr>
 <tr>
 <th>Line coverage:</th>
-<td class="limit-width right" title="1 of 1">100%</td>
+<td class="limit-width right" title="2 of 2">100%</td>
 </tr>
 </table>
 </div>
@@ -108,6 +108,7 @@
 <thead><tr><th>Method</th><th>Branch coverage <a href="https://en.wikipedia.org/wiki/Code_coverage" target="_blank"><i class="icon-info-circled"></i></a></th><th>Crap Score <a href="https://googletesting.blogspot.de/2011/02/this-code-is-crap.html" target="_blank"><i class="icon-info-circled"></i></a></th><th>Cyclomatic complexity <a href="https://en.wikipedia.org/wiki/Cyclomatic_complexity" target="_blank"><i class="icon-info-circled"></i></a></th><th>Line coverage <a href="https://en.wikipedia.org/wiki/Code_coverage" target="_blank"><i class="icon-info-circled"></i></a></th></tr></thead>
 <tbody>
 <tr><td title="ValidateCreate(System.String,AsyncResponse.FlowState,System.TimeSpan)"><a href="#file0_line17" class="navigatetohash">ValidateCreate(...)</a></td><td>100%</td><td>1</td><td>1</td><td>100%</td></tr>
+<tr><td title="ObserveLeaseAsync(System.String,System.Threading.CancellationToken)"><a href="#file0_line87" class="navigatetohash">ObserveLeaseAsync(...)</a></td><td>100%</td><td>1</td><td>1</td><td>100%</td></tr>
 </tbody>
 </table>
 </div>
@@ -186,17 +187,37 @@
 <tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line67"></a><code>67</code></td><td></td><td class="lightgray"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;string&nbsp;leaseId,</code></td></tr>
 <tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line68"></a><code>68</code></td><td></td><td class="lightgray"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;CancellationToken&nbsp;cancellationToken&nbsp;=&nbsp;default);</code></td></tr>
 <tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line69"></a><code>69</code></td><td></td><td class="lightgray"><code></code></td></tr>
-<tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line70"></a><code>70</code></td><td></td><td class="lightgray"><code>&nbsp;&nbsp;&nbsp;&nbsp;///&nbsp;&lt;summary&gt;Deletes&nbsp;the&nbsp;state&nbsp;of&nbsp;one&nbsp;flow&nbsp;run;&nbsp;&lt;c&gt;true&lt;/c&gt;&nbsp;when&nbsp;an&nbsp;entry&nbsp;was&nbsp;removed.&lt;/summary&gt;</code></td></tr>
-<tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line71"></a><code>71</code></td><td></td><td class="lightgray"><code>&nbsp;&nbsp;&nbsp;&nbsp;Task&lt;bool&gt;&nbsp;TryDeleteAsync(string&nbsp;flowId,&nbsp;CancellationToken&nbsp;cancellationToken&nbsp;=&nbsp;default);</code></td></tr>
-<tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line72"></a><code>72</code></td><td></td><td class="lightgray"><code>}</code></td></tr>
+<tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line70"></a><code>70</code></td><td></td><td class="lightgray"><code>&nbsp;&nbsp;&nbsp;&nbsp;///&nbsp;&lt;summary&gt;</code></td></tr>
+<tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line71"></a><code>71</code></td><td></td><td class="lightgray"><code>&nbsp;&nbsp;&nbsp;&nbsp;///&nbsp;Reports&nbsp;the&nbsp;execution&nbsp;lease&nbsp;currently&nbsp;persisted&nbsp;for&nbsp;&lt;paramref&nbsp;name=&quot;flowId&quot;/&gt;&nbsp;—&nbsp;the&nbsp;raw</code></td></tr>
+<tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line72"></a><code>72</code></td><td></td><td class="lightgray"><code>&nbsp;&nbsp;&nbsp;&nbsp;///&nbsp;owner&nbsp;and&nbsp;expiry,&nbsp;without&nbsp;judging&nbsp;whether&nbsp;it&nbsp;has&nbsp;lapsed.&nbsp;Returns</code></td></tr>
+<tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line73"></a><code>73</code></td><td></td><td class="lightgray"><code>&nbsp;&nbsp;&nbsp;&nbsp;///&nbsp;&lt;see&nbsp;cref=&quot;FlowLeaseObservation.Unheld&quot;/&gt;&nbsp;when&nbsp;no&nbsp;lease&nbsp;is&nbsp;held&nbsp;(or&nbsp;the&nbsp;ledger&nbsp;is&nbsp;absent),</code></td></tr>
+<tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line74"></a><code>74</code></td><td></td><td class="lightgray"><code>&nbsp;&nbsp;&nbsp;&nbsp;///&nbsp;and&nbsp;&lt;c&gt;null&lt;/c&gt;&nbsp;when&nbsp;this&nbsp;store&nbsp;cannot&nbsp;report&nbsp;leases&nbsp;at&nbsp;all,&nbsp;which&nbsp;is&nbsp;the&nbsp;default&nbsp;for</code></td></tr>
+<tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line75"></a><code>75</code></td><td></td><td class="lightgray"><code>&nbsp;&nbsp;&nbsp;&nbsp;///&nbsp;compatibility&nbsp;with&nbsp;application-owned&nbsp;stores.</code></td></tr>
+<tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line76"></a><code>76</code></td><td></td><td class="lightgray"><code>&nbsp;&nbsp;&nbsp;&nbsp;///&nbsp;&lt;para&gt;</code></td></tr>
+<tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line77"></a><code>77</code></td><td></td><td class="lightgray"><code>&nbsp;&nbsp;&nbsp;&nbsp;///&nbsp;A&nbsp;wake-up&nbsp;that&nbsp;finds&nbsp;the&nbsp;lease&nbsp;held&nbsp;uses&nbsp;this&nbsp;to&nbsp;tell&nbsp;a&nbsp;live&nbsp;holder&nbsp;from&nbsp;a&nbsp;dead&nbsp;one:&nbsp;a</code></td></tr>
+<tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line78"></a><code>78</code></td><td></td><td class="lightgray"><code>&nbsp;&nbsp;&nbsp;&nbsp;///&nbsp;lease&nbsp;whose&nbsp;owner&nbsp;or&nbsp;expiry&nbsp;changes&nbsp;while&nbsp;the&nbsp;wake-up&nbsp;waits&nbsp;was&nbsp;acquired&nbsp;or&nbsp;renewed&nbsp;by&nbsp;a</code></td></tr>
+<tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line79"></a><code>79</code></td><td></td><td class="lightgray"><code>&nbsp;&nbsp;&nbsp;&nbsp;///&nbsp;live&nbsp;worker,&nbsp;so&nbsp;the&nbsp;wake-up&nbsp;is&nbsp;a&nbsp;duplicate;&nbsp;a&nbsp;lease&nbsp;that&nbsp;never&nbsp;changes&nbsp;belongs&nbsp;to&nbsp;a&nbsp;dead</code></td></tr>
+<tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line80"></a><code>80</code></td><td></td><td class="lightgray"><code>&nbsp;&nbsp;&nbsp;&nbsp;///&nbsp;holder&nbsp;and&nbsp;is&nbsp;waited&nbsp;out&nbsp;to&nbsp;its&nbsp;&lt;em&gt;persisted&lt;/em&gt;&nbsp;expiry,&nbsp;whatever&nbsp;lease&nbsp;duration&nbsp;issued</code></td></tr>
+<tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line81"></a><code>81</code></td><td></td><td class="lightgray"><code>&nbsp;&nbsp;&nbsp;&nbsp;///&nbsp;it.&nbsp;A&nbsp;store&nbsp;that&nbsp;returns&nbsp;&lt;c&gt;null&lt;/c&gt;&nbsp;gives&nbsp;the&nbsp;engine&nbsp;no&nbsp;such&nbsp;evidence,&nbsp;so&nbsp;a&nbsp;wake-up&nbsp;that</code></td></tr>
+<tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line82"></a><code>82</code></td><td></td><td class="lightgray"><code>&nbsp;&nbsp;&nbsp;&nbsp;///&nbsp;cannot&nbsp;acquire&nbsp;the&nbsp;lease&nbsp;within&nbsp;its&nbsp;own&nbsp;lease&nbsp;window&nbsp;is&nbsp;never&nbsp;acknowledged:&nbsp;it&nbsp;fails&nbsp;with</code></td></tr>
+<tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line83"></a><code>83</code></td><td></td><td class="lightgray"><code>&nbsp;&nbsp;&nbsp;&nbsp;///&nbsp;&lt;see&nbsp;cref=&quot;DurableFlowLeaseContendedException&quot;/&gt;&nbsp;and&nbsp;the&nbsp;worker&nbsp;transport&nbsp;redelivers&nbsp;it.</code></td></tr>
+<tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line84"></a><code>84</code></td><td></td><td class="lightgray"><code>&nbsp;&nbsp;&nbsp;&nbsp;///&nbsp;&lt;/para&gt;</code></td></tr>
+<tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line85"></a><code>85</code></td><td></td><td class="lightgray"><code>&nbsp;&nbsp;&nbsp;&nbsp;///&nbsp;&lt;/summary&gt;</code></td></tr>
+<tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line86"></a><code>86</code></td><td></td><td class="lightgray"><code>&nbsp;&nbsp;&nbsp;&nbsp;Task&lt;FlowLeaseObservation?&gt;&nbsp;ObserveLeaseAsync(string&nbsp;flowId,&nbsp;CancellationToken&nbsp;cancellationToken&nbsp;=&nbsp;default)</code></td></tr>
+<tr class="coverableline" title="Covered (6 visits)" data-coverage="{'AllTestMethods': {'VC': '6', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">6</td><td class="rightmargin right"><a id="file0_line87"></a><code>87</code></td><td></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;=&gt;&nbsp;Task.FromResult&lt;FlowLeaseObservation?&gt;(null);</code></td></tr>
+<tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line88"></a><code>88</code></td><td></td><td class="lightgray"><code></code></td></tr>
+<tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line89"></a><code>89</code></td><td></td><td class="lightgray"><code>&nbsp;&nbsp;&nbsp;&nbsp;///&nbsp;&lt;summary&gt;Deletes&nbsp;the&nbsp;state&nbsp;of&nbsp;one&nbsp;flow&nbsp;run;&nbsp;&lt;c&gt;true&lt;/c&gt;&nbsp;when&nbsp;an&nbsp;entry&nbsp;was&nbsp;removed.&lt;/summary&gt;</code></td></tr>
+<tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line90"></a><code>90</code></td><td></td><td class="lightgray"><code>&nbsp;&nbsp;&nbsp;&nbsp;Task&lt;bool&gt;&nbsp;TryDeleteAsync(string&nbsp;flowId,&nbsp;CancellationToken&nbsp;cancellationToken&nbsp;=&nbsp;default);</code></td></tr>
+<tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line91"></a><code>91</code></td><td></td><td class="lightgray"><code>}</code></td></tr>
 </tbody>
 </table>
 </div>
-<div class="footer">Generated by: ReportGenerator 5.5.10.0<br />09/19/2026 - 09:46:11<br /><a href="https://github.com/danielpalme/ReportGenerator">GitHub</a> | <a href="https://reportgenerator.io">reportgenerator.io</a></div></div>
+<div class="footer">Generated by: ReportGenerator 5.5.11.0<br />09/21/2026 - 16:20:22<br /><a href="https://github.com/danielpalme/ReportGenerator">GitHub</a> | <a href="https://reportgenerator.io">reportgenerator.io</a></div></div>
 <div class="containerright">
 <div class="containerrightfixed">
 <h1>Methods/Properties</h1>
 <a href="#file0_line17" class="navigatetohash percentagebar percentagebar100" title="Line coverage: 100% - ValidateCreate(System.String,AsyncResponse.FlowState,System.TimeSpan)"><i class="icon-cube"></i>ValidateCreate(System.String,AsyncResponse.FlowState,System.TimeSpan)</a><br />
+<a href="#file0_line87" class="navigatetohash percentagebar percentagebar100" title="Line coverage: 100% - ObserveLeaseAsync(System.String,System.Threading.CancellationToken)"><i class="icon-cube"></i>ObserveLeaseAsync(System.String,System.Threading.CancellationToken)</a><br />
 <br/></div>
 </div></div>
 <script type="text/javascript" src="class.js"></script>
