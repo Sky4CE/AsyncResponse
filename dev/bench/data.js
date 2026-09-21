@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1790016532069,
+  "lastUpdate": 1790027592458,
   "repoUrl": "https://github.com/Sky4CE/AsyncResponse",
   "entries": {
     "AsyncResponse Microbenchmarks": [
@@ -193172,6 +193172,330 @@ window.BENCHMARK_DATA = {
           "url": "https://github.com/Sky4CE/AsyncResponse/commit/718dffdc7581cfc6d8ef5896111a66c92caa8a20"
         },
         "date": 1790015686188,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "request_response_success_redis throughput",
+            "value": 3,
+            "unit": "req/s"
+          },
+          {
+            "name": "request_response_domain_failure_redis throughput",
+            "value": 3,
+            "unit": "req/s"
+          },
+          {
+            "name": "attach_redis throughput",
+            "value": 3,
+            "unit": "req/s"
+          },
+          {
+            "name": "worker_pubsub_observed throughput",
+            "value": 3,
+            "unit": "req/s"
+          },
+          {
+            "name": "multi_step_success_redis throughput",
+            "value": 3,
+            "unit": "req/s"
+          },
+          {
+            "name": "multi_step_domain_failure_redis throughput",
+            "value": 3,
+            "unit": "req/s"
+          },
+          {
+            "name": "ambient_exception_redis throughput",
+            "value": 3,
+            "unit": "req/s"
+          },
+          {
+            "name": "shared_exception_fanout_redis throughput",
+            "value": 3,
+            "unit": "req/s"
+          },
+          {
+            "name": "reply_target_pubsub throughput",
+            "value": 3,
+            "unit": "req/s"
+          },
+          {
+            "name": "rabbitmq_worker_default_ack_observed throughput",
+            "value": 3,
+            "unit": "req/s"
+          },
+          {
+            "name": "rabbitmq_response_ingress_header throughput",
+            "value": 3,
+            "unit": "req/s"
+          },
+          {
+            "name": "rabbitmq_response_ingress_body throughput",
+            "value": 3,
+            "unit": "req/s"
+          },
+          {
+            "name": "rabbitmq_reply_target throughput",
+            "value": 3,
+            "unit": "req/s"
+          },
+          {
+            "name": "rabbitmq_worker_ack_after_enqueue_observed throughput",
+            "value": 3,
+            "unit": "req/s"
+          },
+          {
+            "name": "azure_servicebus_request_response_success throughput",
+            "value": 3,
+            "unit": "req/s"
+          },
+          {
+            "name": "azure_servicebus_worker_default_ack_observed throughput",
+            "value": 3,
+            "unit": "req/s"
+          },
+          {
+            "name": "azure_servicebus_response_ingress_property throughput",
+            "value": 3,
+            "unit": "req/s"
+          },
+          {
+            "name": "azure_servicebus_response_ingress_body throughput",
+            "value": 3,
+            "unit": "req/s"
+          },
+          {
+            "name": "azure_servicebus_reply_target throughput",
+            "value": 3,
+            "unit": "req/s"
+          },
+          {
+            "name": "azure_servicebus_worker_ack_after_receive_observed throughput",
+            "value": 3,
+            "unit": "req/s"
+          },
+          {
+            "name": "sqs_request_response_success throughput",
+            "value": 3,
+            "unit": "req/s"
+          },
+          {
+            "name": "sqs_worker_default_ack_observed throughput",
+            "value": 3,
+            "unit": "req/s"
+          },
+          {
+            "name": "sqs_response_ingress_attribute throughput",
+            "value": 3,
+            "unit": "req/s"
+          },
+          {
+            "name": "sqs_response_ingress_body throughput",
+            "value": 3,
+            "unit": "req/s"
+          },
+          {
+            "name": "sqs_reply_target throughput",
+            "value": 3,
+            "unit": "req/s"
+          },
+          {
+            "name": "sqs_worker_ack_after_enqueue_observed throughput",
+            "value": 3,
+            "unit": "req/s"
+          },
+          {
+            "name": "redis_worker_default_ack_observed throughput",
+            "value": 3,
+            "unit": "req/s"
+          },
+          {
+            "name": "redis_response_ingress_field throughput",
+            "value": 3,
+            "unit": "req/s"
+          },
+          {
+            "name": "redis_response_ingress_body throughput",
+            "value": 3,
+            "unit": "req/s"
+          },
+          {
+            "name": "redis_reply_target throughput",
+            "value": 3,
+            "unit": "req/s"
+          },
+          {
+            "name": "redis_worker_ack_after_enqueue_observed throughput",
+            "value": 3,
+            "unit": "req/s"
+          },
+          {
+            "name": "nats_request_response_success throughput",
+            "value": 3,
+            "unit": "req/s"
+          },
+          {
+            "name": "nats_worker_default_ack_observed throughput",
+            "value": 3,
+            "unit": "req/s"
+          },
+          {
+            "name": "nats_response_ingress_header throughput",
+            "value": 3,
+            "unit": "req/s"
+          },
+          {
+            "name": "nats_response_ingress_body throughput",
+            "value": 3,
+            "unit": "req/s"
+          },
+          {
+            "name": "nats_reply_target throughput",
+            "value": 3,
+            "unit": "req/s"
+          },
+          {
+            "name": "nats_worker_ack_after_receive_observed throughput",
+            "value": 3,
+            "unit": "req/s"
+          },
+          {
+            "name": "postgresql_request_response_success throughput",
+            "value": 3,
+            "unit": "req/s"
+          },
+          {
+            "name": "postgresql_worker_default_ack_observed throughput",
+            "value": 3,
+            "unit": "req/s"
+          },
+          {
+            "name": "postgresql_response_ingress_header throughput",
+            "value": 3,
+            "unit": "req/s"
+          },
+          {
+            "name": "postgresql_response_ingress_body throughput",
+            "value": 3,
+            "unit": "req/s"
+          },
+          {
+            "name": "postgresql_reply_target throughput",
+            "value": 3,
+            "unit": "req/s"
+          },
+          {
+            "name": "postgresql_worker_ack_after_receive_observed throughput",
+            "value": 3,
+            "unit": "req/s"
+          },
+          {
+            "name": "kafka_worker_default_ack_observed throughput",
+            "value": 3,
+            "unit": "req/s"
+          },
+          {
+            "name": "kafka_response_ingress_header throughput",
+            "value": 3,
+            "unit": "req/s"
+          },
+          {
+            "name": "kafka_response_ingress_body throughput",
+            "value": 3,
+            "unit": "req/s"
+          },
+          {
+            "name": "kafka_reply_target throughput",
+            "value": 3,
+            "unit": "req/s"
+          },
+          {
+            "name": "kafka_worker_ack_after_enqueue_observed throughput",
+            "value": 3,
+            "unit": "req/s"
+          },
+          {
+            "name": "sqlserver_request_response_success throughput",
+            "value": 3,
+            "unit": "req/s"
+          },
+          {
+            "name": "sqlserver_worker_default_ack_observed throughput",
+            "value": 3,
+            "unit": "req/s"
+          },
+          {
+            "name": "sqlserver_response_ingress_header throughput",
+            "value": 3,
+            "unit": "req/s"
+          },
+          {
+            "name": "sqlserver_response_ingress_body throughput",
+            "value": 3,
+            "unit": "req/s"
+          },
+          {
+            "name": "sqlserver_reply_target throughput",
+            "value": 3,
+            "unit": "req/s"
+          },
+          {
+            "name": "sqlserver_worker_ack_after_enqueue_observed throughput",
+            "value": 3,
+            "unit": "req/s"
+          },
+          {
+            "name": "mongodb_request_response_success throughput",
+            "value": 3,
+            "unit": "req/s"
+          },
+          {
+            "name": "mongodb_worker_default_ack_observed throughput",
+            "value": 3,
+            "unit": "req/s"
+          },
+          {
+            "name": "mongodb_response_ingress_header throughput",
+            "value": 3,
+            "unit": "req/s"
+          },
+          {
+            "name": "mongodb_response_ingress_body throughput",
+            "value": 3,
+            "unit": "req/s"
+          },
+          {
+            "name": "mongodb_reply_target throughput",
+            "value": 3,
+            "unit": "req/s"
+          },
+          {
+            "name": "mongodb_worker_ack_after_enqueue_observed throughput",
+            "value": 3,
+            "unit": "req/s"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "tyunisov@gmail.com",
+            "name": "Sky4CE",
+            "username": "Sky4CE"
+          },
+          "committer": {
+            "email": "tyunisov@gmail.com",
+            "name": "Sky4CE",
+            "username": "Sky4CE"
+          },
+          "distinct": true,
+          "id": "5d8f6350738fcf789f70424c1da4c7c951d72942",
+          "message": "fix: apply round-42 review — a live holder is no longer proof that a second delivery is redundant\n\nDurable flows: round 40 acknowledged a contended wake-up once the store showed the lease\nrenewed or taken over, on the premise that the holder's own job stays unacknowledged at the\nbroker and comes back if the holder dies. That premise fails when the contending delivery IS\nthe holder's own job, redelivered because a broker in-flight ceiling lapsed under a handler\nthat is still running (Pub/Sub MaxTotalAckExtension, RabbitMQ consumer_timeout, the SQS\n12-hour visibility cap, a Kafka rebalance): acknowledging it left nothing to redeliver and the\nrun stayed Running with no queued job and no dead letter — the stranding round 40 set out to\nfix, reached by a different road. Jobs now carry an identity (WorkerJobEnvelope.JobId,\nadditive, minted once and preserved by every redelivery and re-publish hop), the execution\nlease records it inside the lease id (55 chars, fits every 64-wide column — no store or schema\nchange), and a delivery carrying the holder's own id is never acknowledged: re-published as\nthe same job past the lease where the transport can delay, otherwise handed back with\nDurableFlowLeaseContendedException. A transport can advertise its ceiling\n(IWorkerTransportInFlightLimit; Pub/Sub, RabbitMQ and SQS do) and in-process timer waits park\nin hops inside it (DurableFlowOptions.MaxInProcessParkDuration); in-process waits also observe\nhost shutdown instead of being killed mid-wait.\n\nSecurity: persisted type names are bounded in shape — length, generic nesting, bracket count,\nno by-ref or pointer decorations — before any resolver or the caches in front of them. The\nruntime's type-name parser recurses per generic argument, so a few hundred kilobytes of\nA`1[[A`1[[… overflowed the parsing thread's stack, and StackOverflowException cannot be\ncaught: the process exited with the message still unacknowledged and every worker it reached\ndied the same way. The recovery path resolves the payload type name before any callback is\nchosen, so no authorizer stood in front of it.\n\nRedis channel: PUBSUB NUMSUB is node-local and the response channels are key-routed, so a\nprobe that skipped an unreachable node and collected its siblings' zeros returned a definitive\n\"no live waiter\" — consuming a live waiter's recovery registration or dropping its response.\nZero is now conclusive only when every node that could hold the subscription answered.\n\nTransports: the early-ACK background queue belongs to the hosted service instead of one\nsupervised attempt, so a routine receive-loop fault on a healthy host no longer runs the\nstop-time drain and dead-letters already-acknowledged work. A stopping host stops starting new\nhandlers, and the visibility/lock/AckWait heartbeat ends with the batch rather than with the\nstop, so handlers no longer outlive their own invisibility on every rolling deploy. Database\nlease renewal beats at a third of the lock timeout and retries a failed beat on a short\nbackoff. Ack-after-handler modes read one message at a time (Redis, NATS) so a poison message\ncannot bury its prefetched batch-mates unexecuted. NATS streams are created, never overwritten\n(new StreamReplicas). RabbitMQ releases the prefetch credit of a failed park (new ParkQueue,\nBrokerConsumerTimeout). SQS hashes non-conforming correlation ids into a valid FIFO\nMessageGroupId. Pub/Sub exposes ClientCount, MaxOutstandingMessages, MaxOutstandingBytes and\nMaxTotalAckExtension. Mongo flow state writes with majority concern; Cosmos no longer treats a\nsession-consistent read as proof a ledger is absent.\n\nFlows: a completed child step answers from its memo — input equality is compared by value, and\na mismatch on an already-completed child is a warning rather than a terminal failure of the\nparent (a running child still fails fast). Reusing a step name in one execution is rejected\ninstead of silently returning the first step's result. DurableFlowInterruptedException\nseparates \"this attempt was interrupted\" from \"the step failed\", so a catch-all no longer runs\ncompensation because of a deploy. In-memory follow-up work runs before new external work, so\nchild starts and parent wake-ups no longer starve behind a bounded channel's parked producers.\n\nPackaging and CI: sibling AsyncResponse.* dependencies are packed as exact versions — the\npackages share internals, so an open range let a restore pair mismatched versions that fail\nwith MissingMethodException at the first call across the seam — verified from outside by\nscripts/verify-package-dependencies.sh, and pushed in dependency order. The retry classifier\nnow strips the timestamp prefix the jobs/logs API returns, so its per-test-block logic engages\ninstead of silently degrading to a whole-log scan that retried real failures toward green.\n\nNot included: Kafka's partition-scoped burial stall, the Redis Streams work-queue semantics,\nthe database-channel late-commit timing interlock, and the NATS NoReply mapping — reported,\nnot half-fixed.\n\nTests: 3279 unit tests green on net10.0 and net8.0 (204 new cases); R1, the Redis probe, the\ntype-name bounds, the harness stop and the package pinning proven red against 718dffdc;\nRelease build 0 warnings with --no-incremental; integration suite compiles and discovers; 29\nclassifier self-tests pass. Docs and CHANGELOG synced.",
+          "timestamp": "2026-09-21T23:47:28+02:00",
+          "tree_id": "d3b309c5ffbd9f92617eb6bb94666baf4bc8b7ca",
+          "url": "https://github.com/Sky4CE/AsyncResponse/commit/5d8f6350738fcf789f70424c1da4c7c951d72942"
+        },
+        "date": 1790027578939,
         "tool": "customBiggerIsBetter",
         "benches": [
           {
