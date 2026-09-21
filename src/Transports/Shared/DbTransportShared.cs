@@ -43,6 +43,7 @@ internal abstract class DbMessageDispatcherBase : IAsyncDisposable
     private readonly string _transportTag;
     private readonly string _roleTagName;
     private readonly string _ackModeTagName;
+    private readonly TimeProvider _timeProvider;
 
     private readonly Channel<DbTransportDelivery>? _backgroundQueue;
     private readonly Task[]? _backgroundWorkers;
@@ -56,7 +57,8 @@ internal abstract class DbMessageDispatcherBase : IAsyncDisposable
         DbSubscriberRole role,
         string providerName,
         string unitNoun,
-        string telemetryName)
+        string telemetryName,
+        TimeProvider? timeProvider = null)
     {
         DbTransportOptionsValidator.ValidateSubscriber(options, subscriberOptions, role.ToString());
 
@@ -71,6 +73,9 @@ internal abstract class DbMessageDispatcherBase : IAsyncDisposable
         _transportTag = telemetryName;
         _roleTagName = $"asyncresponse.{telemetryName}.role";
         _ackModeTagName = $"asyncresponse.{telemetryName}.ack_mode";
+
+        // Clocks the lease-renewal beat only (a test seam; the system clock when omitted).
+        _timeProvider = timeProvider ?? TimeProvider.System;
 
         if (subscriberOptions.AckMode is DbAckMode.AckAfterEnqueue)
         {
@@ -139,7 +144,7 @@ internal abstract class DbMessageDispatcherBase : IAsyncDisposable
         try
         {
             // While the handler runs, a fenced heartbeat keeps extending the claim's lease at
-            // LockTimeout/2 cadence so a slow handler does not let the lock lapse and a competing
+            // LockTimeout/3 cadence so a slow handler does not let the lock lapse and a competing
             // subscriber re-claim (and duplicate-process) the queue item. The heartbeat MUST be
             // armed before any user code runs: a handler can burn its lease entirely
             // synchronously (CPU work or blocking I/O before its first await), and only an
@@ -155,7 +160,7 @@ internal abstract class DbMessageDispatcherBase : IAsyncDisposable
             finally
             {
                 renewalCancellation.Cancel();
-                await JoinRenewalAsync(renewalTask, delivery, cancellationToken).ConfigureAwait(false);
+                ObserveRenewal(renewalTask);
             }
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
@@ -194,7 +199,18 @@ internal abstract class DbMessageDispatcherBase : IAsyncDisposable
 
     private async Task RenewLeaseLoopAsync(DbTransportDelivery delivery, CancellationToken cancellationToken)
     {
-        var interval = TimeSpan.FromTicks(Math.Max(1, _options.LockTimeout.Ticks / 2));
+        // A third of the lease, and a FAILED beat retries on a short backoff instead of waiting out
+        // another full beat. At LockTimeout/2 with the retry one more beat away, the retry landed
+        // at claim + LockTimeout — after locked_until, every time: ONE transient renew failure (a
+        // command timeout, a broken pooled connection, a SQL Server 1205 deadlock victim)
+        // guaranteed the lease lapsed, a peer claimed the row within its EmptyPollDelay, and a
+        // healthy long handler ran twice concurrently. Now a failed beat leaves two thirds of the
+        // lease for retries a second (or LockTimeout/10) apart. Both waits are floored at a
+        // millisecond: Task.Delay truncates to whole milliseconds, and a zero wait would spin.
+        var interval = TimeSpan.FromTicks(Math.Max(TimeSpan.TicksPerMillisecond, _options.LockTimeout.Ticks / 3));
+        var retryInterval = TimeSpan.FromTicks(Math.Max(TimeSpan.TicksPerMillisecond, Math.Min(TimeSpan.TicksPerSecond, _options.LockTimeout.Ticks / 10)));
+        var wait = interval;
+        var failing = false;
         try
         {
             while (true)
@@ -203,7 +219,7 @@ internal abstract class DbMessageDispatcherBase : IAsyncDisposable
                 // finishes, and a thrown-and-caught TaskCanceledException per message dominated
                 // the dispatch cost. SuppressThrowing observes the cancelled delay without
                 // throwing; cancellation still disarms the underlying timer immediately.
-                await Task.Delay(interval, cancellationToken).ConfigureAwait(ConfigureAwaitOptions.SuppressThrowing);
+                await Task.Delay(wait, _timeProvider, cancellationToken).ConfigureAwait(ConfigureAwaitOptions.SuppressThrowing);
                 if (cancellationToken.IsCancellationRequested)
                     return; // The handler finished or the subscriber is stopping.
 
@@ -214,15 +230,33 @@ internal abstract class DbMessageDispatcherBase : IAsyncDisposable
                 }
                 catch (Exception ex)
                 {
-                    _logger.LogWarning(
+                    if (cancellationToken.IsCancellationRequested)
+                        return;
+
+                    // Keep retrying past locked_until too: the renew is fenced on lock_id alone,
+                    // so until a peer actually re-claims the row a late renew still re-establishes
+                    // the lease. Only the first failure of a streak is a warning — at this
+                    // cadence a database outage would otherwise log one per second per in-flight
+                    // delivery.
+                    _logger.Log(
+                        failing ? LogLevel.Debug : LogLevel.Warning,
                         ex,
-                        "Failed to renew the lease of {Provider} message {MessageId} on queue {Queue} ({Role}); retrying next beat.",
+                        "Failed to renew the lease of {Provider} message {MessageId} on queue {Queue} ({Role}); retrying every {RetryInterval} until it succeeds or the lease is lost.",
                         _providerName,
                         delivery.Id,
                         delivery.Queue,
-                        _role);
+                        _role,
+                        retryInterval);
+                    failing = true;
+                    wait = retryInterval;
                     continue;
                 }
+
+                // The beat is not joined before settlement (see ObserveRenewal), so a renew that
+                // was in flight when the handler finished can land AFTER the fenced ack/NAK cleared
+                // the row's lock_id. That "no match" is the settlement's own doing, not a lost lease.
+                if (cancellationToken.IsCancellationRequested)
+                    return;
 
                 if (!renewed)
                 {
@@ -237,6 +271,9 @@ internal abstract class DbMessageDispatcherBase : IAsyncDisposable
                         _role);
                     return;
                 }
+
+                failing = false;
+                wait = interval;
             }
         }
         catch (OperationCanceledException)
@@ -275,43 +312,22 @@ internal abstract class DbMessageDispatcherBase : IAsyncDisposable
     }
 
     /// <summary>
-    /// Joins the lease-renewal heartbeat after its cancellation. Bounded (ASB/SQS parity): the
-    /// in-flight renew pins <see cref="CancellationToken.None"/> for its connect and command, so
-    /// against a degraded database an unbounded join held every settlement on the hot path for a
-    /// full connect+command timeout; past <c>LockTimeout</c> the lease has lapsed regardless.
-    /// NOT joined at all while the subscriber is stopping: settlement (the NAK or ACK around the
-    /// caller) is fenced by <c>lock_id</c>, so a beat still in flight is a no-op against it — and
-    /// the join spent up to <c>LockTimeout</c> of the host's stop budget, a term no shutdown
-    /// validator sums: against a degraded database the full default 30s BEFORE the background
-    /// drain even began, so already-ACKed entries were lost when the host expired mid-drain.
+    /// The cancelled lease-renewal heartbeat is NOT joined before settlement. Every settlement (ack,
+    /// NAK, dead-letter) is fenced by <c>lock_id</c> in all three stores, so a beat still in flight
+    /// is a no-op against it — while the in-flight renew pins <see cref="CancellationToken.None"/>
+    /// for its connect and command, so a join held the ack behind a slow renew: a handler that had
+    /// already SUCCEEDED waited on a degraded database until the lease it was trying to extend had
+    /// lapsed, and the row was claimed and run again before its ack went out. (While the subscriber
+    /// is stopping the wait was also up to <c>LockTimeout</c> of the host's stop budget, a term no
+    /// shutdown validator sums.) The loop swallows its own faults; observe defensively and let the
+    /// beat finish on its own.
     /// </summary>
-    private async Task JoinRenewalAsync(Task renewalTask, DbTransportDelivery delivery, CancellationToken cancellationToken)
-    {
-        if (cancellationToken.IsCancellationRequested)
-        {
-            // The loop swallows its own faults; observe defensively and let the beat finish.
-            _ = renewalTask.ContinueWith(
-                static task => _ = task.Exception,
-                CancellationToken.None,
-                TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously,
-                TaskScheduler.Default);
-            return;
-        }
-
-        try
-        {
-            await renewalTask.WaitAsync(_options.LockTimeout).ConfigureAwait(false);
-        }
-        catch (TimeoutException)
-        {
-            _logger.LogWarning(
-                "{Provider} lease renewal for queue {Queue} ({Role}) did not stop within LockTimeout ({LockTimeout}); abandoning the renewal task.",
-                _providerName,
-                delivery.Queue,
-                _role,
-                _options.LockTimeout);
-        }
-    }
+    private static void ObserveRenewal(Task renewalTask)
+        => _ = renewalTask.ContinueWith(
+            static task => _ = task.Exception,
+            CancellationToken.None,
+            TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously,
+            TaskScheduler.Default);
 
     private async Task HandleEarlyAckAsync(DbTransportDelivery delivery, CancellationToken cancellationToken)
     {
@@ -363,7 +379,7 @@ internal abstract class DbMessageDispatcherBase : IAsyncDisposable
             finally
             {
                 renewalCancellation.Cancel();
-                await JoinRenewalAsync(renewalTask, delivery, cancellationToken).ConfigureAwait(false);
+                ObserveRenewal(renewalTask);
             }
         }
 
@@ -650,7 +666,8 @@ internal static class DbCorrelationIdExtractor
 /// an unkillable poison row that tears down the subscriber on every re-claim. Instead, string
 /// values are taken as-is, scalars keep their raw JSON text (culture-free by construction),
 /// object/array values keep their raw JSON so correlation extraction still sees a usable string,
-/// nulls are skipped, and anything unusable degrades to no headers — a genuinely poison message
+/// nulls are skipped — as is a header whose name or string value cannot be transcoded (an escaped
+/// lone surrogate) — and anything unusable degrades to no headers — a genuinely poison message
 /// then fails in the handler and flows through the NORMAL dead-letter path. Keys differing only
 /// in case (legal JSON from foreign producers) are last-wins, matching the ASB/SQS receive
 /// adapters.
@@ -677,14 +694,25 @@ internal static class DbTransportHeaders
             var headers = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
             foreach (var property in document.RootElement.EnumerateObject())
             {
-                var value = property.Value.ValueKind switch
+                try
                 {
-                    JsonValueKind.String => property.Value.GetString(),
-                    JsonValueKind.Null or JsonValueKind.Undefined => null,
-                    _ => property.Value.GetRawText()
-                };
-                if (value is not null)
-                    headers[property.Name] = value;
+                    var value = property.Value.ValueKind switch
+                    {
+                        JsonValueKind.String => property.Value.GetString(),
+                        JsonValueKind.Null or JsonValueKind.Undefined => null,
+                        _ => property.Value.GetRawText()
+                    };
+                    if (value is not null)
+                        headers[property.Name] = value;
+                }
+                catch (InvalidOperationException)
+                {
+                    // An ESCAPED lone surrogate ("\ud800") parses — it is well-formed JSON — but has
+                    // no UTF-16 string form, so GetString/Name throw InvalidOperationException, not
+                    // the JsonException guarded above: the same after-the-claim, before-any-delivery
+                    // throw this type exists to prevent. The header is unusable; skip it and keep
+                    // the rest.
+                }
             }
 
             return headers;

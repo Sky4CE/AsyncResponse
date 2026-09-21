@@ -177,7 +177,11 @@ public sealed class InMemoryWorkerTransportDrainTests
         await probe.FollowUpRan.Task.WaitAsync(TimeSpan.FromSeconds(10));
         await host.StopAsync(CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(10));
 
-        Assert.Equal([1, 2, 3], probe.Executed);
+        // Follow-up work goes first: job 3 was published by job 1 and continues work the queue
+        // already admitted, so the worker that just finished job 1 runs it before taking job 2
+        // off the queue. (Draining the overflow only through the queue starved follow-ups behind
+        // external producers, which a bounded channel always hands the freed slot to.)
+        Assert.Equal([1, 3, 2], probe.Executed);
         await provider.DisposeAsync();
     }
 

@@ -28,6 +28,7 @@ internal sealed class DurableFlowService : IDurableFlows
         _propagation = propagation;
         _options = options;
         FlowStateConcurrency.ValidateOptions(_options);
+        _options.ValidateInProcessPark();
         _logger = logger;
         _timeProvider = timeProvider ?? TimeProvider.System;
     }

@@ -20,7 +20,8 @@ internal sealed class PostgreSqlMessageDispatcher(
     PostgreSqlAsyncResponseTransportOptions options,
     PostgreSqlSubscriberOptions subscriberOptions,
     ILogger logger,
-    PostgreSqlSubscriberRole role)
+    PostgreSqlSubscriberRole role,
+    TimeProvider? timeProvider = null)
     : DbMessageDispatcherBase(
         handler,
         options,
@@ -29,4 +30,5 @@ internal sealed class PostgreSqlMessageDispatcher(
         role,
         providerName: "PostgreSQL",
         unitNoun: "row",
-        telemetryName: "postgresql");
+        telemetryName: "postgresql",
+        timeProvider: timeProvider);

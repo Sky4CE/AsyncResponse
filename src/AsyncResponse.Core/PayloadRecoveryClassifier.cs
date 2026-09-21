@@ -122,6 +122,15 @@ internal static class PayloadRecoveryClassifier
                         "null — the conservative 'do not resume' route — plus a type-resolution-failure diagnostic.")]
     internal static Type? ResolvePayloadType(string payloadTypeFullName)
     {
+        // Before any cache or the parser, exactly as ResolveServiceType does and for the same
+        // reason — and with more at stake here: this name is resolved BEFORE a callback is chosen,
+        // so no callback authorizer ever stands between a recovery row and this line.
+        if (!AsyncResponseTypeResolution.IsWithinResolutionLimits(payloadTypeFullName))
+        {
+            AsyncResponseDiagnostics.RecordTypeResolutionFailure("payload");
+            return null;
+        }
+
         // Must precede any cache consult/populate: a miss cached without the invalidation hook
         // active could outlive a later assembly load that makes the name resolvable.
         UnresolvableTypeNames.EnsureAssemblyLoadInvalidation();

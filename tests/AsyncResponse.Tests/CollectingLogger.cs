@@ -57,9 +57,19 @@ internal sealed class CollectingLogger : ILogger
         Func<TState, Exception?, string> formatter)
         => Add(formatter(state, exception), exception);
 
+    /// <summary>
+    /// When set, a logged message containing this fragment throws instead of being recorded — the
+    /// realistic way to make a subscriber attempt escape at a chosen point (a throwing logger
+    /// provider), while still collecting everything else the run logs.
+    /// </summary>
+    public string? ThrowOnMessageContaining { get; set; }
+
     private void Add(string message, Exception? exception)
     {
         lock (_gate) _entries.Add((message, exception));
+
+        if (ThrowOnMessageContaining is { } fragment && message.Contains(fragment, StringComparison.OrdinalIgnoreCase))
+            throw new InvalidOperationException("logger exploded");
     }
 
     private sealed class Typed<T>(CollectingLogger owner) : ILogger<T>

@@ -266,7 +266,13 @@ public sealed class Round36RegressionTests
         var input = new R36Input(DateTimeOffset.UnixEpoch);
 
         var first = await context.AwaitChildFlowAsync<R36NoopFlow, R36Input>("child", input, failOnChildFailure: false);
-        var replay = await context.AwaitChildFlowAsync<R36NoopFlow, R36Input>("child", input, failOnChildFailure: false);
+
+        // The replay is a fresh execution — a redelivered wake-up builds a new context over the
+        // same ledger. (Re-calling the step on the SAME context is a reused step name, which the
+        // engine now rejects: within one execution the second call would be answered from the
+        // first one's memo.)
+        var replayContext = CreateContext(provider, parent, store, lease, options, clock, transport);
+        var replay = await replayContext.AwaitChildFlowAsync<R36NoopFlow, R36Input>("child", input, failOnChildFailure: false);
 
         // Both are the memoized snapshot: no ambient context, grandchild result elided, the rest kept.
         Assert.Null(first.Context);

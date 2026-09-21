@@ -1,3 +1,4 @@
+using AsyncResponse.Testing;
 using AsyncResponse.Transports.NATS;
 using System.Reflection;
 using Xunit;
@@ -24,8 +25,9 @@ public sealed class SubscriberSupervisorTests
         Func<CancellationToken, Task> run,
         CancellationToken stoppingToken,
         Func<int, TimeSpan> delayPolicy,
-        Action<Exception, TimeSpan> logRetry)
-        => (Task)RunAsyncMethod.Invoke(null, [run, stoppingToken, delayPolicy, logRetry])!;
+        Action<Exception, TimeSpan> logRetry,
+        TimeProvider? timeProvider = null)
+        => (Task)RunAsyncMethod.Invoke(null, [run, stoppingToken, delayPolicy, logRetry, timeProvider])!;
 
     [Fact]
     public async Task RunAsync_ReturnsWithoutRetrying_WhenRunSucceedsImmediately()
@@ -63,6 +65,12 @@ public sealed class SubscriberSupervisorTests
             CancellationToken.None,
             failures =>
             {
+                // int.MaxValue is the supervisor asking for the policy's longest delay (its
+                // healthy-run threshold), not a failure count; a day keeps these instant runs
+                // consecutive.
+                if (failures == int.MaxValue)
+                    return TimeSpan.FromDays(1);
+
                 observedFailureCounts.Add(failures);
                 return TimeSpan.FromMilliseconds(failures); // deterministic, distinguishable per call
             },
@@ -168,6 +176,124 @@ public sealed class SubscriberSupervisorTests
             (_, _) => { });
 
         Assert.Equal(0, runCalls);
+    }
+
+    /// <summary>
+    /// Regression: the documented "consecutive-failure count" was lifetime-cumulative. A subscriber
+    /// runs for weeks, so a handful of unrelated blips spread over that time pinned EVERY later
+    /// reconnect at the policy's longest delay — in all 10 transports. A run that stayed up at
+    /// least as long as the longest delay the policy can impose was healthy: the next failure
+    /// starts a new streak.
+    /// </summary>
+    [Fact]
+    public async Task RunAsync_StartsTheFailureCountOver_AfterARunThatOutlivedThePolicysLongestDelay()
+    {
+        var clock = new VirtualTimeProvider();
+        var longestDelay = TimeSpan.FromSeconds(30);
+        var attempt = 0;
+        var observedFailureCounts = new List<int>();
+
+        await RunAsync(
+            _ =>
+            {
+                attempt++;
+                switch (attempt)
+                {
+                    case <= 3:
+                        throw new InvalidOperationException("a burst of failures: the broker is down");
+                    case 4:
+                        // The reconnect worked and the subscriber then consumed for an hour.
+                        clock.Advance(TimeSpan.FromHours(1));
+                        throw new InvalidOperationException("an unrelated blip, an hour later");
+                    case 5:
+                        // Stayed up for exactly the longest delay: healthy too (inclusive bound).
+                        clock.Advance(longestDelay);
+                        throw new InvalidOperationException("and another");
+                    default:
+                        return Task.CompletedTask;
+                }
+            },
+            CancellationToken.None,
+            failures =>
+            {
+                if (failures == int.MaxValue)
+                    return longestDelay;
+
+                observedFailureCounts.Add(failures);
+                return TimeSpan.Zero; // a zero wait completes inline on any clock
+            },
+            (_, _) => { },
+            clock);
+
+        // The old lifetime count fed 1, 2, 3, 4, 5 here: the blip an hour later already waited
+        // like a fourth consecutive failure, and every one after it waited longer still.
+        Assert.Equal(new List<int> { 1, 2, 3, 1, 1 }, observedFailureCounts);
+    }
+
+    /// <summary>
+    /// The other half: runs that fail FASTER than the policy's longest delay are still one streak
+    /// and keep escalating — a crash loop must not reset itself back to the shortest delay.
+    /// </summary>
+    [Fact]
+    public async Task RunAsync_KeepsEscalating_WhileRunsFailBeforeThePolicysLongestDelay()
+    {
+        var clock = new VirtualTimeProvider();
+        var longestDelay = TimeSpan.FromSeconds(30);
+        var attempt = 0;
+        var observedFailureCounts = new List<int>();
+
+        await RunAsync(
+            _ =>
+            {
+                attempt++;
+                if (attempt > 4)
+                    return Task.CompletedTask;
+
+                // Connected, consumed briefly, died: one tick short of a healthy run.
+                clock.Advance(longestDelay - TimeSpan.FromTicks(1));
+                throw new InvalidOperationException($"attempt {attempt} fails");
+            },
+            CancellationToken.None,
+            failures =>
+            {
+                if (failures == int.MaxValue)
+                    return longestDelay;
+
+                observedFailureCounts.Add(failures);
+                return TimeSpan.Zero;
+            },
+            (_, _) => { },
+            clock);
+
+        Assert.Equal(new List<int> { 1, 2, 3, 4 }, observedFailureCounts);
+    }
+
+    /// <summary>The retry wait runs on the supplied clock, so a virtual clock decides when it ends.</summary>
+    [Fact]
+    public async Task RunAsync_WaitsOutTheRetryDelay_OnTheSuppliedClock()
+    {
+        var clock = new VirtualTimeProvider();
+        var attempt = 0;
+        var waiting = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        var task = RunAsync(
+            _ =>
+            {
+                attempt++;
+                return attempt == 1 ? throw new InvalidOperationException("fails once") : Task.CompletedTask;
+            },
+            CancellationToken.None,
+            _ => TimeSpan.FromMinutes(5),
+            (_, _) => waiting.TrySetResult(),
+            clock);
+
+        await waiting.Task.WaitAsync(TimeSpan.FromSeconds(30));
+        await WaitUntilAsync(() => clock.NextTimerDueAt is not null);
+        Assert.False(task.IsCompleted);
+
+        clock.Advance(TimeSpan.FromMinutes(5));
+        await task.WaitAsync(TimeSpan.FromSeconds(30));
+        Assert.Equal(2, attempt);
     }
 
     private static async Task WaitUntilAsync(Func<bool> condition)

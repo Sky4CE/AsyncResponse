@@ -430,6 +430,102 @@ public class AsyncResponseTypeResolutionTests : IDisposable
         Assert.Equal(RecoveryAction.Resume, classification.Action);
         Assert.Equal(7, Assert.IsType<Round33Outer<int>>(classification.MaterializedPayload).Inner);
     }
+
+    // -----------------------------------------------------------------------------------------
+    // Persisted type names are written by whoever can write the recovery store or the worker
+    // stream. The CLR's type-name parser recurses per generic argument with no depth limit of its
+    // own, and a StackOverflowException cannot be caught: the process exits, the message stays
+    // unacknowledged, and every worker it is redelivered to exits the same way. So no persisted
+    // name reaches that parser — or the caches in front of it — without passing these limits.
+    //
+    // The tests below deliberately never hand a hostile name to the runtime: they assert that the
+    // guard refuses it FIRST. Feeding one to Type.GetType to "prove" the crash would take the
+    // whole test host down with it.
+    // -----------------------------------------------------------------------------------------
+
+    [Theory]
+    // A name longer than the cap, built from a legitimate prefix so nothing else can reject it.
+    [InlineData(4097, 0, 0, false)]
+    [InlineData(4096, 0, 0, true)]
+    // Nesting: a generic level costs TWO brackets in the assembly-qualified form, so the
+    // 16-bracket depth bound is eight levels of nesting.
+    [InlineData(0, 9, 0, false)]
+    [InlineData(0, 8, 0, true)]
+    // A chain of decorations nests only one deep however long it grows, so it needs its own bound.
+    [InlineData(0, 0, 65, false)]
+    [InlineData(0, 0, 64, true)]
+    public void IsWithinResolutionLimits_BoundsLengthNestingAndBracketCount(int length, int nesting, int brackets, bool expected)
+    {
+        var name = length > 0
+            ? "N.T" + new string('x', length - 3)
+            : nesting > 0
+                ? string.Concat(string.Concat(Enumerable.Repeat("N.T`1[[", nesting)), "N.T", string.Concat(Enumerable.Repeat("]]", nesting)))
+                : "N.T" + string.Concat(Enumerable.Repeat("[]", brackets));
+
+        Assert.Equal(expected, AsyncResponseTypeResolution.IsWithinResolutionLimits(name));
+    }
+
+    [Theory]
+    // By-ref and pointer decorations: no callback service, payload, flow or flow-input type is
+    // one, and refusing them wherever they appear keeps the guard a single forward scan.
+    [InlineData("N.T&")]
+    [InlineData("N.T*")]
+    [InlineData("N.T`1[[N.U&, Asm]]")]
+    public void IsWithinResolutionLimits_RefusesByRefAndPointerDecorations(string name)
+        => Assert.False(AsyncResponseTypeResolution.IsWithinResolutionLimits(name));
+
+    [Fact]
+    public void ResolutionPaths_RefuseAnOversizedName_WithoutConsultingResolvers()
+    {
+        // A resolver stands for the recursive parser behind every path: RegisterAssembly's is
+        // Assembly.GetType, and an application resolver is as likely to call Type.GetType itself.
+        // Reaching it at all is the defect, so the probe records and the assertion is that it
+        // never ran — and that the name never became a cache key either.
+        var consulted = 0;
+        AsyncResponseTypeResolution.RegisterResolver(_ =>
+        {
+            Interlocked.Increment(ref consulted);
+            return typeof(OperationResult);
+        });
+
+        var hostile = "N.T" + new string('x', AsyncResponseTypeResolution.MaxTypeNameLength);
+
+        Assert.Null(AsyncResponseTypeResolution.Resolve(hostile));
+        Assert.Null(ReflectionExtensions.ResolveServiceType(hostile));
+        Assert.Equal(0, consulted);
+
+        // A name within the limits still resolves through the very same resolver.
+        Assert.Same(typeof(OperationResult), AsyncResponseTypeResolution.Resolve("N.Reasonable"));
+        Assert.Equal(1, consulted);
+    }
+
+    [Fact]
+    public void RecoveryClassification_RefusesAnOversizedPayloadTypeName()
+    {
+        // The recovery path resolves the persisted payload type name BEFORE any callback is
+        // chosen or authorized, so no authorizer configuration stands in front of it: the bound
+        // has to be here.
+        var hostile = "N.T" + new string('x', AsyncResponseTypeResolution.MaxTypeNameLength);
+
+        var classification = PayloadRecoveryClassifier.Classify("""{"Status":2}""", hostile);
+
+        Assert.Null(classification.MaterializedPayload);
+    }
+
+    [Fact]
+    public void DescribeForDiagnostics_KeepsOrdinaryNamesWhole_AndExcerptsTheRest()
+    {
+        // The name is store data: an unresolvable one is logged on every delivery, so it must not
+        // carry megabytes of store-written text — or its raw line breaks — into the log.
+        Assert.Equal("N.Ordinary", AsyncResponseTypeResolution.DescribeForDiagnostics("N.Ordinary"));
+
+        var hostile = "N.T" + new string('x', AsyncResponseTypeResolution.MaxTypeNameLength) + "\n";
+        var described = AsyncResponseTypeResolution.DescribeForDiagnostics(hostile);
+
+        Assert.True(described.Length < 200, $"the excerpt is {described.Length} characters long");
+        Assert.DoesNotContain("\n", described, StringComparison.Ordinal);
+        Assert.Contains(hostile.Length.ToString(System.Globalization.CultureInfo.InvariantCulture), described, StringComparison.Ordinal);
+    }
 }
 
 /// <summary>

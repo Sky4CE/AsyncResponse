@@ -135,40 +135,79 @@ public sealed class CosmosFlowStateStore : IFlowStateStore, IDisposable
         ArgumentException.ThrowIfNullOrWhiteSpace(flowId);
         var container = await GetContainerAsync(cancellationToken).ConfigureAwait(false);
 
+        // Point reads have no predicate, so the expiry check happens client-side on the app
+        // clock — see the time-authority note on this class.
+        var document = await ReadDocumentAsync(container, flowId, cancellationToken).ConfigureAwait(false);
+        if (document is null || document.ExpiresAtUtc <= DateTime.UtcNow)
+        {
+            // Callers acknowledge the wake-up on null, so "absent" must not come from a read
+            // alone. Session consistency is read-your-writes for the client that WROTE: a
+            // different process never received the writer's session token, so its read may be
+            // served by a replica that has not applied the create yet (a plain 404, sub-status 0
+            // — 1002 only answers a token the replica cannot satisfy) or by one still holding an
+            // older version whose expiry has since been extended. Inside that replication lag a
+            // live run's only wake-up was acknowledged as "no state". The write path answers
+            // authoritatively, and its 412 brings this client's session token up to the write
+            // region's, so the re-read below is current.
+            for (var attempt = 0; ; attempt++)
+            {
+                if (!await ExistsOnWritePathAsync(container, flowId, cancellationToken).ConfigureAwait(false))
+                    return null;
+
+                document = await ReadDocumentAsync(container, flowId, cancellationToken).ConfigureAwait(false);
+                if (document is not null)
+                    break;
+
+                // Present for writes and absent for reads, repeatedly: a delete can win that race
+                // once, not every time. This client's reads are not session-consistent with its
+                // writes (an Eventual or Consistent Prefix account or client), so nothing it
+                // reads can prove the run is gone.
+                if (attempt == MaxAbsenceConfirmations - 1)
+                {
+                    throw new FlowStateUnreadableException(
+                        flowId,
+                        "the container's write path reports its document present while reads keep answering 404; the " +
+                        "CosmosClient's reads are not session-consistent with its writes (the store needs Session consistency or stronger)");
+                }
+            }
+
+            if (document.ExpiresAtUtc <= DateTime.UtcNow)
+                return null;
+        }
+
+        // The document exists, so a missing required field is an unreadable ledger, not an
+        // absent one. Reporting it as absent let the executor ack the only wake-up of a run that
+        // is still sitting in the container.
+        if (document.Revision is not { } revision)
+            throw new FlowStateUnreadableException(flowId, "its stored document has no revision");
+
+        if (string.IsNullOrEmpty(document.StateJson))
+            throw new FlowStateUnreadableException(flowId, "its stored document has no state JSON");
+
+        return DurableFlowStoreShared.ReadState(flowId, document.StateJson, revision);
+    }
+
+    private static async Task<CosmosFlowStateDocument?> ReadDocumentAsync(Container container, string flowId, CancellationToken cancellationToken)
+    {
         try
         {
             var response = await container.ReadItemAsync<CosmosFlowStateDocument>(
                 flowId,
                 new PartitionKey(flowId),
                 cancellationToken: cancellationToken).ConfigureAwait(false);
-            var document = response.Resource;
-            // Point reads have no predicate, so the expiry check happens client-side on the app
-            // clock — see the time-authority note on this class.
-            if (document.ExpiresAtUtc <= DateTime.UtcNow)
-                return null;
-
-            // The document exists, so a missing required field is an unreadable ledger, not an
-            // absent one — absence is the NotFound catch below. Reporting it as absent let the
-            // executor ack the only wake-up of a run that is still sitting in the container.
-            if (document.Revision is not { } revision)
-                throw new FlowStateUnreadableException(flowId, "its stored document has no revision");
-
-            if (string.IsNullOrEmpty(document.StateJson))
-                throw new FlowStateUnreadableException(flowId, "its stored document has no state JSON");
-
-            return DurableFlowStoreShared.ReadState(flowId, document.StateJson, revision);
+            return response.Resource;
         }
         catch (CosmosException ex) when (ex.StatusCode == HttpStatusCode.NotFound && ex.SubStatusCode == 0)
         {
-            // Sub-status 0 is the only 404 that means "no such item". Cosmos also answers 404 for
-            // conditions where the ledger still exists — 1002 ReadSessionNotAvailable (a routine
-            // Session-consistency lag when a DIFFERENT process reads right after this one's write,
-            // surfaced once the SDK's session retries exhaust) and 1003/1004 (container/database
-            // recreated). Callers acknowledge the wake-up on null, so mapping those to null
-            // silently dropped a live run's only wake-up; letting them throw routes the delivery
-            // through retry/dead-letter instead. Same contract point the siblings defend with
-            // ConsistentRead (DynamoDB) and ReadPreference.Primary (MongoDB) — Cosmos cannot
-            // strengthen consistency per-request, so the sub-status is the only discriminator.
+            // Sub-status 0 is the only 404 that CAN mean "no such item". Cosmos also answers 404
+            // for conditions where the ledger still exists — 1002 ReadSessionNotAvailable (the
+            // replicas in reach are behind the session token this client already holds, surfaced
+            // once the SDK's session retries exhaust) and 1003/1004 (container/database
+            // recreated). Mapping those to null silently dropped a live run's only wake-up;
+            // letting them throw routes the delivery through retry/dead-letter instead. Sub-status
+            // 0 is still only what one replica says, which is why LoadAsync confirms it on the
+            // write path. (DynamoDB pins this contract point with ConsistentRead and MongoDB with
+            // primary reads; Cosmos cannot strengthen a read per request.)
             return null;
         }
     }
@@ -365,6 +404,17 @@ public sealed class CosmosFlowStateStore : IFlowStateStore, IDisposable
         // lease nobody has taken over must keep reading as the same lease, because the engine's
         // proof of a live holder is that two observations DIFFER. Whether it has lapsed stays
         // UpdateLeaseAsync's call.
+        //
+        // That proof only holds when each observation is at least as new as the moment it was
+        // asked for. A waiting delivery runs in a process that never received the holder's
+        // session token, so a bare query may be served by a lagging replica: a baseline older
+        // than the wait makes a renewal written BEFORE the delivery arrived look like one written
+        // while it waited, and the delivery is acknowledged as a duplicate of a holder that may
+        // already be dead. The write-path round trip first pins the query to the write region's
+        // progress as of now (and answers absence authoritatively, without the query).
+        if (!await ExistsOnWritePathAsync(container, flowId, cancellationToken).ConfigureAwait(false))
+            return FlowLeaseObservation.Unheld;
+
         try
         {
             var current = await ReadLeaseAsync(container, flowId, cancellationToken).ConfigureAwait(false);
@@ -373,6 +423,69 @@ public sealed class CosmosFlowStateStore : IFlowStateStore, IDisposable
         catch (CosmosException ex) when (ex.StatusCode == HttpStatusCode.NotFound && ex.SubStatusCode == 0)
         {
             return FlowLeaseObservation.Unheld;
+        }
+    }
+
+    /// <summary>
+    /// How often <see cref="LoadAsync"/> re-asks the write path when it reports the ledger present
+    /// and the follow-up read still answers 404, before it gives up proving absence.
+    /// </summary>
+    private const int MaxAbsenceConfirmations = 3;
+
+    /// <summary>
+    /// An <c>If-Match</c> value no document can carry (service ETags are quoted GUIDs, and the
+    /// wildcard is <c>*</c>), so the conditional patch below can never apply.
+    /// </summary>
+    internal const string NeverMatchingEtag = "\"asyncresponse-consistency-barrier\"";
+
+    // Inert even if it could apply: no reader or writer of the ledger document knows this path.
+    private const string BarrierPath = "/consistencyBarrier";
+
+    /// <summary>
+    /// Asks the container's WRITE path whether the ledger document exists, with a conditional
+    /// patch whose precondition cannot hold. Writes are served by the partition's write-region
+    /// primary, never by a lagging read replica: 404 (sub-status 0) there is an authoritative
+    /// "no such item", and 412 means the document exists. Nothing is ever written.
+    /// <para>
+    /// The 412 has a second effect the callers depend on. The SDK records the session token of a
+    /// 412/409/404 response exactly as it does a successful one (StoreClient and
+    /// GatewayStoreModel both capture it), so after this call the client's session token for the
+    /// partition is at least the write region's progress as of now, and under Session consistency
+    /// the NEXT read from this client cannot be served by a replica behind it — it is current, or
+    /// it fails with 404/1002, which every path here lets throw.
+    /// </para>
+    /// <para>
+    /// What that guarantees, by the client's effective consistency level: Strong reads, and
+    /// Bounded Staleness reads served from the write region, were already current; Session (the
+    /// account default) is made current by the token; Bounded Staleness read from another
+    /// region, Consistent Prefix and Eventual send no session token on reads, so only the absence
+    /// answer is authoritative there and the following read can still lag. An account with
+    /// multiple WRITE regions has no single authoritative write path (it already lets two regions
+    /// win the same ETag-fenced lease write and resolves them last-writer-wins), so none of this
+    /// holds on one. The cost is one extra bodiless request, on the two decision paths only —
+    /// never on a load that found its document.
+    /// </para>
+    /// </summary>
+    private static async Task<bool> ExistsOnWritePathAsync(Container container, string flowId, CancellationToken cancellationToken)
+    {
+        try
+        {
+            await container.PatchItemAsync<CosmosFlowStateDocument>(
+                flowId,
+                new PartitionKey(flowId),
+                [PatchOperation.Set(BarrierPath, 0)],
+                new PatchItemRequestOptions { IfMatchEtag = NeverMatchingEtag, EnableContentResponseOnWrite = false },
+                cancellationToken).ConfigureAwait(false);
+            // Unreachable against the service; a patch that applied still proves the document exists.
+            return true;
+        }
+        catch (CosmosException ex) when (ex.StatusCode == HttpStatusCode.PreconditionFailed)
+        {
+            return true;
+        }
+        catch (CosmosException ex) when (ex.StatusCode == HttpStatusCode.NotFound && ex.SubStatusCode == 0)
+        {
+            return false;
         }
     }
 

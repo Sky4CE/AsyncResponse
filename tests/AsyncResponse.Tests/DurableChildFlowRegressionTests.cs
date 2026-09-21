@@ -258,8 +258,12 @@ public class DurableChildFlowRegressionTests
     }
 
     [Fact]
-    public async Task AwaitChildFlow_CompletedCheckpoint_WithChangedInput_FailsInsteadOfReturningStaleChild()
+    public async Task AwaitChildFlow_CompletedCheckpoint_WithChangedInput_ReturnsTheMemoizedChild()
     {
+        // A completed step answers from its memo whatever the current arguments say — a local step
+        // never re-reads its lambda, a timer never re-reads its delay — and a child flow is no
+        // different once it has finished. Failing the parent terminally here threw away a settled
+        // outcome (and killed every in-flight parent) whenever a deploy edited the child's input.
         var store = new InMemoryFlowStateStore();
         var child = new FlowState
         {
@@ -291,6 +295,53 @@ public class DurableChildFlowRegressionTests
             UpdatedAtUtc = DateTime.UtcNow
         };
 
+        Assert.True(await store.TryCreateAsync(parent.FlowId!, parent, TimeSpan.FromMinutes(5)));
+        await using var lease = await FlowStateConcurrency.TryAcquireExecutionLeaseAsync(
+            store,
+            parent.FlowId!,
+            new DurableFlowOptions(),
+            NullLogger.Instance);
+        Assert.NotNull(lease);
+
+        var context = CreateContext(parent, store, lease!);
+        var memoized = await context.AwaitChildFlowAsync<GatedChildFlow, TestFlowInput>("child", new TestFlowInput(2));
+
+        Assert.Equal(child.FlowId, memoized.FlowId);
+        Assert.Equal(FlowRunStatus.Succeeded, memoized.Status);
+    }
+
+    [Fact]
+    public async Task AwaitChildFlow_RunningChild_WithChangedInput_StillFailsFast()
+    {
+        // Only a COMPLETED child answers from its memo. A child still running would be awaited
+        // under input it never received, so the mismatch is still terminal there.
+        var store = new InMemoryFlowStateStore();
+        var child = new FlowState
+        {
+            FlowId = "running-root:child",
+            FlowTypeName = typeof(GatedChildFlow).FullName,
+            InputTypeName = typeof(TestFlowInput).FullName,
+            InputJson = JsonSerializer.Serialize(new TestFlowInput(1)),
+            Status = FlowRunStatus.Running,
+            ParentFlowId = "running-root",
+            ParentStepName = "child",
+            CreatedAtUtc = DateTime.UtcNow,
+            UpdatedAtUtc = DateTime.UtcNow
+        };
+        var parent = new FlowState
+        {
+            FlowId = "running-root",
+            FlowTypeName = typeof(GatedParentFlow).FullName,
+            Status = FlowRunStatus.Running,
+            Steps = new Dictionary<string, FlowStepState>(StringComparer.Ordinal)
+            {
+                ["child"] = new() { ChildFlowId = child.FlowId }
+            },
+            CreatedAtUtc = DateTime.UtcNow,
+            UpdatedAtUtc = DateTime.UtcNow
+        };
+
+        Assert.True(await store.TryCreateAsync(child.FlowId!, child, TimeSpan.FromMinutes(5)));
         Assert.True(await store.TryCreateAsync(parent.FlowId!, parent, TimeSpan.FromMinutes(5)));
         await using var lease = await FlowStateConcurrency.TryAcquireExecutionLeaseAsync(
             store,

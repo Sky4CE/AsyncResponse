@@ -39,6 +39,9 @@ AsyncResponse.DurableFlowFailedException.DurableFlowFailedException(string! mess
 AsyncResponse.DurableFlowFailedException.DurableFlowFailedException(string! message, System.Exception! innerException) -> void
 AsyncResponse.DurableFlowIdConflictException
 AsyncResponse.DurableFlowIdConflictException.DurableFlowIdConflictException(string! message) -> void
+AsyncResponse.DurableFlowInterruptedException
+AsyncResponse.DurableFlowInterruptedException.DurableFlowInterruptedException(string! message) -> void
+AsyncResponse.DurableFlowInterruptedException.DurableFlowInterruptedException(string! message, System.Exception? innerException) -> void
 AsyncResponse.DurableFlowNotDispatchedException
 AsyncResponse.DurableFlowNotDispatchedException.DurableFlowNotDispatchedException(string! flowId, System.Exception? innerException = null) -> void
 AsyncResponse.DurableFlowNotDispatchedException.FlowId.get -> string!
@@ -261,6 +264,8 @@ AsyncResponse.IRecoveryStateStore.SaveAsync(string! correlationId, AsyncResponse
 AsyncResponse.IRecoveryStateStore.TryDeleteAsync(string! correlationId, System.Guid registrationId, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task<bool>!
 AsyncResponse.IWorkerTransport
 AsyncResponse.IWorkerTransport.PublishAsync(AsyncResponse.WorkerJobEnvelope! job, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task!
+AsyncResponse.IWorkerTransportInFlightLimit
+AsyncResponse.IWorkerTransportInFlightLimit.MaxInFlightDuration.get -> System.TimeSpan?
 AsyncResponse.Placeholder
 AsyncResponse.PlaceholderType
 AsyncResponse.PlaceholderType.CorrelationId = 2 -> AsyncResponse.PlaceholderType
@@ -316,6 +321,8 @@ AsyncResponse.WorkerJobEnvelope.Context.get -> System.Collections.Generic.Dictio
 AsyncResponse.WorkerJobEnvelope.Context.set -> void
 AsyncResponse.WorkerJobEnvelope.CorrelationId.get -> string?
 AsyncResponse.WorkerJobEnvelope.CorrelationId.set -> void
+AsyncResponse.WorkerJobEnvelope.JobId.get -> string?
+AsyncResponse.WorkerJobEnvelope.JobId.set -> void
 AsyncResponse.WorkerJobEnvelope.LastRedelayRemaining.get -> System.TimeSpan?
 AsyncResponse.WorkerJobEnvelope.LastRedelayRemaining.set -> void
 AsyncResponse.WorkerJobEnvelope.NotBeforeUtc.get -> System.DateTime?

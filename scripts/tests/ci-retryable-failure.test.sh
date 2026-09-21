@@ -7,7 +7,8 @@
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-classifier="$here/../ci-retryable-failure.sh"
+# Overridable so a new fixture can be shown to FAIL against an older copy of the classifier.
+classifier="${CI_RETRY_CLASSIFIER:-$here/../ci-retryable-failure.sh}"
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
 
@@ -88,6 +89,50 @@ expect block-ends-at-summary 1 "real: Assert.True() Failure" \
 # Build errors outrank everything, blocks included.
 expect build-error-with-flake-blocks 1 "real: error MSB3027" \
   "  failed AsyncResponse.IntegrationTests.Boot.Baz\n  Xunit.Sdk.TestPipelineException: Class fixture type 'XFixture' threw in InitializeAsync\nerror MSB3027: Could not copy\n"
+
+# ---- The jobs/logs API shape: what auto-retry.yml actually feeds the classifier. ----
+#
+# Every fixture above is console text, the shape the in-job retry tees. The log auto-retry.yml
+# downloads is different: a UTF-8 BOM opens it, every line starts with a timestamp, the colour
+# codes come AFTER the timestamp, and a "from <assembly>" line sits between a failed test and its
+# exception. The line-anchored block splitter matched nothing in it, so the verdict fell back to the
+# whole-log scan and the mixed log below — a boot flake next to an executed test's
+# NullReferenceException — was retried. Shapes copied from a real failed integration-tests leg.
+ts="2026-09-21T16:02:31.9876543Z "
+dll="/home/runner/work/AsyncResponse/AsyncResponse/tests/AsyncResponse.IntegrationTests/bin/Release/net10.0/AsyncResponse.IntegrationTests.dll (net10.0|x64)"
+api_flake_block="${ts}\e[m\e[31mfailed\e[m AsyncResponse.IntegrationTests.Boot.Baz \e[90m(12ms)\e[m\n${ts}  from ${dll}\n${ts}\e[31m  Xunit.Sdk.TestPipelineException: Class fixture type 'AsyncResponse.IntegrationTests.DataBatchFixture' threw in InitializeAsync\n${ts}\e[m\e[90m    at Xunit.v3.FixtureMappingManager.GetFixture(Type)\n"
+api_nre_block="${ts}\e[m\e[31mfailed\e[m AsyncResponse.IntegrationTests.Foo.Bar \e[90m(3s 040ms)\e[m\n${ts}  from ${dll}\n${ts}\e[31m  System.NullReferenceException: Object reference not set to an instance of an object.\n${ts}\e[m\e[90m    at AsyncResponse.IntegrationTests.Foo.Bar() in /src/tests/Foo.cs:line 42\n"
+api_summary() { printf '%s' "${ts}\e[m\e[m${dll} \e[31mfailed with $1 error(s)\e[m \e[90m(3m 24s)\e[m\n${ts}Exit code: 2\n${ts}\e[31mTest run summary: Failed!\n${ts}\e[m  total: 333\n${ts}\e[31m  failed: $1\n${ts}\e[m  succeeded: 330\n${ts}  skipped: 0\n"; }
+
+# The reproduced finding. The evidence line is the exception, not the "from <assembly>" line.
+expect api-log-fixture-flake-plus-executed-nre 1 "real: System.NullReferenceException: Object reference not set to an instance of an object. in AsyncResponse.IntegrationTests.Foo.Bar" \
+  "\xEF\xBB\xBF${ts}Current runner version: '2.337.0'\n${api_flake_block}${api_nre_block}$(api_summary 2)"
+# The timestamp strip must not cost the flake verdict its retry.
+expect api-log-pure-fixture-flake 0 "flake: Fixture' threw in InitializeAsync" \
+  "\xEF\xBB\xBF${ts}Current runner version: '2.337.0'\n${api_flake_block}$(api_summary 1)"
+# The BOM sits in front of the FIRST line's timestamp; left in place it hides that line's test.
+expect api-log-bom-on-the-failed-line 1 "real: System.NullReferenceException" \
+  "\xEF\xBB\xBF${api_nre_block}${api_flake_block}$(api_summary 2)"
+expect console-log-bom-on-the-failed-line 1 "real: System.NullReferenceException" \
+  "\xEF\xBB\xBF  failed AsyncResponse.IntegrationTests.Foo.Bar (3s)\n  System.NullReferenceException: boom\n  failed AsyncResponse.IntegrationTests.Boot.Baz\n  Xunit.Sdk.TestPipelineException: Class fixture type 'XFixture' threw in InitializeAsync\n"
+# An in-job retry puts two runs — two summaries — in one job log; their counts add up to the blocks.
+expect api-log-two-attempts-both-flakes 0 "flake: Fixture' threw in InitializeAsync" \
+  "${api_flake_block}${api_flake_block}$(api_summary 2)${api_flake_block}$(api_summary 1)"
+
+# Fail closed. The runner says tests failed, and the splitter cannot find them (a format this
+# script does not know, a prefix nobody anticipated): the whole-log scan is NOT a substitute for
+# per-test judgement, so a flake signature elsewhere in the log earns no retry.
+expect summary-reports-failures-but-no-blocks 1 "real: the log reports 'failed: 1'" \
+  "Class fixture type 'AsyncResponse.IntegrationTests.DataBatchFixture' threw in InitializeAsync\n[x] AsyncResponse.IntegrationTests.Foo.Bar\n  System.NullReferenceException: boom\nTest run summary: Failed!\n  total: 10\n  failed: 1\n  succeeded: 9\n"
+expect assembly-result-reports-errors-but-no-blocks 1 "real: the log reports 'failed with 2 error(s)'" \
+  "Class fixture type 'AsyncResponse.IntegrationTests.DataBatchFixture' threw in InitializeAsync\n${dll} failed with 2 error(s) (3m 24s)\n"
+expect summary-reports-more-failures-than-blocks 1 "real: the log reports" \
+  "${api_flake_block}[x] AsyncResponse.IntegrationTests.Foo.Bar\n  System.NullReferenceException: boom\n$(api_summary 2)"
+
+# The per-assembly result line ends the last failed test: the test host's captured output follows
+# it, and a flake signature logged in there is not that test's exception.
+expect host-output-after-the-assembly-result-is-not-the-last-test 1 "real: System.NullReferenceException: boom in AsyncResponse.IntegrationTests.Foo.Bar" \
+  "  failed AsyncResponse.IntegrationTests.Foo.Bar (3s)\n  System.NullReferenceException: boom\n${dll} failed with 1 error(s) (3m 24s)\nExit code: 2\n  Standard output: warn: Microsoft.EntityFrameworkCore.Database.Command[0]\n        SQLite Error 5: 'database is locked'.\nTest run summary: Failed!\n  total: 10\n  failed: 1\n"
 
 code=0
 "$classifier" "$work/does-not-exist.log" > "$work/missing.out" || code=$?

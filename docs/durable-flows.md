@@ -283,6 +283,7 @@ property makes every failure mode collapse into "run it again":
 | Process is down when a **failed** response arrives | `OnRecovery() == Fail` routes to the auto-registered **failure** callback: the run is marked `Failed` — a failure is never resumed as a success |
 | The **terminal** response itself was the lost message | Its payload is already the step result. The resumed run skips that completed await and continues; it does not wait for a consumed correlation id or re-send the remote request |
 | The same flow job is delivered to two replicas | Atomic start preserves the first input, and the execution lease lets one worker run. The duplicate delivery is acknowledged without entering flow code **once the store shows the lease being renewed or taken over** — proof of a live holder; a lease that never changes belongs to a dead owner, so the delivery waits for its *persisted* expiry and resumes from the last compare-and-swap checkpoint. The wait follows the lease the owner actually wrote, so a deployment that shortens `ExecutionLeaseDuration` cannot acknowledge a wake-up behind a crashed owner's longer lease. See [lease contention](durable-flow-state-stores.md#lease-contention-and-deployments-that-change-the-lease-duration) |
+| The broker redelivers the job whose handler is **still running** | A live holder only makes a second delivery redundant when the holder's own job is a *different* one — that job is still unacknowledged at the broker and comes back if the holder dies. When a broker in-flight ceiling lapses under a running handler (Pub/Sub `MaxTotalAckExtension`, RabbitMQ `consumer_timeout`, the SQS 12-hour cap, a Kafka rebalance), the contending delivery **is** the holder's own job, and it is the last copy of the wake-up the broker has. The execution lease records the job that drives it (`WorkerJobEnvelope.JobId`), so such a delivery is recognised and never acknowledged as a duplicate: on a transport that can delay it is re-published as the same job just past the holder's lease, and otherwise it is handed back with `DurableFlowLeaseContendedException`. Counted on `asyncresponse.flow.own_job_redeliveries` and logged as a warning — it means a ceiling lapsed, so shorten the park (`DurableFlowOptions.MaxInProcessParkDuration`) or raise the ceiling |
 | The process **dies mid-`StartAsync`** | The publish of the start job is the start's commit point, and the job carries the initial ledger: `IDurableFlowExecutor.CreateAndExecuteAsync` creates the run (insert-if-absent) before executing it. A crash **before** the publish leaves nothing behind; a crash **after** it leaves a job whose execution creates and runs the flow. There is no window in which a committed `Running` ledger exists that nothing will ever execute (the pre-1.0 order — create, then publish — had exactly that window, and `IFlowStateStore` has no enumeration a reconciler could use to find such a run). The starter also writes the ledger after publishing; a transient failure of that write may leave `GetStateAsync` returning null until the worker creates it; losing that write to the executor (or to a concurrent identical start) is the expected shape, not an error |
 | `StartAsync`'s **publish fails** | After the start's own retry ladder, `StartAsync` throws **`DurableFlowNotDispatchedException`** and **nothing was persisted**. Its `FlowId` carries the id the start would have used — including a generated one — so the retry stays idempotent: if the publish had in fact landed (the ambiguous case is deliberately included), the same id dedupes against the run the job created; a retry with a fresh generated id would start a second, independent run. Supply deterministic ids wherever the caller may retry |
 | A child flow is running | The parent run is parked as `Running`; the child terminal state re-enqueues the parent, which reloads the child state and continues |
@@ -308,6 +309,19 @@ terminal exception, throw a retriable one, or run compensating steps first.
 - **Hotfix an in-flight run**: deploy the fix, `ResumeAsync(flowId)` (or wait for redelivery) —
   runs continue into the *current* code. No replay history, no determinism constraints, no
   workflow-version patching.
+- **Change a child flow's input**: a child step that has already **completed** answers from its
+  memo whatever the current arguments say — the same rule a completed `StepAsync` follows (it
+  never re-reads its lambda) and a completed `DelayAsync` follows (it never re-reads its delay).
+  The mismatch is logged as a warning, not a failure: a settled child outcome is not thrown away,
+  and a deploy that edits the input cannot kill every parent already past that step. A child that
+  is still **running** is a different matter — it would be awaited under input it never received,
+  so that mismatch is still terminal.
+- **Reuse a step name**: don't. Checkpoints are keyed by name, so a second step under a name that
+  already returned in the same execution would be handed the first one's result — the classic
+  "step inside a loop ran iteration one and silently skipped the rest". The engine now rejects it
+  with an `InvalidOperationException` naming the step; put the iteration key in the name
+  (`$"send-{item.Id}"`). A step that *threw* is not recorded, so retrying it under its own name
+  within one execution still works.
 
 ## Compensation
 
@@ -316,6 +330,27 @@ explicit and local: catch the failure in the flow, run compensating steps (guard
 names, awaited through `AwaitStepAsync` if remote), then throw `DurableFlowFailedException` to
 close the run. You author the undo logic next to the steps it undoes; what you don't get is an
 engine deriving the compensation sequence for you.
+
+**Do not compensate on an interruption.** A `catch (Exception)` around a step also catches this
+*attempt* being interrupted rather than the work failing: the run parking (a durable timer or a
+child flow suspended it — its wake-up is already published), or the host stopping while the run
+waited in process on a timer or an awaited response (the delivery is handed back and redelivered
+after the restart). Nothing went wrong, and the checkpoints are intact, so running the undo logic
+there compensates work that is about to be replayed. Both are raised as
+`DurableFlowInterruptedException`, which derives from `OperationCanceledException` — so the usual
+filter already excludes it, along with caller-token cancellations, which mean the same thing:
+
+```csharp
+try
+{
+    await flow.StepAsync("charge", () => _payments.ChargeAsync(order));
+}
+catch (Exception ex) when (ex is not OperationCanceledException)
+{
+    await flow.StepAsync("refund", () => _payments.RefundAsync(order));
+    throw new DurableFlowFailedException("Charge failed; refunded.", ex);
+}
+```
 
 ## Cookbook: patterns from production flows
 
@@ -332,13 +367,15 @@ try
         until: r => r.State is not DagRunState.Queued and not DagRunState.Running,
         timeout: TimeSpan.FromMinutes(30));
 }
-catch (Exception ex)
+catch (Exception ex) when (ex is not OperationCanceledException)
 {
     await flow.ReportProgressAsync($"lineage failed ({ex.Message}); continuing");
 }
 ```
 
-The step is recorded as faulted-not-completed and the flow moves on. If the run is later resumed,
+The filter matters: without it this also swallows the run parking and the host stopping
+(`DurableFlowInterruptedException`), turning a redeploy into "lineage failed". The step is
+recorded as faulted-not-completed and the flow moves on. If the run is later resumed,
 a faulted awaited step restarts fresh — which is what you want for a best-effort stage.
 
 **Subset runs.** "Only create the ticket this time" is an input flag and an early return — no

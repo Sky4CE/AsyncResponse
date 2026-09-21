@@ -378,17 +378,40 @@ public class NatsJetStreamTransportAdapterTests
 {
     private readonly Mock<INatsJSContext> _jetStream = new();
 
+    /// <summary>
+    /// The stream does not exist: JetStream answers a lookup with a 404 "stream not found", which
+    /// is the only answer that lets this transport create one.
+    /// </summary>
+    private void StreamNotFound(string stream)
+        => _jetStream
+            .Setup(c => c.GetStreamAsync(stream, It.IsAny<StreamInfoRequest?>(), It.IsAny<CancellationToken>()))
+            .ThrowsAsync(new NatsJSApiException(new ApiError { Code = 404, ErrCode = 10059, Description = "stream not found" }));
+
+    /// <summary>The stream exists with <paramref name="config"/> — an operator's own configuration.</summary>
+    private void ExistingStream(string stream, StreamConfig config)
+    {
+        var info = new Mock<INatsJSStream>();
+        info.SetupGet(s => s.Info).Returns(new StreamInfo { Config = config });
+        _jetStream
+            .Setup(c => c.GetStreamAsync(stream, It.IsAny<StreamInfoRequest?>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(info.Object);
+    }
+
     [Fact]
     public async Task EnsureStreamAsync_CreatesStreamWithSubjectAndLimit()
     {
-        _jetStream.Setup(c => c.CreateOrUpdateStreamAsync(It.IsAny<StreamConfig>(), It.IsAny<CancellationToken>())).ReturnsAsync(Mock.Of<INatsJSStream>());
+        StreamNotFound("stream");
+        _jetStream.Setup(c => c.CreateStreamAsync(It.IsAny<StreamConfig>(), It.IsAny<CancellationToken>())).ReturnsAsync(Mock.Of<INatsJSStream>());
         var adapter = new NatsJetStreamTransportAdapter(_jetStream.Object);
 
         await adapter.EnsureStreamAsync("stream", "subj", 100, CancellationToken.None);
 
-        _jetStream.Verify(c => c.CreateOrUpdateStreamAsync(
+        // Created, never "create or update": an existing stream carries an operator's own
+        // replicas, limits and placement, and this transport must not write over them.
+        _jetStream.Verify(c => c.CreateStreamAsync(
             It.Is<StreamConfig>(cfg => cfg.Name == "stream" && cfg.Subjects!.Contains("subj") && cfg.MaxMsgs == 100),
             It.IsAny<CancellationToken>()), Times.Once);
+        _jetStream.Verify(c => c.CreateOrUpdateStreamAsync(It.IsAny<StreamConfig>(), It.IsAny<CancellationToken>()), Times.Never);
     }
 
     [Fact]
@@ -400,12 +423,13 @@ public class NatsJetStreamTransportAdapterTests
         // burial and each over-cap poison message NAK-looped forever (the consumer runs with
         // MaxDeliver=-1 on the premise that the dispatcher bounds attempts). The DLQ must be a
         // bounded evict-oldest archive — Redis's MAXLEN-trimmed dead-letter stream shape.
-        _jetStream.Setup(c => c.CreateOrUpdateStreamAsync(It.IsAny<StreamConfig>(), It.IsAny<CancellationToken>())).ReturnsAsync(Mock.Of<INatsJSStream>());
+        StreamNotFound("dead-stream");
+        _jetStream.Setup(c => c.CreateStreamAsync(It.IsAny<StreamConfig>(), It.IsAny<CancellationToken>())).ReturnsAsync(Mock.Of<INatsJSStream>());
         var adapter = new NatsJetStreamTransportAdapter(_jetStream.Object);
 
         await adapter.EnsureDeadLetterStreamAsync("dead-stream", "dead-subj", 100, CancellationToken.None);
 
-        _jetStream.Verify(c => c.CreateOrUpdateStreamAsync(
+        _jetStream.Verify(c => c.CreateStreamAsync(
             It.Is<StreamConfig>(cfg => cfg.Name == "dead-stream"
                 && cfg.Subjects!.Contains("dead-subj")
                 && cfg.MaxMsgs == 100
@@ -421,12 +445,19 @@ public class NatsJetStreamTransportAdapterTests
         // by an earlier build (work-queue retention) rejects the update. The old stream still
         // accepts burials until it fills; failing the whole subscriber over it would be worse —
         // keep running and tell the operator how to migrate.
-        _jetStream
-            .Setup(c => c.CreateOrUpdateStreamAsync(It.IsAny<StreamConfig>(), It.IsAny<CancellationToken>()))
-            .ThrowsAsync(new NatsJSApiException(new ApiError { Code = 500, ErrCode = 10052, Description = "stream configuration update can not change retention policy" }));
+        ExistingStream("dead-stream", new StreamConfig("dead-stream", ["dead-subj"])
+        {
+            Retention = StreamConfigRetention.Workqueue,
+            Discard = StreamConfigDiscard.New,
+            MaxMsgs = 100
+        });
         var adapter = new NatsJetStreamTransportAdapter(_jetStream.Object);
 
         await adapter.EnsureDeadLetterStreamAsync("dead-stream", "dead-subj", 100, CancellationToken.None);
+
+        // Left exactly as it is: neither created nor updated.
+        _jetStream.Verify(c => c.CreateStreamAsync(It.IsAny<StreamConfig>(), It.IsAny<CancellationToken>()), Times.Never);
+        _jetStream.Verify(c => c.CreateOrUpdateStreamAsync(It.IsAny<StreamConfig>(), It.IsAny<CancellationToken>()), Times.Never);
     }
 
     [Fact]

@@ -156,8 +156,18 @@ public sealed class MongoDbFlowStateStore : IFlowStateStore, IDisposable
         // (LoadAsync's contract, and the reason the DynamoDB sibling pins ConsistentRead).
         // It also keeps reads on the same authority whose $$NOW the filters evaluate against
         // (see ReadServerNowAsync).
+        //
+        // Majority writes, whatever write concern the host-supplied database carries: under an
+        // inherited w=1 (a connection-string default, or any pre-5.0 deployment) the primary
+        // acknowledges a checkpoint, lease, or create before a single secondary has it, and a
+        // failover rolls it back — the lease a worker is executing under, or the step result it
+        // just recorded, silently disappears and the step's side effect runs again. The read
+        // concern stays inherited on purpose: primary reads already see every write this store
+        // had acknowledged (read-your-writes needs nothing more), and a majority snapshot could
+        // only hide a competitor's newer write, which the revision/lease filters reject anyway.
         _collection = database.GetCollection<MongoFlowStateDocument>(_options.CollectionName)
-            .WithReadPreference(ReadPreference.Primary);
+            .WithReadPreference(ReadPreference.Primary)
+            .WithWriteConcern(WriteConcern.WMajority);
         _ownedClient = ownedClient;
     }
 

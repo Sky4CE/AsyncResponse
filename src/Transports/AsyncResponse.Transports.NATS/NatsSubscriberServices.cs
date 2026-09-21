@@ -20,14 +20,29 @@ internal abstract class NatsSubscriberService : BackgroundService
     /// </summary>
     private static readonly TimeSpan LongPollExpires = TimeSpan.FromSeconds(30);
 
+    /// <summary>
+    /// A long poll that comes back empty sooner than this did not expire: the server holds a pull
+    /// request for the whole <see cref="LongPollExpires"/> when there is nothing to deliver. Half
+    /// the period leaves room for a poll cut short by a reconnect without ever mistaking a
+    /// millisecond answer for an expiry.
+    /// </summary>
+    private static readonly TimeSpan FastEmptyPollThreshold = LongPollExpires / 2;
+
+    /// <summary>
+    /// Consecutive fast-empty long polls after which the attempt is handed back to the supervisor,
+    /// so the stream/consumer provisioning runs again.
+    /// </summary>
+    private const int MaxConsecutiveFastEmptyPolls = 5;
+
     private readonly INatsJetStreamTransport _jetStream;
+    private readonly TimeProvider _timeProvider;
 
     /// <summary>Runs the NatsSubscriberService operation.</summary>
     protected NatsSubscriberService(
         IOptions<NatsAsyncResponseTransportOptions> options,
         INatsConnection connection,
         ILogger logger)
-        : this(options, new NatsJetStreamTransportAdapter(connection.CreateJetStreamContext(), logger), logger)
+        : this(options, new NatsJetStreamTransportAdapter(connection.CreateJetStreamContext(), logger, options.Value.StreamReplicas), logger)
     {
     }
 
@@ -35,13 +50,18 @@ internal abstract class NatsSubscriberService : BackgroundService
     protected NatsSubscriberService(
         IOptions<NatsAsyncResponseTransportOptions> options,
         INatsJetStreamTransport jetStream,
-        ILogger logger)
+        ILogger logger,
+        TimeProvider? timeProvider = null)
     {
         Options = options.Value;
         NatsTransportOptionsValidator.ValidateCommon(Options);
         _jetStream = jetStream;
         Logger = logger;
         Schema = new NatsTransportSubjectSchema(Options);
+
+        // Times the idle long poll and paces its fast-empty backoff. The system clock in
+        // production — what is measured is a real server's answer; the seam exists for tests.
+        _timeProvider = timeProvider ?? TimeProvider.System;
     }
 
     protected NatsAsyncResponseTransportOptions Options { get; }
@@ -70,24 +90,18 @@ internal abstract class NatsSubscriberService : BackgroundService
         return base.StartAsync(cancellationToken);
     }
 
-    protected override Task ExecuteAsync(CancellationToken stoppingToken)
-        => SubscriberSupervisor.RunAsync(
-            RunSubscriberAsync,
-            stoppingToken,
-            failures => AsyncResponseRetry.Backoff(failures, Options.SubscriberRetryBaseDelay, Options.SubscriberRetryMaxDelay),
-            (ex, retryDelay) => Logger.LogWarning(ex, "NATS subscriber failed for subject {Subject} ({Role}); retrying in {RetryDelay}.", Subject, Role, retryDelay));
-
-    private async Task RunSubscriberAsync(CancellationToken stoppingToken)
+    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        if (Options.CreateStreams)
-        {
-            await _jetStream.EnsureStreamAsync(Stream, Subject, Options.StreamMaxMessages, stoppingToken).ConfigureAwait(false);
-            if (Options.DeadLetterEnabled)
-                await _jetStream.EnsureDeadLetterStreamAsync(Schema.DeadLetterStream, Schema.DeadLetterSubject, Options.DeadLetterStreamMaxMessages, stoppingToken).ConfigureAwait(false);
-        }
-
-        await _jetStream.EnsureConsumerAsync(Stream, Consumer, Options.AckWait, stoppingToken).ConfigureAwait(false);
-
+        // The dispatcher — and with it the ACK-after-enqueue queue and its workers — belongs to
+        // the hosted service, not to one supervised attempt. Disposing it IS the stop-time drain
+        // (wait BackgroundDrainTimeout, then cancel and dead-letter whatever is still queued), so
+        // owning it per attempt ran that drain on every fetch-loop failure of a host that was NOT
+        // stopping: a NATS blip or a JetStream leader election paused consumption for the drain
+        // budget and then buried queued, already-ACKed work as "drain budget lapsed" — or lost it
+        // outright when the dead-letter publish rode the same failing connection. Nothing in it
+        // is per attempt (the JetStream adapter wraps the host's reconnecting connection, and each
+        // delivery carries its own settlement handles), so every rebuilt attempt feeds this one
+        // instance and only the host stop drains it.
         await using var dispatcher = new NatsMessageDispatcher(
             HandleMessageAsync,
             _jetStream,
@@ -98,23 +112,51 @@ internal abstract class NatsSubscriberService : BackgroundService
             Role,
             Consumer);
 
+        await SubscriberSupervisor.RunAsync(
+            attemptToken => RunSubscriberAsync(dispatcher, attemptToken),
+            stoppingToken,
+            failures => AsyncResponseRetry.Backoff(failures, Options.SubscriberRetryBaseDelay, Options.SubscriberRetryMaxDelay),
+            (ex, retryDelay) => Logger.LogWarning(ex, "NATS subscriber failed for subject {Subject} ({Role}); retrying in {RetryDelay}.", Subject, Role, retryDelay)).ConfigureAwait(false);
+    }
+
+    private async Task RunSubscriberAsync(NatsMessageDispatcher dispatcher, CancellationToken stoppingToken)
+    {
+        if (Options.CreateStreams)
+        {
+            await _jetStream.EnsureStreamAsync(Stream, Subject, Options.StreamMaxMessages, stoppingToken).ConfigureAwait(false);
+            if (Options.DeadLetterEnabled)
+                await _jetStream.EnsureDeadLetterStreamAsync(Schema.DeadLetterStream, Schema.DeadLetterSubject, Options.DeadLetterStreamMaxMessages, stoppingToken).ConfigureAwait(false);
+        }
+
+        await _jetStream.EnsureConsumerAsync(Stream, Consumer, Options.AckWait, stoppingToken).ConfigureAwait(false);
+
         Logger.LogInformation(
             "NATS subscriber started. Subject: {Subject}. Stream: {Stream}. Consumer: {Consumer}. Role: {Role}. AckMode: {AckMode}.",
             Subject, Stream, Consumer, Role, SubscriberOptions.AckMode);
 
-        var batch = new List<NatsJobDelivery>(SubscriberOptions.BatchSize);
+        // JetStream counts a delivery when it hands the message over, not when a handler starts.
+        // ACK-after-handler runs its batch serially, so every message prefetched behind a handler
+        // that kills the process (stack overflow, OOM, FailFast) came back with its count bumped
+        // without ever having run — and MaxDeliveryAttempts crashes later the pre-execution cap
+        // dead-lettered up to BatchSize-1 healthy batch-mates along with the poison one. One
+        // message per fetch leaves the rest on the stream, where nothing is counted and any peer
+        // can take it. ACK-after-enqueue settles each message as it is accepted, so it keeps the
+        // batch.
+        var fetchSize = SubscriberOptions.AckMode is NatsAckMode.AckAfterEnqueue ? SubscriberOptions.BatchSize : 1;
+        var batch = new List<NatsJobDelivery>(fetchSize);
+        var fastEmptyPolls = 0;
         while (!stoppingToken.IsCancellationRequested)
         {
             batch.Clear();
 
-            // Drain whatever is already available, up to the batch size. The batch is
+            // Drain whatever is already available, up to the fetch size. The batch is
             // materialized out of the client buffer BEFORE dispatch so the in-progress heartbeat
             // below can reach every waiting message: the server starts each message's AckWait
             // clock at delivery, and an open-ended consume buffered the whole prefetch
             // client-side — a serial batch whose handlers together outlast AckWait had its tail
             // redelivered to a competing consumer (and NumDelivered climbed toward the Term cap)
             // while it was still queued here.
-            await foreach (var delivery in _jetStream.FetchNoWaitAsync(Stream, Consumer, SubscriberOptions.BatchSize, stoppingToken).ConfigureAwait(false))
+            await foreach (var delivery in _jetStream.FetchNoWaitAsync(Stream, Consumer, fetchSize, stoppingToken).ConfigureAwait(false))
                 batch.Add(delivery);
 
             if (batch.Count == 0)
@@ -122,15 +164,57 @@ internal abstract class NatsSubscriberService : BackgroundService
                 // Nothing waiting: long-poll for a single message so idle delivery latency stays
                 // push-like. Siblings arriving behind the long-polled message stay ON the stream
                 // — where AckWait has not started — until the next no-wait drain.
+                var pollStarted = _timeProvider.GetTimestamp();
                 await foreach (var delivery in _jetStream.FetchAsync(Stream, Consumer, maxMessages: 1, LongPollExpires, stoppingToken).ConfigureAwait(false))
                     batch.Add(delivery);
 
                 if (batch.Count == 0)
-                    continue; // the long poll expired empty; re-arm
+                {
+                    fastEmptyPolls = await BackOffAfterEmptyLongPollAsync(_timeProvider.GetElapsedTime(pollStarted), fastEmptyPolls, stoppingToken).ConfigureAwait(false);
+                    continue;
+                }
             }
 
+            fastEmptyPolls = 0;
             await DispatchBatchAsync(dispatcher, batch, stoppingToken).ConfigureAwait(false);
         }
+    }
+
+    /// <summary>
+    /// Tells an expired long poll (re-arm at once) from one the server never held. A pull request
+    /// that reaches no live consumer — the durable or its stream was deleted, or JetStream has no
+    /// leader for it — is answered "503 no responders", which the client ends WITHOUT an
+    /// exception: exactly what an expiry looks like, only in a millisecond. Re-arming on that spun
+    /// the loop thousands of times a second against a cluster that was already in trouble, and
+    /// since nothing ever threw, the supervisor never reran the provisioning that would have
+    /// recreated the consumer — the subscriber stayed dead until the process restarted. (A poll
+    /// in flight when the consumer is deleted does throw; the silent case is the replica that was
+    /// inside a handler at that moment.) Returns the updated consecutive fast-empty count.
+    /// </summary>
+    private async Task<int> BackOffAfterEmptyLongPollAsync(TimeSpan pollDuration, int fastEmptyPolls, CancellationToken stoppingToken)
+    {
+        if (pollDuration >= FastEmptyPollThreshold || stoppingToken.IsCancellationRequested)
+            return 0; // the long poll expired empty; re-arm
+
+        fastEmptyPolls++;
+        if (fastEmptyPolls >= MaxConsecutiveFastEmptyPolls)
+        {
+            throw new InvalidOperationException(
+                $"NATS consumer '{Consumer}' on stream '{Stream}' answered {fastEmptyPolls} consecutive long polls empty without holding them " +
+                $"(the last one returned after {pollDuration.TotalMilliseconds:F0} ms of a {LongPollExpires.TotalSeconds:F0} s wait): " +
+                "the pull requests are not reaching a live consumer — it or its stream was deleted, or JetStream has no leader for it. Rebuilding the subscriber.");
+        }
+
+        var delay = AsyncResponseRetry.Backoff(fastEmptyPolls, Options.SubscriberRetryBaseDelay, Options.SubscriberRetryMaxDelay);
+        Logger.LogDebug(
+            "NATS long poll for {Role} returned empty after {PollDuration} instead of being held; backing off {Delay} before polling again ({FastEmptyPolls}/{MaxFastEmptyPolls}).",
+            Role,
+            pollDuration,
+            delay,
+            fastEmptyPolls,
+            MaxConsecutiveFastEmptyPolls);
+        await Task.Delay(delay, _timeProvider, stoppingToken).ConfigureAwait(false);
+        return fastEmptyPolls;
     }
 
     private async Task DispatchBatchAsync(
@@ -141,16 +225,26 @@ internal abstract class NatsSubscriberService : BackgroundService
         // The batch is dispatched serially, so a slow handler lets the server-side AckWait of the
         // later (still unsettled) messages lapse into redelivery. While the batch is in flight, a
         // heartbeat signals in-progress for every unsettled message to reset its AckWait window.
+        // The heartbeat is NOT tied to the stop token: a handler takes no token, so it outlives
+        // the stop signal, and cancelling its renewal there let AckWait lapse under the live
+        // handler on every rolling deploy — the job was redelivered to a peer and ran twice. It
+        // ends only when this loop has let go of every message.
         var progress = new BatchProgress();
-        using var renewalCancellation = CancellationTokenSource.CreateLinkedTokenSource(stoppingToken);
+        using var renewalCancellation = new CancellationTokenSource();
         var renewalTask = RenewInProgressLoopAsync(batch, progress, renewalCancellation.Token);
+        var next = 0;
         try
         {
-            foreach (var delivery in batch)
+            for (; next < batch.Count; next++)
             {
+                // Stopping: do not start what has not started. The rest of the batch used to run
+                // on, handler after handler, past the stop signal.
+                if (stoppingToken.IsCancellationRequested)
+                    break;
+
                 try
                 {
-                    await dispatcher.HandleAsync(delivery, stoppingToken).ConfigureAwait(false);
+                    await dispatcher.HandleAsync(batch[next], stoppingToken).ConfigureAwait(false);
                 }
                 finally
                 {
@@ -160,6 +254,11 @@ internal abstract class NatsSubscriberService : BackgroundService
         }
         finally
         {
+            // Hand back whatever never started (a stop, or a handler cancelled by it, cut the
+            // batch short) while the heartbeat still covers it.
+            for (var i = Math.Max(next, progress.SettledCount); i < batch.Count; i++)
+                await ReleaseUnstartedAsync(batch[i]).ConfigureAwait(false);
+
             renewalCancellation.Cancel();
             try
             {
@@ -185,6 +284,30 @@ internal abstract class NatsSubscriberService : BackgroundService
                     TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously,
                     TaskScheduler.Default);
             }
+        }
+    }
+
+    /// <summary>
+    /// Hands a prefetched message that never started back to the server, with no redelivery delay
+    /// so an idle peer can take it at once. Leaving it unsettled instead would pin it for the rest
+    /// of its AckWait window — the stop that cut the batch short is usually a rolling deploy, and
+    /// the messages behind the handler are exactly the work the surviving replicas should pick up.
+    /// A failure here is not worth failing the stop over: the window lapses and the server
+    /// redelivers anyway, which is the same outcome one AckWait later.
+    /// </summary>
+    private async Task ReleaseUnstartedAsync(NatsJobDelivery delivery)
+    {
+        try
+        {
+            await delivery.NakAsync(TimeSpan.Zero).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            Logger.LogDebug(
+                ex,
+                "Failed to hand back an unstarted NATS message on subject {Subject} ({Role}); it redelivers when its AckWait lapses.",
+                delivery.Subject,
+                Role);
         }
     }
 

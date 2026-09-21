@@ -2,6 +2,7 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
+using System.Reflection;
 
 namespace AsyncResponse;
 
@@ -127,6 +128,117 @@ internal sealed class DurableFlowObserverLifetimeAudit(IServiceCollection servic
 }
 
 /// <summary>
+/// The runtime half of "all AsyncResponse packages are one version". The channel, transport,
+/// durable-flow store, and Testing packages are not ordinary consumers of Core: Core (and
+/// Abstractions) grant them <c>InternalsVisibleTo</c>, and they call internal types that carry no
+/// compatibility promise between releases. NuGet sees only <c>Core &gt;= x</c>, so bumping one
+/// package — or a transitive dependency dragging Core forward — yields an install that restores,
+/// builds, and starts, and then throws <see cref="MissingMethodException"/> or
+/// <see cref="TypeLoadException"/> at the first call into a changed internal: usually inside a
+/// background consume loop, long after startup, where it reads as a broker fault. Evaluated by
+/// <see cref="AsyncResponseStartupValidator"/> before anything else, so the mismatch fails the
+/// host start with both assemblies named instead.
+/// <para>
+/// The version compared is <see cref="AssemblyInformationalVersionAttribute"/> without its
+/// <c>+build-metadata</c> suffix — the package version. <c>AssemblyVersion</c> cannot tell
+/// <c>1.2.0-rc.1</c> from <c>1.2.0-rc.2</c>, and the metadata suffix is the source-control
+/// revision, which legitimately differs between assemblies of one incremental local build. Only
+/// plain attribute and name reads: nothing here needs trimming annotations.
+/// </para>
+/// </summary>
+internal static class AsyncResponsePackageVersions
+{
+    private const string Core = "AsyncResponse.Core";
+
+    /// <summary>A loaded package assembly: its simple name and its package version.</summary>
+    internal readonly record struct LoadedPackage(string Name, string Version);
+
+    /// <summary>
+    /// Whether <paramref name="assemblySimpleName"/> is one of the shipped packages. By family,
+    /// not by the <c>AsyncResponse.</c> prefix: the application's own assemblies may share the
+    /// prefix (this repository's tests and samples do) and version independently.
+    /// </summary>
+    internal static bool IsPackageAssembly(string assemblySimpleName)
+        => assemblySimpleName is Core or "AsyncResponse.Abstractions" or "AsyncResponse.Testing"
+           || assemblySimpleName.StartsWith("AsyncResponse.Channels.", StringComparison.Ordinal)
+           || assemblySimpleName.StartsWith("AsyncResponse.Transports.", StringComparison.Ordinal)
+           || assemblySimpleName.StartsWith("AsyncResponse.DurableFlows.", StringComparison.Ordinal);
+
+    /// <summary>
+    /// The package assemblies loaded right now. Provider assemblies are loaded by the time the
+    /// host starts — their registration extension ran — so the ones that can fail are the ones
+    /// seen. An assembly that merely borrows a family name is told apart by its strong-name
+    /// token: every shipped package is signed with Core's key.
+    /// </summary>
+    internal static IReadOnlyList<LoadedPackage> Loaded()
+    {
+        var coreAssembly = typeof(AsyncResponsePackageVersions).Assembly;
+        var coreToken = coreAssembly.GetName().GetPublicKeyToken() ?? [];
+
+        var packages = new List<LoadedPackage>();
+        foreach (var assembly in AppDomain.CurrentDomain.GetAssemblies())
+        {
+            var name = assembly.GetName();
+            if (name.Name is not { } simpleName
+                || !IsPackageAssembly(simpleName)
+                || !coreToken.AsSpan().SequenceEqual(name.GetPublicKeyToken() ?? []))
+            {
+                continue;
+            }
+
+            packages.Add(new LoadedPackage(simpleName, PackageVersion(assembly, name)));
+        }
+
+        return packages;
+    }
+
+    private static string PackageVersion(Assembly assembly, AssemblyName name)
+    {
+        var informational = assembly.GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion;
+        if (string.IsNullOrEmpty(informational))
+            return name.Version?.ToString() ?? string.Empty;
+
+        var metadata = informational.IndexOf('+', StringComparison.Ordinal);
+        return metadata < 0 ? informational : informational[..metadata];
+    }
+
+    /// <summary>
+    /// Throws when any of <paramref name="loaded"/> is a different version from Core. A set
+    /// without Core (never the real one — this code IS Core) has nothing to compare against.
+    /// </summary>
+    internal static void EnsureSingleVersion(IEnumerable<LoadedPackage> loaded)
+    {
+        var packages = loaded as IReadOnlyCollection<LoadedPackage> ?? [.. loaded];
+        string? coreVersion = null;
+        foreach (var package in packages)
+        {
+            if (package.Name == Core)
+            {
+                coreVersion = package.Version;
+                break;
+            }
+        }
+
+        if (coreVersion is null)
+            return;
+
+        foreach (var package in packages)
+        {
+            if (string.Equals(package.Version, coreVersion, StringComparison.Ordinal))
+                continue;
+
+            throw new InvalidOperationException(
+                $"{package.Name} {package.Version} is loaded next to {Core} {coreVersion}. All AsyncResponse.* packages must be the " +
+                "same version: the channel, transport, durable-flow store, and Testing packages bind to internal Core APIs that " +
+                "change between releases, so a mixed install fails with MissingMethodException or TypeLoadException at first use — " +
+                $"typically inside a background loop, long after startup. Reference every AsyncResponse.* package at {coreVersion} " +
+                "(or move all of them to one newer version); a central <PackageVersion> per package, or one shared version property, " +
+                "keeps them aligned.");
+        }
+    }
+}
+
+/// <summary>
 /// Validates at host startup that <c>AddAsyncResponse()</c> was paired with exactly one response
 /// channel, one worker transport, and one durable-flow state store. These are mandatory core
 /// choices; making each explicit keeps the fluent registration complete and prevents silently
@@ -145,6 +257,9 @@ internal sealed class AsyncResponseStartupValidator(
     /// <summary>Starts this service.</summary>
     public Task StartAsync(CancellationToken cancellationToken)
     {
+        // First: every check below may already run provider code bound to Core internals.
+        AsyncResponsePackageVersions.EnsureSingleVersion(AsyncResponsePackageVersions.Loaded());
+
         ValidateWatchdogOptions(_options.Value.Watchdog);
         ValidateInboundMessageBudget(_options.Value);
         _observerAudit?.Validate();

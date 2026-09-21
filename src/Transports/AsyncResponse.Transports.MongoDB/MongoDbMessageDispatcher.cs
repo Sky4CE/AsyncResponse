@@ -20,7 +20,8 @@ internal sealed class MongoDbMessageDispatcher(
     MongoDbAsyncResponseTransportOptions options,
     MongoDbSubscriberOptions subscriberOptions,
     ILogger logger,
-    MongoDbSubscriberRole role)
+    MongoDbSubscriberRole role,
+    TimeProvider? timeProvider = null)
     : DbMessageDispatcherBase(
         handler,
         options,
@@ -29,4 +30,5 @@ internal sealed class MongoDbMessageDispatcher(
         role,
         providerName: "MongoDB",
         unitNoun: "document",
-        telemetryName: "mongodb");
+        telemetryName: "mongodb",
+        timeProvider: timeProvider);

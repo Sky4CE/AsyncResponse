@@ -89,6 +89,16 @@ internal sealed class PostgreSqlTransportStore
                     await lockCommand.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
                 }
 
+                // The dequeue index is (queue, available_at, created_at) and the claim orders by
+                // exactly that tail, so a claim is one ordered index descent that stops at the
+                // first unleased row. The previous pair — an index over (queue, available_at,
+                // locked_until, created_at) behind ORDER BY created_at — could not serve its own
+                // ordering past the available_at range: the planner either walked the created_at
+                // index through every older row of the OTHER logical queues (dead letters kept for
+                // retention, delayed jobs) or sorted the whole ready set, on every claim, so
+                // draining a burst cost its square. A table created by an older build keeps its
+                // "<table>_claim_idx"; nothing reads it any more and nothing here drops it (DROP
+                // INDEX needs an ACCESS EXCLUSIVE lock on a live queue) — see docs/postgresql.md.
                 await using var command = connection.CreateCommand();
                 command.Transaction = transaction;
                 command.CommandText =
@@ -107,8 +117,8 @@ internal sealed class PostgreSqlTransportStore
                         attempts integer NOT NULL DEFAULT 0,
                         dead_letter_reason text NULL
                     );
-                    CREATE INDEX IF NOT EXISTS {Quote(IndexName(_options.MessageTable, "claim"))}
-                        ON {MessageTable} (queue, available_at, locked_until, created_at);
+                    CREATE INDEX IF NOT EXISTS {Quote(IndexName(_options.MessageTable, "ready"))}
+                        ON {MessageTable} (queue, available_at, created_at);
                     CREATE INDEX IF NOT EXISTS {Quote(IndexName(_options.MessageTable, "created"))}
                         ON {MessageTable} (created_at);
                     """;
@@ -125,7 +135,7 @@ internal sealed class PostgreSqlTransportStore
                     throw new InvalidOperationException(PostgreSqlRelationVerifier.DdlCollisionMessage("transport", _options.SchemaName), ex);
                 }
             }
-            else if (!await TableExistsAsync(connection, transaction, cancellationToken).ConfigureAwait(false))
+            else if (!await RelationExistsAsync(connection, transaction, _options.MessageTable, cancellationToken).ConfigureAwait(false))
             {
                 // Operator-managed schema and the migration has not run yet: the first query
                 // surfaces a clear PostgreSQL error (the documented "create it yourself, later"
@@ -142,6 +152,25 @@ internal sealed class PostgreSqlTransportStore
             // an operator-provisioned table can carry the wrong shape. Verify against the catalog
             // that every relation actually IS what this store reads and writes, definitions
             // included (in-transaction, under the shared DDL lock when this build just ran the DDL).
+            //
+            // The dequeue index is REQUIRED only where this build's DDL just guaranteed it. On an
+            // operator-managed schema it is verified when present and only warned about when
+            // absent: it is claim performance, not correctness, and a migration written for an
+            // older build (which carried "<table>_claim_idx" instead) must not fail startup over it.
+            var readyIndex = IndexName(_options.MessageTable, "ready");
+            var verifyReadyIndex = _options.AutoCreateSchema
+                || await RelationExistsAsync(connection, transaction, readyIndex, cancellationToken).ConfigureAwait(false);
+            if (!verifyReadyIndex)
+            {
+                _logger?.LogWarning(
+                    "PostgreSQL transport table {Schema}.{Table} has no dequeue index {Index} and AutoCreateSchema is disabled. " +
+                    "Claims still work, but their cost grows with the backlog — performance only; create the index over " +
+                    "(queue, available_at, created_at) as described in docs/postgresql.md.",
+                    _options.SchemaName,
+                    _options.MessageTable,
+                    readyIndex);
+            }
+
             await PostgreSqlRelationVerifier.VerifyAsync(
                 connection,
                 transaction,
@@ -161,7 +190,10 @@ internal sealed class PostgreSqlTransportStore
                             new("attempts", "integer", Nullable: false, DefaultExpression: "0"),
                             new("dead_letter_reason", "text", Nullable: true),
                         ], PrimaryKey: ["id"]),
-                    new(IndexName(_options.MessageTable, "claim"), 'i', _options.MessageTable, ["queue", "available_at", "locked_until", "created_at"]),
+                    .. verifyReadyIndex
+                        ? (PostgreSqlRelationVerifier.ExpectedRelation[])
+                            [new(readyIndex, 'i', _options.MessageTable, ["queue", "available_at", "created_at"])]
+                        : [],
                     new(IndexName(_options.MessageTable, "created"), 'i', _options.MessageTable, ["created_at"]),
                 ],
                 cancellationToken).ConfigureAwait(false);
@@ -176,11 +208,11 @@ internal sealed class PostgreSqlTransportStore
     }
 
     /// <summary>
-    /// Reports whether ANY relation occupies the configured queue-table name (any relkind: a view
-    /// or foreign component's object must reach verification, which names the precise wrong-kind
-    /// reason instead of skipping the checks).
+    /// Reports whether ANY relation occupies the given name in the configured schema (any relkind:
+    /// a view or foreign component's object must reach verification, which names the precise
+    /// wrong-kind reason instead of skipping the checks).
     /// </summary>
-    private async Task<bool> TableExistsAsync(NpgsqlConnection connection, NpgsqlTransaction transaction, CancellationToken cancellationToken)
+    private async Task<bool> RelationExistsAsync(NpgsqlConnection connection, NpgsqlTransaction transaction, string relation, CancellationToken cancellationToken)
     {
         await using var command = connection.CreateCommand();
         command.Transaction = transaction;
@@ -193,7 +225,7 @@ internal sealed class PostgreSqlTransportStore
                 WHERE n.nspname = @schema AND c.relname = @table);
             """;
         command.Parameters.AddWithValue("schema", _options.SchemaName);
-        command.Parameters.AddWithValue("table", _options.MessageTable);
+        command.Parameters.AddWithValue("table", relation);
         return (bool)(await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false))!;
     }
 
@@ -210,7 +242,20 @@ internal sealed class PostgreSqlTransportStore
         TimeSpan? delay = null)
     {
         await InsertAsync(id, queue, payload, headers, deadLetterReason: null, notify: true, cancellationToken, delay).ConfigureAwait(false);
-        await PruneDeadLettersIfDueAsync(cancellationToken).ConfigureAwait(false);
+
+        // The row is committed: nothing after this line may fail the publish. A prune that threw
+        // (a lock timeout, a dropped connection, the caller's token firing mid-DELETE) reported a
+        // FAILED publish for a job that is already claimable, and the caller's retry inserts it
+        // again once a subscriber has consumed and deleted the first copy — one job, run twice.
+        // The prune is opportunistic housekeeping; the next throttle window retries it.
+        try
+        {
+            await PruneDeadLettersIfDueAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            _logger?.LogWarning(ex, "PostgreSQL dead-letter prune failed; the publish it followed is committed and unaffected, and the prune is retried in the next throttle window.");
+        }
     }
 
     public async Task<PostgreSqlTransportDelivery?> TryClaimAsync(string queue, TimeSpan lockTimeout, CancellationToken cancellationToken)
@@ -220,6 +265,11 @@ internal sealed class PostgreSqlTransportStore
 
         await using var connection = await _dataSource.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         await using var command = connection.CreateCommand();
+        // Ready order is AVAILABILITY order — (available_at, created_at), the dequeue index's own
+        // key order behind the queue equality — so the scan returns its first unleased row without
+        // sorting. It equals publish order for every row that was neither delayed nor NAKed (both
+        // columns default to the same now()); a delayed or redelivered row queues by when it became
+        // due instead of jumping ahead of everything published while it waited.
         command.CommandText =
             $"""
             WITH next AS (
@@ -228,7 +278,7 @@ internal sealed class PostgreSqlTransportStore
                 WHERE queue = @queue
                   AND available_at <= now()
                   AND (locked_until IS NULL OR locked_until <= now())
-                ORDER BY created_at
+                ORDER BY available_at, created_at
                 FOR UPDATE SKIP LOCKED
                 LIMIT 1
             )
@@ -359,6 +409,10 @@ internal sealed class PostgreSqlTransportStore
     {
         await using var connection = await _dataSource.OpenConnectionAsync(CancellationToken.None).ConfigureAwait(false);
         await using var command = connection.CreateCommand();
+        // No NOTIFY: the released row only becomes claimable once its delay has passed
+        // (RedeliveryDelay is validated positive), so a wake sent now made every idle subscriber
+        // of every queue, in every process, poll for a row none of them could claim yet — on each
+        // handler failure. The row is picked up by the first poll tick after it falls due.
         command.CommandText =
             $"""
             UPDATE {MessageTable}
@@ -366,13 +420,10 @@ internal sealed class PostgreSqlTransportStore
                 locked_until = NULL,
                 lock_id = NULL
             WHERE id = @id AND lock_id = @lock_id;
-            SELECT pg_notify(@channel, @payload);
             """;
         command.Parameters.AddWithValue("id", id);
         command.Parameters.AddWithValue("lock_id", lockId);
         command.Parameters.AddWithValue("delay", delay);
-        command.Parameters.AddWithValue("channel", _options.NotificationChannel);
-        command.Parameters.AddWithValue("payload", "retry");
         await command.ExecuteNonQueryAsync(CancellationToken.None).ConfigureAwait(false);
     }
 
@@ -466,11 +517,22 @@ internal sealed class PostgreSqlTransportStore
         }
     }
 
-    public async Task ExecuteListenAsync(Func<Task> onNotification, CancellationToken cancellationToken)
+    /// <summary>
+    /// LISTENs on the transport's notification channel and invokes <paramref name="onNotification"/>
+    /// for each wake. Every logical queue of every process shares the one channel and a publish
+    /// NOTIFYs the queue it inserted into, so a listener that names its <paramref name="queue"/>
+    /// is woken only for that queue; without it (<c>null</c>) every publish to any queue wakes it
+    /// into a claim that finds nothing.
+    /// </summary>
+    public async Task ExecuteListenAsync(Func<Task> onNotification, CancellationToken cancellationToken, string? queue = null)
     {
         await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
         await using var connection = await _dataSource.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
-        connection.Notification += (_, _) => _ = onNotification();
+        connection.Notification += (_, e) =>
+        {
+            if (IsWakeFor(queue, e.Payload))
+                _ = onNotification();
+        };
         await using (var command = connection.CreateCommand())
         {
             command.CommandText = $"LISTEN {Quote(_options.NotificationChannel)};";
@@ -480,6 +542,14 @@ internal sealed class PostgreSqlTransportStore
         while (!cancellationToken.IsCancellationRequested)
             await connection.WaitAsync(cancellationToken).ConfigureAwait(false);
     }
+
+    /// <summary>
+    /// Whether a NOTIFY payload is a wake for <paramref name="queue"/>. The payload is the queue
+    /// name a publish inserted into, compared ordinally like the queue column itself; a listener
+    /// that names no queue keeps every wake.
+    /// </summary>
+    internal static bool IsWakeFor(string? queue, string payload)
+        => queue is null || string.Equals(payload, queue, StringComparison.Ordinal);
 
     /// <summary>
     /// Opportunistically deletes dead-letter rows older than the configured retention. No-op unless

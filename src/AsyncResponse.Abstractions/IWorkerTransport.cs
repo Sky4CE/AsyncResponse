@@ -71,6 +71,20 @@ public sealed class WorkerJobEnvelope
     /// Additive wire property: absent (zero) on jobs written before it existed.
     /// </summary>
     public int RedelayStallCount { get; set; }
+
+    /// <summary>
+    /// Identity of this job, minted once when the job is first published and carried unchanged by
+    /// every copy of it: a broker redelivery, a <see cref="NotBeforeUtc"/> re-publish hop, and a
+    /// publisher-level retry all keep the id, while two independently enqueued jobs never share
+    /// one. It lets a consumer tell "the broker redelivered the job a live handler is still
+    /// executing" (an in-flight ceiling lapsed — see <see cref="IWorkerTransportInFlightLimit"/>)
+    /// apart from "a second, genuinely redundant job": the durable-flow executor records it with
+    /// the execution lease and never acknowledges a contending delivery that carries the lease
+    /// holder's own id, because that delivery is the only copy of the wake-up the broker still
+    /// has. Opaque; compare ordinally. Additive wire property: absent on jobs written before it
+    /// existed, which keep the previous evidence-based duplicate handling.
+    /// </summary>
+    public string? JobId { get; set; }
 }
 
 /// <summary>

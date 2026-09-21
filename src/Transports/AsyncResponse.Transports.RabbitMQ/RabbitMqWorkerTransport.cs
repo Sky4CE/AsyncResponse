@@ -15,7 +15,7 @@ namespace AsyncResponse.Transports.RabbitMQ;
 /// once the broker has accepted the message. A single channel is shared across concurrent publishers;
 /// RabbitMQ.Client v7 tracks each in-flight confirmation independently, so concurrent publishing is safe.
 /// </remarks>
-public sealed class RabbitMqWorkerTransport : IWorkerTransport, IAsyncDisposable
+public sealed class RabbitMqWorkerTransport : IWorkerTransport, IWorkerTransportInFlightLimit, IAsyncDisposable
 {
     private readonly RabbitMqAsyncResponseOptions _options;
     private readonly IRabbitMqConnectionFactory _connectionFactory;
@@ -51,8 +51,22 @@ public sealed class RabbitMqWorkerTransport : IWorkerTransport, IAsyncDisposable
         _ = RabbitMqOptionsValidator.Required(options.WorkerQueue, nameof(options.WorkerQueue));
         _ = RabbitMqOptionsValidator.Required(options.WorkerRoutingKey, nameof(options.WorkerRoutingKey));
         RabbitMqOptionsValidator.ValidateConnection(options);
+        RabbitMqOptionsValidator.ValidateConsumerTimeout(options);
         AsyncResponseChannelOptions.EnsureTimerBacked(options.ShutdownTimeout, nameof(RabbitMqAsyncResponseOptions), nameof(options.ShutdownTimeout));
     }
+
+    /// <summary>
+    /// The broker's <c>consumer_timeout</c> as mirrored by
+    /// <see cref="RabbitMqAsyncResponseOptions.BrokerConsumerTimeout"/>: past it RabbitMQ closes the
+    /// consumer's channel and requeues the still-unacknowledged delivery while its handler runs.
+    /// <c>null</c> when that option is <c>null</c>, and when the worker subscriber uses
+    /// <see cref="RabbitMqAckMode.AckAfterEnqueue"/> — the delivery is acknowledged before its handler
+    /// starts, so no handler run is ever in flight at the broker.
+    /// </summary>
+    public TimeSpan? MaxInFlightDuration
+        => _options.WorkerSubscriber.AckMode == RabbitMqAckMode.AckAfterEnqueue
+            ? null
+            : _options.BrokerConsumerTimeout;
 
     private async Task<IRabbitMqChannel> GetChannelAsync(CancellationToken cancellationToken)
     {

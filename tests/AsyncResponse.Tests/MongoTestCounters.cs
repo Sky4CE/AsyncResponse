@@ -15,14 +15,18 @@ namespace AsyncResponse.Tests;
 internal static class MongoTestCounters
 {
     /// <summary>
-    /// Stubs the driver's fluent <c>WithReadPreference</c> to return the mock itself. The channel
-    /// store pins <c>ReadPreference.Primary</c> on every collection handle at construction, so a
-    /// loose mock returning null there would replace the test's stubbed collection with null.
+    /// Stubs the driver's fluent <c>WithReadPreference</c> and <c>WithWriteConcern</c> to return
+    /// the mock itself. The stores pin <c>ReadPreference.Primary</c> — and the flow-state store
+    /// also <c>WriteConcern.WMajority</c> — on every collection handle at construction, so a loose
+    /// mock returning null there would replace the test's stubbed collection with null.
     /// </summary>
     public static Mock<IMongoCollection<T>> SelfPinning<T>(this Mock<IMongoCollection<T>> collection)
     {
         collection
             .Setup(c => c.WithReadPreference(It.IsAny<ReadPreference>()))
+            .Returns(collection.Object);
+        collection
+            .Setup(c => c.WithWriteConcern(It.IsAny<WriteConcern>()))
             .Returns(collection.Object);
         return collection;
     }

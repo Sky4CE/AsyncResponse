@@ -1073,6 +1073,12 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
     // IActiveSubscriberProbe
 
     /// <inheritdoc/>
+    /// <remarks>
+    /// Returns the live subscriber count, or a negative value when liveness could not be
+    /// established. Zero is reported only when every node that could hold the subscription
+    /// answered: the channels are key-routed, so the subscription lives on the single slot owner,
+    /// and a zero collected while that node was unreachable says nothing about the waiter.
+    /// </remarks>
     public async ValueTask<long> CountActiveSubscribersAsync(string correlationId, CancellationToken cancellationToken = default)
     {
         if (string.IsNullOrWhiteSpace(correlationId))
@@ -1085,30 +1091,49 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
         // watchdog probe sweeps off blocking thread-pool waits, and the per-endpoint token check
         // lets a shutdown abort the sweep between probes.
         long subscribers = 0;
-        var probed = false;
+        var answeredEveryPrimary = true;
+        var primaryAnswered = false;
         foreach (var endPoint in _multiplexer.GetEndPoints())
         {
             cancellationToken.ThrowIfCancellationRequested();
 
             var server = _multiplexer.GetServer(endPoint);
+
+            // PUBSUB NUMSUB is node-local and the response channels are key-routed, so the
+            // subscription sits on the ONE node that owns the channel key's slot — a primary. A
+            // node that has never connected reports the default (not a replica), which counts it
+            // as a primary here: the conservative direction, since the unknown node may be the
+            // very owner. Replicas are asked too (a positive answer is proof wherever it comes
+            // from) but never decide a zero.
+            var isPrimary = !server.IsReplica;
             if (!server.IsConnected)
+            {
+                answeredEveryPrimary &= !isPrimary;
                 continue;
+            }
 
             try
             {
                 subscribers = Math.Max(subscribers, await server.SubscriptionSubscriberCountAsync(channel).ConfigureAwait(false));
-                probed = true;
+                primaryAnswered |= isPrimary;
             }
             catch (Exception ex) when (ex is not OperationCanceledException)
             {
+                answeredEveryPrimary &= !isPrimary;
                 _logger.LogDebug(ex, "Failed to read subscriber count for channel {Channel}.", channel.ToString()!);
             }
         }
 
-        // Negative = "could not be probed" (the watchdog's unknown-liveness contract): when no
-        // endpoint answered, 0 would assert there is definitively no live waiter and flag every
-        // over-threshold registration stale during a transient probe outage.
-        return probed ? subscribers : -1L;
+        // A count above zero is proof of a live waiter wherever it was read. A zero is only the
+        // absence of one on the nodes that ANSWERED: skipping the slot owner and returning the
+        // siblings' node-local zeros asserted "definitively no live waiter" for a waiter that was
+        // subscribed all along — consuming its recovery registration (a double resume) or
+        // dropping its response. Negative = "could not be probed", the watchdog's and the
+        // snapshot-race re-check's unknown-liveness contract.
+        if (subscribers > 0)
+            return subscribers;
+
+        return primaryAnswered && answeredEveryPrimary ? 0L : -1L;
     }
 
     /// <summary>

@@ -20,7 +20,8 @@ internal sealed class SqlServerMessageDispatcher(
     SqlServerAsyncResponseTransportOptions options,
     SqlServerSubscriberOptions subscriberOptions,
     ILogger logger,
-    SqlServerSubscriberRole role)
+    SqlServerSubscriberRole role,
+    TimeProvider? timeProvider = null)
     : DbMessageDispatcherBase(
         handler,
         options,
@@ -29,4 +30,5 @@ internal sealed class SqlServerMessageDispatcher(
         role,
         providerName: "SQL Server",
         unitNoun: "row",
-        telemetryName: "sqlserver");
+        telemetryName: "sqlserver",
+        timeProvider: timeProvider);

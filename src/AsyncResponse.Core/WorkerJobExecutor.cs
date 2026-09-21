@@ -173,6 +173,15 @@ internal sealed class WorkerJobExecutor(
             // correlation id or reply target.
             using var asyncResponseScope = AsyncResponseContext.PushContext(job.CorrelationId, job.ReplyTarget);
 
+            // The executing job itself, for the one handler that needs it: a durable-flow
+            // execution records the job's identity with its lease, and re-publishes THIS job when
+            // the broker redelivers it under a handler that is still running. Entered in this
+            // frame — the one that awaits the invocation — because an AsyncLocal written inside a
+            // callee never flows back here, and entered even for a job without an id so a job the
+            // in-memory transport runs under its enqueuer's captured context never reads as the
+            // job that published it.
+            using var jobScope = WorkerJobScope.Enter(job);
+
             var invocation = ReflectionExtensions.ResolveCallback(
                 job.Call,
                 payload: null,

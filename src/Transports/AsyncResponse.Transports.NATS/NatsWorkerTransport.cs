@@ -27,7 +27,7 @@ public sealed class NatsWorkerTransport : IWorkerTransport
     public NatsWorkerTransport(
         IOptions<NatsAsyncResponseTransportOptions> options,
         INatsConnection connection)
-        : this(options, new NatsJetStreamTransportAdapter(connection.CreateJetStreamContext()))
+        : this(options, new NatsJetStreamTransportAdapter(connection.CreateJetStreamContext(), null, options.Value.StreamReplicas))
     {
     }
 

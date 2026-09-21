@@ -41,6 +41,8 @@ AsyncResponse.Transports.NATS.NatsAsyncResponseTransportOptions.ResponseSubject.
 AsyncResponse.Transports.NATS.NatsAsyncResponseTransportOptions.ResponseSubscriber.get -> AsyncResponse.Transports.NATS.NatsSubscriberOptions!
 AsyncResponse.Transports.NATS.NatsAsyncResponseTransportOptions.StreamMaxMessages.get -> long?
 AsyncResponse.Transports.NATS.NatsAsyncResponseTransportOptions.StreamMaxMessages.set -> void
+AsyncResponse.Transports.NATS.NatsAsyncResponseTransportOptions.StreamReplicas.get -> int
+AsyncResponse.Transports.NATS.NatsAsyncResponseTransportOptions.StreamReplicas.set -> void
 AsyncResponse.Transports.NATS.NatsAsyncResponseTransportOptions.SubjectPrefix.get -> string!
 AsyncResponse.Transports.NATS.NatsAsyncResponseTransportOptions.SubjectPrefix.set -> void
 AsyncResponse.Transports.NATS.NatsAsyncResponseTransportOptions.SubscriberRetryBaseDelay.get -> System.TimeSpan

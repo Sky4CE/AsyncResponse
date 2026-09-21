@@ -82,6 +82,10 @@ public static class AsyncResponseDiagnostics
         Meter.CreateCounter<long>("asyncresponse.worker.inmemory_delayed_rejections", unit: "{job}",
             description: "Delayed jobs published from inside a running job that the in-memory worker transport refused because DelayedJobCapacity jobs were already scheduled; the publishing job failed and is redelivered.");
 
+    private static readonly Counter<long> FlowOwnJobRedeliveries =
+        Meter.CreateCounter<long>("asyncresponse.flow.own_job_redeliveries", unit: "{delivery}",
+            description: "Durable-flow wake-ups that found the execution lease held by a live execution of their OWN job: the broker redelivered a job whose handler is still running, i.e. a broker in-flight ceiling lapsed under it. Never acknowledged as duplicates; tagged by resolution (redelayed: re-published as the same job, then acknowledged; waiting: kept with the transport).");
+
     // Every live in-memory transport in the process, for the overflow-depth gauge: the meter is
     // static and a process may host several transports (test harnesses, host-per-tenant workers),
     // so the gauge sums them and drops the ones that have been collected. Weak references keep a
@@ -97,6 +101,16 @@ public static class AsyncResponseDiagnostics
     {
         if (InMemoryOverflowRejections.Enabled)
             InMemoryOverflowRejections.Add(1);
+    }
+
+    /// <summary>
+    /// Records one durable-flow wake-up recognised as the lease holder's own job redelivered
+    /// (<paramref name="resolution"/>: <c>redelayed</c> or <c>waiting</c>).
+    /// </summary>
+    internal static void RecordFlowOwnJobRedelivery(string resolution)
+    {
+        if (FlowOwnJobRedeliveries.Enabled)
+            FlowOwnJobRedeliveries.Add(1, new KeyValuePair<string, object?>("resolution", resolution));
     }
 
     /// <summary>Records one in-job delayed publish the in-memory transport rejected at its delayed-job capacity.</summary>

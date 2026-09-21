@@ -1,6 +1,7 @@
 using AsyncResponse.Channels.NATS;
 using AsyncResponse.Transports.NATS;
 using Microsoft.Extensions.Logging;
+using System.Collections.Concurrent;
 using System.Runtime.CompilerServices;
 using System.Threading.Channels;
 
@@ -412,6 +413,12 @@ internal sealed class FakeNatsJetStreamTransport : INatsJetStreamTransport
     private int _ensureStreamAttempts;
     private readonly Channel<NatsJobDelivery> _deliveries = Channel.CreateUnbounded<NatsJobDelivery>();
 
+    /// <summary>
+    /// The <c>maxMessages</c> of every fetch, in order. How many messages a fetch asks for decides
+    /// how many share one message's delivery-count fate, so it is observable here.
+    /// </summary>
+    public readonly ConcurrentQueue<int> FetchSizes = new();
+
     public Task EnsureStreamAsync(string stream, string subject, long? maxMessages, CancellationToken cancellationToken)
     {
         _ensureStreamAttempts++;
@@ -457,6 +464,7 @@ internal sealed class FakeNatsJetStreamTransport : INatsJetStreamTransport
     /// <summary>Immediate drain: yields only what is already queued, like a JetStream no-wait fetch.</summary>
     public async IAsyncEnumerable<NatsJobDelivery> FetchNoWaitAsync(string stream, string durable, int maxMessages, [EnumeratorCancellation] CancellationToken cancellationToken)
     {
+        FetchSizes.Enqueue(maxMessages);
         for (var i = 0; i < maxMessages && _deliveries.Reader.TryRead(out var delivery); i++)
         {
             cancellationToken.ThrowIfCancellationRequested();
@@ -468,6 +476,7 @@ internal sealed class FakeNatsJetStreamTransport : INatsJetStreamTransport
     /// <summary>Long poll: waits for the first delivery (or expiry/completion), then drains up to the batch.</summary>
     public async IAsyncEnumerable<NatsJobDelivery> FetchAsync(string stream, string durable, int maxMessages, TimeSpan expires, [EnumeratorCancellation] CancellationToken cancellationToken)
     {
+        FetchSizes.Enqueue(maxMessages);
         using var expiry = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         expiry.CancelAfter(expires);
         for (var i = 0; i < maxMessages; i++)

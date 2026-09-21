@@ -14,7 +14,7 @@ namespace AsyncResponse.Transports.GooglePubSub;
 /// The publisher client is created lazily and re-created on demand: a transient build failure when the
 /// first job is published does not permanently break the transport (a faulted build attempt is not cached).
 /// </remarks>
-public sealed class GooglePubSubWorkerTransport : IWorkerTransport, IAsyncDisposable
+public sealed class GooglePubSubWorkerTransport : IWorkerTransportInFlightLimit, IAsyncDisposable
 {
     private readonly GooglePubSubAsyncResponseOptions _options;
     private readonly Func<CancellationToken, Task<IGooglePubSubPublisherClient>> _publisherFactory;
@@ -37,8 +37,30 @@ public sealed class GooglePubSubWorkerTransport : IWorkerTransport, IAsyncDispos
         _ = GooglePubSubOptionsValidator.Required(_options.ProjectId, nameof(_options.ProjectId));
         _ = GooglePubSubOptionsValidator.Required(_options.WorkerTopicId, nameof(_options.WorkerTopicId));
         GooglePubSubOptionsValidator.ValidateTimeouts(_options);
+        // Advertised below as the in-flight ceiling, whose contract is "positive": check it here
+        // as well as in the subscriber, which may start later than the first consumer of the value.
+        GooglePubSubOptionsValidator.ValidateMaxTotalAckExtension(
+            _options.WorkerSubscriber,
+            $"{nameof(GooglePubSubAsyncResponseOptions)}.{nameof(GooglePubSubAsyncResponseOptions.WorkerSubscriber)}");
         _publisherFactory = publisherFactory;
     }
+
+    /// <summary>
+    /// The worker subscriber's <see cref="GooglePubSubSubscriberOptions.MaxTotalAckExtension"/>: past
+    /// it the Pub/Sub client stops extending the job's ack deadline and Pub/Sub redelivers the same
+    /// job while its first handler is still running. <c>null</c> when the worker subscriber uses
+    /// <see cref="GooglePubSubAckMode.AckAfterEnqueue"/> — the delivery is settled at enqueue, so no
+    /// handler is ever held against the ceiling.
+    /// <para>
+    /// The subscriber and this publisher read the same options instance, so the value is the one the
+    /// consuming side applies. Pub/Sub redelivers up to one ack deadline (60 seconds) <em>after</em>
+    /// the extension lapses; advertising the extension itself keeps the engine on the safe side.
+    /// </para>
+    /// </summary>
+    public TimeSpan? MaxInFlightDuration
+        => _options.WorkerSubscriber.AckMode is GooglePubSubAckMode.AckAfterEnqueue
+            ? null
+            : _options.WorkerSubscriber.MaxTotalAckExtension;
 
     private async Task<IGooglePubSubPublisherClient> GetPublisherAsync(CancellationToken cancellationToken)
     {

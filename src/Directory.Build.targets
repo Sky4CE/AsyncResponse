@@ -1,0 +1,34 @@
+<Project>
+
+  <!-- Sibling AsyncResponse.* packages are packed as EXACT-version dependencies: [1.2.3], not the
+       ">= 1.2.3" NuGet writes for a ProjectReference by default.
+
+       The packages are one product split along provider lines, not independently versioned
+       libraries. Core grants InternalsVisibleTo to every provider package and Abstractions grants
+       it to Core and the database channels, and the providers compile against those internals
+       (AsyncResponseIngress, the envelope JSON, FlowStateJson, JsonSafety, the startup markers, …)
+       — a surface no public-API baseline tracks and that changes freely between releases. With an open range NuGet happily
+       resolves AsyncResponse.Core 0.2.0 next to AsyncResponse.Transports.Redis 0.1.0, and the
+       application dies with MissingMethodException at the first call across the seam instead of
+       failing at restore. With the exact range the same graph is NU1608 (a direct reference
+       outside a dependency's range) or NU1107 (two providers pinning different Cores).
+
+       Every ProjectReference under src/ is a sibling package, so every one is pinned — including
+       Core -> Abstractions, which is NOT public-API-only for this purpose (see the IVT list in
+       AsyncResponse.Abstractions.csproj).
+
+       _GetProjectReferenceVersions is a private NuGet.Build.Tasks.Pack target: it fills
+       _ProjectReferencesWithVersions, whose ProjectVersion metadata the pack task parses as a
+       version RANGE. There is no public knob for this (NuGet/Home#5556), so the hook is guarded
+       from the outside instead: scripts/verify-package-dependencies.sh reads the packed .nuspec
+       files in CI and before every publish, and fails when a sibling dependency is not exact —
+       which is what an SDK that renamed the target would produce. -->
+  <Target Name="PinSiblingPackageVersions" AfterTargets="_GetProjectReferenceVersions">
+    <ItemGroup>
+      <_ProjectReferencesWithVersions Condition="'%(ProjectVersion)' != '' And !$([System.String]::Copy('%(ProjectVersion)').StartsWith('['))">
+        <ProjectVersion>[%(ProjectVersion)]</ProjectVersion>
+      </_ProjectReferencesWithVersions>
+    </ItemGroup>
+  </Target>
+
+</Project>

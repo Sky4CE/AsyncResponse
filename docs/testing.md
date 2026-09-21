@@ -184,7 +184,12 @@ registration in place — exactly what a crashed process leaves behind.
 incarnation's execution leases, but there is no process to kill: a step body that outlives the
 graceful stop (bounded by `options.RealTimeGuard`) — it ignored its cancellation and is blocked
 on something the test controls — keeps running beside the new incarnation and performs its side
-effects *after* the restart returned, which is less than a "restart" claims. `SimulateRestartAsync`
+effects *after* the restart returned, which is less than a "restart" claims. An engine-owned park
+does not cost that wait: an awaited step or an in-process timer can only end when the test replies
+or moves the virtual clock, and neither can happen while the test is awaiting the restart, so the
+stop ends as soon as a park is all that is left (the leases are broken immediately after, and the
+new incarnation takes the execution over). Only user code that is genuinely still running waits
+out the guard. `SimulateRestartAsync`
 therefore refuses with `InvalidOperationException` when user code is still executing after the
 stop lapsed (engine-owned parks — an awaited step or an in-process timer holding its worker slot
 on the virtual clock — are expected and never trip this). Let the step observe its cancellation

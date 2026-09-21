@@ -71,6 +71,12 @@ public abstract class AsyncResponseChannelOptions
     /// characters are rejected because the stores disagree about them (see
     /// <see cref="PortableText.IndexOfControlCharacter"/>).
     /// <para>
+    /// The id is quoted back through <see cref="DiagnosticText.EscapedExcerpt"/>, never raw: the
+    /// rejection is logged at Error and copied onto the activity status, and the two rejections that
+    /// quote the id are the two whose offending unit — a CR/LF, an unpaired surrogate — may sit
+    /// inside the quoted 40 units. Quoted raw, the inbound id wrote its own log lines.
+    /// </para>
+    /// <para>
     /// The rules kept in <see cref="PortableText"/> are the ones this contract genuinely SHARES
     /// with <c>FlowStateConcurrency.FlowIdNotPortable</c>. Two flow-id rules are deliberately not
     /// mirrored here because correlation ids have no such sink: the UTF-8 byte cap exists for
@@ -105,7 +111,7 @@ public abstract class AsyncResponseChannelOptions
         {
             return PortableText.IllFormedUtf16Rejection(
                 "CorrelationId",
-                PortableText.Excerpt(correlationId),
+                DiagnosticText.EscapedExcerpt(correlationId),
                 correlationId[illFormed],
                 illFormed);
         }
@@ -114,7 +120,7 @@ public abstract class AsyncResponseChannelOptions
         {
             return PortableText.ControlCharacterRejection(
                 "CorrelationId",
-                PortableText.Excerpt(correlationId),
+                DiagnosticText.EscapedExcerpt(correlationId),
                 correlationId[control],
                 control);
         }

@@ -97,9 +97,32 @@ jobs:
         # the shipped src/** packages without a hand-maintained list.
         run: dotnet pack AsyncResponse.slnx --configuration Release --no-build -p:Version="$PACKAGE_VERSION" -o ./artifacts
 
+      - name: Verify sibling package dependencies are pinned
+        # The packages share internals, so a mixed-version install fails at runtime rather than at
+        # restore. src/Directory.Build.targets pins each sibling dependency to an exact version
+        # through a private NuGet pack target; this is the check from outside it.
+        run: bash scripts/verify-package-dependencies.sh ./artifacts
+
       - name: Push to nuget.org
-        run: >
-          dotnet nuget push "./artifacts/*.nupkg"
-          --api-key "${{ secrets.NUGET_API_KEY }}"
-          --source https://api.nuget.org/v3/index.json
-          --skip-duplicate
+        # Dependency order: a consumer that restores a provider package the moment it appears must
+        # find the Abstractions/Core it pins already on the feed. A mid-push failure then leaves a
+        # resolvable graph instead of satellites whose exact-pinned Core does not exist yet.
+        # --skip-duplicate makes a re-run of this job idempotent.
+        env:
+          NUGET_API_KEY: ${{ secrets.NUGET_API_KEY }}
+        run: |
+          push() {
+            dotnet nuget push "$1" \
+              --api-key "$NUGET_API_KEY" \
+              --source https://api.nuget.org/v3/index.json \
+              --skip-duplicate
+          }
+
+          push "./artifacts/AsyncResponse.Abstractions.*.nupkg"
+          push "./artifacts/AsyncResponse.Core.*.nupkg"
+          for package in ./artifacts/*.nupkg; do
+            case "$(basename "$package")" in
+              AsyncResponse.Abstractions.*|AsyncResponse.Core.*) continue ;;
+            esac
+            push "$package"
+          done

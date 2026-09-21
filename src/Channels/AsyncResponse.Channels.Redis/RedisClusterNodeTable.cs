@@ -1,12 +1,14 @@
+using Microsoft.Extensions.Logging;
+using StackExchange.Redis;
 using System.Globalization;
 using System.Net;
 
 namespace AsyncResponse.Channels.Redis;
 
 /// <summary>
-/// The slice of a <c>CLUSTER NODES</c> reply the recovery scan needs: which address each node is
-/// reachable at, and whether it owns slots as a primary. Parsed from the raw reply — the text
-/// format is Redis's own wire contract — rather than read through the client's
+/// The slice of a <c>CLUSTER NODES</c> reply the recovery scan and the liveness probe need: which
+/// address each node is reachable at, and whether it owns slots as a primary. Parsed from the raw
+/// reply — the text format is Redis's own wire contract — rather than read through the client's
 /// <c>ClusterConfiguration</c>, which cannot be constructed outside the client and would leave
 /// this classification untestable.
 /// <para>
@@ -17,7 +19,14 @@ namespace AsyncResponse.Channels.Redis;
 /// </summary>
 internal static class RedisClusterNodeTable
 {
-    internal readonly record struct Node(string Address, string? HostName, int Port, bool IsReplica, bool HasSlots);
+    internal readonly record struct Node(string Address, string? HostName, int Port, bool IsReplica, bool HasSlots)
+    {
+        /// <summary>
+        /// A primary with a slot field of any kind — a migration marker counts: a primary that is
+        /// importing its first slot already holds the keys moved into it so far.
+        /// </summary>
+        public bool IsSlotOwner => !IsReplica && HasSlots;
+    }
 
     private const int FirstSlotField = 8;
 
@@ -41,10 +50,21 @@ internal static class RedisClusterNodeTable
             if (address.IndexOf('@') is var bus and >= 0)
                 address = address[..bus];
 
+            var hasSlots = fields.Length > FirstSlotField;
             var portSeparator = address.LastIndexOf(':');
+            var port = 0;
             if (portSeparator <= 0
-                || !int.TryParse(address.AsSpan(portSeparator + 1), NumberStyles.None, CultureInfo.InvariantCulture, out var port))
-                continue;
+                || !int.TryParse(address.AsSpan(portSeparator + 1), NumberStyles.None, CultureInfo.InvariantCulture, out port))
+            {
+                // No usable address (the noaddr flag prints ":0@0"). A line that lists slots is
+                // kept anyway, under an address no endpoint can match: dropped, a slot owner
+                // nobody can reach would vanish from the table, and a coverage check over the
+                // rest would pass without its shard.
+                if (!hasSlots)
+                    continue;
+
+                (address, portSeparator, port) = (string.Empty, 0, 0);
+            }
 
             var flags = fields[2].Split(',');
             nodes.Add(new Node(
@@ -52,10 +72,35 @@ internal static class RedisClusterNodeTable
                 string.IsNullOrEmpty(hostName) ? null : hostName,
                 port,
                 IsReplica: Array.Exists(flags, static flag => flag is "slave" or "replica"),
-                HasSlots: fields.Length > FirstSlotField));
+                HasSlots: hasSlots));
         }
 
         return nodes;
+    }
+
+    /// <summary>
+    /// Reads and parses <paramref name="clusterNode"/>'s view of the node table, or <c>null</c>
+    /// when it cannot be read or lists nothing — which every caller treats as "unknown", never as
+    /// "no slot owners".
+    /// </summary>
+    internal static async Task<List<Node>?> TryReadAsync(IServer clusterNode, ILogger logger)
+    {
+        string? nodeTable;
+        try
+        {
+            nodeTable = await clusterNode.ClusterNodesRawAsync().ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is RedisException or TimeoutException or InvalidOperationException)
+        {
+            logger.LogDebug(ex, "Could not read CLUSTER NODES from {EndPoint}.", clusterNode.EndPoint);
+            return null;
+        }
+
+        if (string.IsNullOrWhiteSpace(nodeTable))
+            return null;
+
+        var nodes = Parse(nodeTable);
+        return nodes.Count == 0 ? null : nodes;
     }
 
     /// <summary>
@@ -66,24 +111,28 @@ internal static class RedisClusterNodeTable
     /// </summary>
     internal static bool OwnsNoSlots(List<Node> nodes, EndPoint? endPoint)
     {
+        foreach (var node in nodes)
+        {
+            if (IsSameNode(node, endPoint))
+                return !node.IsSlotOwner;
+        }
+
+        return false;
+    }
+
+    /// <summary>Whether <paramref name="endPoint"/> is the address (or announced hostname) and port the table lists <paramref name="node"/> at.</summary>
+    internal static bool IsSameNode(Node node, EndPoint? endPoint)
+    {
         var (host, port) = endPoint switch
         {
             IPEndPoint ip => (ip.Address.ToString(), ip.Port),
             DnsEndPoint dns => (dns.Host, dns.Port),
             _ => (null, 0)
         };
-        if (host is null)
-            return false;
 
-        foreach (var node in nodes)
-        {
-            if (node.Port != port || !(SameHost(node.Address, host) || (node.HostName is { } announced && SameHost(announced, host))))
-                continue;
-
-            return node.IsReplica || !node.HasSlots;
-        }
-
-        return false;
+        return host is not null
+            && node.Port == port
+            && (SameHost(node.Address, host) || (node.HostName is { } announced && SameHost(announced, host)));
     }
 
     private static bool SameHost(string left, string right)

@@ -53,8 +53,11 @@ internal abstract class RabbitMqMessageDispatcher : IAsyncDisposable
     internal static int ResolveDeliveryAttempt(RabbitMqDelivery delivery)
     {
         var priorAttempts = Math.Max(ReadDeathCount(delivery.BasicProperties), delivery.Redelivered ? 1L : 0L);
-        var attempt = priorAttempts + 1;
-        return attempt > int.MaxValue ? int.MaxValue : (int)attempt;
+
+        // Saturate BEFORE the +1. x-death is a message header, so any publisher can forge it: a count
+        // of long.MaxValue wrapped to long.MinValue on the increment, slipped under the int.MaxValue
+        // range check and cast to attempt 0 — a message below every cap forever, never parked.
+        return priorAttempts >= int.MaxValue ? int.MaxValue : (int)(priorAttempts + 1);
     }
 
     /// <summary>
@@ -242,6 +245,22 @@ internal abstract class RabbitMqMessageDispatcher : IAsyncDisposable
                 "dead-lettered messages would be consumed as live traffic.");
         }
 
+        // The park publish goes through the default exchange, whose routing key IS the queue name:
+        // parked into a live queue, a capped message is redelivered straight back to the subscriber
+        // that parked it — past its cap, so it is parked again, in a loop at broker rate.
+        if (!string.IsNullOrWhiteSpace(transportOptions.ParkQueue)
+            && (StringComparer.Ordinal.Equals(transportOptions.ParkQueue, transportOptions.WorkerQueue)
+                || StringComparer.Ordinal.Equals(transportOptions.ParkQueue, transportOptions.ResponseQueue)))
+        {
+            throw new InvalidOperationException(
+                $"{nameof(RabbitMqAsyncResponseOptions)}.{nameof(RabbitMqAsyncResponseOptions.ParkQueue)} " +
+                $"'{transportOptions.ParkQueue}' must not be a live queue " +
+                $"({nameof(RabbitMqAsyncResponseOptions.WorkerQueue)}/{nameof(RabbitMqAsyncResponseOptions.ResponseQueue)}): " +
+                "parked messages would be consumed as live traffic.");
+        }
+
+        RabbitMqOptionsValidator.ValidateConsumerTimeout(transportOptions);
+
         if (subscriberOptions.PrefetchCount == 0)
             throw new InvalidOperationException($"{optionPath}.{nameof(RabbitMqSubscriberOptions.PrefetchCount)} must be positive.");
 
@@ -295,8 +314,25 @@ internal abstract class RabbitMqMessageDispatcher : IAsyncDisposable
         IRabbitMqChannel channel,
         CancellationToken subscriberCancellationToken);
 
+    /// <summary>
+    /// Binds the channel of the subscriber attempt that is about to consume; disposing the returned
+    /// handle unbinds it when that attempt ends. The dispatcher lives as long as the hosted
+    /// subscriber and is fed by every attempt, so only a dispatcher that works after the delivery
+    /// callback returns needs to know which channel is the live one.
+    /// </summary>
+    public virtual IDisposable AttachChannel(IRabbitMqChannel channel) => NoChannelAttachment.Instance;
+
     /// <summary>Releases resources held by this instance.</summary>
     public virtual ValueTask DisposeAsync() => ValueTask.CompletedTask;
+
+    private sealed class NoChannelAttachment : IDisposable
+    {
+        public static readonly NoChannelAttachment Instance = new();
+
+        public void Dispose()
+        {
+        }
+    }
 
     /// <summary>Runs the ExecuteHandlerAsync operation.</summary>
     protected async Task ExecuteHandlerAsync(
@@ -374,6 +410,9 @@ internal sealed class AwaitingRabbitMqMessageDispatcher(
     RabbitMqSubscriberRole role)
     : RabbitMqMessageDispatcher(handler, transportOptions, subscriberOptions, logger, queue, role)
 {
+    /// <summary>Failed parks in a row; paces the requeue of the next one (reset by a park that lands).</summary>
+    private int _consecutiveParkFailures;
+
     /// <summary>Handles the delivered message.</summary>
     public override async Task HandleAsync(
         RabbitMqDelivery delivery,
@@ -396,7 +435,8 @@ internal sealed class AwaitingRabbitMqMessageDispatcher(
                 await ParkAtCapAsync(
                     delivery,
                     channel,
-                    new InvalidOperationException($"RabbitMQ delivery exceeded {MaxDeliveryAttempts} delivery attempts before its handler ran.")).ConfigureAwait(false);
+                    new InvalidOperationException($"RabbitMQ delivery exceeded {MaxDeliveryAttempts} delivery attempts before its handler ran."),
+                    subscriberCancellationToken).ConfigureAwait(false);
             }
 
             return;
@@ -432,7 +472,7 @@ internal sealed class AwaitingRabbitMqMessageDispatcher(
             else if (deathCount == 0 || belowCap)
                 await TryNackAsync(delivery, channel, requeue: false).ConfigureAwait(false);
             else
-                await ParkAtCapAsync(delivery, channel, ex).ConfigureAwait(false);
+                await ParkAtCapAsync(delivery, channel, ex, subscriberCancellationToken).ConfigureAwait(false);
             return;
         }
 
@@ -459,45 +499,75 @@ internal sealed class AwaitingRabbitMqMessageDispatcher(
     /// <summary>
     /// Terminal settlement for a delivery at its cap whose <c>x-death</c> shows the dead-letter
     /// exchange already returned it once: another reject would only re-enter that cycle. The
-    /// message is copied to <see cref="RabbitMqAsyncResponseOptions.DeadLetterQueue"/> through
-    /// the default exchange when one is configured — bypassing the exchange that cycles — and the
-    /// delivery is ACKed so the loop ends; without a queue the drop is logged as an error. A
-    /// failed copy leaves the delivery un-ACKed, so the broker redelivers it and the park retries.
+    /// message is copied to <see cref="RabbitMqAsyncResponseOptions.ParkQueue"/> (or, without one,
+    /// <see cref="RabbitMqAsyncResponseOptions.DeadLetterQueue"/>) through the default exchange —
+    /// bypassing the exchange that cycles — and the delivery is ACKed so the loop ends; without a
+    /// queue the drop is logged as an error. A failed copy is handed back to the broker with a
+    /// requeue after a backoff, so it is redelivered and the park retries.
     /// </summary>
-    private async Task ParkAtCapAsync(RabbitMqDelivery delivery, IRabbitMqChannel channel, Exception exception)
+    private async Task ParkAtCapAsync(
+        RabbitMqDelivery delivery,
+        IRabbitMqChannel channel,
+        Exception exception,
+        CancellationToken subscriberCancellationToken)
     {
         // A closed channel already requeued every un-ACKed delivery; it comes back with the same
         // x-death count and parks on its next attempt.
         if (!channel.IsOpen)
             return;
 
-        var deadLetterQueue = TransportOptions.DeadLetterQueue;
-        if (!string.IsNullOrWhiteSpace(deadLetterQueue))
+        var parkQueue = !string.IsNullOrWhiteSpace(TransportOptions.ParkQueue)
+            ? TransportOptions.ParkQueue
+            : TransportOptions.DeadLetterQueue;
+        if (!string.IsNullOrWhiteSpace(parkQueue))
         {
             try
             {
                 await channel.BasicPublishAsync(
                     string.Empty,
-                    deadLetterQueue,
+                    parkQueue,
                     BuildDeadLetterProperties(delivery, exception),
                     delivery.Body,
                     CancellationToken.None).ConfigureAwait(false);
+                Volatile.Write(ref _consecutiveParkFailures, 0);
                 Logger.LogWarning(
                     exception,
                     "RabbitMQ delivery {DeliveryTag} on {Queue} reached {MaxDeliveryAttempts} delivery attempts after riding the dead-letter cycle; parked in {DeadLetterQueue}.",
                     delivery.DeliveryTag,
                     QueueName,
                     MaxDeliveryAttempts,
-                    deadLetterQueue);
+                    parkQueue);
             }
             catch (Exception publishException)
             {
+                // Hand the delivery back explicitly. AMQP never redelivers an un-ACKed delivery
+                // while its channel stays open — leaving it unsettled only pinned one prefetch
+                // credit, and PrefetchCount failed parks later the consumer received nothing at
+                // all, most likely during the very incident that is filling the park queue. The
+                // pause keeps the requeue → redeliver → failed-park loop off broker rate; it runs
+                // inside the delivery callback, so this channel's deliveries wait with it.
+                var retryDelay = AsyncResponseRetry.Backoff(
+                    Interlocked.Increment(ref _consecutiveParkFailures),
+                    TransportOptions.SubscriberRetryBaseDelay,
+                    TransportOptions.SubscriberRetryMaxDelay);
                 Logger.LogError(
                     publishException,
-                    "Failed to park capped RabbitMQ delivery {DeliveryTag} on {Queue} in {DeadLetterQueue}; leaving it un-ACKed so the broker redelivers it.",
+                    "Failed to park capped RabbitMQ delivery {DeliveryTag} on {Queue} in {DeadLetterQueue}; requeueing it in {RetryDelay} so the broker redelivers it and the park is retried.",
                     delivery.DeliveryTag,
                     QueueName,
-                    deadLetterQueue);
+                    parkQueue,
+                    retryDelay);
+
+                try
+                {
+                    await Task.Delay(retryDelay, subscriberCancellationToken).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException)
+                {
+                    // Stopping: skip the rest of the pause, not the requeue.
+                }
+
+                await TryNackAsync(delivery, channel, requeue: true).ConfigureAwait(false);
                 return;
             }
         }
@@ -505,7 +575,7 @@ internal sealed class AwaitingRabbitMqMessageDispatcher(
         {
             Logger.LogError(
                 exception,
-                "RabbitMQ delivery {DeliveryTag} on {Queue} reached {MaxDeliveryAttempts} delivery attempts after riding the dead-letter cycle and no DeadLetterQueue is configured; ACKing it so the cycle ends — the message is dropped.",
+                "RabbitMQ delivery {DeliveryTag} on {Queue} reached {MaxDeliveryAttempts} delivery attempts after riding the dead-letter cycle and neither ParkQueue nor DeadLetterQueue is configured; ACKing it so the cycle ends — the message is dropped.",
                 delivery.DeliveryTag,
                 QueueName,
                 MaxDeliveryAttempts);
@@ -572,6 +642,21 @@ internal sealed class QueuedRabbitMqMessageDispatcher : RabbitMqMessageDispatche
     /// DLX route is unreachable once the ACK happened at enqueue).
     /// </summary>
     private volatile IRabbitMqChannel? _channel;
+
+    /// <summary>
+    /// The live subscriber attempt's channel. This dispatcher outlives attempts — queued work that
+    /// was already ACKed must survive a channel shutdown or connection blip instead of being
+    /// drained as if the host were stopping — so a background failure that lands while an attempt
+    /// is being rebuilt publishes through the NEXT attempt's channel, never the dead one.
+    /// </summary>
+    private readonly object _attachGate = new();
+    private ChannelAttachment? _attachment;
+    private TaskCompletionSource _attached = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+    /// <summary>Signalled when disposal starts: no further attempt will attach a channel.</summary>
+    private readonly CancellationTokenSource _stopping = new();
+    private readonly CancellationToken _stoppingToken;
+    private readonly TimeSpan _deadLetterChannelWait;
     private readonly TimeSpan _drainTimeout;
     private readonly string _queueName;
     private readonly RabbitMqSubscriberRole _role;
@@ -590,6 +675,15 @@ internal sealed class QueuedRabbitMqMessageDispatcher : RabbitMqMessageDispatche
         : base(handler, transportOptions, subscriberOptions, logger, queue, role)
     {
         _drainTimeout = subscriberOptions.BackgroundDrainTimeout;
+        _stoppingToken = _stopping.Token;
+
+        // Twice the supervisor's longest backoff: a reachable broker yields the next attempt's
+        // channel well inside it, and an unreachable one must not hold a background worker (and
+        // the queued work behind it) for the length of the outage.
+        var channelWait = transportOptions.SubscriberRetryMaxDelay + transportOptions.SubscriberRetryMaxDelay;
+        _deadLetterChannelWait = channelWait > AsyncResponseChannelOptions.MaxTimerBackedTimeout
+            ? AsyncResponseChannelOptions.MaxTimerBackedTimeout
+            : channelWait;
         _queueName = queue;
         _role = role;
         _queue = Channel.CreateBounded<RabbitMqDelivery>(new BoundedChannelOptions(subscriberOptions.BackgroundQueueCapacity)
@@ -642,16 +736,23 @@ internal sealed class QueuedRabbitMqMessageDispatcher : RabbitMqMessageDispatche
                 _queueName,
                 PendingCount,
                 RunningCount);
+            // The park also ends with the attempt that delivered it. The queue outlives attempts,
+            // so a write parked under a channel that has since died would otherwise land later —
+            // after the broker already requeued that un-ACKed delivery for the next attempt — and
+            // the job would run twice.
+            using var parked = CancellationTokenSource.CreateLinkedTokenSource(
+                subscriberCancellationToken,
+                AttachmentEnded(channel));
             try
             {
-                await _queue.Writer.WriteAsync(delivery, subscriberCancellationToken).ConfigureAwait(false);
+                await _queue.Writer.WriteAsync(delivery, parked.Token).ConfigureAwait(false);
             }
             catch (Exception ex) when (ex is OperationCanceledException or ChannelClosedException)
             {
-                // Subscriber stopping or dispatcher draining while parked: the delivery was never
-                // enqueued (and never ACKed), so hand it back to the broker — one NACK, not a spin.
-                // A closed channel requeues the un-ACKed delivery on its own; never throw from here,
-                // this runs inside the client's delivery callback.
+                // Subscriber stopping, its attempt ending, or dispatcher draining while parked: the
+                // delivery was never enqueued (and never ACKed), so hand it back to the broker — one
+                // NACK, not a spin. A closed channel requeues the un-ACKed delivery on its own;
+                // never throw from here, this runs inside the client's delivery callback.
                 Interlocked.Decrement(ref _pendingCount);
                 await TryRequeueAsync(delivery, channel).ConfigureAwait(false);
                 return;
@@ -692,49 +793,167 @@ internal sealed class QueuedRabbitMqMessageDispatcher : RabbitMqMessageDispatche
         if (string.IsNullOrWhiteSpace(TransportOptions.DeadLetterExchange))
             return;
 
-        if (_channel is not { IsOpen: true } channel)
-        {
-            Logger.LogError(
-                "Cannot dead-letter already-ACKed RabbitMQ delivery {DeliveryTag} on {Queue}: the subscriber channel is closed. The failure is only observable via logs and OnBackgroundFailure.",
-                delivery.DeliveryTag,
-                _queueName);
-            return;
-        }
-
         var properties = BuildDeadLetterProperties(delivery, exception);
 
         var routingKey = string.IsNullOrWhiteSpace(TransportOptions.DeadLetterRoutingKey)
             ? delivery.RoutingKey
             : TransportOptions.DeadLetterRoutingKey;
 
-        // Serialized: multiple background workers can fail concurrently, and they share the
-        // subscriber's one channel.
-        await _deadLetterPublishGate.WaitAsync().ConfigureAwait(false);
-        try
+        // The channel this delivery arrived on may be gone: the dispatcher outlives subscriber
+        // attempts. Publish through the live attempt's channel, waiting for the next one while the
+        // subscriber is being rebuilt — bounded, and not at all once disposal has started (no
+        // further attempt follows).
+        using var channelWait = CancellationTokenSource.CreateLinkedTokenSource(_stoppingToken);
+        channelWait.CancelAfter(_deadLetterChannelWait);
+
+        while (true)
         {
-            await channel.BasicPublishAsync(
-                TransportOptions.DeadLetterExchange!,
-                routingKey,
-                properties,
-                delivery.Body,
-                CancellationToken.None).ConfigureAwait(false);
-            Logger.LogInformation(
-                "Dead-lettered already-ACKed RabbitMQ delivery {DeliveryTag} from {Queue} to exchange {DeadLetterExchange}.",
-                delivery.DeliveryTag,
-                _queueName,
-                TransportOptions.DeadLetterExchange);
+            var channel = await WaitForOpenChannelAsync(channelWait.Token).ConfigureAwait(false);
+            if (channel is null)
+            {
+                Logger.LogError(
+                    "Cannot dead-letter already-ACKed RabbitMQ delivery {DeliveryTag} on {Queue}: the subscriber channel is closed and no new one was attached. The failure is only observable via logs and OnBackgroundFailure.",
+                    delivery.DeliveryTag,
+                    _queueName);
+                return;
+            }
+
+            // Serialized: multiple background workers can fail concurrently, and they share the
+            // subscriber's one channel.
+            await _deadLetterPublishGate.WaitAsync().ConfigureAwait(false);
+            try
+            {
+                await channel.BasicPublishAsync(
+                    TransportOptions.DeadLetterExchange!,
+                    routingKey,
+                    properties,
+                    delivery.Body,
+                    CancellationToken.None).ConfigureAwait(false);
+                Logger.LogInformation(
+                    "Dead-lettered already-ACKed RabbitMQ delivery {DeliveryTag} from {Queue} to exchange {DeadLetterExchange}.",
+                    delivery.DeliveryTag,
+                    _queueName,
+                    TransportOptions.DeadLetterExchange);
+                return;
+            }
+            catch (Exception publishException) when (!channel.IsOpen && !channelWait.IsCancellationRequested)
+            {
+                // The channel died under the publish (a broker nack or an unroutable return leaves
+                // it open): the next attempt's channel takes the copy.
+                Logger.LogDebug(
+                    publishException,
+                    "The subscriber channel closed while dead-lettering already-ACKed RabbitMQ delivery {DeliveryTag} on {Queue}; retrying on the next attempt's channel.",
+                    delivery.DeliveryTag,
+                    _queueName);
+            }
+            catch (Exception publishException)
+            {
+                Logger.LogError(
+                    publishException,
+                    "Failed to dead-letter already-ACKed RabbitMQ delivery {DeliveryTag} on {Queue}; the failure is only observable via logs and OnBackgroundFailure.",
+                    delivery.DeliveryTag,
+                    _queueName);
+                return;
+            }
+            finally
+            {
+                _deadLetterPublishGate.Release();
+            }
         }
-        catch (Exception publishException)
+    }
+
+    /// <summary>Binds the live subscriber attempt's channel.</summary>
+    public override IDisposable AttachChannel(IRabbitMqChannel channel)
+    {
+        var attachment = new ChannelAttachment(this, channel);
+        lock (_attachGate)
         {
-            Logger.LogError(
-                publishException,
-                "Failed to dead-letter already-ACKed RabbitMQ delivery {DeliveryTag} on {Queue}; the failure is only observable via logs and OnBackgroundFailure.",
-                delivery.DeliveryTag,
-                _queueName);
+            _attachment = attachment;
+            _attached.TrySetResult();
         }
-        finally
+
+        return attachment;
+    }
+
+    private void Detach(ChannelAttachment attachment)
+    {
+        lock (_attachGate)
         {
-            _deadLetterPublishGate.Release();
+            if (ReferenceEquals(_attachment, attachment))
+                _attachment = null;
+        }
+    }
+
+    /// <summary>
+    /// Cancelled when the attempt that attached <paramref name="channel"/> ends; never, for a
+    /// channel no attempt attached (a caller driving <see cref="HandleAsync"/> directly).
+    /// </summary>
+    private CancellationToken AttachmentEnded(IRabbitMqChannel channel)
+    {
+        lock (_attachGate)
+        {
+            return _attachment is { } attachment && ReferenceEquals(attachment.Channel, channel)
+                ? attachment.Ended
+                : CancellationToken.None;
+        }
+    }
+
+    /// <summary>
+    /// The open channel to publish through — the attached attempt's, else the one the last delivery
+    /// arrived on — or <c>null</c> once <paramref name="cancellationToken"/> fires with none open.
+    /// </summary>
+    private async ValueTask<IRabbitMqChannel?> WaitForOpenChannelAsync(CancellationToken cancellationToken)
+    {
+        while (true)
+        {
+            Task attached;
+            lock (_attachGate)
+            {
+                if ((_attachment?.Channel ?? _channel) is { IsOpen: true } channel)
+                    return channel;
+
+                // A closed channel whose attempt has not unwound yet still counts as attached:
+                // wait for the NEXT attach, not the one that already happened.
+                if (_attached.Task.IsCompleted)
+                    _attached = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                attached = _attached.Task;
+            }
+
+            try
+            {
+                await attached.WaitAsync(cancellationToken).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                return null;
+            }
+        }
+    }
+
+    private sealed class ChannelAttachment : IDisposable
+    {
+        private readonly QueuedRabbitMqMessageDispatcher _owner;
+        private readonly CancellationTokenSource _ended = new();
+        private int _disposed;
+
+        public ChannelAttachment(QueuedRabbitMqMessageDispatcher owner, IRabbitMqChannel channel)
+        {
+            _owner = owner;
+            Channel = channel;
+            Ended = _ended.Token;
+        }
+
+        public IRabbitMqChannel Channel { get; }
+        public CancellationToken Ended { get; }
+
+        public void Dispose()
+        {
+            if (Interlocked.Exchange(ref _disposed, 1) != 0)
+                return;
+
+            _owner.Detach(this);
+            _ended.Cancel();
+            _ended.Dispose();
         }
     }
 
@@ -770,6 +989,11 @@ internal sealed class QueuedRabbitMqMessageDispatcher : RabbitMqMessageDispatche
             PendingCount,
             RunningCount);
         _queue.Writer.TryComplete();
+
+        // Workers read the token captured at construction, never the source, so disposing it
+        // under them is safe.
+        _stopping.Cancel();
+        _stopping.Dispose();
 
         try
         {

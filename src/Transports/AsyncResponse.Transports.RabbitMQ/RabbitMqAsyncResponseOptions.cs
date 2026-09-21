@@ -86,9 +86,25 @@ public sealed class RabbitMqAsyncResponseOptions
 
     /// <summary>
     /// Optional dead-letter queue declared and bound to <see cref="DeadLetterExchange"/>. Leave null to manage
-    /// the dead-letter queue externally.
+    /// the dead-letter queue externally. It is declared only together with <see cref="DeadLetterExchange"/>:
+    /// set on its own (a broker policy supplies the dead-letter exchange) it must already exist — it is still
+    /// where a capped message is parked unless <see cref="ParkQueue"/> names another queue, and a park that
+    /// finds no queue fails loudly and the delivery is requeued. Because it is bound to the dead-letter
+    /// exchange it receives <em>every</em> dead-lettered message: when that exchange also feeds a TTL-retry
+    /// queue, each retry hop leaves a copy here, including hops of messages that later succeed — use
+    /// <see cref="ParkQueue"/> for that topology.
     /// </summary>
     public string? DeadLetterQueue { get; set; }
+
+    /// <summary>
+    /// Optional queue that receives only the messages the delivery cap parks (see
+    /// <see cref="RabbitMqSubscriberOptions.MaxDeliveryAttempts"/>): a capped message that has already ridden
+    /// the dead-letter cycle is published here through the default exchange and ACKed. Declared durable and
+    /// deliberately <em>unbound</em> when <see cref="DeclareTopology"/> is enabled — with or without a
+    /// <see cref="DeadLetterExchange"/> — so, unlike <see cref="DeadLetterQueue"/>, it never collects the
+    /// retry hops of a TTL-retry cycle. When null, capped messages are parked in <see cref="DeadLetterQueue"/>.
+    /// </summary>
+    public string? ParkQueue { get; set; }
 
     /// <summary>
     /// Routing key used both for the <c>x-dead-letter-routing-key</c> argument and for binding
@@ -142,6 +158,19 @@ public sealed class RabbitMqAsyncResponseOptions
     /// <see cref="RabbitMqAckMode.AckAfterEnqueue"/>.
     /// </summary>
     public TimeSpan? HostShutdownTimeout { get; set; } = TimeSpan.FromSeconds(30);
+
+    /// <summary>
+    /// The broker's <c>consumer_timeout</c>, mirrored here because the client cannot read it: RabbitMQ
+    /// closes a channel whose delivery stays unacknowledged longer than that (<c>PRECONDITION_FAILED</c>)
+    /// and requeues the delivery, so a worker handler still running past it — in
+    /// <see cref="RabbitMqAckMode.AckAfterHandlerCompletes"/> the delivery stays unacknowledged for the
+    /// handler's whole run — has its job redelivered to another consumer mid-run. The value is advertised
+    /// through <see cref="IWorkerTransportInFlightLimit.MaxInFlightDuration"/> so durable-flow timers that
+    /// wait in process plan their waits inside it; nothing in this package enforces it. Default:
+    /// <c>30 minutes</c>, the broker's default. Keep it equal to (or below) the broker's setting; set
+    /// <c>null</c> only when the broker's <c>consumer_timeout</c> is disabled. Must be positive.
+    /// </summary>
+    public TimeSpan? BrokerConsumerTimeout { get; set; } = TimeSpan.FromMinutes(30);
 
     /// <summary>Adds or replaces a named RabbitMQ reply target.</summary>
     public RabbitMqAsyncResponseOptions AddReplyTarget(

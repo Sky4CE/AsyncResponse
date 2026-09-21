@@ -98,6 +98,29 @@ public class DurableFlowOptions
     public TimeSpan TimerInProcessThreshold { get; set; } = TimeSpan.FromSeconds(10);
 
     /// <summary>
+    /// The longest a durable timer holds ONE worker delivery while it waits in process. A timer
+    /// that cannot suspend (the transport has no native delayed delivery, or the remainder is under
+    /// <see cref="TimerInProcessThreshold"/>) waits under the execution lease with its delivery
+    /// unsettled, and some brokers cap how long that may last no matter how alive the handler is
+    /// (<see cref="IWorkerTransportInFlightLimit"/>: Google Pub/Sub's <c>MaxTotalAckExtension</c>,
+    /// RabbitMQ's <c>consumer_timeout</c>, SQS's 12-hour visibility ceiling) — past it the broker
+    /// hands the same job to another consumer while the first handler is still sleeping. A longer
+    /// sleep is therefore waited in hops: the timer parks for at most this long, then checkpoints,
+    /// publishes an immediate wake-up for the run and ends the delivery; the wake-up replays to
+    /// the same timer (its due time is checkpointed) and parks the next hop under a fresh
+    /// delivery whose in-flight clock starts again.
+    /// <para>
+    /// <c>null</c> (the default) derives the hop from the transport: half of the ceiling it
+    /// advertises, or no bound at all — one wait for the whole remainder — when it advertises
+    /// none. A value can only shorten a transport-derived hop (the shorter of the two applies) or
+    /// supply one for a transport that advertises no ceiling, e.g. a custom transport or a broker
+    /// policy the library cannot see. Must be positive and at most the .NET timer ceiling
+    /// (~49.7 days). Awaited-response steps are not hopped; see the durable-flows guide.
+    /// </para>
+    /// </summary>
+    public TimeSpan? MaxInProcessParkDuration { get; set; }
+
+    /// <summary>
     /// Ledger size, in bytes (estimated from the serialized input, step results, values, and
     /// context), past which the executor logs a warning naming the flow — once when the threshold
     /// is first crossed and again at each doubling, so a long run logs a handful of times, not once
@@ -130,4 +153,15 @@ public class DurableFlowOptions
     /// Leave <c>false</c> (the default) unless that loss mode is acceptable. Default: false.
     /// </summary>
     public bool AllowEarlyAckWorkerSubscriber { get; set; }
+
+    /// <summary>
+    /// Startup validation of <see cref="MaxInProcessParkDuration"/>: the hop arms a BCL timer, so a
+    /// non-positive or over-ceiling value would pass registration and throw only when the first
+    /// timer parks — inside a delivery, as a retriable failure that dead-letters the run.
+    /// </summary>
+    internal void ValidateInProcessPark()
+    {
+        if (MaxInProcessParkDuration is { } park)
+            AsyncResponseChannelOptions.EnsureTimerBacked(park, nameof(DurableFlowOptions), nameof(MaxInProcessParkDuration));
+    }
 }

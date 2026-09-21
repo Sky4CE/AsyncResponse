@@ -338,6 +338,20 @@ internal sealed class LostSubscriberCallbackDispatcher(
             // guard in the consuming flow silently fails). A null (unclassifiable) verdict is
             // treated conservatively as "do not resume", so a payload that cannot be understood
             // never takes the happy path.
+            //
+            // A payload type name past the resolution limits is never parsed (it can overflow the
+            // stack inside the CLR's type-name parser — see IsWithinResolutionLimits), so it
+            // classifies as unresolvable and takes the same conservative route. Said out loud,
+            // because unlike a renamed type this is a recovery row nobody's code wrote.
+            if (recoveryState?.PayloadTypeFullName is { } payloadTypeName
+                && !AsyncResponseTypeResolution.IsWithinResolutionLimits(payloadTypeName))
+            {
+                _logger.LogError(
+                    "The recovery registration for channel {Channel} names a payload type that is not resolved: {PayloadType}. The response is treated as unclassifiable (do not resume).",
+                    channel,
+                    AsyncResponseTypeResolution.DescribeForDiagnostics(payloadTypeName));
+            }
+
             var classification = recoveryState is null
                 ? default
                 : PayloadRecoveryClassifier.Classify(response, recoveryState.PayloadTypeFullName);
@@ -507,9 +521,14 @@ internal sealed class LostSubscriberCallbackDispatcher(
 
         _logger.LogWarning("No subscribers for channel {Channel}; response declined to resume, invoking failure callback. Payload: {PayloadLength} UTF-16 code units.", channel, payloadJson?.Length ?? 0);
 
+        // The type name goes into the exception's MESSAGE, which generic exception logging
+        // sweeps up: bounded and escaped like every other quote of a persisted name. An ordinary
+        // name passes through unchanged.
         var domainFailure = new AsyncResponseDomainFailureException(
             recoveryState.CorrelationId,
-            recoveryState.PayloadTypeFullName,
+            recoveryState.PayloadTypeFullName is { } registeredTypeName
+                ? AsyncResponseTypeResolution.DescribeForDiagnostics(registeredTypeName)
+                : null,
             payloadJson);
 
         var invocation = ReflectionExtensions.ResolveCallback(

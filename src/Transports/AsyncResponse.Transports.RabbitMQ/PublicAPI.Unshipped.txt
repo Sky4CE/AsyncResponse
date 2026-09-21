@@ -6,6 +6,8 @@ AsyncResponse.Transports.RabbitMQ.RabbitMqAsyncResponseOptions
 AsyncResponse.Transports.RabbitMQ.RabbitMqAsyncResponseOptions.AddReplyTarget(string! name, string! exchange, string! routingKey) -> AsyncResponse.Transports.RabbitMQ.RabbitMqAsyncResponseOptions!
 AsyncResponse.Transports.RabbitMQ.RabbitMqAsyncResponseOptions.AutomaticRecoveryEnabled.get -> bool
 AsyncResponse.Transports.RabbitMQ.RabbitMqAsyncResponseOptions.AutomaticRecoveryEnabled.set -> void
+AsyncResponse.Transports.RabbitMQ.RabbitMqAsyncResponseOptions.BrokerConsumerTimeout.get -> System.TimeSpan?
+AsyncResponse.Transports.RabbitMQ.RabbitMqAsyncResponseOptions.BrokerConsumerTimeout.set -> void
 AsyncResponse.Transports.RabbitMQ.RabbitMqAsyncResponseOptions.ClientProvidedName.get -> string!
 AsyncResponse.Transports.RabbitMQ.RabbitMqAsyncResponseOptions.ClientProvidedName.set -> void
 AsyncResponse.Transports.RabbitMQ.RabbitMqAsyncResponseOptions.ConnectionString.get -> string?
@@ -30,6 +32,8 @@ AsyncResponse.Transports.RabbitMQ.RabbitMqAsyncResponseOptions.HostShutdownTimeo
 AsyncResponse.Transports.RabbitMQ.RabbitMqAsyncResponseOptions.HostShutdownTimeout.set -> void
 AsyncResponse.Transports.RabbitMQ.RabbitMqAsyncResponseOptions.NetworkRecoveryInterval.get -> System.TimeSpan
 AsyncResponse.Transports.RabbitMQ.RabbitMqAsyncResponseOptions.NetworkRecoveryInterval.set -> void
+AsyncResponse.Transports.RabbitMQ.RabbitMqAsyncResponseOptions.ParkQueue.get -> string?
+AsyncResponse.Transports.RabbitMQ.RabbitMqAsyncResponseOptions.ParkQueue.set -> void
 AsyncResponse.Transports.RabbitMQ.RabbitMqAsyncResponseOptions.Password.get -> string!
 AsyncResponse.Transports.RabbitMQ.RabbitMqAsyncResponseOptions.Password.set -> void
 AsyncResponse.Transports.RabbitMQ.RabbitMqAsyncResponseOptions.Port.get -> int
@@ -99,8 +103,9 @@ AsyncResponse.Transports.RabbitMQ.RabbitMqSubscriberOptions.RabbitMqSubscriberOp
 AsyncResponse.Transports.RabbitMQ.RabbitMqSubscriberOptions.UseAckAfterEnqueue(int backgroundWorkerCount, int backgroundQueueCapacity, System.TimeSpan? backgroundDrainTimeout = null) -> AsyncResponse.Transports.RabbitMQ.RabbitMqSubscriberOptions!
 AsyncResponse.Transports.RabbitMQ.RabbitMqWorkerTransport
 AsyncResponse.Transports.RabbitMQ.RabbitMqWorkerTransport.DisposeAsync() -> System.Threading.Tasks.ValueTask
+AsyncResponse.Transports.RabbitMQ.RabbitMqWorkerTransport.MaxInFlightDuration.get -> System.TimeSpan?
 AsyncResponse.Transports.RabbitMQ.RabbitMqWorkerTransport.PublishAsync(AsyncResponse.WorkerJobEnvelope! job, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task!
 AsyncResponse.Transports.RabbitMQ.RabbitMqWorkerTransport.RabbitMqWorkerTransport(Microsoft.Extensions.Options.IOptions<AsyncResponse.Transports.RabbitMQ.RabbitMqAsyncResponseOptions!>! options) -> void
-const AsyncResponse.Transports.RabbitMQ.RabbitMqAsyncResponseOptions.TransportName = "rabbitmq" -> string!
 Microsoft.Extensions.DependencyInjection.RabbitMqAsyncResponseServiceCollectionExtensions
+const AsyncResponse.Transports.RabbitMQ.RabbitMqAsyncResponseOptions.TransportName = "rabbitmq" -> string!
 static Microsoft.Extensions.DependencyInjection.RabbitMqAsyncResponseServiceCollectionExtensions.WithRabbitMqTransport(this Microsoft.Extensions.DependencyInjection.AsyncResponseRegistrationBuilder! builder, System.Action<AsyncResponse.Transports.RabbitMQ.RabbitMqAsyncResponseOptions!>! configure) -> Microsoft.Extensions.DependencyInjection.AsyncResponseRegistrationBuilder!

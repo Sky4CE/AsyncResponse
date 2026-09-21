@@ -42,6 +42,10 @@ jobs:
       # The classifier is repo-tracked (scripts/ci-retryable-failure.sh); a workflow_run job
       # checks out the default branch's copy, which is the one ci.yml on main runs with.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # This job's token carries actions: write, and nothing here uses git after the checkout
+          # (the API calls below authenticate through GH_TOKEN): do not leave it in .git/config.
+          persist-credentials: false
 
       - name: Re-run failed jobs
         env:
@@ -81,6 +85,11 @@ jobs:
               continue
             fi
             fetched=$((fetched + 1))
+            # This log is not the console text ci.yml's in-job retry tees: it opens with a UTF-8
+            # BOM and every line carries a timestamp prefix. The classifier strips both before it
+            # splits the log per failed test, and answers "real" when the run summary reports
+            # failed tests it could not find — the per-test gate never silently degrades to a
+            # whole-log scan here (scripts/tests/ci-retryable-failure.test.sh holds both shapes).
             # Exit 0 = flake (retryable), 1 = a real executed-test or build failure, 2 = unmatched,
             # 3 = unreadable; the first line names the evidence.
             verdict=0

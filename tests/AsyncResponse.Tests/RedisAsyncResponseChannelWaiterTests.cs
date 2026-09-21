@@ -1062,4 +1062,95 @@ public class RedisAsyncResponseChannelWaiterTests
         var count = await channel.CountActiveSubscribersAsync("corr");
         Assert.Equal(-1, count);
     }
+
+    /// <summary>
+    /// PUBSUB NUMSUB is node-local and the response channels are key-routed, so the subscription
+    /// lives on ONE node. A zero collected while that node was unreachable is the absence of a
+    /// waiter on the nodes that answered, not proof there is none.
+    /// </summary>
+    [Theory]
+    // The slot owner is unreachable and a sibling primary answers its own node-local zero:
+    // unknown. Read as 0, it consumed a live waiter's recovery registration.
+    [InlineData(false, false, 0L, -1L)]
+    // Every primary answered: a zero is now the whole answer.
+    [InlineData(true, false, 0L, 0L)]
+    // A replica holds no key-routed subscription, so its absence decides nothing.
+    [InlineData(false, true, 0L, 0L)]
+    // A positive count is proof of a live waiter wherever it was read.
+    [InlineData(false, false, 3L, 3L)]
+    public async Task CountActiveSubscribersAsync_ReportsZeroOnlyWhenEveryPrimaryAnswered(
+        bool unreachableIsConnected,
+        bool unreachableIsReplica,
+        long reachableCount,
+        long expected)
+    {
+        var mockSubscriber = new Mock<ISubscriber>();
+        var multiplexer = new Mock<IConnectionMultiplexer>();
+        multiplexer.Setup(m => m.GetSubscriber(It.IsAny<object?>())).Returns(mockSubscriber.Object);
+
+        var ownerEndPoint = new Mock<EndPoint>().Object;
+        var siblingEndPoint = new Mock<EndPoint>().Object;
+        multiplexer.Setup(m => m.GetEndPoints(It.IsAny<bool>())).Returns([ownerEndPoint, siblingEndPoint]);
+
+        var owner = new Mock<IServer>();
+        owner.SetupGet(s => s.IsConnected).Returns(unreachableIsConnected);
+        owner.SetupGet(s => s.IsReplica).Returns(unreachableIsReplica);
+        owner.Setup(s => s.SubscriptionSubscriberCountAsync(It.IsAny<RedisChannel>(), It.IsAny<CommandFlags>()))
+            .ReturnsAsync(0L);
+        multiplexer.Setup(m => m.GetServer(ownerEndPoint, It.IsAny<object?>())).Returns(owner.Object);
+
+        var sibling = new Mock<IServer>();
+        sibling.SetupGet(s => s.IsConnected).Returns(true);
+        sibling.Setup(s => s.SubscriptionSubscriberCountAsync(It.IsAny<RedisChannel>(), It.IsAny<CommandFlags>()))
+            .ReturnsAsync(reachableCount);
+        multiplexer.Setup(m => m.GetServer(siblingEndPoint, It.IsAny<object?>())).Returns(sibling.Object);
+
+        var channel = new RedisAsyncResponseChannel(
+            _services.GetRequiredService<IServiceScopeFactory>(),
+            multiplexer.Object,
+            _store.Object,
+            Options.Create(new RedisAsyncResponseOptions()),
+            new AsyncResponseContextPropagation([]),
+            new TestLogger<RedisAsyncResponseChannel>());
+
+        Assert.Equal(expected, await channel.CountActiveSubscribersAsync("corr"));
+    }
+
+    /// <summary>
+    /// A primary that answers with a failure is no more probed than one that never answered:
+    /// the exception arm must not leave a zero looking conclusive either.
+    /// </summary>
+    [Fact]
+    public async Task CountActiveSubscribersAsync_PrimaryThatThrows_MakesAZeroUnknown()
+    {
+        var mockSubscriber = new Mock<ISubscriber>();
+        var multiplexer = new Mock<IConnectionMultiplexer>();
+        multiplexer.Setup(m => m.GetSubscriber(It.IsAny<object?>())).Returns(mockSubscriber.Object);
+
+        var faultingEndPoint = new Mock<EndPoint>().Object;
+        var siblingEndPoint = new Mock<EndPoint>().Object;
+        multiplexer.Setup(m => m.GetEndPoints(It.IsAny<bool>())).Returns([faultingEndPoint, siblingEndPoint]);
+
+        var faulting = new Mock<IServer>();
+        faulting.SetupGet(s => s.IsConnected).Returns(true);
+        faulting.Setup(s => s.SubscriptionSubscriberCountAsync(It.IsAny<RedisChannel>(), It.IsAny<CommandFlags>()))
+            .ThrowsAsync(new RedisTimeoutException(CommandFlags.None, "probe timed out", CommandStatus.WaitingInBacklog));
+        multiplexer.Setup(m => m.GetServer(faultingEndPoint, It.IsAny<object?>())).Returns(faulting.Object);
+
+        var sibling = new Mock<IServer>();
+        sibling.SetupGet(s => s.IsConnected).Returns(true);
+        sibling.Setup(s => s.SubscriptionSubscriberCountAsync(It.IsAny<RedisChannel>(), It.IsAny<CommandFlags>()))
+            .ReturnsAsync(0L);
+        multiplexer.Setup(m => m.GetServer(siblingEndPoint, It.IsAny<object?>())).Returns(sibling.Object);
+
+        var channel = new RedisAsyncResponseChannel(
+            _services.GetRequiredService<IServiceScopeFactory>(),
+            multiplexer.Object,
+            _store.Object,
+            Options.Create(new RedisAsyncResponseOptions()),
+            new AsyncResponseContextPropagation([]),
+            new TestLogger<RedisAsyncResponseChannel>());
+
+        Assert.Equal(-1, await channel.CountActiveSubscribersAsync("corr"));
+    }
 }

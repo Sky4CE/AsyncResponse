@@ -163,6 +163,9 @@ public sealed class DurableFlowStoreReviewFixesTests
         collection
             .Setup(item => item.WithReadPreference(It.IsAny<ReadPreference>()))
             .Returns(collection.Object);
+        collection
+            .Setup(item => item.WithWriteConcern(It.IsAny<WriteConcern>()))
+            .Returns(collection.Object);
         collection.WithProvisionedTtlIndex();
         var database = new Mock<IMongoDatabase>().WithTestNamespace();
         database
@@ -220,6 +223,9 @@ public sealed class DurableFlowStoreReviewFixesTests
         var collection = new Mock<IMongoCollection<MongoFlowStateDocument>>();
         collection
             .Setup(item => item.WithReadPreference(It.IsAny<ReadPreference>()))
+            .Returns(collection.Object);
+        collection
+            .Setup(item => item.WithWriteConcern(It.IsAny<WriteConcern>()))
             .Returns(collection.Object);
         collection.WithProvisionedTtlIndex();
         var database = new Mock<IMongoDatabase>().WithTestNamespace();

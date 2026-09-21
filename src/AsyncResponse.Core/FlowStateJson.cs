@@ -109,6 +109,33 @@ internal static class FlowStateJson
     }
 
     /// <summary>
+    /// <see cref="JsonEquivalent"/> for a flow input whose type is known, comparing the VALUE
+    /// rather than the shape a serializer once gave it. Inputs are written with their nulls and
+    /// defaults, so the JSON of one and the same value changes whenever <typeparamref name="TInput"/>
+    /// gains or loses a member: <c>{"TenantId":7}</c> persisted last month and
+    /// <c>{"TenantId":7,"Region":null}</c> serialized today are the same input. The persisted JSON
+    /// is therefore read as <typeparamref name="TInput"/> and written back by today's serializer
+    /// before it is compared. A genuinely different value still differs after the round trip, and
+    /// a persisted input today's type cannot read is a mismatch, never an exception.
+    /// </summary>
+    public static bool InputEquivalent<TInput>(string? persisted, string requested)
+    {
+        if (JsonEquivalent(persisted, requested))
+            return true;
+        if (persisted is null)
+            return false;
+
+        try
+        {
+            return JsonEquivalent(AsyncResponseJson.Serialize(JsonSafety.SafeDeserialize<TInput>(persisted)), requested);
+        }
+        catch (Exception ex) when (ex is JsonException or InvalidDataException or NotSupportedException)
+        {
+            return false;
+        }
+    }
+
+    /// <summary>
     /// Serializes a child <see cref="FlowState"/> for memoization as a parent step result, without
     /// the captured ambient <see cref="FlowState.Context"/> (propagation machinery — it can carry
     /// principal/tenant values — that the parent never needs) and without the child's OWN

@@ -450,6 +450,13 @@ reads are pinned to the primary regardless of the registered connection's read p
 where a stale revision replays an already-checkpointed step and a not-yet-replicated ledger reads
 as absent — the one answer that acknowledges a wake-up.
 
+Ledger writes — creates, checkpoints, lease acquire/renew/release, deletes — use
+`w: "majority"` regardless of the registered connection's write concern. Under an inherited `w=1`
+the primary acknowledges a lease or checkpoint before any secondary has it, and a failover rolls
+it back: the lease a worker is executing under, or the step result it just recorded, disappears
+and the step's side effect runs again. The read concern is left as registered — primary reads
+already see every write the store had acknowledged.
+
 With `AutoCreateIndexes = false` the store verifies at startup that the provisioned collection
 carries a TTL index on `expires_at_utc` (`createIndex({ expires_at_utc: 1 }, { expireAfterSeconds: 0 })`)
 and fails with an actionable error when it is missing — that index is the store's only cleanup
@@ -486,13 +493,39 @@ An oversized document fails the write with `FlowStateTooLargeException` naming t
 instead; the ledger JSON alone is checked first, as the cheap pre-check it can only understate.
 
 Every ledger operation — loads, updates, lease acquire/renew/release, and deletes — treats only a
-`404` with sub-status `0` as a genuinely absent flow. Cosmos also answers `404` for conditions
-where the ledger still exists — `1002` (`ReadSessionNotAvailable`, routine Session-consistency lag
-when another process reads right after a write) and `1003`/`1004` (container or database
-recreated) — and those surface as errors so the wake-up is retried or dead-lettered instead of
-being acknowledged against a live run, and so an update or lease call does not misread one as a
-lost lease (the same contract point DynamoDB pins with `ConsistentRead` and MongoDB with primary
-reads).
+`404` with sub-status `0` as a possibly absent flow. Cosmos also answers `404` for conditions
+where the ledger still exists — `1002` (`ReadSessionNotAvailable`: the replicas in reach are behind
+the session token the client already holds) and `1003`/`1004` (container or database recreated) —
+and those surface as errors so the wake-up is retried or dead-lettered instead of being
+acknowledged against a live run, and so an update or lease call does not misread one as a lost
+lease.
+
+A sub-status `0` is still only one replica's answer. Session consistency is read-your-writes for
+the client that wrote; a **different process** never received the writer's session token, so its
+read can be served by a replica that has not applied the write yet — a plain `404`, or an older
+version of the document, never a `1002`. Cosmos cannot strengthen a read per request (unlike
+DynamoDB's `ConsistentRead` or MongoDB's primary reads), so the two reads whose answer lets a
+wake-up be acknowledged go through the **write path** first: a conditional `PatchItemAsync` whose
+`If-Match` can never hold. Writes are served by the write region's primary, so its `404` is an
+authoritative "no such ledger" and its `412` means the ledger exists; the SDK also records the
+`412`'s session token, so the read that follows cannot be served by a replica behind it.
+
+- `LoadAsync` does this only when its read says the ledger is absent or logically expired — a load
+  that finds its document costs nothing extra. If the write path keeps reporting the ledger present
+  while reads keep answering `404`, the load throws `FlowStateUnreadableException` rather than
+  report "no state".
+- `ObserveLeaseAsync` does it before every observation, because a stale baseline makes a renewal
+  written *before* the delivery started waiting look like proof of a live holder. It costs one
+  extra bodiless request per poll (every two seconds, or each `ExecutionLeaseRenewInterval` when
+  that is shorter) while a delivery waits behind a held lease.
+
+What that guarantees depends on the client's effective consistency level: **Strong**, and **Bounded
+Staleness** read from the write region, were already current; **Session** (the account default)
+is made current by the recorded token; **Bounded Staleness** read from another region,
+**Consistent Prefix**, and **Eventual** send no session token on reads, so only the absence answer
+is authoritative there and an observation can still lag — run the store at Session or stronger.
+An account with **multiple write regions** has no single authoritative write path (two regions can
+both win the same ETag-fenced lease write), so none of these guarantees hold on one.
 
 Lease maintenance — acquire, the renewal heartbeat (every `ExecutionLeaseRenewInterval`, 20 seconds
 by default), and release — never moves the ledger body. Each reads a projection of the lease

@@ -54,13 +54,22 @@ AsyncResponse.Transports.GooglePubSub.GooglePubSubSubscriberOptions.BackgroundQu
 AsyncResponse.Transports.GooglePubSub.GooglePubSubSubscriberOptions.BackgroundQueueCapacity.set -> void
 AsyncResponse.Transports.GooglePubSub.GooglePubSubSubscriberOptions.BackgroundWorkerCount.get -> int
 AsyncResponse.Transports.GooglePubSub.GooglePubSubSubscriberOptions.BackgroundWorkerCount.set -> void
+AsyncResponse.Transports.GooglePubSub.GooglePubSubSubscriberOptions.ClientCount.get -> int
+AsyncResponse.Transports.GooglePubSub.GooglePubSubSubscriberOptions.ClientCount.set -> void
 AsyncResponse.Transports.GooglePubSub.GooglePubSubSubscriberOptions.GooglePubSubSubscriberOptions() -> void
+AsyncResponse.Transports.GooglePubSub.GooglePubSubSubscriberOptions.MaxOutstandingBytes.get -> long
+AsyncResponse.Transports.GooglePubSub.GooglePubSubSubscriberOptions.MaxOutstandingBytes.set -> void
+AsyncResponse.Transports.GooglePubSub.GooglePubSubSubscriberOptions.MaxOutstandingMessages.get -> int
+AsyncResponse.Transports.GooglePubSub.GooglePubSubSubscriberOptions.MaxOutstandingMessages.set -> void
+AsyncResponse.Transports.GooglePubSub.GooglePubSubSubscriberOptions.MaxTotalAckExtension.get -> System.TimeSpan
+AsyncResponse.Transports.GooglePubSub.GooglePubSubSubscriberOptions.MaxTotalAckExtension.set -> void
 AsyncResponse.Transports.GooglePubSub.GooglePubSubSubscriberOptions.OnBackgroundFailure.get -> System.Func<AsyncResponse.Transports.GooglePubSub.GooglePubSubBackgroundFailureContext!, System.Threading.Tasks.ValueTask>?
 AsyncResponse.Transports.GooglePubSub.GooglePubSubSubscriberOptions.OnBackgroundFailure.set -> void
 AsyncResponse.Transports.GooglePubSub.GooglePubSubSubscriberOptions.UseAckAfterEnqueue(int backgroundWorkerCount, int backgroundQueueCapacity, System.TimeSpan? backgroundDrainTimeout = null) -> AsyncResponse.Transports.GooglePubSub.GooglePubSubSubscriberOptions!
 AsyncResponse.Transports.GooglePubSub.GooglePubSubWorkerTransport
 AsyncResponse.Transports.GooglePubSub.GooglePubSubWorkerTransport.DisposeAsync() -> System.Threading.Tasks.ValueTask
 AsyncResponse.Transports.GooglePubSub.GooglePubSubWorkerTransport.GooglePubSubWorkerTransport(Microsoft.Extensions.Options.IOptions<AsyncResponse.Transports.GooglePubSub.GooglePubSubAsyncResponseOptions!>! options) -> void
+AsyncResponse.Transports.GooglePubSub.GooglePubSubWorkerTransport.MaxInFlightDuration.get -> System.TimeSpan?
 AsyncResponse.Transports.GooglePubSub.GooglePubSubWorkerTransport.PublishAsync(AsyncResponse.WorkerJobEnvelope! job, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task!
 const AsyncResponse.Transports.GooglePubSub.GooglePubSubAsyncResponseOptions.TransportName = "google-pubsub" -> string!
 Microsoft.Extensions.DependencyInjection.GooglePubSubAsyncResponseServiceCollectionExtensions

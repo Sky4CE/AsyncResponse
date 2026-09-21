@@ -182,6 +182,7 @@ public sealed class CosmosDurableFlowStateStoreTests
                 It.IsAny<ItemRequestOptions>(),
                 It.IsAny<CancellationToken>()))
             .ThrowsAsync(CosmosError(HttpStatusCode.NotFound));
+        AbsentOnTheWritePath(container);
 
         using var autoCreated = new CosmosFlowStateStore(client.Object, Options.Create(new CosmosDurableFlowOptions
         {
@@ -397,6 +398,7 @@ public sealed class CosmosDurableFlowStateStoreTests
             .Setup(item => item.ReadItemAsync<CosmosFlowStateDocument>(
                 It.IsAny<string>(), It.IsAny<PartitionKey>(), It.IsAny<ItemRequestOptions>(), It.IsAny<CancellationToken>()))
             .ThrowsAsync(CosmosError(HttpStatusCode.NotFound));
+        AbsentOnTheWritePath(container);
         using var store = new CosmosFlowStateStore(client.Object, Options.Create(new CosmosDurableFlowOptions
         {
             DatabaseName = "flows",
@@ -703,6 +705,7 @@ public sealed class CosmosDurableFlowStateStoreTests
         using var harness = new CosmosHarness();
         var document = Document(CreateState("flow"), DateTime.UtcNow.AddMinutes(5));
         harness.QueriesLease(document);
+        harness.WritePathSeesTheLedger();
 
         // Present, never leased (or released: the release patches both fields to null).
         Assert.Same(FlowLeaseObservation.Unheld, await harness.Store.ObserveLeaseAsync("flow"));
@@ -740,7 +743,7 @@ public sealed class CosmosDurableFlowStateStoreTests
         Assert.Null(noExpiry.ExpiresAtUtc);
 
         // Read through the lease projection only: no point read (which would transfer stateJson)
-        // and no write of any kind.
+        // and no lease write. (The write-path confirmation before each query can never apply.)
         harness.Container.Verify(
             item => item.ReadItemAsync<CosmosFlowStateDocument>(
                 It.IsAny<string>(),
@@ -753,7 +756,7 @@ public sealed class CosmosDurableFlowStateStoreTests
                 It.IsAny<string>(),
                 It.IsAny<PartitionKey>(),
                 It.IsAny<IReadOnlyList<PatchOperation>>(),
-                It.IsAny<PatchItemRequestOptions>(),
+                IsLeasePatch(),
                 It.IsAny<CancellationToken>()),
             Times.Never);
     }
@@ -762,6 +765,7 @@ public sealed class CosmosDurableFlowStateStoreTests
     public async Task Round40_ObserveLease_QueriesTheFlowsOwnPartitionById()
     {
         using var harness = new CosmosHarness();
+        harness.WritePathSeesTheLedger();
         QueryDefinition? sentQuery = null;
         QueryRequestOptions? sentOptions = null;
         harness.Container
@@ -793,6 +797,7 @@ public sealed class CosmosDurableFlowStateStoreTests
     public async Task Round40_ObserveLease_OnlyAGenuineNotFoundReadsAsUnheld()
     {
         using var harness = new CosmosHarness();
+        harness.WritePathSeesTheLedger();
 
         // Sub-status 0 is the only 404 that means "nothing there" — the store-wide rule.
         harness.QueriesThrowing(CosmosError(HttpStatusCode.NotFound));
@@ -818,6 +823,7 @@ public sealed class CosmosDurableFlowStateStoreTests
         using var harness = new CosmosHarness();
         var document = Document(CreateState("flow"), DateTime.UtcNow.AddMinutes(5));
         harness.QueriesLease(document);
+        harness.WritePathSeesTheLedger();
         harness.PatchesSuccessfully((operations, _) =>
         {
             document.LeaseId = (string?)PatchValue(PatchFor(operations, "/leaseId"));
@@ -840,6 +846,193 @@ public sealed class CosmosDurableFlowStateStoreTests
         await harness.Store.ReleaseLeaseAsync("flow", "owner-a");
         Assert.Same(FlowLeaseObservation.Unheld, await harness.Store.ObserveLeaseAsync("flow"));
     }
+
+    // ---- Reads that let a wake-up be acknowledged are confirmed on the write path. ----
+    //
+    // Session consistency is read-your-writes for the client that wrote. A DIFFERENT process never
+    // received the writer's session token, so a lagging replica answers it with a plain 404/0 or
+    // an older document — not 1002. The mocks below model exactly that: reads lag until the client
+    // has made a write-path round trip (whose 412 carries the write region's session token), and
+    // are current afterwards.
+
+    [Fact]
+    public async Task Load_AReplicaThatHasNotSeenTheCreate_IsNotReportedAsNoState()
+    {
+        using var harness = new CosmosHarness();
+        var sessionIsCurrent = false;
+        harness.WritePath = () =>
+        {
+            sessionIsCurrent = true;
+            return CosmosError(HttpStatusCode.PreconditionFailed);
+        };
+        var current = Document(CreateState("flow"), DateTime.UtcNow.AddMinutes(5));
+        harness.ReadsLagging(() => sessionIsCurrent, stale: null, current);
+
+        // Pre-fix: the lagging 404 was returned as null, and the executor acknowledged the only
+        // wake-up of a run that exists.
+        var loaded = await harness.Store.LoadAsync("flow");
+
+        Assert.Equal("flow", loaded?.FlowId);
+        Assert.Equal(1, harness.WritePathCalls);
+    }
+
+    [Fact]
+    public async Task Load_AnOlderVersionThatHasSinceBeenExtended_IsNotReportedAsExpired()
+    {
+        using var harness = new CosmosHarness();
+        var sessionIsCurrent = false;
+        harness.WritePath = () =>
+        {
+            sessionIsCurrent = true;
+            return CosmosError(HttpStatusCode.PreconditionFailed);
+        };
+        // The lagging replica still holds the version whose idle TTL has lapsed; a checkpoint it
+        // has not applied yet extended it.
+        harness.ReadsLagging(
+            () => sessionIsCurrent,
+            stale: Document(CreateState("flow"), DateTime.UtcNow.AddSeconds(-1)),
+            current: Document(CreateState("flow"), DateTime.UtcNow.AddMinutes(5)));
+
+        Assert.Equal("flow", (await harness.Store.LoadAsync("flow"))?.FlowId);
+
+        // Genuinely expired and not yet purged: present on the write path, still expired on the
+        // current read — one confirmation, then "no state".
+        using var expired = new CosmosHarness();
+        expired.WritePathSeesTheLedger();
+        expired.Reads(Document(CreateState("flow"), DateTime.UtcNow.AddSeconds(-1)));
+        Assert.Null(await expired.Store.LoadAsync("flow"));
+        Assert.Equal(1, expired.WritePathCalls);
+    }
+
+    [Fact]
+    public async Task Load_ConfirmsAbsenceOnce_AndNeverTouchesTheWritePathForALedgerItFound()
+    {
+        using var harness = new CosmosHarness();
+
+        // Absent on the read AND on the write path: the authoritative "no state".
+        harness.ReadsException(HttpStatusCode.NotFound);
+        Assert.Null(await harness.Store.LoadAsync("flow"));
+        Assert.Equal(1, harness.WritePathCalls);
+
+        // The confirmation can never apply (an If-Match no document carries, never the wildcard),
+        // asks for no body back, and names none of the ledger's own fields.
+        var (operations, options) = harness.LastWritePathRequest!.Value;
+        Assert.Equal(CosmosFlowStateStore.NeverMatchingEtag, options.IfMatchEtag);
+        Assert.NotEqual("*", options.IfMatchEtag);
+        Assert.False(options.EnableContentResponseOnWrite);
+        Assert.DoesNotContain(
+            Assert.Single(operations).Path,
+            new[] { "/id", "/flowId", "/stateJson", "/expiresAtUtc", "/updatedAtUtc", "/revision", "/leaseId", "/leaseExpiresAtUtc", "/ttl" });
+
+        // The RU bound: a load that finds its document costs exactly the point read.
+        harness.Reads(Document(CreateState("flow"), DateTime.UtcNow.AddMinutes(5)));
+        Assert.NotNull(await harness.Store.LoadAsync("flow"));
+        Assert.Equal(1, harness.WritePathCalls);
+    }
+
+    [Fact]
+    public async Task Load_PresentForWritesButNeverForReads_ThrowsInsteadOfReportingNoState()
+    {
+        // An Eventual / Consistent Prefix client sends no session token, so the 412 cannot make
+        // its reads current. A delete can win the race between the two calls once — not every
+        // time — so repeated disagreement is refused rather than acknowledged.
+        using var harness = new CosmosHarness();
+        harness.WritePathSeesTheLedger();
+        harness.ReadsException(HttpStatusCode.NotFound);
+
+        var ex = await Assert.ThrowsAsync<FlowStateUnreadableException>(() => harness.Store.LoadAsync("flow"));
+
+        Assert.Contains("session-consistent", ex.Reason, StringComparison.Ordinal);
+        Assert.Equal(3, harness.WritePathCalls);
+
+        // A delete that really did land between the two calls: present, then gone on both paths.
+        using var deleted = new CosmosHarness();
+        var confirmations = 0;
+        deleted.WritePath = () => CosmosError(++confirmations == 1 ? HttpStatusCode.PreconditionFailed : HttpStatusCode.NotFound);
+        deleted.ReadsException(HttpStatusCode.NotFound);
+        Assert.Null(await deleted.Store.LoadAsync("flow"));
+    }
+
+    [Fact]
+    public async Task WritePathConfirmation_FaultsPropagate_InsteadOfReadingAsAbsentOrPresent()
+    {
+        using var harness = new CosmosHarness();
+        harness.ReadsException(HttpStatusCode.NotFound);
+
+        // 404/1002 on the write path names a ledger that may exist; 503 proves nothing either way.
+        harness.WritePath = ReadSessionNotAvailable;
+        Assert.Equal(1002, (await Assert.ThrowsAsync<CosmosException>(() => harness.Store.LoadAsync("flow"))).SubStatusCode);
+        await Assert.ThrowsAsync<CosmosException>(() => harness.Store.ObserveLeaseAsync("flow"));
+
+        harness.WritePath = () => CosmosError(HttpStatusCode.ServiceUnavailable);
+        await Assert.ThrowsAsync<CosmosException>(() => harness.Store.LoadAsync("flow"));
+        await Assert.ThrowsAsync<CosmosException>(() => harness.Store.ObserveLeaseAsync("flow"));
+    }
+
+    [Fact]
+    public async Task ObserveLease_IsReadBehindAWritePathRoundTrip_SoALaggingReplicaCannotSupplyTheBaseline()
+    {
+        // The executor acknowledges a waiting delivery as a duplicate when two observations
+        // differ. A baseline served by a lagging replica makes a renewal written BEFORE the
+        // delivery arrived look like one written while it waited — and that holder may be dead.
+        using var harness = new CosmosHarness();
+        var sessionIsCurrent = false;
+        harness.WritePath = () =>
+        {
+            sessionIsCurrent = true;
+            return CosmosError(HttpStatusCode.PreconditionFailed);
+        };
+        var staleExpiry = new DateTime(2031, 3, 14, 9, 0, 0, DateTimeKind.Utc);
+        var currentExpiry = staleExpiry.AddSeconds(20);
+        var queriedBeforeTheRoundTrip = false;
+        harness.QueriesLease(() =>
+        {
+            queriedBeforeTheRoundTrip |= !sessionIsCurrent;
+            return new CosmosLeaseProjection
+            {
+                Id = "flow",
+                ETag = "etag",
+                ExpiresAtUtc = DateTime.UtcNow.AddMinutes(5),
+                Revision = 0,
+                LeaseId = "holder",
+                LeaseExpiresAtUtc = sessionIsCurrent ? currentExpiry : staleExpiry
+            };
+        });
+
+        var observed = await harness.Store.ObserveLeaseAsync("flow");
+
+        Assert.Equal(currentExpiry, observed!.ExpiresAtUtc);
+        Assert.False(queriedBeforeTheRoundTrip);
+
+        // Every observation, not just the first: the store cannot know which one is the baseline.
+        await harness.Store.ObserveLeaseAsync("flow");
+        Assert.Equal(2, harness.WritePathCalls);
+    }
+
+    [Fact]
+    public async Task ObserveLease_AbsentOnTheWritePath_IsUnheldWithoutAQuery()
+    {
+        using var harness = new CosmosHarness();
+
+        Assert.Same(FlowLeaseObservation.Unheld, await harness.Store.ObserveLeaseAsync("flow"));
+
+        harness.Container.Verify(
+            item => item.GetItemQueryIterator<CosmosLeaseProjection>(
+                It.IsAny<QueryDefinition>(),
+                It.IsAny<string?>(),
+                It.IsAny<QueryRequestOptions>()),
+            Times.Never);
+    }
+
+    private static void AbsentOnTheWritePath(Mock<Container> container)
+        => container
+            .Setup(item => item.PatchItemAsync<CosmosFlowStateDocument>(
+                It.IsAny<string>(),
+                It.IsAny<PartitionKey>(),
+                It.IsAny<IReadOnlyList<PatchOperation>>(),
+                It.IsAny<PatchItemRequestOptions>(),
+                It.IsAny<CancellationToken>()))
+            .ThrowsAsync(CosmosError(HttpStatusCode.NotFound));
 
     private static CosmosException ReadSessionNotAvailable()
         => new("read session not available", HttpStatusCode.NotFound, 1002, "activity", 0);
@@ -958,6 +1151,7 @@ public sealed class CosmosDurableFlowStateStoreTests
                     It.IsAny<ContainerRequestOptions>(),
                     It.IsAny<CancellationToken>()))
                 .ReturnsAsync(_containerResponse.Object);
+            AnswersTheWritePath();
             Store = new CosmosFlowStateStore(Client.Object, Options.Create(new CosmosDurableFlowOptions
             {
                 DatabaseName = "flows",
@@ -969,6 +1163,35 @@ public sealed class CosmosDurableFlowStateStoreTests
         public Mock<CosmosClient> Client { get; }
         public Mock<Container> Container { get; }
         public CosmosFlowStateStore Store { get; }
+
+        /// <summary>
+        /// What the container's WRITE path answers the store's never-matching conditional patch:
+        /// 404/0 (no such ledger — the default, an empty container), 412 (it exists), or a fault.
+        /// </summary>
+        public Func<CosmosException> WritePath { get; set; } = () => CosmosError(HttpStatusCode.NotFound);
+
+        /// <summary>Write-path confirmations issued so far.</summary>
+        public int WritePathCalls;
+
+        /// <summary>The last confirmation's operations and request options.</summary>
+        public (IReadOnlyList<PatchOperation> Operations, PatchItemRequestOptions Options)? LastWritePathRequest { get; private set; }
+
+        public void WritePathSeesTheLedger() => WritePath = () => CosmosError(HttpStatusCode.PreconditionFailed);
+
+        private void AnswersTheWritePath()
+            => Container
+                .Setup(item => item.PatchItemAsync<CosmosFlowStateDocument>(
+                    It.IsAny<string>(),
+                    It.IsAny<PartitionKey>(),
+                    It.IsAny<IReadOnlyList<PatchOperation>>(),
+                    It.Is<PatchItemRequestOptions>(options => options.IfMatchEtag == CosmosFlowStateStore.NeverMatchingEtag),
+                    It.IsAny<CancellationToken>()))
+                .Returns((string _, PartitionKey _, IReadOnlyList<PatchOperation> operations, PatchItemRequestOptions options, CancellationToken _) =>
+                {
+                    Interlocked.Increment(ref WritePathCalls);
+                    LastWritePathRequest = (operations, options);
+                    return Task.FromException<ItemResponse<CosmosFlowStateDocument>>(WritePath());
+                });
 
         public void Reads(CosmosFlowStateDocument document)
         {
@@ -997,6 +1220,30 @@ public sealed class CosmosDurableFlowStateStoreTests
                     response.SetupGet(item => item.Resource).Returns(createDocument());
                     response.SetupGet(item => item.ETag).Returns("etag");
                     return response.Object;
+                });
+
+        /// <summary>
+        /// A replica this client reaches WITHOUT the writer's session token: it answers with
+        /// <paramref name="stale"/> (null = a plain 404/0, the create not applied yet) until
+        /// <paramref name="sessionIsCurrent"/>, and with <paramref name="current"/> afterwards.
+        /// </summary>
+        public void ReadsLagging(Func<bool> sessionIsCurrent, CosmosFlowStateDocument? stale, CosmosFlowStateDocument current)
+            => Container
+                .Setup(item => item.ReadItemAsync<CosmosFlowStateDocument>(
+                    It.IsAny<string>(),
+                    It.IsAny<PartitionKey>(),
+                    It.IsAny<ItemRequestOptions>(),
+                    It.IsAny<CancellationToken>()))
+                .Returns(() =>
+                {
+                    var document = sessionIsCurrent() ? current : stale;
+                    if (document is null)
+                        return Task.FromException<ItemResponse<CosmosFlowStateDocument>>(CosmosError(HttpStatusCode.NotFound));
+
+                    var response = new Mock<ItemResponse<CosmosFlowStateDocument>>();
+                    response.SetupGet(item => item.Resource).Returns(document);
+                    response.SetupGet(item => item.ETag).Returns("etag");
+                    return Task.FromResult(response.Object);
                 });
 
         public void ReadsException(HttpStatusCode statusCode)
@@ -1114,7 +1361,7 @@ public sealed class CosmosDurableFlowStateStoreTests
                     It.IsAny<string>(),
                     It.IsAny<PartitionKey>(),
                     It.IsAny<IReadOnlyList<PatchOperation>>(),
-                    It.IsAny<PatchItemRequestOptions>(),
+                    IsLeasePatch(),
                     It.IsAny<CancellationToken>()))
                 .Callback<string, PartitionKey, IReadOnlyList<PatchOperation>, PatchItemRequestOptions, CancellationToken>(
                     (_, _, operations, requestOptions, _) => onPatch?.Invoke(operations, requestOptions))
@@ -1126,12 +1373,19 @@ public sealed class CosmosDurableFlowStateStoreTests
                     It.IsAny<string>(),
                     It.IsAny<PartitionKey>(),
                     It.IsAny<IReadOnlyList<PatchOperation>>(),
-                    It.IsAny<PatchItemRequestOptions>(),
+                    IsLeasePatch(),
                     It.IsAny<CancellationToken>()))
                 .ThrowsAsync(exception);
 
         public void Dispose() => Store.Dispose();
     }
+
+    /// <summary>
+    /// A lease patch (fenced by a projection's ETag), as opposed to the write-path confirmation the
+    /// harness answers on its own — the two share one <c>PatchItemAsync</c> overload.
+    /// </summary>
+    private static PatchItemRequestOptions IsLeasePatch()
+        => It.Is<PatchItemRequestOptions>(options => options.IfMatchEtag != CosmosFlowStateStore.NeverMatchingEtag);
 
     /// <summary>The value a patch operation carries, read through the SDK's public surface (the value itself is not exposed).</summary>
     private static object? PatchValue(PatchOperation operation)

@@ -33,4 +33,50 @@ internal static class GooglePubSubOptionsValidator
         if (options.HostShutdownTimeout is { } hostShutdownTimeout && hostShutdownTimeout <= TimeSpan.Zero)
             throw new InvalidOperationException($"{nameof(GooglePubSubAsyncResponseOptions)}.{nameof(options.HostShutdownTimeout)} must be positive when set.");
     }
+
+    /// <summary>
+    /// The first lease already lasts the client's 60-second ack deadline, so a smaller total
+    /// extension cannot make Pub/Sub redeliver sooner — it would only shrink the in-flight ceiling
+    /// the worker transport advertises, and with it every in-process durable-flow wait.
+    /// </summary>
+    internal static readonly TimeSpan MinimumMaxTotalAckExtension = TimeSpan.FromMinutes(1);
+
+    /// <summary>The SDK's own <c>ClientCount</c> range; outside it the client build throws.</summary>
+    internal const int MaximumClientCount = 256;
+
+    /// <summary>
+    /// Bounds the ack-extension ceiling. The SDK arms one timer with it per pulled batch, so an
+    /// over-ceiling value surfaces as a raw timer exception inside the streaming pull (and a
+    /// perpetual subscriber restart loop) instead of failing startup.
+    /// </summary>
+    public static void ValidateMaxTotalAckExtension(GooglePubSubSubscriberOptions subscriberOptions, string optionPath)
+    {
+        AsyncResponseChannelOptions.EnsureTimerBacked(subscriberOptions.MaxTotalAckExtension, optionPath, nameof(GooglePubSubSubscriberOptions.MaxTotalAckExtension));
+        if (subscriberOptions.MaxTotalAckExtension < MinimumMaxTotalAckExtension)
+            throw new InvalidOperationException(
+                $"{optionPath}.{nameof(GooglePubSubSubscriberOptions.MaxTotalAckExtension)} must be at least {MinimumMaxTotalAckExtension.TotalMinutes:0} minute: " +
+                "the first lease already lasts the Pub/Sub client's 60-second ack deadline, so a smaller value cannot speed up redelivery.");
+    }
+
+    /// <summary>
+    /// Validates the streaming-pull settings handed to the SDK's subscriber client. The SDK checks
+    /// them only when the client is built — inside the supervised retry loop, where a bad value
+    /// turns into an endless rebuild-and-fail cycle rather than a startup failure.
+    /// </summary>
+    public static void ValidateStreamingPull(GooglePubSubSubscriberOptions subscriberOptions, string optionPath)
+    {
+        ValidateMaxTotalAckExtension(subscriberOptions, optionPath);
+
+        if (subscriberOptions.ClientCount is < 1 or > MaximumClientCount)
+            throw new InvalidOperationException(
+                $"{optionPath}.{nameof(GooglePubSubSubscriberOptions.ClientCount)} must be between 1 and {MaximumClientCount} (the Pub/Sub client's range).");
+
+        if (subscriberOptions.MaxOutstandingMessages <= 0)
+            throw new InvalidOperationException(
+                $"{optionPath}.{nameof(GooglePubSubSubscriberOptions.MaxOutstandingMessages)} must be positive.");
+
+        if (subscriberOptions.MaxOutstandingBytes <= 0)
+            throw new InvalidOperationException(
+                $"{optionPath}.{nameof(GooglePubSubSubscriberOptions.MaxOutstandingBytes)} must be positive.");
+    }
 }

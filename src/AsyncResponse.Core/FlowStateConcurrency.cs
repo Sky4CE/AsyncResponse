@@ -127,12 +127,18 @@ internal static class FlowStateConcurrency
         DurableFlowOptions options,
         ILogger logger,
         TimeProvider? timeProvider = null,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        string? jobTag = null)
     {
         ValidateOptions(options);
 
         var clock = timeProvider ?? TimeProvider.System;
-        var leaseId = Guid.NewGuid().ToString("N");
+
+        // The job driving this execution is recorded IN the lease id, so it lands atomically with
+        // the acquire on every store and comes back through ObserveLeaseAsync: a later delivery of
+        // that same job can then tell it is contending with its own first delivery (see
+        // FlowLeaseContention). Without a job identity this is the plain 32-character id.
+        var leaseId = FlowLeaseContention.NewLeaseId(jobTag);
 
         // Stamp the deadline BEFORE the call, not after it returns. The store starts the lease when
         // it executes the command; every millisecond after that — network latency, a delayed

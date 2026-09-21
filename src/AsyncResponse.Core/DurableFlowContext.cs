@@ -1,6 +1,7 @@
 using Microsoft.Extensions.Logging;
 using System.Diagnostics.CodeAnalysis;
 using System.Linq.Expressions;
+using System.Runtime.ExceptionServices;
 
 namespace AsyncResponse;
 
@@ -29,7 +30,28 @@ internal sealed class DurableFlowContext : IDurableFlowContext
     private readonly IDurableFlowExecutionObserver[] _observers;
     private readonly IWorkerTransport? _workerTransport;
     private readonly TimeSpan? _channelDefaultWaitTimeout;
+    private readonly CancellationToken _hostStopping;
     private bool _suspended;
+
+    // The failure of a park that did not commit (see ParkAsync). Sticky like _suspended: flow
+    // code that swallowed the first throw gets it again from every later context call, and from
+    // the executor's flush when the body returns normally.
+    private ExceptionDispatchInfo? _parkFailure;
+
+    // Step names that RETURNED in this execution (memoized or freshly completed); see GetStep.
+    private HashSet<string>? _returnedSteps;
+
+    // 1 while a step call of this context is in flight; see EnterStep.
+    private int _activeStep;
+
+    // Identifies the context whose step is executing on the current async flow. Tells a step
+    // called from INSIDE another step's body (nested: sequential, supported) from a sibling
+    // started next to it (Task.WhenAll: concurrent, not supported) — the sibling starts from the
+    // flow body's execution context, where this is not set. A bare token rather than the context:
+    // execution-context snapshots outlive the execution (the in-memory transport keeps one with
+    // every delayed wake-up), and must not pin the ledger with them.
+    private static readonly AsyncLocal<object?> ActiveStepOwner = new();
+    private readonly object _stepToken = new();
     private bool _progressDirty;
     private DateTime _lastPersistenceUtc;
 
@@ -61,7 +83,8 @@ internal sealed class DurableFlowContext : IDurableFlowContext
         TimeProvider? timeProvider = null,
         IDurableFlowExecutionObserver[]? observers = null,
         IWorkerTransport? workerTransport = null,
-        TimeSpan? channelDefaultWaitTimeout = null)
+        TimeSpan? channelDefaultWaitTimeout = null,
+        CancellationToken hostStopping = default)
     {
         _state = state;
         _store = store;
@@ -77,6 +100,7 @@ internal sealed class DurableFlowContext : IDurableFlowContext
         _observers = observers ?? [];
         _workerTransport = workerTransport;
         _channelDefaultWaitTimeout = channelDefaultWaitTimeout;
+        _hostStopping = hostStopping;
     }
 
     private DateTime UtcNow => _timeProvider.GetUtcNow().UtcDateTime;
@@ -113,6 +137,7 @@ internal sealed class DurableFlowContext : IDurableFlowContext
         ArgumentException.ThrowIfNullOrWhiteSpace(name);
         ArgumentNullException.ThrowIfNull(step);
 
+        using var active = EnterStep(name);
         var checkpoint = GetStep(name);
         if (checkpoint.Completed)
             return;
@@ -135,6 +160,7 @@ internal sealed class DurableFlowContext : IDurableFlowContext
         ArgumentException.ThrowIfNullOrWhiteSpace(name);
         ArgumentNullException.ThrowIfNull(step);
 
+        using var active = EnterStep(name);
         var checkpoint = GetStep(name);
         if (checkpoint.Completed)
             return DeserializeResult<TResult>(checkpoint.ResultJson);
@@ -192,6 +218,7 @@ internal sealed class DurableFlowContext : IDurableFlowContext
 
     private async Task DelayCoreAsync(string name, FlowStepState checkpoint, DateTime wakeAtUtc, CancellationToken cancellationToken)
     {
+        using var active = EnterStep(name);
         cancellationToken.ThrowIfCancellationRequested();
         await NotifyStepAsync(static (o, e) => o.OnStepStartingAsync(e), name, DurableFlowStepKind.Timer, wakeAtUtc: wakeAtUtc).ConfigureAwait(false);
 
@@ -253,7 +280,11 @@ internal sealed class DurableFlowContext : IDurableFlowContext
                 throw new InvalidOperationException("Unreachable.");
             }
 
-            if (remaining > AsyncResponseChannelOptions.MaxTimerBackedTimeout)
+            // One delivery is never held past the in-process budget: a longer remainder is waited
+            // in hops, each under a fresh delivery (see HandOverTimerAsync).
+            var wait = InProcessParkBudget() is { } budget && budget < remaining ? budget : remaining;
+
+            if (wait > AsyncResponseChannelOptions.MaxTimerBackedTimeout)
             {
                 throw new DurableFlowFailedException(
                     $"Timer step '{name}' of flow '{FlowId}' sleeps for {remaining.TotalDays:0.#} days, which exceeds the " +
@@ -275,46 +306,139 @@ internal sealed class DurableFlowContext : IDurableFlowContext
                 await SaveForSleepAsync(remaining, cancellationToken).ConfigureAwait(false);
             }
 
-            await WaitInProcessAsync(remaining, cancellationToken).ConfigureAwait(false);
+            await WaitInProcessAsync(wait, cancellationToken).ConfigureAwait(false);
             _lease.ThrowIfLost();
+
+            if (wait < remaining)
+            {
+                // Measured again rather than computed: a timer that fired late may already have
+                // covered the rest, and a due timer completes here like any other.
+                var left = wakeAtUtc - UtcNow;
+                if (left > TimeSpan.Zero)
+                {
+                    await HandOverTimerAsync(name, wakeAtUtc, left, cancellationToken).ConfigureAwait(false);
+                    throw new InvalidOperationException("Unreachable.");
+                }
+            }
         }
 
         await CompleteStepAsync(name, checkpoint, resultJson: null, CancellationToken.None, kind: DurableFlowStepKind.Timer).ConfigureAwait(false);
     }
 
     /// <summary>
-    /// In-process timer wait under the execution lease — the fallback for transports without
-    /// delayed delivery and for sub-threshold remainders. Cancellation (caller token, host
-    /// shutdown via lease loss) deliberately leaves the checkpoint untouched: the persisted due
-    /// time is the breadcrumb, and the redelivered execution waits out the remainder — the timer
-    /// itself cannot fault.
+    /// The longest an in-process timer wait may hold one delivery, or <c>null</c> for no bound:
+    /// half of the in-flight ceiling the worker transport advertises
+    /// (<see cref="IWorkerTransportInFlightLimit"/>) — the other half is headroom for the steps
+    /// that ran before the timer in the same delivery and for the hand-over itself — shortened
+    /// further by <see cref="DurableFlowOptions.MaxInProcessParkDuration"/>, which also supplies a
+    /// bound when the transport advertises none. Capped at the BCL timer ceiling the wait arms.
     /// </summary>
-    private async Task WaitInProcessAsync(TimeSpan remaining, CancellationToken cancellationToken)
+    private TimeSpan? InProcessParkBudget()
     {
-        using var linked = cancellationToken.CanBeCanceled
-            ? CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _lease.LostToken)
+        TimeSpan? budget = _workerTransport is IWorkerTransportInFlightLimit { MaxInFlightDuration: { } ceiling } && ceiling > TimeSpan.Zero
+            ? ceiling / 2
+            : null;
+
+        if (_options.MaxInProcessParkDuration is { } configured && (budget is null || configured < budget))
+            budget = configured;
+
+        return budget > AsyncResponseChannelOptions.MaxTimerBackedTimeout
+            ? AsyncResponseChannelOptions.MaxTimerBackedTimeout
+            : budget;
+    }
+
+    /// <summary>
+    /// In-process timer wait under the execution lease — the fallback for transports without
+    /// delayed delivery and for sub-threshold remainders. Cancellation (caller token, lease loss,
+    /// host stop) deliberately leaves the checkpoint untouched: the persisted due time is the
+    /// breadcrumb, and the redelivered execution waits out the remainder — the timer itself
+    /// cannot fault.
+    /// <para>
+    /// Host stop is wired in explicitly. Nothing else ends this wait at shutdown — the lease keeps
+    /// renewing for as long as the process lives — so a deploy used to wait a parked handler out
+    /// for the transport's whole drain budget and then kill it.
+    /// </para>
+    /// </summary>
+    private async Task WaitInProcessAsync(TimeSpan wait, CancellationToken cancellationToken)
+    {
+        using var linked = cancellationToken.CanBeCanceled || _hostStopping.CanBeCanceled
+            ? CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _lease.LostToken, _hostStopping)
             : null;
 
         try
         {
-            await Task.Delay(remaining, _timeProvider, linked?.Token ?? _lease.LostToken).ConfigureAwait(false);
+            await Task.Delay(wait, _timeProvider, linked?.Token ?? _lease.LostToken).ConfigureAwait(false);
         }
         catch (OperationCanceledException ex)
         {
             _lease.ThrowIfLost(ex);
+            if (_hostStopping.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
+                throw HostStopping(ex);
             throw;
         }
     }
 
-    private async Task SuspendForTimerAsync(string name, DateTime wakeAtUtc, TimeSpan remaining, CancellationToken cancellationToken)
-    {
-        _suspended = true;
-        _state.LastMessage = $"Flow {FlowId} sleeping until {wakeAtUtc:O} at step '{name}'.";
-        await SaveForSleepAsync(remaining, cancellationToken).ConfigureAwait(false);
+    /// <summary>
+    /// The exception an in-process park ends with at host stop. A cancellation on purpose (the
+    /// executor's lease-contention poll does the same): the worker transport treats the job as not
+    /// executed and redelivers it after the restart, and neither the step nor the run is faulted.
+    /// </summary>
+    private DurableFlowInterruptedException HostStopping(Exception cause)
+        => new($"Host is stopping; durable flow '{FlowId}' left its in-process wait and the delivery is abandoned for redelivery.", cause);
 
+    private Task SuspendForTimerAsync(string name, DateTime wakeAtUtc, TimeSpan remaining, CancellationToken cancellationToken)
+    {
+        _state.LastMessage = $"Flow {FlowId} sleeping until {wakeAtUtc:O} at step '{name}'.";
         var id = FlowId;
-        await _builder.EnqueueWorkerAsync<IDurableFlowExecutor>(executor => executor.ExecuteAsync(id), remaining).ConfigureAwait(false);
-        throw new DurableFlowSuspendedException(_state.LastMessage);
+        return ParkAsync(
+            remaining,
+            () => _builder.EnqueueWorkerAsync<IDurableFlowExecutor>(executor => executor.ExecuteAsync(id), remaining),
+            cancellationToken);
+    }
+
+    /// <summary>
+    /// Ends an in-process hop with time still to sleep: checkpoint, publish an IMMEDIATE wake-up,
+    /// suspend. The wake-up replays to this timer — its due time is checkpointed — and waits the
+    /// next hop under a new delivery, whose in-flight clock the broker starts from zero. Only ever
+    /// called AFTER a hop was waited: the wake-up is not delayed, so publishing it without having
+    /// waited would spin deliveries instead of sleeping.
+    /// </summary>
+    private Task HandOverTimerAsync(string name, DateTime wakeAtUtc, TimeSpan left, CancellationToken cancellationToken)
+    {
+        _state.LastMessage = $"Flow {FlowId} sleeping until {wakeAtUtc:O} at step '{name}' (continuing under a fresh delivery).";
+        var id = FlowId;
+        return ParkAsync(
+            left,
+            () => _builder.EnqueueWorkerAsync<IDurableFlowExecutor>(executor => executor.ExecuteAsync(id)),
+            cancellationToken);
+    }
+
+    /// <summary>
+    /// Commits a park — persist, publish the wake-up — and only then marks this execution
+    /// suspended. The executor acknowledges a suspended execution's delivery, so the flag must
+    /// never be up before the wake-up exists: raised first (as it used to be), a failed save or
+    /// publish left it set, flow code that catches <see cref="Exception"/> around the step carried
+    /// on into the next context call, that call threw "suspended", and the delivery was
+    /// acknowledged for a run nothing would ever wake — on the child path with a child ledger that
+    /// was never enqueued. A failure is kept and surfaced again (see <see cref="ThrowIfSuspended"/>
+    /// and <see cref="FlushProgressAsync"/>) so the attempt ends as the retriable failure it is
+    /// even when the first throw was swallowed.
+    /// </summary>
+    private async Task ParkAsync(TimeSpan window, Func<Task> publishWakeUp, CancellationToken cancellationToken)
+    {
+        try
+        {
+            await SaveForSleepAsync(window, cancellationToken).ConfigureAwait(false);
+            await publishWakeUp().ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            _parkFailure = ExceptionDispatchInfo.Capture(ex);
+            throw;
+        }
+
+        _suspended = true;
+        throw new DurableFlowSuspendedException(_state.LastMessage ?? $"Flow {FlowId} is suspended.");
     }
 
     /// <summary>
@@ -603,6 +727,7 @@ internal sealed class DurableFlowContext : IDurableFlowContext
         if (flowId is not null)
             ArgumentException.ThrowIfNullOrWhiteSpace(flowId);
 
+        using var active = EnterStep(name);
         var checkpoint = GetStep(name);
         var requestedChildFlowId = flowId ?? $"{FlowId}:{name}";
         var breadcrumb = checkpoint.ChildFlowId;
@@ -629,7 +754,7 @@ internal sealed class DurableFlowContext : IDurableFlowContext
             var completedChild = DeserializeResult<FlowState>(checkpoint.ResultJson)
                 ?? throw new DurableFlowFailedException(
                     $"Completed child step '{name}' of flow '{FlowId}' has no child-state snapshot.");
-            ThrowIfChildMismatched<TFlow, TInput>(completedChild, childFlowId, name, inputJson);
+            ThrowIfChildMismatched<TFlow, TInput>(completedChild, childFlowId, name, inputJson, completed: true);
             ThrowIfChildFailed(completedChild, failOnChildFailure);
             return completedChild;
         }
@@ -730,6 +855,7 @@ internal sealed class DurableFlowContext : IDurableFlowContext
         ArgumentException.ThrowIfNullOrWhiteSpace(name);
         ArgumentNullException.ThrowIfNull(trigger);
 
+        using var active = EnterStep(name);
         var checkpoint = GetStep(name);
         if (checkpoint.Completed)
             return DeserializeResult<TResponse>(checkpoint.ResultJson);
@@ -848,6 +974,7 @@ internal sealed class DurableFlowContext : IDurableFlowContext
 
             await NotifyStepAsync(static (o, e) => o.OnStepWaitingAsync(e), name, DurableFlowStepKind.Awaited, correlationId).ConfigureAwait(false);
 
+            WarnIfWaitOutlivesInFlightCeiling(name, waitWindow);
             var response = await WaitForResponseAsync(waiter.ResponseTask, cancellationToken).ConfigureAwait(false);
 
             checkpoint.PendingCorrelationId = null;
@@ -878,24 +1005,7 @@ internal sealed class DurableFlowContext : IDurableFlowContext
                 // the run until the step timeout. The checkpoint therefore wins over the
                 // cancellation: persist the received payload and return it; the caller's token
                 // gets its say again at the next step boundary.
-                var received = waiter.ResponseTask.Result;
-                checkpoint.PendingCorrelationId = null;
-
-                // Checked AFTER settling, never before. Running ThrowIfLost at the top of this
-                // catch threw while the waiter still held a claimed, channel-acked response: the
-                // payload was dropped with no checkpoint and no re-publish, PendingCorrelationId
-                // stayed set, and the redelivered execution re-attached to a correlation id that
-                // could never be answered — one lost response plus one duplicate remote request.
-                // A lost lease cannot write lease-fenced, so the payload is persisted through the
-                // lease-less compare-and-swap the recovery path already uses; only then is the
-                // takeover signal raised.
-                if (_lease.IsLost)
-                {
-                    await CheckpointReceivedWithoutLeaseAsync(name, checkpoint, received, correlationId).ConfigureAwait(false);
-                    _lease.ThrowIfLost(ex);
-                }
-
-                await CompleteStepAsync(name, checkpoint, AsyncResponseJson.Serialize(received), CancellationToken.None, kind: DurableFlowStepKind.Awaited, correlationId: correlationId, notify: false).ConfigureAwait(false);
+                var received = await SettleWonResponseAsync(name, checkpoint, waiter.ResponseTask.Result, correlationId, ex).ConfigureAwait(false);
                 notifyCompletion = true;
                 return received;
             }
@@ -949,20 +1059,11 @@ internal sealed class DurableFlowContext : IDurableFlowContext
                     // consults the token, so a lease lost in the same instant the response landed
                     // returns the payload and lands here (not in the cancellation branch) when the
                     // fenced completion save trips ThrowIfLost — and the clock-based check inside
-                    // that save can trip on its own in the same window. The claimed,
-                    // channel-acked payload exists nowhere else: persist it through the lease-less
-                    // compare-and-swap before the takeover signal propagates, as the cancellation
-                    // branch does. Without this the redelivered execution re-attached to a
-                    // consumed correlation id, burned the step timeout, and re-sent the request.
-                    var received = waiter.ResponseTask.Result;
-                    checkpoint.PendingCorrelationId = null;
-                    if (_lease.IsLost)
-                    {
-                        await CheckpointReceivedWithoutLeaseAsync(name, checkpoint, received, correlationId).ConfigureAwait(false);
-                        _lease.ThrowIfLost(ex);
-                    }
-
-                    await CompleteStepAsync(name, checkpoint, AsyncResponseJson.Serialize(received), CancellationToken.None, kind: DurableFlowStepKind.Awaited, correlationId: correlationId, notify: false).ConfigureAwait(false);
+                    // that save can trip on its own in the same window. Settled exactly as the
+                    // cancellation branch settles it: without this the redelivered execution
+                    // re-attached to a consumed correlation id, burned the step timeout, and
+                    // re-sent the request.
+                    var received = await SettleWonResponseAsync(name, checkpoint, waiter.ResponseTask.Result, correlationId, ex).ConfigureAwait(false);
                     notifyCompletion = true;
                     return received;
                 }
@@ -999,6 +1100,68 @@ internal sealed class DurableFlowContext : IDurableFlowContext
             if (notifyCompletion)
                 await NotifyStepAsync(static (o, e) => o.OnStepCompletedAsync(e), name, DurableFlowStepKind.Awaited, correlationId, checkpoint.WakeAtUtc).ConfigureAwait(false);
         }
+    }
+
+    /// <summary>
+    /// An awaited step holds its delivery for the whole wait, and — unlike a timer — it is NOT
+    /// handed over to a fresh delivery at the in-process budget: disposing the waiter deletes its
+    /// lost-subscriber recovery registration, so a response landing between one hop's waiter and
+    /// the next hop's re-attach would find neither a subscriber nor a recovery target and be
+    /// dropped. On a transport with an in-flight ceiling a wait longer than the budget can
+    /// therefore outlive its delivery: the broker redelivers the job while this handler is still
+    /// parked, and the copy contends on the execution lease this handler holds. That is
+    /// configuration the operator can fix and should hear about — hence one warning per parked
+    /// step.
+    /// </summary>
+    private void WarnIfWaitOutlivesInFlightCeiling(string name, TimeSpan? waitWindow)
+    {
+        if (_workerTransport is not IWorkerTransportInFlightLimit { MaxInFlightDuration: { } ceiling }
+            || ceiling <= TimeSpan.Zero
+            || InProcessParkBudget() is not { } budget
+            || waitWindow <= budget)
+        {
+            return;
+        }
+
+        _logger.LogWarning(
+            "Flow {FlowId} step '{Step}' waits in process for up to {WaitWindow} for its response, but the worker transport redelivers a job held longer than {InFlightCeiling} even while its handler is alive (in-process budget: {Budget}). Awaited steps are not handed over to a fresh delivery the way timers are, so a response slower than that is awaited under a delivery the broker has already handed to another consumer. Keep the step's timeout within the budget, raise the broker's ceiling, or poll with a durable timer between shorter awaited steps.",
+            FlowId,
+            name,
+            waitWindow?.ToString() ?? "an unbounded time",
+            ceiling,
+            budget);
+    }
+
+    /// <summary>
+    /// Checkpoints a response that WON the waiter's settlement while the attempt was already
+    /// unwinding (a cancellation, or a throw from outside the wait). The one place this is done,
+    /// because both unwinding branches need it and each was once fixed without the other.
+    /// <para>
+    /// The lease is checked AFTER settling, never before. Running ThrowIfLost first threw while
+    /// the waiter still held a claimed, channel-acked response: the payload was dropped with no
+    /// checkpoint and no re-publish, PendingCorrelationId stayed set, and the redelivered
+    /// execution re-attached to a correlation id that could never be answered — one lost response
+    /// plus one duplicate remote request. A lost lease cannot write lease-fenced, so the payload
+    /// is persisted through the lease-less compare-and-swap the recovery path already uses; only
+    /// then is the takeover signal raised, with <paramref name="cause"/> attached.
+    /// </para>
+    /// </summary>
+    private async Task<TResponse> SettleWonResponseAsync<TResponse>(
+        string name,
+        FlowStepState checkpoint,
+        TResponse received,
+        string correlationId,
+        Exception cause)
+    {
+        checkpoint.PendingCorrelationId = null;
+        if (_lease.IsLost)
+        {
+            await CheckpointReceivedWithoutLeaseAsync(name, checkpoint, received, correlationId).ConfigureAwait(false);
+            _lease.ThrowIfLost(cause);
+        }
+
+        await CompleteStepAsync(name, checkpoint, AsyncResponseJson.Serialize(received), CancellationToken.None, kind: DurableFlowStepKind.Awaited, correlationId: correlationId, notify: false).ConfigureAwait(false);
+        return received;
     }
 
     /// <summary>
@@ -1041,6 +1204,7 @@ internal sealed class DurableFlowContext : IDurableFlowContext
             checkpoint.Faulted = false;
             checkpoint.Message = persistedStep.Message;
             checkpoint.CompletedAtUtc = persistedStep.CompletedAtUtc;
+            MarkStepReturned(name);
             return true;
         }
         catch (Exception ex)
@@ -1123,7 +1287,6 @@ internal sealed class DurableFlowContext : IDurableFlowContext
         // can complete and re-execute this parent on another worker at any moment, and a save after
         // that point would clobber the re-execution's newer checkpoints with this stale snapshot.
         // The executor therefore does NOT save again on the suspension path.
-        _suspended = true;
         _state.LastMessage = $"Flow {FlowId} suspended waiting for child flow {childFlowId}.";
 
         // Cover the child's OWN park window, not just this parent's idle margin. A plain
@@ -1133,9 +1296,7 @@ internal sealed class DurableFlowContext : IDurableFlowContext
         // is acked as redundant and the child never replays. The parent's row then expired
         // mid-park and the child's completion wake-up found no state: the parent run, and every
         // step after this one, silently lost.
-        await SaveForSleepAsync(RemainingChildParkWindow(child), cancellationToken).ConfigureAwait(false);
-        await EnqueueChildAsync(childFlowId).ConfigureAwait(false);
-        throw new DurableFlowSuspendedException(_state.LastMessage);
+        await ParkAsync(RemainingChildParkWindow(child), () => EnqueueChildAsync(childFlowId), cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -1168,9 +1329,49 @@ internal sealed class DurableFlowContext : IDurableFlowContext
         return furthest > now ? furthest - now : TimeSpan.Zero;
     }
 
+    private void MarkStepReturned(string name)
+        => (_returnedSteps ??= new HashSet<string>(StringComparer.Ordinal)).Add(name);
+
+    /// <summary>
+    /// Marks a step call in flight for its whole duration. A flow body is sequential by contract
+    /// and nothing here is thread-safe: two steps running at once (<c>Task.WhenAll</c> over two
+    /// context calls) interleave their writes of one ledger and one revision counter, which used to
+    /// surface — sometimes — as a rejected checkpoint blamed on a lost execution lease. A second
+    /// call that starts while one is in flight fails immediately with the actual reason instead.
+    /// A step called from INSIDE the running step's own body is sequential and stays allowed.
+    /// </summary>
+    private StepScope EnterStep(string name)
+    {
+        if (Interlocked.CompareExchange(ref _activeStep, 1, 0) == 0)
+        {
+            // Scoped to the calling step method: an async method's changes to the execution
+            // context never flow back to its caller, so the flow body itself never sees this.
+            ActiveStepOwner.Value = _stepToken;
+            return new StepScope(this);
+        }
+
+        if (ReferenceEquals(ActiveStepOwner.Value, _stepToken))
+            return default;
+
+        throw new InvalidOperationException(
+            $"Step '{name}' of flow '{FlowId}' was started while another step of the same run was still executing. A durable flow body runs " +
+            "its steps sequentially — await each context call before making the next one (no Task.WhenAll over steps). For parallel work, " +
+            "start child flows or run the parallel part inside one step.");
+    }
+
+    private readonly struct StepScope(DurableFlowContext? owner) : IDisposable
+    {
+        public void Dispose()
+        {
+            if (owner is not null)
+                Volatile.Write(ref owner._activeStep, 0);
+        }
+    }
+
     private void ThrowIfSuspended()
     {
         _lease.ThrowIfLost();
+        _parkFailure?.Throw();
         if (_suspended)
             throw new DurableFlowSuspendedException(_state.LastMessage ?? $"Flow {FlowId} is suspended.");
     }
@@ -1195,7 +1396,8 @@ internal sealed class DurableFlowContext : IDurableFlowContext
         FlowState child,
         string childFlowId,
         string stepName,
-        string requestedInputJson)
+        string requestedInputJson,
+        bool completed = false)
     {
         // A child id is owned by exactly one parent: the notification that resumes a suspended
         // parent follows the child's single ParentFlowId, so a second parent awaiting the same id
@@ -1224,17 +1426,47 @@ internal sealed class DurableFlowContext : IDurableFlowContext
                 $"but the persisted run is {child.FlowTypeName}. The flowId collides with a different flow — use a unique child id.");
         }
 
-        if (!string.Equals(child.InputTypeName, typeof(TInput).FullName, StringComparison.Ordinal)
-            || !FlowStateJson.JsonEquivalent(child.InputJson, requestedInputJson))
+        // The VALUE is compared, not the JSON shape the serializer happened to give it when the
+        // child was created: a member added to TInput since (nulls and defaults are written) made
+        // every in-flight parent's replay differ from its own persisted child and fail terminally.
+        if (string.Equals(child.InputTypeName, typeof(TInput).FullName, StringComparison.Ordinal)
+            && FlowStateJson.InputEquivalent<TInput>(child.InputJson, requestedInputJson))
         {
-            throw new DurableFlowFailedException(
-                $"Step '{stepName}' of flow '{FlowId}' requested child flow id '{childFlowId}' with a different input " +
-                "type or value than the persisted child. Replays must use semantically identical child input.");
+            return;
         }
+
+        if (completed)
+        {
+            // A completed step answers from its memo whatever the current arguments are — a
+            // local step never re-reads its lambda, a timer never re-reads its delay. The child
+            // finished (possibly weeks ago) and its outcome is settled; failing the PARENT
+            // terminally over an input edit made since would throw that outcome away.
+            _logger.LogWarning(
+                "Flow {FlowId} step '{Step}' requested child flow {ChildFlowId} with a different input type or value than the completed child ran with; returning the completed child's memoized outcome.",
+                FlowId, stepName, childFlowId);
+            return;
+        }
+
+        throw new DurableFlowFailedException(
+            $"Step '{stepName}' of flow '{FlowId}' requested child flow id '{childFlowId}' with a different input " +
+            "type or value than the persisted child. Replays must use semantically identical child input.");
     }
 
     private FlowStepState GetStep(string name)
     {
+        // A name that already RETURNED in this execution is being used for a second step. The
+        // checkpoint is keyed by name alone, so the second use would be answered from the first
+        // one's memo: a step inside a loop ran its first iteration and silently skipped the rest,
+        // returning iteration one's result every time. A step that THREW is not recorded, so
+        // retrying it under its name within one execution keeps working.
+        if (_returnedSteps is not null && _returnedSteps.Contains(name))
+        {
+            throw new InvalidOperationException(
+                $"Step name '{name}' was already used in this execution of flow '{FlowId}'. Checkpoints are keyed by step name, so a second " +
+                "step with the same name would be skipped and handed the first one's result. Give every step a unique name — inside a loop, " +
+                "put the iteration key in it (for example $\"send-{item.Id}\").");
+        }
+
         var steps = _state.Steps ??= new Dictionary<string, FlowStepState>(StringComparer.Ordinal);
         if (!steps.TryGetValue(name, out var step))
         {
@@ -1244,6 +1476,11 @@ internal sealed class DurableFlowContext : IDurableFlowContext
                     "No side effects of this step were started. Partition the work into bounded child flows, or explicitly raise the budget after measuring checkpoint costs.");
             step = new FlowStepState();
             steps[name] = step;
+        }
+        else if (step.Completed)
+        {
+            // Every caller returns a completed step's memo straight away.
+            MarkStepReturned(name);
         }
 
         return step;
@@ -1270,6 +1507,7 @@ internal sealed class DurableFlowContext : IDurableFlowContext
         step.Faulted = faulted;
         step.CompletedAtUtc = UtcNow;
         _state.LastMessage = faulted ? $"Step '{name}' completed (child flow failed)." : $"Step '{name}' completed.";
+        MarkStepReturned(name);
         await SaveAsync(cancellationToken).ConfigureAwait(false);
 
         if (_logger.IsEnabled(LogLevel.Debug))
@@ -1402,7 +1640,15 @@ internal sealed class DurableFlowContext : IDurableFlowContext
     }
 
     internal Task FlushProgressAsync()
-        => _progressDirty ? SaveAsync(CancellationToken.None) : Task.CompletedTask;
+    {
+        // The body returned normally although a park failed — flow code swallowed the throw. The
+        // run is neither finished nor parked, so the executor must not mark it Succeeded: the
+        // failure surfaces here, where the executor awaits the body's outcome.
+        if (_parkFailure is { } failure)
+            return Task.FromException(failure.SourceException);
+
+        return _progressDirty ? SaveAsync(CancellationToken.None) : Task.CompletedTask;
+    }
 
     private async Task SaveAsync(CancellationToken cancellationToken, Exception? cause = null, TimeSpan? ttl = null)
     {
@@ -1444,11 +1690,23 @@ internal sealed class DurableFlowContext : IDurableFlowContext
 
     private async Task<TResponse> WaitForResponseAsync<TResponse>(Task<TResponse> responseTask, CancellationToken cancellationToken)
     {
-        if (!cancellationToken.CanBeCanceled)
+        if (!cancellationToken.CanBeCanceled && !_hostStopping.CanBeCanceled)
             return await responseTask.WaitAsync(_lease.LostToken).ConfigureAwait(false);
 
-        using var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _lease.LostToken);
-        return await responseTask.WaitAsync(linked.Token).ConfigureAwait(false);
+        // Host stop ends the park like the caller's token does (see WaitInProcessAsync): it lands
+        // in the awaited step's wait-side cancellation branch, which settles the handoff and keeps
+        // the breadcrumb, so the redelivered execution re-attaches to the same correlation id.
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _lease.LostToken, _hostStopping);
+        try
+        {
+            return await responseTask.WaitAsync(linked.Token).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException ex) when (_hostStopping.IsCancellationRequested
+            && !cancellationToken.IsCancellationRequested
+            && !_lease.LostToken.IsCancellationRequested)
+        {
+            throw HostStopping(ex);
+        }
     }
 
     private static TResult DeserializeResult<TResult>(string? resultJson)

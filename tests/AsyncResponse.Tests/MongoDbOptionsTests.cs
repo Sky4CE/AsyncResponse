@@ -62,6 +62,9 @@ public sealed class MongoDbOptionsTests
             flowCollection
                 .Setup(c => c.WithReadPreference(It.IsAny<ReadPreference>()))
                 .Returns(flowCollection.Object);
+            flowCollection
+                .Setup(c => c.WithWriteConcern(It.IsAny<WriteConcern>()))
+                .Returns(flowCollection.Object);
             database
                 .Setup(d => d.GetCollection<MongoFlowStateDocument>(It.IsAny<string>(), It.IsAny<MongoCollectionSettings>()))
                 .Returns(flowCollection.Object);
@@ -105,6 +108,9 @@ public sealed class MongoDbOptionsTests
         var okFlowCollection = new Mock<IMongoCollection<MongoFlowStateDocument>>();
         okFlowCollection
             .Setup(c => c.WithReadPreference(It.IsAny<ReadPreference>()))
+            .Returns(okFlowCollection.Object);
+        okFlowCollection
+            .Setup(c => c.WithWriteConcern(It.IsAny<WriteConcern>()))
             .Returns(okFlowCollection.Object);
         okDatabase
             .Setup(d => d.GetCollection<MongoFlowStateDocument>(It.IsAny<string>(), It.IsAny<MongoCollectionSettings>()))
@@ -555,6 +561,16 @@ public sealed class MongoDbOptionsTests
         => Assert.Null(MongoDbCorrelationIdExtractor.Extract(
             headers: null,
             """{"CorrelationId":"1","CorrelationId":"2"}""",
+            new MongoDbAsyncResponseTransportOptions()));
+
+    [Fact]
+    public void CorrelationExtractor_ReturnsNull_WhenTheIdIsAnEscapedLoneSurrogate()
+        // "\ud800" is well-formed JSON — Parse accepts it — but it has no string form, so reading
+        // it throws InvalidOperationException, not the JsonException the walker guarded. Same rule
+        // as the duplicate key above: the id is not in this body, and extraction must not throw.
+        => Assert.Null(MongoDbCorrelationIdExtractor.Extract(
+            headers: null,
+            """{"CorrelationId":"\ud800"}""",
             new MongoDbAsyncResponseTransportOptions()));
 
     [Fact]

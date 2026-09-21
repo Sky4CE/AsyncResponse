@@ -431,6 +431,16 @@ public sealed class PostgreSqlOptionsTests
             new PostgreSqlAsyncResponseTransportOptions()));
 
     [Fact]
+    public void CorrelationExtractor_ReturnsNull_WhenTheIdIsAnEscapedLoneSurrogate()
+        // "\ud800" is well-formed JSON — Parse accepts it — but it has no string form, so reading
+        // it throws InvalidOperationException, not the JsonException the walker guarded. Same rule
+        // as the duplicate key above: the id is not in this body, and extraction must not throw.
+        => Assert.Null(PostgreSqlCorrelationIdExtractor.Extract(
+            headers: null,
+            """{"CorrelationId":"\ud800"}""",
+            new PostgreSqlAsyncResponseTransportOptions()));
+
+    [Fact]
     public void PostgreSqlRetry_ClassifiesTransientExceptions()
     {
         var transientDriverFailure = new NpgsqlException("network", new TimeoutException());

@@ -35,6 +35,18 @@
 #     real-failure check entirely, so exactly the loudest correctness failures were classified as
 #     retryable. Every match here is a single grep whose output is trimmed in bash.
 #
+#  3. THE SPLITTER MUST ENGAGE, OR THE VERDICT IS "REAL". Rule 1 is only as good as the block
+#     splitter, and the splitter anchors on the START of a line. The log auto-retry.yml fetches
+#     from the jobs/logs API is not the console text the in-job retry tees: it opens with a UTF-8
+#     BOM and every line carries a "2026-09-21T16:02:31.9876543Z " prefix, so the anchored
+#     "failed" pattern matched nothing, zero blocks were found, and the verdict silently fell
+#     back to the whole-log scan rule 1 replaced — a fixture flake next to an executed test's
+#     NullReferenceException was retried toward green on main. The BOM and the timestamp are
+#     stripped before anything is matched, and the fallback no longer trusts an empty split: when
+#     the runner's own summary reports more failed tests than the splitter found blocks for
+#     ("failed: 5", or "failed with 5 error(s)" and no block at all), the log has a shape this
+#     script cannot read, and a failure it cannot read is never retried.
+#
 # Signatures are matched over the raw log, ANSI colour codes and all: every signature is a
 # substring that sits between colour escapes in the runner's output, never across them; the
 # block splitter strips the escapes before looking for the "failed" line.
@@ -70,16 +82,21 @@ first_match() {
 }
 
 # Splits the log into failed-test blocks and counts them by kind. Prints one record:
-#   blocks US real US flake US unexplained US real-evidence US flake-evidence US unexplained-evidence
+#   blocks US real US flake US unexplained US reported-failed US real-evidence US flake-evidence
+#   US unexplained-evidence US reported-evidence
 # (US = the unit separator, so empty evidence fields survive `read`). The regexes travel through
 # the environment, not -v: awk applies escape processing to -v values and would turn `\(` into `(`.
+# The BOM travels the same way, as literal bytes: one built inside awk (`sprintf("%c", 239)`) is a
+# byte in a byte-oriented awk (mawk, the hosted runner's) and a different character altogether in
+# a UTF-8-aware one, while a literal is read under the same rules as the log it is compared with.
 classify_blocks() {
-  CI_REAL_RE="$REAL_FAILURE_SIGNATURES" CI_FLAKE_RE="$FLAKE_SIGNATURES" awk '
+  CI_REAL_RE="$REAL_FAILURE_SIGNATURES" CI_FLAKE_RE="$FLAKE_SIGNATURES" CI_BOM=$'\xEF\xBB\xBF' awk '
     BEGIN {
       esc = sprintf("%c", 27)
       ansi_re = esc "\\[[0-9;]*[A-Za-z]"
       real_re = ENVIRON["CI_REAL_RE"]
       flake_re = ENVIRON["CI_FLAKE_RE"]
+      bom = ENVIRON["CI_BOM"]
     }
     function flush() {
       if (in_block) {
@@ -98,7 +115,10 @@ classify_blocks() {
       }
       in_block = 0; block_real = ""; block_flake = ""; block_first = ""; block_name = ""
     }
-    { gsub(ansi_re, "") }
+    # The jobs/logs API shape (rule 3): a BOM opens the file and a timestamp opens every line, in
+    # front of the colour codes. All of it goes before any anchored pattern looks at the line.
+    NR == 1 && bom != "" && index($0, bom) == 1 { $0 = substr($0, length(bom) + 1) }
+    { gsub(ansi_re, ""); sub(/^[0-9-]+T[0-9:.]+Z /, "") }
     /^[[:space:]]*failed[[:space:]]+[^[:space:]]/ {
       flush()
       in_block = 1
@@ -107,18 +127,42 @@ classify_blocks() {
       sub(/[[:space:]]+\([^()]*\)[[:space:]]*$/, "", block_name)
       next
     }
-    /^[[:space:]]*(passed|skipped)[[:space:]]/ || /^[[:space:]]*(Test run summary|Test summary|Passed!|Failed!|Zero tests ran|total:)/ {
+    # The per-assembly result line ("…/AsyncResponse.IntegrationTests.dll (net10.0|x64) failed with
+    # 5 error(s)") ends the last failed test. What follows it is the whole captured output of the
+    # test host — thousands of lines of AppHost and sample-app logging — not the exception of
+    # that test, and a flake signature logged in there explained away whichever executed-test
+    # failure happened to be printed last. (No apostrophes in here: this program is single-quoted.)
+    / failed with [0-9]+ error\(s\)/ {
       flush()
+      if (reported_evidence == "" && match($0, /failed with [0-9]+ error\(s\)/)) reported_evidence = substr($0, RSTART, RLENGTH)
       next
     }
+    /^[[:space:]]*(passed|skipped)[[:space:]]/ || /^[[:space:]]*(Test run summary|Test summary|Passed!|Failed!|Zero tests ran|total:)/ {
+      flush()
+      # The count of failed tests the runner itself prints ("  failed: 5", within the few lines
+      # under "Test run summary") is what rule 3 holds the splitter to.
+      if ($0 ~ /^[[:space:]]*Test run summary/) summary_lines = 6
+      next
+    }
+    summary_lines > 0 {
+      summary_lines--
+      if ($0 ~ /^[[:space:]]*failed:[[:space:]]*[0-9]+[[:space:]]*$/) {
+        count = $0
+        gsub(/[^0-9]/, "", count)
+        reported_failed += count
+        if (count + 0 > 0 && reported_evidence == "") reported_evidence = "failed: " count
+      }
+    }
     in_block {
-      if (block_first == "" && $0 ~ /[^[:space:]]/) { block_first = $0; sub(/^[[:space:]]+/, "", block_first) }
+      # "from <assembly>.dll (net10.0|x64)" sits between the test name and its exception; it is
+      # not the line anyone wants to read as the evidence of the verdict.
+      if (block_first == "" && $0 ~ /[^[:space:]]/ && $0 !~ /^[[:space:]]*from [^[:space:]]+\.dll/) { block_first = $0; sub(/^[[:space:]]+/, "", block_first) }
       if (block_real == "" && match($0, real_re)) block_real = substr($0, RSTART, RLENGTH)
       if (block_flake == "" && match($0, flake_re)) block_flake = substr($0, RSTART, RLENGTH)
     }
     END {
       flush()
-      printf "%d\037%d\037%d\037%d\037%s\037%s\037%s\n", blocks, real_blocks, flake_blocks, unexplained_blocks, real_evidence, flake_evidence, unexplained_evidence
+      printf "%d\037%d\037%d\037%d\037%d\037%s\037%s\037%s\037%s\n", blocks, real_blocks, flake_blocks, unexplained_blocks, reported_failed, real_evidence, flake_evidence, unexplained_evidence, reported_evidence
     }' "$log"
 }
 
@@ -127,7 +171,7 @@ if build=$(first_match "$BUILD_FAILURE_SIGNATURES") && [ -n "$build" ]; then
   exit 1
 fi
 
-IFS=$'\037' read -r blocks real_blocks flake_blocks unexplained_blocks real_evidence flake_evidence unexplained_evidence < <(classify_blocks)
+IFS=$'\037' read -r blocks real_blocks flake_blocks unexplained_blocks reported_failed real_evidence flake_evidence unexplained_evidence reported_evidence < <(classify_blocks)
 
 if [ "$real_blocks" -gt 0 ]; then
   echo "real: $real_evidence"
@@ -142,6 +186,14 @@ fi
 # assertion, output the runner did not attribute to a test) is still one.
 if real=$(first_match "$REAL_FAILURE_SIGNATURES") && [ -n "$real" ]; then
   echo "real: $real"
+  exit 1
+fi
+
+# Rule 3: the runner says tests failed and the splitter did not find them (or not all of them).
+# Per-test judgement did not happen for the missing ones, so no flake signature elsewhere in the
+# log can vouch for them.
+if [ "$reported_failed" -gt "$blocks" ] || { [ "$blocks" -eq 0 ] && [ -n "$reported_evidence" ]; }; then
+  echo "real: the log reports '$reported_evidence' ($reported_failed failed test(s) in its run summaries) but only $blocks failed-test block(s) could be read from it; a test failure this script cannot read is never retried"
   exit 1
 fi
 

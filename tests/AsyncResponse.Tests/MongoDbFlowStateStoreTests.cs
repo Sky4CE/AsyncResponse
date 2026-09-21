@@ -110,6 +110,9 @@ public sealed class MongoDbFlowStateStoreTests
         collection
             .Setup(c => c.WithReadPreference(It.IsAny<ReadPreference>()))
             .Returns(collection.Object);
+        collection
+            .Setup(c => c.WithWriteConcern(It.IsAny<WriteConcern>()))
+            .Returns(collection.Object);
 
         // The provisioned collection lists ONLY the default _id index — no TTL reaper.
         var cursor = new Mock<IAsyncCursor<BsonDocument>>();
@@ -151,6 +154,9 @@ public sealed class MongoDbFlowStateStoreTests
         var collection = new Mock<IMongoCollection<MongoFlowStateDocument>>();
         collection
             .Setup(c => c.WithReadPreference(It.IsAny<ReadPreference>()))
+            .Returns(collection.Object);
+        collection
+            .Setup(c => c.WithWriteConcern(It.IsAny<WriteConcern>()))
             .Returns(collection.Object);
 
         // The provisioned collection lists ONLY the default _id index — no TTL reaper.
@@ -194,6 +200,9 @@ public sealed class MongoDbFlowStateStoreTests
             // AutoCreateIndexes = false now performs.
             Collection
                 .Setup(item => item.WithReadPreference(It.IsAny<ReadPreference>()))
+                .Returns(Collection.Object);
+            Collection
+                .Setup(item => item.WithWriteConcern(It.IsAny<WriteConcern>()))
                 .Returns(Collection.Object);
             Collection.WithProvisionedTtlIndex();
             Database

@@ -42,7 +42,10 @@ internal sealed record NatsJobDelivery(
 /// </summary>
 internal interface INatsJetStreamTransport
 {
-    /// <summary>Idempotently creates or updates the stream capturing <paramref name="subject"/>.</summary>
+    /// <summary>
+    /// Creates the stream capturing <paramref name="subject"/> when it does not exist. An existing
+    /// stream is verified, never rewritten.
+    /// </summary>
     Task EnsureStreamAsync(string stream, string subject, long? maxMessages, CancellationToken cancellationToken);
 
     /// <summary>
@@ -78,10 +81,13 @@ internal interface INatsJetStreamTransport
 }
 
 /// <summary>Production <see cref="INatsJetStreamTransport"/> over a NATS <see cref="INatsJSContext"/>.</summary>
-internal sealed class NatsJetStreamTransportAdapter(INatsJSContext _jetStream, ILogger? _logger = null) : INatsJetStreamTransport
+internal sealed class NatsJetStreamTransportAdapter(INatsJSContext _jetStream, ILogger? _logger = null, int _streamReplicas = 1) : INatsJetStreamTransport
 {
+    // JetStream ApiError.ErrCode for "stream name already in use with a different configuration".
+    private const int StreamNameInUseErrCode = 10058;
+
     /// <summary>Ensures the required resource exists.</summary>
-    public async Task EnsureStreamAsync(string stream, string subject, long? maxMessages, CancellationToken cancellationToken)
+    public Task EnsureStreamAsync(string stream, string subject, long? maxMessages, CancellationToken cancellationToken)
     {
         var config = new StreamConfig(stream, [subject])
         {
@@ -94,13 +100,14 @@ internal sealed class NatsJetStreamTransportAdapter(INatsJSContext _jetStream, I
             // If the unprocessed backlog itself reaches MaxMsgs, refuse new publishes (a failed
             // PubAck the publisher's retry/exception path surfaces) instead of silently evicting
             // the oldest pending jobs.
-            Discard = StreamConfigDiscard.New
+            Discard = StreamConfigDiscard.New,
+            NumReplicas = _streamReplicas
         };
-        await _jetStream.CreateOrUpdateStreamAsync(config, cancellationToken).ConfigureAwait(false);
+        return EnsureStreamAsync(stream, subject, config, retentionIsRequired: true, cancellationToken);
     }
 
     /// <summary>Ensures the dead-letter stream exists.</summary>
-    public async Task EnsureDeadLetterStreamAsync(string stream, string subject, long? maxMessages, CancellationToken cancellationToken)
+    public Task EnsureDeadLetterStreamAsync(string stream, string subject, long? maxMessages, CancellationToken cancellationToken)
     {
         // NOT the work-queue config above: nothing ever consumes (so nothing ever acks) the
         // dead-letter subject, which means work-queue retention removes nothing and Discard=New
@@ -112,25 +119,128 @@ internal sealed class NatsJetStreamTransportAdapter(INatsJSContext _jetStream, I
         {
             MaxMsgs = maxMessages ?? -1,
             Retention = StreamConfigRetention.Limits,
-            Discard = StreamConfigDiscard.Old
+            Discard = StreamConfigDiscard.Old,
+            NumReplicas = _streamReplicas
         };
 
+        // Retention is NOT required here: a DLQ provisioned by an earlier build (work-queue
+        // retention) cannot be changed in place — JetStream makes retention immutable — and it
+        // still accepts burials until it fills; failing the whole subscriber over it would be
+        // worse. Keep running and tell the operator how to migrate.
+        return EnsureStreamAsync(stream, subject, config, retentionIsRequired: false, cancellationToken);
+    }
+
+    /// <summary>
+    /// Creates the stream when it is missing and otherwise leaves it exactly as it is. This ran as
+    /// a create-or-UPDATE with the minimal config above, and a JetStream update replaces the whole
+    /// configuration: every subscriber start (and every first publish) reset whatever an operator
+    /// had tuned on the live stream — replicas back to 1, max age / max bytes / max message size
+    /// back to unlimited, the duplicate window back to its default. An existing stream is only
+    /// checked for what this transport cannot work without; the rest of any drift is reported,
+    /// never overwritten.
+    /// </summary>
+    private async Task EnsureStreamAsync(string stream, string subject, StreamConfig desired, bool retentionIsRequired, CancellationToken cancellationToken)
+    {
+        var existing = await TryGetStreamConfigAsync(stream, cancellationToken).ConfigureAwait(false);
+        if (existing is null)
+        {
+            try
+            {
+                // Creating with a configuration identical to the live one is a JetStream no-op, so
+                // replicas of one deployment racing here all succeed.
+                await _jetStream.CreateStreamAsync(desired, cancellationToken).ConfigureAwait(false);
+                return;
+            }
+            catch (NatsJSApiException ex) when (ex.Error.ErrCode == StreamNameInUseErrCode)
+            {
+                // A peer configured differently (mid-rollout) won the creation race: from here on
+                // it is an existing stream like any other.
+                existing = await TryGetStreamConfigAsync(stream, cancellationToken).ConfigureAwait(false);
+                if (existing is null)
+                    throw;
+            }
+        }
+
+        VerifyExistingStream(stream, subject, existing, desired, retentionIsRequired);
+    }
+
+    private async Task<StreamConfig?> TryGetStreamConfigAsync(string stream, CancellationToken cancellationToken)
+    {
         try
         {
-            await _jetStream.CreateOrUpdateStreamAsync(config, cancellationToken).ConfigureAwait(false);
+            var info = await _jetStream.GetStreamAsync(stream, cancellationToken: cancellationToken).ConfigureAwait(false);
+            return info.Info.Config;
         }
-        catch (NatsJSApiException ex)
+        catch (NatsJSApiException ex) when (ex.Error.Code == 404)
         {
-            // Retention is immutable on an existing stream, so a DLQ provisioned by an earlier
-            // build (work-queue retention) rejects this update. The old stream still accepts
-            // burials until it fills; failing the whole subscriber over it would be worse. Keep
-            // running and tell the operator how to migrate.
-            _logger?.LogWarning(
-                ex,
-                "Could not update the NATS dead-letter stream {Stream} to limits retention (an existing stream's retention policy is immutable). " +
-                "It keeps its current configuration; to migrate, delete and let this host recreate it (its messages are dead letters — export first if needed).",
-                stream);
+            return null; // "stream not found" — the only answer that means the stream may be created
         }
+    }
+
+    private void VerifyExistingStream(string stream, string subject, StreamConfig existing, StreamConfig desired, bool retentionIsRequired)
+    {
+        // Nothing this transport publishes would be stored: every publish would fail with "no
+        // response from stream" and the consumer would sit on an empty (or someone else's) stream.
+        if (existing.Subjects is null || !existing.Subjects.Any(captured => SubjectCaptures(captured, subject)))
+        {
+            throw new InvalidOperationException(
+                $"NATS stream '{stream}' already exists but does not capture subject '{subject}' " +
+                $"(it captures: {(existing.Subjects is { Count: > 0 } subjects ? string.Join(", ", subjects) : "none")}). " +
+                "An existing stream is never modified by this transport: add the subject to the stream, or configure a different stream name.");
+        }
+
+        if (existing.Retention != desired.Retention)
+        {
+            if (retentionIsRequired)
+            {
+                // Without work-queue retention acked jobs are never removed: the stream fills with
+                // finished work until MaxMsgs rejects every publish (or, with Discard=Old, evicts
+                // jobs nobody has run yet). Retention cannot be changed on a live stream, so there
+                // is nothing to repair here — fail, as the rejected update did before.
+                throw new InvalidOperationException(
+                    $"NATS stream '{stream}' already exists with {existing.Retention} retention; this transport requires {desired.Retention} retention, " +
+                    "and JetStream does not allow changing the retention policy of an existing stream. " +
+                    "Delete the stream (after draining it) so this host can recreate it, or configure a different stream name.");
+            }
+
+            _logger?.LogWarning(
+                "The NATS dead-letter stream {Stream} has {Retention} retention instead of limits retention (an existing stream's retention policy is immutable). " +
+                "It keeps its current configuration; to migrate, delete and let this host recreate it (its messages are dead letters — export first if needed).",
+                stream,
+                existing.Retention);
+        }
+
+        if (existing.Discard != desired.Discard || existing.MaxMsgs != desired.MaxMsgs)
+        {
+            _logger?.LogWarning(
+                "NATS stream {Stream} already exists with discard={Discard}, max_msgs={MaxMsgs}; this host is configured for discard={DesiredDiscard}, max_msgs={DesiredMaxMsgs}. " +
+                "An existing stream is never modified by this transport — apply the change to the stream yourself, or align the transport options with it.",
+                stream,
+                existing.Discard,
+                existing.MaxMsgs,
+                desired.Discard,
+                desired.MaxMsgs);
+        }
+    }
+
+    /// <summary>NATS subject matching: <c>*</c> stands for exactly one token, a trailing <c>&gt;</c> for one or more.</summary>
+    internal static bool SubjectCaptures(string captured, string subject)
+    {
+        var capturedTokens = captured.Split('.');
+        var subjectTokens = subject.Split('.');
+        for (var i = 0; i < capturedTokens.Length; i++)
+        {
+            if (capturedTokens[i] == ">")
+                return i < subjectTokens.Length;
+
+            if (i >= subjectTokens.Length)
+                return false;
+
+            if (capturedTokens[i] != "*" && !string.Equals(capturedTokens[i], subjectTokens[i], StringComparison.Ordinal))
+                return false;
+        }
+
+        return capturedTokens.Length == subjectTokens.Length;
     }
 
     /// <summary>Ensures the required resource exists.</summary>

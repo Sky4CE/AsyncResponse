@@ -273,8 +273,12 @@ public sealed class SqsSubscriberTests
         // Regression (r24): the renewal heartbeat hardcoded CancellationToken.None in its seam
         // closure and never re-checked its token between messages, and the shutdown path awaited
         // it unbounded — a degraded SQS endpoint held StopAsync hostage for up to a full SDK retry
-        // budget PER remaining batch message. The seam now threads the shutdown-linked token and
-        // the sweep exits between messages once it fires.
+        // budget PER remaining batch message. The sweep exits between messages once the batch does.
+        //
+        // The heartbeat is NOT ended by the stop itself: the handler in flight takes no token and
+        // keeps running, and cancelling its renewal at that moment let its visibility lapse under
+        // it — a competing consumer re-ran the same job on every rolling deploy. It ends when the
+        // batch loop does, which is also what bounds StopAsync.
         var client = new FakeSqsClient();
         var releaseFirstHandler = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var sweepBlocked = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -324,18 +328,26 @@ public sealed class SqsSubscriberTests
         await subscriber.StartAsync(CancellationToken.None);
         await sweepBlocked.Task.WaitAsync(TimeSpan.FromSeconds(5));
 
-        // Shutdown fires while the sweep is parked in m1's renew: the linked token must reach the
-        // in-flight SDK call (so the SDK can abort its retries)...
+        // Shutdown fires while the sweep is parked in m1's renew and m1's handler is still live.
         var stopping = subscriber.StopAsync(CancellationToken.None);
-        await WaitUntilAsync(() => sweepToken.IsCancellationRequested);
 
-        // ...and once the parked renew returns, the sweep must exit BETWEEN messages instead of
-        // spending another SDK call on m2.
+        // m1's heartbeat must survive the stop: the only cancel site is past the batch loop, and
+        // the loop cannot leave it while the handler is blocked.
+        Assert.False(sweepToken.IsCancellationRequested);
+
+        // Once the parked renew returns and the handler completes, the sweep exits BETWEEN
+        // messages instead of spending another renewal on m2 — and the batch's end cancels it.
         releaseSweep.TrySetResult();
         releaseFirstHandler.TrySetResult();
         await stopping.WaitAsync(TimeSpan.FromSeconds(10));
 
-        Assert.Empty(secondCalls.VisibilityChanges);
+        Assert.True(sweepToken.IsCancellationRequested);
+        // m2 never ran, and was handed straight back rather than left to sit out its timeout. The
+        // hand-back is LAST: the sweep may legitimately have renewed m2 while it waited its turn,
+        // but the suppression mark and the per-message gate keep any of those renewals from
+        // landing after the release and stretching m2's invisibility back to the full timeout.
+        ingress.Verify(i => i.HandleWorkerMessageAsync("m2-body"), Times.Never);
+        Assert.Equal(TimeSpan.Zero, secondCalls.VisibilityChanges[^1]);
     }
 
     [Fact]

@@ -49,12 +49,29 @@ public sealed class NatsAsyncResponseTransportOptions
 
     /// <summary>
     /// Creates the worker and response JetStream streams (and the dead-letter stream when enabled) on
-    /// subscriber startup, idempotently. Disable when streams are provisioned out of band.
+    /// subscriber startup when they do not exist. A stream that already exists is never modified:
+    /// startup fails when it does not capture the configured subject or (worker/response streams)
+    /// does not use work-queue retention, and logs a warning when its discard policy or message
+    /// limit differs from these options — settings tuned on the live stream (replicas, max age,
+    /// max bytes, …) are left alone. Disable when streams are provisioned out of band.
     /// </summary>
     public bool CreateStreams { get; set; } = true;
 
-    /// <summary>Maximum message count retained per worker/response stream. Set null to disable the limit.</summary>
+    /// <summary>
+    /// Maximum message count retained per worker/response stream. Set null to disable the limit.
+    /// Applied when this library creates the stream; a later change is reported as drift, not
+    /// applied to the existing stream.
+    /// </summary>
     public long? StreamMaxMessages { get; set; } = 100_000;
+
+    /// <summary>
+    /// Replica count (JetStream <c>num_replicas</c>) for the streams this library creates: worker,
+    /// response, and dead-letter. <c>1</c>–<c>5</c>; use an odd number (3 or 5) on a clustered
+    /// JetStream — an even count tolerates no more failures than the odd count below it. Values
+    /// above 1 require a JetStream cluster with at least that many servers. Only applied when a
+    /// stream is created; an existing stream keeps its replica count. Default: <c>1</c>.
+    /// </summary>
+    public int StreamReplicas { get; set; } = 1;
 
     /// <summary>How long the server waits for an ACK before redelivering a message (the JetStream AckWait).</summary>
     public TimeSpan AckWait { get; set; } = TimeSpan.FromSeconds(30);

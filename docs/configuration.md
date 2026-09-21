@@ -98,6 +98,7 @@ setting) is rejected at startup, because the engine would consume only the last 
 | `MaxRetainedSteps` | 256 (`null` disables) | Maximum distinct checkpoints in one flow ledger. A new step beyond the limit fails terminally before its side effects. Existing checkpoints can still replay. Partition long histories into bounded child flows; raise or disable only after measuring write amplification. |
 | `LedgerSizeWarningBytes` | 512 KiB (`null` disables) | Estimated ledger size past which the executor logs a warning naming the flow — once when first crossed, again at each doubling. Every checkpoint rewrites the whole ledger, so persistence cost grows with each completed step until `MaxStateBytes` (or the provider's item cap) fails the run; this is the early signal to keep step results small or partition into child flows. Lower it on DynamoDB (350 KB item cap). Must be positive. |
 | `TimerInProcessThreshold` | 10 seconds | Timer remainders (`flow.DelayAsync`) at or under this wait in process under the execution lease; longer remainders suspend the run behind a delayed wake-up job when the transport supports native delayed delivery. Zero always prefers suspension; on transports without delayed delivery every timer waits in process regardless. See [timers-and-scheduling.md](timers-and-scheduling.md). |
+| `MaxInProcessParkDuration` | `null` (derive from the transport) | The longest a durable timer holds ONE worker delivery while it waits in process (no native delayed delivery, or a remainder under `TimerInProcessThreshold`). Some brokers cap how long a delivery may stay in flight however alive its handler is — Google Pub/Sub's `MaxTotalAckExtension`, RabbitMQ's `consumer_timeout`, the SQS 12-hour visibility ceiling — and past it the broker hands the same job to a second consumer while the first is still sleeping. Longer sleeps are therefore waited in hops: park, checkpoint, publish an immediate wake-up, end the delivery; the replay resumes the same timer under a fresh delivery. `null` derives the hop from the transport (half of any ceiling it advertises, unbounded when it advertises none); a value can only shorten that hop, or supply one for a transport the library cannot read a ceiling from. Must be positive and at most ~49.7 days. Awaited-response steps are not hopped — see [timers-and-scheduling.md](timers-and-scheduling.md). |
 | `MaxStateBytes` | DynamoDB 350 000 · Cosmos 1 900 000 · MongoDB 15 000 000 · `null` (unlimited) elsewhere | Serialized-ledger size budget checked on every create/checkpoint. An oversized write fails with a diagnosable error (flow id, size, limit) instead of the raw provider error, before the run burns redeliveries — defaults sit under each provider's hard item/document cap. On Cosmos the budget is enforced on the **complete document** as it is sent (the ledger JSON is embedded as a string and escaped a second time, so a ledger well under the budget can produce a document over Cosmos's 2 MB item cap); the ledger JSON alone is checked first as the cheap pre-check. Keep large payloads in your own storage and pass references (see the ledger-size note in [durable-flows.md](durable-flows.md#child-flows)). |
 
 Configure these on the selected store, for example:
@@ -216,9 +217,14 @@ The in-memory transport is configured directly on registration:
 running job — a durable flow starting a child, or a child waking its parent — never waits for
 capacity: the workers are the only consumers, so a worker parking on a full queue would be waiting
 on itself (with the default `WorkerCount = 1`, permanently). Follow-up work is a continuation of a
-job the queue already admitted, so it is accepted past the bound into an **in-job overflow** and
-drains as soon as a worker frees a slot; it still counts toward the shutdown drain, so nothing is
-lost at exit. The overflow is bounded by `InJobOverflowCapacity` (default 4096; `0` allows none;
+job the queue already admitted, so it is accepted past the bound into an **in-job overflow**, and a
+worker that finishes a job runs whatever is waiting there before it takes anything new off the
+queue; it still counts toward the shutdown drain, so nothing is lost at exit. (Draining the
+overflow only *through* the queue starved it: a bounded channel hands a slot freed by a read
+straight to a producer already parked in `PublishAsync`, so under sustained external load the
+overflow never drained at all and follow-ups — a child flow's start, a parent's wake-up — were
+eventually rejected at the bound. External producers stay parked while follow-ups run, which is
+the backpressure the capacity exists to apply.) The overflow is bounded by `InJobOverflowCapacity` (default 4096; `0` allows none;
 negative is rejected at startup): past it a follow-up publish throws `InvalidOperationException` —
 the publishing job fails and is redelivered by the retry ladder below, so make in-job publishes
 idempotent. Every held job retains its materialized envelope and captured execution context, and an

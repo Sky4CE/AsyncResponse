@@ -2,6 +2,8 @@ using Amazon.SQS;
 using Microsoft.Extensions.Options;
 using System.Diagnostics;
 using System.Net;
+using System.Security.Cryptography;
+using System.Text;
 using System.Text.Json;
 
 namespace AsyncResponse.Transports.SQS;
@@ -12,13 +14,29 @@ namespace AsyncResponse.Transports.SQS;
 /// <c>GetQueueUrl</c> once) and cached for the lifetime of the transport; a transient resolution
 /// failure on the first publish is not cached, so the next publish retries. When the worker queue
 /// is a FIFO queue (name or URL ending in <c>.fifo</c>), the correlation id becomes the
-/// <c>MessageGroupId</c> so one flow's jobs stay ordered, and every message carries a unique
+/// <c>MessageGroupId</c> so one flow's jobs stay ordered (an id SQS would reject there — longer
+/// than 128 characters, or anything outside ASCII letters, digits and punctuation — is replaced by
+/// a stable hash of itself), and every message carries a unique
 /// <c>MessageDeduplicationId</c> so distinct jobs of the same flow are never deduplicated away.
 /// </remarks>
-public sealed class SqsWorkerTransport : IWorkerTransport, IDelayedWorkerTransport, IAsyncDisposable
+public sealed class SqsWorkerTransport : IWorkerTransport, IDelayedWorkerTransport, IWorkerTransportInFlightLimit, IAsyncDisposable
 {
     /// <summary>The SQS per-message <c>DelaySeconds</c> ceiling (15 minutes).</summary>
     internal static readonly TimeSpan SqsMaxDelay = TimeSpan.FromSeconds(900);
+
+    /// <summary>
+    /// The SQS in-flight ceiling: a message stays invisible for at most 12 hours counted from the
+    /// <c>ReceiveMessage</c> that delivered it. Extending the visibility timeout does not reset
+    /// that clock, and a <c>ChangeMessageVisibility</c> that would cross it is rejected.
+    /// https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-visibility-timeout.html
+    /// </summary>
+    internal static readonly TimeSpan SqsMaxInFlightDuration = TimeSpan.FromHours(12);
+
+    /// <summary>The SQS <c>MessageGroupId</c> length limit.</summary>
+    private const int MaxMessageGroupIdLength = 128;
+
+    /// <summary>Marks a <c>MessageGroupId</c> derived by hashing a correlation id SQS would reject.</summary>
+    private const string HashedMessageGroupIdPrefix = "sha256-";
 
     private readonly SqsAsyncResponseOptions _options;
     private readonly ISqsClient _client;
@@ -97,6 +115,29 @@ public sealed class SqsWorkerTransport : IWorkerTransport, IDelayedWorkerTranspo
     public TimeSpan MaxPublishDelay => _isFifoQueue ? TimeSpan.Zero : SqsMaxDelay;
 
     /// <inheritdoc/>
+    /// <remarks>
+    /// SQS redelivers a message the moment its visibility lapses, however alive its handler is.
+    /// With <see cref="SqsSubscriberOptions.VisibilityRenewalInterval"/> set, the worker
+    /// subscriber keeps extending the visibility until the 12-hour SQS maximum, which nothing can
+    /// extend past. Without renewal an explicit <see cref="SqsSubscriberOptions.VisibilityTimeout"/>
+    /// is itself the ceiling and is reported as such; when that is unset too, the queue's own
+    /// visibility timeout governs — a value this transport never reads — so only the 12-hour
+    /// upper bound can be reported: set <c>VisibilityTimeout</c> to advertise the real one.
+    /// <c>null</c> in <see cref="SqsAckMode.AckAfterEnqueue"/>, where the message is deleted before
+    /// its handler runs and nothing stays in flight at the broker.
+    /// </remarks>
+    public TimeSpan? MaxInFlightDuration
+        => _options.WorkerSubscriber switch
+        {
+            { AckMode: SqsAckMode.AckAfterEnqueue } => null,
+            // The positivity guard covers a publisher-only process, where the subscriber options
+            // are never validated because no subscriber starts.
+            { VisibilityRenewalInterval: null, VisibilityTimeout: { } visibilityTimeout } when visibilityTimeout > TimeSpan.Zero
+                => visibilityTimeout,
+            _ => SqsMaxInFlightDuration
+        };
+
+    /// <inheritdoc/>
     public Task PublishAsync(WorkerJobEnvelope job, TimeSpan delay, CancellationToken cancellationToken = default)
     {
         if (_isFifoQueue && delay > TimeSpan.Zero)
@@ -138,7 +179,7 @@ public sealed class SqsWorkerTransport : IWorkerTransport, IDelayedWorkerTranspo
                 AsyncResponseJson.Serialize(job),
                 string.IsNullOrWhiteSpace(job.CorrelationId) ? null : job.CorrelationId,
                 MessageGroupId: _isFifoQueue
-                    ? (string.IsNullOrWhiteSpace(job.CorrelationId) ? _options.FifoMessageGroupIdFallback : job.CorrelationId)
+                    ? (string.IsNullOrWhiteSpace(job.CorrelationId) ? _options.FifoMessageGroupIdFallback : ToMessageGroupId(job.CorrelationId))
                     : null,
                 MessageDeduplicationId: _isFifoQueue ? Guid.NewGuid().ToString("N") : null,
                 messageAttributes,
@@ -154,6 +195,36 @@ public sealed class SqsWorkerTransport : IWorkerTransport, IDelayedWorkerTranspo
             AsyncResponseDiagnostics.SetError(activity, ex);
             throw;
         }
+    }
+
+    /// <summary>
+    /// Maps a correlation id onto a <c>MessageGroupId</c> SQS accepts. A correlation id is portable
+    /// text — spaces, non-ASCII, up to 400 characters — while SQS allows at most 128 characters of
+    /// ASCII letters, digits and punctuation there and rejects the whole <c>SendMessage</c>
+    /// otherwise, so every FIFO publish for such an id failed. Conforming ids pass through
+    /// unchanged (existing groups keep their ordering); the rest become a stable SHA-256 of the id,
+    /// so one id still always lands in one group.
+    /// </summary>
+    internal static string ToMessageGroupId(string correlationId)
+        => IsValidMessageGroupId(correlationId)
+            ? correlationId
+            // Uppercase hex: ToHexStringLower is .NET 9+, and this package still targets net8.0.
+            : HashedMessageGroupIdPrefix + Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(correlationId)));
+
+    /// <summary>Whether SQS accepts the value as a <c>MessageGroupId</c> (or <c>MessageDeduplicationId</c>).</summary>
+    internal static bool IsValidMessageGroupId(string value)
+    {
+        if (value.Length is 0 or > MaxMessageGroupIdLength)
+            return false;
+
+        foreach (var character in value)
+        {
+            // ASCII letters, digits and punctuation: exactly the printable range minus the space.
+            if (character is <= ' ' or > '~')
+                return false;
+        }
+
+        return true;
     }
 
     private async Task<string> SendWithRetryAsync(

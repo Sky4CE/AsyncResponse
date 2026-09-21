@@ -52,19 +52,37 @@ internal abstract class PostgreSqlSubscriberService : BackgroundService
         return base.StartAsync(cancellationToken);
     }
 
-    protected override Task ExecuteAsync(CancellationToken stoppingToken)
-        => SubscriberSupervisor.RunAsync(
-            RunSubscriberAsync,
+    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
+    {
+        // ONE dispatcher for the service's lifetime, outliving every supervised attempt below; only
+        // the host stopping disposes it. In early-ACK mode it owns the queued and running work
+        // whose queue items the ACK already deleted, and its DisposeAsync IS the stop-time drain:
+        // wait out BackgroundDrainTimeout, then cancel and dead-letter whatever is still queued.
+        // Built inside the attempt, every poll fault — a claim timeout, a deadlock victim, a
+        // failover: routine for a loop that polls the database several times a second — ran that
+        // drain on a host that was NOT stopping: consumption paused for the whole budget, then
+        // healthy already-ACKed work was dead-lettered as "drain budget lapsed" — or, when the
+        // dead-letter write needed the same failing database, survived only as an Error log line.
+        await using var dispatcher = new PostgreSqlMessageDispatcher(
+            HandleMessageAsync,
+            Options,
+            SubscriberOptions,
+            Logger,
+            Role);
+
+        await SubscriberSupervisor.RunAsync(
+            attemptToken => RunSubscriberAsync(dispatcher, attemptToken),
             stoppingToken,
             failures => AsyncResponseRetry.Backoff(failures, Options.SubscriberRetryBaseDelay, Options.SubscriberRetryMaxDelay),
-            (ex, delay) => Logger.LogWarning(ex, "PostgreSQL subscriber failed for queue {Queue} ({Role}); retrying in {RetryDelay}.", Queue, Role, delay));
+            (ex, delay) => Logger.LogWarning(ex, "PostgreSQL subscriber failed for queue {Queue} ({Role}); retrying in {RetryDelay}.", Queue, Role, delay)).ConfigureAwait(false);
+    }
 
-    private async Task RunSubscriberAsync(CancellationToken stoppingToken)
+    private async Task RunSubscriberAsync(PostgreSqlMessageDispatcher dispatcher, CancellationToken stoppingToken)
     {
         await _store.EnsureCreatedAsync(stoppingToken).ConfigureAwait(false);
         using var signalCts = CancellationTokenSource.CreateLinkedTokenSource(stoppingToken);
 
-        // The LISTEN task starts inside the try so ANY escape — the dispatcher's constructor
+        // The LISTEN task starts inside the try so ANY escape — a throwing logger provider
         // included — runs the cancelling finally. Disposing signalCts does NOT cancel it, so an
         // escape before the finally would otherwise leave ListenLoopAsync parked in
         // connection.WaitAsync holding a pooled connection, one per retry until pool exhaustion.
@@ -72,13 +90,6 @@ internal abstract class PostgreSqlSubscriberService : BackgroundService
         try
         {
             listenTask = Task.Run(() => ListenLoopAsync(signalCts.Token), signalCts.Token);
-
-            await using var dispatcher = new PostgreSqlMessageDispatcher(
-                HandleMessageAsync,
-                Options,
-                SubscriberOptions,
-                Logger,
-                Role);
 
             Logger.LogInformation(
                 "PostgreSQL subscriber started. Queue: {Queue}. Role: {Role}. AckMode: {AckMode}.",

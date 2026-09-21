@@ -1062,26 +1062,89 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
             return cleanup.IsCompletedSuccessfully ? Task.CompletedTask : cleanup.AsTask();
         }
 
-        private Task TimeoutAsync()
-            => DispatchSerialAsync(
-                0,
-                static (subscription, _) => subscription.TimeoutCoreAsync());
+        /// <summary>
+        /// The timer callback's whole body. Nothing awaits it, so nothing may escape it: a fault
+        /// here is an unobserved task at best and, thrown synchronously out of the timer callback
+        /// (a logger that throws while the gate is free), an unhandled exception on a timer
+        /// thread — a process exit, with the waiter never settled. The durable channels wrap the
+        /// same body for the same reason.
+        /// <para>
+        /// The timeout queues behind the per-waiter dispatch gate so it cannot beat a delivery
+        /// that already claimed a message — and, like the dispose path's identical wait
+        /// (<see cref="DisposeCleanupAsync"/>), that wait is bounded by
+        /// <c>DisposalDrainTimeout</c>. Unbounded, a wedged <c>Until</c> predicate held the gate
+        /// forever and the timeout — the one mechanism that exists to end a wait nothing else
+        /// ends — never ran: the waiter hung where every durable channel faults it. A lapsed
+        /// budget faults the task as indeterminate rather than timed out, because the wedged
+        /// delivery holds a response that WAS received.
+        /// </para>
+        /// </summary>
+        private async Task TimeoutAsync()
+        {
+            try
+            {
+                var drainTimeout = _owner._options.DisposalDrainTimeout;
+                try
+                {
+                    await DispatchSerialAsync(0, static (subscription, _) => subscription.TimeoutCoreAsync())
+                        .WaitAsync(drainTimeout, _owner._timeProvider).ConfigureAwait(false);
+                }
+                catch (TimeoutException)
+                {
+                    // Settle first, report second: the log call is the part that can throw. The
+                    // abandoned timeout marker no-ops behind CleanupStarted whenever the wedged
+                    // dispatch finally releases the gate, and a late TrySetResult from it loses
+                    // against this fault.
+                    TrySetException(new AsyncResponseIndeterminateDeliveryException(CorrelationId, drainTimeout));
+                    AsyncResponseDiagnostics.SetError(_activity, "indeterminate_delivery", "Waiter timeout lapsed with a delivery in flight.");
+                    try
+                    {
+                        _owner._logger.LogWarning(
+                            "The waiter timeout for correlationId {CorrelationId} could not run within {DrainTimeout} because a delivery is still in flight; faulting the waiter as indeterminate.",
+                            CorrelationId, drainTimeout);
+                    }
+                    finally
+                    {
+                        await CleanupOnceAsync().ConfigureAwait(false);
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                try
+                {
+                    _owner._logger.LogError(ex, "Error handling waiter timeout for correlationId {CorrelationId}.", CorrelationId);
+                }
+                catch
+                {
+                    // The logger is what is failing; there is nowhere left to report to.
+                }
+            }
+        }
 
-        private Task TimeoutCoreAsync()
+        private async Task TimeoutCoreAsync()
         {
             if (CleanupStarted)
-                return Task.CompletedTask;
+                return;
 
             if (!TryBeginTerminal())
-                return Task.CompletedTask;
+                return;
 
-            _owner._logger.LogWarning("Timed out waiting for response for correlationId {CorrelationId}.", CorrelationId);
-            AsyncResponseDiagnostics.RecordWaiterTimeout("inmemory");
-
+            // The task is completed BEFORE anything that can throw: a logger or a metrics
+            // listener failing here used to leave the waiter terminal (no later signal can
+            // complete it) and unsettled — pending forever, with its timer already spent.
             var exception = new TimeoutException($"Timed out waiting for response for correlationId {CorrelationId}.");
-            AsyncResponseDiagnostics.SetError(_activity, "timeout", exception.Message);
             SetTimeoutException(exception);
-            return CleanupOnceAsTask();
+            try
+            {
+                _owner._logger.LogWarning("Timed out waiting for response for correlationId {CorrelationId}.", CorrelationId);
+                AsyncResponseDiagnostics.RecordWaiterTimeout("inmemory");
+                AsyncResponseDiagnostics.SetError(_activity, "timeout", exception.Message);
+            }
+            finally
+            {
+                await CleanupOnceAsync().ConfigureAwait(false);
+            }
         }
     }
 

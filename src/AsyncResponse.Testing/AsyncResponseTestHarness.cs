@@ -376,20 +376,71 @@ public sealed class AsyncResponseTestHarness : IAsyncDisposable
         // is parked on virtual time; the restart then proceeds like a hard crash and the lease
         // machinery reconciles the leftover execution.
         using var cutoff = new CancellationTokenSource(_options.RealTimeGuard);
-        foreach (var service in Enumerable.Reverse(_started))
+
+        // An engine-owned park — an awaited step, an in-process timer on the virtual clock — ends
+        // only when the test replies or moves the clock, and neither can happen while the test is
+        // awaiting this stop. Waiting it out therefore always burned the WHOLE guard (10 s by
+        // default), once per restart and again per disposal, in a kit whose point is that nothing
+        // sleeps for real. The moment a park is all that is left, end the wait: that is where the
+        // lapsed guard was heading anyway — the leases are broken right after and the new
+        // incarnation takes the execution over, exactly as after a real crash.
+        using var stopWatching = new CancellationTokenSource();
+        var watcher = AbandonOnceOnlyParkedAsync(cutoff, stopWatching.Token);
+        try
         {
-            try
+            foreach (var service in Enumerable.Reverse(_started))
             {
-                await service.StopAsync(cutoff.Token).ConfigureAwait(false);
+                try
+                {
+                    await service.StopAsync(cutoff.Token).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException)
+                {
+                    // Hard-crash semantics for whatever did not stop in time.
+                }
             }
-            catch (OperationCanceledException)
-            {
-                // Hard-crash semantics for whatever did not stop in time.
-            }
+        }
+        finally
+        {
+            await stopWatching.CancelAsync().ConfigureAwait(false);
+            await watcher.ConfigureAwait(false);
         }
 
         _started = [];
     }
+
+    /// <summary>
+    /// Cancels <paramref name="cutoff"/> as soon as every execution still outstanding is an
+    /// engine-owned park. Deliberately does nothing while NOTHING is parked: a stop that can still
+    /// make progress is left to finish cleanly, and the real-time guard stays the backstop for
+    /// user code that is genuinely stuck.
+    /// </summary>
+    private async Task AbandonOnceOnlyParkedAsync(CancellationTokenSource cutoff, CancellationToken stopWatching)
+    {
+        try
+        {
+            while (!stopWatching.IsCancellationRequested)
+            {
+                var parked = _quiesce.ParkedCount;
+                if (parked > 0 && Transport.OutstandingJobs + _quiesce.DirectRunsInFlight <= parked)
+                {
+                    await cutoff.CancelAsync().ConfigureAwait(false);
+                    return;
+                }
+
+                // The SYSTEM clock: the harness's virtual one is not moving while a test awaits
+                // this stop, which is the whole reason the park cannot end by itself.
+                await Task.Delay(ParkedStopPollInterval, TimeProvider.System, stopWatching).ConfigureAwait(false);
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            // The stop finished on its own.
+        }
+    }
+
+    /// <summary>How often the stop checks whether a park is all that is left.</summary>
+    private static readonly TimeSpan ParkedStopPollInterval = TimeSpan.FromMilliseconds(5);
 
     /// <inheritdoc/>
     public async ValueTask DisposeAsync()

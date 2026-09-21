@@ -16,7 +16,15 @@ invoke. Anyone who can write to the recovery store or worker stream can therefor
 process to invoke any registered (service, method) pair with attacker-influenced arguments.
 Persisted type names are resolved only against assemblies already loaded into the process — a
 name never makes the process load one — so that reach is bounded to what the consuming process
-has itself loaded.
+has itself loaded. A persisted name is also bounded in **shape** before it is resolved at all
+(length, generic nesting, total bracket count; by-ref and pointer decorations are refused): the
+runtime's type-name parser recurses per generic argument, and a few hundred kilobytes of
+`A\`1[[A\`1[[…` — comfortably inside the message budget — overflows the parsing thread's stack.
+A `StackOverflowException` cannot be caught, so the process would exit with the message still
+unacknowledged and take every worker it was redelivered to down the same way. The check runs
+before the caches in front of the resolvers, and before any callback is chosen or authorized —
+the recovery path resolves the payload's type name first, so no authorizer could stand in front
+of it. A name outside the limits is simply unresolvable, the same outcome a renamed type has.
 
 - Authenticate and authorize access to your channel store and transport broker — Redis (or Valkey /
   Dragonfly / Garnet), NATS, PostgreSQL, SQL Server, Azure Service Bus, AWS SQS, Google Pub/Sub,

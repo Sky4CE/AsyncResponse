@@ -24,4 +24,18 @@ internal static class RabbitMqOptionsValidator
 
         AsyncResponseChannelOptions.EnsureTimerBacked(options.NetworkRecoveryInterval, nameof(RabbitMqAsyncResponseOptions), nameof(options.NetworkRecoveryInterval));
     }
+
+    /// <summary>
+    /// The mirrored broker <c>consumer_timeout</c> is advertised as the transport's in-flight ceiling
+    /// (<see cref="IWorkerTransportInFlightLimit.MaxInFlightDuration"/>, whose contract is "positive"),
+    /// and the durable-flow engine plans in-process waits inside it: zero or a negative value leaves
+    /// no room for any wait. <c>null</c> (the broker's timeout is disabled) is the way to say "no
+    /// ceiling".
+    /// </summary>
+    public static void ValidateConsumerTimeout(RabbitMqAsyncResponseOptions options)
+    {
+        if (options.BrokerConsumerTimeout is { } consumerTimeout && consumerTimeout <= TimeSpan.Zero)
+            throw new InvalidOperationException(
+                $"{nameof(RabbitMqAsyncResponseOptions)}.{nameof(options.BrokerConsumerTimeout)} must be positive, or null when the broker's consumer_timeout is disabled.");
+    }
 }

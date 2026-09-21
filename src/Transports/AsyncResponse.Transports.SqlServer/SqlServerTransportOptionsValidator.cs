@@ -32,7 +32,7 @@ internal static class SqlServerTransportOptionsValidator
         }
 
         // Timer-armed knobs get the .NET timer ceiling (LockTimeout also drives the in-process
-        // lease-renewal Task.Delay at half its value); DeadLetterRetention is a database-side
+        // lease-renewal Task.Delay at a third of its value); DeadLetterRetention is a database-side
         // "now - retention" prune cutoff and gets the persistence bound instead.
         if (options.DeadLetterRetention is { } deadLetterRetention)
             AsyncResponseChannelOptions.EnsurePersistedTtl(deadLetterRetention, nameof(SqlServerAsyncResponseTransportOptions), nameof(options.DeadLetterRetention));

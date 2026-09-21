@@ -62,7 +62,7 @@ internal abstract class AsyncResponseBuilderBase(
     internal static bool TryEstimateUpperBound(WorkerJobEnvelope envelope, out long upperBound)
     {
         long total = EnvelopeFixedOverhead;
-        total += Escaped(envelope.CorrelationId);
+        total += Escaped(envelope.CorrelationId) + Escaped(envelope.JobId);
         total += Escaped(envelope.Call.ServiceInterfaceFullName) + Escaped(envelope.Call.MethodName);
 
         if (envelope.ReplyTarget is { } target)
@@ -164,7 +164,12 @@ internal abstract class AsyncResponseBuilderBase(
                 Call = work,
                 CorrelationId = ambientCorrelationId,
                 ReplyTarget = AsyncResponseContext.ReplyTarget,
-                Context = _propagation?.Capture()
+                Context = _propagation?.Capture(),
+                // Minted once, here, and carried by every later copy of this job (a broker
+                // redelivery, a NotBeforeUtc re-publish hop): it is what lets a consumer tell the
+                // broker redelivering a job whose handler is still running apart from a second,
+                // independently enqueued job. Two enqueues never share one.
+                JobId = Guid.NewGuid().ToString("N")
             };
 
             if (delay <= TimeSpan.Zero)

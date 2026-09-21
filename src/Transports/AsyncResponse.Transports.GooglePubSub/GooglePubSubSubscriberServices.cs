@@ -43,30 +43,44 @@ internal abstract class GooglePubSubSubscriberService : BackgroundService
         SubscriptionName subscriptionName,
         GooglePubSubSubscriberOptions subscriberOptions)
     {
+        var subscriber = await CreateSubscriberBuilder(subscriptionName, subscriberOptions).BuildAsync().ConfigureAwait(false);
+        return new GooglePubSubSubscriberClientAdapter(subscriber);
+    }
+
+    /// <summary>
+    /// Every streaming-pull knob is set explicitly. Left to the SDK they default to one connection
+    /// per CPU, 1,000 outstanding messages <em>per connection</em> and a 60-minute ack-extension
+    /// ceiling nothing in this package knew about — so a process leased thousands of jobs it was
+    /// not running, and a handler outliving the ceiling had its message redelivered mid-run with
+    /// no option to raise it and nothing advertising it to the durable-flow engine.
+    /// </summary>
+    internal static SubscriberClientBuilder CreateSubscriberBuilder(
+        SubscriptionName subscriptionName,
+        GooglePubSubSubscriberOptions subscriberOptions)
+    {
         // EmulatorOrProduction honors PUBSUB_EMULATOR_HOST when present (local dev / tests) and uses
         // real Google Cloud otherwise — no behavior change in production.
-        var builder = new SubscriberClientBuilder
+        return new SubscriberClientBuilder
         {
             SubscriptionName = subscriptionName,
-            EmulatorDetection = EmulatorDetection.EmulatorOrProduction
-        };
-
-        // In early-ACK mode, bound the streaming pull to the background queue capacity so the client
-        // never holds more un-ACKed messages than the dispatcher can accept. Combined with the
-        // dispatcher's write-side backpressure this keeps queue-full NACKs (which burn a configured
-        // DeadLetterPolicy's delivery attempts) out of steady-state operation.
-        if (subscriberOptions.AckMode is GooglePubSubAckMode.AckAfterEnqueue)
-        {
-            builder.Settings = new SubscriberClient.Settings
+            EmulatorDetection = EmulatorDetection.EmulatorOrProduction,
+            ClientCount = subscriberOptions.ClientCount,
+            Settings = new SubscriberClient.Settings
             {
-                FlowControlSettings = new Google.Api.Gax.FlowControlSettings(
-                    maxOutstandingElementCount: subscriberOptions.BackgroundQueueCapacity,
-                    maxOutstandingByteCount: null)
-            };
-        }
-
-        var subscriber = await builder.BuildAsync().ConfigureAwait(false);
-        return new GooglePubSubSubscriberClientAdapter(subscriber);
+                MaxTotalAckExtension = subscriberOptions.MaxTotalAckExtension,
+                // In early-ACK mode, bound the streaming pull to the background queue capacity so the client
+                // never holds more un-ACKed messages than the dispatcher can accept. Combined with the
+                // dispatcher's write-side backpressure this keeps queue-full NACKs (which burn a configured
+                // DeadLetterPolicy's delivery attempts) out of steady-state operation.
+                FlowControlSettings = subscriberOptions.AckMode is GooglePubSubAckMode.AckAfterEnqueue
+                    ? new Google.Api.Gax.FlowControlSettings(
+                        maxOutstandingElementCount: subscriberOptions.BackgroundQueueCapacity,
+                        maxOutstandingByteCount: null)
+                    : new Google.Api.Gax.FlowControlSettings(
+                        maxOutstandingElementCount: subscriberOptions.MaxOutstandingMessages,
+                        maxOutstandingByteCount: subscriberOptions.MaxOutstandingBytes)
+            }
+        };
     }
 
     /// <summary>Runs this background operation until cancellation is requested.</summary>
@@ -85,7 +99,7 @@ internal abstract class GooglePubSubSubscriberService : BackgroundService
         return base.StartAsync(cancellationToken);
     }
 
-    protected override Task ExecuteAsync(CancellationToken stoppingToken)
+    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         var projectId = GooglePubSubOptionsValidator.Required(Options.ProjectId, nameof(Options.ProjectId));
         var subscriptionId = SubscriptionId;
@@ -95,14 +109,34 @@ internal abstract class GooglePubSubSubscriberService : BackgroundService
         // queue for Pub/Sub: capping redelivery is delegated to the subscription's native
         // DeadLetterPolicy. The client cannot cheaply probe whether one is configured, so tell the
         // operator unconditionally instead of failing silently forever on a poison message.
+        // The same goes for the RetryPolicy: a subscription without one redelivers a NACKed message
+        // immediately, so a transient fault burns a DeadLetterPolicy's whole delivery-attempt budget
+        // in about a second and dead-letters every message that arrives during the blip. The
+        // package never creates subscriptions and reading one needs an admin client plus
+        // pubsub.subscriptions.get, which a consumer identity commonly lacks — so say it here too.
         Logger.LogWarning(
             "Pub/Sub redelivery is unbounded for subscription {Subscription} ({Role}): the transport enforces no delivery-attempt cap and has no library dead-letter queue. "
-            + "Configure a DeadLetterPolicy on the subscription to cap redeliveries of failing messages.",
+            + "Configure a DeadLetterPolicy on the subscription to cap redeliveries of failing messages, and a RetryPolicy (exponential backoff) with it: "
+            + "without one Pub/Sub redelivers a NACKed message immediately, so a transient failure exhausts the DeadLetterPolicy's delivery attempts within seconds.",
             subscriptionName.ToString(),
             SubscriberRole);
 
-        return SubscriberSupervisor.RunAsync(
-            ct => RunSubscriberAsync(subscriptionName, subscriptionId, ct),
+        // The dispatcher outlives every supervised attempt; only host stop drains it. A streaming-pull
+        // fault (network blip, UNAVAILABLE) ends an attempt, not the host — yet scoped to the attempt,
+        // the early-ACK dispatcher's dispose ran its STOP-TIME drain on each one: consumption paused
+        // for up to BackgroundDrainTimeout, then queued work already ACKed at the broker (which
+        // Pub/Sub will never redeliver) was refused as "drain budget lapsed" on a host that was not
+        // stopping. It captures nothing per attempt, so every rebuilt client feeds the same queue.
+        await using var dispatcher = GooglePubSubMessageDispatcher.Create(
+            HandleMessageAsync,
+            Options,
+            SubscriberOptions,
+            Logger,
+            subscriptionId,
+            SubscriberRole);
+
+        await SubscriberSupervisor.RunAsync(
+            ct => RunSubscriberAsync(subscriptionName, dispatcher, ct),
             stoppingToken,
             failures => AsyncResponseRetry.Backoff(
                 failures,
@@ -113,25 +147,17 @@ internal abstract class GooglePubSubSubscriberService : BackgroundService
                 "Pub/Sub subscriber failed for subscription {Subscription} ({Role}); retrying in {RetryDelay}.",
                 subscriptionName.ToString(),
                 SubscriberRole,
-                retryDelay));
+                retryDelay)).ConfigureAwait(false);
     }
 
     private async Task RunSubscriberAsync(
         SubscriptionName subscriptionName,
-        string subscriptionId,
+        GooglePubSubMessageDispatcher dispatcher,
         CancellationToken stoppingToken)
     {
         var subscriber = await _subscriberFactory(subscriptionName, SubscriberOptions).ConfigureAwait(false);
         try
         {
-            await using var dispatcher = GooglePubSubMessageDispatcher.Create(
-                HandleMessageAsync,
-                Options,
-                SubscriberOptions,
-                Logger,
-                subscriptionId,
-                SubscriberRole);
-
             Logger.LogInformation(
                 "Pub/Sub subscriber started. Subscription: {Subscription}. Role: {Role}. AckMode: {AckMode}.",
                 subscriptionName.ToString(),

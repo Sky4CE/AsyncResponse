@@ -22,6 +22,9 @@ internal abstract class SqsSubscriberService : BackgroundService
     protected SqsAsyncResponseOptions Options { get; }
     protected ILogger Logger { get; }
 
+    /// <summary>Measures how long a delivery has been in flight; replaced by tests to reach the 12-hour ceiling.</summary>
+    internal TimeProvider Clock { get; set; } = TimeProvider.System;
+
     protected abstract string QueueName { get; }
     protected abstract SqsSubscriberOptions SubscriberOptions { get; }
     protected abstract SqsSubscriberRole SubscriberRole { get; }
@@ -43,11 +46,26 @@ internal abstract class SqsSubscriberService : BackgroundService
         return base.StartAsync(cancellationToken);
     }
 
-    protected override Task ExecuteAsync(CancellationToken stoppingToken)
+    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         var queue = QueueName;
-        return SubscriberSupervisor.RunAsync(
-            ct => RunSubscriberAsync(queue, ct),
+
+        // The dispatcher outlives the supervised attempts below. In ACK-after-enqueue mode it
+        // holds work that was already DELETED at the broker, and disposing it runs the stop-time
+        // drain — so scoped to one attempt, any receive fault (throttling, a network blip) on a
+        // host that is NOT stopping paused consumption for the drain budget and then surfaced
+        // the still-queued work as lapsed, work SQS can never redeliver. It captures nothing
+        // per-attempt (deliveries carry their own settlement), so only host stop drains it.
+        await using var dispatcher = SqsMessageDispatcher.Create(
+            HandleMessageAsync,
+            Options,
+            SubscriberOptions,
+            Logger,
+            queue,
+            SubscriberRole);
+
+        await SubscriberSupervisor.RunAsync(
+            ct => RunSubscriberAsync(queue, dispatcher, ct),
             stoppingToken,
             failures => AsyncResponseRetry.Backoff(
                 failures,
@@ -58,24 +76,16 @@ internal abstract class SqsSubscriberService : BackgroundService
                 "SQS subscriber failed for queue {Queue} ({Role}); retrying in {RetryDelay}.",
                 queue,
                 SubscriberRole,
-                retryDelay));
+                retryDelay)).ConfigureAwait(false);
     }
 
-    private async Task RunSubscriberAsync(string queue, CancellationToken stoppingToken)
+    private async Task RunSubscriberAsync(string queue, SqsMessageDispatcher dispatcher, CancellationToken stoppingToken)
     {
         // A queue configured by name resolves through GetQueueUrl; failures here (queue not yet
         // provisioned, endpoint still starting) surface to the retry loop above.
         var queueUrl = SqsQueueAddress.IsUrl(queue)
             ? queue
             : await _client.GetQueueUrlAsync(queue, stoppingToken).ConfigureAwait(false);
-
-        await using var dispatcher = SqsMessageDispatcher.Create(
-            HandleMessageAsync,
-            Options,
-            SubscriberOptions,
-            Logger,
-            queue,
-            SubscriberRole);
 
         Logger.LogInformation(
             "SQS subscriber started. Queue: {Queue}. Role: {Role}. AckMode: {AckMode}.",
@@ -91,6 +101,10 @@ internal abstract class SqsSubscriberService : BackgroundService
             await dispatcher.WaitForCapacityAsync(stoppingToken).ConfigureAwait(false);
             var maxMessages = Math.Min(Options.MaxMessagesPerReceive, dispatcher.FreeCapacity);
 
+            // Stamped BEFORE the call: the 12-hour in-flight ceiling counts from the broker-side
+            // receive, which happens somewhere inside the long poll, so measuring from here can
+            // only over-estimate a delivery's age — the safe direction for the renewal clamp.
+            var receiveStarted = Clock.GetTimestamp();
             var deliveries = await _client.ReceiveMessagesAsync(
                 new SqsReceiveRequest(
                     queueUrl,
@@ -99,7 +113,7 @@ internal abstract class SqsSubscriberService : BackgroundService
                     SubscriberOptions.VisibilityTimeout),
                 stoppingToken).ConfigureAwait(false);
 
-            await DispatchBatchAsync(dispatcher, deliveries, queue, stoppingToken).ConfigureAwait(false);
+            await DispatchBatchAsync(dispatcher, deliveries, queue, receiveStarted, stoppingToken).ConfigureAwait(false);
         }
     }
 
@@ -107,6 +121,7 @@ internal abstract class SqsSubscriberService : BackgroundService
         SqsMessageDispatcher dispatcher,
         IReadOnlyList<SqsTransportDelivery> deliveries,
         string queue,
+        long receiveStarted,
         CancellationToken stoppingToken)
     {
         if (deliveries.Count == 0)
@@ -116,8 +131,20 @@ internal abstract class SqsSubscriberService : BackgroundService
             || SubscriberOptions.VisibilityRenewalInterval is not { } renewalInterval
             || SubscriberOptions.VisibilityTimeout is not { } visibilityTimeout)
         {
-            foreach (var delivery in deliveries)
-                await dispatcher.HandleAsync(delivery, stoppingToken).ConfigureAwait(false);
+            for (var index = 0; index < deliveries.Count; index++)
+            {
+                // The handler takes no token, so a stop cannot interrupt the message in hand —
+                // but it must not START the rest of the batch: every fresh handler runs against
+                // the host's shutdown budget and is killed mid-flight when that lapses.
+                if (stoppingToken.IsCancellationRequested)
+                {
+                    await HandBackUnstartedAsync(deliveries, index, progress: null, queue).ConfigureAwait(false);
+                    return;
+                }
+
+                await dispatcher.HandleAsync(deliveries[index], stoppingToken).ConfigureAwait(false);
+            }
+
             return;
         }
 
@@ -126,18 +153,33 @@ internal abstract class SqsSubscriberService : BackgroundService
         // While the batch is in flight, a heartbeat resets every unsettled message's invisibility to
         // the configured visibility timeout.
         var progress = new BatchProgress(deliveries.Count);
-        using var renewalCancellation = CancellationTokenSource.CreateLinkedTokenSource(stoppingToken);
+        // NOT linked to the stop token: the handler in flight when the host stops keeps running
+        // (it takes no token), and ending its heartbeat at that moment let its visibility lapse
+        // under a live handler — a competing consumer then ran the same job a second time on
+        // every rolling deploy. The heartbeat ends when the batch loop does.
+        using var renewalCancellation = new CancellationTokenSource();
         var renewalTask = RenewVisibilityLoopAsync(
             deliveries,
             progress,
             renewalInterval,
             visibilityTimeout,
             queue,
+            receiveStarted,
             renewalCancellation.Token);
+        var handBack = Task.CompletedTask;
         try
         {
             for (var index = 0; index < deliveries.Count; index++)
             {
+                // Same stop rule as the renewal-free path above. Without it the loop kept
+                // starting the rest of the batch serially after the stop — with the heartbeat
+                // already cancelled, so those handlers outlived their visibility.
+                if (stoppingToken.IsCancellationRequested)
+                {
+                    handBack = HandBackUnstartedAsync(deliveries, index, progress, queue);
+                    break;
+                }
+
                 var delivery = deliveries[index];
                 var batchIndex = index;
                 // The dispatcher's failure path shortens visibility to RedeliveryDelay while the
@@ -195,7 +237,95 @@ internal abstract class SqsSubscriberService : BackgroundService
                     SubscriberRole,
                     Options.ShutdownTimeout);
             }
+
+            // Started before the join above and bounded by the same ShutdownTimeout, so the two
+            // overlap: the stop path still spends one ShutdownTimeout here, not two.
+            await handBack.ConfigureAwait(false);
         }
+    }
+
+    /// <summary>
+    /// Makes the batch messages that were never started visible again at once. Left alone they
+    /// stay invisible for the rest of their visibility timeout although nothing is processing
+    /// them, stalling that work for as long on every rolling deploy; the receive already counted
+    /// toward the redrive policy either way. Best-effort and bounded by
+    /// <see cref="SqsAsyncResponseOptions.ShutdownTimeout"/>: a message that cannot be handed back
+    /// simply reappears when its visibility timeout lapses.
+    /// </summary>
+    private async Task HandBackUnstartedAsync(
+        IReadOnlyList<SqsTransportDelivery> deliveries,
+        int firstUnstarted,
+        BatchProgress? progress,
+        string queue)
+    {
+        var budget = new CancellationTokenSource(Options.ShutdownTimeout);
+        var releases = new Task[deliveries.Count - firstUnstarted];
+        for (var index = firstUnstarted; index < deliveries.Count; index++)
+            releases[index - firstUnstarted] = ReleaseAsync(index);
+
+        try
+        {
+            await Task.WhenAll(releases).WaitAsync(Options.ShutdownTimeout).ConfigureAwait(false);
+            budget.Dispose();
+        }
+        catch (TimeoutException)
+        {
+            // An SDK call mid-retry ignored the budget token. The source stays undisposed: the
+            // abandoned calls still hold its token.
+            Logger.LogWarning(
+                "Handing unstarted SQS messages back to {Queue} ({Role}) did not finish within the shutdown budget ({ShutdownTimeout}); they reappear when their visibility timeout lapses.",
+                queue,
+                SubscriberRole,
+                Options.ShutdownTimeout);
+        }
+
+        async Task ReleaseAsync(int index)
+        {
+            var delivery = deliveries[index];
+            SemaphoreSlim? gate = null;
+            try
+            {
+                if (progress is not null)
+                {
+                    // Same ordering rule as the retry delay: a renewal already in flight for this
+                    // receipt must settle first, or its reply overwrites the release.
+                    progress.SuppressRenewal(index);
+                    await progress.VisibilityGate(index).WaitAsync(budget.Token).ConfigureAwait(false);
+                    gate = progress.VisibilityGate(index);
+                }
+
+                await delivery.ChangeVisibilityAsync(TimeSpan.Zero, budget.Token).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                Logger.LogWarning(
+                    ex,
+                    "Failed to hand unstarted SQS message {MessageId} back to {Queue} while stopping; it reappears when its visibility timeout lapses.",
+                    delivery.MessageId,
+                    queue);
+            }
+            finally
+            {
+                gate?.Release();
+            }
+        }
+    }
+
+    /// <summary>
+    /// The visibility a renewal may still request for a delivery received
+    /// <paramref name="inFlight"/> ago, or <c>null</c> once nothing is left. SQS never keeps a
+    /// message invisible for more than 12 hours from its receive and REJECTS — it does not
+    /// truncate — a <c>ChangeMessageVisibility</c> that would cross that, so an unclamped renewal
+    /// fails on every beat from <c>12 h − VisibilityTimeout</c> onward and forfeits the tail of
+    /// the ceiling. Rounded down to whole seconds because the adapter rounds requests up.
+    /// </summary>
+    internal static TimeSpan? ClampRenewalToInFlightCeiling(TimeSpan visibilityTimeout, TimeSpan inFlight)
+    {
+        var remaining = TimeSpan.FromSeconds(Math.Floor((SqsWorkerTransport.SqsMaxInFlightDuration - inFlight).TotalSeconds));
+        if (remaining <= TimeSpan.Zero)
+            return null;
+
+        return visibilityTimeout < remaining ? visibilityTimeout : remaining;
     }
 
     private async Task RenewVisibilityLoopAsync(
@@ -204,6 +334,7 @@ internal abstract class SqsSubscriberService : BackgroundService
         TimeSpan renewalInterval,
         TimeSpan visibilityTimeout,
         string queue,
+        long receiveStarted,
         CancellationToken cancellationToken)
     {
         try
@@ -241,7 +372,22 @@ internal abstract class SqsSubscriberService : BackgroundService
                         {
                             if (i < progress.SettledCount || progress.IsRenewalSuppressed(i))
                                 continue;
-                            await delivery.ChangeVisibilityAsync(visibilityTimeout, cancellationToken).ConfigureAwait(false);
+
+                            var extension = ClampRenewalToInFlightCeiling(visibilityTimeout, Clock.GetElapsedTime(receiveStarted));
+                            if (extension is { } clamped)
+                                await delivery.ChangeVisibilityAsync(clamped, cancellationToken).ConfigureAwait(false);
+
+                            if (extension != visibilityTimeout)
+                            {
+                                // The ceiling, not a renewal fault: nothing can extend this
+                                // delivery any further, so say so once and stop asking instead of
+                                // logging a rejected renewal on every remaining beat.
+                                progress.SuppressRenewal(i);
+                                Logger.LogWarning(
+                                    "SQS message {MessageId} on {Queue} has reached the 12-hour SQS in-flight ceiling; its visibility cannot be extended further and SQS will redeliver it while its handler is still running.",
+                                    delivery.MessageId,
+                                    queue);
+                            }
                         }
                         finally
                         {

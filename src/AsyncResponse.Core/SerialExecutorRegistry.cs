@@ -189,13 +189,22 @@ internal sealed class SerialExecutorRegistry(
         Accepted,
 
         /// <summary>
-        /// Not accepted right now — the executor's bounded queue is full, or the channel's executor
-        /// is mid-retirement. The work was not queued; the producer should come back later.
+        /// Not accepted right now — the executor's bounded queue is full, or (for a caller that did
+        /// not ask to tell the two apart) the channel's executor is mid-retirement. The work was not
+        /// queued; the producer should come back later.
         /// </summary>
         Full,
 
         /// <summary>Suppressed by a tombstone (retired executor, no registration left): nothing will ever run it.</summary>
-        Suppressed
+        Suppressed,
+
+        /// <summary>
+        /// Not accepted right now because the channel's executor is mid-retirement — nothing is
+        /// overloaded, and <see cref="EnqueueAsync"/> would wait the retirement out and admit the
+        /// work onto a fresh executor. Reported only to a caller that passes
+        /// <c>distinguishRetiring</c>; everyone else keeps reading it as <see cref="Full"/>.
+        /// </summary>
+        Retiring
     }
 
     /// <summary>
@@ -206,8 +215,17 @@ internal sealed class SerialExecutorRegistry(
     /// backlog of NEW progress messages, stopped every other correlation id's delivery until its
     /// executor drained. A <see cref="TryEnqueueOutcome.Full"/> result leaves the message
     /// unclaimed in the store for a later rescan of that one correlation id.
+    /// <para>
+    /// <paramref name="distinguishRetiring"/> is for a producer whose <see cref="TryEnqueueOutcome.Full"/>
+    /// is TERMINAL rather than "come back later". The sweep above answers a full queue and a
+    /// retiring executor the same way — the message stays in the store — so it keeps one case. The
+    /// Redis channel has no store to come back to: a full queue faults the wait as overloaded, and
+    /// reading a mid-retirement executor (a previous waiter on the same correlation id still
+    /// tearing down) as that overload faulted a fan-out sibling or a re-attached waiter as
+    /// indeterminate with nothing overloaded at all.
+    /// </para>
     /// </summary>
-    public TryEnqueueOutcome TryEnqueue(string channel, Func<Task> work)
+    public TryEnqueueOutcome TryEnqueue(string channel, Func<Task> work, bool distinguishRetiring = false)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(channel);
         ArgumentNullException.ThrowIfNull(work);
@@ -233,7 +251,7 @@ internal sealed class SerialExecutorRegistry(
             // Mid-retirement: EnqueueAsync would wait for the drain and then recreate; a
             // non-blocking caller simply comes back after it.
             if (current.Retiring)
-                return TryEnqueueOutcome.Full;
+                return distinguishRetiring ? TryEnqueueOutcome.Retiring : TryEnqueueOutcome.Full;
 
             // TryWrite is synchronous and never blocks, so it can run under the gate; no in-flight
             // enqueue bookkeeping is needed because nothing is left waiting for capacity.

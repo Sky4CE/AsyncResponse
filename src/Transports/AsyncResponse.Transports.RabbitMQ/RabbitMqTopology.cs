@@ -50,6 +50,15 @@ internal static class RabbitMqTopology
 
         var queueArguments = await EnsureDeadLetterTopologyAsync(channel, options, routingKey, cancellationToken).ConfigureAwait(false);
 
+        // The park queue is declared on its own, never bound: it is reached only through the default
+        // exchange (routing key = queue name) by the park-at-cap publish. Bound to the dead-letter
+        // exchange — as DeadLetterQueue is — it would also collect one copy per retry hop of a
+        // TTL-retry cycle, including the hops of messages that later succeed. Declared with or
+        // without a dead-letter exchange: a broker policy can supply that exchange, and a park
+        // destination nobody declared turns every park into a failed publish.
+        if (!string.IsNullOrWhiteSpace(options.ParkQueue))
+            await channel.QueueDeclareAsync(options.ParkQueue, durable: true, exclusive: false, autoDelete: false, arguments: null, cancellationToken).ConfigureAwait(false);
+
         await channel.QueueDeclareAsync(queue, durable: true, exclusive: false, autoDelete: false, queueArguments, cancellationToken).ConfigureAwait(false);
         await channel.QueueBindAsync(queue, exchange, routingKey, cancellationToken).ConfigureAwait(false);
     }

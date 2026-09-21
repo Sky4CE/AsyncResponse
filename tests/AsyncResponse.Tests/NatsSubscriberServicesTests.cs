@@ -94,17 +94,14 @@ public class NatsSubscriberServicesTests
     }
 
     [Fact]
-    public async Task WorkerSubscriber_SlowBatch_SignalsInProgressForEveryUnsettledMessage_ThenStops()
+    public async Task WorkerSubscriber_SlowHandler_SignalsInProgressForTheMessageInFlight_ThenStops()
     {
-        // Red-on-old: the open-ended consume loop buffered the whole prefetched batch client-side
-        // with no AckWait heartbeat anywhere in the package — a serial batch whose handlers
-        // together outlasted AckWait had its tail redelivered to a competing consumer while it
-        // was still queued here, and NumDelivered climbed toward the Term cap on healthy work.
+        // The AckWait heartbeat: a handler that outlasts AckWait had its own message redelivered
+        // to a competing consumer while it was still running, and NumDelivered climbed toward the
+        // Term cap on healthy work.
         var ingress = new GatedIngress();
         var first = new RecordingDelivery();
-        var second = new RecordingDelivery();
         _jetStream.EnqueueDelivery(first.Create("p1", numDelivered: 1));
-        _jetStream.EnqueueDelivery(second.Create("p2", numDelivered: 1));
         var subscriber = new NatsWorkerSubscriber(
             Options(o => o.AckWait = TimeSpan.FromMilliseconds(300)),
             _jetStream,
@@ -116,24 +113,62 @@ public class NatsSubscriberServicesTests
         {
             await ingress.Started.Task.WaitAsync(TimeSpan.FromSeconds(5)); // p1 is wedged in the handler
 
-            // While p1 sits in the handler and p2 waits its turn, the ~AckWait/3 heartbeat
-            // signals in-progress for BOTH unsettled messages.
-            await Eventually(() => first.Progresses >= 1 && second.Progresses >= 1);
+            // While p1 sits in the handler the ~AckWait/3 heartbeat signals in-progress for it.
+            await Eventually(() => first.Progresses >= 1);
             Assert.Equal(0, first.Acks);
-            Assert.Equal(0, second.Acks);
 
             ingress.Release.TrySetResult();
-            await Eventually(() => first.Acks == 1 && second.Acks == 1);
+            await Eventually(() => first.Acks == 1);
 
-            // The heartbeat dies with the batch: no further renewals after both settled.
+            // The heartbeat dies with the batch: no further renewals after it settled.
             var firstProgresses = first.Progresses;
-            var secondProgresses = second.Progresses;
             await Task.Delay(400);
             Assert.Equal(firstProgresses, first.Progresses);
-            Assert.Equal(secondProgresses, second.Progresses);
         }
         finally
         {
+            await subscriber.StopAsync(CancellationToken.None);
+            subscriber.Dispose();
+        }
+    }
+
+    [Fact]
+    public async Task WorkerSubscriber_AckAfterHandler_FetchesOneMessageAtATime()
+    {
+        // A fetch consumes the delivery count of EVERY message it returns, whether or not a
+        // handler ever ran: a message that kills the process took its prefetched batch-mates with
+        // it, and they were dead-lettered as "max delivery attempts exceeded" without ever being
+        // executed. Where the handler decides settlement, only the message actually handed to it
+        // may burn an attempt — so the fetch asks for exactly one.
+        var ingress = new GatedIngress();
+        var first = new RecordingDelivery();
+        var second = new RecordingDelivery();
+        _jetStream.EnqueueDelivery(first.Create("p1", numDelivered: 1));
+        _jetStream.EnqueueDelivery(second.Create("p2", numDelivered: 1));
+        var subscriber = new NatsWorkerSubscriber(
+            Options(o => o.WorkerSubscriber.BatchSize = 16),
+            _jetStream,
+            ingress,
+            new TestLogger<NatsWorkerSubscriber>());
+
+        await subscriber.StartAsync(CancellationToken.None);
+        try
+        {
+            await ingress.Started.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+            // p1 is in the handler; p2 has NOT been fetched, so it is still the server's to give
+            // to an idle peer — and its delivery count is untouched by p1's fate.
+            Assert.Equal(0, second.Progresses);
+            Assert.Equal(0, second.Acks);
+            Assert.All(_jetStream.FetchSizes, size => Assert.Equal(1, size));
+
+            ingress.Release.TrySetResult();
+            await Eventually(() => first.Acks == 1 && second.Acks == 1);
+            Assert.All(_jetStream.FetchSizes, size => Assert.Equal(1, size));
+        }
+        finally
+        {
+            ingress.Release.TrySetResult();
             await subscriber.StopAsync(CancellationToken.None);
             subscriber.Dispose();
         }

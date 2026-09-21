@@ -114,14 +114,16 @@ internal static class ReflectionExtensions
             // 2) Load the service type by full name
             var serviceType = ResolveServiceType(dto.ServiceInterfaceFullName);
 
+            // The name is quoted through DescribeForDiagnostics: it is store-/stream-written text
+            // on its way into an exception the ingress logs at Error.
             if (serviceType == null)
                 throw new CallbackTargetUnresolvableException(
-                    $"Type '{dto.ServiceInterfaceFullName}' not found in loaded assemblies.");
+                    $"Type '{AsyncResponseTypeResolution.DescribeForDiagnostics(dto.ServiceInterfaceFullName)}' not found in loaded assemblies.");
 
             // 3) Resolve the service instance
             var service = provider.GetService(serviceType)
                        ?? throw new CallbackTargetUnresolvableException(
-                            $"Service '{dto.ServiceInterfaceFullName}' is not registered.");
+                            $"Service '{AsyncResponseTypeResolution.DescribeForDiagnostics(dto.ServiceInterfaceFullName)}' is not registered.");
 
             // 4) Resolve and cache method metadata + compiled invocation delegate.
             var plan = GetInvocationPlan(serviceType, dto.MethodName, dto.Params.Length);
@@ -162,7 +164,7 @@ internal static class ReflectionExtensions
         if (authorizer is not null && !authorizer.IsAllowed(serviceInterfaceFullName, methodName))
         {
             throw new CallbackTargetUnresolvableException(
-                $"Callback target '{serviceInterfaceFullName}.{methodName}' is not authorized by the registered " +
+                $"Callback target '{AsyncResponseTypeResolution.DescribeForDiagnostics(serviceInterfaceFullName)}.{DiagnosticText.EscapedExcerpt(methodName, 256)}' is not authorized by the registered " +
                 $"{nameof(IAsyncResponseCallbackAuthorizer)}; add it to the allowlist (AuthorizeCallbacks) to permit it.");
         }
     }
@@ -207,6 +209,18 @@ internal static class ReflectionExtensions
                         "resolved fails closed with an actionable error and a type-resolution-failure diagnostic instead of misbehaving.")]
     internal static Type? ResolveServiceType(string serviceInterfaceFullName)
     {
+        // Before ANY cache is consulted or filled, and before the parser: a name past the limits
+        // can take the process down inside Type.GetType (see IsWithinResolutionLimits), and it
+        // must not become a cache key either — the caches are name-keyed and sit in front of
+        // callback authorization for the payload and flow paths, so without this an unauthorized
+        // writer chose how many megabytes each of their entries held. Answered as any other
+        // unresolvable name, so every caller keeps the drop/dead-letter route it already has.
+        if (!AsyncResponseTypeResolution.IsWithinResolutionLimits(serviceInterfaceFullName))
+        {
+            AsyncResponseDiagnostics.RecordTypeResolutionFailure("service");
+            return null;
+        }
+
         // Must precede any cache consult/populate: a miss cached without the invalidation hook
         // active could outlive a later assembly load that makes the name resolvable.
         UnresolvableTypeNames.EnsureAssemblyLoadInvalidation();
@@ -290,7 +304,7 @@ internal static class ReflectionExtensions
 
         if (candidates.Length == 0)
             throw new CallbackTargetUnresolvableException(
-                $"No method '{key.MethodName}' with {key.ParameterCount} parameter(s) on '{key.ServiceType.Name}'.");
+                $"No method '{DiagnosticText.EscapedExcerpt(key.MethodName, 256)}' with {key.ParameterCount} parameter(s) on '{key.ServiceType.Name}'.");
 
         if (candidates.Length > 1)
             throw new CallbackTargetUnresolvableException(

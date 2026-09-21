@@ -119,6 +119,16 @@ internal static class CorrelationIdJsonPaths
                 _ => null
             };
         }
+        catch (InvalidOperationException)
+        {
+            // An ESCAPED lone surrogate ("\ud800") is well-formed JSON — Parse accepts it — but it
+            // has no UTF-16 string form, so transcoding it (JsonProperty.Name on any property of a
+            // walked object, GetString on the value or on an embedded-JSON candidate) throws
+            // InvalidOperationException, not JsonException. Same rule as the duplicate key below:
+            // unresolvable, NOT a failure — an escape here made an unroutable inbound message a
+            // handler failure, which on RabbitMQ's default MaxDeliveryAttempts = 0 requeues forever.
+            return null;
+        }
         finally
         {
             scratch?.Dispose();

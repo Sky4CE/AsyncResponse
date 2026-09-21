@@ -557,6 +557,16 @@ public sealed class SqlServerOptionsTests
             TransportOptions()));
 
     [Fact]
+    public void CorrelationExtractor_ReturnsNull_WhenTheIdIsAnEscapedLoneSurrogate()
+        // "\ud800" is well-formed JSON — Parse accepts it — but it has no string form, so reading
+        // it throws InvalidOperationException, not the JsonException the walker guarded. Same rule
+        // as the duplicate key above: the id is not in this body, and extraction must not throw.
+        => Assert.Null(SqlServerCorrelationIdExtractor.Extract(
+            headers: null,
+            """{"CorrelationId":"\ud800"}""",
+            TransportOptions()));
+
+    [Fact]
     public void SqlServerRetry_ClassifiesTransientExceptions()
     {
         Assert.True(SqlServerTransportRetry.IsTransient(new TimeoutException()));

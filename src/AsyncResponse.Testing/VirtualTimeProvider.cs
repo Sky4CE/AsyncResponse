@@ -16,7 +16,14 @@ namespace AsyncResponse.Testing;
 /// </para>
 /// <para>
 /// Time never moves on its own; <see cref="GetUtcNow"/> is exact and starts at
-/// <see cref="DefaultStartTime"/> (2030-01-01T00:00:00Z) unless a start is supplied. Thread-safe.
+/// <see cref="DefaultStartTime"/> (2030-01-01T00:00:00Z) unless a start is supplied. Thread-safe:
+/// advances are serialized, and an advance made from inside a timer callback nests (see
+/// <see cref="AdvanceTo"/>).
+/// </para>
+/// <para>
+/// <see cref="CreateTimer"/> and <see cref="ITimer.Change"/> accept and reject exactly the
+/// arguments the system timer does — whole milliseconds, <c>-1</c> for "never", and the
+/// 4294967294 ms (~49.7-day) ceiling — so a timer the virtual clock arms is one production arms too.
 /// </para>
 /// </summary>
 public sealed class VirtualTimeProvider : TimeProvider
@@ -24,7 +31,10 @@ public sealed class VirtualTimeProvider : TimeProvider
     /// <summary>The default virtual epoch: a fixed instant, so tests never depend on the wall clock.</summary>
     public static readonly DateTimeOffset DefaultStartTime = new(2030, 1, 1, 0, 0, 0, TimeSpan.Zero);
 
+    // _gate guards the clock state and is never held while a callback runs. _advanceGate
+    // serializes whole advances and IS held across their callbacks; it is always taken first.
     private readonly object _gate = new();
+    private readonly object _advanceGate = new();
     private readonly SortedSet<VirtualTimer> _armed = new(VirtualTimerOrder.Instance);
     private DateTimeOffset _utcNow;
     private long _sequence;
@@ -69,45 +79,81 @@ public sealed class VirtualTimeProvider : TimeProvider
         }
     }
 
-    /// <summary>Advances virtual time by <paramref name="delta"/>, firing every timer that falls due, in order.</summary>
+    /// <summary>
+    /// Advances virtual time by <paramref name="delta"/>, firing every timer that falls due, in order.
+    /// See <see cref="AdvanceTo"/> for how concurrent and re-entrant advances behave.
+    /// </summary>
     public void Advance(TimeSpan delta)
     {
         ArgumentOutOfRangeException.ThrowIfLessThan(delta, TimeSpan.Zero);
-        AdvanceTo(GetUtcNow() + delta);
+
+        // The target is relative to "now", so it is computed INSIDE the advance gate: read before
+        // it, two threads advancing at once both started from the same instant and landed as one
+        // step — or one of them found the clock already past its target and threw "backwards".
+        lock (_advanceGate)
+            AdvanceTo(GetUtcNow() + delta);
     }
 
-    /// <summary>Advances virtual time to <paramref name="target"/>, firing every timer that falls due, in order.</summary>
+    /// <summary>
+    /// Advances virtual time to <paramref name="target"/>, firing every timer that falls due, in order.
+    /// <para>
+    /// One advance runs at a time. A call from another thread waits for the running advance to
+    /// finish and then performs its own, so callbacks never run side by side and a callback never
+    /// observes a clock later than its own fire instant. A call from <b>inside a timer callback</b>
+    /// (re-entrant, same thread) nests: it runs to completion right there, firing everything due up
+    /// to its own target in order, and the outer advance then carries on from wherever time stands —
+    /// an outer target the nested advance already passed is simply complete, because time never
+    /// moves backwards. Callbacks run on the advancing thread with no clock state locked, so they
+    /// may read the clock and create, change, or dispose timers freely; a callback that blocks on
+    /// <em>another</em> thread's advance deadlocks, as that advance is waiting for this one.
+    /// </para>
+    /// </summary>
+    /// <exception cref="ArgumentOutOfRangeException"><paramref name="target"/> is earlier than the current virtual time.</exception>
     public void AdvanceTo(DateTimeOffset target)
     {
         target = target.ToUniversalTime();
 
-        while (true)
+        // Monitor re-entrancy is the nesting rule above: the advancing thread's own callbacks
+        // re-enter, every other thread queues behind the whole advance.
+        lock (_advanceGate)
         {
-            VirtualTimer due;
-            lock (_gate)
+            var validated = false;
+            while (true)
             {
-                if (target < _utcNow)
-                    throw new ArgumentOutOfRangeException(nameof(target), target, "Cannot advance virtual time backwards.");
-
-                var next = _armed.Count == 0 ? null : _armed.Min;
-                if (next is null || next.DueAt > target)
+                VirtualTimer due;
+                lock (_gate)
                 {
-                    _utcNow = target;
-                    return;
+                    if (target < _utcNow)
+                    {
+                        // Only the caller's own request can be "backwards". Re-checked on every
+                        // iteration, this also threw out of a perfectly valid advance whose
+                        // callback had nested one past its target.
+                        if (!validated)
+                            throw new ArgumentOutOfRangeException(nameof(target), target, "Cannot advance virtual time backwards.");
+                        return;
+                    }
+
+                    validated = true;
+                    var next = _armed.Count == 0 ? null : _armed.Min;
+                    if (next is null || next.DueAt > target)
+                    {
+                        _utcNow = target;
+                        return;
+                    }
+
+                    due = next;
+                    _armed.Remove(due);
+                    if (due.DueAt > _utcNow)
+                        _utcNow = due.DueAt;
+
+                    due.PrepareFire(_utcNow, out var rearmed);
+                    if (rearmed)
+                        _armed.Add(due);
                 }
 
-                due = next;
-                _armed.Remove(due);
-                if (due.DueAt > _utcNow)
-                    _utcNow = due.DueAt;
-
-                due.PrepareFire(_utcNow, out var rearmed);
-                if (rearmed)
-                    _armed.Add(due);
+                // Outside the state lock: the callback may read the clock, create timers, or re-arm this one.
+                due.Invoke();
             }
-
-            // Outside the lock: the callback may read the clock, create timers, or re-arm this one.
-            due.Invoke();
         }
     }
 
@@ -141,6 +187,9 @@ public sealed class VirtualTimeProvider : TimeProvider
     /// <summary>A manually-driven timer; visible only through <see cref="ITimer"/>.</summary>
     internal sealed class VirtualTimer(VirtualTimeProvider _owner, TimerCallback _callback, object? _state) : ITimer
     {
+        /// <summary><c>System.Threading.Timer</c>'s largest due time and period, in milliseconds (~49.7 days).</summary>
+        private const long MaxSupportedTimeoutMilliseconds = 0xFFFFFFFE;
+
         internal DateTimeOffset DueAt { get; private set; }
         internal long Sequence { get; private set; }
         private TimeSpan _period = Timeout.InfiniteTimeSpan;
@@ -149,11 +198,17 @@ public sealed class VirtualTimeProvider : TimeProvider
 
         public bool Change(TimeSpan dueTime, TimeSpan period)
         {
-            // Match System.Threading.Timer's contract: -1ms means "never"; other negatives are invalid.
-            if (dueTime < TimeSpan.Zero && dueTime != Timeout.InfiniteTimeSpan)
-                throw new ArgumentOutOfRangeException(nameof(dueTime));
-            if (period < TimeSpan.Zero && period != Timeout.InfiniteTimeSpan)
-                throw new ArgumentOutOfRangeException(nameof(period));
+            // The system timer's own check, to the letter (TimeProvider.System.CreateTimer and its
+            // ITimer.Change): whole milliseconds, truncated; -1 means "never"; 0xFFFFFFFE is the
+            // ceiling; dueTime is judged first. The laxer check this replaces armed timers the
+            // BCL rejects — a 50-day due time, any period past the ceiling — so code passed here
+            // and threw ArgumentOutOfRangeException in production.
+            var dueMilliseconds = (long)dueTime.TotalMilliseconds;
+            ArgumentOutOfRangeException.ThrowIfLessThan(dueMilliseconds, -1, nameof(dueTime));
+            ArgumentOutOfRangeException.ThrowIfGreaterThan(dueMilliseconds, MaxSupportedTimeoutMilliseconds, nameof(dueTime));
+            var periodMilliseconds = (long)period.TotalMilliseconds;
+            ArgumentOutOfRangeException.ThrowIfLessThan(periodMilliseconds, -1, nameof(period));
+            ArgumentOutOfRangeException.ThrowIfGreaterThan(periodMilliseconds, MaxSupportedTimeoutMilliseconds, nameof(period));
 
             lock (_owner._gate)
             {
@@ -166,11 +221,14 @@ public sealed class VirtualTimeProvider : TimeProvider
                     _armed = false;
                 }
 
-                _period = period;
-                if (dueTime == Timeout.InfiniteTimeSpan)
+                // Judged on the same truncated values as the check: a period of 0 or -1 whole
+                // milliseconds is one-shot, a due time of -1 is "never", and a negative
+                // sub-millisecond due time is 0 (due now) — never an instant before "now".
+                _period = periodMilliseconds > 0 ? period : Timeout.InfiniteTimeSpan;
+                if (dueMilliseconds == -1)
                     return true;
 
-                DueAt = _owner._utcNow + dueTime;
+                DueAt = _owner._utcNow + (dueTime > TimeSpan.Zero ? dueTime : TimeSpan.Zero);
                 Sequence = _owner._sequence++;
                 _owner._armed.Add(this);
                 _armed = true;

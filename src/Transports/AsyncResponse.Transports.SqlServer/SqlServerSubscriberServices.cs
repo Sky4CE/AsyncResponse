@@ -52,14 +52,32 @@ internal abstract class SqlServerSubscriberService : BackgroundService
         return base.StartAsync(cancellationToken);
     }
 
-    protected override Task ExecuteAsync(CancellationToken stoppingToken)
-        => SubscriberSupervisor.RunAsync(
-            RunSubscriberAsync,
+    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
+    {
+        // ONE dispatcher for the service's lifetime, outliving every supervised attempt below; only
+        // the host stopping disposes it. In early-ACK mode it owns the queued and running work
+        // whose queue items the ACK already deleted, and its DisposeAsync IS the stop-time drain:
+        // wait out BackgroundDrainTimeout, then cancel and dead-letter whatever is still queued.
+        // Built inside the attempt, every poll fault — a claim timeout, a deadlock victim, a
+        // failover: routine for a loop that polls the database several times a second — ran that
+        // drain on a host that was NOT stopping: consumption paused for the whole budget, then
+        // healthy already-ACKed work was dead-lettered as "drain budget lapsed" — or, when the
+        // dead-letter write needed the same failing database, survived only as an Error log line.
+        await using var dispatcher = new SqlServerMessageDispatcher(
+            HandleMessageAsync,
+            Options,
+            SubscriberOptions,
+            Logger,
+            Role);
+
+        await SubscriberSupervisor.RunAsync(
+            attemptToken => RunSubscriberAsync(dispatcher, attemptToken),
             stoppingToken,
             failures => AsyncResponseRetry.Backoff(failures, Options.SubscriberRetryBaseDelay, Options.SubscriberRetryMaxDelay),
-            (ex, delay) => Logger.LogWarning(ex, "SQL Server subscriber failed for queue {Queue} ({Role}); retrying in {RetryDelay}.", Queue, Role, delay));
+            (ex, delay) => Logger.LogWarning(ex, "SQL Server subscriber failed for queue {Queue} ({Role}); retrying in {RetryDelay}.", Queue, Role, delay)).ConfigureAwait(false);
+    }
 
-    private async Task RunSubscriberAsync(CancellationToken stoppingToken)
+    private async Task RunSubscriberAsync(SqlServerMessageDispatcher dispatcher, CancellationToken stoppingToken)
     {
         await _store.EnsureCreatedAsync(stoppingToken).ConfigureAwait(false);
 
@@ -72,20 +90,13 @@ internal abstract class SqlServerSubscriberService : BackgroundService
                 _signals.Writer.TryWrite(true);
         };
 
-        // The subscription happens inside the try so ANY escape — the dispatcher's constructor
+        // The subscription happens inside the try so ANY escape — a throwing logger provider
         // included — runs the unsubscribing finally: the store is a singleton, so a handler leaked
         // by one failed run survives every retry and every later publish invokes it. A -= that the
         // += never preceded is a harmless no-op.
         try
         {
             _store.MessagePublished += onPublished;
-
-            await using var dispatcher = new SqlServerMessageDispatcher(
-                HandleMessageAsync,
-                Options,
-                SubscriberOptions,
-                Logger,
-                Role);
 
             Logger.LogInformation(
                 "SQL Server subscriber started. Queue: {Queue}. Role: {Role}. AckMode: {AckMode}.",

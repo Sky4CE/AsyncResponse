@@ -61,7 +61,22 @@ Two refinements:
 On transports **without** native delayed delivery (Kafka, RabbitMQ, Google Pub/Sub, Redis
 Streams, NATS), timers wait in process under the execution lease — the same footprint as an
 awaited step, with the same crash story (broker redelivery of the executing job resumes the
-remainder). The ledger's TTL is automatically extended to cover the sleep on both paths, so a
+remainder). Such a wait holds its broker delivery unsettled, and some brokers cap how long ONE
+delivery may stay in flight however alive its handler is: Google Pub/Sub stops extending at
+`MaxTotalAckExtension` (60 minutes by default), RabbitMQ closes a channel whose delivery outlives
+`consumer_timeout` (30 minutes by default), and SQS never keeps a message invisible beyond 12
+hours. Past the ceiling the broker hands the **same job** to another consumer while the first
+handler is still sleeping. A transport that knows its ceiling advertises it
+(`IWorkerTransportInFlightLimit`), and the engine then waits a long sleep in **hops**: it parks for
+at most half the ceiling (or `DurableFlowOptions.MaxInProcessParkDuration`, whichever is shorter),
+checkpoints, publishes an immediate wake-up for the run and ends the delivery; the replay resumes
+the same timer — its due time is checkpointed — under a fresh delivery whose in-flight clock starts
+again. A wake-up that arrives anyway while its own handler is still running is recognised and never
+acknowledged as a duplicate (see [durable-flows.md](durable-flows.md#one-run-at-a-time)).
+
+Awaited-response steps are **not** hopped: a step re-attaches to a correlation id, so handing its
+delivery back would need the wait to be re-established from the ledger on every hop. A step whose
+timeout exceeds the transport's ceiling logs a warning naming both, once per park. The ledger's TTL is automatically extended to cover the sleep on both paths, so a
 run can never out-sleep its own state. That contract also bounds a single sleep: at most the
 3650-day persistence ceiling **minus** `DurableFlowOptions.StateExpiry` (default 14 days →
 3636 days), so the extended TTL always outlives the due instant by the full idle margin; a longer

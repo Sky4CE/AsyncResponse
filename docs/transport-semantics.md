@@ -49,6 +49,14 @@ These hold for every transport in the matrix, verified per package:
   `Func<<Transport>BackgroundFailureContext, ValueTask>? OnBackgroundFailure`, invoked when a
   handler fails after the message was already settled (see the
   [context table](#what-onbackgroundfailure-receives) for what each transport reports).
+- **The background queue outlives a reconnect.** The early-ACK dispatcher belongs to the hosted
+  service, not to one connect-and-consume attempt, and only the host stopping disposes (drains)
+  it. Scoped to an attempt — as it was — any routine fault in the receive loop (a claim timeout,
+  a deadlock victim, a broker blip; for the database transports a poll that runs several times a
+  second) ran the *stop-time* drain on a host that was not stopping: consumption paused for the
+  whole budget and healthy work the broker had already been told to forget was dead-lettered as
+  "drain budget lapsed" — or, when the dead-letter write needed the same failing dependency,
+  survived only as an error log line.
 - **`BackgroundDrainTimeout` = 20 s.** The maximum time to wait for queued and running
   background handlers while a hosted subscriber stops. The database transports split it —
   three quarters for the handlers, one quarter reserved for dead-lettering what is still queued

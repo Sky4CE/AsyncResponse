@@ -1,8 +1,10 @@
+using AsyncResponse.Testing;
 using AsyncResponse.Transports.MongoDB;
 using AsyncResponse.Transports.PostgreSQL;
 using AsyncResponse.Transports.SqlServer;
 using Microsoft.Extensions.Logging.Abstractions;
 using System.Diagnostics;
+using System.Reflection;
 using Xunit;
 
 namespace AsyncResponse.Tests;
@@ -16,13 +18,13 @@ public sealed class DbTransportSharedCoverageTests
 {
     /// <summary>
     /// A lease renewal that throws is a transient store blip, not a lost fence: it is logged and the
-    /// heartbeat tries again on the next beat rather than abandoning the in-flight handler.
+    /// heartbeat keeps trying rather than abandoning the in-flight handler.
     /// </summary>
     [Theory]
     [InlineData(Provider.SqlServer)]
     [InlineData(Provider.PostgreSql)]
     [InlineData(Provider.MongoDb)]
-    public async Task LeaseRenewal_ThatThrows_IsLoggedAndRetriedOnTheNextBeat(Provider provider)
+    public async Task LeaseRenewal_ThatThrows_IsLoggedAndRetried(Provider provider)
     {
         var calls = new Calls { RenewThrows = true };
         var logger = new CollectingLogger();
@@ -43,6 +45,94 @@ public sealed class DbTransportSharedCoverageTests
         Assert.True(calls.Renew >= 2);
         Assert.Equal(1, calls.Ack);
         Assert.Contains(logger.Messages, message => message.StartsWith("Failed to renew the lease of", StringComparison.Ordinal));
+    }
+
+    /// <summary>
+    /// Regression: the beat ran at LockTimeout/2 and a FAILED beat simply waited for the next one —
+    /// which therefore landed at claim + LockTimeout, after <c>locked_until</c>, every time. ONE
+    /// transient renew failure (a command timeout, a broken pooled connection, a SQL Server 1205
+    /// deadlock victim) guaranteed the lease lapsed; a peer claimed the row within its
+    /// EmptyPollDelay and a healthy long handler ran twice concurrently. The beat now runs at
+    /// LockTimeout/3 and a failed one is retried on a short backoff, so the renewal lands with most
+    /// of the lease still in hand. Virtual clock: nothing here waits on real time.
+    /// </summary>
+    [Theory]
+    [InlineData(Provider.SqlServer)]
+    [InlineData(Provider.PostgreSql)]
+    [InlineData(Provider.MongoDb)]
+    public async Task LeaseRenewal_OneFailedBeat_IsRetriedAndLandsBeforeTheLeaseLapses(Provider provider)
+    {
+        var lockTimeout = TimeSpan.FromSeconds(30);
+        var clock = new VirtualTimeProvider();
+        var calls = new Calls { RenewFailuresRemaining = 1 };
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var (dispatcher, handle) = CreateInlineDispatcher(provider, calls, () => release.Task, lockTimeout, clock, new CollectingLogger());
+
+        await using (dispatcher)
+        {
+            var handling = handle(CancellationToken.None);
+            try
+            {
+                // Walk to one second short of the locked_until the claim stamped. Nothing has
+                // extended the lease yet, so whatever renewal is going to save it must have
+                // SUCCEEDED by now.
+                await WalkAsync(clock, lockTimeout - TimeSpan.FromSeconds(1));
+
+                Assert.True(
+                    Volatile.Read(ref calls.RenewSucceeded) >= 1,
+                    $"one failed beat and the lease was never renewed before it lapsed ({Volatile.Read(ref calls.Renew)} renew call(s), none successful)");
+            }
+            finally
+            {
+                release.TrySetResult();
+                await handling.WaitAsync(TimeSpan.FromSeconds(30));
+            }
+        }
+
+        Assert.Equal(1, calls.Ack);
+    }
+
+    /// <summary>
+    /// The retry is "until it succeeds or the fence is lost": a store that keeps failing is retried
+    /// on the short backoff — several attempts inside one lease — and the loop stops for good once
+    /// the renew reports that the <c>lock_id</c> no longer matches.
+    /// </summary>
+    [Theory]
+    [InlineData(Provider.SqlServer)]
+    [InlineData(Provider.PostgreSql)]
+    [InlineData(Provider.MongoDb)]
+    public async Task LeaseRenewal_KeepsRetryingOnTheShortBackoff_UntilTheFenceIsLost(Provider provider)
+    {
+        var lockTimeout = TimeSpan.FromSeconds(30);
+        var clock = new VirtualTimeProvider();
+        var calls = new Calls { RenewFailuresRemaining = 4, RenewResult = false };
+        var logger = new CollectingLogger();
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var (dispatcher, handle) = CreateInlineDispatcher(provider, calls, () => release.Task, lockTimeout, clock, logger);
+
+        await using (dispatcher)
+        {
+            var handling = handle(CancellationToken.None);
+            try
+            {
+                // Beat at 10 s, then four retries a second apart, then the fence-lost answer:
+                // five renew calls, all inside the one lease (at the old cadence there were two).
+                await WalkAsync(clock, lockTimeout - TimeSpan.FromSeconds(1), until: () => Volatile.Read(ref calls.Renew) >= 5);
+                Assert.Equal(5, Volatile.Read(ref calls.Renew));
+                await Eventually(() => logger.Messages.Any(message => message.Contains("was lost", StringComparison.Ordinal)));
+
+                // Fence lost: the loop is over, so nothing is armed on the clock any more and a
+                // further lease's worth of time renews nothing.
+                Assert.Null(clock.NextTimerDueAt);
+                clock.Advance(lockTimeout);
+                Assert.Equal(5, Volatile.Read(ref calls.Renew));
+            }
+            finally
+            {
+                release.TrySetResult();
+                await handling.WaitAsync(TimeSpan.FromSeconds(30));
+            }
+        }
     }
 
     /// <summary>
@@ -545,6 +635,46 @@ public sealed class DbTransportSharedCoverageTests
         Assert.Equal(0, calls.DeadLetter);
     }
 
+    /// <summary>
+    /// Regression: <c>DbTransportHeaders.Materialize</c> guarded only <c>JsonException</c>, but an
+    /// ESCAPED lone surrogate (<c>"\ud800"</c>) is well-formed JSON — Parse accepts it — and only
+    /// transcoding it throws, with <c>InvalidOperationException</c>. That is the very throw this
+    /// helper exists to prevent: after the claim committed attempts+1/lock_id and before any
+    /// delivery object exists, so the row can never reach the failure handler or the dead-letter
+    /// path. The unusable header is skipped and the rest survive.
+    /// </summary>
+    [Theory]
+    [InlineData(typeof(SqlServerAsyncResponseTransportOptions))]
+    [InlineData(typeof(PostgreSqlAsyncResponseTransportOptions))]
+    [InlineData(typeof(MongoDbAsyncResponseTransportOptions))]
+    public void HeaderMaterialization_SkipsAHeaderThatCannotBeTranscoded_InsteadOfThrowing(Type marker)
+    {
+        var materialize = marker.Assembly
+            .GetType("AsyncResponse.Transports.DbTransportHeaders", throwOnError: true)!
+            .GetMethod("Materialize", BindingFlags.Public | BindingFlags.Static)!;
+
+        IReadOnlyDictionary<string, string> Materialize(string json)
+        {
+            try
+            {
+                return (IReadOnlyDictionary<string, string>)materialize.Invoke(null, [json])!;
+            }
+            catch (TargetInvocationException ex) when (ex.InnerException is not null)
+            {
+                System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(ex.InnerException).Throw();
+                throw;
+            }
+        }
+
+        var badValue = Materialize("""{"AR-CorrelationId":"abc","noise":"\ud800","n":1}""");
+        Assert.Equal("abc", badValue["AR-CorrelationId"]);
+        Assert.Equal("1", badValue["n"]);
+        Assert.False(badValue.ContainsKey("noise"));
+
+        var badName = Materialize("""{"\udc00":"noise","AR-CorrelationId":"abc"}""");
+        Assert.Equal("abc", Assert.Single(badName).Value);
+    }
+
     public enum Provider
     {
         SqlServer,
@@ -557,44 +687,58 @@ public sealed class DbTransportSharedCoverageTests
     /// one message, and disposes — draining any background worker the early-ACK mode started.
     /// </summary>
     /// <summary>
-    /// The renewal join is bounded by LockTimeout (ASB/SQS parity): the in-flight renew pins
-    /// CancellationToken.None for its connect and command, so against a degraded database an
-    /// unbounded join held every settlement — on the hot path, and at shutdown the host budget —
-    /// for a full connect+command timeout. Past LockTimeout the lease has lapsed regardless.
+    /// Regression: settlement JOINED the cancelled heartbeat first, for up to LockTimeout. The
+    /// in-flight renew pins CancellationToken.None for its connect and command, so against a slow
+    /// database a handler that had already SUCCEEDED sat waiting on the renew until the very lease
+    /// it was extending had lapsed — and the row was re-claimed and run again before its ack went
+    /// out. Every settlement is fenced by lock_id, so a beat still in flight is a no-op against it
+    /// and nothing needs to wait: the ack goes out while the renew is still wedged. When that beat
+    /// finally lands on a row the ack deleted, its "no match" is the settlement's doing and is NOT
+    /// reported as a lost lease.
     /// </summary>
     [Theory]
     [InlineData(Provider.SqlServer)]
     [InlineData(Provider.PostgreSql)]
     [InlineData(Provider.MongoDb)]
-    public async Task RenewalJoin_IsBoundedByLockTimeout_WhenTheInFlightRenewNeverReturns(Provider provider)
+    public async Task Settlement_DoesNotWaitOnAnInFlightRenewal(Provider provider)
     {
+        // A lease whose REAL-time length the old join would have had to wait out in full.
+        var lockTimeout = TimeSpan.FromMinutes(2);
+        var clock = new VirtualTimeProvider();
         var calls = new Calls { RenewGate = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously) };
         var logger = new CollectingLogger();
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var (dispatcher, handle) = CreateInlineDispatcher(provider, calls, () => release.Task, lockTimeout, clock, logger);
 
-        await RunAsync(
-            provider,
-            logger,
-            lockTimeout: TimeSpan.FromMilliseconds(200),
-            calls: calls,
-            handler: async () =>
-            {
-                // Return once a beat is in flight (and, in this fake, wedged for good).
-                while (Volatile.Read(ref calls.Renew) < 1)
-                    await Task.Delay(10);
-            }).WaitAsync(TimeSpan.FromSeconds(10));
+        await using (dispatcher)
+        {
+            var handling = handle(CancellationToken.None);
 
-        Assert.Equal(1, calls.Ack);
-        Assert.Contains(logger.Messages, message => message.Contains("did not stop within LockTimeout", StringComparison.Ordinal));
-        calls.RenewGate.TrySetResult(true);
+            // The first beat fires and wedges inside the store call; then the handler succeeds.
+            await WalkAsync(clock, lockTimeout, until: () => Volatile.Read(ref calls.Renew) >= 1);
+            Assert.Equal(1, Volatile.Read(ref calls.Renew));
+            release.TrySetResult();
+
+            var settled = await Task.WhenAny(handling, Task.Delay(TimeSpan.FromSeconds(20))) == handling;
+            Assert.True(settled, "the ack waited on a lease renewal that was still in flight");
+            await handling;
+            Assert.Equal(1, calls.Ack);
+
+            // The abandoned beat now answers "no match" — the ack deleted the row.
+            calls.RenewGate.TrySetResult(false);
+            await Task.Delay(100);
+            Assert.DoesNotContain(logger.Messages, message => message.Contains("was lost", StringComparison.Ordinal));
+        }
     }
 
     /// <summary>
-    /// Regression (round 33): the join above ran even while the subscriber was STOPPING. RenewAsync
+    /// Regression (round 33): the renewal join ran even while the subscriber was STOPPING. RenewAsync
     /// pins CancellationToken.None, so against a stalled database the stop path spent the full
     /// LockTimeout (30 s by default) — a term no shutdown validator sums — BEFORE the background
     /// drain even began, and already-ACKed entries were lost when the host expired mid-drain.
-    /// Settlement is fenced by lock_id, so a beat still in flight is a no-op against it: once the
-    /// stopping token is cancelled the join is skipped entirely. Inline (ack-after-handler) path.
+    /// Settlement is fenced by lock_id, so a beat still in flight is a no-op against it: the join
+    /// was first skipped once the stopping token is cancelled, and has since been dropped
+    /// altogether (see the settlement fact above). Inline (ack-after-handler) path.
     /// </summary>
     [Theory]
     [InlineData(Provider.SqlServer)]
@@ -682,6 +826,90 @@ public sealed class DbTransportSharedCoverageTests
             calls.RenewGate.TrySetResult(true);
             await dispatcher.DisposeAsync();
         }
+    }
+
+    /// <summary>
+    /// An ack-after-handler dispatcher whose lease-renewal beat runs on <paramref name="clock"/>,
+    /// plus a delegate that handles one fresh delivery wired to <paramref name="calls"/>.
+    /// </summary>
+    private static (IAsyncDisposable Dispatcher, Func<CancellationToken, Task> Handle) CreateInlineDispatcher(
+        Provider provider,
+        Calls calls,
+        Func<Task> handler,
+        TimeSpan lockTimeout,
+        TimeProvider clock,
+        CollectingLogger logger)
+    {
+        switch (provider)
+        {
+            case Provider.SqlServer:
+            {
+                var options = new SqlServerAsyncResponseTransportOptions
+                {
+                    ConnectionString = "Server=localhost;Database=unused;User ID=sa;Password=unused;TrustServerCertificate=True",
+                    LockTimeout = lockTimeout
+                };
+                var dispatcher = new SqlServerMessageDispatcher(
+                    (_, _) => handler(), options, new SqlServerSubscriberOptions(), logger, SqlServerSubscriberRole.Worker, clock);
+                return (dispatcher, token => dispatcher.HandleAsync(
+                    new SqlServerTransportDelivery(
+                        Guid.NewGuid(), "worker", "{}", Headers, 1,
+                        calls.AckAsync, calls.NakAsync, calls.DeadLetterAsync, calls.RenewAsync),
+                    token));
+            }
+
+            case Provider.PostgreSql:
+            {
+                var options = new PostgreSqlAsyncResponseTransportOptions { LockTimeout = lockTimeout };
+                var dispatcher = new PostgreSqlMessageDispatcher(
+                    (_, _) => handler(), options, new PostgreSqlSubscriberOptions(), logger, PostgreSqlSubscriberRole.Worker, clock);
+                return (dispatcher, token => dispatcher.HandleAsync(
+                    new PostgreSqlTransportDelivery(
+                        Guid.NewGuid(), "worker", "{}", Headers, 1,
+                        calls.AckAsync, calls.NakAsync, calls.DeadLetterAsync, calls.RenewAsync),
+                    token));
+            }
+
+            default:
+            {
+                var options = new MongoDbAsyncResponseTransportOptions { LockTimeout = lockTimeout };
+                var dispatcher = new MongoDbMessageDispatcher(
+                    (_, _) => handler(), options, new MongoDbSubscriberOptions(), logger, MongoDbSubscriberRole.Worker, clock);
+                return (dispatcher, token => dispatcher.HandleAsync(
+                    new MongoDbTransportDelivery(
+                        Guid.NewGuid(), "worker", "{}", Headers, 1,
+                        calls.AckAsync, calls.NakAsync, calls.DeadLetterAsync, calls.RenewAsync),
+                    token));
+            }
+        }
+    }
+
+    /// <summary>
+    /// Walks the virtual clock forward by <paramref name="span"/> in half-second steps. The beat
+    /// re-arms itself from a continuation that may run off the advancing thread, so each step first
+    /// waits (briefly, in real time) for the loop to have a timer armed again — otherwise a step
+    /// could pass over a beat that was not armed yet. A loop that has ended never re-arms; the
+    /// settle wait then just lapses.
+    /// </summary>
+    private static async Task WalkAsync(VirtualTimeProvider clock, TimeSpan span, Func<bool>? until = null)
+    {
+        var step = TimeSpan.FromMilliseconds(500);
+        for (var walked = TimeSpan.Zero; walked < span; walked += step)
+        {
+            await SettleAsync(clock, until);
+            if (until?.Invoke() == true)
+                return;
+
+            clock.Advance(step);
+        }
+
+        await SettleAsync(clock, until);
+    }
+
+    private static async Task SettleAsync(VirtualTimeProvider clock, Func<bool>? until)
+    {
+        for (var i = 0; i < 200 && clock.NextTimerDueAt is null && until?.Invoke() != true; i++)
+            await Task.Delay(5);
     }
 
     private static async Task RunAsync(
@@ -832,15 +1060,25 @@ public sealed class DbTransportSharedCoverageTests
         /// <summary>When set, every renew parks on this gate — a store call that never returns.</summary>
         public TaskCompletionSource<bool>? RenewGate;
 
+        /// <summary>The next this-many renews throw (a transient store blip); later ones answer.</summary>
+        public int RenewFailuresRemaining;
+
+        /// <summary>What a renew that reaches the store answers: <c>false</c> = the lock_id fence no longer matches.</summary>
+        public bool RenewResult = true;
+
+        public int RenewSucceeded;
+
         public ValueTask<bool> RenewAsync()
         {
             Interlocked.Increment(ref Renew);
-            if (RenewThrows)
+            if (RenewThrows || Interlocked.Decrement(ref RenewFailuresRemaining) >= 0)
                 throw new InvalidOperationException("lease store unavailable");
             if (RenewGate is not null)
                 return new ValueTask<bool>(RenewGate.Task);
 
-            return ValueTask.FromResult(true);
+            if (RenewResult)
+                Interlocked.Increment(ref RenewSucceeded);
+            return ValueTask.FromResult(RenewResult);
         }
     }
 

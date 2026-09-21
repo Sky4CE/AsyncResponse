@@ -117,6 +117,100 @@ public static class AsyncResponseTypeResolution
     }
 
     /// <summary>
+    /// Longest persisted type name that is resolved, in UTF-16 code units. The names this library
+    /// writes are <see cref="Type.FullName"/> values, which spell every generic argument
+    /// assembly-qualified — roughly 150–250 units per component (namespace-qualified name plus
+    /// <c>, Assembly, Version=…, Culture=…, PublicKeyToken=…</c>). 4096 leaves room for about
+    /// twenty such components (an eight-element <c>ValueTuple</c> of generic payloads fits), the
+    /// node budget <c>System.Reflection.Metadata.TypeNameParseOptions.MaxNodes</c> defaults to,
+    /// while keeping a hostile name three orders of magnitude under the inbound message budget —
+    /// and keeping the name-keyed resolution caches from holding megabyte keys.
+    /// </summary>
+    internal const int MaxTypeNameLength = 4096;
+
+    /// <summary>
+    /// Deepest <c>[</c> nesting that is resolved: eight levels of generic nesting in the
+    /// assembly-qualified form (<c>Outer`1[[Inner`1[[…]], asm]]</c> costs two brackets a level).
+    /// </summary>
+    internal const int MaxTypeNameNesting = 16;
+
+    /// <summary>
+    /// Most <c>[</c> a resolved name may hold in total — generic argument lists, the
+    /// assembly-qualified wrapper around each argument, and array ranks together. This is the
+    /// bound on a CHAIN of decorations (<c>T[][][]…</c>), which nests no deeper than one bracket
+    /// however long it grows.
+    /// </summary>
+    internal const int MaxTypeNameBrackets = 64;
+
+    /// <summary>
+    /// Whether <paramref name="fullName"/> may be handed to the CLR type-name parser. Every
+    /// resolution path — the default scan, the registered resolvers, and both name-keyed caches in
+    /// front of them — asks this FIRST.
+    /// <para>
+    /// <c>Type.GetType</c> and <c>Assembly.GetType</c> parse generic arguments by recursion and
+    /// build array/pointer/by-ref decorations as a chain that is then resolved by recursion, with
+    /// no depth limit of their own inside the runtime. A persisted name is written by whoever can
+    /// write the recovery store or the worker stream, and a few hundred kilobytes of
+    /// <c>A`1[[A`1[[…</c> — far inside the inbound message budget — overflows the stack of the
+    /// thread that parses it. A <see cref="StackOverflowException"/> cannot be caught: the process
+    /// exits, the message is still unacknowledged, and every worker the broker redelivers it to
+    /// exits the same way. The payload type name is resolved before any callback is chosen, so no
+    /// callback authorizer stands in front of it. The scan below is a single iterative pass, so
+    /// the guard cannot itself be driven deep.
+    /// </para>
+    /// <para>
+    /// Deliberately conservative rather than a second parser: a backslash-escaped bracket is
+    /// counted as a bracket, and <c>&amp;</c> / <c>*</c> are refused wherever they appear. No
+    /// callback service, payload, flow, or flow-input type is a pointer, a by-ref, or an
+    /// unknown-bound array, and a name refused here is simply unresolvable to the caller — the
+    /// outcome it already has for a renamed type.
+    /// </para>
+    /// </summary>
+    internal static bool IsWithinResolutionLimits(string fullName)
+    {
+        if (fullName.Length > MaxTypeNameLength)
+            return false;
+
+        var depth = 0;
+        var brackets = 0;
+        foreach (var unit in fullName)
+        {
+            switch (unit)
+            {
+                case '[':
+                    if (++depth > MaxTypeNameNesting || ++brackets > MaxTypeNameBrackets)
+                        return false;
+                    break;
+                case ']':
+                    if (depth > 0)
+                        depth--;
+                    break;
+                case '&' or '*':
+                    return false;
+            }
+        }
+
+        return true;
+    }
+
+    /// <summary>
+    /// A persisted type name as it may appear in a log line or an exception message. Within the
+    /// resolution limits it is the whole name — so an ordinary name reads exactly as before — with
+    /// control characters and unpaired surrogates escaped; past them it is a short escaped excerpt
+    /// plus the real length. Never megabytes of store-written text, and never its raw line breaks,
+    /// copied into an Error log on every delivery.
+    /// </summary>
+    internal static string DescribeForDiagnostics(string? fullName)
+    {
+        if (fullName is null)
+            return string.Empty;
+
+        return IsWithinResolutionLimits(fullName)
+            ? DiagnosticText.EscapedExcerpt(fullName, MaxTypeNameLength)
+            : $"{DiagnosticText.EscapedExcerpt(fullName, 80)} ({fullName.Length} UTF-16 code units; outside the persisted type-name limits)";
+    }
+
+    /// <summary>
     /// The default scan: resolves a persisted type name against the assemblies ALREADY loaded into
     /// the process, and only those. The name is parsed with the full CLR type-name grammar, so a
     /// generic instantiation whose argument is assembly-qualified — chosen by whoever can write
@@ -126,10 +220,25 @@ public static class AsyncResponseTypeResolution
     /// looked at it. Supplying the resolvers confines every component of the name to what is
     /// loaded, which is the contract this class documents; the registered resolvers above are
     /// consulted only when this returns <c>null</c>.
+    /// <para>
+    /// "Loaded" means the snapshot taken here, and every resolved component is checked against
+    /// it. <c>Assembly.GetType</c> follows type forwarders, and the facades nearly every process
+    /// has loaded (<c>netstandard</c>, <c>mscorlib</c>, <c>System.Runtime</c>) forward to most of
+    /// the framework: asking <c>netstandard</c> for <c>System.Net.Mail.SmtpClient</c> makes the
+    /// runtime load <c>System.Net.Mail</c> and answer with a type from it. That load cannot be
+    /// prevented from here — it is limited to the framework's own assemblies, never a file the
+    /// name's author supplies — but its result can be refused, so a persisted name still only
+    /// ever resolves to a type from an assembly the process had already loaded for itself.
+    /// </para>
     /// </summary>
     [RequiresUnreferencedCode("Resolves a persisted type name by string; a trimmed app may have removed the type.")]
     internal static Type? ResolveLoaded(string fullName)
     {
+        // Backstop: the caching resolvers in front of this refuse such a name before they touch
+        // their caches, but nothing may reach the recursive parser below without the check.
+        if (!IsWithinResolutionLimits(fullName))
+            return null;
+
         var loaded = AppDomain.CurrentDomain.GetAssemblies();
         return Type.GetType(
             fullName,
@@ -137,11 +246,17 @@ public static class AsyncResponseTypeResolution
             typeResolver: (assembly, typeName, ignoreCase) =>
             {
                 if (assembly is not null)
-                    return assembly.GetType(typeName, throwOnError: false, ignoreCase);
+                {
+                    return assembly.GetType(typeName, throwOnError: false, ignoreCase) is { } named && IsDefinedIn(loaded, named)
+                        ? named
+                        : null;
+                }
 
                 foreach (var candidate in loaded)
                 {
-                    if (candidate.GetType(typeName, throwOnError: false, ignoreCase) is { } type)
+                    // A forwarded hit from outside the snapshot is skipped, not final: a later
+                    // candidate may define the same name itself.
+                    if (candidate.GetType(typeName, throwOnError: false, ignoreCase) is { } type && IsDefinedIn(loaded, type))
                         return type;
                 }
 
@@ -150,9 +265,18 @@ public static class AsyncResponseTypeResolution
             throwOnError: false);
     }
 
+    /// <summary>Whether <paramref name="type"/> comes from one of the snapshotted assemblies rather than from one a type forwarder just loaded.</summary>
+    private static bool IsDefinedIn(Assembly[] loaded, Type type)
+        => Array.IndexOf(loaded, type.Assembly) >= 0;
+
     /// <summary>Consults the registered resolvers in order; returns the first non-null match, or <c>null</c>.</summary>
     internal static Type? Resolve(string fullName)
     {
+        // RegisterAssembly's resolver is Assembly.GetType — the same recursive parser as the
+        // default scan — and an application resolver is as likely to call Type.GetType itself.
+        if (!IsWithinResolutionLimits(fullName))
+            return null;
+
         foreach (var resolver in _resolvers)
         {
             try

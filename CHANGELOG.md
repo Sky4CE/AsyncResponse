@@ -13,6 +13,108 @@ work that has landed on `main` but not yet shipped. Security reporters credited 
 
 ### Changed
 
+- **Round-42 review (2026-09-21, whole repository): a live holder is not proof that a second
+  delivery is redundant.**
+  - *A wake-up is never acknowledged as a duplicate of the job it IS.* Round 40 acknowledged a
+    contended wake-up once the store showed the lease being renewed or taken over, on the premise
+    that the holder's own job stays unacknowledged at the broker and comes back if the holder
+    dies. That premise fails when the contending delivery is the holder's **own** job, redelivered
+    because a broker in-flight ceiling lapsed under a handler that is still running: Google
+    Pub/Sub stops extending at `MaxTotalAckExtension` (60 min), RabbitMQ closes a channel whose
+    delivery outlives `consumer_timeout` (30 min), SQS never keeps a message invisible past 12
+    hours, and a Kafka rebalance re-fetches an unstored offset. That delivery was the last copy of
+    the wake-up: acknowledging it left nothing to redeliver, and the run stayed `Running` for ever
+    with no queued job and no dead letter — the exact stranding round 40 set out to fix, reached by
+    a different road. Jobs now carry an identity (`WorkerJobEnvelope.JobId`, additive, minted once
+    and preserved by every redelivery and re-publish hop), the execution lease records the job that
+    drives it inside the lease id (no store or schema change), and a contended delivery carrying
+    the holder's own id is never acknowledged: where the transport can delay it is re-published as
+    the same job just past the holder's lease, and otherwise it is handed back with
+    `DurableFlowLeaseContendedException`. Counted on `asyncresponse.flow.own_job_redeliveries`.
+  - *In-process timer waits are bounded by what the broker allows.* A transport can now advertise
+    its ceiling (`IWorkerTransportInFlightLimit`; Google Pub/Sub, RabbitMQ and SQS do), and a timer
+    that must wait in process parks in hops inside it — park, checkpoint, publish an immediate
+    wake-up, end the delivery — instead of holding one delivery for the whole sleep. New
+    `DurableFlowOptions.MaxInProcessParkDuration` shortens the hop or supplies one for a transport
+    that advertises no ceiling. In-process waits also observe host shutdown now: the delivery is
+    handed back for redelivery instead of being killed mid-wait when the shutdown budget lapses.
+  - *Persisted type names are bounded in shape before they are resolved.* Length, generic nesting
+    and bracket count are checked — and by-ref/pointer decorations refused — ahead of the resolvers
+    and the caches in front of them. The runtime's type-name parser recurses per generic argument,
+    so a few hundred kilobytes of `A\`1[[A\`1[[…` (well inside the message budget) overflowed the
+    parsing thread's stack; `StackOverflowException` cannot be caught, so the process exited with
+    the message still unacknowledged and every worker it was redelivered to exited the same way.
+    The recovery path resolves the payload type name before any callback is chosen, so no
+    authorizer stood in front of it.
+  - *The Redis channel reports "no live waiter" only when it could have seen one.* `PUBSUB NUMSUB`
+    is node-local and the response channels are key-routed, so the subscription lives on one slot
+    owner. A probe that skipped an unreachable node and collected its siblings' node-local zeros
+    returned a definitive `0`, which consumed a live waiter's recovery registration (a double
+    resume) or dropped its response. Zero is now conclusive only when every node that could hold
+    the subscription answered; otherwise the probe reports unknown and the publish is retried.
+  - *The early-ACK background queue outlives a reconnect.* It belonged to a single supervised
+    attempt in every transport, so a routine receive-loop fault on a healthy host ran the
+    *stop-time* drain: consumption paused for the whole budget and already-acknowledged work was
+    dead-lettered as "drain budget lapsed". It now belongs to the hosted service, and only host
+    shutdown drains it.
+  - *A stopping host stops starting new work.* The batch loops kept handing prefetched messages to
+    handlers after the stop, while the visibility/lock/AckWait heartbeat had already been cancelled
+    by the same token — so those handlers outlived their own invisibility and a peer ran them a
+    second time on every rolling deploy. The loops now break between messages and hand back what
+    never started; the heartbeat ends with the batch, not with the stop.
+  - *A database transport's lease survives one failed renewal.* The beat ran at `LockTimeout / 2`
+    and a failed beat waited another full interval, so the retry always landed after the lease had
+    expired: one transient fault (a timeout, a broken pooled connection, a deadlock victim) handed
+    a healthy long handler's row to a peer. Renewal now beats at a third of the timeout and retries
+    a failed beat on a short backoff until it succeeds or the fence is lost.
+  - *Ack-after-handler modes read one message at a time (Redis, NATS).* A fetch consumes the
+    delivery count of every message it returns, so a message that killed the process took its
+    prefetched batch-mates with it — they were dead-lettered as "max delivery attempts exceeded"
+    without ever being executed.
+  - *In-memory follow-up work no longer starves.* A bounded channel hands a slot freed by a read
+    straight to a producer already parked in `PublishAsync`, so pumping the in-job overflow through
+    the queue never drained it under sustained external load: child starts and parent wake-ups were
+    eventually rejected at the overflow bound. A worker now runs what is waiting in the overflow
+    before taking anything new off the queue.
+  - *A completed child step answers from its memo.* Comparing the requested child input against the
+    persisted one failed the **parent** terminally whenever the two differed — including when they
+    differed only in serializer shape, so adding a nullable member to a child input killed every
+    parent already past that step. Input equality is now compared by value, and a mismatch on an
+    already-completed child is a warning: a settled outcome is not thrown away. A child that is
+    still running still fails fast.
+  - *Reusing a step name in one execution is rejected.* Checkpoints are keyed by name, so a second
+    step under a name that already returned was handed the first one's result — a step inside a
+    loop ran its first iteration and silently skipped the rest.
+  - *`DurableFlowInterruptedException` separates "interrupted" from "failed".* A parked run and a
+    stopping host no longer look like a step failure to a `catch (Exception)`, which was running
+    compensation — and terminally failing runs — because of a deploy. It derives from
+    `OperationCanceledException`, so the usual filter already excludes it.
+  - *NATS streams are created, never overwritten.* `CreateOrUpdateStream` re-applied a minimal
+    configuration on every start, which could revert an operator's replicas or limits; an existing
+    stream is now verified (subject capture, retention) and left alone, with a new `StreamReplicas`
+    option for the create path.
+  - *RabbitMQ: a failed park releases its prefetch credit.* A delivery left un-acknowledged on a
+    live channel is not redelivered — it pins a credit — so 16 failed parks stalled the consumer
+    outright; a failed park now nacks with requeue after a bounded backoff. Publisher confirms are
+    keyed on either dead-letter setting, and `ParkQueue` names a park queue that is not bound to
+    the retry exchange.
+  - *SQS FIFO accepts portable correlation ids.* An id with spaces, non-ASCII, or over 128
+    characters is hashed into a conforming `MessageGroupId` instead of failing every publish;
+    conforming ids pass through unchanged so existing group ordering is preserved.
+  - *Google Pub/Sub concurrency and ack extension are configurable.* `ClientCount`,
+    `MaxOutstandingMessages`, `MaxOutstandingBytes` and `MaxTotalAckExtension` are exposed and
+    validated instead of inheriting SDK defaults the library neither bounded nor documented.
+  - *Mongo and Cosmos durable-flow stores read and write authoritatively.* The Mongo store pins
+    majority write concern (an inherited `w=1` let a failover roll back a lease or a checkpoint),
+    and the Cosmos store no longer treats a session-consistent read as proof that a ledger is
+    absent or a lease unchanged.
+  - *Smaller fixes.* Dead-letter headers are capped (Kafka), lone-surrogate JSON no longer escapes
+    the header/correlation extractors as an uncatchable poison message, the subscriber retry
+    backoff resets after a healthy run instead of climbing to its maximum over the process's
+    lifetime, a start job older than the ledger lifetime is dropped instead of re-running a
+    finished run, and the test harness no longer spends its full real-time guard stopping a run
+    that is merely parked.
+
 - Recovery preserves broker redelivery for transient callback failures even when no callback
   succeeded. A checkpointed response whose resume publish fails keeps its recovery registration.
 - All durable stores preflight initial state before start publication. The shared public

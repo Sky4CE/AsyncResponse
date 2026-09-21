@@ -29,19 +29,19 @@ public sealed class TransportSubscriberTeardownTests
     {
         var options = Options.Create(new SqlServerAsyncResponseTransportOptions
         {
-            ConnectionString = "Server=tcp:127.0.0.1,1;Database=none;User ID=sa;Password=unused;Encrypt=False;Connect Timeout=1",
-            // Hostile subscriber options: valid for the service constructor (which validates only
-            // the common options) but rejected by the dispatcher constructor — the deterministic
-            // escape between the += and the claim loop.
-            WorkerSubscriber = { BatchSize = 0 }
+            ConnectionString = "Server=tcp:127.0.0.1,1;Database=none;User ID=sa;Password=unused;Encrypt=False;Connect Timeout=1"
         });
         var store = new SqlServerTransportStore(options);
         Prelatch(store);
+        // A throwing logger provider on the "subscriber started" line: the deterministic escape
+        // between the += and the claim loop. (The dispatcher is built by the hosted service now,
+        // outside the attempt, so its option validation no longer lands in here.)
+        var logger = new CollectingLogger { ThrowOnMessageContaining = "subscriber started" };
         var subscriber = new SqlServerWorkerSubscriber(
-            options, store, Mock.Of<IAsyncResponseIngress>(), NullLogger<SqlServerWorkerSubscriber>.Instance);
+            options, store, Mock.Of<IAsyncResponseIngress>(), logger.For<SqlServerWorkerSubscriber>());
 
         var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => RunSubscriberAsync(subscriber));
-        Assert.Contains("BatchSize", ex.Message, StringComparison.Ordinal);
+        Assert.Equal("logger exploded", ex.Message);
 
         // The finally must have unsubscribed: the store is a singleton, so a leaked closure would
         // survive this run and every retry, invoked by every later publish.
@@ -60,17 +60,19 @@ public sealed class TransportSubscriberTeardownTests
         {
             SubscriberRetryBaseDelay = TimeSpan.FromMilliseconds(25),
             SubscriberRetryMaxDelay = TimeSpan.FromMilliseconds(25),
-            ShutdownTimeout = TimeSpan.FromSeconds(5),
-            WorkerSubscriber = { BatchSize = 0 }
+            ShutdownTimeout = TimeSpan.FromSeconds(5)
         });
         var store = new PostgreSqlTransportStore(dataSource, options);
         Prelatch(store);
-        var logger = new CollectingLogger();
+        // A throwing logger provider on the "subscriber started" line: the escape lands after the
+        // listen task was started and before the claim loop. (The dispatcher is built by the
+        // hosted service now, outside the attempt, so its option validation cannot serve here.)
+        var logger = new CollectingLogger { ThrowOnMessageContaining = "subscriber started" };
         var subscriber = new PostgreSqlWorkerSubscriber(
             options, store, Mock.Of<IAsyncResponseIngress>(), logger.For<PostgreSqlWorkerSubscriber>());
 
         var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => RunSubscriberAsync(subscriber));
-        Assert.Contains("BatchSize", ex.Message, StringComparison.Ordinal);
+        Assert.Equal("logger exploded", ex.Message);
 
         // The finally cancelled AND joined the listen task before the fault surfaced, so its
         // failure-retry loop (unreachable server, 25 ms backoff) must be silent from here on. A
@@ -120,12 +122,79 @@ public sealed class TransportSubscriberTeardownTests
         await watchCancelled.Task.WaitAsync(TimeSpan.FromSeconds(5));
     }
 
-    private static Task RunSubscriberAsync(object subscriber)
+    /// <summary>
+    /// Runs one supervised attempt. The dispatcher now outlives the attempts — the hosted service
+    /// owns it, and only host shutdown drains it — so the attempt takes it as an argument; it is
+    /// built here the way <c>ExecuteAsync</c> builds it, from the subscriber's own members, so
+    /// this keeps working when a dispatcher gains a constructor parameter.
+    /// </summary>
+    private static async Task RunSubscriberAsync(object subscriber)
     {
         var method = subscriber.GetType().BaseType!
             .GetMethod("RunSubscriberAsync", BindingFlags.Instance | BindingFlags.NonPublic);
         Assert.NotNull(method);
-        return (Task)method!.Invoke(subscriber, [CancellationToken.None])!;
+
+        var dispatcher = CreateDispatcher(subscriber, method!.GetParameters()[0].ParameterType);
+        try
+        {
+            await (Task)method.Invoke(subscriber, [dispatcher, CancellationToken.None])!;
+        }
+        finally
+        {
+            await ((IAsyncDisposable)dispatcher).DisposeAsync();
+        }
+    }
+
+    /// <summary>
+    /// Builds a dispatcher of <paramref name="dispatcherType"/>, taking each constructor argument
+    /// from the subscriber: the handler delegate from its <c>HandleMessageAsync</c>, everything
+    /// else from the first member (property or field, base types included) that fits the parameter.
+    /// </summary>
+    private static object CreateDispatcher(object subscriber, Type dispatcherType)
+    {
+        var constructor = dispatcherType
+            .GetConstructors(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
+            .Single();
+
+        var arguments = constructor.GetParameters().Select(parameter =>
+        {
+            if (typeof(Delegate).IsAssignableFrom(parameter.ParameterType))
+            {
+                var handler = FindMember(subscriber.GetType(), type => type
+                    .GetMethods(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
+                    .FirstOrDefault(candidate => candidate.Name == "HandleMessageAsync"));
+                return Delegate.CreateDelegate(parameter.ParameterType, subscriber, (MethodInfo)handler!);
+            }
+
+            var member = FindMember(subscriber.GetType(), type =>
+                type.GetProperties(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
+                    .FirstOrDefault(candidate => parameter.ParameterType.IsAssignableFrom(candidate.PropertyType))
+                ?? (MemberInfo?)type.GetFields(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
+                    .FirstOrDefault(candidate => parameter.ParameterType.IsAssignableFrom(candidate.FieldType)));
+
+            return member switch
+            {
+                PropertyInfo property => property.GetValue(subscriber),
+                FieldInfo field => field.GetValue(subscriber),
+                // An optional parameter nothing on the subscriber fits (a TimeProvider): its default.
+                _ => parameter.HasDefaultValue
+                    ? parameter.DefaultValue
+                    : throw new InvalidOperationException($"No member of {subscriber.GetType()} fits {parameter.ParameterType}.")
+            };
+        }).ToArray();
+
+        return constructor.Invoke(arguments);
+    }
+
+    private static MemberInfo? FindMember(Type type, Func<Type, MemberInfo?> select)
+    {
+        for (var current = type; current is not null; current = current.BaseType)
+        {
+            if (select(current) is { } found)
+                return found;
+        }
+
+        return null;
     }
 
     /// <summary>Latches the store's <c>_created</c> so EnsureCreated never dials the (bogus) server.</summary>

@@ -79,7 +79,8 @@ public sealed class InMemoryWorkerTransport : IWorkerTransport, IDelayedWorkerTr
     /// <summary>
     /// Follow-up jobs published from inside a running job that did not fit the bounded queue. They
     /// are already counted in <c>_outstanding</c>, so the drain cannot complete the writer while
-    /// any remain; a worker moves them into the queue as soon as it frees a slot. Bounded by
+    /// any remain; a worker that finishes a job moves them into the queue while it has room and
+    /// runs the rest itself before it reads the queue again (<see cref="TryTakeOverflow"/>). Bounded by
     /// <see cref="InMemoryWorkerTransportOptions.InJobOverflowCapacity"/> (tracked in
     /// <see cref="_overflowDepth"/>): unbounded, a fan-out handler could retain every follow-up
     /// envelope and its captured ExecutionContext until the process ran out of memory, with the
@@ -98,7 +99,11 @@ public sealed class InMemoryWorkerTransport : IWorkerTransport, IDelayedWorkerTr
     /// <summary>Follow-up jobs currently held past the queue's capacity (the overflow-depth gauge and test inspection).</summary>
     internal int OverflowDepth => Volatile.Read(ref _overflowDepth);
 
-    /// <summary>Moves overflow jobs into the queue while it has room. Called by a worker before it reports a job finished.</summary>
+    /// <summary>
+    /// Moves overflow jobs into the queue while it has room, so idle workers can share them.
+    /// Called by a worker before it reports a job finished. On its own this does NOT drain the
+    /// overflow — see <see cref="TryTakeOverflow"/>.
+    /// </summary>
     internal void PumpOverflow()
     {
         lock (_overflowPumpGate)
@@ -111,6 +116,34 @@ public sealed class InMemoryWorkerTransport : IWorkerTransport, IDelayedWorkerTr
                 _overflow.TryDequeue(out _);
                 Interlocked.Decrement(ref _overflowDepth);
             }
+        }
+    }
+
+    /// <summary>
+    /// Hands the oldest overflow job straight to the calling worker, bypassing the queue. A
+    /// bounded channel gives a slot freed by a read directly to a producer already parked in
+    /// <c>WriteAsync</c>, so while ANY external producer (or fired delayed job) is waiting for
+    /// room, <see cref="PumpOverflow"/>'s <c>TryWrite</c> finds the queue full every single time:
+    /// under sustained external load the overflow never drained at all. Follow-up work — a child
+    /// flow's start, a parent's wake-up — starved behind an endless supply of NEW external work,
+    /// the overflow filled, and every job that published a follow-up then failed at the bound and
+    /// was eventually dropped. Follow-ups continue work the queue already admitted, so the worker
+    /// that just finished a job runs them before it takes anything new; external producers stay
+    /// parked meanwhile, which is the backpressure the capacity exists to apply.
+    /// <para>
+    /// Under the pump gate: an unguarded dequeue between a pumper's peek and its dequeue would run
+    /// one job twice and drop the next.
+    /// </para>
+    /// </summary>
+    internal bool TryTakeOverflow(out QueuedJob queued)
+    {
+        lock (_overflowPumpGate)
+        {
+            if (!_overflow.TryDequeue(out queued))
+                return false;
+
+            Interlocked.Decrement(ref _overflowDepth);
+            return true;
         }
     }
 
@@ -698,27 +731,42 @@ internal sealed class InMemoryWorkerHost(
         // is empty, never by abandoning accepted jobs mid-queue.
         await foreach (var queued in _transport.Reader.ReadAllAsync().ConfigureAwait(false))
         {
-            if (stoppingToken.IsCancellationRequested && _logger.IsEnabled(LogLevel.Debug))
-                _logger.LogDebug("Draining in-memory worker job {Target}.{Method} during shutdown.", queued.Job.Call.ServiceInterfaceFullName, queued.Job.Call.MethodName);
+            await RunJobAsync(queued, stoppingToken).ConfigureAwait(false);
 
-            try
-            {
-                await ExecuteWithRedeliveryAsync(queued, stoppingToken).ConfigureAwait(false);
-            }
-            catch (Exception ex)
-            {
-                // Backstop only — the redelivery loop already contains job failures. Nothing may
-                // break this loop: it is the transport's delivery guarantee for everything still
-                // queued behind the current job.
-                _logger.LogError(ex, "In-memory worker job {Target}.{Method} failed.", queued.Job.Call.ServiceInterfaceFullName, queued.Job.Call.MethodName);
-            }
-            finally
-            {
-                // Before OnJobFinished: this job just freed a slot, and the overflow entries are
-                // still counted in the outstanding total that gates the drain's writer completion.
-                _transport.PumpOverflow();
-                _transport.OnJobFinished();
-            }
+            // Follow-up work first: whatever the pump could not place in the queue is run here,
+            // BEFORE the next read — the read is what hands the freed slot to a parked external
+            // producer, and it would keep doing so for as long as one is waiting (see
+            // TryTakeOverflow). Each follow-up is an outstanding job in its own right and is
+            // finished through the same path as a queued one, pump included — so whenever the
+            // queue does have room, idle workers share a large fan-out instead of this worker
+            // running all of it serially.
+            while (_transport.TryTakeOverflow(out var followUp))
+                await RunJobAsync(followUp, stoppingToken).ConfigureAwait(false);
+        }
+    }
+
+    private async Task RunJobAsync(InMemoryWorkerTransport.QueuedJob queued, CancellationToken stoppingToken)
+    {
+        if (stoppingToken.IsCancellationRequested && _logger.IsEnabled(LogLevel.Debug))
+            _logger.LogDebug("Draining in-memory worker job {Target}.{Method} during shutdown.", queued.Job.Call.ServiceInterfaceFullName, queued.Job.Call.MethodName);
+
+        try
+        {
+            await ExecuteWithRedeliveryAsync(queued, stoppingToken).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            // Backstop only — the redelivery loop already contains job failures. Nothing may
+            // break this loop: it is the transport's delivery guarantee for everything still
+            // queued behind the current job.
+            _logger.LogError(ex, "In-memory worker job {Target}.{Method} failed.", queued.Job.Call.ServiceInterfaceFullName, queued.Job.Call.MethodName);
+        }
+        finally
+        {
+            // Before OnJobFinished: this job just freed a slot, and the overflow entries are
+            // still counted in the outstanding total that gates the drain's writer completion.
+            _transport.PumpOverflow();
+            _transport.OnJobFinished();
         }
     }
 

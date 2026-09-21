@@ -77,6 +77,7 @@ internal abstract class GooglePubSubMessageDispatcher : IAsyncDisposable
             : $"{nameof(GooglePubSubAsyncResponseOptions)}.{nameof(GooglePubSubAsyncResponseOptions.ResponseSubscriber)}";
 
         GooglePubSubOptionsValidator.ValidateTimeouts(transportOptions);
+        GooglePubSubOptionsValidator.ValidateStreamingPull(subscriberOptions, optionPath);
 
         if (!string.IsNullOrWhiteSpace(transportOptions.WorkerSubscriptionId)
             && !string.IsNullOrWhiteSpace(transportOptions.ResponseSubscriptionId)

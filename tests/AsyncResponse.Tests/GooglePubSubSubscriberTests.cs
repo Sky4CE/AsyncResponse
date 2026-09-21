@@ -661,6 +661,131 @@ public class GooglePubSubSubscriberTests
     }
 
     [Fact]
+    public async Task SubscriberService_Startup_WarnsThatASubscriptionWithoutARetryPolicyRedeliversImmediately()
+    {
+        // The package never creates the subscription and cannot read its policies through the
+        // consume-only client, so the startup warning is the one place an operator learns that a
+        // DeadLetterPolicy alone is not enough: without a RetryPolicy a NACK redelivers at once, and
+        // a transient fault spends every delivery attempt — dead-lettering healthy jobs — in seconds.
+        var client = new FakeSubscriberClient();
+        var logger = new CapturingLogger<GooglePubSubWorkerSubscriber>();
+        var subscriber = new GooglePubSubWorkerSubscriber(
+            Options.Create(new GooglePubSubAsyncResponseOptions
+            {
+                ProjectId = "project-a",
+                WorkerSubscriptionId = "workers"
+            }),
+            Mock.Of<IAsyncResponseIngress>(),
+            logger,
+            (_, _) => Task.FromResult<IGooglePubSubSubscriberClient>(client));
+
+        await subscriber.StartAsync(CancellationToken.None);
+        await WaitForHandlerAsync(client);
+        await subscriber.StopAsync(CancellationToken.None);
+
+        Assert.Contains(logger.Entries, entry =>
+            entry.Level == LogLevel.Warning
+            && entry.Message.Contains("RetryPolicy", StringComparison.Ordinal)
+            && entry.Message.Contains("immediately", StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Fact]
+    public async Task WorkerSubscriberService_AckAfterEnqueue_StreamingPullFault_DoesNotDrainOrRefuseAlreadyAckedWork()
+    {
+        // The early-ACK dispatcher used to live inside one supervised attempt, so a streaming-pull
+        // fault on a host that was NOT stopping disposed it: consumption paused for the stop-time
+        // drain, then the queued job — already ACKed at the broker, so Pub/Sub never redelivers it —
+        // was refused as "drain budget lapsed". The dispatcher now outlives attempts: the queued job
+        // runs, the rebuilt client feeds the same queue, and only host stop drains.
+        var first = new FakeSubscriberClient();
+        var second = new FakeSubscriberClient();
+        var clientsBuilt = 0;
+        var handled = new System.Collections.Concurrent.ConcurrentQueue<string>();
+        var firstStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseFirst = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var secondHandled = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var thirdHandled = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var failureReported = new TaskCompletionSource<GooglePubSubBackgroundFailureContext>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var ingress = new Mock<IAsyncResponseIngress>();
+        ingress
+            .Setup(i => i.HandleWorkerMessageAsync(It.IsAny<string>()))
+            .Returns<string>(async body =>
+            {
+                if (body == "first")
+                {
+                    firstStarted.TrySetResult();
+                    await releaseFirst.Task.ConfigureAwait(false);
+                }
+
+                handled.Enqueue(body);
+                if (body == "second")
+                    secondHandled.TrySetResult();
+                if (body == "third")
+                    thirdHandled.TrySetResult();
+            });
+        var options = new GooglePubSubAsyncResponseOptions
+        {
+            ProjectId = "project-a",
+            WorkerSubscriptionId = "workers",
+            ShutdownTimeout = TimeSpan.FromMilliseconds(250),
+            SubscriberRetryBaseDelay = TimeSpan.FromMilliseconds(1),
+            SubscriberRetryMaxDelay = TimeSpan.FromMilliseconds(1)
+        };
+        options.WorkerSubscriber.UseAckAfterEnqueue(
+            backgroundWorkerCount: 1,
+            backgroundQueueCapacity: 8,
+            backgroundDrainTimeout: TimeSpan.FromMilliseconds(200));
+        options.WorkerSubscriber.OnBackgroundFailure = context =>
+        {
+            failureReported.TrySetResult(context);
+            return ValueTask.CompletedTask;
+        };
+        var logger = new CapturingLogger<GooglePubSubWorkerSubscriber>();
+        var subscriber = new GooglePubSubWorkerSubscriber(
+            Options.Create(options),
+            ingress.Object,
+            logger,
+            (_, _) => Task.FromResult<IGooglePubSubSubscriberClient>(
+                Interlocked.Increment(ref clientsBuilt) == 1 ? first : second));
+
+        await subscriber.StartAsync(CancellationToken.None);
+        var firstHandler = await WaitForHandlerAsync(first);
+        Assert.Equal(SubscriberClient.Reply.Ack, await firstHandler(Body("first"), CancellationToken.None));
+        await firstStarted.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        // Queued behind the running handler — and ACKed at the broker already.
+        Assert.Equal(SubscriberClient.Reply.Ack, await firstHandler(Body("second"), CancellationToken.None));
+
+        first.Fault(new InvalidOperationException("streaming pull UNAVAILABLE"));
+
+        // The supervisor rebuilt the client: the attempt ended, the host did not.
+        var secondHandler = await WaitForHandlerAsync(second);
+
+        releaseFirst.TrySetResult();
+        var outcome = await Task.WhenAny(secondHandled.Task, failureReported.Task).WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.True(
+            ReferenceEquals(outcome, secondHandled.Task),
+            "the already-ACKed queued job was refused after a streaming-pull fault instead of being handled");
+
+        // The rebuilt client feeds the very same queue.
+        Assert.Equal(SubscriberClient.Reply.Ack, await secondHandler(Body("third"), CancellationToken.None));
+        await thirdHandled.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.False(failureReported.Task.IsCompleted);
+        Assert.DoesNotContain(logger.Entries, entry => entry.Message.StartsWith("Draining", StringComparison.Ordinal));
+
+        await subscriber.StopAsync(CancellationToken.None);
+
+        Assert.Equal(["first", "second", "third"], handled);
+        // Host stop — and only host stop — drained the dispatcher, once.
+        Assert.Single(logger.Entries, entry => entry.Message.StartsWith("Draining", StringComparison.Ordinal));
+
+        static PubsubMessage Body(string body) => new()
+        {
+            MessageId = body,
+            Data = ByteString.CopyFromUtf8(body)
+        };
+    }
+
+    [Fact]
     public async Task QueuedDispose_SurvivesAWorkerFaultingOutsideItsHandlerGuard()
     {
         // Regression: the drain join caught only TimeoutException (the shared DB base and NATS
@@ -1298,6 +1423,9 @@ public class GooglePubSubSubscriberTests
             _run.TrySetResult();
             return Task.CompletedTask;
         }
+
+        /// <summary>Fails the running streaming pull, like a network blip or UNAVAILABLE does mid-run.</summary>
+        public void Fault(Exception exception) => _run.TrySetException(exception);
     }
 
     private sealed class FaultingSubscriberClient : IGooglePubSubSubscriberClient

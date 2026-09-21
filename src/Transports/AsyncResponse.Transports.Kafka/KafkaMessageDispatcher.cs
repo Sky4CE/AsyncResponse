@@ -450,6 +450,12 @@ internal abstract class KafkaMessageDispatcher : IAsyncDisposable
         StoreOffsetAfterSettlement(message.Topic, message.Partition, message.Offset);
     }
 
+    /// <summary>
+    /// Longest <c>exceptionType</c> / <c>exceptionMessage</c> dead-letter header value, in UTF-16
+    /// code units.
+    /// </summary>
+    internal const int MaxDeadLetterHeaderLength = 4096;
+
     private async Task DeadLetterCoreAsync(
         string sourceTopic,
         int partition,
@@ -474,8 +480,13 @@ internal abstract class KafkaMessageDispatcher : IAsyncDisposable
         headers.Add(KafkaTransportHeader.Utf8("subscriberRole", _role.ToString()));
         headers.Add(KafkaTransportHeader.Utf8("attempts", attempts.ToString(CultureInfo.InvariantCulture)));
         headers.Add(KafkaTransportHeader.Utf8("reason", reason));
-        headers.Add(KafkaTransportHeader.Utf8("exceptionType", exception.GetType().FullName!));
-        headers.Add(KafkaTransportHeader.Utf8("exceptionMessage", exception.Message));
+        // Capped: these two are the only dead-letter headers whose size the failing code decides
+        // (an exception message can quote a whole payload; a closed generic's name nests without
+        // bound), and an uncapped one pushed the dead-letter record past message.max.bytes — a
+        // burial that then fails on every retry, for a message that was itself within the limit.
+        // Surrogate-aware cut (see PortableText.TruncateWellFormed).
+        headers.Add(KafkaTransportHeader.Utf8("exceptionType", PortableText.TruncateWellFormed(exception.GetType().FullName!, MaxDeadLetterHeaderLength)));
+        headers.Add(KafkaTransportHeader.Utf8("exceptionMessage", PortableText.TruncateWellFormed(exception.Message, MaxDeadLetterHeaderLength)));
         headers.Add(KafkaTransportHeader.Utf8("occurredAtUtc", DateTimeOffset.UtcNow.ToString("O")));
 
         // The unprocessable-message discard blocks the poll thread on this (the awaiting

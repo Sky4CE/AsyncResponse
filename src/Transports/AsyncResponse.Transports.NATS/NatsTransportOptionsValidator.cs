@@ -133,6 +133,13 @@ internal static class NatsTransportOptionsValidator
         PositiveOrNull(options.StreamMaxMessages, nameof(options.StreamMaxMessages));
         PositiveOrNull(options.DeadLetterStreamMaxMessages, nameof(options.DeadLetterStreamMaxMessages));
 
+        // nats-server rejects num_replicas outside 1..5 when the stream is created — at first use,
+        // inside the subscriber retry loop as an opaque broker error retried forever — so the
+        // bound is a named startup error here.
+        if (options.StreamReplicas is < 1 or > 5)
+            throw new InvalidOperationException(
+                $"{nameof(NatsAsyncResponseTransportOptions)}.{nameof(options.StreamReplicas)} must be between 1 and 5 (JetStream's replica limit); it is {options.StreamReplicas}.");
+
         if (options.PublishMaxAttempts <= 0)
             throw new InvalidOperationException($"{nameof(NatsAsyncResponseTransportOptions)}.{nameof(options.PublishMaxAttempts)} must be positive.");
 

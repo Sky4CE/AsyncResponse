@@ -41,7 +41,7 @@ internal static class PostgreSqlTransportOptionsValidator
             $"; rename {nameof(options.MessageTable)} so the derived index names stay distinct.");
 
         // Timer-armed knobs get the .NET timer ceiling (LockTimeout also drives the in-process
-        // lease-renewal Task.Delay at half its value); DeadLetterRetention and RedeliveryDelay are
+        // lease-renewal Task.Delay at a third of its value); DeadLetterRetention and RedeliveryDelay are
         // database-side "now + value" stamps and get the persistence bound instead.
         if (options.DeadLetterRetention is { } deadLetterRetention)
             AsyncResponseChannelOptions.EnsurePersistedTtl(deadLetterRetention, nameof(PostgreSqlAsyncResponseTransportOptions), nameof(options.DeadLetterRetention));

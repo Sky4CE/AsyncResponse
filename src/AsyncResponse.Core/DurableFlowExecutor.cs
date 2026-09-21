@@ -31,7 +31,10 @@ public interface IDurableFlowExecutor
     /// publish leaves a job whose execution creates the run, never a committed ledger that nothing
     /// will ever execute. An existing ledger for the same flow type and semantically identical
     /// input is executed as an idempotent re-start; one bound to different work is logged and the
-    /// job dropped (the starter already reported the conflict to its caller).
+    /// job dropped (the starter already reported the conflict to its caller). A start job whose
+    /// carried state was created longer ago than <c>DurableFlowOptions.StateExpiry</c> and that
+    /// finds no ledger is a replay of a run that has finished and expired: it is logged at Error
+    /// and dropped rather than re-created, which would re-execute every completed step.
     /// </summary>
     Task CreateAndExecuteAsync(string flowId, string initialStateJson);
 
@@ -251,15 +254,34 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
     /// wait ends with neither proof nor the lease, the delivery is not acknowledged —
     /// <see cref="DurableFlowLeaseContendedException"/> hands it back to the transport.
     /// </para>
+    /// <para>
+    /// A live holder makes this delivery redundant only when the holder's OWN job is a different
+    /// one: that job stays unacknowledged at the broker and is redelivered if the holder dies. A
+    /// broker with an in-flight ceiling (Pub/Sub <c>MaxTotalAckExtension</c>, RabbitMQ
+    /// <c>consumer_timeout</c>, the SQS 12-hour visibility cap, a Kafka rebalance) redelivers the
+    /// holder's own job while its handler is still running, and THAT delivery is the last copy of
+    /// the wake-up: acknowledging it leaves nothing to redeliver when the holder's process ends.
+    /// The lease records the job that drives it (<see cref="FlowLeaseContention"/>), so such a
+    /// delivery is recognised and never acknowledged as a duplicate — it is re-published as the
+    /// same job, delayed past the lease, where the transport can delay, and otherwise kept with
+    /// the transport.
+    /// </para>
     /// </summary>
     private async Task<FlowExecutionLease?> AcquireExecutionLeaseWithRetryAsync(IFlowStateStore store, string flowId)
     {
+        // The job driving this execution (null for a direct call, tag-less for a job written
+        // before WorkerJobEnvelope.JobId existed): recorded with the lease on acquire, compared
+        // with the lease in the way on contention.
+        var ownJob = WorkerJobScope.Current;
+        var ownJobTag = FlowLeaseContention.JobTag(ownJob?.JobId);
+
         var lease = await FlowStateConcurrency.TryAcquireExecutionLeaseAsync(
             store,
             flowId,
             _options,
             _logger,
-            _timeProvider).ConfigureAwait(false);
+            _timeProvider,
+            jobTag: ownJobTag).ConfigureAwait(false);
         if (lease is not null)
             return lease;
 
@@ -284,6 +306,7 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
             : TimeSpan.FromSeconds(2);
         FlowLeaseObservation? baseline = null;
         var storeReportsLeases = true;
+        string? ownJobHolderLeaseId = null;
 
         while (true)
         {
@@ -312,7 +335,8 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
                 flowId,
                 _options,
                 _logger,
-                _timeProvider).ConfigureAwait(false);
+                _timeProvider,
+                jobTag: ownJobTag).ConfigureAwait(false);
             if (lease is not null)
                 return lease;
 
@@ -344,21 +368,67 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
                             deadline = persistedDeadline;
                     }
                 }
-                else if (!string.Equals(observed.LeaseId, baseline.LeaseId, StringComparison.Ordinal)
-                         || observed.ExpiresAtUtc > baseline.ExpiresAtUtc)
+                else
                 {
-                    // Only a worker that acquired or renewed the lease AFTER this delivery started
-                    // waiting can have written that. Every execution is driven by a worker job that
-                    // stays unacked until its handler completes, so if that live holder crashes
-                    // later the broker redelivers its own job — this delivery is genuinely
-                    // redundant and safe to ack. The retry loop exists purely to cover deliveries
-                    // that arrive inside a DEAD holder's unexpired lease window, which broker
-                    // redelivery alone cannot cover.
-                    _logger.LogDebug(
-                        "Durable flow {FlowId} is executing on another live worker (its lease was {Evidence} while this delivery waited); skipping duplicate delivery.",
-                        flowId,
-                        string.Equals(observed.LeaseId, baseline.LeaseId, StringComparison.Ordinal) ? "renewed" : "taken over");
-                    return null;
+                    switch (FlowLeaseContention.Judge(baseline, observed, ownJobTag))
+                    {
+                        case FlowLeaseContentionVerdict.AcknowledgeDuplicate:
+                            // Only a worker that acquired or renewed the lease AFTER this delivery
+                            // started waiting can have written that, and the job driving it is
+                            // not this one. The premise that makes the ack safe: the holder's OWN
+                            // job — a different job — is still unacknowledged at the broker, so
+                            // if that holder crashes later the broker redelivers it. The retry
+                            // loop exists to cover deliveries that arrive inside a DEAD holder's
+                            // unexpired lease window, which broker redelivery alone cannot cover.
+                            // Legacy caveat: when either side carries no job identity (a job or a
+                            // lease written before WorkerJobEnvelope.JobId existed, mid rolling
+                            // upgrade) the two cannot be told apart, and the evidence-based ack
+                            // applies as it did before.
+                            _logger.LogDebug(
+                                "Durable flow {FlowId} is executing on another live worker (its lease was {Evidence} while this delivery waited); skipping duplicate delivery.",
+                                flowId,
+                                string.Equals(observed.LeaseId, baseline.LeaseId, StringComparison.Ordinal) ? "renewed" : "taken over");
+                            return null;
+
+                        case FlowLeaseContentionVerdict.HolderOwnJobRedelivered:
+                            // The live holder is executing THIS job: the broker handed it out a
+                            // second time while its handler was still running, which only happens
+                            // once an in-flight ceiling has lapsed. The first delivery can no
+                            // longer be settled, so this one is the last copy of the wake-up —
+                            // acknowledging it would leave nothing to redeliver when the holder's
+                            // process ends, and the run would stay Running forever.
+                            // MaxPublishDelay <= zero: the capability is unavailable in the current
+                            // configuration (an SQS FIFO worker queue) — same as not implementing it.
+                            var redelay = _workerTransport is IDelayedWorkerTransport delayedTransport
+                                && delayedTransport.MaxPublishDelay > TimeSpan.Zero
+                                    ? delayedTransport
+                                    : null;
+                            if (ownJobHolderLeaseId is null)
+                            {
+                                ownJobHolderLeaseId = observed.LeaseId;
+                                AsyncResponseDiagnostics.RecordFlowOwnJobRedelivery(redelay is not null ? "redelayed" : "waiting");
+                                _logger.LogWarning(
+                                    "Durable flow {FlowId} wake-up is a redelivery of the job its live lease holder is still executing: a broker in-flight ceiling lapsed under the running handler " +
+                                    "(Google Pub/Sub MaxTotalAckExtension, RabbitMQ consumer_timeout, the SQS 12-hour visibility cap, a Kafka rebalance). It is the only copy of the wake-up the broker still has and is not acknowledged as a duplicate; {Resolution}.",
+                                    flowId,
+                                    redelay is not null
+                                        ? "it is re-published as the same job, delayed past the holder's lease"
+                                        : "it waits for the lease and is otherwise handed back to the transport");
+                            }
+
+                            if (redelay is not null)
+                            {
+                                // Publish BEFORE the ack this return causes; a failed publish
+                                // propagates and the delivery stays with the transport.
+                                await RepublishOwnJobPastLeaseAsync(redelay, ownJob!, observed, flowId).ConfigureAwait(false);
+                                return null;
+                            }
+
+                            // No delayed delivery: keep waiting on the deadline already set (a
+                            // live holder's renewals never extend it) — the lease freeing or the
+                            // ledger turning terminal resolves the wait, the deadline throws.
+                            break;
+                    }
                 }
             }
 
@@ -379,6 +449,19 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
             }
         }
 
+        if (ownJobHolderLeaseId is not null)
+        {
+            // A live holder WAS proven — and it is executing this delivery's own job, so the proof
+            // is no licence to ack. The transport keeps the wake-up; its retry policy paces the
+            // redeliveries and its dead-letter queue is the alarm if the holder outlives them.
+            throw new DurableFlowLeaseContendedException(
+                flowId,
+                $"the lease '{ownJobHolderLeaseId}' is held by a live execution of this same worker job: the broker redelivered a job whose handler is still running, so a broker in-flight ceiling lapsed under it " +
+                "(Google Pub/Sub MaxTotalAckExtension, RabbitMQ consumer_timeout, the SQS 12-hour visibility cap, or a Kafka rebalance re-fetching an unstored offset). " +
+                "This delivery is the only copy of the wake-up the broker still has, so it is never acknowledged as a duplicate, and the registered worker transport cannot re-publish it delayed past the holder's lease; " +
+                "keep a single in-process wait shorter than the broker's in-flight ceiling, or raise the ceiling");
+        }
+
         // No lease and no proof of a live holder. Acknowledging here is what stranded runs behind
         // a lease issued under a longer configuration; the transport keeps the wake-up instead.
         throw new DurableFlowLeaseContendedException(
@@ -394,6 +477,63 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
 
     private static DateTime AddSaturating(DateTime instant, TimeSpan span)
         => span > DateTime.MaxValue - instant ? DateTime.MaxValue : instant + span;
+
+    /// <summary>
+    /// Re-publishes <paramref name="job"/> — the job this delivery AND the live lease holder both
+    /// carry — so that it comes back about when the holder's lease would lapse if the holder died
+    /// now. The copy keeps the <see cref="WorkerJobEnvelope.JobId"/>: a fresh id would read as a
+    /// different, redundant job at its next contention and be acknowledged on the holder's
+    /// renewal, which is the loss this exists to prevent. The hop repeats at lease cadence while
+    /// the holder lives; it finds a terminal ledger and acks once the holder finishes, or an
+    /// expired lease it takes over once the holder dies.
+    /// </summary>
+    private async Task RepublishOwnJobPastLeaseAsync(
+        IDelayedWorkerTransport transport,
+        WorkerJobEnvelope job,
+        FlowLeaseObservation holderLease,
+        string flowId)
+    {
+        var nowUtc = _timeProvider.GetUtcNow().UtcDateTime;
+
+        // One renew interval past the persisted expiry, so a holder that is still alive has
+        // visibly renewed by the time the hop lands. The expiry is store data this host does not
+        // control (see MaxLeaseContentionWait above): bounded by that budget and by what the
+        // transport can delay in one publish. Coming back early costs one more hop, never the run.
+        var delay = (holderLease.ExpiresAtUtc is { } expiresAtUtc && expiresAtUtc > nowUtc
+                ? expiresAtUtc - nowUtc
+                : TimeSpan.Zero)
+            + _options.ExecutionLeaseRenewInterval;
+        if (delay > _options.MaxLeaseContentionWait)
+            delay = _options.MaxLeaseContentionWait;
+        if (delay > transport.MaxPublishDelay)
+            delay = transport.MaxPublishDelay;
+
+        var hop = CopyForRedelay(job, AddSaturating(nowUtc, delay));
+        await transport.PublishAsync(hop, delay).ConfigureAwait(false);
+
+        _logger.LogInformation(
+            "Durable flow {FlowId} wake-up re-published as the same job, due {NotBeforeUtc:O} ({Delay} from now, past the live holder's lease); acknowledging this delivery.",
+            flowId,
+            hop.NotBeforeUtc,
+            delay);
+    }
+
+    /// <summary>
+    /// The same job with a new due time. A copy, not the delivered instance: the transport still
+    /// owns that one (the in-memory transport retries it as-is), and a due time stamped on it
+    /// would outlive a failed publish. The stall counters are left behind on purpose — they
+    /// belong to the due-time chain that ended with this delivery.
+    /// </summary>
+    internal static WorkerJobEnvelope CopyForRedelay(WorkerJobEnvelope job, DateTime notBeforeUtc) => new()
+    {
+        SchemaVersion = job.SchemaVersion,
+        Call = job.Call,
+        CorrelationId = job.CorrelationId,
+        ReplyTarget = job.ReplyTarget,
+        Context = job.Context,
+        JobId = job.JobId,
+        NotBeforeUtc = notBeforeUtc
+    };
 
     /// <inheritdoc />
     public async Task CreateAndExecuteAsync(string flowId, string initialStateJson)
@@ -415,6 +555,25 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
         await using (var scope = _scopeFactory.CreateAsyncScope())
         {
             var store = scope.ServiceProvider.GetRequiredService<IFlowStateStore>();
+
+            // A start job outlives the run it started: a dead-letter replay, or a Kafka consumer
+            // group rewound past it, delivers it again long after the run finished and its ledger
+            // expired. Insert-if-absent then succeeds, and the "new" run re-executes every step —
+            // and every side effect — of work that completed weeks ago. A start older than the
+            // ledger lifetime with NO ledger behind it is that replay (or a start that never ran
+            // and whose ledger would itself have expired by now, which an ExecuteAsync wake-up
+            // would equally find gone): dropped, loudly. Checked only when the ledger is absent —
+            // a live run past StateExpiry (a long park keeps its ledger through the retention
+            // floor) still owns this job as its wake-up and takes the ordinary path below.
+            if (StartedBeyondStateExpiry(initial, out var age)
+                && await store.LoadAsync(flowId).ConfigureAwait(false) is null)
+            {
+                _logger.LogError(
+                    "Durable flow {FlowId} ({FlowType}) start job dropped: the start is {Age} old — past {StateExpiryOption} ({StateExpiry}) — and no ledger exists, so the run it started has finished and expired (or never ran within its ledger's lifetime). Re-creating it would re-execute completed work; start the flow again if it is still wanted.",
+                    flowId, initial.FlowTypeName, age, $"{nameof(DurableFlowOptions)}.{nameof(DurableFlowOptions.StateExpiry)}", _options.StateExpiry);
+                return;
+            }
+
             if (await FlowStateConcurrency.TryCreateAsync(store, flowId, initial, _options.StateExpiry).ConfigureAwait(false))
             {
                 // The starter died (or has not got there yet) between its publish and its own
@@ -450,6 +609,23 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
         }
 
         await ExecuteAsync(flowId).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Whether the start job's carried ledger was stamped longer ago than a ledger lives
+    /// (<see cref="DurableFlowOptions.StateExpiry"/> — every save, the terminal one included,
+    /// retains it for at least that long past <see cref="FlowState.CreatedAtUtc"/>). A carrier
+    /// without the stamp is never judged: there is nothing to measure.
+    /// </summary>
+    private bool StartedBeyondStateExpiry(FlowState initial, out TimeSpan age)
+    {
+        age = TimeSpan.Zero;
+        if (initial.CreatedAtUtc is not { } createdAt)
+            return false;
+
+        var createdAtUtc = createdAt.Kind == DateTimeKind.Local ? createdAt.ToUniversalTime() : createdAt;
+        age = _timeProvider.GetUtcNow().UtcDateTime - createdAtUtc;
+        return age > _options.StateExpiry;
     }
 
     /// <inheritdoc />
@@ -811,8 +987,11 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
             throw new InvalidOperationException($"The persisted flow state carries no {kind} type name; it was written by an incompatible producer.");
 
         return ReflectionExtensions.ResolveServiceType(fullName)
+            // The name is store data: rendered through the diagnostics helper so an unresolvable
+            // one cannot copy megabytes of store-written text, or its raw line breaks, into this
+            // message and from there into a log on every delivery.
             ?? throw new InvalidOperationException(
-                $"Cannot resolve {kind} type '{fullName}'. For plugin/collectible-assembly scenarios register a resolver " +
+                $"Cannot resolve {kind} type '{AsyncResponseTypeResolution.DescribeForDiagnostics(fullName)}'. For plugin/collectible-assembly scenarios register a resolver " +
                 $"via {nameof(AsyncResponseTypeResolution)}.{nameof(AsyncResponseTypeResolution.RegisterAssembly)}.");
     }
 

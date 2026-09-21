@@ -13,7 +13,8 @@ namespace AsyncResponse.Transports;
 /// stop tears a connection down mid-consume; any other exception — including a cancellation NOT
 /// caused by host shutdown, e.g. a transport-internal timeout — increments the failure count, asks
 /// the caller-supplied delay policy how long to wait, reports the retry through the caller-supplied
-/// callback, and waits before trying again.
+/// callback, and waits before trying again. The count is of CONSECUTIVE failures: a run that stayed
+/// up at least as long as the policy's saturated delay before failing starts the count over.
 /// </summary>
 internal static class SubscriberSupervisor
 {
@@ -21,17 +22,25 @@ internal static class SubscriberSupervisor
     /// Runs <paramref name="run"/> until it completes or <paramref name="stoppingToken"/> requests
     /// shutdown. <paramref name="delayPolicy"/> receives the 1-based consecutive-failure count and
     /// returns how long to wait before the next attempt; <paramref name="logRetry"/> renders the
-    /// per-transport log line for that wait.
+    /// per-transport log line for that wait. The policy must saturate: it is also asked for
+    /// <see cref="int.MaxValue"/> failures, and that answer — its longest delay — is the healthy-run
+    /// threshold past which a failed run no longer counts as consecutive with the one before it.
+    /// <paramref name="timeProvider"/> clocks both the run and the wait (a test seam; the system
+    /// clock when omitted).
     /// </summary>
     public static async Task RunAsync(
         Func<CancellationToken, Task> run,
         CancellationToken stoppingToken,
         Func<int, TimeSpan> delayPolicy,
-        Action<Exception, TimeSpan> logRetry)
+        Action<Exception, TimeSpan> logRetry,
+        TimeProvider? timeProvider = null)
     {
+        var clock = timeProvider ?? TimeProvider.System;
         var failures = 0;
+        TimeSpan? healthyRun = null;
         while (!stoppingToken.IsCancellationRequested)
         {
+            var startedAt = clock.GetTimestamp();
             try
             {
                 await run(stoppingToken).ConfigureAwait(false);
@@ -48,10 +57,20 @@ internal static class SubscriberSupervisor
             }
             catch (Exception ex)
             {
+                // Consecutive, not lifetime: a subscriber runs for weeks, and with a count that only
+                // ever grew, a handful of unrelated blips spread over that time pinned EVERY later
+                // reconnect at the policy's longest delay — a one-second broker failover then cost
+                // the full maximum on every replica, for the rest of the process's life. A run that
+                // outlived the longest delay the policy can impose was healthy, so this failure
+                // starts a new streak. (A run that merely took that long to fail — a black-holed
+                // connect — resets too, harmlessly: its own duration already paces the retries.)
+                if (failures > 0 && clock.GetElapsedTime(startedAt) >= (healthyRun ??= delayPolicy(int.MaxValue)))
+                    failures = 0;
+
                 failures++;
                 var retryDelay = delayPolicy(failures);
                 logRetry(ex, retryDelay);
-                await Task.Delay(retryDelay, stoppingToken).ConfigureAwait(false);
+                await Task.Delay(retryDelay, clock, stoppingToken).ConfigureAwait(false);
             }
         }
     }

@@ -97,6 +97,68 @@ public sealed class GooglePubSubSubscriberOptions
     public Func<GooglePubSubBackgroundFailureContext, ValueTask>? OnBackgroundFailure { get; set; }
 
     /// <summary>
+    /// Longest the Pub/Sub client keeps extending one message's ack deadline while it is held in
+    /// this process (the SDK's <c>SubscriberClient.Settings.MaxTotalAckExtension</c>). Default:
+    /// <c>60 minutes</c>, the SDK default. Must be at least one minute and at most the .NET timer
+    /// ceiling (~49.7 days); keep it under the subscription's message retention.
+    /// <para>
+    /// This is the transport's <em>in-flight ceiling</em>. The clock starts when the client receives
+    /// the message, not when its handler starts. Once it lapses the client stops extending the
+    /// deadline, the current lease (up to 60 seconds) runs out, and Pub/Sub redelivers the
+    /// <em>same</em> message — to this or another subscriber, counting a delivery attempt against
+    /// the subscription's <c>DeadLetterPolicy</c> — while the first handler is still running. The
+    /// first handler is not cancelled, and its late ACK is best-effort: it cannot recall a copy
+    /// Pub/Sub has already handed out, so the work runs twice.
+    /// A handler that can legitimately run longer than this must raise it; the worker
+    /// subscriber's value is what <see cref="GooglePubSubWorkerTransport"/> advertises through
+    /// <see cref="IWorkerTransportInFlightLimit"/>, so durable-flow timers that wait in process are
+    /// planned inside it.
+    /// </para>
+    /// <para>
+    /// The floor exists because the first lease already lasts the client's 60-second ack deadline:
+    /// a smaller value cannot make Pub/Sub redeliver sooner, it would only shrink the ceiling flows
+    /// plan against.
+    /// </para>
+    /// </summary>
+    public TimeSpan MaxTotalAckExtension { get; set; } = TimeSpan.FromMinutes(60);
+
+    /// <summary>
+    /// Number of streaming-pull connections (SDK <c>SubscriberServiceApiClient</c>s) the subscriber
+    /// client opens. Must be between 1 and 256 (the SDK's range). Default: <c>1</c>.
+    /// <para>
+    /// The SDK's own default is the machine's CPU count, and it applies the flow-control limits to
+    /// <em>each</em> connection's fetch independently while limiting concurrent handlers once for
+    /// the whole client: with N connections the process leases up to N ×
+    /// <see cref="MaxOutstandingMessages"/> messages but runs at most
+    /// <see cref="MaxOutstandingMessages"/> handlers. The surplus sits leased and idle — withheld
+    /// from other subscriber processes and spending its <see cref="MaxTotalAckExtension"/> budget
+    /// before a handler ever starts — which is the wrong trade for job-style handlers that run for
+    /// seconds to hours. One connection keeps the leased set equal to the running set; raise it only
+    /// when a single stream's fetch throughput (not handler time) is the bottleneck.
+    /// </para>
+    /// </summary>
+    public int ClientCount { get; set; } = 1;
+
+    /// <summary>
+    /// Flow-control ceiling on messages the client holds un-ACKed at once (SDK
+    /// <c>FlowControlSettings.MaxOutstandingElementCount</c>). In
+    /// <see cref="GooglePubSubAckMode.AckAfterHandlerCompletes"/> this is the maximum number of
+    /// handlers running concurrently in this process — including durable flows parked in process on
+    /// a timer. Must be positive. Default: <c>1000</c>, the SDK default.
+    /// Ignored in <see cref="GooglePubSubAckMode.AckAfterEnqueue"/>, where the streaming pull is
+    /// bounded to <see cref="BackgroundQueueCapacity"/> instead.
+    /// </summary>
+    public int MaxOutstandingMessages { get; set; } = 1000;
+
+    /// <summary>
+    /// Flow-control ceiling on the total size, in bytes, of the messages the client holds un-ACKed
+    /// at once (SDK <c>FlowControlSettings.MaxOutstandingByteCount</c>). Must be positive; a single
+    /// message larger than the ceiling is still delivered, on its own. Default: <c>100,000,000</c>
+    /// (100 MB), the SDK default. Ignored in <see cref="GooglePubSubAckMode.AckAfterEnqueue"/>.
+    /// </summary>
+    public long MaxOutstandingBytes { get; set; } = 100_000_000;
+
+    /// <summary>
     /// Explicitly opts this subscriber into ACK-after-enqueue behavior.
     /// </summary>
     public GooglePubSubSubscriberOptions UseAckAfterEnqueue(
