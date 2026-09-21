@@ -422,7 +422,22 @@ public sealed class InMemoryWorkerTransport : IWorkerTransport, IDelayedWorkerTr
 
             // The timer is created inside the gate so a concurrent drain either sees it in the map
             // (and disposes it) or the publish observed _draining above. One-shot; Fire removes it.
-            var timer = _timeProvider.CreateTimer(static state => ((DelayedJob)state!).Fire(), delayed, delay, Timeout.InfiniteTimeSpan);
+            ITimer timer;
+            try
+            {
+                timer = _timeProvider.CreateTimer(static state => ((DelayedJob)state!).Fire(), delayed, delay, Timeout.InfiniteTimeSpan);
+            }
+            catch
+            {
+                // Not armed, so nothing will ever fire — or drain — this job: hand the reserved
+                // slot back before the publish fails. Without this every failed arming (a time
+                // provider already disposed by a finished test fixture, a provider that rejects
+                // the delay) burned one of DelayedJobCapacity for the life of the transport, and
+                // once they were gone every delayed publish was rejected or blocked forever.
+                _delayedSlots.Release();
+                throw;
+            }
+
             _delayedJobs.Add(delayed, timer);
         }
     }

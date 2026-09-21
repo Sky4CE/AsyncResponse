@@ -134,7 +134,9 @@ occurrence that fell due during an outage longer than the start's retry ladder. 
 its process: an occurrence whose publish was still failing at shutdown persisted nothing, so
 nothing can find it after a restart and it is skipped like any occurrence missed while no replica
 was up (the run history shows the gap). Separately, each schedule probes the last
-`StartupRedriveWindow` (default 1 hour; zero disables it; at most the 64 most recent occurrences)
+`StartupRedriveWindow` (default 1 hour; zero disables it; at most the 64 most recent occurrences —
+the probe looks back only as far as it needs to find them, so a long window on a frequent schedule
+costs startup nothing)
 at startup and re-drives any occurrence whose ledger *exists*, is Running, and has zero attempts —
 a run whose wake-up was published and then lost in transit (an early-ACK worker subscriber, a
 broker that dropped the job) and that nothing else would find. A run that is merely queued behind

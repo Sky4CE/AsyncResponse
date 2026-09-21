@@ -694,6 +694,14 @@ internal abstract class DbAsyncResponseChannelBase :
         }
     }
 
+    // The REAL clock, deliberately — here and in the dispatch loop's poll and rescan delays —
+    // although waiter timeouts and the delivery-confirmation wait arm on _timeProvider. These
+    // loops keep pace with state that lives in the database and moves in real time whatever clock
+    // the process was handed: subscriber rows expire on the SERVER's clock, and another process's
+    // response becomes visible when ITS transaction commits. A heartbeat parked on a virtual clock
+    // that a test never advances lets the rows of live waiters expire server-side (their responses
+    // then route to lost-subscriber recovery), and a parked poll never delivers a cross-process
+    // response at all. What the injected clock owns is time the process itself defines.
     private async Task HeartbeatLoopAsync(CancellationToken cancellationToken)
     {
         while (!cancellationToken.IsCancellationRequested)
@@ -1497,7 +1505,16 @@ internal abstract class DbAsyncResponseChannelBase :
 
     private async Task<bool> WaitForAcknowledgementAsync(PendingConfirmation confirmation, CancellationToken cancellationToken)
     {
-        var deadline = _timeProvider.GetUtcNow() + _options.DeliveryConfirmationTimeout;
+        // MONOTONIC, on the injected clock: the confirmation budget is a pure interval, and it used
+        // to be a wall-clock deadline (GetUtcNow() + timeout). A system clock stepped forward while
+        // a publish waited here — an NTP correction, a VM resumed or migrated — made `remaining`
+        // non-positive at once, the loop body never ran, and TryConfirmDeliveryAsync went straight
+        // to TryClaimForRecoveryAsync: the message was claimed for lost-subscriber recovery under
+        // a live waiter the dispatch loop was about to deliver it to. This is the same rule the
+        // poll deadlines below already follow (_pollArmedAt); TimeProvider's timestamp keeps the
+        // wait drivable by a virtual clock, which a raw Stopwatch would not.
+        var startedAt = _timeProvider.GetTimestamp();
+        TimeSpan Remaining() => _options.DeliveryConfirmationTimeout - _timeProvider.GetElapsedTime(startedAt);
 
         // One `remaining` computation drives both the loop condition and the poll delay: the old
         // shape tested the deadline twice, one line apart, so the code read as if two different
@@ -1509,9 +1526,9 @@ internal abstract class DbAsyncResponseChannelBase :
         // token behind on every publish; WaitAsync tears its timer down when the confirmation
         // wins. A lapsed poll interval surfaces as TimeoutException, which is the loop condition,
         // not a failure.
-        for (var remaining = deadline - _timeProvider.GetUtcNow();
+        for (var remaining = Remaining();
              remaining > TimeSpan.Zero;
-             remaining = deadline - _timeProvider.GetUtcNow())
+             remaining = Remaining())
         {
             var pollDelay = remaining < _options.DeliveryConfirmationPollInterval
                 ? remaining

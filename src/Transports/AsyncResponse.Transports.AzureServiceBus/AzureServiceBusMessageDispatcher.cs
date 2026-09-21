@@ -47,9 +47,12 @@ internal abstract class AzureServiceBusMessageDispatcher : IAsyncDisposable
     protected const int MaxDeadLetterDescriptionLength = 4096;
 
     protected static string TruncateDeadLetterDescription(string? description)
-        => string.IsNullOrEmpty(description) || description.Length <= MaxDeadLetterDescriptionLength
-            ? description ?? string.Empty
-            : description[..MaxDeadLetterDescriptionLength];
+        // Surrogate-aware cut: an exception message is arbitrary text, and a fixed-index slice
+        // through a non-BMP character left a lone high surrogate that the AMQP encoder replaces
+        // with U+FFFD — corrupting the forensic text exactly where it was cut.
+        => string.IsNullOrEmpty(description)
+            ? string.Empty
+            : PortableText.TruncateWellFormed(description, MaxDeadLetterDescriptionLength);
 
     /// <summary>Creates the dispatcher configured by the subscriber options.</summary>
     public static AzureServiceBusMessageDispatcher Create(

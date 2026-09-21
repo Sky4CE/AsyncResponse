@@ -74,9 +74,38 @@ internal static class PortableText
             "succeeds on one store and fails at its first write on another, and control characters corrupt diagnostics " +
             "everywhere. Use a printable id.";
 
-    /// <summary>The shared 40-character excerpt used when quoting an offending id back to the caller.</summary>
+    /// <summary>
+    /// The shared 40-character excerpt used when quoting an offending id back to the caller. Cut
+    /// through <see cref="TruncateWellFormed"/>: a fixed-index slice used to split a surrogate pair
+    /// that straddled the cut, so the helper that quotes an id in the "unpaired surrogate"
+    /// rejection could mint an unpaired surrogate of its own.
+    /// </summary>
     internal static string Excerpt(string value)
-        => value.Length <= 40 ? value : string.Concat(value.AsSpan(0, 40), "…");
+        => value.Length <= 40 ? value : string.Concat(TruncateWellFormed(value, 40), "…");
+
+    /// <summary>
+    /// The longest prefix of <paramref name="value"/> that fits <paramref name="maxLength"/> UTF-16
+    /// code units WITHOUT ending inside a surrogate pair — one unit shorter than the budget when
+    /// the pair straddles it. <c>value[..maxLength]</c> keeps the high surrogate and drops its low
+    /// half; every UTF-8 encoder then substitutes U+FFFD for the orphan (see
+    /// <see cref="IndexOfIllFormedUtf16"/>), silently corrupting the text at the cut — or, under a
+    /// strict encoder, failing the write that carried it. Every length-capped diagnostic string
+    /// (id excerpts, dead-letter reasons, generated consumer names) is cut here. A surrogate that
+    /// was already unpaired in the input is not repaired: this never makes text worse, it only
+    /// refuses to break a pair that was whole.
+    /// </summary>
+    internal static string TruncateWellFormed(string value, int maxLength)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegative(maxLength);
+        if (value.Length <= maxLength)
+            return value;
+
+        var cut = maxLength;
+        if (cut > 0 && char.IsHighSurrogate(value[cut - 1]) && char.IsLowSurrogate(value[cut]))
+            cut--;
+
+        return value[..cut];
+    }
 
     /// <summary>The rejection message for an unpaired surrogate, worded for the given kind of id.</summary>
     internal static string IllFormedUtf16Rejection(string kind, string excerpt, char offending, int index)

@@ -642,6 +642,41 @@ public class RabbitMqDispatcherTests
     }
 
     /// <summary>
+    /// Review 2026-09-21 F8: the <c>AR-DeadLetter-Reason</c> header was cut with
+    /// <c>message[..512]</c>. With a non-BMP character straddling the limit that kept a lone high
+    /// surrogate, which the client's UTF-8 encoding replaces with U+FFFD — the parked copy's
+    /// forensic text was corrupted at the cut. The cut is surrogate-aware now.
+    /// </summary>
+    [Fact]
+    public async Task Awaiting_AtCap_NeverCutsTheDeadLetterReasonInsideASurrogatePair()
+    {
+        var properties = new BasicProperties
+        {
+            CorrelationId = "cid-park-surrogate",
+            Headers = new Dictionary<string, object?>
+            {
+                ["x-death"] = new List<object?> { new Dictionary<string, object?> { ["count"] = 2L } }
+            }
+        };
+        var longMessage = new string('x', 511) + "\U0001F600" + new string('y', 100);
+
+        var channel = new FakeDispatcherChannel();
+        await using var dispatcher = RabbitMqMessageDispatcher.Create(
+            (_, _) => throw new InvalidOperationException(longMessage),
+            new RabbitMqAsyncResponseOptions { DeadLetterExchange = "dlx", DeadLetterQueue = "parked" },
+            new RabbitMqSubscriberOptions { MaxDeliveryAttempts = 3 },
+            NullLogger.Instance,
+            "worker.q",
+            RabbitMqSubscriberRole.Worker);
+
+        await dispatcher.HandleAsync(Delivery("poison-payload", properties, routingKey: "worker.route", deliveryTag: 72), channel, CancellationToken.None);
+
+        var reason = Assert.IsType<string>(Assert.Single(channel.Publishes).Properties.Headers!["AR-DeadLetter-Reason"]);
+        Assert.Equal(-1, PortableText.IndexOfIllFormedUtf16(reason));
+        Assert.Equal(longMessage[..511], reason);
+    }
+
+    /// <summary>
     /// Round 33 (B1): AT the cap with <c>x-death</c> present the catch still rejected without
     /// requeue — but x-death means the dead-letter exchange already returned this message once
     /// (DLX → retry queue → TTL → back), so that reject re-entered the same cycle and the poison

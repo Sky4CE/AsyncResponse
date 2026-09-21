@@ -222,6 +222,11 @@ internal static class FlowStateConcurrency
                 $"{nameof(DurableFlowOptions)}.{nameof(options.ExecutionLeaseRenewInterval)} must be shorter than " +
                 $"{nameof(DurableFlowOptions.ExecutionLeaseDuration)}.");
         }
+        // Compared against elapsed time only (the contention poll arms pollDelay-sized timers), so
+        // any positive value is representable; zero or less would cap the store-driven wait below
+        // "no wait at all", which is a misconfiguration rather than a way to disable the feature.
+        if (options.MaxLeaseContentionWait <= TimeSpan.Zero)
+            throw new InvalidOperationException($"{nameof(DurableFlowOptions)}.{nameof(options.MaxLeaseContentionWait)} must be positive (got {options.MaxLeaseContentionWait}).");
         if (options.ProgressPersistenceInterval < TimeSpan.Zero)
             throw new InvalidOperationException($"{nameof(DurableFlowOptions)}.{nameof(options.ProgressPersistenceInterval)} cannot be negative.");
         // Timer remainders at or under the threshold arm an in-process Task.Delay, so the knob is

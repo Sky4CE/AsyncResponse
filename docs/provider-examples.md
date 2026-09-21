@@ -241,6 +241,12 @@ builder.Services.AddAsyncResponse()
 The transport uses consumer groups, pending-entry reclaim, and a dead-letter stream. Redis Streams
 requires Redis 5 or a compatible server that implements the Streams command set.
 
+Each process joins its groups under a generated consumer name, `{machine}-{pid}-{guid}` plus the
+subscriber role, kept within 64 characters by shortening the machine name only: the process id and
+the GUID are what keep two processes on one host apart, and consumers that share a name share one
+pending-entry list. Set `ConsumerName` yourself only when your orchestrator guarantees a unique
+value per running process.
+
 ### RabbitMQ transport
 
 ```csharp

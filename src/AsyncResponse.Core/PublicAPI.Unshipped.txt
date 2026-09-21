@@ -119,6 +119,8 @@ AsyncResponse.DurableFlowOptions.ExecutionLeaseRenewInterval.get -> System.TimeS
 AsyncResponse.DurableFlowOptions.ExecutionLeaseRenewInterval.set -> void
 AsyncResponse.DurableFlowOptions.LedgerSizeWarningBytes.get -> long?
 AsyncResponse.DurableFlowOptions.LedgerSizeWarningBytes.set -> void
+AsyncResponse.DurableFlowOptions.MaxLeaseContentionWait.get -> System.TimeSpan
+AsyncResponse.DurableFlowOptions.MaxLeaseContentionWait.set -> void
 AsyncResponse.DurableFlowOptions.MaxRetainedSteps.get -> int?
 AsyncResponse.DurableFlowOptions.MaxRetainedSteps.set -> void
 AsyncResponse.DurableFlowOptions.ProgressPersistenceInterval.get -> System.TimeSpan

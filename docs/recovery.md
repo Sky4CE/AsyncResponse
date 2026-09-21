@@ -273,9 +273,19 @@ disconnected scans normally, and a disconnected replica never matters. Earlier v
 disconnected servers silently: with Redis down the scan enumerated nothing, published "0
 registrations, no error", and the health check went from `Degraded` to `Healthy` *because of* the
 outage. Expect the opposite now — a Redis outage shows up here as
-`Async-response watchdog scan failed: …` until the connection is back. On a cluster that has
-failed a primary over, the old primary keeps the scan failing until it rejoins (as a replica) or
-is removed from the cluster: the multiplexer still reports it as a primary it cannot reach.
+`Async-response watchdog scan failed: …` until the connection is back.
+
+Before a cluster scan fails over an unreachable node, the scanner asks a connected primary for the
+cluster's own node table (`CLUSTER NODES`) and ignores any unreachable node the table lists as a
+**replica** or as **owning no slots** — only a slot owner can make the scan partial. The client's
+view of a node's role is only as good as its last handshake: a replica that was already down when
+the process started has never been handshaken and reads as "not a replica", and used to fail every
+scan of a cluster whose slot owners were all reachable. The same lookup lets a failed-over cluster
+scan normally as soon as the failover has moved the old primary's slots, instead of failing until
+the node rejoins. It runs only on the path that was about to fail, so a healthy cluster pays
+nothing for it, and every unknown stays a failure: a node the table does not list (a DNS name the
+cluster does not announce), a table that cannot be read (the ACL must allow `CLUSTER NODES` for
+the lookup to help), a slot-owning primary.
 
 The Redis scan streams: keys come from `SCAN` asynchronously, and registration blobs are read in
 pipelined batches of 128 (individual `GET`s, so a cluster routes each to its shard) rather than

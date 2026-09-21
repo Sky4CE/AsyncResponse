@@ -177,12 +177,22 @@ case drops the run's only wake-up, so the engine acknowledges a contended wake-u
   *persisted* expiry, then acquires the lease and executes from the last checkpoint;
 - if neither happens within one local lease window past the persisted expiry (a store clock far
   from this host's, or a store that reports a lease it will not hand over), the wake-up fails with
-  `DurableFlowLeaseContendedException` and the worker transport redelivers it.
+  `DurableFlowLeaseContendedException` and the worker transport redelivers it;
+- the persisted expiry moves the deadline at most `DurableFlowOptions.MaxLeaseContentionWait`
+  (default 1 hour) past the moment the wake-up started waiting. The expiry is data the waiting host
+  does not control: without a ceiling, a store clock hours ahead of this host — or an expiry column
+  read back shifted — parked the delivery for as long as the bad value said, polling the store
+  every two seconds and holding its worker slot, and never reached the exception that names clock
+  skew as the cause. Past the budget the wake-up fails the same way and is redelivered. This
+  host's own lease window is always waited, whatever the budget is set to.
 
 This is what makes **changing `ExecutionLeaseDuration` between deployments safe**. The wait is
 bounded by the lease the previous deployment actually wrote, not by the new deployment's
 configuration: a successor configured with a 30-second lease that meets a crashed owner's
-10-minute lease waits out the 10 minutes. (Earlier versions waited only
+10-minute lease waits out the 10 minutes. A deployment that issues leases longer than
+`MaxLeaseContentionWait` should raise that budget in step — otherwise a wake-up behind such a
+lease is handed back to the transport at the budget and spends delivery attempts until the lease
+lapses. (Earlier versions waited only
 `ExecutionLeaseDuration + ExecutionLeaseRenewInterval` of the *waiting* host and then acknowledged
 the wake-up as a duplicate, so shortening the lease could strand every run whose redelivery
 arrived before the old lease expired — `Running`, `Attempts` unchanged, nothing left to wake it.)
@@ -190,8 +200,9 @@ arrived before the old lease expired — `Running`, `Attempts` unchanged, nothin
 Two operational consequences:
 
 - the handler of a contended wake-up can stay parked for as long as the longest lease still
-  persisted. Transports redeliver a job whose visibility or lock lapses meanwhile; the extra
-  delivery waits the same way and the first one to acquire the lease wins;
+  persisted, up to `MaxLeaseContentionWait`. Transports redeliver a job whose visibility or lock
+  lapses meanwhile; the extra delivery waits the same way and the first one to acquire the lease
+  wins;
 - an application-owned store that leaves `ObserveLeaseAsync` at its default gives the engine no
   evidence. It still takes over a dead holder's lease inside its own lease window, but a wake-up
   that stays contended through that window is **never acknowledged**: it throws

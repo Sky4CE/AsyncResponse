@@ -415,6 +415,31 @@ public sealed class AzureServiceBusDispatcherTests
     }
 
     [Fact]
+    public async Task AckAfterHandlerCompletes_NeverCutsALongHandlerMessageInsideASurrogatePair()
+    {
+        // Review 2026-09-21 F8: the cut was description[..4096]. An exception message is arbitrary
+        // text; with a non-BMP character straddling the limit the slice kept the high surrogate
+        // and dropped its low half, and the AMQP encoder then replaces the orphan with U+FFFD —
+        // the forensic text was corrupted exactly where it was cut. The cut now steps back one
+        // unit so the pair stays whole (and out).
+        var calls = new SettlementCalls();
+        var longMessage = new string('x', 4095) + "\U0001F600" + new string('y', 100);
+        await using var dispatcher = AzureServiceBusMessageDispatcher.Create(
+            (_, _) => throw new InvalidOperationException(longMessage),
+            new AzureServiceBusAsyncResponseOptions(),
+            new AzureServiceBusSubscriberOptions { MaxDeliveryAttempts = 2 },
+            NullLogger.Instance,
+            "workers",
+            AzureServiceBusSubscriberRole.Worker);
+
+        await dispatcher.HandleAsync(Delivery(calls, deliveryCount: 2), CancellationToken.None);
+
+        Assert.Equal(1, calls.DeadLetter);
+        Assert.Equal(-1, PortableText.IndexOfIllFormedUtf16(calls.DeadLetterDescription!));
+        Assert.Equal(longMessage[..4095], calls.DeadLetterDescription);
+    }
+
+    [Fact]
     public async Task AckAfterHandlerCompletes_LeavesAShortHandlerMessageIntact()
     {
         // The truncation must not touch the common case: a message at or under the limit is passed

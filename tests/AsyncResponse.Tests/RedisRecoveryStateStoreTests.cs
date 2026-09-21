@@ -964,6 +964,144 @@ public class RedisRecoveryStateStoreTests
         Assert.Equal(["corr-a", "corr-b"], states.Select(state => state.CorrelationId).OrderBy(id => id, StringComparer.Ordinal));
     }
 
+    // -----------------------------------------------------------------------------------------
+    // Review 2026-09-21 F5. IServer.IsReplica is only as good as the last handshake: a node that
+    // has never connected since the process started still reports the default — NOT a replica.
+    // A replica that was down at startup therefore counted as an unreachable PRIMARY and failed
+    // every scan of a cluster whose slot owners were all reachable: the recovery health check sat
+    // at Degraded for as long as the replica stayed down. The cluster's own node table now
+    // decides, on the failing path only.
+    // -----------------------------------------------------------------------------------------
+
+    private const string ClusterNodeTable =
+        "07c37dfeb235213a872192d90877d0cd55635b91 10.0.0.1:6379@16379 myself,master - 0 0 1 connected 0-8191\n" +
+        "67ed2db8d677e59ec4a4cefb06858cf2a1a89fa1 10.0.0.2:6379@16379 master - 0 1426238316232 2 connected 8192-16383\n" +
+        "292f8b365bb7edb5e285caf0b7e6ddc7265d2f4f 10.0.0.7:6379@16379 slave 67ed2db8d677e59ec4a4cefb06858cf2a1a89fa1 0 1426238317741 2 disconnected\n";
+
+    [Fact]
+    public async Task ScanAsync_ClusterWithAReplicaThatNeverConnected_IsStillACompleteScan()
+    {
+        var shardA = ClusterPrimary("10.0.0.1", "ar:recovery:corr-a");
+        var shardB = ClusterPrimary("10.0.0.2", "ar:recovery:corr-b");
+        shardA.Setup(s => s.ClusterNodesRawAsync(It.IsAny<CommandFlags>())).ReturnsAsync(ClusterNodeTable);
+        // Down since before this process started: never handshaken, so IsReplica is the default.
+        var neverConnectedReplica = new Mock<IServer>();
+        neverConnectedReplica.SetupGet(s => s.IsConnected).Returns(false);
+        neverConnectedReplica.SetupGet(s => s.IsReplica).Returns(false);
+        neverConnectedReplica.SetupGet(s => s.EndPoint).Returns(new IPEndPoint(IPAddress.Parse("10.0.0.7"), 6379));
+        SetupServers(shardA, shardB, neverConnectedReplica);
+        SetupRegistrations("corr-a", "corr-b");
+
+        var states = await DrainScanAsync();
+
+        Assert.Equal(["corr-a", "corr-b"], states.Select(state => state.CorrelationId).OrderBy(id => id, StringComparer.Ordinal));
+    }
+
+    [Fact]
+    public async Task ScanAsync_ClusterWithAnUnreachableSlotOwner_StillFails_AndNamesOnlyThatNode()
+    {
+        var shardA = ClusterPrimary("10.0.0.1", "ar:recovery:corr-a");
+        shardA.Setup(s => s.ClusterNodesRawAsync(It.IsAny<CommandFlags>())).ReturnsAsync(ClusterNodeTable);
+        var shardB = new Mock<IServer>();
+        shardB.SetupGet(s => s.IsConnected).Returns(false);
+        shardB.SetupGet(s => s.EndPoint).Returns(new IPEndPoint(IPAddress.Parse("10.0.0.2"), 6379));
+        var downReplica = new Mock<IServer>();
+        downReplica.SetupGet(s => s.IsConnected).Returns(false);
+        downReplica.SetupGet(s => s.EndPoint).Returns(new IPEndPoint(IPAddress.Parse("10.0.0.7"), 6379));
+        SetupServers(shardA, shardB, downReplica);
+        SetupRegistrations("corr-a");
+
+        var failure = await Assert.ThrowsAsync<RedisConnectionException>(() => DrainScanAsync());
+
+        Assert.Contains("10.0.0.2:6379", failure.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("10.0.0.7", failure.Message, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData(null)]
+    [InlineData("")]
+    [InlineData("not a node table")]
+    public async Task ScanAsync_ClusterWhoseNodeTableSaysNothing_StaysConservative(string? nodeTable)
+    {
+        var shardA = ClusterPrimary("10.0.0.1", "ar:recovery:corr-a");
+        shardA.Setup(s => s.ClusterNodesRawAsync(It.IsAny<CommandFlags>())).ReturnsAsync(nodeTable);
+        var unknown = new Mock<IServer>();
+        unknown.SetupGet(s => s.IsConnected).Returns(false);
+        unknown.SetupGet(s => s.EndPoint).Returns(new IPEndPoint(IPAddress.Parse("10.0.0.7"), 6379));
+        SetupServers(shardA, unknown);
+        SetupRegistrations("corr-a");
+
+        await Assert.ThrowsAsync<RedisConnectionException>(() => DrainScanAsync());
+    }
+
+    [Fact]
+    public async Task ScanAsync_ClusterWhoseNodeTableCannotBeRead_StaysConservative()
+    {
+        var shardA = ClusterPrimary("10.0.0.1", "ar:recovery:corr-a");
+        shardA.Setup(s => s.ClusterNodesRawAsync(It.IsAny<CommandFlags>()))
+            .ThrowsAsync(new RedisConnectionException(ConnectionFailureType.SocketFailure, CommandFlags.None, "CLUSTER NODES: connection lost", innerException: null, CommandStatus.Sent));
+        var unknown = new Mock<IServer>();
+        unknown.SetupGet(s => s.IsConnected).Returns(false);
+        unknown.SetupGet(s => s.EndPoint).Returns(new IPEndPoint(IPAddress.Parse("10.0.0.7"), 6379));
+        SetupServers(shardA, unknown);
+        SetupRegistrations("corr-a");
+
+        var failure = await Assert.ThrowsAsync<RedisConnectionException>(() => DrainScanAsync());
+
+        Assert.Contains("10.0.0.7:6379", failure.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void ClusterNodeTable_ClassifiesOnlyWhatItLists()
+    {
+        var nodes = RedisClusterNodeTable.Parse(
+            // Redis 7 with an announced hostname, a Redis 3 line without the bus port, IPv6, a
+            // failed-over primary that lost its slots, and a failing primary that still owns some.
+            "a 10.0.0.1:6379@16379,redis-a.internal master - 0 0 1 connected 0-5460\n" +
+            "b 10.0.0.2:6379 slave a 0 0 1 connected\n" +
+            "c 2001:db8::3:6379@16379 replica a 0 0 1 connected\n" +
+            "d 10.0.0.4:6379@16379 master,fail - 0 0 2 disconnected\n" +
+            "e 10.0.0.5:6379@16379 master,fail? - 0 0 3 disconnected 5461-16383\n" +
+            "garbage\n");
+
+        Assert.Equal(5, nodes.Count);
+        Assert.True(RedisClusterNodeTable.OwnsNoSlots(nodes, new IPEndPoint(IPAddress.Parse("10.0.0.2"), 6379)));
+        Assert.True(RedisClusterNodeTable.OwnsNoSlots(nodes, new IPEndPoint(IPAddress.Parse("2001:db8:0:0:0:0:0:3"), 6379)));
+        Assert.True(RedisClusterNodeTable.OwnsNoSlots(nodes, new IPEndPoint(IPAddress.Parse("10.0.0.4"), 6379)));
+
+        // Slot owners — reachable or failing — are never waved through.
+        Assert.False(RedisClusterNodeTable.OwnsNoSlots(nodes, new IPEndPoint(IPAddress.Parse("10.0.0.1"), 6379)));
+        Assert.False(RedisClusterNodeTable.OwnsNoSlots(nodes, new DnsEndPoint("REDIS-A.internal", 6379)));
+        Assert.False(RedisClusterNodeTable.OwnsNoSlots(nodes, new IPEndPoint(IPAddress.Parse("10.0.0.5"), 6379)));
+
+        // Unknown is not "owns nothing": an unlisted address, the right host on another port, a
+        // DNS name the cluster does not announce, no endpoint at all.
+        Assert.False(RedisClusterNodeTable.OwnsNoSlots(nodes, new IPEndPoint(IPAddress.Parse("10.0.0.9"), 6379)));
+        Assert.False(RedisClusterNodeTable.OwnsNoSlots(nodes, new IPEndPoint(IPAddress.Parse("10.0.0.2"), 6380)));
+        Assert.False(RedisClusterNodeTable.OwnsNoSlots(nodes, new DnsEndPoint("redis-b.internal", 6379)));
+        Assert.False(RedisClusterNodeTable.OwnsNoSlots(nodes, endPoint: null));
+    }
+
+    private Mock<IServer> ClusterPrimary(string address, string recoveryKey)
+    {
+        var server = new Mock<IServer>();
+        server.SetupGet(s => s.IsConnected).Returns(true);
+        server.SetupGet(s => s.ServerType).Returns(ServerType.Cluster);
+        server.SetupGet(s => s.EndPoint).Returns(new IPEndPoint(IPAddress.Parse(address), 6379));
+        SetupKeys(server, [(RedisKey)recoveryKey]);
+        return server;
+    }
+
+    private void SetupRegistrations(params string[] correlationIds)
+    {
+        foreach (var correlationId in correlationIds)
+        {
+            _database
+                .Setup(d => d.StringGetAsync((RedisKey)$"ar:recovery:{correlationId}", It.IsAny<CommandFlags>()))
+                .ReturnsAsync(EnvelopeBlob((new RecoveryState { RegistrationId = Guid.NewGuid(), CorrelationId = correlationId }, _time.Now + TimeSpan.FromMinutes(10))));
+        }
+    }
+
     /// <summary>
     /// Outside a cluster every primary serves the same dataset: after a failover the multiplexer
     /// still lists the old primary (disconnected, last known as a primary) next to the promoted

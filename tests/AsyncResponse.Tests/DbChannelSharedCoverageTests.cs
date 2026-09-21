@@ -917,6 +917,59 @@ public sealed class DbChannelSharedCoverageTests
         Assert.Equal(0, reads.Sum());
     }
 
+    // Review 2026-09-21 F3. The delivery-confirmation budget is an interval, and it was a wall-clock
+    // deadline (GetUtcNow() + timeout). A system clock stepped FORWARD while a publish waited — an
+    // NTP correction, a resumed or migrated VM — made the remaining budget negative before the
+    // first wait: the publisher skipped the wait outright and went on to claim the message for
+    // lost-subscriber recovery under a live waiter that was about to be handed it. The budget now
+    // runs on the injected clock's MONOTONIC timestamp, the rule the poll deadlines already follow.
+    [Theory]
+    [InlineData(Provider.SqlServer)]
+    [InlineData(Provider.PostgreSql)]
+    [InlineData(Provider.MongoDb)]
+    public async Task DeliveryConfirmation_SurvivesAForwardWallClockStep(Provider provider)
+    {
+        var clock = new ForwardSteppingClock();
+        await using var harness = Harness.Create(provider, false, TimeSpan.FromSeconds(30), timeProvider: clock);
+        // One poll interval as long as the whole budget: the only thing that can end the wait
+        // early is the in-process delivery below, never a store round trip.
+        harness.ConfigureDeliveryConfirmation(timeout: TimeSpan.FromSeconds(20), pollInterval: TimeSpan.FromSeconds(20));
+
+        var (acknowledged, delivered) = harness.BeginWaitForAcknowledgement(clock);
+
+        // The local dispatch loop delivers a moment later — well inside the 20 s budget.
+        await Task.Delay(TimeSpan.FromMilliseconds(100));
+        Assert.False(acknowledged.IsCompleted, "The wait ended before the delivery: the stepped wall clock was read as an exhausted budget.");
+        delivered.TrySetResult(true);
+
+        Assert.True(await acknowledged.WaitAsync(TimeSpan.FromSeconds(10)));
+    }
+
+    /// <summary>
+    /// A system clock that is stepped a day forward after its first reading, as an NTP correction
+    /// or a VM resume steps it; the monotonic timestamp (the base implementation's Stopwatch) and
+    /// the timers are untouched, exactly as on a real host.
+    /// </summary>
+    private sealed class ForwardSteppingClock : TimeProvider
+    {
+        private int _step;
+
+        /// <summary>Arms the step: the NEXT reading is the last one before the clock jumps.</summary>
+        public void StepAfterNextReading() => Volatile.Write(ref _step, 1);
+
+        public override DateTimeOffset GetUtcNow()
+        {
+            var now = base.GetUtcNow();
+            return Interlocked.CompareExchange(ref _step, 2, 1) switch
+            {
+                1 => now,
+                2 => now + TimeSpan.FromDays(1),
+                _ => now
+            };
+        }
+    }
+
+
     [Theory]
     [InlineData(Provider.PostgreSql)]
     [InlineData(Provider.SqlServer)]
@@ -1403,6 +1456,29 @@ public sealed class DbChannelSharedCoverageTests
 
         public void AddSubscription(string correlationId, object subscription)
             => Method("AddSubscription").Invoke(Channel, [correlationId, subscription]);
+
+        /// <summary>Overrides the harness's test-sized (2 ms) delivery-confirmation budget.</summary>
+        public void ConfigureDeliveryConfirmation(TimeSpan timeout, TimeSpan pollInterval)
+        {
+            var options = Field("_options").GetValue(Channel)!;
+            options.GetType().GetProperty("DeliveryConfirmationTimeout")!.SetValue(options, timeout);
+            options.GetType().GetProperty("DeliveryConfirmationPollInterval")!.SetValue(options, pollInterval);
+        }
+
+        /// <summary>
+        /// Starts the publish path's wait for a delivery confirmation and hands back the wait
+        /// together with the completion the local dispatch loop would trip. The clock is stepped
+        /// right after the wait reads "now" for the first time — the window a real step lands in.
+        /// </summary>
+        public (Task<bool> Acknowledged, TaskCompletionSource<bool> Delivered) BeginWaitForAcknowledgement(ForwardSteppingClock steppingClock)
+        {
+            var messageId = Guid.NewGuid();
+            var confirmation = Method("BeginConfirmation").Invoke(Channel, [messageId])!;
+            var pending = (System.Collections.Concurrent.ConcurrentDictionary<Guid, TaskCompletionSource<bool>>)Field("_pendingConfirmations").GetValue(Channel)!;
+            steppingClock.StepAfterNextReading();
+            var acknowledged = (Task<bool>)Method("WaitForAcknowledgementAsync").Invoke(Channel, [confirmation, CancellationToken.None])!;
+            return (acknowledged, pending[messageId]);
+        }
 
         /// <summary>
         /// Replaces the subscription's per-message dispatch delegate (<c>ProcessUnderContextAsync</c>,

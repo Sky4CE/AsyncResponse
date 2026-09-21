@@ -36,6 +36,69 @@ work that has landed on `main` but not yet shipped. Security reporters credited 
   Added fault, concurrency, serializer-parity, and checkpoint-cost regressions and guidance.
 
 
+- **Round-41 review (2026-09-21, whole repository): values the process does not control get a bound.**
+  - *A contended flow wake-up no longer follows a persisted lease expiry without limit.* Round 40
+    moved the contended wake-up's deadline to the lease's persisted expiry plus one lease window —
+    with no ceiling. That expiry is data: a store clock hours ahead of the waiting host, or an
+    expiry column read back shifted, moved the deadline as far out as the value said (saturating at
+    `DateTime.MaxValue`, i.e. never). The delivery then polled the store every two seconds for
+    good, holding its worker slot, and the exception whose message says "check for clock skew" was
+    unreachable in exactly that case. New option `DurableFlowOptions.MaxLeaseContentionWait`
+    (default 1 hour, must be positive) bounds the store-driven extension; past it the wake-up fails
+    with `DurableFlowLeaseContendedException` — naming the budget and both causes — and the
+    transport redelivers it. This host's own lease window is always waited. **Deployments that
+    issue leases longer than an hour** should raise the budget in step, or a wake-up behind a
+    crashed owner's lease spends delivery attempts from the one-hour mark until the lease lapses.
+  - *Redis transport: the generated consumer name keeps its unique part.* The name is
+    `{machine}-{pid}-{guid}`, and the 64-character cut kept its HEAD — so a 63-character host name
+    (a Kubernetes pod name, any host at Linux's `HOST_NAME_MAX`) lost the process id and the whole
+    GUID, and every process on that host joined its consumer groups under one identity, sharing a
+    pending-entry list: each could claim and acknowledge entries another was still handling. The
+    machine name gives up the characters now; the process id and GUID are never cut.
+  - *Database channels: the delivery-confirmation budget is monotonic.* It was a wall-clock
+    deadline (`GetUtcNow() + DeliveryConfirmationTimeout`). A system clock stepped forward while a
+    publish waited — an NTP correction, a resumed or migrated VM — made the remaining budget
+    negative before the first wait, and the publisher went straight on to claim the message for
+    lost-subscriber recovery under a live waiter that was about to be handed it. The budget runs on
+    the injected clock's monotonic timestamp, the rule the poll deadlines already followed (and
+    still drivable by a virtual clock). The heartbeat and poll loops stay on the real clock on
+    purpose — they keep pace with database-side state — and now say why.
+  - *Scheduled flows: the startup probe's cost follows what it keeps, not its window.* The probe
+    keeps the 64 most recent occurrences inside `StartupRedriveWindow`, but found them by walking
+    the whole window forward from its far end, and the window has no ceiling: a per-minute schedule
+    with a one-year window evaluated the cron expression 525,600 times at every startup (31 million
+    times when the window reached the epoch clamp), synchronously, ahead of the schedule's first
+    occurrence. The look-back now starts at one hour and doubles until it holds 64 occurrences or
+    covers the window; the result is identical.
+  - *Redis recovery scan: a replica that never connected is not an unreachable primary.* The
+    client's view of a node's role is only as good as its last handshake, so a replica that was
+    down when the process started read as "not a replica" and failed every scan of a cluster whose
+    slot owners were all reachable — the recovery health check sat at `Degraded` for as long as the
+    replica stayed down. Before failing a cluster scan the scanner now reads the cluster's own
+    node table (`CLUSTER NODES`, on the failing path only) and ignores unreachable nodes it lists
+    as replicas or as owning no slots; a failed-over cluster therefore scans again as soon as the
+    old primary's slots have moved. Every unknown — an unlisted node, an unreadable table — still
+    fails the scan.
+  - *In-memory worker transport: a delayed publish that cannot be armed gives its slot back.* The
+    `DelayedJobCapacity` slot is reserved before the timer is created, and only the shutdown branch
+    released it. A timer that could not be armed left the slot held by a job nothing would ever
+    fire or drain; enough of those and every delayed publish was rejected or blocked forever.
+  - *Length-capped text is cut between characters, never inside one.* The id excerpt quoted in
+    flow-id and correlation-id rejections, the Azure Service Bus dead-letter description (4,096)
+    and the RabbitMQ `AR-DeadLetter-Reason` header (512) were cut at a fixed UTF-16 index. With a
+    non-BMP character straddling the cut that kept a lone high surrogate, which every UTF-8 encoder
+    replaces with U+FFFD — so the helper that reports "this id contains an unpaired surrogate" could
+    mint one, and dead-letter forensics were corrupted exactly where they were cut. All four go
+    through one surrogate-aware cut (`PortableText.TruncateWellFormed`).
+  - *Ingress: the correlation-id body walk allocates a fifth of what it did.* The duplicate-key
+    scan built a fresh `HashSet` for every segment of every configured path of every message, and
+    read `JsonProperty.Name` — a new string per read — three times per property. One set per thread
+    and one read per property: ~51 KB → ~10 KB per message on a three-level, hundred-property body.
+  - *In-memory channel:* the typed and raw-ingress deliveries shared two hand-synchronized copies
+    of the completion semantics; they run one.
+  - Regression tests: 15 red-on-old proofs against `dc1a2569` in a worktree (the scheduler probe
+    ran 39 s there against a 5 s budget), plus new-API and parity pins — 46 new test cases in all.
+
 - **Round-40 review (2026-09-19): incomplete evidence is not completion — lease proof, sweep deadlines, and scan coverage.**
   - *A contended flow wake-up is acknowledged on evidence from the store, never on the waiting
     host's own lease window.* The executor polled a held lease for ITS `ExecutionLeaseDuration +

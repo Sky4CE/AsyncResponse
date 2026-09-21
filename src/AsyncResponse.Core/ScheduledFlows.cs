@@ -468,15 +468,7 @@ internal sealed class ScheduledFlowService(
             return;
 
         var now = timeProvider.GetUtcNow();
-        var cursor = window >= now - DateTimeOffset.UnixEpoch ? DateTimeOffset.UnixEpoch : now - window;
-        var candidates = new List<DateTimeOffset>();
-        while (schedule.GetNextOccurrence(cursor) is { } occurrence && occurrence <= now)
-        {
-            candidates.Add(occurrence);
-            if (candidates.Count > MaxStartupProbes)
-                candidates.RemoveAt(0);
-            cursor = occurrence;
-        }
+        var candidates = RecentOccurrences(schedule, now, window, MaxStartupProbes);
 
         foreach (var occurrence in candidates)
         {
@@ -503,6 +495,48 @@ internal sealed class ScheduledFlowService(
                 "Scheduled flow '{Schedule}' found occurrence {FlowId} committed but never executed (Running, 0 attempts) — its worker job was lost before publish (a crash or an outage in a previous process). Re-driving it.",
                 registration.Name, flowId);
             undispatched.Add(new UndispatchedOccurrence { FlowId = flowId, Occurrence = occurrence, DueUtc = now, AwaitingFirstPublish = false });
+        }
+    }
+
+    /// <summary>First look-back <see cref="RecentOccurrences"/> tries; doubled until it holds enough occurrences.</summary>
+    private static readonly TimeSpan InitialProbeLookback = TimeSpan.FromHours(1);
+
+    /// <summary>
+    /// The <paramref name="max"/> most recent occurrences in <c>(now - window, now]</c>, oldest
+    /// first. The schedule only enumerates FORWARD, and the probe used to walk the whole window
+    /// from its far end to find the few occurrences at its near end: <paramref name="max"/>
+    /// bounded the list, not the walk, and <c>StartupRedriveWindow</c> has no ceiling — a
+    /// per-minute schedule with a one-year window cost 525,600 cron evaluations at every startup
+    /// (29 million when the window reached the epoch clamp), all but 64 results discarded, in a
+    /// synchronous stretch ahead of the schedule's first occurrence. The look-back now starts
+    /// small and doubles until it holds <paramref name="max"/> occurrences or covers the window,
+    /// so the walk is proportional to what the probe keeps: a dense schedule stops after the
+    /// first hour or two, and a sparse one reaches the full window in about twenty doublings of
+    /// near-empty walks. The most recent occurrences of a shorter look-back are, by construction,
+    /// the most recent occurrences of the whole window.
+    /// </summary>
+    internal static List<DateTimeOffset> RecentOccurrences(CronSchedule schedule, DateTimeOffset now, TimeSpan window, int max)
+    {
+        var sinceEpoch = now - DateTimeOffset.UnixEpoch;
+        var fullLookback = window >= sinceEpoch ? sinceEpoch : window;
+        var lookback = fullLookback < InitialProbeLookback ? fullLookback : InitialProbeLookback;
+
+        while (true)
+        {
+            var candidates = new List<DateTimeOffset>();
+            var cursor = now - lookback;
+            while (schedule.GetNextOccurrence(cursor) is { } occurrence && occurrence <= now)
+            {
+                candidates.Add(occurrence);
+                if (candidates.Count > max)
+                    candidates.RemoveAt(0);
+                cursor = occurrence;
+            }
+
+            if (candidates.Count >= max || lookback >= fullLookback)
+                return candidates;
+
+            lookback = lookback > fullLookback - lookback ? fullLookback : lookback + lookback;
         }
     }
 

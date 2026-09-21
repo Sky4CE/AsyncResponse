@@ -99,6 +99,9 @@ internal abstract class RabbitMqMessageDispatcher : IAsyncDisposable
         return max;
     }
 
+    /// <summary>Longest <c>AR-DeadLetter-Reason</c> header value, in UTF-16 code units.</summary>
+    internal const int MaxDeadLetterReasonLength = 512;
+
     /// <summary>
     /// Builds the properties for a dead-letter copy of <paramref name="delivery"/>: the original
     /// headers plus the <c>AR-DeadLetter-*</c> forensic headers.
@@ -112,7 +115,9 @@ internal abstract class RabbitMqMessageDispatcher : IAsyncDisposable
                 headers[header.Key] = header.Value;
         }
 
-        headers["AR-DeadLetter-Reason"] = exception.Message is { Length: > 512 } longMessage ? longMessage[..512] : exception.Message;
+        // Surrogate-aware cut (see PortableText.TruncateWellFormed): a fixed-index slice through a
+        // non-BMP character left a lone high surrogate in a header the client encodes as UTF-8.
+        headers["AR-DeadLetter-Reason"] = PortableText.TruncateWellFormed(exception.Message, MaxDeadLetterReasonLength);
         headers["AR-DeadLetter-Source-Queue"] = _queue;
         headers["AR-DeadLetter-Role"] = _role.ToString();
 

@@ -179,7 +179,7 @@ internal sealed class RedisRecoveryStateStore : IRecoveryStateStore, IRecoverySt
         var seenKeys = new HashSet<string>(StringComparer.Ordinal);
         var batch = new List<string>(ScanReadBatchSize);
 
-        foreach (var server in ResolveScanTargets())
+        foreach (var server in await ResolveScanTargetsAsync().ConfigureAwait(false))
         {
             // KeysAsync, not Keys: the synchronous enumerator blocked its thread on every SCAN
             // page of what is, by definition, a walk of the whole keyspace.
@@ -267,7 +267,7 @@ internal sealed class RedisRecoveryStateStore : IRecoveryStateStore, IRecoverySt
     /// this changes nothing: that node is the primary.
     /// </para>
     /// </summary>
-    private List<IServer> ResolveScanTargets()
+    private async Task<List<IServer>> ResolveScanTargetsAsync()
     {
         var primaries = new List<IServer>();
         List<IServer>? unreachable = null;
@@ -295,14 +295,52 @@ internal sealed class RedisRecoveryStateStore : IRecoveryStateStore, IRecoverySt
         // the multiplexer knows serves the same dataset (a failed-over deployment lists the old
         // primary as disconnected until it rejoins as a replica), and one connected primary is
         // the whole keyspace.
-        if (unreachable is not null && primaries.Exists(static primary => primary.ServerType == ServerType.Cluster))
+        if (unreachable is not null && primaries.Find(static primary => primary.ServerType == ServerType.Cluster) is { } clusterPrimary)
         {
+            // IsReplica is only as good as the last handshake: a node that has NEVER connected
+            // since this process started (a replica that was down at startup) still reports the
+            // default — not a replica — so it landed here as an "unreachable primary" and failed
+            // every scan of a cluster whose slot owners were all reachable. Ask the cluster itself
+            // before failing: only a node that owns slots can make the scan partial.
+            unreachable = await ExcludeNodesThatOwnNoSlotsAsync(clusterPrimary, unreachable).ConfigureAwait(false);
+            if (unreachable.Count == 0)
+                return primaries;
+
             throw ScanUnavailable(
                 $"Recovery-state scan failed: Redis cluster primary {string.Join(", ", unreachable.Select(static server => server.EndPoint?.ToString() ?? "(unknown endpoint)"))} is not connected, " +
                 "so the registrations in its slots cannot be read. A partial scan is reported as failed rather than as a verdict over the reachable shards.");
         }
 
         return primaries;
+    }
+
+    /// <summary>
+    /// Drops from <paramref name="unreachable"/> every node the cluster's own node table
+    /// (<c>CLUSTER NODES</c>, asked of a connected primary) lists as a replica or as owning no
+    /// slots: such a node holds no registrations a connected primary does not, so its absence
+    /// cannot make the scan partial. Runs ONLY on the path that was about to fail the scan, so a
+    /// healthy cluster pays nothing for it. Conservative in every unknown: a node the table does
+    /// not list, a table that cannot be read or parsed, a slot-owning primary — all stay
+    /// unreachable, and the scan fails as before.
+    /// </summary>
+    private async Task<List<IServer>> ExcludeNodesThatOwnNoSlotsAsync(IServer clusterPrimary, List<IServer> unreachable)
+    {
+        string? nodeTable;
+        try
+        {
+            nodeTable = await clusterPrimary.ClusterNodesRawAsync().ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is RedisException or TimeoutException or InvalidOperationException)
+        {
+            _logger.LogDebug(ex, "Could not read CLUSTER NODES to classify unreachable Redis endpoints; treating them as slot owners.");
+            return unreachable;
+        }
+
+        if (string.IsNullOrWhiteSpace(nodeTable))
+            return unreachable;
+
+        var nodes = RedisClusterNodeTable.Parse(nodeTable);
+        return unreachable.FindAll(server => !RedisClusterNodeTable.OwnsNoSlots(nodes, server.EndPoint));
     }
 
     private static RedisConnectionException ScanUnavailable(string message)

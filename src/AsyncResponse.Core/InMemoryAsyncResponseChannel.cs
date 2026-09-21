@@ -1150,30 +1150,17 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
 
         private Task DispatchResponseCoreAsync(object? response, byte[]? wireBytes)
         {
+            T payload;
             try
             {
-                var payload = MaterializeAs(response, wireBytes);
-
-                var completion = _completionPredicate(payload);
-                if (!completion.IsCompletedSuccessfully)
-                    return AwaitCompletionPredicateAsync(completion, payload);
-
-                var finished = completion.Result;
-                if (!finished || !TryBeginTerminal())
-                    return Task.CompletedTask;
-
-                _tcs.TrySetResult(payload);
-                return CleanupOnceAsTask();
+                payload = MaterializeAs(response, wireBytes);
             }
             catch (Exception ex)
             {
-                if (!TryBeginTerminal())
-                    return Task.CompletedTask;
-
-                AsyncResponseDiagnostics.SetError(WaitActivity, ex);
-                _tcs.TrySetException(ex);
-                return CleanupOnceAsTask();
+                return FaultAsync(ex);
             }
+
+            return DispatchPayloadAsync(payload);
         }
 
         private Task DispatchRawJsonResponseCoreAsync(RawJsonResponse response)
@@ -1193,8 +1180,12 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
             }
         }
 
-        // Raw ingress has to materialize JSON before it can run the same completion semantics as
-        // the typed path. Keep this separate so typed publishers stay on the shorter inline path.
+        // The ONE copy of the completion semantics — predicate, terminal transition, result,
+        // cleanup — that both the typed and the raw-ingress deliveries run once each has
+        // materialized its payload. The typed path used to carry its own inline copy from when it
+        // handed the publisher's instance straight through; since wire parity it deserializes on
+        // every delivery like the raw path does, so the second copy bought nothing and had to be
+        // kept in lockstep by hand (its catch had already drifted into a re-spelling of FaultAsync).
         private Task DispatchPayloadAsync(T payload)
         {
             try
@@ -1267,12 +1258,7 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
             }
             catch (Exception ex)
             {
-                if (!TryBeginTerminal())
-                    return;
-
-                AsyncResponseDiagnostics.SetError(WaitActivity, ex);
-                _tcs.TrySetException(ex);
-                await CleanupOnceAsync().ConfigureAwait(false);
+                await FaultAsync(ex).ConfigureAwait(false);
             }
         }
 

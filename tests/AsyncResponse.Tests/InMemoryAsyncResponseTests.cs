@@ -437,6 +437,62 @@ public class InMemoryAsyncResponseTests
         Assert.Equal("done", (await waiter.ResponseTask.WaitAsync(TimeSpan.FromSeconds(2))).Message);
     }
 
+    // Review 2026-09-21 F11: the typed and the raw-ingress deliveries carried two hand-synchronized
+    // copies of the completion semantics; they now share one. Whatever the path and whether the
+    // predicate completes synchronously or not, the waiter sees the same four outcomes.
+    [Theory]
+    [InlineData(false, false)]
+    [InlineData(false, true)]
+    [InlineData(true, false)]
+    [InlineData(true, true)]
+    public async Task TypedAndRawDeliveries_ShareOneSetOfCompletionSemantics(bool raw, bool asyncPredicate)
+    {
+        var provider = CreateProvider();
+        var subscriber = provider.GetRequiredService<IAsyncResponseSubscriber>();
+        var probe = provider.GetRequiredService<IActiveSubscriberProbe>();
+        var suffix = $"{(raw ? "raw" : "typed")}-{(asyncPredicate ? "async" : "sync")}";
+
+        Task Publish(string correlationId, OperationStatus status, string message)
+            => raw
+                ? provider.GetRequiredService<IRawAsyncResponsePublisher>().SetRawResponseJson(
+                    JsonSerializer.Serialize(new OperationResult { Status = status, Message = message }), correlationId)
+                : provider.GetRequiredService<IAsyncResponsePublisher>().SetResponse(
+                    new OperationResult { Status = status, Message = message }, correlationId);
+
+        async ValueTask<bool> Judge(OperationResult payload)
+        {
+            if (asyncPredicate)
+                await Task.Yield();
+            return payload.Message == "poison"
+                ? throw new InvalidOperationException("predicate failed")
+                : payload.Status == OperationStatus.Completed;
+        }
+
+        // A non-terminal delivery leaves the waiter waiting; the terminal one completes it with
+        // ITS payload and tears the subscription down.
+        var completing = $"{CorrelationId}-parity-{suffix}";
+        await using (var waiter = await subscriber.CreateResponseWaiter<OperationResult>(completing, Judge, TimeSpan.FromSeconds(5)))
+        {
+            await Publish(completing, OperationStatus.Running, "progress");
+            await Task.Delay(50);
+            Assert.False(waiter.ResponseTask.IsCompleted);
+
+            await Publish(completing, OperationStatus.Completed, "done");
+            Assert.Equal("done", (await waiter.ResponseTask.WaitAsync(TimeSpan.FromSeconds(2))).Message);
+            Assert.Equal(0, await probe.CountActiveSubscribersAsync(completing));
+        }
+
+        // A throwing predicate faults the waiter with the predicate's own exception.
+        var faulting = $"{CorrelationId}-parity-fault-{suffix}";
+        await using (var waiter = await subscriber.CreateResponseWaiter<OperationResult>(faulting, Judge, TimeSpan.FromSeconds(5)))
+        {
+            await Publish(faulting, OperationStatus.Completed, "poison");
+            var fault = await Assert.ThrowsAsync<InvalidOperationException>(() => waiter.ResponseTask.WaitAsync(TimeSpan.FromSeconds(2)));
+            Assert.Equal("predicate failed", fault.Message);
+            Assert.Equal(0, await probe.CountActiveSubscribersAsync(faulting));
+        }
+    }
+
     [Fact]
     public async Task RawJsonResponse_WhenCompletionPredicateThrows_FaultsWaiter()
     {

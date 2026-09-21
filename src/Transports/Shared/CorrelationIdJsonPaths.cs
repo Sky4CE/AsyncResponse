@@ -134,7 +134,45 @@ internal static class CorrelationIdJsonPaths
     // reproduce that rather than silently resolving to one of the duplicates.
     private static bool TryGetProperty(JsonElement obj, string name, out JsonElement value)
     {
-        var seen = new HashSet<string>(StringComparer.Ordinal);
+        var seen = RentSeenNames();
+        try
+        {
+            return TryGetProperty(obj, name, seen, out value);
+        }
+        finally
+        {
+            ReturnSeenNames(seen);
+        }
+    }
+
+    // The duplicate-key scan needs a set of the object's property names, and used to allocate a
+    // fresh one — set, buckets, and every growth step on the way to the object's size — for every
+    // segment of every configured path of every delivered message. The walk is synchronous and
+    // never re-enters itself, so one set per thread serves them all; a set grown by an unusually
+    // wide object is dropped rather than pinned on the thread for good.
+    [ThreadStatic]
+    private static HashSet<string>? t_seenNames;
+
+    private const int MaxRetainedSeenNames = 256;
+
+    private static HashSet<string> RentSeenNames()
+    {
+        var seen = t_seenNames ?? new HashSet<string>(StringComparer.Ordinal);
+        t_seenNames = null;
+        return seen;
+    }
+
+    private static void ReturnSeenNames(HashSet<string> seen)
+    {
+        if (seen.Count > MaxRetainedSeenNames)
+            return;
+
+        seen.Clear();
+        t_seenNames = seen;
+    }
+
+    private static bool TryGetProperty(JsonElement obj, string name, HashSet<string> seen, out JsonElement value)
+    {
         var exactFound = false;
         JsonElement exactValue = default;
         var caseInsensitiveFound = false;
@@ -142,7 +180,10 @@ internal static class CorrelationIdJsonPaths
 
         foreach (var property in obj.EnumerateObject())
         {
-            if (!seen.Add(property.Name))
+            // Read ONCE: JsonProperty.Name transcodes a new string on every call, and the three
+            // reads below used to cost three strings per property of every object walked.
+            var propertyName = property.Name;
+            if (!seen.Add(propertyName))
             {
                 // Unresolvable, NOT a failure: extraction cannot choose between the duplicates, so
                 // the id is simply not in this body. Throwing here made an unroutable inbound
@@ -157,12 +198,12 @@ internal static class CorrelationIdJsonPaths
                 return false;
             }
 
-            if (!exactFound && string.Equals(property.Name, name, StringComparison.Ordinal))
+            if (!exactFound && string.Equals(propertyName, name, StringComparison.Ordinal))
             {
                 exactFound = true;
                 exactValue = property.Value;
             }
-            else if (!caseInsensitiveFound && string.Equals(property.Name, name, StringComparison.OrdinalIgnoreCase))
+            else if (!caseInsensitiveFound && string.Equals(propertyName, name, StringComparison.OrdinalIgnoreCase))
             {
                 caseInsensitiveFound = true;
                 caseInsensitiveValue = property.Value;

@@ -65,6 +65,22 @@ public class DurableFlowOptions
     public TimeSpan ExecutionLeaseRenewInterval { get; set; } = TimeSpan.FromSeconds(20);
 
     /// <summary>
+    /// The longest one wake-up stays parked behind an execution lease held by another worker
+    /// because of the expiry the STORE reports for it. A wake-up that meets a held lease waits the
+    /// holder's <em>persisted</em> expiry out (so a deployment that shortened
+    /// <see cref="ExecutionLeaseDuration"/> still takes over a crashed owner's longer lease), and
+    /// that expiry is data the waiting host does not control: a store clock hours ahead of this
+    /// host, or an expiry column that reads back shifted, would otherwise park the delivery — and
+    /// its worker slot — for as long as the bad value says, polling the store the whole time.
+    /// Past this budget the wake-up fails with <c>DurableFlowLeaseContendedException</c> and the
+    /// worker transport redelivers it, exactly as when the lease outlives its persisted expiry.
+    /// This host's own lease window (<see cref="ExecutionLeaseDuration"/> +
+    /// <see cref="ExecutionLeaseRenewInterval"/>) is always waited, whatever this is set to. Raise
+    /// it when a deployment legitimately issues leases longer than the default. Default: 1 hour.
+    /// </summary>
+    public TimeSpan MaxLeaseContentionWait { get; set; } = TimeSpan.FromHours(1);
+
+    /// <summary>
     /// Minimum interval between persistence writes made only by <c>ReportProgressAsync</c>.
     /// Reports inside the interval update the in-memory flow state and are coalesced into the next
     /// checkpoint or flow outcome. Set to zero to persist every report. Default: 1 second.

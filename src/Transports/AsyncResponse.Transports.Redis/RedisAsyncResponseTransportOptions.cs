@@ -47,8 +47,12 @@ public sealed class RedisAsyncResponseTransportOptions
 
     /// <summary>
     /// Consumer name used inside Redis consumer groups. When null, the package generates a stable
-    /// process-local name containing machine name, process id, and a short random suffix. Configure
-    /// this only when your orchestrator guarantees uniqueness per running process.
+    /// process-local name, <c>{machine}-{pid}-{guid}</c>, kept within 64 characters by shortening
+    /// the MACHINE NAME only — the process id and the GUID are what make it unique, so a long host
+    /// name (a Kubernetes pod name, a host at HOST_NAME_MAX) never costs two processes on one host
+    /// their separate identities. The subscriber role is appended to either form. Consumers that
+    /// share a name share one pending-entry list, so configure this only when your orchestrator
+    /// guarantees uniqueness per running process.
     /// </summary>
     public string? ConsumerName { get; set; }
 

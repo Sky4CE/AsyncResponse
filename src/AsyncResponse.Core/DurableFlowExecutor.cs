@@ -267,7 +267,18 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
         // observation of the lease in the way moves the deadline to a full window past ITS expiry.
         // The 2s poll delay is capped by the renew interval so short test-sized leases still get polled.
         var window = _options.ExecutionLeaseDuration + _options.ExecutionLeaseRenewInterval;
-        var deadline = AddSaturating(_timeProvider.GetUtcNow().UtcDateTime, window);
+        var startedWaitingUtc = _timeProvider.GetUtcNow().UtcDateTime;
+        var deadline = AddSaturating(startedWaitingUtc, window);
+
+        // The store-driven extension below follows DATA this host does not control. A store clock
+        // hours ahead of this one, or an expiry column read back shifted, used to move the deadline
+        // as far out as the bad value said (saturating at DateTime.MaxValue, i.e. never): the
+        // delivery then polled the store every pollDelay for good, pinning its worker slot, and
+        // the contention exception whose message says "check for clock skew" was unreachable in
+        // exactly the case it names. MaxLeaseContentionWait bounds the extension — never this
+        // host's own window above, which is always waited.
+        var extensionCeiling = AddSaturating(startedWaitingUtc, _options.MaxLeaseContentionWait);
+        var extensionCapped = false;
         var pollDelay = _options.ExecutionLeaseRenewInterval < TimeSpan.FromSeconds(2)
             ? _options.ExecutionLeaseRenewInterval
             : TimeSpan.FromSeconds(2);
@@ -323,6 +334,12 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
                         // deployment's lease duration issued it; the extra window absorbs clock
                         // skew between this host and the store before the wait is declared stuck.
                         var persistedDeadline = AddSaturating(persistedExpiry, window);
+                        if (persistedDeadline > extensionCeiling)
+                        {
+                            persistedDeadline = extensionCeiling;
+                            extensionCapped = true;
+                        }
+
                         if (persistedDeadline > deadline)
                             deadline = persistedDeadline;
                     }
@@ -370,7 +387,9 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
                 ? $"the flow state store does not report leases ({nameof(IFlowStateStore)}.{nameof(IFlowStateStore.ObserveLeaseAsync)} returned null), and the lease stayed held through this host's whole lease window of {window}"
                 : baseline is null
                     ? $"the lease stayed unacquirable through this host's whole lease window of {window} although the store reports no holder"
-                    : $"the lease held by '{baseline.LeaseId}' (persisted expiry {baseline.ExpiresAtUtc:O}) neither changed nor became acquirable within a full lease window past that expiry; check for clock skew between this host and the store");
+                    : extensionCapped
+                        ? $"the lease held by '{baseline.LeaseId}' (persisted expiry {baseline.ExpiresAtUtc:O}) neither changed nor became acquirable within {nameof(DurableFlowOptions)}.{nameof(DurableFlowOptions.MaxLeaseContentionWait)} ({_options.MaxLeaseContentionWait}), and its persisted expiry lies further out than that budget lets one delivery wait; raise the budget if a deployment legitimately issues leases that long, otherwise check for clock skew between this host and the store"
+                        : $"the lease held by '{baseline.LeaseId}' (persisted expiry {baseline.ExpiresAtUtc:O}) neither changed nor became acquirable within a full lease window past that expiry; check for clock skew between this host and the store");
     }
 
     private static DateTime AddSaturating(DateTime instant, TimeSpan span)

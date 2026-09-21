@@ -199,8 +199,10 @@ public static class AsyncResponseCoreServiceCollectionExtensions
         var options = new ScheduledFlowOptions();
         configure?.Invoke(options);
         ArgumentNullException.ThrowIfNull(options.TimeZone, $"{nameof(ScheduledFlowOptions)}.{nameof(ScheduledFlowOptions.TimeZone)}");
-        // The re-drive interval arms a Task.Delay, so it gets the timer ceiling; the startup window
-        // is only ever subtracted from "now" (zero disables the probe).
+        // The re-drive interval arms a Task.Delay, so it gets the timer ceiling. The startup window
+        // needs none: it is subtracted from "now" (clamped at the epoch) and bounds a look-back whose
+        // cost follows the occurrences the probe keeps, not the window's length — see
+        // ScheduledFlowService.RecentOccurrences. Zero disables the probe.
         AsyncResponseChannelOptions.EnsureTimerBacked(options.RedriveInterval, nameof(ScheduledFlowOptions), nameof(ScheduledFlowOptions.RedriveInterval));
         if (options.StartupRedriveWindow < TimeSpan.Zero)
             throw new ArgumentException($"{nameof(ScheduledFlowOptions)}.{nameof(ScheduledFlowOptions.StartupRedriveWindow)} cannot be negative (zero disables the startup probe).", nameof(configure));

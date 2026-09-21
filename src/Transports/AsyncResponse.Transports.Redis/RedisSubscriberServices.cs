@@ -447,13 +447,26 @@ internal abstract class RedisSubscriberService : BackgroundService
     }
 
     private static string CreateGeneratedConsumerName()
-    {
-        var name = $"{Environment.MachineName}-{Environment.ProcessId}-{Guid.NewGuid():N}";
-        return TrimConsumerName(name);
-    }
+        => ComposeGeneratedConsumerName(Environment.MachineName, Environment.ProcessId, Guid.NewGuid());
 
-    internal static string TrimConsumerName(string name)
-        => name.Length <= 64 ? name : name[..64];
+    /// <summary>Length budget of the generated consumer name, before the role suffix.</summary>
+    internal const int MaxGeneratedConsumerNameLength = 64;
+
+    /// <summary>
+    /// <c>{machine}-{pid}-{guid}</c> within <see cref="MaxGeneratedConsumerNameLength"/>, with the
+    /// MACHINE NAME giving up the characters. The process id and the GUID are the only parts that
+    /// make the name unique, and they sit at the end: the old head-keeping cut
+    /// (<c>name[..64]</c>) removed them first, so a 63-character host name — a Kubernetes pod
+    /// name, or any host at Linux's HOST_NAME_MAX — left every process on that host with the SAME
+    /// consumer identity. Consumers that share a name share one pending-entry list inside the
+    /// group: each could claim and acknowledge entries the other was still handling. The suffix is
+    /// at most 44 characters, so the machine name always keeps at least 20.
+    /// </summary>
+    internal static string ComposeGeneratedConsumerName(string machineName, int processId, Guid instance)
+    {
+        var suffix = $"-{processId.ToString(System.Globalization.CultureInfo.InvariantCulture)}-{instance:N}";
+        return PortableText.TruncateWellFormed(machineName, MaxGeneratedConsumerNameLength - suffix.Length) + suffix;
+    }
 }
 
 internal sealed class RedisWorkerSubscriber : RedisSubscriberService

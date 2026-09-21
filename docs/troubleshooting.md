@@ -197,11 +197,15 @@ owns the full story — this page is the map, not the territory.
   acknowledges a wake-up in that state — it may be the run's only one. The reason in the message
   says which case it is: *"the flow state store does not report leases"* — an application-owned
   `IFlowStateStore` that does not implement `ObserveLeaseAsync`, so a duplicate of a long-running
-  execution cannot be recognized as one; or *"neither changed nor became acquirable … past that
+  execution cannot be recognized as one; *"neither changed nor became acquirable … past that
   expiry"* — the store still refuses the lease a full lease window after the expiry it reports,
-  which points at clock skew between this host and the store (or a store bug).
+  which points at clock skew between this host and the store (or a store bug); or *"its persisted
+  expiry lies further out than that budget lets one delivery wait"* — the expiry the store reports
+  is more than `MaxLeaseContentionWait` (default 1 hour) away, which is either a deployment that
+  really issues leases that long, or a store clock (or expiry column) far ahead of this host.
 - **Fix:** implement `ObserveLeaseAsync` in the custom store (and forward it from any decorator
-  around a built-in one); fix time synchronization. The redelivered job completes the run once
+  around a built-in one); fix time synchronization; raise `MaxLeaseContentionWait` when leases
+  longer than it are intended. The redelivered job completes the run once
   the lease is free — a dead-lettered one needs a replay or `ResumeAsync(flowId)`. See
   [lease contention](durable-flow-state-stores.md#lease-contention-and-deployments-that-change-the-lease-duration).
 

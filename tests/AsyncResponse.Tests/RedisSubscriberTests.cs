@@ -365,10 +365,51 @@ public class RedisSubscriberTests
     }
 
     [Fact]
-    public void TrimConsumerName_TruncatesOnlyWhenRedisConsumerNameWouldBeTooLong()
+    public void GeneratedConsumerName_TruncatesOnlyWhenRedisConsumerNameWouldBeTooLong()
     {
-        Assert.Equal("short-consumer", RedisSubscriberService.TrimConsumerName("short-consumer"));
-        Assert.Equal(64, RedisSubscriberService.TrimConsumerName(new string('x', 65)).Length);
+        var instance = Guid.NewGuid();
+        Assert.Equal($"short-host-42-{instance:N}", RedisSubscriberService.ComposeGeneratedConsumerName("short-host", 42, instance));
+        Assert.Equal(
+            RedisSubscriberService.MaxGeneratedConsumerNameLength,
+            RedisSubscriberService.ComposeGeneratedConsumerName(new string('x', 65), 42, instance).Length);
+    }
+
+    // Review 2026-09-21 F2: the cut kept the HEAD of "{machine}-{pid}-{guid}", so a host name at
+    // Linux's HOST_NAME_MAX (or a 63-character Kubernetes pod name) lost the process id AND the
+    // GUID — every process on that host got the same consumer identity, and with it one shared
+    // pending-entry list inside the group.
+    [Theory]
+    [InlineData(56)]
+    [InlineData(63)]
+    [InlineData(64)]
+    [InlineData(200)]
+    public void GeneratedConsumerName_KeepsTheProcessIdAndGuid_HoweverLongTheMachineNameIs(int machineNameLength)
+    {
+        var machine = new string('h', machineNameLength);
+        var first = Guid.NewGuid();
+        var second = Guid.NewGuid();
+
+        var one = RedisSubscriberService.ComposeGeneratedConsumerName(machine, 1, first);
+        var other = RedisSubscriberService.ComposeGeneratedConsumerName(machine, 1, second);
+
+        // Two processes on one host (same machine name, and — in sibling containers with their
+        // own PID namespaces — even the same process id) must never share a consumer name.
+        Assert.NotEqual(one, other);
+        Assert.EndsWith($"-1-{first:N}", one, StringComparison.Ordinal);
+        Assert.EndsWith($"-1-{second:N}", other, StringComparison.Ordinal);
+        Assert.True(one.Length <= RedisSubscriberService.MaxGeneratedConsumerNameLength, $"{one.Length} characters");
+    }
+
+    [Fact]
+    public void GeneratedConsumerName_NeverCutsTheMachineNameInsideASurrogatePair()
+    {
+        // 44-character suffix (10-digit pid) leaves the machine name a 20-unit budget; the pair
+        // straddles units 19/20, so a fixed-index cut would keep the orphaned high surrogate.
+        var machine = new string('h', 19) + "\U0001F600" + new string('h', 40);
+        var name = RedisSubscriberService.ComposeGeneratedConsumerName(machine, int.MaxValue, Guid.NewGuid());
+
+        Assert.Equal(-1, PortableText.IndexOfIllFormedUtf16(name));
+        Assert.StartsWith(new string('h', 19) + "-", name, StringComparison.Ordinal);
     }
 
     [Fact]
