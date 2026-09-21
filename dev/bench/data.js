@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1789977508099,
+  "lastUpdate": 1789977535073,
   "repoUrl": "https://github.com/Sky4CE/AsyncResponse",
   "entries": {
     "AsyncResponse Microbenchmarks": [
@@ -110472,6 +110472,140 @@ window.BENCHMARK_DATA = {
           {
             "name": "durable-flow-storm throughput",
             "value": 1430.1684772790277,
+            "unit": "flows/s"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "tyunisov@gmail.com",
+            "name": "Sky4CE",
+            "username": "Sky4CE"
+          },
+          "committer": {
+            "email": "tyunisov@gmail.com",
+            "name": "Sky4CE",
+            "username": "Sky4CE"
+          },
+          "distinct": true,
+          "id": "a66faed6fc304ef522783c803a2194db5a1174b2",
+          "message": "fix(tests): launch the crash worker from its own build output\n\nThe abrupt-crash suite started the copy of the worker that the ProjectReference places next to the integration test assembly. That directory's contents are decided by the TEST project's conflict resolution: it references ASP.NET Core, so package assemblies the shared framework ships at an equal or higher version are dropped from its output, while the worker's runtimeconfig.json lists Microsoft.NETCore.App only. On CI (SDK 10.0.401, framework 10.0.12 = Microsoft.Extensions.Hosting 10.0.12) every scenario died at startup with FileNotFoundException for Microsoft.Extensions.Hosting.Abstractions; on an older local SDK the package won the conflict and the suite passed.\n\nThe integration test csproj now stamps the worker's exact TargetPath into its assembly metadata (EmbedCrashWorkerPath, via GetTargetPath) and the suite launches the worker from there. The scenarios' owner lease goes from 10 s to 20 s so a cold subprocess start on a loaded runner cannot miss the refused-before-expiry premise. docs/testing.md and CHANGELOG record the gotcha.",
+          "timestamp": "2026-09-21T09:44:59+02:00",
+          "tree_id": "537a6327ca837779606dbb12d65c260cf7bab086",
+          "url": "https://github.com/Sky4CE/AsyncResponse/commit/a66faed6fc304ef522783c803a2194db5a1174b2"
+        },
+        "date": 1789977534300,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "waiter-storm throughput",
+            "value": 89488.56568800779,
+            "unit": "ops/s"
+          },
+          {
+            "name": "progress-storm throughput",
+            "value": 48166.86543526469,
+            "unit": "ops/s"
+          },
+          {
+            "name": "worker-storm throughput",
+            "value": 58855.228145229274,
+            "unit": "jobs/s"
+          },
+          {
+            "name": "google-pubsub-ack-after-enqueue-dispatch-storm throughput",
+            "value": 201299.59015403446,
+            "unit": "ops/s"
+          },
+          {
+            "name": "rabbitmq-ack-after-enqueue-dispatch-storm throughput",
+            "value": 258949.28737156113,
+            "unit": "ops/s"
+          },
+          {
+            "name": "redis-ack-after-enqueue-dispatch-storm throughput",
+            "value": 253228.66548493292,
+            "unit": "ops/s"
+          },
+          {
+            "name": "nats-ack-after-receive-dispatch-storm throughput",
+            "value": 251476.16508907286,
+            "unit": "ops/s"
+          },
+          {
+            "name": "postgresql-ack-after-receive-dispatch-storm throughput",
+            "value": 186384.95202451333,
+            "unit": "ops/s"
+          },
+          {
+            "name": "sqlserver-ack-after-enqueue-dispatch-storm throughput",
+            "value": 217882.01253257337,
+            "unit": "ops/s"
+          },
+          {
+            "name": "mongodb-ack-after-enqueue-dispatch-storm throughput",
+            "value": 173227.36438029644,
+            "unit": "ops/s"
+          },
+          {
+            "name": "azure-servicebus-ack-after-receive-dispatch-storm throughput",
+            "value": 251912.01217238844,
+            "unit": "ops/s"
+          },
+          {
+            "name": "sqs-ack-after-enqueue-dispatch-storm throughput",
+            "value": 388144.5139654396,
+            "unit": "ops/s"
+          },
+          {
+            "name": "kafka-ack-after-enqueue-dispatch-storm throughput",
+            "value": 329432.84840818046,
+            "unit": "ops/s"
+          },
+          {
+            "name": "race-burst throughput",
+            "value": 116477.40641156872,
+            "unit": "ops/s"
+          },
+          {
+            "name": "raw-ingress-storm throughput",
+            "value": 78147.71167870662,
+            "unit": "ops/s"
+          },
+          {
+            "name": "shared-response-fanout throughput",
+            "value": 58182.61708204401,
+            "unit": "ops/s"
+          },
+          {
+            "name": "exception-fanout throughput",
+            "value": 29049.932418237222,
+            "unit": "ops/s"
+          },
+          {
+            "name": "timeout-storm throughput",
+            "value": 4792.267197649872,
+            "unit": "ops/s"
+          },
+          {
+            "name": "dispose-cleanup-storm throughput",
+            "value": 170128.20861801456,
+            "unit": "ops/s"
+          },
+          {
+            "name": "context-isolation-storm throughput",
+            "value": 74146.57294539847,
+            "unit": "ops/s"
+          },
+          {
+            "name": "watchdog-scan-storm throughput",
+            "value": 1721111.1493580255,
+            "unit": "entries/s"
+          },
+          {
+            "name": "durable-flow-storm throughput",
+            "value": 1620.081755805725,
             "unit": "flows/s"
           }
         ]
