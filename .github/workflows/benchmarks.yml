@@ -92,7 +92,7 @@ jobs:
           echo "Total benchmarks: $(jq '.Benchmarks | length' "${{ github.workspace }}/benchmark-report.json")"
 
       - name: Publish BenchmarkDotNet results
-        uses: benchmark-action/github-action-benchmark@52576c92bccf6ac60c8223ec7eb2565637cae9ba # v1
+        uses: benchmark-action/github-action-benchmark@4322e5726e6334590d251fc4f92bec0efafc45dc # v1.22.2
         with:
           name: AsyncResponse Microbenchmarks
           tool: benchmarkdotnet
@@ -143,7 +143,7 @@ jobs:
             --json "${{ github.workspace }}/stress"
 
       - name: Publish stress throughput (bigger is better)
-        uses: benchmark-action/github-action-benchmark@52576c92bccf6ac60c8223ec7eb2565637cae9ba # v1
+        uses: benchmark-action/github-action-benchmark@4322e5726e6334590d251fc4f92bec0efafc45dc # v1.22.2
         with:
           name: AsyncResponse Stress - throughput
           tool: customBiggerIsBetter
@@ -159,7 +159,7 @@ jobs:
           summary-always: true
 
       - name: Publish stress latency & allocations (smaller is better)
-        uses: benchmark-action/github-action-benchmark@52576c92bccf6ac60c8223ec7eb2565637cae9ba # v1
+        uses: benchmark-action/github-action-benchmark@4322e5726e6334590d251fc4f92bec0efafc45dc # v1.22.2
         with:
           name: AsyncResponse Stress - latency & allocations
           tool: customSmallerIsBetter

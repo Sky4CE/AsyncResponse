@@ -147,7 +147,7 @@ jobs:
           dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- "${args[@]}"
 
       - name: Publish load-test throughput (bigger is better)
-        uses: benchmark-action/github-action-benchmark@52576c92bccf6ac60c8223ec7eb2565637cae9ba # v1
+        uses: benchmark-action/github-action-benchmark@4322e5726e6334590d251fc4f92bec0efafc45dc # v1.22.2
         with:
           name: AsyncResponse Load test - throughput
           tool: customBiggerIsBetter
@@ -171,7 +171,7 @@ jobs:
           summary-always: true
 
       - name: Publish load-test latency (smaller is better)
-        uses: benchmark-action/github-action-benchmark@52576c92bccf6ac60c8223ec7eb2565637cae9ba # v1
+        uses: benchmark-action/github-action-benchmark@4322e5726e6334590d251fc4f92bec0efafc45dc # v1.22.2
         with:
           name: AsyncResponse Load test - latency
           tool: customSmallerIsBetter
