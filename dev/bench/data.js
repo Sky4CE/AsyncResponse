@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1790069667793,
+  "lastUpdate": 1790069698371,
   "repoUrl": "https://github.com/Sky4CE/AsyncResponse",
   "entries": {
     "AsyncResponse Microbenchmarks": [
@@ -113360,6 +113360,140 @@ window.BENCHMARK_DATA = {
           {
             "name": "durable-flow-storm throughput",
             "value": 1407.5758660870606,
+            "unit": "flows/s"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "tyunisov@gmail.com",
+            "name": "Sky4CE",
+            "username": "Sky4CE"
+          },
+          "committer": {
+            "email": "tyunisov@gmail.com",
+            "name": "Sky4CE",
+            "username": "Sky4CE"
+          },
+          "distinct": true,
+          "id": "eb3a317acf6e83d50ad1b004527db682f3c20737",
+          "message": "The round-42 claim-ordering fix renamed the transport's dequeue index to\n{message_table}_ready_idx over (queue, available_at, created_at), but\nPostgreSqlTransportOptionsValidator still reserved the old _claim_idx name in its\nname plan — so the cross-component collision guard protected a name nothing creates\nany more, and a MessageTable whose derived _ready_idx collided with another\ncomponent's relation would no longer fail at startup. The validator now reserves the\nname the store actually creates.\n\nThe two PostgreSqlDirectIntegrationTests that pin this (SharedSchema_CrossComponent\nNameCollisions and PreexistingObjectsWithWrongDefinitions) referenced the old index\nname and its old column list, which is what failed CI in both the data and AOT\nintegration jobs; they now use jobs_ready_idx and the new expected columns. Two unit\ntests asserted the validator's old role wording and passed only because of the same\ndrift. docs/postgresql.md gains the manual-schema migration note the store's comment\nalready pointed at: create the new index CONCURRENTLY, drop the old one when no host\nruns the previous build; an auto-created schema adds the new index and leaves the old\none alone, because DROP INDEX takes an ACCESS EXCLUSIVE lock on a live queue.\n\nVerified by reproducing both test bodies against a real PostgreSQL with the library's\nown store and channel types: the collision fails in both orders and the reshaped index\nfails verification naming (queue, available_at, created_at). 3279 unit tests green on\nnet10.0 and net8.0; Release build 0 warnings with --no-incremental.",
+          "timestamp": "2026-09-22T11:20:05+02:00",
+          "tree_id": "288be4bdbf65825ac496f5a325b56607215090dc",
+          "url": "https://github.com/Sky4CE/AsyncResponse/commit/eb3a317acf6e83d50ad1b004527db682f3c20737"
+        },
+        "date": 1790069697679,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "waiter-storm throughput",
+            "value": 58713.327948929735,
+            "unit": "ops/s"
+          },
+          {
+            "name": "progress-storm throughput",
+            "value": 31442.783566743597,
+            "unit": "ops/s"
+          },
+          {
+            "name": "worker-storm throughput",
+            "value": 26139.93375722547,
+            "unit": "jobs/s"
+          },
+          {
+            "name": "google-pubsub-ack-after-enqueue-dispatch-storm throughput",
+            "value": 184247.5697745547,
+            "unit": "ops/s"
+          },
+          {
+            "name": "rabbitmq-ack-after-enqueue-dispatch-storm throughput",
+            "value": 267926.99525233364,
+            "unit": "ops/s"
+          },
+          {
+            "name": "redis-ack-after-enqueue-dispatch-storm throughput",
+            "value": 232324.73422050406,
+            "unit": "ops/s"
+          },
+          {
+            "name": "nats-ack-after-receive-dispatch-storm throughput",
+            "value": 233139.3613846613,
+            "unit": "ops/s"
+          },
+          {
+            "name": "postgresql-ack-after-receive-dispatch-storm throughput",
+            "value": 197100.2609607455,
+            "unit": "ops/s"
+          },
+          {
+            "name": "sqlserver-ack-after-enqueue-dispatch-storm throughput",
+            "value": 201336.87686236613,
+            "unit": "ops/s"
+          },
+          {
+            "name": "mongodb-ack-after-enqueue-dispatch-storm throughput",
+            "value": 194646.44419875738,
+            "unit": "ops/s"
+          },
+          {
+            "name": "azure-servicebus-ack-after-receive-dispatch-storm throughput",
+            "value": 210031.08460052087,
+            "unit": "ops/s"
+          },
+          {
+            "name": "sqs-ack-after-enqueue-dispatch-storm throughput",
+            "value": 270112.582924563,
+            "unit": "ops/s"
+          },
+          {
+            "name": "kafka-ack-after-enqueue-dispatch-storm throughput",
+            "value": 224664.57578834798,
+            "unit": "ops/s"
+          },
+          {
+            "name": "race-burst throughput",
+            "value": 97050.29223783998,
+            "unit": "ops/s"
+          },
+          {
+            "name": "raw-ingress-storm throughput",
+            "value": 75956.51276965701,
+            "unit": "ops/s"
+          },
+          {
+            "name": "shared-response-fanout throughput",
+            "value": 36647.00432727827,
+            "unit": "ops/s"
+          },
+          {
+            "name": "exception-fanout throughput",
+            "value": 19044.223734587507,
+            "unit": "ops/s"
+          },
+          {
+            "name": "timeout-storm throughput",
+            "value": 4777.905055859683,
+            "unit": "ops/s"
+          },
+          {
+            "name": "dispose-cleanup-storm throughput",
+            "value": 234330.33078069493,
+            "unit": "ops/s"
+          },
+          {
+            "name": "context-isolation-storm throughput",
+            "value": 71794.72452364201,
+            "unit": "ops/s"
+          },
+          {
+            "name": "watchdog-scan-storm throughput",
+            "value": 1554968.1231534753,
+            "unit": "entries/s"
+          },
+          {
+            "name": "durable-flow-storm throughput",
+            "value": 1461.815450827978,
             "unit": "flows/s"
           }
         ]
