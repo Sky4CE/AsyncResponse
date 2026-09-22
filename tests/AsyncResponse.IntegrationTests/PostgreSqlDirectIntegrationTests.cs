@@ -71,15 +71,15 @@ public sealed class PostgreSqlDirectIntegrationTests(DataBatchFixture fixture) :
     public async Task SharedSchema_CrossComponentNameCollisions_FailActionablyInsteadOfSilentlySkippingDdl()
     {
         // Per-component ValidateNamePlan cannot see the OTHER packages sharing a schema: the
-        // channel's recovery table below occupies the transport's derived claim-index name.
+        // channel's recovery table below occupies the transport's derived dequeue-index name.
         // Tables, indexes, and sequences share one relation namespace, and CREATE ... IF NOT
         // EXISTS matches ANY relation — previously the loser silently skipped its DDL (a missing
-        // claim index, or a channel "table" that is actually someone else's index). The post-DDL
+        // dequeue index, or a channel "table" that is actually someone else's index). The post-DDL
         // catalog verification must fail whichever component starts second, in both orders.
         await WithDataSourceAsync("cross_collide_a", async (schema, dataSource) =>
         {
             var channelOptions = ChannelOptions(schema);
-            channelOptions.RecoveryStateTable = "jobs_claim_idx";
+            channelOptions.RecoveryStateTable = "jobs_ready_idx";
             var channel = new PostgreSqlChannelSql(dataSource, Options.Create(channelOptions));
             await channel.EnsureCreatedAsync();
 
@@ -87,7 +87,7 @@ public sealed class PostgreSqlDirectIntegrationTests(DataBatchFixture fixture) :
             transportOptions.MessageTable = "jobs";
             var transport = new PostgreSqlTransportStore(dataSource, Options.Create(transportOptions));
             var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => transport.EnsureCreatedAsync());
-            Assert.Contains("jobs_claim_idx", ex.Message, StringComparison.Ordinal);
+            Assert.Contains("jobs_ready_idx", ex.Message, StringComparison.Ordinal);
             Assert.Contains("occupied by a table", ex.Message, StringComparison.Ordinal);
         });
 
@@ -99,7 +99,7 @@ public sealed class PostgreSqlDirectIntegrationTests(DataBatchFixture fixture) :
             await transport.EnsureCreatedAsync();
 
             var channelOptions = ChannelOptions(schema);
-            channelOptions.RecoveryStateTable = "jobs_claim_idx";
+            channelOptions.RecoveryStateTable = "jobs_ready_idx";
             var channel = new PostgreSqlChannelSql(dataSource, Options.Create(channelOptions));
             // In this direction the collision breaks the DDL batch itself (CREATE INDEX ... ON a
             // relation that is really the transport's index → wrong object type), which the store
@@ -115,7 +115,7 @@ public sealed class PostgreSqlDirectIntegrationTests(DataBatchFixture fixture) :
     {
         // CREATE INDEX IF NOT EXISTS accepts ANY existing index with the name and guarantees
         // nothing about its shape: a same-name index over the WRONG columns silently starved the
-        // claim query of its compound index. The verifier must compare definitions, not names.
+        // claim query of its dequeue index. The verifier must compare definitions, not names.
         await WithDataSourceAsync("wrong_index_def", async (schema, dataSource) =>
         {
             var transportOptions = TransportOptions(schema);
@@ -128,8 +128,8 @@ public sealed class PostgreSqlDirectIntegrationTests(DataBatchFixture fixture) :
             {
                 reshape.CommandText =
                     $"""
-                    DROP INDEX "{schema}"."jobs_claim_idx";
-                    CREATE INDEX "jobs_claim_idx" ON "{schema}"."jobs" (created_at);
+                    DROP INDEX "{schema}"."jobs_ready_idx";
+                    CREATE INDEX "jobs_ready_idx" ON "{schema}"."jobs" (created_at);
                     """;
                 await reshape.ExecuteNonQueryAsync();
             }
@@ -137,7 +137,7 @@ public sealed class PostgreSqlDirectIntegrationTests(DataBatchFixture fixture) :
             var second = new PostgreSqlTransportStore(dataSource, Options.Create(transportOptions));
             var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => second.EnsureCreatedAsync());
             Assert.Contains("does not match the expected definition", ex.Message, StringComparison.Ordinal);
-            Assert.Contains("queue, available_at, locked_until, created_at", ex.Message, StringComparison.Ordinal);
+            Assert.Contains("queue, available_at, created_at", ex.Message, StringComparison.Ordinal);
         });
 
         // Same family for sequences: an existing integer sequence would overflow at 2^31 draws;

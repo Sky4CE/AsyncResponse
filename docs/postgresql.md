@@ -109,6 +109,28 @@ CREATE SEQUENCE IF NOT EXISTS public.asyncresponse_channel_messages_ack_seq AS b
 The column is nullable and the migration is safe to run while old-version hosts are still up:
 rows they ack carry no sequence and fall back to the previous watermark rule.
 
+The transport's dequeue index also changed shape. It is now
+`{message_table}_ready_idx` over `(queue, available_at, created_at)` — the claim orders by exactly
+that tail, so it is one ordered index descent that stops at the first unleased row. The previous
+`{message_table}_claim_idx` over `(queue, available_at, locked_until, created_at)` could not serve
+its own ordering behind the `available_at` range predicate, so every claim either walked the
+`created_at` index through the older rows of the other logical queues (retained dead letters,
+delayed jobs) or sorted the whole ready set — draining a burst of K rows cost O(K²).
+
+With `AutoCreateSchema = false` the new index is **verified when present and only warned about when
+absent**: it is claim performance, not correctness, so a schema still carrying the old index keeps
+starting. Create it when convenient — `CONCURRENTLY` needs no write lock — and drop the old one
+once no host runs the previous build:
+
+```sql
+CREATE INDEX CONCURRENTLY IF NOT EXISTS asyncresponse_transport_messages_ready_idx
+    ON public.asyncresponse_transport_messages (queue, available_at, created_at);
+DROP INDEX CONCURRENTLY IF EXISTS public.asyncresponse_transport_messages_claim_idx;
+```
+
+On an auto-created schema this build creates the new index itself and leaves the old one alone:
+`DROP INDEX` takes an ACCESS EXCLUSIVE lock on a live queue, so dropping it is the operator's call.
+
 ## Configuration checklist
 
 ```csharp

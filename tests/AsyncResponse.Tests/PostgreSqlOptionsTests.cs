@@ -154,11 +154,11 @@ public sealed class PostgreSqlOptionsTests
             options => options.MessageTable = new string('q', 64),
             "limited to 63");
 
-        // A queue table whose name ends exactly where the reserved "_claim_idx" stem truncates
-        // derives its own name for the claim index (63 = 53-char stem + "_claim_idx").
+        // A queue table whose name ends exactly where the reserved "_ready_idx" stem truncates
+        // derives its own name for the dequeue index (63 = 53-char stem + "_ready_idx").
         AssertTransportInvalid(
-            options => options.MessageTable = new string('q', 53) + "_claim_idx",
-            "claim index");
+            options => options.MessageTable = new string('q', 53) + "_ready_idx",
+            "dequeue index");
 
         // Exactly at the cap the derived index names stay distinct and the plan validates.
         PostgreSqlTransportOptionsValidator.ValidateCommon(

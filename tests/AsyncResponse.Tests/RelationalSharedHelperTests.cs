@@ -127,14 +127,14 @@ public sealed class RelationalSharedHelperTests
     [Fact]
     public void PostgreSqlTransportNamePlan_RendersItsOwnGuidance()
     {
-        // A maximum-length table name whose stem truncates exactly onto its own claim-index name:
+        // A maximum-length table name whose stem truncates exactly onto its own dequeue-index name:
         // the only way this package's single configured name can collide with a derived one.
-        var messageTable = new string('a', 53) + "_claim_idx";
+        var messageTable = new string('a', 53) + "_ready_idx";
         var options = new PostgreSqlAsyncResponseTransportOptions { MessageTable = messageTable };
 
         var ex = Assert.Throws<InvalidOperationException>(() => PostgreSqlTransportOptionsValidator.ValidateCommon(options));
         Assert.Equal(
-            $"PostgreSqlAsyncResponseTransportOptions: the MessageTable table ('{messageTable}') and the claim index (derived from " +
+            $"PostgreSqlAsyncResponseTransportOptions: the MessageTable table ('{messageTable}') and the dequeue index (derived from " +
             $"MessageTable) ('{messageTable}') resolve to the same name — object names are compared case-insensitively" +
             "; rename MessageTable so the derived index names stay distinct.",
             ex.Message);

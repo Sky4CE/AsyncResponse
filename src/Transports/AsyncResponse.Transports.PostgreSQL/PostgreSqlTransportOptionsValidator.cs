@@ -32,7 +32,7 @@ internal static class PostgreSqlTransportOptionsValidator
         (string Role, string Name)[] namePlan =
         [
             ($"{nameof(options.MessageTable)} table", options.MessageTable),
-            ("claim index (derived from MessageTable)", PostgreSqlTransportStore.IndexName(options.MessageTable, "claim")),
+            ("dequeue index (derived from MessageTable)", PostgreSqlTransportStore.IndexName(options.MessageTable, "ready")),
             ("created index (derived from MessageTable)", PostgreSqlTransportStore.IndexName(options.MessageTable, "created")),
         ];
         RelationalNamePlan.RequireDistinct(
