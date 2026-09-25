@@ -136,6 +136,149 @@ public sealed class DurableFlowExecutorCoverageTests
         Assert.Equal("recover-suspended", observer.Completed[1].FlowId);
     }
 
+    [Fact]
+    public async Task RecoverFailAndResume_OnALaggingPresentCopy_LookAgainAuthoritativelyBeforeAcknowledging()
+    {
+        // Regression: three executor decisions acknowledge a delivery WITHOUT writing — a recovered
+        // response that matches no pending step, a correlation-scoped failure for an id no step is
+        // pending on, a resume of a run that does not read Running — so no revision fence corrects
+        // a stale read behind them. On a store whose loads can serve an older copy of a present
+        // ledger (Cosmos session reads from a process that never got the holder's session token),
+        // the holder's breadcrumb checkpoint was not visible yet: the recovered payload and the
+        // failure were dropped for good, and an operator's resume of a run set back to Running was
+        // ignored. Each now looks again through IFlowStateStore.LoadCurrentAsync before concluding.
+        var current = new InMemoryFlowStateStore();
+        foreach (var flowId in new[] { "recover-lag", "fail-lag" })
+        {
+            await CreateAsync(current, PendingOn(flowId, "pre-breadcrumb", revision: 0));
+            Assert.True(await current.TryUpdateAsync(flowId, PendingOn(flowId, "breadcrumb", revision: 1), 0, TimeSpan.FromMinutes(5)));
+        }
+
+        await CreateAsync(current, State("resume-lag"));
+        var store = new LaggingReadStore(current)
+        {
+            Stale =
+            {
+                ["recover-lag"] = () => PendingOn("recover-lag", "pre-breadcrumb", revision: 0),
+                ["fail-lag"] = () => PendingOn("fail-lag", "pre-breadcrumb", revision: 0),
+                ["resume-lag"] = () => State("resume-lag", FlowRunStatus.Suspended)
+            }
+        };
+        await using var harness = CreateHarness(store);
+
+        await harness.Executor.RecoverAsync("recover-lag", new object(), "breadcrumb");
+        var recovered = (await current.LoadAsync("recover-lag"))!.Steps!["step"];
+        Assert.True(recovered.Completed);
+        Assert.NotNull(recovered.ResultJson);
+        Assert.Null(recovered.PendingCorrelationId);
+
+        await harness.Executor.FailAsync("fail-lag", new InvalidOperationException("remote failure"), "breadcrumb");
+        Assert.Equal(FlowRunStatus.Failed, (await current.LoadAsync("fail-lag"))!.Status);
+
+        await harness.Executor.ResumeAsync("resume-lag");
+
+        // The recovered run is woken, and so is the resumed one.
+        harness.Builder.Verify(instance => instance.EnqueueWorkerAsync(
+            It.IsAny<Expression<Func<IDurableFlowExecutor, Task>>>(),
+            It.IsAny<CancellationToken>()), Times.Exactly(2));
+        Assert.Equal(3, store.CurrentLoads);
+
+        static FlowState PendingOn(string flowId, string correlationId, long revision)
+        {
+            var state = State(flowId);
+            state.Revision = revision;
+            state.Steps = new Dictionary<string, FlowStepState> { ["step"] = new() { PendingCorrelationId = correlationId } };
+            return state;
+        }
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task AFailureSignal_ReadingALaggingSuspendedCopy_LooksAgainAuthoritatively_BeforeIgnoringIt(bool correlationScoped)
+    {
+        // Precommit review (F3): a failure signal for a run that reads Suspended is ignored — by
+        // design, while the run really is suspended. But Suspended is not terminal: right after an
+        // operator set the run back to Running, a replica behind that write still shows Suspended,
+        // and the failure its resumed run waits on was acknowledged and dropped. Nothing is written
+        // on that path, so no fence corrects the read; it looks again through LoadCurrentAsync.
+        var flowId = $"fail-suspended-lag-{correlationScoped}";
+        var current = new InMemoryFlowStateStore();
+        await CreateAsync(current, PendingOn(flowId, FlowRunStatus.Running));
+        var store = new LaggingReadStore(current)
+        {
+            Stale = { [flowId] = () => PendingOn(flowId, FlowRunStatus.Suspended) }
+        };
+        await using var harness = CreateHarness(store);
+
+        if (correlationScoped)
+            await harness.Executor.FailAsync(flowId, new InvalidOperationException("remote failure"), "breadcrumb");
+        else
+            await harness.Executor.FailAsync(flowId, new InvalidOperationException("remote failure"));
+
+        var failed = (await current.LoadAsync(flowId))!;
+        Assert.Equal(FlowRunStatus.Failed, failed.Status);
+        Assert.Equal("remote failure", failed.LastMessage);
+        Assert.Equal(1, store.CurrentLoads);
+
+        // A run that really is Suspended still ignores the signal — after the one current look.
+        var suspendedId = $"fail-suspended-really-{correlationScoped}";
+        await CreateAsync(current, PendingOn(suspendedId, FlowRunStatus.Suspended));
+        if (correlationScoped)
+            await harness.Executor.FailAsync(suspendedId, new InvalidOperationException("remote failure"), "breadcrumb");
+        else
+            await harness.Executor.FailAsync(suspendedId, new InvalidOperationException("remote failure"));
+
+        Assert.Equal(FlowRunStatus.Suspended, (await current.LoadAsync(suspendedId))!.Status);
+        Assert.Equal(2, store.CurrentLoads);
+
+        static FlowState PendingOn(string flowId, FlowRunStatus status)
+        {
+            var state = State(flowId, status);
+            state.Steps = new Dictionary<string, FlowStepState> { ["step"] = new() { PendingCorrelationId = "breadcrumb" } };
+            return state;
+        }
+    }
+
+    /// <summary>
+    /// Plain loads served by a replica that has not applied the holder's latest checkpoint for the
+    /// ids in <see cref="Stale"/>; <see cref="LoadCurrentAsync"/> and every write go to the
+    /// authoritative store.
+    /// </summary>
+    private sealed class LaggingReadStore(InMemoryFlowStateStore current) : IFlowStateStore
+    {
+        public Dictionary<string, Func<FlowState>> Stale { get; } = new(StringComparer.Ordinal);
+
+        public int CurrentLoads;
+
+        public Task<FlowState?> LoadAsync(string flowId, CancellationToken cancellationToken = default)
+            => Stale.TryGetValue(flowId, out var stale) ? Task.FromResult<FlowState?>(stale()) : current.LoadAsync(flowId, cancellationToken);
+
+        public Task<FlowState?> LoadCurrentAsync(string flowId, CancellationToken cancellationToken = default)
+        {
+            Interlocked.Increment(ref CurrentLoads);
+            return current.LoadAsync(flowId, cancellationToken);
+        }
+
+        public Task<bool> TryCreateAsync(string flowId, FlowState state, TimeSpan ttl, CancellationToken cancellationToken = default)
+            => current.TryCreateAsync(flowId, state, ttl, cancellationToken);
+
+        public Task<bool> TryUpdateAsync(string flowId, FlowState state, long expectedRevision, TimeSpan ttl, string? leaseId = null, CancellationToken cancellationToken = default)
+            => current.TryUpdateAsync(flowId, state, expectedRevision, ttl, leaseId, cancellationToken);
+
+        public Task<bool> TryAcquireLeaseAsync(string flowId, string leaseId, TimeSpan leaseDuration, CancellationToken cancellationToken = default)
+            => current.TryAcquireLeaseAsync(flowId, leaseId, leaseDuration, cancellationToken);
+
+        public Task<bool> TryRenewLeaseAsync(string flowId, string leaseId, TimeSpan leaseDuration, CancellationToken cancellationToken = default)
+            => current.TryRenewLeaseAsync(flowId, leaseId, leaseDuration, cancellationToken);
+
+        public Task ReleaseLeaseAsync(string flowId, string leaseId, CancellationToken cancellationToken = default)
+            => current.ReleaseLeaseAsync(flowId, leaseId, cancellationToken);
+
+        public Task<bool> TryDeleteAsync(string flowId, CancellationToken cancellationToken = default)
+            => current.TryDeleteAsync(flowId, cancellationToken);
+    }
+
     private sealed class RecordingObserver : IDurableFlowExecutionObserver
     {
         public List<DurableFlowStepEvent> Completed { get; } = [];

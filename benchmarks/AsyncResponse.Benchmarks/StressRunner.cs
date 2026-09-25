@@ -682,7 +682,7 @@ internal static class StressRunner
                 () => { Interlocked.Increment(ref acks); return ValueTask.CompletedTask; },
                 _ => { Interlocked.Increment(ref naks); return ValueTask.CompletedTask; },
                 (_, _, _) => { Interlocked.Increment(ref deadLetters); return ValueTask.FromResult(true); },
-                () => ValueTask.FromResult(true)),
+                _ => ValueTask.FromResult(true)),
                 CancellationToken.None).ConfigureAwait(false);
         }, settle: () => allProcessed.Task.WaitAsync(TimeSpan.FromSeconds(60)));
 
@@ -764,7 +764,7 @@ internal static class StressRunner
                 () => { Interlocked.Increment(ref acks); return ValueTask.CompletedTask; },
                 _ => { Interlocked.Increment(ref naks); return ValueTask.CompletedTask; },
                 (_, _, _) => { Interlocked.Increment(ref deadLetters); return ValueTask.FromResult(true); },
-                () => ValueTask.FromResult(true)),
+                _ => ValueTask.FromResult(true)),
                 CancellationToken.None).ConfigureAwait(false);
         }, settle: () => allProcessed.Task.WaitAsync(TimeSpan.FromSeconds(60)));
 
@@ -846,7 +846,7 @@ internal static class StressRunner
                 () => { Interlocked.Increment(ref acks); return ValueTask.CompletedTask; },
                 _ => { Interlocked.Increment(ref naks); return ValueTask.CompletedTask; },
                 (_, _, _) => { Interlocked.Increment(ref deadLetters); return ValueTask.FromResult(true); },
-                () => ValueTask.FromResult(true)),
+                _ => ValueTask.FromResult(true)),
                 CancellationToken.None).ConfigureAwait(false);
         }, settle: () => allProcessed.Task.WaitAsync(TimeSpan.FromSeconds(60)));
 

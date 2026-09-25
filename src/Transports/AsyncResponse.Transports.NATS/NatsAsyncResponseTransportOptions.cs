@@ -50,10 +50,18 @@ public sealed class NatsAsyncResponseTransportOptions
     /// <summary>
     /// Creates the worker and response JetStream streams (and the dead-letter stream when enabled) on
     /// subscriber startup when they do not exist. A stream that already exists is never modified:
-    /// startup fails when it does not capture the configured subject or (worker/response streams)
-    /// does not use work-queue retention, and logs a warning when its discard policy or message
-    /// limit differs from these options — settings tuned on the live stream (replicas, max age,
-    /// max bytes, …) are left alone. Disable when streams are provisioned out of band.
+    /// the subscriber refuses it when it does not capture the configured subject or (worker/response
+    /// streams) does not use work-queue retention, and logs a warning when its discard policy or
+    /// message limit differs from these options — settings tuned on the live stream (replicas, max
+    /// age, max bytes, …) are left alone. Disable when streams are provisioned out of band. The
+    /// durable consumers follow the same rule whatever this is set to: created when missing, never
+    /// modified — the subscriber refuses an existing one that is a push consumer, does not use
+    /// explicit acks, or has a max deliver at or below
+    /// <see cref="NatsSubscriberOptions.MaxDeliveryAttempts"/>. A refusal does not fail host
+    /// startup: every subscriber attempt fails with an error naming the stream or consumer, logged
+    /// as a warning and retried with backoff, and nothing is consumed until it is fixed. A consumer
+    /// whose ack wait differs from <see cref="AckWait"/> is used as it is — the in-progress
+    /// heartbeat renews at a third of the shorter of the two — and the drift is logged once.
     /// </summary>
     public bool CreateStreams { get; set; } = true;
 
@@ -73,7 +81,12 @@ public sealed class NatsAsyncResponseTransportOptions
     /// </summary>
     public int StreamReplicas { get; set; } = 1;
 
-    /// <summary>How long the server waits for an ACK before redelivering a message (the JetStream AckWait).</summary>
+    /// <summary>
+    /// How long the server waits for an ACK before redelivering a message (the JetStream AckWait).
+    /// Applied when this library creates the durable consumer; an existing consumer keeps its own
+    /// ack wait (change it on the consumer), and the in-progress heartbeat follows whichever of the
+    /// two is shorter.
+    /// </summary>
     public TimeSpan AckWait { get; set; } = TimeSpan.FromSeconds(30);
 
     /// <summary>

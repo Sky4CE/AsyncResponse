@@ -40,8 +40,9 @@ public sealed class SqliteDurableFlowOptions : DurableFlowOptions
     public bool AutoCreateSchema { get; set; } = true;
 
     /// <summary>
-    /// How often <see cref="SqliteFlowStateStore.TryCreateAsync"/> opportunistically deletes one bounded
-    /// batch (1000 rows) of expired rows (loads already treat expired state as absent; pruning
+    /// How often <see cref="SqliteFlowStateStore.TryCreateAsync"/> opportunistically runs a
+    /// budgeted prune of expired rows: batches of 1000 until one comes back short or
+    /// <see cref="PruneBudget"/> lapses (loads already treat expired state as absent; pruning
     /// bounds table growth). Zero or negative prunes on every save. Default: 5 minutes.
     /// </summary>
     public TimeSpan PruneInterval { get; set; } = TimeSpan.FromMinutes(5);
@@ -146,7 +147,7 @@ public sealed class SqliteFlowStateStore : IFlowStateStore
         var stateJson = DurableFlowStoreShared.SerializeBounded(flowId, state, _options.MaxStateBytes, "SQLite");
         await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
         if (DurableFlowStoreShared.ShouldPrune(ref _lastPruneTicks, _options.PruneInterval))
-            await DurableFlowStoreShared.PruneQuietlyAsync(() => PruneExpiredAsync(cancellationToken), _options.PruneBudget, "SQLite", _logger).ConfigureAwait(false);
+            await DurableFlowStoreShared.PruneQuietlyAsync(() => PruneExpiredAsync(cancellationToken), _options.PruneBudget, "SQLite", _logger, cancellationToken).ConfigureAwait(false);
         await using var connection = await OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         await using var command = connection.CreateCommand();
         command.CommandText =

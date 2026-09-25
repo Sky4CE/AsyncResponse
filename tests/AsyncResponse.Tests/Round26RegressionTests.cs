@@ -471,8 +471,10 @@ public sealed class Round26RegressionTests
 
         await InvokeExtendAncestorLedgersAsync(context, TimeSpan.FromDays(30));
 
-        Assert.Equal(TimeSpan.FromDays(30), store.LastTtl["parent"]);
-        Assert.Equal(TimeSpan.FromDays(30), store.LastTtl["grandparent"]);
+        // The walk anchors the floor to an absolute instant (fixpoint r1, S1#19) and stamps
+        // "floor − now" at each write, so the real clock shaves a hair off the 30 days.
+        Assert.InRange(store.LastTtl["parent"], TimeSpan.FromDays(30) - TimeSpan.FromMinutes(1), TimeSpan.FromDays(30));
+        Assert.InRange(store.LastTtl["grandparent"], TimeSpan.FromDays(30) - TimeSpan.FromMinutes(1), TimeSpan.FromDays(30));
     }
 
     [Fact]
@@ -496,10 +498,11 @@ public sealed class Round26RegressionTests
     private static T PrivateField<T>(object target, string name)
         => (T)target.GetType().GetField(name, BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(target)!;
 
+    /// <summary>The walk for a park that keeps the chain <paramref name="ttl"/> from now (it takes the absolute floor).</summary>
     private static Task InvokeExtendAncestorLedgersAsync(DurableFlowContext context, TimeSpan ttl)
         => (Task)typeof(DurableFlowContext)
             .GetMethod("ExtendAncestorLedgersAsync", BindingFlags.Instance | BindingFlags.NonPublic)!
-            .Invoke(context, [ttl, CancellationToken.None])!;
+            .Invoke(context, [DateTime.UtcNow + ttl, CancellationToken.None])!;
 
     /// <summary>
     /// A context wired with only what the ancestor walk touches (state, store, options, clock and

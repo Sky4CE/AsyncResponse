@@ -937,6 +937,7 @@ public sealed class CosmosDurableFlowStateStoreTests
         // its reads current. A delete can win the race between the two calls once — not every
         // time — so repeated disagreement is refused rather than acknowledged.
         using var harness = new CosmosHarness();
+        harness.Client.SetupGet(client => client.ClientOptions).Returns(new CosmosClientOptions { ConsistencyLevel = ConsistencyLevel.Eventual });
         harness.WritePathSeesTheLedger();
         harness.ReadsException(HttpStatusCode.NotFound);
 
@@ -951,6 +952,68 @@ public sealed class CosmosDurableFlowStateStoreTests
         deleted.WritePath = () => CosmosError(++confirmations == 1 ? HttpStatusCode.PreconditionFailed : HttpStatusCode.NotFound);
         deleted.ReadsException(HttpStatusCode.NotFound);
         Assert.Null(await deleted.Store.LoadAsync("flow"));
+    }
+
+    [Theory]
+    [InlineData(ConsistencyLevel.Session)]
+    [InlineData(ConsistencyLevel.Strong)]
+    public async Task Load_PresentForWritesButHiddenFromSessionConsistentReads_IsATtlLapsedLedger_ReadAsAbsent(ConsistencyLevel level)
+    {
+        // Past the SERVER ttl, reads answer 404 while the background purge has not run yet and the
+        // write path still sees the physical item (the Cosmos emulator does exactly this). Under
+        // Session or Strong each 412 made the re-read current, so the disagreement is the ttl
+        // hiding the item — yet it threw FlowStateUnreadableException, and every wake-up of a
+        // genuinely expired run was retried into the dead-letter queue instead of acknowledged.
+        using var harness = new CosmosHarness();
+        harness.Client.SetupGet(client => client.ClientOptions).Returns(new CosmosClientOptions { ConsistencyLevel = level });
+        harness.WritePathSeesTheLedger();
+        harness.ReadsException(HttpStatusCode.NotFound);
+
+        Assert.Null(await harness.Store.LoadAsync("flow"));
+        Assert.Null(await harness.Store.LoadCurrentAsync("flow"));
+    }
+
+    /// <summary>
+    /// The same decision when the client sets no consistency override: the ACCOUNT default decides,
+    /// read once. A Session or Strong account reads the ttl-hidden ledger as absent; Bounded Staleness
+    /// (stronger than Session, but reads outside the write region lag with no session token to pin
+    /// them) and Eventual — the emulator's default — refuse it, naming what the store needs.
+    /// </summary>
+    [Theory]
+    [InlineData(ConsistencyLevel.Session, true)]
+    [InlineData(ConsistencyLevel.Strong, true)]
+    [InlineData(ConsistencyLevel.BoundedStaleness, false)]
+    [InlineData(ConsistencyLevel.Eventual, false)]
+    public async Task Load_PresentForWritesButHiddenFromReads_FollowsTheAccountDefault_WhenTheClientSetsNoLevel(ConsistencyLevel accountDefault, bool absent)
+    {
+        using var harness = new CosmosHarness();
+        harness.Client.SetupGet(client => client.ClientOptions).Returns(new CosmosClientOptions());
+        harness.Client.Setup(client => client.ReadAccountAsync()).ReturnsAsync(Account(accountDefault));
+        harness.WritePathSeesTheLedger();
+        harness.ReadsException(HttpStatusCode.NotFound);
+
+        if (absent)
+        {
+            Assert.Null(await harness.Store.LoadAsync("flow"));
+            Assert.Null(await harness.Store.LoadCurrentAsync("flow"));
+        }
+        else
+        {
+            var ex = await Assert.ThrowsAsync<FlowStateUnreadableException>(() => harness.Store.LoadAsync("flow"));
+            Assert.Contains("needs Session or Strong consistency", ex.Reason, StringComparison.Ordinal);
+            await Assert.ThrowsAsync<FlowStateUnreadableException>(() => harness.Store.LoadCurrentAsync("flow"));
+        }
+
+        harness.Client.Verify(client => client.ReadAccountAsync(), Times.Once);
+
+        // AccountProperties has no public constructor: built from the account JSON the SDK itself parses.
+        static AccountProperties Account(ConsistencyLevel level)
+        {
+            var account = Newtonsoft.Json.JsonConvert.DeserializeObject<AccountProperties>(
+                $$$"""{"id":"account","userConsistencyPolicy":{"defaultConsistencyLevel":"{{{level}}}"}}""")!;
+            Assert.Equal(level, account.Consistency.DefaultConsistencyLevel);
+            return account;
+        }
     }
 
     [Fact]
@@ -1022,6 +1085,195 @@ public sealed class CosmosDurableFlowStateStoreTests
                 It.IsAny<string?>(),
                 It.IsAny<QueryRequestOptions>()),
             Times.Never);
+    }
+
+    [Fact]
+    public async Task LoadCurrent_AsksTheWritePathFirst_EvenForALedgerAPlainLoadFinds()
+    {
+        // Regression: a present-but-older copy skipped the write-path barrier, and three engine
+        // decisions acknowledge a delivery on such a read WITHOUT writing — a recovered response
+        // matching no pending step, a correlation-scoped failure for an id no step is pending on,
+        // a resume of a run that does not read Running. The holder checkpointed the breadcrumb,
+        // this process's replica had not applied it, and the recovered payload was dropped.
+        // LoadCurrentAsync is the engine's authoritative load for exactly those paths.
+        using var harness = new CosmosHarness();
+        var sessionIsCurrent = false;
+        harness.WritePath = () =>
+        {
+            sessionIsCurrent = true;
+            return CosmosError(HttpStatusCode.PreconditionFailed);
+        };
+        var before = CreateState("flow");
+        before.LastMessage = "before the breadcrumb";
+        var after = CreateState("flow");
+        after.LastMessage = "breadcrumb checkpointed";
+        harness.ReadsLagging(
+            () => sessionIsCurrent,
+            stale: Document(before, DateTime.UtcNow.AddMinutes(5)),
+            current: Document(after, DateTime.UtcNow.AddMinutes(5)));
+        IFlowStateStore store = harness.Store;
+
+        // A plain load keeps round 42's RU bound: the copy it finds, no write-path request.
+        Assert.Equal("before the breadcrumb", (await store.LoadAsync("flow"))!.LastMessage);
+        Assert.Equal(0, harness.WritePathCalls);
+
+        // The current load asks the write path first, so its read is what the writer committed.
+        Assert.Equal("breadcrumb checkpointed", (await store.LoadCurrentAsync("flow"))!.LastMessage);
+        Assert.Equal(1, harness.WritePathCalls);
+
+        // And absent on the write path is the authoritative "no state", without a read.
+        using var absent = new CosmosHarness();
+        absent.ReadsThrowing(new CosmosException("a read must not be needed", HttpStatusCode.ServiceUnavailable, 0, "activity", 0));
+        Assert.Null(await ((IFlowStateStore)absent.Store).LoadCurrentAsync("flow"));
+    }
+
+    [Fact]
+    public async Task DocumentTimes_ReadBackWithALocalKind_AreNormalizedToUtcAsTheyAreRead()
+    {
+        // Regression: DateTime comparison ignores Kind. A host serializer with local time zone
+        // handling hands the document's instants back as DateTimeKind.Local carrying LOCAL ticks,
+        // and every expiry and lease check compared those ticks with DateTime.UtcNow. Deterministic
+        // on any host: the checkpoint writes the document back, and a lease deadline it did not
+        // touch must leave as the same instant, stamped Utc.
+        using var harness = new CosmosHarness();
+        var leaseDeadline = DateTime.UtcNow.AddMinutes(1);
+        var document = Document(CreateState("flow"), DateTime.UtcNow.AddMinutes(5).ToLocalTime());
+        document.LeaseId = "owner";
+        document.LeaseExpiresAtUtc = leaseDeadline.ToLocalTime();
+        document.UpdatedAtUtc = document.UpdatedAtUtc.ToLocalTime();
+        harness.Reads(document);
+        CosmosFlowStateDocument? written = null;
+        harness.ReplacesSuccessfully(replaced => written = replaced);
+
+        var next = CreateState("flow");
+        next.Revision = 1;
+        Assert.True(await harness.Store.TryUpdateAsync("flow", next, 0, TimeSpan.FromMinutes(5), "owner"));
+
+        Assert.Equal(DateTimeKind.Utc, written!.LeaseExpiresAtUtc!.Value.Kind);
+        Assert.Equal(leaseDeadline, written.LeaseExpiresAtUtc.Value);
+    }
+
+    [Fact]
+    public async Task LeaseChecks_OnTimesReadBackWithALocalKind_JudgeTheInstantNotTheTicks()
+    {
+        // The behavioural half of the normalization, through the lease projection. On a host west
+        // of UTC the live lease below read as expired by the zone offset (a second worker took a
+        // live holder's lease); east of UTC the dead one read as live for hours (contention
+        // churn). On a UTC host local ticks are UTC ticks, so both halves hold either way there.
+        using var live = new CosmosHarness();
+        live.QueriesLease(new CosmosFlowStateDocument
+        {
+            Id = "flow",
+            FlowId = "flow",
+            ExpiresAtUtc = DateTime.UtcNow.AddMinutes(5).ToLocalTime(),
+            Revision = 0,
+            LeaseId = "holder",
+            LeaseExpiresAtUtc = DateTime.UtcNow.AddSeconds(60).ToLocalTime()
+        });
+        live.PatchesSuccessfully();
+        Assert.False(await live.Store.TryAcquireLeaseAsync("flow", "intruder", TimeSpan.FromMinutes(1)));
+
+        using var dead = new CosmosHarness();
+        dead.QueriesLease(new CosmosFlowStateDocument
+        {
+            Id = "flow",
+            FlowId = "flow",
+            ExpiresAtUtc = DateTime.UtcNow.AddMinutes(5).ToLocalTime(),
+            Revision = 0,
+            LeaseId = "dead-holder",
+            LeaseExpiresAtUtc = DateTime.UtcNow.AddSeconds(-60).ToLocalTime()
+        });
+        dead.PatchesSuccessfully();
+        Assert.True(await dead.Store.TryAcquireLeaseAsync("flow", "successor", TimeSpan.FromMinutes(1)));
+    }
+
+    [Fact]
+    public async Task ADocumentWithoutItsExpiry_IsUnreadable_NotAbsent_AndIsNeitherReplacedNorLeased()
+    {
+        // Regression: a missing `expiresAtUtc` deserialized to DateTime.MinValue — "long expired" —
+        // so a present, corrupt ledger read as absent and the executor acknowledged the run's only
+        // wake-up (DynamoDB throws FlowStateUnreadableException for the same shape; decision 164:
+        // only a well-formed ELAPSED expiry may read as absent). Built from raw JSON so the document
+        // carries no expiry at all, whatever the field's CLR type.
+        var state = CreateState("flow");
+        CosmosFlowStateDocument Corrupt() => Newtonsoft.Json.JsonConvert.DeserializeObject<CosmosFlowStateDocument>(
+            Newtonsoft.Json.JsonConvert.SerializeObject(new { id = "flow", flowId = "flow", stateJson = JsonSerializer.Serialize(state), revision = 0 }))!;
+
+        using var harness = new CosmosHarness();
+        harness.WritePathSeesTheLedger();
+        harness.ReadsFactory(Corrupt);
+        var unreadable = await Assert.ThrowsAsync<FlowStateUnreadableException>(() => harness.Store.LoadAsync("flow"));
+        Assert.Contains("expiry", unreadable.Reason, StringComparison.Ordinal);
+
+        // A create that collides with it does not treat it as a free, expired slot...
+        harness.Container
+            .Setup(item => item.CreateItemAsync(
+                It.IsAny<CosmosFlowStateDocument>(),
+                It.IsAny<PartitionKey?>(),
+                It.IsAny<ItemRequestOptions>(),
+                It.IsAny<CancellationToken>()))
+            .ThrowsAsync(CosmosError(HttpStatusCode.Conflict));
+        harness.ReplacesSuccessfully();
+        Assert.False(await harness.Store.TryCreateAsync("flow", CreateState("flow"), TimeSpan.FromMinutes(5)));
+        harness.Container.Verify(
+            item => item.ReplaceItemAsync(
+                It.IsAny<CosmosFlowStateDocument>(),
+                It.IsAny<string>(),
+                It.IsAny<PartitionKey?>(),
+                It.IsAny<ItemRequestOptions>(),
+                It.IsAny<CancellationToken>()),
+            Times.Never);
+
+        // ...and neither a checkpoint nor a lease counts it as live.
+        var next = CreateState("flow");
+        next.Revision = 1;
+        Assert.False(await harness.Store.TryUpdateAsync("flow", next, 0, TimeSpan.FromMinutes(5)));
+        harness.QueriesLease(Corrupt());
+        harness.PatchesSuccessfully();
+        Assert.False(await harness.Store.TryAcquireLeaseAsync("flow", "owner", TimeSpan.FromMinutes(1)));
+    }
+
+    [Fact]
+    public async Task LeaseQuery_AllowsAScan_SoAContainerWithoutIndexingStillServesLeases()
+    {
+        // Regression: the lease projection filters on `id`, which is auto-indexed only under the
+        // Consistent indexing mode. A container provisioned as a key-value store (IndexingMode.None)
+        // answered that query with a 400 unless scans are allowed — every acquire, renewal, release
+        // and observation failed while point reads kept working. One document in one partition, so
+        // the scan costs nothing measurable.
+        using var harness = new CosmosHarness();
+        var options = new List<QueryRequestOptions>();
+        harness.Container
+            .Setup(item => item.GetItemQueryIterator<CosmosLeaseProjection>(
+                It.IsAny<QueryDefinition>(),
+                It.IsAny<string?>(),
+                It.IsAny<QueryRequestOptions>()))
+            .Callback<QueryDefinition, string?, QueryRequestOptions>((_, _, requestOptions) => options.Add(requestOptions))
+            .Returns(() => EmptyLeaseIterator());
+        harness.WritePathSeesTheLedger();
+
+        await harness.Store.TryAcquireLeaseAsync("flow", "owner", TimeSpan.FromMinutes(1));
+        await harness.Store.TryRenewLeaseAsync("flow", "owner", TimeSpan.FromMinutes(1));
+        await harness.Store.ReleaseLeaseAsync("flow", "owner");
+        await harness.Store.ObserveLeaseAsync("flow");
+
+        Assert.Equal(4, options.Count);
+        Assert.All(options, requestOptions => Assert.True(requestOptions.EnableScanInQuery));
+
+        static FeedIterator<CosmosLeaseProjection> EmptyLeaseIterator()
+        {
+            var page = new Mock<FeedResponse<CosmosLeaseProjection>>();
+            page.Setup(item => item.GetEnumerator()).Returns(() => Enumerable.Empty<CosmosLeaseProjection>().GetEnumerator());
+            var more = true;
+            var iterator = new Mock<FeedIterator<CosmosLeaseProjection>>();
+            iterator.SetupGet(item => item.HasMoreResults).Returns(() => more);
+            iterator.Setup(item => item.ReadNextAsync(It.IsAny<CancellationToken>())).ReturnsAsync(() =>
+            {
+                more = false;
+                return page.Object;
+            });
+            return iterator.Object;
+        }
     }
 
     private static void AbsentOnTheWritePath(Mock<Container> container)

@@ -17,7 +17,14 @@ internal enum RedisDispatchOutcome
     Processed,
 
     /// <summary>The entry could not be accepted right now (background queue full) and was left pending for retry.</summary>
-    Deferred
+    Deferred,
+
+    /// <summary>
+    /// The flow engine handed the delivery back because the host is stopping
+    /// (<see cref="DurableFlowInterruptedException"/>): it was left pending, unsettled, for
+    /// redelivery — not progress, and nothing further in the batch should start.
+    /// </summary>
+    HandedBack
 }
 
 internal sealed record RedisStreamDelivery(
@@ -122,7 +129,8 @@ internal abstract class RedisMessageDispatcher : IAsyncDisposable
         // idle-reset heartbeat's Task.Delay at one third of its value, so its real sink is the
         // timer ceiling too — under the persistence bound a legal 200-day value passed validation
         // and then killed every batch with ArgumentOutOfRangeException from the heartbeat's delay.
-        // PendingClaimInterval is a "now + interval" schedule stamp and keeps the persistence bound.
+        // PendingClaimInterval is only compared with elapsed monotonic time and keeps the
+        // persistence bound.
         AsyncResponseChannelOptions.EnsureTimerBacked(subscriberOptions.EmptyPollDelay, optionPath, nameof(RedisSubscriberOptions.EmptyPollDelay));
         AsyncResponseChannelOptions.EnsureTimerBacked(subscriberOptions.PendingMessageMinIdleTime, optionPath, nameof(RedisSubscriberOptions.PendingMessageMinIdleTime));
         AsyncResponseChannelOptions.EnsurePersistedTtl(subscriberOptions.PendingClaimInterval, optionPath, nameof(RedisSubscriberOptions.PendingClaimInterval));
@@ -191,6 +199,20 @@ internal abstract class RedisMessageDispatcher : IAsyncDisposable
     /// <summary>Releases resources held by this instance.</summary>
     public virtual ValueTask DisposeAsync() => ValueTask.CompletedTask;
 
+    private int _handBackSignalled;
+
+    /// <summary>
+    /// Whether the flow engine has handed a delivery back (<see cref="DurableFlowInterruptedException"/>)
+    /// — inline, or in an early-ACK worker. That only happens because the host is stopping, and
+    /// it arrives before this subscriber's token (the engine reacts to ApplicationStopping, which
+    /// fires first), so the subscriber stops reading and claiming from here on. Latched: the host
+    /// does not come back from a stop.
+    /// </summary>
+    public bool HandBackSignalled => Volatile.Read(ref _handBackSignalled) != 0;
+
+    /// <summary>Latches <see cref="HandBackSignalled"/>.</summary>
+    protected void SignalHandBack() => Volatile.Write(ref _handBackSignalled, 1);
+
     /// <summary>Runs the ExecuteHandlerAsync operation.</summary>
     protected async Task ExecuteHandlerAsync(
         RedisStreamDelivery delivery,
@@ -212,6 +234,12 @@ internal abstract class RedisMessageDispatcher : IAsyncDisposable
         try
         {
             await _handler(delivery, cancellationToken).ConfigureAwait(false);
+        }
+        catch (DurableFlowInterruptedException)
+        {
+            // Not a failure: the flow engine hands the delivery back because the host is stopping.
+            // The caller settles it as a hand-back, with no failure log and no error span.
+            throw;
         }
         catch (Exception ex)
         {
@@ -296,7 +324,7 @@ internal abstract class RedisMessageDispatcher : IAsyncDisposable
     {
         if (entry.Id.IsNull)
         {
-            // A trimmed-while-pending tombstone (Redis 5/6 answer XCLAIM with a nil entry) carries
+            // A trimmed-while-pending tombstone (Redis 6.2 answers XCLAIM with a nil entry) carries
             // no id to ACK and no payload to record: sending its null id to XACK is rejected by the
             // client from inside the caller's catch, which replaced the original error, faulted the
             // subscriber, and re-dead-lettered the tombstone every claim cycle. The claim loop
@@ -320,10 +348,35 @@ internal abstract class RedisMessageDispatcher : IAsyncDisposable
             Attempt: 0,
             entry);
 
-        // Settlement deliberately ignores cancellation (as every other settlement in this file
-        // does): a shutdown landing between the dead-letter XADD and the XACK left the entry in
-        // the PEL to be reclaimed and dead-lettered a SECOND time after restart.
-        await DeadLetterAndAckAsync(delivery, failure, "unparsable_entry", CancellationToken.None).ConfigureAwait(false);
+        await TryDeadLetterAndAckAsync(delivery, failure, "unparsable_entry").ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Burial that never throws ("a burial that throws is a burial that failed" — DB-transport
+    /// parity). Unguarded, a dead-letter XADD that failed — MISCONF/OOM, the adapter's timeout, a
+    /// WRONGTYPE on the dead-letter key — escaped past the XACK to the supervisor, which restarted
+    /// the subscriber; the pending-claim loop then re-claimed the same entry every cycle, and
+    /// every restart abandoned the rest of the claimed batch with bumped counts. Every burial of
+    /// an entry that is still pending goes through here (the early-ACK workers guard their own
+    /// post-ACK burials). Settlement deliberately ignores cancellation: a shutdown
+    /// landing between the XADD and the XACK would leave the entry in the PEL to be reclaimed and
+    /// dead-lettered a SECOND time.
+    /// </summary>
+    protected async Task TryDeadLetterAndAckAsync(RedisStreamDelivery delivery, Exception exception, string reason)
+    {
+        try
+        {
+            await DeadLetterAndAckAsync(delivery, exception, reason, CancellationToken.None).ConfigureAwait(false);
+        }
+        catch (Exception deadLetterException)
+        {
+            Logger.LogError(
+                deadLetterException,
+                "Failed to dead-letter Redis message {MessageId} on {Stream} ({Reason}); the entry stays pending and is reclaimed on the next pending-claim cycle.",
+                delivery.MessageId.ToString(),
+                delivery.Stream.ToString(),
+                reason);
+        }
     }
 
     private static string DescribeRawEntry(StreamEntry entry)
@@ -394,6 +447,20 @@ internal sealed class AwaitingRedisMessageDispatcher(
         {
             throw;
         }
+        catch (DurableFlowInterruptedException)
+        {
+            // Host stop, recognised by type rather than by token: ApplicationStopping fires before
+            // hosted services stop, so the flow engine interrupts the run while this subscriber's
+            // token is still live. Read as a handler failure it was logged as one and — at
+            // MaxDeliveryAttempts — dead-lettered and ACKed, burying a flow's only wake-up because
+            // of a deploy. Leave it pending, unsettled, for redelivery after the restart.
+            SignalHandBack();
+            Logger.LogInformation(
+                "Redis message {MessageId} on {Stream} was handed back by the flow engine because the host is stopping; it stays pending for redelivery.",
+                delivery.MessageId.ToString(),
+                delivery.Stream.ToString());
+            return RedisDispatchOutcome.HandedBack;
+        }
         catch (Exception ex) when (ReachedDeliveryAttempts(delivery))
         {
             Logger.LogWarning(
@@ -432,32 +499,6 @@ internal sealed class AwaitingRedisMessageDispatcher(
         }
 
         return RedisDispatchOutcome.Processed;
-    }
-
-    /// <summary>
-    /// Burial that never throws (queued-dispatcher and DB-transport parity: "a burial that throws
-    /// is a burial that failed"). Unguarded, a dead-letter XADD that failed — MISCONF/OOM, the
-    /// adapter's timeout, a WRONGTYPE on the dead-letter key — escaped past the XACK to the
-    /// supervisor, which restarted the subscriber; the pending-claim loop then re-claimed the
-    /// same entry every cycle and the whole stream stopped draining. Settlement deliberately
-    /// ignores cancellation: a shutdown landing between the XADD and the XACK would leave the
-    /// entry in the PEL to be reclaimed and dead-lettered a SECOND time.
-    /// </summary>
-    private async Task TryDeadLetterAndAckAsync(RedisStreamDelivery delivery, Exception exception, string reason)
-    {
-        try
-        {
-            await DeadLetterAndAckAsync(delivery, exception, reason, CancellationToken.None).ConfigureAwait(false);
-        }
-        catch (Exception deadLetterException)
-        {
-            Logger.LogError(
-                deadLetterException,
-                "Failed to dead-letter Redis message {MessageId} on {Stream} ({Reason}); the entry stays pending and is reclaimed on the next pending-claim cycle.",
-                delivery.MessageId.ToString(),
-                delivery.Stream.ToString(),
-                reason);
-        }
     }
 }
 
@@ -527,11 +568,10 @@ internal sealed class QueuedRedisMessageDispatcher : RedisMessageDispatcher
         // forever, with nothing ever consulting MaxDeliveryAttempts to bury it.
         if (AlreadyExceededDeliveryAttempts(delivery))
         {
-            await DeadLetterAndAckAsync(
+            await TryDeadLetterAndAckAsync(
                 delivery,
                 new InvalidOperationException($"Redis message exceeded {MaxDeliveryAttempts} delivery attempts."),
-                "max_delivery_attempts_exceeded",
-                CancellationToken.None).ConfigureAwait(false);
+                "max_delivery_attempts_exceeded").ConfigureAwait(false);
             return RedisDispatchOutcome.Processed;
         }
 
@@ -666,6 +706,51 @@ internal sealed class QueuedRedisMessageDispatcher : RedisMessageDispatcher
                     delivery,
                     _drainCancellation.Token,
                     logFailures: false).ConfigureAwait(false);
+            }
+            catch (DurableFlowInterruptedException ex)
+            {
+                // Host stop — even when the drain has not started (ApplicationStopping fires
+                // first): not a handler failure, so no Error log. But the entry was ACKed at
+                // enqueue and Redis will never redeliver it, so beyond the OnBackgroundFailure
+                // report a dead-letter copy under its own reason is its only durable record: a
+                // replay is safe, the run resuming from its last checkpoint. Checked before the
+                // drain's own cancellation below, so a hand-back is recorded as one whenever it
+                // lands.
+                SignalHandBack();
+                if (TransportOptions.DeadLetterEnabled)
+                {
+                    Logger.LogWarning(
+                        "Redis background handler for already-ACKed message {MessageId} on {Stream} was handed back by the flow engine because the host is stopping; Redis will not redeliver it. Dead-lettering a copy (handed_back_after_commit) and surfacing via OnBackgroundFailure.",
+                        delivery.MessageId.ToString(),
+                        _stream);
+                }
+                else
+                {
+                    // No copy can be written: the wake-up is lost unless the report records it.
+                    Logger.LogError(
+                        "Redis background handler for already-ACKed message {MessageId} on {Stream} was handed back by the flow engine because the host is stopping; Redis will not redeliver it, and no dead-letter destination is configured, so the wake-up is lost unless OnBackgroundFailure records it (resume the flow explicitly).",
+                        delivery.MessageId.ToString(),
+                        _stream);
+                }
+
+                await NotifyBackgroundFailureAsync(delivery, ex).ConfigureAwait(false);
+
+                try
+                {
+                    await DeadLetterAndAckAsync(
+                        delivery,
+                        ex,
+                        "handed_back_after_commit",
+                        CancellationToken.None).ConfigureAwait(false);
+                }
+                catch (Exception deadLetterException)
+                {
+                    Logger.LogError(
+                        deadLetterException,
+                        "Failed to dead-letter handed-back Redis message {MessageId} on {Stream}.",
+                        delivery.MessageId.ToString(),
+                        _stream);
+                }
             }
             catch (OperationCanceledException ex) when (_drainCancellation.IsCancellationRequested)
             {

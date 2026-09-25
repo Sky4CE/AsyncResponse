@@ -21,11 +21,13 @@ internal sealed class SqsReplyTargetProvider(
 
         // A NAMED target must not be the worker queue or a derived dead-letter queue
         // (DB-transport parity): its responses would be consumed as worker jobs (or sit in a
-        // redrive DLQ), while the waiter times out.
+        // redrive DLQ), while the waiter times out. Either side may be a name or a URL; only a
+        // certain match throws here, on every enqueue — a name against a URL sharing it may be
+        // another account's queue, so the worker subscriber warns about that at startup instead.
         var deadLetterCollision = !string.IsNullOrWhiteSpace(options.DeadLetterQueueSuffix)
-            && (StringComparer.Ordinal.Equals(queue, SqsQueueAddress.DeriveDeadLetterQueueName(options.WorkerQueue, options.DeadLetterQueueSuffix))
-                || StringComparer.Ordinal.Equals(queue, SqsQueueAddress.DeriveDeadLetterQueueName(options.ResponseQueue, options.DeadLetterQueueSuffix)));
-        if (StringComparer.Ordinal.Equals(queue, options.WorkerQueue) || deadLetterCollision)
+            && (SqsQueueAddress.SameQueue(queue, SqsQueueAddress.DeriveDeadLetterQueueName(options.WorkerQueue, options.DeadLetterQueueSuffix))
+                || SqsQueueAddress.SameQueue(queue, SqsQueueAddress.DeriveDeadLetterQueueName(options.ResponseQueue, options.DeadLetterQueueSuffix)));
+        if (SqsQueueAddress.SameQueue(queue, options.WorkerQueue) || deadLetterCollision)
         {
             throw new InvalidOperationException(
                 $"SQS async-response reply target '{targetName}' uses queue '{queue}', which collides with " +

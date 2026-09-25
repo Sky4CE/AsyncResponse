@@ -136,6 +136,212 @@ public sealed class DbTransportSharedCoverageTests
     }
 
     /// <summary>
+    /// Regression: the flow engine signals "host is stopping, hand this delivery back" with
+    /// <see cref="DurableFlowInterruptedException"/>, and it arrives BEFORE the subscriber's own
+    /// stopping token is cancelled (ApplicationStopping fires ahead of every hosted service's
+    /// StopAsync, and the worker subscriber is stopped last). The dispatcher's filter tested only its
+    /// own token, so the hand-back was treated as a handler failure: a "failed on attempt N" warning
+    /// and a NAK — and at the attempt cap, the flow's wake-up dead-lettered with a "Host is stopping"
+    /// reason. It now leaves the claim unsettled, exactly like its own shutdown, and returns — and
+    /// the receive span is no longer marked as an error on the way (a routine shutdown put a failed
+    /// span on the trace of every delivery it handed back).
+    /// </summary>
+    [Theory]
+    [InlineData(Provider.SqlServer)]
+    [InlineData(Provider.PostgreSql)]
+    [InlineData(Provider.MongoDb)]
+    public async Task HostStopHandBack_WhileTheSubscriberTokenIsLive_LeavesTheClaimUnsettled(Provider provider)
+    {
+        foreach (var cap in new[] { 0, 1 })
+        {
+            var calls = new Calls();
+            var logger = new CollectingLogger();
+            using var activities = new AsyncResponseActivityCollector();
+
+            await RunAsync(
+                provider,
+                logger,
+                lockTimeout: TimeSpan.FromSeconds(30),
+                calls: calls,
+                handler: static () => Task.FromException(new DurableFlowInterruptedException("Host is stopping; the flow will resume after the restart.")),
+                maxDeliveryAttempts: cap);
+
+            Assert.Equal(0, calls.Nak);
+            Assert.Equal(0, calls.DeadLetter);
+            Assert.Equal(0, calls.Ack);
+            Assert.DoesNotContain(logger.Messages, message => message.Contains("failed on attempt", StringComparison.Ordinal));
+            Assert.DoesNotContain(logger.Messages, message => message.Contains("dead-lettering", StringComparison.Ordinal));
+            var receive = Assert.Single(activities.All(), activity => activity.OperationName.EndsWith(".receive", StringComparison.Ordinal));
+            Assert.NotEqual(ActivityStatusCode.Error, receive.Status);
+        }
+
+        // Contrast: a real handler failure still marks the same span as an error.
+        using (var failing = new AsyncResponseActivityCollector())
+        {
+            await RunAsync(
+                provider,
+                new CollectingLogger(),
+                lockTimeout: TimeSpan.FromSeconds(30),
+                calls: new Calls(),
+                handler: static () => Task.FromException(new InvalidOperationException("handler blew up")));
+
+            var receive = Assert.Single(failing.All(), activity => activity.OperationName.EndsWith(".receive", StringComparison.Ordinal));
+            Assert.Equal(ActivityStatusCode.Error, receive.Status);
+        }
+    }
+
+    /// <summary>
+    /// Regression: a claim parked on a full early-ACK background queue kept waiting after its
+    /// heartbeat reported the lease LOST (a renew fenced on <c>lock_id</c> alone answers "no match"
+    /// only once a peer re-claimed or finished the row) — and once capacity freed it enqueued and ran
+    /// that row anyway: a job a peer already owned, executed a second time, with this ack's fence
+    /// failing silently. The park now drops the delivery the moment the lease is lost: no enqueue, no
+    /// ack, no NAK (the fence is gone).
+    /// </summary>
+    [Theory]
+    [InlineData(Provider.SqlServer)]
+    [InlineData(Provider.PostgreSql)]
+    [InlineData(Provider.MongoDb)]
+    public async Task EarlyAckPark_DropsTheDelivery_WhenItsLeaseIsLost(Provider provider)
+    {
+        // Only the parked claim ever renews (early-ACK deliveries have no inline heartbeat), and
+        // its store answers "fence gone". Explicit gates and a virtual clock: the worker is proven
+        // to hold the first delivery before the second is handed over (otherwise the second finds
+        // the one-slot queue still full, parks, and is dropped too), and the park's beat runs only
+        // when the clock is walked.
+        var calls = new Calls { RenewResult = false };
+        var clock = new VirtualTimeProvider();
+        var runs = 0;
+        var firstRunning = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseFirst = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var (dispatcher, handle) = CreateEarlyAckDispatcher(
+            provider,
+            calls,
+            handler: async _ =>
+            {
+                Interlocked.Increment(ref runs);
+                firstRunning.TrySetResult();
+                await releaseFirst.Task;
+            },
+            onBackgroundFailure: static () => { },
+            drain: TimeSpan.FromSeconds(10),
+            queueCapacity: 1,
+            clock: clock);
+
+        try
+        {
+            // The first delivery occupies the single worker, the second fills the one-slot queue,
+            // the third parks with its heartbeat armed — and its first renew reports the lease lost.
+            await handle(CancellationToken.None);
+            await firstRunning.Task.WaitAsync(TimeSpan.FromSeconds(30));
+            await handle(CancellationToken.None);
+            Assert.Equal(0, Volatile.Read(ref calls.Renew));
+
+            var parked = handle(CancellationToken.None);
+            await WalkAsync(clock, TimeSpan.FromSeconds(30), until: () => parked.IsCompleted);
+            await parked.WaitAsync(TimeSpan.FromSeconds(30));
+            Assert.True(Volatile.Read(ref calls.Renew) >= 1);
+        }
+        finally
+        {
+            releaseFirst.TrySetResult();
+            await dispatcher.DisposeAsync();
+        }
+
+        Assert.Equal(2, Volatile.Read(ref runs));
+        Assert.Equal(2, calls.Ack);
+        Assert.Equal(0, calls.Nak);
+    }
+
+    /// <summary>
+    /// Regression: a renew attempt was unbounded — the stores pinned CancellationToken.None and set no
+    /// command timeout — so a renew hung on a black-holed pooled connection or a failover failed only
+    /// at the provider's 30 s command timeout (never, on MongoDB), after the 20 s of lease left past
+    /// the beat: the short-backoff retry never got to run inside the lease and a peer re-claimed the
+    /// row under a healthy handler. Each attempt is now bounded by the beat interval, so a hung one is
+    /// abandoned and retried well before <c>locked_until</c>. Virtual clock.
+    /// </summary>
+    [Theory]
+    [InlineData(Provider.SqlServer)]
+    [InlineData(Provider.PostgreSql)]
+    [InlineData(Provider.MongoDb)]
+    public async Task LeaseRenewal_AHungAttempt_IsAbandonedAndRetriedInsideTheLease(Provider provider)
+    {
+        var lockTimeout = TimeSpan.FromSeconds(30);
+        var clock = new VirtualTimeProvider();
+        var calls = new Calls { RenewHangsUntilCancelled = true };
+        var logger = new CollectingLogger();
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var (dispatcher, handle) = CreateInlineDispatcher(provider, calls, () => release.Task, lockTimeout, clock, logger);
+
+        await using (dispatcher)
+        {
+            var handling = handle(CancellationToken.None);
+            try
+            {
+                // Beat at 10 s hangs; its bound fires at 20 s; the retry starts a second later —
+                // all inside the lease the claim stamped (30 s).
+                await WalkAsync(clock, lockTimeout - TimeSpan.FromSeconds(1), until: () => Volatile.Read(ref calls.Renew) >= 2);
+                Assert.True(
+                    Volatile.Read(ref calls.Renew) >= 2,
+                    "a hung renew attempt was never abandoned, so no retry ran before the lease lapsed");
+                Assert.Contains(logger.Messages, message => message.StartsWith("Failed to renew the lease of", StringComparison.Ordinal));
+            }
+            finally
+            {
+                release.TrySetResult();
+                await handling.WaitAsync(TimeSpan.FromSeconds(30));
+            }
+        }
+
+        Assert.Equal(1, calls.Ack);
+    }
+
+    /// <summary>
+    /// Regression: the inline heartbeat's source was LINKED to the subscriber's stopping token, so
+    /// the beat ended the moment the host began stopping — while the handler, which takes no token,
+    /// kept running through the stop budget. <c>locked_until</c> then passed under a live handler, a
+    /// peer (a new replica mid-deploy) claimed the row and ran it concurrently, and the original's
+    /// fenced ack silently no-opped. The beat now ends only when the handler does. Virtual clock.
+    /// </summary>
+    [Theory]
+    [InlineData(Provider.SqlServer)]
+    [InlineData(Provider.PostgreSql)]
+    [InlineData(Provider.MongoDb)]
+    public async Task LeaseRenewal_KeepsBeatingAfterTheSubscriberStops_WhileTheHandlerStillRuns(Provider provider)
+    {
+        // A 1 s beat, so the walk (and the old code's settle waits) stay short.
+        var lockTimeout = TimeSpan.FromSeconds(3);
+        var clock = new VirtualTimeProvider();
+        var calls = new Calls();
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var (dispatcher, handle) = CreateInlineDispatcher(provider, calls, () => release.Task, lockTimeout, clock, new CollectingLogger());
+        using var stopping = new CancellationTokenSource();
+
+        await using (dispatcher)
+        {
+            var handling = handle(stopping.Token);
+            try
+            {
+                // The host starts stopping while the handler is still running.
+                await stopping.CancelAsync();
+
+                await WalkAsync(clock, TimeSpan.FromSeconds(2.5), until: () => Volatile.Read(ref calls.RenewSucceeded) >= 2);
+                Assert.True(
+                    Volatile.Read(ref calls.RenewSucceeded) >= 2,
+                    $"the lease heartbeat stopped with the subscriber while the handler still ran ({Volatile.Read(ref calls.Renew)} renew call(s))");
+            }
+            finally
+            {
+                release.TrySetResult();
+                await handling.WaitAsync(TimeSpan.FromSeconds(30));
+            }
+        }
+
+        Assert.Equal(1, calls.Ack);
+    }
+
+    /// <summary>
     /// A handler that completes before the first beat produces no renewal activity — the beat is
     /// cancelled exception-free before it fires — and the grace wait proves nothing keeps beating
     /// after the ack (no leaked renewal loop). The heartbeat is still ARMED before the handler
@@ -428,6 +634,42 @@ public sealed class DbTransportSharedCoverageTests
             $"DisposeAsync took {stopwatch.Elapsed} against a {drain} budget");
     }
 
+    /// <summary>
+    /// Regression (round-43 pre-commit review): an early-ACK job the flow engine handed back at
+    /// host stop (DurableFlowInterruptedException) was logged as a background handler FAILURE at
+    /// Error and dead-lettered under the generic failure reason — an alert on every deploy, while
+    /// Kafka, RabbitMQ, Redis and NATS log it as a warning and dead-letter it as
+    /// handed_back_after_commit. The copy still matters: the early ACK deleted the row, so nothing
+    /// else records the wake-up.
+    /// </summary>
+    [Theory]
+    [InlineData(Provider.SqlServer)]
+    [InlineData(Provider.PostgreSql)]
+    [InlineData(Provider.MongoDb)]
+    public async Task EarlyAck_HostStopHandBack_IsAWarning_DeadLetteredAsHandedBackAfterCommit(Provider provider)
+    {
+        var calls = new Calls();
+        var log = new CollectingLogger();
+        var backgroundFailures = 0;
+        var (dispatcher, handle) = CreateEarlyAckDispatcher(
+            provider,
+            calls,
+            handler: _ => throw new DurableFlowInterruptedException("The host is stopping; the delivery is handed back."),
+            onBackgroundFailure: () => Interlocked.Increment(ref backgroundFailures),
+            drain: TimeSpan.FromSeconds(5),
+            log: log);
+
+        await using (dispatcher)
+        {
+            await handle(CancellationToken.None);
+            await Eventually(() => calls.DeadLetter == 1 && Volatile.Read(ref backgroundFailures) == 1);
+        }
+
+        Assert.StartsWith("handed_back_after_commit", calls.LastDeadLetterException?.Message, StringComparison.Ordinal);
+        Assert.Contains(log.Messages, message => message.Contains("handed back by the flow engine", StringComparison.Ordinal));
+        Assert.DoesNotContain(log.Messages, message => message.Contains("background handler failed", StringComparison.Ordinal));
+    }
+
     private static (IAsyncDisposable Dispatcher, Func<CancellationToken, Task> Handle) CreateEarlyAckDispatcher(
         Provider provider,
         Calls calls,
@@ -435,9 +677,11 @@ public sealed class DbTransportSharedCoverageTests
         Action onBackgroundFailure,
         TimeSpan drain,
         int queueCapacity = 8,
-        TimeSpan? lockTimeout = null)
+        TimeSpan? lockTimeout = null,
+        TimeProvider? clock = null,
+        CollectingLogger? log = null)
     {
-        var logger = new CollectingLogger();
+        var logger = log ?? new CollectingLogger();
         var lease = lockTimeout ?? TimeSpan.FromSeconds(30);
         switch (provider)
         {
@@ -451,7 +695,7 @@ public sealed class DbTransportSharedCoverageTests
                 var subscriber = new SqlServerSubscriberOptions();
                 subscriber.UseAckAfterEnqueue(1, queueCapacity, drain);
                 subscriber.OnBackgroundFailure = _ => { onBackgroundFailure(); return ValueTask.CompletedTask; };
-                var dispatcher = new SqlServerMessageDispatcher((_, token) => handler(token), options, subscriber, logger, SqlServerSubscriberRole.Worker);
+                var dispatcher = new SqlServerMessageDispatcher((_, token) => handler(token), options, subscriber, logger, SqlServerSubscriberRole.Worker, clock);
                 return (dispatcher, token => dispatcher.HandleAsync(
                     new SqlServerTransportDelivery(
                         Guid.NewGuid(), "worker", "{}", Headers, 1,
@@ -465,7 +709,7 @@ public sealed class DbTransportSharedCoverageTests
                 var subscriber = new PostgreSqlSubscriberOptions();
                 subscriber.UseAckAfterEnqueue(1, queueCapacity, drain);
                 subscriber.OnBackgroundFailure = _ => { onBackgroundFailure(); return ValueTask.CompletedTask; };
-                var dispatcher = new PostgreSqlMessageDispatcher((_, token) => handler(token), options, subscriber, logger, PostgreSqlSubscriberRole.Worker);
+                var dispatcher = new PostgreSqlMessageDispatcher((_, token) => handler(token), options, subscriber, logger, PostgreSqlSubscriberRole.Worker, clock);
                 return (dispatcher, token => dispatcher.HandleAsync(
                     new PostgreSqlTransportDelivery(
                         Guid.NewGuid(), "worker", "{}", Headers, 1,
@@ -479,7 +723,7 @@ public sealed class DbTransportSharedCoverageTests
                 var subscriber = new MongoDbSubscriberOptions();
                 subscriber.UseAckAfterEnqueue(1, queueCapacity, drain);
                 subscriber.OnBackgroundFailure = _ => { onBackgroundFailure(); return ValueTask.CompletedTask; };
-                var dispatcher = new MongoDbMessageDispatcher((_, token) => handler(token), options, subscriber, logger, MongoDbSubscriberRole.Worker);
+                var dispatcher = new MongoDbMessageDispatcher((_, token) => handler(token), options, subscriber, logger, MongoDbSubscriberRole.Worker, clock);
                 return (dispatcher, token => dispatcher.HandleAsync(
                     new MongoDbTransportDelivery(
                         Guid.NewGuid(), "worker", "{}", Headers, 1,
@@ -673,6 +917,41 @@ public sealed class DbTransportSharedCoverageTests
 
         var badName = Materialize("""{"\udc00":"noise","AR-CorrelationId":"abc"}""");
         Assert.Equal("abc", Assert.Single(badName).Value);
+    }
+
+    /// <summary>
+    /// Regression: a RAW lone surrogate (not the escape) in <c>headers_json</c> — SQL Server's
+    /// <c>nvarchar(max)</c> stores UTF-16 code units unvalidated and SqlClient returns them verbatim
+    /// — cannot even be transcoded to the UTF-8 <c>JsonDocument.Parse(string)</c> reads, and that
+    /// throws <see cref="ArgumentException"/>, which the <see cref="System.Text.Json.JsonException"/>
+    /// guard let through: inside <c>TryClaimAsync</c>, after the claim committed, before any delivery
+    /// existed — an unkillable poison row that tore the subscriber down on every re-claim. The
+    /// unusable column now degrades to no headers. Built in the body: theory data mangles lone
+    /// surrogates.
+    /// </summary>
+    [Theory]
+    [InlineData(typeof(SqlServerAsyncResponseTransportOptions))]
+    [InlineData(typeof(PostgreSqlAsyncResponseTransportOptions))]
+    [InlineData(typeof(MongoDbAsyncResponseTransportOptions))]
+    public void HeaderMaterialization_DegradesARawLoneSurrogateToNoHeaders_InsteadOfThrowing(Type marker)
+    {
+        var materialize = marker.Assembly
+            .GetType("AsyncResponse.Transports.DbTransportHeaders", throwOnError: true)!
+            .GetMethod("Materialize", BindingFlags.Public | BindingFlags.Static)!;
+        var json = "{\"AR-CorrelationId\":\"abc\",\"noise\":\"" + '\ud800' + "\"}";
+
+        IReadOnlyDictionary<string, string> headers;
+        try
+        {
+            headers = (IReadOnlyDictionary<string, string>)materialize.Invoke(null, [json])!;
+        }
+        catch (TargetInvocationException ex) when (ex.InnerException is not null)
+        {
+            System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(ex.InnerException).Throw();
+            throw;
+        }
+
+        Assert.Empty(headers);
     }
 
     public enum Provider
@@ -1037,9 +1316,12 @@ public sealed class DbTransportSharedCoverageTests
         /// <summary>When set, every burial takes this long to commit and is counted only once it has.</summary>
         public TimeSpan DeadLetterDelay;
 
+        public Exception? LastDeadLetterException;
+
         public ValueTask<bool> DeadLetterAsync(Exception exception, bool deleteOriginal, CancellationToken cancellationToken)
         {
             LastDeadLetterToken = cancellationToken;
+            LastDeadLetterException = exception;
             if (DeadLetterDelay > TimeSpan.Zero)
                 return new ValueTask<bool>(SlowDeadLetterAsync());
 
@@ -1068,17 +1350,28 @@ public sealed class DbTransportSharedCoverageTests
 
         public int RenewSucceeded;
 
-        public ValueTask<bool> RenewAsync()
+        /// <summary>When set, every renew hangs until the token it was handed fires (a black-holed connection).</summary>
+        public bool RenewHangsUntilCancelled;
+
+        public ValueTask<bool> RenewAsync(CancellationToken cancellationToken)
         {
             Interlocked.Increment(ref Renew);
             if (RenewThrows || Interlocked.Decrement(ref RenewFailuresRemaining) >= 0)
                 throw new InvalidOperationException("lease store unavailable");
+            if (RenewHangsUntilCancelled)
+                return new ValueTask<bool>(HangAsync(cancellationToken));
             if (RenewGate is not null)
                 return new ValueTask<bool>(RenewGate.Task);
 
             if (RenewResult)
                 Interlocked.Increment(ref RenewSucceeded);
             return ValueTask.FromResult(RenewResult);
+        }
+
+        private static async Task<bool> HangAsync(CancellationToken cancellationToken)
+        {
+            await Task.Delay(Timeout.Infinite, cancellationToken);
+            return true;
         }
     }
 

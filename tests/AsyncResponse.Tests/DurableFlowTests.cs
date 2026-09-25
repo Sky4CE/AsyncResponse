@@ -574,6 +574,49 @@ public class DurableFlowTests
         lease.ThrowIfLost();
     }
 
+    [Theory]
+    [InlineData("value")]
+    [InlineData("progress")]
+    [InlineData("await")]
+    public async Task ACallerCancelledSave_IsACancellation_NotALostLease(string call)
+    {
+        // Fixpoint r1 (S1#14): the round-32 rule (a caller's token never marks the lease lost)
+        // covered step completions only. SetValueAsync, ReportProgressAsync and an awaited step's
+        // breadcrumb still saved under the caller's token, and the store's cancellation tripped
+        // MarkLost on a lease whose row was intact: every later context call then failed with
+        // "lost its execution lease", and an awaited step's fault checkpoint replaced the
+        // cancellation with that misdiagnosis.
+        var store = new InMemoryFlowStateStore();
+        var state = new FlowState { FlowId = $"caller-cancelled-{call}" };
+        await using var lease = await CreateLeaseAsync(store, state);
+        var context = new DurableFlowContext(
+            state,
+            store,
+            Mock.Of<IAsyncResponseBuilder>(),
+            new AsyncResponseContextPropagation([]),
+            new DurableFlowOptions { ProgressPersistenceInterval = TimeSpan.Zero },
+            SubscriberReturning(new TaskCompletionSource<OperationResult>().Task, []),
+            recoverableSubscriber: null,
+            NullLogger.Instance,
+            lease);
+        using var cancelled = new CancellationTokenSource();
+        cancelled.Cancel();
+
+        Func<Task> cancelledCall = call switch
+        {
+            "value" => () => context.SetValueAsync("key", 1, cancelled.Token),
+            "progress" => () => context.ReportProgressAsync("working", cancelled.Token),
+            _ => () => context.AwaitStepAsync<OperationResult>("remote", _ => Task.CompletedTask, cancellationToken: cancelled.Token)
+        };
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(cancelledCall);
+
+        Assert.False(lease.IsLost);
+        // The execution carries on under its intact lease.
+        Assert.Equal(7, await context.StepAsync("after", () => Task.FromResult(7)));
+        Assert.True((await store.LoadAsync(state.FlowId!))!.Steps!["after"].Completed);
+    }
+
     [Fact]
     public async Task AwaitStep_ResponseWinningTheDisposalSettlement_IsCheckpointedNotStranded()
     {
@@ -635,16 +678,17 @@ public class DurableFlowTests
     }
 
     [Fact]
-    public async Task AwaitStep_CancellationTearingTheBreadcrumbSave_AbandonsTheLeaseForFreshRestart()
+    public async Task AwaitStep_CancellationTearingTheBreadcrumbSave_EndsInAFreshRestart()
     {
         // The one interleave a since-deleted 200-iteration scheduler lottery kept surfacing, now
         // pinned deterministically (the other two legal outcomes of cancellation-vs-response have
         // their own deterministic facts above): the token fires INSIDE the breadcrumb write
-        // itself. Whether the store applied the torn write is unknowable, so the lease is
-        // conservatively abandoned (store-throw => MarkLost) and the surfaced failure carries the
-        // cancellation as its cause. The trigger never ran — nothing was sent — so the
-        // redelivered execution starting the step FRESH is contract-correct, and nothing may be
-        // persisted that would make it re-attach instead.
+        // itself. The trigger never ran — nothing was sent — so the redelivered execution starting
+        // the step FRESH is contract-correct, and nothing may be persisted that would make it
+        // re-attach instead. The caller's cancellation is surfaced as itself and leaves the lease
+        // intact (fixpoint r1, S1#14): it used to be read as a lost lease. Whether the store
+        // applied the torn write stays unknowable — had it, the fault checkpoint's
+        // compare-and-swap is refused and diagnoses it, exactly as a lost lease used to.
         using var cancellation = new CancellationTokenSource();
         var store = new CancelOnNthUpdateStore(cancellation, 1);
         var state = new FlowState { FlowId = "torn-breadcrumb-flow" };
@@ -677,7 +721,7 @@ public class DurableFlowTests
             lease);
 
         var triggerRan = false;
-        var surfaced = await Assert.ThrowsAsync<InvalidOperationException>(() => context.AwaitStepAsync<OperationResult>(
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => context.AwaitStepAsync<OperationResult>(
             "torn-step",
             _ =>
             {
@@ -686,17 +730,18 @@ public class DurableFlowTests
             },
             cancellationToken: cancellation.Token));
 
-        // Takeover-shaped failure with the cancellation attached — the caller can tell WHY the
-        // lease was abandoned.
-        Assert.IsAssignableFrom<OperationCanceledException>(surfaced.InnerException);
         // The breadcrumb save precedes the send, so the torn write cannot have double-sent.
         Assert.False(triggerRan);
+        Assert.False(lease.IsLost);
 
-        // Fresh-restart shape: the persisted ledger never saw the step — no breadcrumb to
-        // re-attach to, no fault marker (the fault save was refused by the lost lease).
+        // Fresh-restart shape: no live breadcrumb to re-attach to — the step is recorded as
+        // faulted, which makes the next execution mint a fresh correlation id.
         var persisted = await store.LoadAsync("torn-breadcrumb-flow");
         Assert.NotNull(persisted);
-        Assert.True(persisted!.Steps is null || !persisted.Steps.ContainsKey("torn-step"));
+        Assert.True(
+            persisted!.Steps is null
+            || !persisted.Steps.TryGetValue("torn-step", out var torn)
+            || torn.Faulted || torn.PendingCorrelationId is null);
     }
 
 
@@ -895,8 +940,12 @@ public class DurableFlowTests
     }
 
     [Fact]
-    public async Task ReportProgress_CoalescesPersistenceAndFlushesLatestValue()
+    public async Task ReportProgress_CoalescesPersistence_IntoTheNextCheckpoint_NotAFlushTheOutcomeOverwrites()
     {
+        // The body's end used to flush a throttled report with a whole-ledger write, which the
+        // executor's terminal save (Status + its own LastMessage) overwrote the next moment — one
+        // wasted store write per run (fixpoint r1, GS1#7). The coalesced value rides the next
+        // checkpoint instead.
         var state = new FlowState { FlowId = "progress-flow" };
         var store = new RecordingFlowStateStore();
         await using var lease = await CreateLeaseAsync(store, state);
@@ -916,7 +965,67 @@ public class DurableFlowTests
         await context.ReportProgressAsync("three");
         await context.FlushProgressAsync();
 
+        Assert.Equal(["one"], store.PersistedMessages);
+
+        await context.SetValueAsync("key", 1);
         Assert.Equal(["one", "three"], store.PersistedMessages);
+    }
+
+    [Fact]
+    public async Task StepsRunInParallelInsideAStepBody_AreRefused_WhileSequentialNestingAtAnyDepthStillWorks()
+    {
+        // Fixpoint r1 (GS1#6): being inside SOME running step used to admit a call as "nested",
+        // so Task.WhenAll over two context calls inside one step's body let both run concurrently
+        // — interleaving one ledger and one revision counter, the very race the guard exists for.
+        var state = new FlowState { FlowId = "parallel-in-a-step" };
+        var store = new InMemoryFlowStateStore();
+        await using var lease = await CreateLeaseAsync(store, state);
+        var context = new DurableFlowContext(
+            state,
+            store,
+            Mock.Of<IAsyncResponseBuilder>(),
+            new AsyncResponseContextPropagation([]),
+            new DurableFlowOptions(),
+            Mock.Of<IAsyncResponseSubscriber>(),
+            recoverableSubscriber: null,
+            NullLogger.Instance,
+            lease);
+
+        Exception? second = null;
+        var ranB = false;
+        await context.StepAsync("outer", async () =>
+        {
+            var gate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            var a = context.StepAsync("inner-a", async () => await gate.Task);
+            second = await Record.ExceptionAsync(() => context.StepAsync("inner-b", () =>
+            {
+                ranB = true;
+                return Task.CompletedTask;
+            }));
+            gate.SetResult();
+            await a;
+        });
+
+        var refused = Assert.IsType<InvalidOperationException>(second);
+        Assert.Contains("while another step", refused.Message, StringComparison.Ordinal);
+        Assert.False(ranB);
+
+        // Sequential nesting stays allowed at any depth, and so do sequential siblings inside a body.
+        await context.StepAsync("level-1", async () =>
+        {
+            await context.StepAsync("level-2", async () =>
+            {
+                await context.StepAsync("level-3a", () => Task.CompletedTask);
+                await context.StepAsync("level-3b", () => Task.CompletedTask);
+            });
+            await context.StepAsync("level-2b", () => Task.CompletedTask);
+        });
+        await context.StepAsync("after", () => Task.CompletedTask);
+
+        var persisted = (await store.LoadAsync(state.FlowId!))!.Steps!;
+        Assert.All(new[] { "outer", "inner-a", "level-1", "level-2", "level-3a", "level-3b", "level-2b", "after" },
+            step => Assert.True(persisted[step].Completed, step));
+        Assert.False(persisted.ContainsKey("inner-b"));
     }
 
     [Fact]

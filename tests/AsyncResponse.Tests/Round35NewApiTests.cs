@@ -24,6 +24,7 @@ public sealed class Round35NewApiTests
             .WithInMemoryChannel()
             .WithInMemoryDurableFlows()
             .WithDurableFlow<Round35RegressionTests.R35MarkerFlow, Round35RegressionTests.R35Input>();
+        services.AddSingleton<Round35RegressionTests.R35ExecutionCounter>();
         services.AddSingleton(transport);
         return services.BuildServiceProvider();
     }
@@ -59,10 +60,11 @@ public sealed class Round35NewApiTests
         const string id = "flow-r35-conflict";
         Assert.True(await store.TryCreateAsync(id, InitialState(id, """{"Name":"first"}"""), TimeSpan.FromDays(1)));
 
-        var before = Volatile.Read(ref Round35RegressionTests.R35MarkerFlow.Executions);
+        var counter = provider.GetRequiredService<Round35RegressionTests.R35ExecutionCounter>();
+        var before = counter.Executions;
         await executor.CreateAndExecuteAsync(id, FlowStateJson.Serialize(InitialState(id, """{"Name":"second"}""")));
 
-        Assert.Equal(before, Volatile.Read(ref Round35RegressionTests.R35MarkerFlow.Executions));
+        Assert.Equal(before, counter.Executions);
         var untouched = await store.LoadAsync(id);
         Assert.NotNull(untouched);
         Assert.Equal("""{"Name":"first"}""", untouched!.InputJson);
@@ -81,11 +83,12 @@ public sealed class Round35NewApiTests
         const string id = "flow-r35-same-start";
         Assert.True(await store.TryCreateAsync(id, InitialState(id, """{"Name":"acme"}"""), TimeSpan.FromDays(1)));
 
-        var before = Volatile.Read(ref Round35RegressionTests.R35MarkerFlow.Executions);
+        var counter = provider.GetRequiredService<Round35RegressionTests.R35ExecutionCounter>();
+        var before = counter.Executions;
         // Semantically identical input (different formatting) is the same start.
         await executor.CreateAndExecuteAsync(id, FlowStateJson.Serialize(InitialState(id, """{ "Name" : "acme" }""")));
 
-        Assert.Equal(before + 1, Volatile.Read(ref Round35RegressionTests.R35MarkerFlow.Executions));
+        Assert.Equal(before + 1, counter.Executions);
         Assert.Equal(FlowRunStatus.Succeeded, (await store.LoadAsync(id))!.Status);
     }
 
@@ -114,6 +117,186 @@ public sealed class Round35NewApiTests
             for (var i = 0; i < 6; i++)
                 await flow.StepAsync($"step-{i}", () => Task.FromResult(new string('x', 1024)));
         }
+    }
+
+    public sealed class TinyChildFlow : IDurableFlow<ChattyInput>
+    {
+        public Task ExecuteAsync(IDurableFlowContext flow, ChattyInput input) => Task.CompletedTask;
+    }
+
+    /// <summary>Awaits ten children one after another: eleven executions of one already-large ledger.</summary>
+    public sealed class ManyWakeUpsFlow : IDurableFlow<ChattyInput>
+    {
+        public async Task ExecuteAsync(IDurableFlowContext flow, ChattyInput input)
+        {
+            for (var i = 0; i < 10; i++)
+                await flow.AwaitChildFlowAsync<TinyChildFlow, ChattyInput>($"child-{i}", new ChattyInput("c"));
+        }
+    }
+
+    [Fact]
+    public async Task LedgerGrowth_AcrossManyWakeUps_IsLoggedPerDoubling_NotOncePerExecution()
+    {
+        // Fixpoint r1 (GS1#5): every wake-up builds a fresh context, and each one started at the
+        // bare threshold — a run already past it warned again on the first save of EVERY execution.
+        var logger = new CollectingLogger();
+        var services = new ServiceCollection();
+        services.AddSingleton(typeof(ILogger<>), typeof(NullLogger<>));
+        services.AddSingleton<ILogger<DurableFlowExecutor>>(logger.For<DurableFlowExecutor>());
+        services
+            .AddAsyncResponse()
+            .WithInMemoryChannel()
+            .WithInMemoryTransport()
+            .WithInMemoryDurableFlows(options =>
+            {
+                options.LedgerSizeWarningBytes = 512;
+                // The run is real (in-memory transport, system clock): a parent wake-up that
+                // beats the parked parent's lease release waits one contention poll, which is
+                // min(renew interval, 2 s). At the default that was up to 2 s per child, ten
+                // times over, against the deadline below; at 100 ms it is milliseconds.
+                options.ExecutionLeaseRenewInterval = TimeSpan.FromMilliseconds(100);
+            })
+            .WithDurableFlow<ManyWakeUpsFlow, ChattyInput>()
+            .WithDurableFlow<TinyChildFlow, ChattyInput>();
+        await using var provider = services.BuildServiceProvider();
+        var hosted = provider.GetServices<IHostedService>().ToArray();
+        foreach (var service in hosted)
+            await service.StartAsync(CancellationToken.None);
+
+        try
+        {
+            var flows = provider.GetRequiredService<IDurableFlows>();
+            // A kilobyte of input: the ledger is past the 512-byte threshold from its first save.
+            var id = await flows.StartAsync<ManyWakeUpsFlow, ChattyInput>(new ChattyInput(new string('x', 1024)), "flow-gs15-wakeups");
+
+            var deadline = DateTime.UtcNow.AddSeconds(30);
+            FlowState? state;
+            do
+            {
+                state = await flows.GetStateAsync(id);
+                if (state?.Status == FlowRunStatus.Succeeded)
+                    break;
+                await Task.Delay(20);
+            }
+            while (DateTime.UtcNow < deadline);
+            Assert.Equal(FlowRunStatus.Succeeded, state?.Status);
+            Assert.True(state!.Attempts >= 11, $"expected one execution per child wake-up, saw {state.Attempts}");
+
+            // ~1 KiB growing to a few KiB: a handful of doublings, not one warning per execution.
+            var warnings = logger.Messages.Where(m => m.Contains("LedgerSizeWarningBytes threshold", StringComparison.Ordinal)
+                && m.Contains(id, StringComparison.Ordinal)).ToArray();
+            Assert.InRange(warnings.Length, 1, 4);
+
+            // Precommit review (A3): and the FIRST crossing is logged. The input alone put the
+            // ledger past the threshold (~1.1 KiB), so the first warning reports that size, as the
+            // first execution begins — seeding every execution at the next doubling, the first one
+            // included, skipped it and warned only once the ledger reached 2 KiB.
+            var firstWarnedSize = long.Parse(
+                System.Text.RegularExpressions.Regex.Match(warnings[0], @"roughly (\d+) bytes").Groups[1].Value,
+                System.Globalization.CultureInfo.InvariantCulture);
+            Assert.InRange(firstWarnedSize, 1024, 2047);
+        }
+        finally
+        {
+            foreach (var service in hosted)
+                await service.StopAsync(CancellationToken.None);
+        }
+    }
+
+    [Theory]
+    [InlineData(1, 1)]   // the run's first execution: no earlier one can have warned
+    [InlineData(2, 0)]   // a later one: the first execution already did
+    public async Task ALedgerItsStartAlreadyMadeLarge_IsWarnedAsItsFirstExecutionBegins_AndNotAgainLater(int attempts, int expectedWarnings)
+    {
+        // Precommit review (A3): each context seeded its first warning at the next doubling above
+        // the ledger's current size, the first execution's included — so a ledger already past the
+        // threshold when the run started (a 600 KiB input against the 512 KiB default) logged its
+        // first crossing never, only a later doubling if one came. The step below adds nothing
+        // like a doubling: the warning must not wait for one.
+        var clock = new AsyncResponse.Testing.VirtualTimeProvider();
+        var transport = new DurableFlowContextTestSupport.RecordingTransport();
+        await using var provider = DurableFlowContextTestSupport.BuildProvider(transport, clock);
+        var store = provider.GetRequiredService<IFlowStateStore>();
+        var options = DurableFlowContextTestSupport.Options(o => o.LedgerSizeWarningBytes = 512);
+        var state = DurableFlowContextTestSupport.State($"large-from-its-start-{attempts}");
+        state.InputJson = System.Text.Json.JsonSerializer.Serialize(new ChattyInput(new string('x', 600)));
+        state.Attempts = attempts;
+        Assert.True(await store.TryCreateAsync(state.FlowId!, state, options.StateExpiry));
+        await using var lease = await DurableFlowContextTestSupport.AcquireAsync(store, state.FlowId!, options, clock);
+        var logger = new CollectingLogger();
+
+        var context = DurableFlowContextTestSupport.CreateContext(provider, state, store, lease, options, clock, transport, logger);
+        await context.StepAsync("small", () => Task.CompletedTask);
+
+        var warnings = logger.Messages.Where(m => m.Contains("LedgerSizeWarningBytes threshold", StringComparison.Ordinal)).ToArray();
+        Assert.Equal(expectedWarnings, warnings.Length);
+        Assert.All(warnings, warning => Assert.Contains(state.FlowId!, warning, StringComparison.Ordinal));
+    }
+
+    /// <summary>One small step: a later execution that saves once, well short of any doubling.</summary>
+    public sealed class OneSmallStepFlow : IDurableFlow<ChattyInput>
+    {
+        public async Task ExecuteAsync(IDurableFlowContext flow, ChattyInput input)
+            => await flow.StepAsync("small", () => Task.FromResult(1));
+    }
+
+    private static ServiceProvider BuildLedgerWarningProvider(CollectingLogger logger)
+    {
+        var services = new ServiceCollection();
+        services.AddSingleton(typeof(ILogger<>), typeof(NullLogger<>));
+        services.AddSingleton<ILogger<DurableFlowExecutor>>(logger.For<DurableFlowExecutor>());
+        services
+            .AddAsyncResponse()
+            .WithInMemoryChannel()
+            .WithInMemoryDurableFlows(options => options.LedgerSizeWarningBytes = 512)
+            .WithDurableFlow<OneSmallStepFlow, ChattyInput>();
+        services.AddSingleton<IWorkerTransport>(new NullWorkerTransport());
+        return services.BuildServiceProvider();
+    }
+
+    private static FlowState SmallLedger(string flowId, Type flowType, int attempts) => new()
+    {
+        FlowId = flowId,
+        FlowTypeName = flowType.FullName,
+        InputTypeName = typeof(ChattyInput).FullName,
+        InputJson = System.Text.Json.JsonSerializer.Serialize(new ChattyInput("c")),
+        Status = FlowRunStatus.Running,
+        Attempts = attempts,
+        CreatedAtUtc = DateTime.UtcNow,
+        UpdatedAtUtc = DateTime.UtcNow
+    };
+
+    private static string[] LedgerWarnings(CollectingLogger logger, string flowId)
+        => logger.Messages.Where(m => m.Contains("LedgerSizeWarningBytes threshold", StringComparison.Ordinal)
+            && m.Contains(flowId, StringComparison.Ordinal)).ToArray();
+
+    [Fact]
+    public async Task ALedgerARecoveredResponsePushesPastTheThreshold_BetweenLaterExecutions_IsWarnedExactlyOnce()
+    {
+        // Pass-2 precommit review (A3 residual): only the first execution warns at the bare
+        // threshold; every later one seeds at the next doubling above the ledger's size. A crossing
+        // made between executions by a lease-less write — here the recovery checkpoint of a large
+        // recovered response after execution 2 died — was therefore never logged: execution 3
+        // started above it. The write that crosses now warns, and execution 3 does not repeat it.
+        var logger = new CollectingLogger();
+        await using var provider = BuildLedgerWarningProvider(logger);
+        var store = provider.GetRequiredService<IFlowStateStore>();
+        var executor = provider.GetRequiredService<IDurableFlowExecutor>();
+        var ledger = SmallLedger("recovered-past-the-threshold", typeof(OneSmallStepFlow), attempts: 2);
+        ledger.Steps = new Dictionary<string, FlowStepState> { ["remote"] = new() { PendingCorrelationId = "cid" } };
+        Assert.True(await store.TryCreateAsync(ledger.FlowId!, ledger, TimeSpan.FromDays(1)));
+        Assert.InRange(FlowStateJson.EstimateLedgerChars(ledger), 0, 511);
+
+        await executor.RecoverAsync(ledger.FlowId!, new ChattyInput(new string('x', 700)), "cid");
+        Assert.InRange(FlowStateJson.EstimateLedgerChars((await store.LoadAsync(ledger.FlowId!))!), 512, 1023);
+        Assert.Single(LedgerWarnings(logger, ledger.FlowId!));
+
+        await executor.ExecuteAsync(ledger.FlowId!);
+
+        var finished = await store.LoadAsync(ledger.FlowId!);
+        Assert.Equal(FlowRunStatus.Succeeded, finished!.Status);
+        Assert.Equal(3, finished.Attempts);
+        Assert.Single(LedgerWarnings(logger, ledger.FlowId!));
     }
 
     [Fact]

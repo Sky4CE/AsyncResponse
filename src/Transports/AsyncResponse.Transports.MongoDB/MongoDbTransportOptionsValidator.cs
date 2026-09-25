@@ -62,6 +62,26 @@ internal static class MongoDbTransportOptionsValidator
             transportOptions.HostShutdownTimeout,
             ($"{nameof(MongoDbSubscriberOptions)}.{nameof(subscriber.BackgroundDrainTimeout)} ({role})", subscriber.BackgroundDrainTimeout),
             ($"{nameof(MongoDbAsyncResponseTransportOptions)}.{nameof(transportOptions.ShutdownTimeout)}", transportOptions.ShutdownTimeout));
+
+        // Both roles early-ACK: the host stops its hosted services ONE AFTER ANOTHER (the .NET
+        // default HostOptions.ServicesStopConcurrently = false, in reverse registration order), so
+        // the response subscriber's whole stop spend runs to completion before the worker's stop
+        // even begins — the worker keeps claiming and early-ACKing meanwhile — and the two spends
+        // ADD UP. Checked per role, each passed alone (20 + 5 <= 30 with stock defaults) while the
+        // worker's drain got only what the response side left, and the already-ACKed rows the host
+        // abandoned mid-drain (deleted from the table) vanished with no dead-letter record.
+        if (transportOptions.WorkerSubscriber.AckMode is MongoDbAckMode.AckAfterEnqueue
+            && transportOptions.ResponseSubscriber.AckMode is MongoDbAckMode.AckAfterEnqueue)
+        {
+            ShutdownBudgetValidator.Validate(
+                "MongoDB",
+                $"{nameof(MongoDbAsyncResponseTransportOptions)}.{nameof(transportOptions.HostShutdownTimeout)}",
+                transportOptions.HostShutdownTimeout,
+                ($"{nameof(MongoDbSubscriberOptions)}.{nameof(subscriber.BackgroundDrainTimeout)} (Worker)", transportOptions.WorkerSubscriber.BackgroundDrainTimeout),
+                ($"{nameof(MongoDbAsyncResponseTransportOptions)}.{nameof(transportOptions.ShutdownTimeout)} (Worker)", transportOptions.ShutdownTimeout),
+                ($"{nameof(MongoDbSubscriberOptions)}.{nameof(subscriber.BackgroundDrainTimeout)} (ResponseIngress)", transportOptions.ResponseSubscriber.BackgroundDrainTimeout),
+                ($"{nameof(MongoDbAsyncResponseTransportOptions)}.{nameof(transportOptions.ShutdownTimeout)} (ResponseIngress)", transportOptions.ShutdownTimeout));
+        }
     }
 
     public static void ValidateSubscriber(MongoDbSubscriberOptions subscriber, string role)

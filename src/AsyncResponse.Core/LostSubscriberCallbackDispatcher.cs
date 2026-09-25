@@ -126,7 +126,7 @@ internal sealed class LostSubscriberCallbackDispatcher(
                     continue;
 
                 callbackInvoked = true;
-                await DeleteConsumedRegistrationAsync(recoveryStateStore, correlationId, recoveryState.RegistrationId, cancellationToken).ConfigureAwait(false);
+                await DeleteConsumedRegistrationAsync(recoveryStateStore, correlationId, recoveryState.RegistrationId).ConfigureAwait(false);
             }
             catch (Exception ex)
             {
@@ -186,7 +186,7 @@ internal sealed class LostSubscriberCallbackDispatcher(
                     continue;
 
                 callbackInvoked = true;
-                await DeleteConsumedRegistrationAsync(recoveryStateStore, correlationId, recoveryState.RegistrationId, cancellationToken).ConfigureAwait(false);
+                await DeleteConsumedRegistrationAsync(recoveryStateStore, correlationId, recoveryState.RegistrationId).ConfigureAwait(false);
             }
             catch (Exception ex)
             {
@@ -220,7 +220,11 @@ internal sealed class LostSubscriberCallbackDispatcher(
     /// the ingress burning its own retry ladder on an earlier sibling's failure and then escalating
     /// through <c>SetException</c>, which re-invokes the very failure callback that just gave up.
     /// Any other transient failure is wrapped for the same redelivery path. Only an entirely
-    /// deterministic set retains the ingress's retry-then-escalate handling.
+    /// deterministic set is rethrown raw — a resume that can never be wired up — and the ingress
+    /// escalates that through <c>SetException</c> on the first attempt: it excludes
+    /// <see cref="IsPermanentCallbackFailure"/> from its retry ladder, since no later attempt can
+    /// succeed. (The exception route never reaches this with a deterministic failure: its failure
+    /// callback's deterministic faults are logged and acknowledged where they happen.)
     /// </summary>
     private static void ThrowUnsettled(List<ExceptionDispatchInfo> failures, string correlationId)
     {
@@ -458,19 +462,16 @@ internal sealed class LostSubscriberCallbackDispatcher(
 
             _logger.LogWarning("No subscribers for channel {Channel}; invoking failure callback.", channel);
 
-            var invocation = ReflectionExtensions.ResolveCallback(
-                recoveryState.FailureCallback,
-                payload: null,
-                exception: exception,
-                correlationId: recoveryState.CorrelationId
-            );
+            // The same ladder and the same settlement as the response route's failure callback:
+            // a deterministic fault (unauthorized, unresolvable, malformed, no longer binding) is
+            // logged and acknowledged with the registration kept — this route IS the SetException
+            // escalation, so rethrowing it only made the transport redeliver the same fault
+            // forever (RabbitMQ's default requeue has no cap) and handed a direct SetException
+            // caller an internal exception type.
+            var invoked = await InvokeFailureCallbackAsync(recoveryState, payload: null, exception, channel, activity).ConfigureAwait(false);
+            activity?.SetTag("asyncresponse.recovery.callback_invoked", invoked);
 
-            await InvokeAsync(invocation, recoveryState.Context).ConfigureAwait(false);
-
-            _logger.LogInformation("Failure callback invoked for channel {Channel}.", channel);
-            activity?.SetTag("asyncresponse.recovery.callback_invoked", true);
-
-            return true;
+            return invoked;
         }
         catch (Exception ex)
         {
@@ -531,15 +532,35 @@ internal sealed class LostSubscriberCallbackDispatcher(
                 : null,
             payloadJson);
 
-        var invocation = ReflectionExtensions.ResolveCallback(
-            recoveryState.FailureCallback,
-            payload: response,
-            exception: domainFailure,
-            correlationId: recoveryState.CorrelationId
-        );
+        return await InvokeFailureCallbackAsync(recoveryState, response, domainFailure, channel, activity).ConfigureAwait(false);
+    }
 
+    /// <summary>
+    /// Invokes <paramref name="recoveryState"/>'s failure callback and settles the outcome — the
+    /// one policy BOTH failure routes share (a response that declined to resume, and an exception
+    /// envelope). Returns <c>true</c> once the callback ran; <c>false</c> for a deterministic
+    /// fault, which is logged and acknowledged with the registration kept for the watchdog; and
+    /// throws <see cref="RecoveryCallbackFailedException"/> when a transient fault outlasted the
+    /// in-process ladder, so the transport redelivers.
+    /// </summary>
+    private async Task<bool> InvokeFailureCallbackAsync(
+        RecoveryState recoveryState,
+        object? payload,
+        Exception exception,
+        string channel,
+        Activity? activity)
+    {
         try
         {
+            // Inside the try: a malformed persisted descriptor is a deterministic wiring fault
+            // like any other and takes the same log-and-acknowledge settlement below.
+            var invocation = ReflectionExtensions.ResolveCallback(
+                recoveryState.FailureCallback!,
+                payload: payload,
+                exception: exception,
+                correlationId: recoveryState.CorrelationId
+            );
+
             // Bounded in-process retry, mirroring the ingress's transient-fault policy: a failure
             // callback is re-invocable by contract (broker redelivery re-invokes it the same way),
             // and a one-shot invoke turned a transient dependency blip into a silently dropped
@@ -609,16 +630,18 @@ internal sealed class LostSubscriberCallbackDispatcher(
     /// way on every attempt, so retrying only burns the backoff ladder on the publish path.
     /// <para>
     /// Narrow on purpose: only faults raised while WIRING UP the call qualify — the target is
-    /// unauthorized, its persisted type no longer resolves, its service is not registered
-    /// (<see cref="CallbackTargetUnresolvableException"/>), or its method/arguments no longer bind
+    /// unauthorized, its persisted descriptor is malformed, its persisted type no longer resolves,
+    /// its service is not registered, or a persisted argument no longer converts to its parameter
+    /// (<see cref="CallbackTargetUnresolvableException"/>), or its method no longer binds
     /// (<see cref="MissingMethodException"/>, <see cref="TypeLoadException"/>). A failure thrown by
     /// the callback BODY is never classified here, whatever its type: a handler that throws
     /// <see cref="InvalidOperationException"/> for a transient reason is ordinary application code
     /// and keeps the full retry ladder, which is why the marker type exists rather than a plain
-    /// <c>is InvalidOperationException</c> test.
+    /// <c>is InvalidOperationException</c> test. The broker ingress consults the same predicate to
+    /// escalate such a fault without its own retry ladder.
     /// </para>
     /// </summary>
-    private static bool IsPermanentCallbackFailure(Exception exception)
+    internal static bool IsPermanentCallbackFailure(Exception exception)
         => exception is CallbackTargetUnresolvableException
             or MissingMethodException
             or MissingMemberException
@@ -632,16 +655,23 @@ internal sealed class LostSubscriberCallbackDispatcher(
     /// failure callback for a flow whose resume had already succeeded. A failed delete leaves the
     /// registration to its TTL and the watchdog; recovery is at-least-once, so a later delivery
     /// re-invoking the callback is within contract.
+    /// <para>
+    /// Deliberately NOT under the publisher's cancellation token: that token scopes the publish's
+    /// own I/O (broker send, recovery-state lookup), and once the callback has run the delete is
+    /// its bookkeeping. A caller cancelling late — an HTTP <c>RequestAborted</c> while the resume
+    /// ran — left the consumed registration armed for its TTL, so the watchdog flagged a resumed
+    /// flow as stuck and a retried publish re-invoked the callback. The store client's own
+    /// timeouts bound the call, as they bound the channel's cleanup delete.
+    /// </para>
     /// </summary>
     private async Task DeleteConsumedRegistrationAsync(
         IRecoveryStateStore recoveryStateStore,
         string correlationId,
-        Guid registrationId,
-        CancellationToken cancellationToken)
+        Guid registrationId)
     {
         try
         {
-            await recoveryStateStore.TryDeleteAsync(correlationId, registrationId, cancellationToken).ConfigureAwait(false);
+            await recoveryStateStore.TryDeleteAsync(correlationId, registrationId, CancellationToken.None).ConfigureAwait(false);
         }
         catch (Exception ex)
         {
@@ -674,9 +704,11 @@ internal sealed class LostSubscriberCallbackDispatcher(
         catch
         {
             // No wire representation exists (unserializable payload — cycles, unregistered AOT
-            // metadata). Hand the instance through: the wire-only classifier treats it as
-            // unclassifiable, so it takes the conservative failure route with the instance
-            // attached — a payload that could never have crossed the wire never resumes a flow.
+            // metadata). Every bundled channel serializes a typed publish BEFORE dispatching here
+            // and throws to the publisher, so this is a backstop for a caller that does not. Hand
+            // the instance through: the wire-only classifier treats it as unclassifiable, so it
+            // takes the conservative failure route — a payload that could never have crossed the
+            // wire never resumes a flow.
             return response;
         }
     }

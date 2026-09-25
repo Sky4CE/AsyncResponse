@@ -26,8 +26,25 @@ public sealed class MongoDbStoreQueryTests
     {
         var rendered = Render(MongoDbChannelStore.BuildMessageWatchPipeline());
 
-        var stage = Assert.Single(rendered);
-        Assert.Equal("insert", stage["$match"]["operationType"].AsString);
+        Assert.Equal("insert", rendered[0]["$match"]["operationType"].AsString);
+    }
+
+    /// <summary>
+    /// Fixpoint r1 S5#17: every process watches every insert, and the stream shipped each full
+    /// envelope to every watcher although the wake only reads its correlation id. The pipeline now
+    /// projects the event down to that id (the <c>_id</c> resume token stays: an inclusion
+    /// projection keeps it). Pre-fix: a single $match stage, no $project.
+    /// </summary>
+    [Fact]
+    public void ChannelWatchPipeline_ProjectsEachEventDownToItsCorrelationId()
+    {
+        var rendered = Render(MongoDbChannelStore.BuildMessageWatchPipeline());
+
+        Assert.Equal(2, rendered.Count);
+        var projection = rendered[1]["$project"].AsBsonDocument;
+        Assert.Equal(1, projection["fullDocument.correlation_id"].ToInt32());
+        Assert.False(projection.Contains("fullDocument"), "the whole document must not be projected");
+        Assert.False(projection.Contains("_id") && projection["_id"].ToInt32() == 0, "the resume token must survive the projection");
     }
 
     [Fact]
@@ -59,7 +76,7 @@ public sealed class MongoDbStoreQueryTests
     public void TransportClaimFilter_GatesOnQueueAvailabilityAndLockExpiry_UsingServerClock()
     {
         var rendered = MongoDbTransportStore.BuildClaimFilter("worker")
-            .Render(TransportRenderArgs());
+            .Render(RenderArgsFor<BsonDocument>());
 
         Assert.Equal("worker", rendered["queue"].AsString);
 
@@ -78,11 +95,18 @@ public sealed class MongoDbStoreQueryTests
     {
         var lockId = Guid.NewGuid();
         var rendered = MongoDbTransportStore.BuildClaimUpdate(lockId, TimeSpan.FromSeconds(30))
-            .Render(TransportRenderArgs());
+            .Render(RenderArgsFor<BsonDocument>());
 
+        // attempts through $convert (onError/onNull 0), not a bare $add: a foreign producer's
+        // non-numeric attempts made the server-side update itself fail, so the document was never
+        // locked, stayed at the head of the claim order, and every claim of the queue failed.
         var set = rendered.AsBsonArray[0]["$set"].AsBsonDocument;
         Assert.Equal(
-            new BsonArray { new BsonDocument("$ifNull", new BsonArray { "$attempts", 0 }), 1 },
+            new BsonArray
+            {
+                new BsonDocument("$convert", new BsonDocument { ["input"] = "$attempts", ["to"] = "int", ["onError"] = 0, ["onNull"] = 0 }),
+                1
+            },
             set["attempts"]["$add"].AsBsonArray);
         Assert.Equal(new BsonArray { "$$NOW", 30_000d }, set["locked_until"]["$add"].AsBsonArray);
         Assert.Equal(new BsonBinaryData(lockId, GuidRepresentation.Standard), set["lock_id"].AsBsonBinaryData);
@@ -172,13 +196,78 @@ public sealed class MongoDbStoreQueryTests
             .Render(ChannelRenderArgs());
 
         var set = rendered.AsBsonArray[0]["$set"].AsBsonDocument;
-        Assert.Equal("corr", set["correlation_id"].AsString);
-        Assert.Equal("{}", set["envelope_json"].AsString);
+        Assert.Equal("corr", set["correlation_id"]["$literal"].AsString);
+        Assert.Equal("{}", set["envelope_json"]["$literal"].AsString);
         // $ifNull keeps the first (server-stamped) values, making a retried publish idempotent.
         Assert.Equal(new BsonArray { "$created_at", "$$NOW" }, set["created_at"]["$ifNull"].AsBsonArray);
         Assert.Equal("$expires_at", set["expires_at"]["$ifNull"].AsBsonArray[0]);
         Assert.Equal(new BsonArray { "$acked_at", BsonNull.Value }, set["acked_at"]["$ifNull"].AsBsonArray);
         Assert.Equal(new BsonArray { "$recovery_claimed", false }, set["recovery_claimed"]["$ifNull"].AsBsonArray);
+    }
+
+    /// <summary>
+    /// Fixpoint r1 GS3#1: the channel's upserts are aggregation pipelines, where a plain string
+    /// beginning with <c>$</c> is a field path — a correlation id like <c>"$order-17"</c> resolved
+    /// to a missing field and was never stored, so every lookup for the id matched nothing and
+    /// each response for it was silently dropped. Every caller-supplied string is now a
+    /// <c>$literal</c>. Pre-fix: the bare string was rendered.
+    /// </summary>
+    [Fact]
+    public void ChannelUpsertPipelines_WrapEveryCallerSuppliedStringInALiteral()
+    {
+        const string correlationId = "$order-17";
+        var state = new RecoveryState { CorrelationId = correlationId, RegistrationId = Guid.NewGuid() };
+
+        var recovery = MongoDbChannelStore.BuildRecoveryStateUpsertPipeline(correlationId, state, TimeSpan.FromHours(1))
+            .Render(RenderArgsFor<MongoRecoveryStateDocument>()).AsBsonArray[0]["$set"].AsBsonDocument;
+        var message = MongoDbChannelStore.BuildInsertMessagePipeline(correlationId, "$envelope", TimeSpan.FromHours(1))
+            .Render(ChannelRenderArgs()).AsBsonArray[0]["$set"].AsBsonDocument;
+        var subscriber = MongoDbChannelStore.BuildSubscriberUpsertPipeline(correlationId, Guid.NewGuid(), "$instance", TimeSpan.FromMinutes(1))
+            .Render(RenderArgsFor<MongoChannelSubscriberDocument>()).AsBsonArray[0]["$set"].AsBsonDocument;
+
+        Assert.Equal(correlationId, recovery["correlation_id"]["$literal"].AsString);
+        Assert.StartsWith("{", recovery["state_json"]["$literal"].AsString, StringComparison.Ordinal);
+        Assert.Equal(correlationId, message["correlation_id"]["$literal"].AsString);
+        Assert.Equal("$envelope", message["envelope_json"]["$literal"].AsString);
+        Assert.Equal(correlationId, subscriber["correlation_id"]["$literal"].AsString);
+        Assert.Equal("$instance", subscriber["instance_id"]["$literal"].AsString);
+    }
+
+    /// <summary>
+    /// Fixpoint r1 GS3#5: the channel's document classes lacked <c>[BsonIgnoreExtraElements]</c>
+    /// (the transport and flow-store documents carry it), so the next element a newer build adds
+    /// would throw on older hosts mid rolling deploy — after a claim had committed. Pre-fix:
+    /// FormatException on the unknown element.
+    /// </summary>
+    [Fact]
+    public void ChannelDocuments_TolerateElementsANewerBuildAdded()
+    {
+        var id = Guid.NewGuid();
+        var message = BsonSerializer.Deserialize<MongoChannelMessageDocument>(new BsonDocument
+        {
+            ["_id"] = new BsonBinaryData(id, GuidRepresentation.Standard),
+            ["correlation_id"] = "corr",
+            ["envelope_json"] = "{}",
+            ["created_at"] = DateTime.UtcNow,
+            ["expires_at"] = DateTime.UtcNow,
+            ["future_field"] = 1
+        });
+        var subscriber = BsonSerializer.Deserialize<MongoChannelSubscriberDocument>(new BsonDocument
+        {
+            ["_id"] = "corr:1",
+            ["correlation_id"] = "corr",
+            ["future_field"] = 1
+        });
+        var recovery = BsonSerializer.Deserialize<MongoRecoveryStateDocument>(new BsonDocument
+        {
+            ["_id"] = "corr:1",
+            ["correlation_id"] = "corr",
+            ["future_field"] = 1
+        });
+
+        Assert.Equal(id, message.Id);
+        Assert.Equal("corr", subscriber.CorrelationId);
+        Assert.Equal("corr", recovery.CorrelationId);
     }
 
     [Fact]
@@ -251,15 +340,16 @@ public sealed class MongoDbStoreQueryTests
             Headers = new Dictionary<string, string> { ["AR-Correlation-Id"] = "corr-claim" },
             Attempts = 3
         };
-        FindOneAndUpdateOptions<MongoTransportMessageDocument, MongoTransportMessageDocument>? capturedOptions = null;
-        collection
+        FindOneAndUpdateOptions<BsonDocument, BsonDocument>? capturedOptions = null;
+        var raw = new Mock<IMongoCollection<BsonDocument>>(MockBehavior.Loose).SelfPinning();
+        raw
             .Setup(c => c.FindOneAndUpdateAsync(
-                It.IsAny<FilterDefinition<MongoTransportMessageDocument>>(),
-                It.IsAny<UpdateDefinition<MongoTransportMessageDocument>>(),
-                It.IsAny<FindOneAndUpdateOptions<MongoTransportMessageDocument, MongoTransportMessageDocument>>(),
+                It.IsAny<FilterDefinition<BsonDocument>>(),
+                It.IsAny<UpdateDefinition<BsonDocument>>(),
+                It.IsAny<FindOneAndUpdateOptions<BsonDocument, BsonDocument>>(),
                 It.IsAny<CancellationToken>()))
-            .Callback((FilterDefinition<MongoTransportMessageDocument> _, UpdateDefinition<MongoTransportMessageDocument> _, FindOneAndUpdateOptions<MongoTransportMessageDocument, MongoTransportMessageDocument> options, CancellationToken _) => capturedOptions = options)
-            .ReturnsAsync(claimed);
+            .Callback((FilterDefinition<BsonDocument> _, UpdateDefinition<BsonDocument> _, FindOneAndUpdateOptions<BsonDocument, BsonDocument> options, CancellationToken _) => capturedOptions = options)
+            .ReturnsAsync(claimed.ToBsonDocument());
         collection
             .Setup(c => c.DeleteOneAsync(It.IsAny<FilterDefinition<MongoTransportMessageDocument>>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync(new DeleteResult.Acknowledged(1));
@@ -270,7 +360,7 @@ public sealed class MongoDbStoreQueryTests
                 It.IsAny<UpdateOptions>(),
                 It.IsAny<CancellationToken>()))
             .ReturnsAsync(new UpdateResult.Acknowledged(1, 1, BsonNull.Value));
-        var store = CreateTransportStore(collection.Object);
+        var store = CreateTransportStore(collection.Object, raw.Object);
 
         var delivery = await store.TryClaimAsync("worker", TimeSpan.FromSeconds(30), CancellationToken.None);
 
@@ -303,17 +393,12 @@ public sealed class MongoDbStoreQueryTests
     public async Task TransportClaimBatch_StopsAtEmptyClaimAndHonorsBatchSize()
     {
         var collection = new Mock<IMongoCollection<MongoTransportMessageDocument>>(MockBehavior.Loose).SelfPinning();
-        collection
-            .SetupSequence(c => c.FindOneAndUpdateAsync(
-                It.IsAny<FilterDefinition<MongoTransportMessageDocument>>(),
-                It.IsAny<UpdateDefinition<MongoTransportMessageDocument>>(),
-                It.IsAny<FindOneAndUpdateOptions<MongoTransportMessageDocument, MongoTransportMessageDocument>>(),
-                It.IsAny<CancellationToken>()))
-            .ReturnsAsync(new MongoTransportMessageDocument { Id = Guid.NewGuid(), Queue = "worker", Payload = "{}" })
-            .ReturnsAsync(new MongoTransportMessageDocument { Id = Guid.NewGuid(), Queue = "worker", Payload = "{}" })
-            .ReturnsAsync((MongoTransportMessageDocument)null!)
-            .ReturnsAsync(new MongoTransportMessageDocument { Id = Guid.NewGuid(), Queue = "worker", Payload = "{}" });
-        var store = CreateTransportStore(collection.Object);
+        var raw = new Mock<IMongoCollection<BsonDocument>>(MockBehavior.Loose).SelfPinning().ClaimsInOrder(
+            new MongoTransportMessageDocument { Id = Guid.NewGuid(), Queue = "worker", Payload = "{}" }.ToBsonDocument(),
+            new MongoTransportMessageDocument { Id = Guid.NewGuid(), Queue = "worker", Payload = "{}" }.ToBsonDocument(),
+            null,
+            new MongoTransportMessageDocument { Id = Guid.NewGuid(), Queue = "worker", Payload = "{}" }.ToBsonDocument());
+        var store = CreateTransportStore(collection.Object, raw.Object);
 
         var claimed = 0;
         await foreach (var _ in store.ClaimBatchAsync("worker", batchSize: 16, TimeSpan.FromSeconds(30), CancellationToken.None))
@@ -332,22 +417,65 @@ public sealed class MongoDbStoreQueryTests
     public async Task ChannelDeliveryAndRecoveryClaims_ReportWhetherTheClaimWon()
     {
         var collection = new Mock<IMongoCollection<MongoChannelMessageDocument>>(MockBehavior.Loose);
+        var projections = new List<BsonDocument?>();
+        var replies = new Queue<MongoChannelMessageDocument?>(
+        [
+            new MongoChannelMessageDocument { Id = Guid.NewGuid(), CorrelationId = "corr" },
+            null,
+            new MongoChannelMessageDocument { Id = Guid.NewGuid(), CorrelationId = "corr" },
+            null
+        ]);
         collection
-            .SetupSequence(c => c.FindOneAndUpdateAsync(
+            .Setup(c => c.FindOneAndUpdateAsync(
                 It.IsAny<FilterDefinition<MongoChannelMessageDocument>>(),
                 It.IsAny<UpdateDefinition<MongoChannelMessageDocument>>(),
                 It.IsAny<FindOneAndUpdateOptions<MongoChannelMessageDocument, MongoChannelMessageDocument>>(),
                 It.IsAny<CancellationToken>()))
-            .ReturnsAsync(new MongoChannelMessageDocument { Id = Guid.NewGuid(), CorrelationId = "corr" })
-            .ReturnsAsync((MongoChannelMessageDocument)null!)
-            .ReturnsAsync(new MongoChannelMessageDocument { Id = Guid.NewGuid(), CorrelationId = "corr" })
-            .ReturnsAsync((MongoChannelMessageDocument)null!);
+            .Returns((FilterDefinition<MongoChannelMessageDocument> _, UpdateDefinition<MongoChannelMessageDocument> _, FindOneAndUpdateOptions<MongoChannelMessageDocument, MongoChannelMessageDocument> options, CancellationToken _) =>
+            {
+                projections.Add(options.Projection?.Render(new RenderArgs<MongoChannelMessageDocument>(
+                    BsonSerializer.LookupSerializer<MongoChannelMessageDocument>(), BsonSerializer.SerializerRegistry)).Document);
+                return Task.FromResult(replies.Dequeue()!);
+            });
         var store = CreateChannelStore(collection);
 
         Assert.True(await store.TryClaimForDeliveryAsync(Guid.NewGuid(), CancellationToken.None));
         Assert.False(await store.TryClaimForDeliveryAsync(Guid.NewGuid(), CancellationToken.None));
         Assert.True(await store.TryClaimForRecoveryAsync(Guid.NewGuid(), CancellationToken.None));
         Assert.False(await store.TryClaimForRecoveryAsync(Guid.NewGuid(), CancellationToken.None));
+
+        // Fixpoint r1 S5#17: a claim's caller only checks that a document came back, so only the
+        // id travels — not the envelope. Pre-fix: no projection, the whole document returned.
+        Assert.Equal(4, projections.Count);
+        Assert.All(projections, projection => Assert.Equal(new BsonDocument("_id", 1), projection));
+    }
+
+    /// <summary>
+    /// Fixpoint r1 S5#17: the insert returned the whole document although the caller already holds
+    /// the envelope; it projects the envelope out. Pre-fix: no projection.
+    /// </summary>
+    [Fact]
+    public async Task ChannelInsert_ReturnsTheStampsWithoutTheEnvelope()
+    {
+        var collection = new Mock<IMongoCollection<MongoChannelMessageDocument>>(MockBehavior.Loose);
+        BsonDocument? projection = null;
+        collection
+            .Setup(c => c.FindOneAndUpdateAsync(
+                It.IsAny<FilterDefinition<MongoChannelMessageDocument>>(),
+                It.IsAny<UpdateDefinition<MongoChannelMessageDocument>>(),
+                It.IsAny<FindOneAndUpdateOptions<MongoChannelMessageDocument, MongoChannelMessageDocument>>(),
+                It.IsAny<CancellationToken>()))
+            .Callback((FilterDefinition<MongoChannelMessageDocument> _, UpdateDefinition<MongoChannelMessageDocument> _, FindOneAndUpdateOptions<MongoChannelMessageDocument, MongoChannelMessageDocument> options, CancellationToken _) =>
+                projection = options.Projection?.Render(new RenderArgs<MongoChannelMessageDocument>(
+                    BsonSerializer.LookupSerializer<MongoChannelMessageDocument>(), BsonSerializer.SerializerRegistry)).Document)
+            .ReturnsAsync(new MongoChannelMessageDocument { Id = Guid.NewGuid(), CorrelationId = "corr", CreatedAtUtc = DateTime.UtcNow });
+        var store = CreateChannelStore(collection);
+
+        var message = await store.InsertMessageAsync(Guid.NewGuid(), "corr", "{\"envelope\":1}", TimeSpan.FromHours(1), CancellationToken.None);
+
+        Assert.Equal(new BsonDocument("envelope_json", 0), projection);
+        // The caller's own envelope, not the (projected-away) stored one.
+        Assert.Equal("{\"envelope\":1}", message.EnvelopeJson);
     }
 
     [Fact]
@@ -382,13 +510,22 @@ public sealed class MongoDbStoreQueryTests
         Assert.True(MongoDbTransportStore.IsChangeStreamUnsupported(messageFailure));
     }
 
-    private static MongoDbTransportStore CreateTransportStore(IMongoCollection<MongoTransportMessageDocument> collection)
+    private static MongoDbTransportStore CreateTransportStore(
+        IMongoCollection<MongoTransportMessageDocument> collection,
+        IMongoCollection<BsonDocument>? raw = null)
     {
         var options = new MongoDbAsyncResponseTransportOptions { AutoCreateIndexes = false };
         var database = new Mock<IMongoDatabase>(MockBehavior.Loose).WithTestNamespace();
         database
             .Setup(d => d.GetCollection<MongoTransportMessageDocument>(options.MessageCollection, It.IsAny<MongoCollectionSettings>()))
             .Returns(collection);
+        if (raw is not null)
+        {
+            database
+                .Setup(d => d.GetCollection<BsonDocument>(options.MessageCollection, It.IsAny<MongoCollectionSettings>()))
+                .Returns(raw);
+        }
+
         return new MongoDbTransportStore(database.Object, Options.Create(options));
     }
 

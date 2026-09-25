@@ -72,5 +72,5 @@ public class SqlServerAckDispatchBenchmarks
             () => ValueTask.CompletedTask,
             _ => ValueTask.CompletedTask,
             (_, _, _) => ValueTask.FromResult(true),
-            () => ValueTask.FromResult(true));
+            _ => ValueTask.FromResult(true));
 }

@@ -28,7 +28,6 @@ internal sealed class DurableFlowService : IDurableFlows
         _propagation = propagation;
         _options = options;
         FlowStateConcurrency.ValidateOptions(_options);
-        _options.ValidateInProcessPark();
         _logger = logger;
         _timeProvider = timeProvider ?? TimeProvider.System;
     }
@@ -42,6 +41,7 @@ internal sealed class DurableFlowService : IDurableFlows
     {
         ArgumentNullException.ThrowIfNull(input);
         cancellationToken.ThrowIfCancellationRequested();
+        var explicitId = flowId is not null;
         if (flowId is null)
             flowId = $"flow-{AsyncResponseContext.GenerateCorrelationId()}";
         else
@@ -83,6 +83,16 @@ internal sealed class DurableFlowService : IDurableFlows
         var id = flowId;
         var initialStateJson = FlowStateJson.Serialize(state);
         store.ValidateCreate(flowId, state, _options.StateExpiry);
+
+        // A caller-chosen id already bound to different work is refused BEFORE anything is
+        // published. Checked only after the publish, the conflict reached the caller while its start
+        // job was already queued — and if the old ledger expired before that job ran, the job
+        // created the run the caller had just been told was refused (a caller that reacted by
+        // retrying under another id then ran the work twice). Best-effort: a read that fails
+        // publishes anyway, and the post-publish check still covers the create race.
+        if (explicitId && await TryLoadBeforePublishAsync(store, flowId, cancellationToken).ConfigureAwait(false) is { } bound)
+            EnsureIdempotentStart<TFlow, TInput>(bound, inputJson, flowId);
+
         await PublishStartAsync(
             executor => executor.CreateAndExecuteAsync(id, initialStateJson),
             id,
@@ -93,6 +103,10 @@ internal sealed class DurableFlowService : IDurableFlows
         // start is expected. After a transient store fault the published job creates the ledger;
         // a query can return null until it does. Deterministic size/argument rejection still
         // propagates, including from custom stores whose preflight uses the no-op default.
+        //
+        // Past the publish nothing is interruptible (CancellationToken.None) and no store failure
+        // costs the caller the id: the run WILL execute, and a StartAsync that threw after its job
+        // was published handed a caller retrying with a generated id a second, independent run.
         bool created;
         try
         {
@@ -101,10 +115,9 @@ internal sealed class DurableFlowService : IDurableFlows
                 flowId,
                 state,
                 _options.StateExpiry,
-                cancellationToken).ConfigureAwait(false);
+                CancellationToken.None).ConfigureAwait(false);
         }
-        catch (Exception ex) when (ex is not (FlowStateTooLargeException or ArgumentException)
-            && (ex is not OperationCanceledException || !cancellationToken.IsCancellationRequested))
+        catch (Exception ex) when (ex is not (FlowStateTooLargeException or ArgumentException))
         {
             _logger.LogWarning(
                 ex,
@@ -119,7 +132,20 @@ internal sealed class DurableFlowService : IDurableFlows
             return flowId;
         }
 
-        var existing = await store.LoadAsync(flowId, cancellationToken).ConfigureAwait(false);
+        FlowState? existing;
+        try
+        {
+            existing = await store.LoadAsync(flowId, CancellationToken.None).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(
+                ex,
+                "Durable flow {FlowId} start job is published but the existing ledger could not be read to confirm it is the same start; the executor runs the job, or drops it loudly if the id is bound to different work.",
+                flowId);
+            return flowId;
+        }
+
         if (existing is null)
         {
             // Lost the create to a ledger that has since expired: the published job's create wins
@@ -228,12 +254,26 @@ internal sealed class DurableFlowService : IDurableFlows
         return await store.LoadAsync(flowId, cancellationToken).ConfigureAwait(false);
     }
 
+    /// <summary>The ledger already under <paramref name="flowId"/>, or <c>null</c> when absent or unreadable (best-effort).</summary>
+    private async Task<FlowState?> TryLoadBeforePublishAsync(IFlowStateStore store, string flowId, CancellationToken cancellationToken)
+    {
+        try
+        {
+            return await store.LoadAsync(flowId, cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException || !cancellationToken.IsCancellationRequested)
+        {
+            _logger.LogDebug(ex, "Durable flow {FlowId} could not be read before its start was published; publishing anyway.", flowId);
+            return null;
+        }
+    }
+
     private static void EnsureIdempotentStart<TFlow, TInput>(
         FlowState existing,
         string requestedInputJson,
         string flowId)
     {
-        if (FlowStateConcurrency.IsSameStart(existing, typeof(TFlow).FullName, typeof(TInput).FullName, requestedInputJson))
+        if (FlowStateConcurrency.IsSameStart(existing, typeof(TFlow).FullName, typeof(TInput).FullName, requestedInputJson, FlowStateJson.InputEquivalent<TInput>))
             return;
 
         throw new DurableFlowIdConflictException(

@@ -47,7 +47,7 @@ public sealed class PostgreSqlDispatcherTests
             () => ValueTask.CompletedTask,
             _ => ValueTask.CompletedTask,
             (_, _, _) => ValueTask.FromResult(true),
-            () => ValueTask.FromResult(true));
+            _ => ValueTask.FromResult(true));
         var dispatcher = new PostgreSqlMessageDispatcher(
             (_, _) => Task.CompletedTask,
             options,
@@ -548,6 +548,35 @@ public sealed class PostgreSqlDispatcherTests
             "Worker");
     }
 
+    /// <summary>
+    /// Regression: each early-ACK subscriber was checked ALONE against the host budget, but the host
+    /// stops hosted services one after another (default <c>ServicesStopConcurrently = false</c>), so
+    /// with BOTH roles early-ACK the response subscriber's drain and the LISTEN join ran first
+    /// and the worker's drain got only what was left — stock defaults passed per role while
+    /// already-ACKed rows were abandoned mid-drain. Both roles' spends are now summed.
+    /// </summary>
+    [Fact]
+    public void ValidateSubscriber_BothRolesEarlyAck_SumBothDrainsAgainstTheHostBudget()
+    {
+        var options = new PostgreSqlAsyncResponseTransportOptions
+        {
+        };
+        options.WorkerSubscriber.UseAckAfterEnqueue(4, 256);
+        options.ResponseSubscriber.UseAckAfterEnqueue(2, 64);
+
+        var ex = Assert.Throws<InvalidOperationException>(() =>
+            PostgreSqlTransportOptionsValidator.ValidateSubscriber(options, options.WorkerSubscriber, "Worker"));
+        Assert.Contains("(Worker)", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("(ResponseIngress)", ex.Message, StringComparison.Ordinal);
+
+        // A budget that fits the sum passes, and so does a single early-ACK role on stock defaults.
+        options.HostShutdownTimeout = TimeSpan.FromSeconds(60);
+        PostgreSqlTransportOptionsValidator.ValidateSubscriber(options, options.ResponseSubscriber, "ResponseIngress");
+        options.HostShutdownTimeout = TimeSpan.FromSeconds(30);
+        options.ResponseSubscriber.AckMode = PostgreSqlAckMode.AckAfterHandlerCompletes;
+        PostgreSqlTransportOptionsValidator.ValidateSubscriber(options, options.WorkerSubscriber, "Worker");
+    }
+
     [Fact]
     public void ValidateSubscriber_NonPositiveHostShutdownTimeout_Throws()
     {
@@ -787,7 +816,7 @@ public sealed class PostgreSqlDispatcherTests
                 calls.DeadLettered.TrySetResult();
                 return ValueTask.FromResult(calls.DeadLetterResult);
             },
-            () =>
+            _ =>
             {
                 calls.Renew++;
                 return ValueTask.FromResult(calls.RenewResult);

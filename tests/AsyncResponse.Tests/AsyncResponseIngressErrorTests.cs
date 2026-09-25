@@ -25,6 +25,26 @@ public class AsyncResponseIngressErrorTests
     }
 
     [Fact]
+    public async Task HandleResponseMessageAsync_DeterministicCallbackFault_EscalatesWithoutRetrying()
+    {
+        // A resume callback that can never be wired up (unauthorized, unresolvable, malformed, no
+        // longer binding) fails identically on every attempt. Pre-fix the ingress still spent its
+        // 4-attempt ladder (~1.75 s of backoff, re-dispatching each time) before escalating — the
+        // cost the dispatcher had already removed for failure callbacks. It escalates at once,
+        // like a parse failure.
+        var original = new CallbackTargetUnresolvableException("resume target is not registered");
+        var rawPublisher = new ThrowingRawPublisher(original);
+        var publisher = new RecordingPublisher();
+        var ingress = CreateIngress(rawPublisher, publisher);
+
+        await ingress.HandleResponseMessageAsync("""{"Status":2}""", "corr-deterministic");
+
+        Assert.Equal(1, rawPublisher.RawJsonCalls);
+        Assert.Same(original, publisher.Exception);
+        Assert.Equal("corr-deterministic", publisher.CorrelationId);
+    }
+
+    [Fact]
     public async Task HandleResponseMessageAsync_TransientFailure_RetriesInProcess_WithoutFinalizing()
     {
         var rawPublisher = new ThrowingRawPublisher(new TimeoutException("store blip"), _failures: 1);
@@ -211,6 +231,8 @@ public class AsyncResponseIngressErrorTests
     [InlineData("""{"SchemaVersion":1,"Call":{"ServiceInterfaceFullName":"X","MethodName":null,"Params":[]},"CorrelationId":"c1"}""")]
     [InlineData("""{"SchemaVersion":1,"Call":{"ServiceInterfaceFullName":"X","MethodName":"Y","Params":null},"CorrelationId":"c1"}""")]
     [InlineData("""{"SchemaVersion":1,"Call":{"ServiceInterfaceFullName":"X","MethodName":"Y","Params":[null]},"CorrelationId":"c1"}""")]
+    [InlineData("""{"SchemaVersion":1,"Call":{"ServiceInterfaceFullName":"  ","MethodName":"Y","Params":[]},"CorrelationId":"c1"}""")]
+    [InlineData("""{"SchemaVersion":1,"Call":{"ServiceInterfaceFullName":"X","MethodName":"","Params":[]},"CorrelationId":"c1"}""")]
     public async Task HandleWorkerMessageAsync_NullCallMembers_AreAcknowledgedInsteadOfRedelivered(string json)
     {
         // Regression (round 31): the Call-null guard's own mechanism — `required` enforces
@@ -223,6 +245,82 @@ public class AsyncResponseIngressErrorTests
         var ingress = CreateIngress(new ThrowingRawPublisher(), new RecordingPublisher());
 
         await ingress.HandleWorkerMessageAsync(json);
+    }
+
+    [Theory]
+    [InlineData(null, "t", "a")]
+    [InlineData("", "t", "a")]
+    [InlineData("  ", "t", "a")]
+    [InlineData("n", null, "a")]
+    [InlineData("n", "t", null)]
+    [InlineData("n", "t", " ")]
+    public async Task HandleWorkerMessageAsync_MalformedReplyTarget_IsAcknowledgedWithoutRunningTheJob(string? name, string? transport, string? address)
+    {
+        // Same mechanism beside the call: the reply target's members are `required` strings, which
+        // enforces presence on the wire, not non-null. A null or blank member parsed, passed the
+        // gate, and threw ArgumentException from the executor's context push — outside the
+        // drop-and-ack filter, on every delivery, forever. It is rejected at the gate now.
+        var worker = new CountingWorker();
+        var services = new ServiceCollection();
+        services.AddSingleton(typeof(ILogger<>), typeof(NullLogger<>));
+        services.AddSingleton<ICountingWorker>(worker);
+        services.AddAsyncResponse().WithInMemoryChannel();
+        await using var provider = services.BuildServiceProvider();
+        var ingress = provider.GetRequiredService<IAsyncResponseIngress>();
+        var replyTarget = new System.Text.Json.Nodes.JsonObject
+        {
+            ["Name"] = name,
+            ["Transport"] = transport,
+            ["Address"] = address
+        };
+        var json = $$"""{"SchemaVersion":1,"Call":{"ServiceInterfaceFullName":"{{typeof(ICountingWorker).FullName}}","MethodName":"{{nameof(ICountingWorker.Run)}}","Params":[]},"CorrelationId":"corr-reply-target","ReplyTarget":{{replyTarget.ToJsonString()}}}""";
+
+        await ingress.HandleWorkerMessageAsync(json);
+
+        Assert.Equal(0, worker.Runs);
+    }
+
+    [Fact]
+    public async Task HandleWorkerMessageAsync_StreamWrittenNames_AreEscapedInItsLogLines()
+    {
+        // The routing line is logged before anything has validated or authorized the envelope,
+        // and its names are stream-written text: a CR/LF inside one ended the real log entry and
+        // started a forged one in every line-oriented sink.
+        var logger = new CapturingLogger<AsyncResponseIngress>();
+        var ingress = CreateIngress(new ThrowingRawPublisher(), new RecordingPublisher(), logger);
+        var envelope = AsyncResponseJson.Serialize(new WorkerJobEnvelope
+        {
+            CorrelationId = "corr-forged-names",
+            Call = new ReflectionCallDto
+            {
+                ServiceInterfaceFullName = "Contoso.IBilling\r\n[Error] forged service line",
+                MethodName = "Charge\r\n[Error] forged method line",
+                Params = []
+            }
+        });
+
+        await Assert.ThrowsAnyAsync<Exception>(() => ingress.HandleWorkerMessageAsync(envelope));
+
+        Assert.Contains(logger.Entries, entry => entry.Message.Contains("Contoso.IBilling", StringComparison.Ordinal));
+        Assert.DoesNotContain(logger.Entries, entry => entry.Message.Contains('\r') || entry.Message.Contains('\n'));
+    }
+
+    public interface ICountingWorker
+    {
+        Task Run();
+    }
+
+    private sealed class CountingWorker : ICountingWorker
+    {
+        private int _runs;
+
+        public int Runs => Volatile.Read(ref _runs);
+
+        public Task Run()
+        {
+            Interlocked.Increment(ref _runs);
+            return Task.CompletedTask;
+        }
     }
 
     [Fact]
@@ -254,6 +352,37 @@ public class AsyncResponseIngressErrorTests
 
         var exception = await Assert.ThrowsAnyAsync<Exception>(() => ingress.HandleWorkerMessageAsync(json));
         Assert.IsType<System.Text.Json.JsonException>(exception);
+    }
+
+    [Fact]
+    public async Task HandleWorkerMessageAsync_HostStopHandBack_PropagatesWithoutAnErrorLog()
+    {
+        // A DurableFlowInterruptedException is the engine handing the delivery back because the
+        // host is stopping — not a failure. The executor records it as neither failed nor an error
+        // span and every transport leaves the delivery unsettled, but the ingress still logged
+        // "Ingress worker job execution failed." at Error for it on every rolling deploy.
+        var logger = new CapturingLogger<AsyncResponseIngress>();
+        var services = new ServiceCollection();
+        services.AddSingleton(typeof(ILogger<>), typeof(NullLogger<>));
+        services.AddSingleton<ILogger<AsyncResponseIngress>>(logger);
+        services.AddSingleton<IHandBackWorker>(new HandBackWorker());
+        services.AddAsyncResponse().WithInMemoryChannel();
+        await using var provider = services.BuildServiceProvider();
+        var ingress = provider.GetRequiredService<IAsyncResponseIngress>();
+
+        var json = AsyncResponseJson.Serialize(new WorkerJobEnvelope
+        {
+            Call = new ReflectionCallDto
+            {
+                ServiceInterfaceFullName = typeof(IHandBackWorker).FullName!,
+                MethodName = nameof(IHandBackWorker.Run),
+                Params = []
+            },
+            CorrelationId = "corr-hand-back"
+        });
+
+        await Assert.ThrowsAsync<DurableFlowInterruptedException>(() => ingress.HandleWorkerMessageAsync(json));
+        Assert.DoesNotContain(logger.Entries, entry => entry.Level >= LogLevel.Error);
     }
 
     [Fact]
@@ -410,9 +539,13 @@ public class AsyncResponseIngressErrorTests
             }
         };
 
-        await Assert.ThrowsAsync<InvalidDataException>(() => provider.GetRequiredService<IAsyncResponseIngress>()
+        // An argument that cannot be converted is a wiring fault (CallbackTargetUnresolvableException,
+        // an InvalidOperationException) wrapping the reader's body-free InvalidDataException; the
+        // worker ingress still propagates it for the transport's retry/dead-letter decision.
+        var thrown = await Assert.ThrowsAnyAsync<InvalidOperationException>(() => provider.GetRequiredService<IAsyncResponseIngress>()
             .HandleWorkerMessageAsync(AsyncResponseJson.Serialize(job)));
-        Assert.Contains(logger.Entries, e => e.Exception is InvalidDataException);
+        Assert.IsType<InvalidDataException>(thrown.InnerException);
+        Assert.Contains(logger.Entries, e => e.Exception?.InnerException is InvalidDataException);
         Assert.All(logger.Entries, e => Assert.DoesNotContain(secret, e.Message + e.Exception, StringComparison.Ordinal));
     }
 
@@ -440,6 +573,16 @@ public class AsyncResponseIngressErrorTests
             logger ?? NullLogger<AsyncResponseIngress>.Instance);
     }
 
+    public interface IHandBackWorker
+    {
+        Task Run();
+    }
+
+    private sealed class HandBackWorker : IHandBackWorker
+    {
+        public Task Run() => throw new DurableFlowInterruptedException("The host is stopping; the delivery is handed back.");
+    }
+
     public interface IJsonThrowingWorker
     {
         Task Parse(int value);
@@ -453,9 +596,6 @@ public class AsyncResponseIngressErrorTests
     private sealed class ThrowingRawPublisher(Exception? _exception = null, int _failures = int.MaxValue) : IRawAsyncResponsePublisher
     {
         public int RawJsonCalls { get; private set; }
-
-        public Task SetRawResponse(object? response, string? correlationId, CancellationToken cancellationToken = default)
-            => _exception is null ? Task.CompletedTask : Task.FromException(_exception);
 
         public Task SetRawResponseJson(string responseJson, string? correlationId, CancellationToken cancellationToken = default)
         {

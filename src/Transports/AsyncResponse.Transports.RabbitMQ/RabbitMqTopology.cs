@@ -1,10 +1,14 @@
 using RabbitMQ.Client;
+using System.Text;
 
 namespace AsyncResponse.Transports.RabbitMQ;
 
 internal static class RabbitMqTopology
 {
     private const string DirectExchange = "direct";
+
+    /// <summary>The AMQP 0-9-1 shortstr ceiling the native correlation-id property is encoded under.</summary>
+    internal const int MaxNativeCorrelationIdBytes = 255;
 
     /// <summary>Ensures the required resource exists.</summary>
     public static Task EnsureWorkerAsync(
@@ -115,7 +119,15 @@ internal static class RabbitMqTopology
 
         if (!string.IsNullOrWhiteSpace(correlationId))
         {
-            properties.CorrelationId = correlationId;
+            // The native correlation-id is an AMQP shortstr — at most 255 UTF-8 bytes, and the
+            // client throws while serializing a longer one, so every publish of such an id failed.
+            // The library's portable bound (MaxCorrelationIdLength, 400 UTF-16 units) allows longer
+            // ids, and only ~86 characters above U+0800 already exceed 255 bytes. Omitted then;
+            // the header (a longstr) still carries the id, and the worker subscriber reads it from
+            // the body anyway. Never truncated or hashed: the response extractor reads the native
+            // value FIRST, so a mangled one would route the response to no waiter.
+            if (Encoding.UTF8.GetByteCount(correlationId) <= MaxNativeCorrelationIdBytes)
+                properties.CorrelationId = correlationId;
             if (!string.IsNullOrWhiteSpace(correlationHeader))
             {
                 properties.Headers = new Dictionary<string, object?>(StringComparer.Ordinal)

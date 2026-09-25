@@ -48,6 +48,13 @@ internal sealed class WorkerJobExecutor(
     {
         ArgumentNullException.ThrowIfNull(job);
 
+        // Every job starts unmarked. The skew marker is an AsyncLocal like WorkerJobScope's, and
+        // the in-memory transport runs a job under its ENQUEUER's captured execution context: a
+        // follow-up published by a job the stall guard released early inherited the unconsumed
+        // marker, and a durable timer replayed in that lineage spent the one-shot proof that
+        // belonged to the job that earned it (waiting in process, or failing on the timer ceiling).
+        using var unmarked = WorkerJobSkewScope.EnterUnmarked();
+
         // Armed only on the skew-proven early-execution path below; disposed with the invocation.
         IDisposable? forcedEarly = null;
 
@@ -56,9 +63,13 @@ internal sealed class WorkerJobExecutor(
         // failure/dead-letter handling. This is the single choke point every transport shares.
         if (!WorkerJobEnvelopeSchema.IsReadable(job.SchemaVersion))
         {
+            // Escaped: the id has not been through the portability check yet (that runs below, and
+            // only for a readable envelope), so it is still raw wire text — a CR/LF in it would
+            // forge a log line.
             _logger.LogWarning(
                 "Worker job for correlationId {CorrelationId} has unsupported schema version {SchemaVersion} (current: {Current}); rejecting it.",
-                job.CorrelationId, job.SchemaVersion, WorkerJobEnvelopeSchema.Current);
+                job.CorrelationId is { } rawId ? DiagnosticText.EscapedExcerpt(rawId, AsyncResponseChannelOptions.MaxCorrelationIdLength) : null,
+                job.SchemaVersion, WorkerJobEnvelopeSchema.Current);
             AsyncResponseDiagnostics.RecordWorkerOutcome("rejected");
             throw new InvalidOperationException(
                 $"Worker job schema version {job.SchemaVersion} is not supported by this build " +
@@ -91,8 +102,9 @@ internal sealed class WorkerJobExecutor(
         // delay is capped, or plain broker imprecision — is re-published for the remainder instead
         // of executed. Every transport funnels through here, so the chunk chain needs no
         // per-transport code.
-        if (job.NotBeforeUtc is { } notBeforeUtc)
+        if (job.NotBeforeUtc is { } stampedNotBefore)
         {
+            var notBeforeUtc = AsUtc(stampedNotBefore);
             var remaining = notBeforeUtc - (_timeProvider ?? TimeProvider.System).GetUtcNow().UtcDateTime;
             if (remaining > NotBeforeTolerance)
             {
@@ -125,9 +137,9 @@ internal sealed class WorkerJobExecutor(
                 var stalled = job.LastRedelayRemaining is { } lastRemaining
                     && lastRemaining >= TimeSpan.Zero
                     && remaining >= lastRemaining - RedelayProgressEpsilon;
-                job.RedelayStallCount = stalled ? Math.Clamp(job.RedelayStallCount, 0, RedelayStallExecuteThreshold) + 1 : 0;
+                var stallCount = stalled ? Math.Clamp(job.RedelayStallCount, 0, RedelayStallExecuteThreshold) + 1 : 0;
 
-                if (stalled && job.RedelayStallCount >= RedelayStallExecuteThreshold)
+                if (stalled && stallCount >= RedelayStallExecuteThreshold)
                 {
                     // The proof dies with this envelope. Anything the execution below re-publishes
                     // is a NEW message whose stall counters start at zero, so a durable timer that
@@ -139,20 +151,35 @@ internal sealed class WorkerJobExecutor(
                     _logger.LogWarning(
                         "Worker job {Target}.{Method} was redelivered {Remaining} before its due time {NotBeforeUtc} with no progress over {StallCount} consecutive hops ({LastRemaining} previously); " +
                         "the publishing and delivery-gating clocks disagree (clock skew). Executing it now instead of re-publishing.",
-                        job.Call.ServiceInterfaceFullName, job.Call.MethodName, remaining, notBeforeUtc, job.RedelayStallCount, job.LastRedelayRemaining);
+                        AsyncResponseTypeResolution.DescribeForDiagnostics(job.Call.ServiceInterfaceFullName), DiagnosticText.EscapedExcerpt(job.Call.MethodName, 256),
+                        remaining, notBeforeUtc, stallCount, job.LastRedelayRemaining);
                     // No outcome recorded here: the execution below records exactly one outcome
                     // ("executed"/"failed") for this delivery, like every other path.
                 }
                 else
                 {
-                    _logger.LogDebug(
-                        "Worker job {Target}.{Method} delivered {Remaining} before its due time {NotBeforeUtc}; re-publishing the next hop.",
-                        job.Call.ServiceInterfaceFullName, job.Call.MethodName, remaining, notBeforeUtc);
+                    if (_logger.IsEnabled(LogLevel.Debug))
+                    {
+                        _logger.LogDebug(
+                            "Worker job {Target}.{Method} delivered {Remaining} before its due time {NotBeforeUtc}; re-publishing the next hop.",
+                            AsyncResponseTypeResolution.DescribeForDiagnostics(job.Call.ServiceInterfaceFullName), DiagnosticText.EscapedExcerpt(job.Call.MethodName, 256),
+                            remaining, notBeforeUtc);
+                    }
+
                     AsyncResponseDiagnostics.RecordWorkerOutcome("redelayed");
 
-                    job.LastRedelayRemaining = remaining;
+                    // The next hop is a COPY carrying the new stall counters; the delivered
+                    // envelope is never modified. The transport still owns it and may retry it as
+                    // is — the in-memory ladder does when this publish throws (delayed capacity
+                    // exhausted, host draining) — and counters stamped on it made each retry, 100
+                    // ms later, read as a hop that made no progress: two retries "proved" clock
+                    // skew and ran the job early, a durable timer spending the forced-early marker
+                    // on it (and failing terminally when more than the timer ceiling was left).
+                    var next = DurableFlowExecutor.CopyForRedelay(job, notBeforeUtc);
+                    next.LastRedelayRemaining = remaining;
+                    next.RedelayStallCount = stallCount;
                     var hop = remaining <= delayedTransport.MaxPublishDelay ? remaining : delayedTransport.MaxPublishDelay;
-                    await delayedTransport.PublishAsync(job, hop).ConfigureAwait(false);
+                    await delayedTransport.PublishAsync(next, hop).ConfigureAwait(false);
                     return;
                 }
             }
@@ -165,7 +192,17 @@ internal sealed class WorkerJobExecutor(
         AsyncResponseDiagnostics.SetReplyTarget(activity, job.ReplyTarget);
         AsyncResponseDiagnostics.SetWorker(activity, job.Call);
 
-        _logger.LogDebug("Executing worker job {Target}.{Method} (correlationId: {CorrelationId}, replyTarget: {ReplyTarget}).", job.Call.ServiceInterfaceFullName, job.Call.MethodName, job.CorrelationId, job.ReplyTarget?.Name);
+        // Escaped: the target is still unresolved wire text here (resolution and authorization run
+        // below), and a blank correlation id skipped the portability check above.
+        if (_logger.IsEnabled(LogLevel.Debug))
+        {
+            _logger.LogDebug(
+                "Executing worker job {Target}.{Method} (correlationId: {CorrelationId}, replyTarget: {ReplyTarget}).",
+                AsyncResponseTypeResolution.DescribeForDiagnostics(job.Call.ServiceInterfaceFullName),
+                DiagnosticText.EscapedExcerpt(job.Call.MethodName, 256),
+                job.CorrelationId is { } correlationId ? DiagnosticText.EscapedExcerpt(correlationId, AsyncResponseChannelOptions.MaxCorrelationIdLength) : null,
+                job.ReplyTarget?.Name is { } replyTarget ? DiagnosticText.EscapedExcerpt(replyTarget, 256) : null);
+        }
 
         try
         {
@@ -194,7 +231,10 @@ internal sealed class WorkerJobExecutor(
             _logger.LogDebug("Executed worker job {Target}.{Method} successfully.", job.Call.ServiceInterfaceFullName, job.Call.MethodName);
             AsyncResponseDiagnostics.RecordWorkerOutcome("executed");
         }
-        catch (Exception ex)
+        // A DurableFlowInterruptedException passes through unrecorded: it is the flow engine
+        // handing the delivery back at host stop — a cancellation by contract, never a job
+        // failure — and each transport settles it as "not executed".
+        catch (Exception ex) when (ex is not DurableFlowInterruptedException)
         {
             AsyncResponseDiagnostics.SetError(activity, ex);
             AsyncResponseDiagnostics.RecordWorkerOutcome("failed");
@@ -205,4 +245,19 @@ internal sealed class WorkerJobExecutor(
             forcedEarly?.Dispose();
         }
     }
+
+    /// <summary>
+    /// <see cref="WorkerJobEnvelope.NotBeforeUtc"/> as a UTC instant. The value is wire data, and
+    /// System.Text.Json reads a timestamp carrying an offset (<c>+00:00</c>, what most non-.NET
+    /// producers write) as LOCAL time, while <see cref="DateTime"/> subtraction ignores
+    /// <see cref="DateTime.Kind"/>: compared raw, the due time moved by the host's UTC offset — a
+    /// job re-delayed hours too long east of Greenwich and run early west of it. An unspecified
+    /// kind is taken as UTC, which is what the property promises.
+    /// </summary>
+    internal static DateTime AsUtc(DateTime value) => value.Kind switch
+    {
+        DateTimeKind.Local => value.ToUniversalTime(),
+        DateTimeKind.Unspecified => DateTime.SpecifyKind(value, DateTimeKind.Utc),
+        _ => value
+    };
 }

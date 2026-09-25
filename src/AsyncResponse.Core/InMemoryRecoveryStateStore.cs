@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using System.Runtime.CompilerServices;
+using System.Text.Json;
 
 namespace AsyncResponse;
 
@@ -40,7 +41,7 @@ internal sealed class InMemoryRecoveryStateStore : IRecoveryStateStore, IRecover
             state.RegistrationId = Guid.NewGuid();
 
         var nowUtc = _timeProvider.GetUtcNow().UtcDateTime;
-        var entry = new Entry(state, nowUtc.Add(ttl));
+        var entry = new Entry(SnapshotCallbackArguments(state), nowUtc.Add(ttl));
         while (true)
         {
             if (!_entries.TryGetValue(correlationId, out var bucket))
@@ -75,7 +76,7 @@ internal sealed class InMemoryRecoveryStateStore : IRecoveryStateStore, IRecover
             if (!pruned.Equals(bucket) && !_entries.TryUpdate(correlationId, pruned, bucket))
                 continue;
 
-            return Task.FromResult(pruned.ReadableStates());
+            return Task.FromResult(pruned.States());
         }
 
         return Task.FromResult<IReadOnlyList<RecoveryState>>([]);
@@ -119,6 +120,89 @@ internal sealed class InMemoryRecoveryStateStore : IRecoveryStateStore, IRecover
         }
 
         return Task.FromResult(false);
+    }
+
+    /// <summary>
+    /// Wire parity for captured callback arguments. A literal the callback expression captured is
+    /// a LIVE object, and every durable store serializes it at save — so on Redis or a database a
+    /// registration carries a snapshot, an argument with a cycle or no AOT contract throws at
+    /// waiter creation, and <c>[JsonIgnore]</c> state never reaches the callback. Kept by
+    /// reference here, the same code passed every in-memory test (the Testing harness included)
+    /// and then behaved differently in production. Such an argument is therefore snapshotted
+    /// through the same serializer, as the <see cref="JsonElement"/> a durable store hands back.
+    /// <para>
+    /// Only what can diverge pays: null, strings, primitives and enums are immutable and round-trip
+    /// losslessly through the conversion plan, and already-wire <see cref="JsonElement"/> values
+    /// are left alone — so placeholder-only and string-literal registrations (the flow engine's)
+    /// keep the caller's instance, allocation-free, on the waiter-creation hot path. A descriptor
+    /// with no parameter list is stored as is; dispatch refuses it as malformed.
+    /// </para>
+    /// </summary>
+    private static RecoveryState SnapshotCallbackArguments(RecoveryState state)
+    {
+        var resume = SnapshotCallbackArguments(state.ResumeCallback);
+        var failure = SnapshotCallbackArguments(state.FailureCallback);
+        if (ReferenceEquals(resume, state.ResumeCallback) && ReferenceEquals(failure, state.FailureCallback))
+            return state;
+
+        return new RecoveryState
+        {
+            SchemaVersion = state.SchemaVersion,
+            RegistrationId = state.RegistrationId,
+            ResumeCallback = resume,
+            FailureCallback = failure,
+            CorrelationId = state.CorrelationId,
+            PayloadTypeFullName = state.PayloadTypeFullName,
+            RegisteredAtUtc = state.RegisteredAtUtc,
+            Context = state.Context
+        };
+    }
+
+    private static ReflectionCallDto? SnapshotCallbackArguments(ReflectionCallDto? callback)
+    {
+        if (callback?.Params is not { } parameters)
+            return callback;
+
+        CallbackParam[]? snapshot = null;
+        for (var i = 0; i < parameters.Length; i++)
+        {
+            var parameter = parameters[i];
+            if (parameter?.Value is not { } value || !DivergesAcrossTheWire(value))
+                continue;
+
+            snapshot ??= (CallbackParam[])parameters.Clone();
+            snapshot[i] = new CallbackParam
+            {
+                Placeholder = parameter.Placeholder,
+                Value = ToWireElement(value)
+            };
+        }
+
+        return snapshot is null
+            ? callback
+            : new ReflectionCallDto
+            {
+                ServiceInterfaceFullName = callback.ServiceInterfaceFullName,
+                MethodName = callback.MethodName,
+                Params = snapshot
+            };
+    }
+
+    private static bool DivergesAcrossTheWire(object value)
+    {
+        if (value is string or JsonElement)
+            return false;
+
+        var type = value.GetType();
+        return !type.IsPrimitive && !type.IsEnum;
+    }
+
+    // The object-typed member is written by its runtime type, exactly as a durable store writes
+    // CallbackParam.Value — and throws the same way for a value that has no wire form.
+    private static JsonElement ToWireElement(object value)
+    {
+        using var document = JsonDocument.Parse(AsyncResponseJson.Serialize(value, value.GetType()));
+        return document.RootElement.Clone();
     }
 
     private bool TryRemove(string correlationId, EntryBucket bucket)
@@ -256,31 +340,21 @@ internal sealed class InMemoryRecoveryStateStore : IRecoveryStateStore, IRecover
             return new EntryBucket(null, remaining);
         }
 
-        public IReadOnlyList<RecoveryState> ReadableStates()
+        // No schema filter: SaveAsync admits only the current schema version, and entries are
+        // never written from outside it, so every stored state is readable. (A filter here was
+        // reachable only by mutating a saved instance through by-reference aliasing, and its
+        // empty answer for an all-unreadable bucket contradicted RecoveryStateUnreadableException.)
+        public IReadOnlyList<RecoveryState> States()
         {
             if (_single is not null)
-                return RecoveryStateSchema.IsReadable(_single.State.SchemaVersion) ? [_single.State] : [];
+                return [_single.State];
 
             if (_many is null)
                 return [];
 
-            var readableCount = 0;
-            foreach (var entry in _many)
-            {
-                if (RecoveryStateSchema.IsReadable(entry.State.SchemaVersion))
-                    readableCount++;
-            }
-
-            if (readableCount == 0)
-                return [];
-
-            var states = new RecoveryState[readableCount];
-            var index = 0;
-            foreach (var entry in _many)
-            {
-                if (RecoveryStateSchema.IsReadable(entry.State.SchemaVersion))
-                    states[index++] = entry.State;
-            }
+            var states = new RecoveryState[_many.Length];
+            for (var i = 0; i < _many.Length; i++)
+                states[i] = _many[i].State;
 
             return states;
         }
@@ -321,8 +395,7 @@ internal sealed class InMemoryRecoveryStateStore : IRecoveryStateStore, IRecover
 
             if (pruned.SingleEntry is { } single)
             {
-                if (RecoveryStateSchema.IsReadable(single.State.SchemaVersion))
-                    yield return single.State;
+                yield return single.State;
                 continue;
             }
 
@@ -330,10 +403,7 @@ internal sealed class InMemoryRecoveryStateStore : IRecoveryStateStore, IRecover
                 continue;
 
             foreach (var entry in pruned.ManyEntries)
-            {
-                if (RecoveryStateSchema.IsReadable(entry.State.SchemaVersion))
-                    yield return entry.State;
-            }
+                yield return entry.State;
         }
     }
 }

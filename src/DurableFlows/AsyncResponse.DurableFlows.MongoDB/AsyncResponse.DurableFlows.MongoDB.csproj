@@ -35,6 +35,7 @@
   <ItemGroup>
     <Compile Include="..\..\Shared\MongoOwnershipLedger.cs" Link="MongoOwnershipLedger.cs" />
     <Compile Include="..\..\Shared\MongoNamespaceRegistry.cs" Link="MongoNamespaceRegistry.cs" />
+    <Compile Include="..\..\Shared\MongoWriteConcerns.cs" Link="MongoWriteConcerns.cs" />
   </ItemGroup>
 
 </Project>

@@ -775,6 +775,7 @@ public class RabbitMqDispatcherTests
     public async Task Awaiting_RedeliveredPastTheCap_RejectsWithoutRunningTheHandler()
     {
         var channel = new FakeDispatcherChannel();
+        var logger = new ListLogger();
         var handlerRuns = 0;
         await using var dispatcher = RabbitMqMessageDispatcher.Create(
             (_, _) =>
@@ -786,7 +787,7 @@ public class RabbitMqDispatcherTests
             },
             new RabbitMqAsyncResponseOptions(),
             new RabbitMqSubscriberOptions { MaxDeliveryAttempts = 1 },
-            NullLogger.Instance,
+            logger,
             "worker.q",
             RabbitMqSubscriberRole.Worker);
 
@@ -797,6 +798,39 @@ public class RabbitMqDispatcherTests
         Assert.Equal(81UL, nack.DeliveryTag);
         Assert.False(nack.Requeue);
         Assert.Empty(channel.Acks);
+
+        // Regression (r1 GS5#7): nothing threw, so nothing logged the reject either — and with no
+        // dead-letter exchange the broker drops the message, i.e. a silent loss. Error when this
+        // package knows of no dead-letter exchange.
+        Assert.Contains(
+            logger.Entries,
+            entry => entry.Level == LogLevel.Error
+                && entry.Message.Contains("81", StringComparison.Ordinal)
+                && entry.Message.Contains(nameof(RabbitMqAsyncResponseOptions.DeadLetterExchange), StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task Awaiting_RedeliveredPastTheCap_WithADeadLetterExchange_LogsTheRejectAsAWarning()
+    {
+        var channel = new FakeDispatcherChannel();
+        var logger = new ListLogger();
+        await using var dispatcher = RabbitMqMessageDispatcher.Create(
+            (_, _) => Task.CompletedTask,
+            new RabbitMqAsyncResponseOptions { DeadLetterExchange = "dlx" },
+            new RabbitMqSubscriberOptions { MaxDeliveryAttempts = 1 },
+            logger,
+            "worker.q",
+            RabbitMqSubscriberRole.Worker);
+
+        await dispatcher.HandleAsync(Delivery("payload", deliveryTag: 84, redelivered: true), channel, CancellationToken.None);
+
+        Assert.False(Assert.Single(channel.Nacks).Requeue);
+        Assert.Contains(
+            logger.Entries,
+            entry => entry.Level == LogLevel.Warning
+                && entry.Message.Contains("84", StringComparison.Ordinal)
+                && entry.Message.Contains("dlx", StringComparison.Ordinal));
+        Assert.DoesNotContain(logger.Entries, entry => entry.Level >= LogLevel.Error);
     }
 
     /// <summary>
@@ -1424,6 +1458,721 @@ public class RabbitMqDispatcherTests
         await dispatcher.DisposeAsync();
     }
 
+    // ---------- Round-1 fixpoint (G10) ----------
+
+    [Fact]
+    public async Task Awaiting_HostStopHandBack_WhileTheSubscriberTokenIsLive_LeavesTheDeliveryUnsettled()
+    {
+        // Regression (r1 S7#1): the host fires ApplicationStopping before it stops any hosted
+        // service, so the flow engine hands a parked flow's delivery back
+        // (DurableFlowInterruptedException) while this subscriber's own token is still live. The
+        // shutdown filter keyed only on that token, so the hand-back ran the FAILURE branch — at a
+        // cap of 1, a reject without requeue: a flow's only wake-up dropped (or dead-lettered) by
+        // a routine deploy. Left un-ACKed, the channel close redelivers it after the restart.
+        var channel = new FakeDispatcherChannel();
+        var logger = new ListLogger();
+        await using var dispatcher = RabbitMqMessageDispatcher.Create(
+            (_, _) => Task.FromException(new DurableFlowInterruptedException("Host is stopping; the wake-up is handed back.")),
+            new RabbitMqAsyncResponseOptions(),
+            new RabbitMqSubscriberOptions { MaxDeliveryAttempts = 1 },
+            logger,
+            "worker.q",
+            RabbitMqSubscriberRole.Worker);
+
+        await dispatcher.HandleAsync(Delivery("payload", deliveryTag: 5), channel, CancellationToken.None);
+
+        Assert.Empty(channel.Acks);
+        Assert.Empty(channel.Nacks);
+        Assert.DoesNotContain(logger.Entries, entry => entry.Level >= LogLevel.Error);
+    }
+
+    [Fact]
+    public async Task Awaiting_Dispose_WaitsForTheRunningHandler_SoItsAckLandsBeforeTheChannelCloses()
+    {
+        // Regression (r1 S7#8): the stop path cancels the consumer, disposes the dispatcher, then
+        // closes the channel — and the awaiting dispatcher's dispose was a no-op, so the close ran
+        // under a handler still in its delivery callback. The broker requeued that delivery for a
+        // peer, and the finished handler's ACK then failed on the closed channel: every deploy
+        // ran in-flight jobs twice. Dispose now waits (bounded) for the callback to leave.
+        var channel = new FakeDispatcherChannel();
+        var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var dispatcher = RabbitMqMessageDispatcher.Create(
+            async (_, _) =>
+            {
+                started.TrySetResult();
+                await release.Task.ConfigureAwait(false);
+            },
+            new RabbitMqAsyncResponseOptions(),
+            new RabbitMqSubscriberOptions(),
+            NullLogger.Instance,
+            "worker.q",
+            RabbitMqSubscriberRole.Worker);
+
+        var handling = dispatcher.HandleAsync(Delivery("payload", deliveryTag: 9), channel, CancellationToken.None);
+        await started.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        try
+        {
+            var disposing = dispatcher.DisposeAsync().AsTask();
+            Assert.False(disposing.IsCompleted); // completes only once the callback has left
+            Assert.Empty(channel.Acks);
+
+            release.TrySetResult();
+            await disposing.WaitAsync(TimeSpan.FromSeconds(10));
+            Assert.Equal(9UL, Assert.Single(channel.Acks)); // settled BEFORE dispose returned, i.e. before the close
+        }
+        finally
+        {
+            release.TrySetResult();
+            await handling.WaitAsync(TimeSpan.FromSeconds(10));
+        }
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task Awaiting_OnceTheSubscriberIsStopping_ABufferedDeliveryIsNotStarted(bool stopViaDispose)
+    {
+        // Regression (r1 S7#8): RabbitMQ.Client keeps dispatching the deliveries it had buffered
+        // after the consumer cancel, and HandleAsync started each one — work the channel close
+        // then cut off and the broker redelivered to a peer. Left un-ACKed and unstarted instead.
+        var channel = new FakeDispatcherChannel();
+        var handlerRuns = 0;
+        var dispatcher = RabbitMqMessageDispatcher.Create(
+            (_, _) =>
+            {
+                Interlocked.Increment(ref handlerRuns);
+                return Task.CompletedTask;
+            },
+            new RabbitMqAsyncResponseOptions(),
+            new RabbitMqSubscriberOptions(),
+            NullLogger.Instance,
+            "worker.q",
+            RabbitMqSubscriberRole.Worker);
+
+        if (stopViaDispose)
+            await dispatcher.DisposeAsync();
+
+        await dispatcher.HandleAsync(
+            Delivery("payload", deliveryTag: 10),
+            channel,
+            stopViaDispose ? CancellationToken.None : new CancellationToken(canceled: true));
+
+        Assert.Equal(0, Volatile.Read(ref handlerRuns));
+        Assert.Empty(channel.Acks);
+        Assert.Empty(channel.Nacks);
+        await dispatcher.DisposeAsync();
+    }
+
+    [Fact]
+    public async Task Awaiting_Dispose_GivesUpOnAHandlerStillRunningPastItsBound_AndSaysSo()
+    {
+        var logger = new ListLogger();
+        var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var dispatcher = RabbitMqMessageDispatcher.Create(
+            async (_, _) =>
+            {
+                started.TrySetResult();
+                await release.Task.ConfigureAwait(false);
+            },
+            new RabbitMqAsyncResponseOptions(),
+            new RabbitMqSubscriberOptions { BackgroundDrainTimeout = TimeSpan.FromMilliseconds(50) },
+            logger,
+            "worker.q",
+            RabbitMqSubscriberRole.Worker);
+
+        var handling = dispatcher.HandleAsync(Delivery("payload", deliveryTag: 11), new FakeDispatcherChannel(), CancellationToken.None);
+        await started.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        await dispatcher.DisposeAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(10));
+
+        Assert.Contains(
+            logger.Entries,
+            entry => entry.Level == LogLevel.Warning && entry.Message.Contains("still running", StringComparison.Ordinal));
+        release.TrySetResult();
+        await handling.WaitAsync(TimeSpan.FromSeconds(10));
+    }
+
+    [Fact]
+    public async Task Awaiting_Dispose_WaitsOnlyForWhatTheHostBudgetLeavesAfterTheCancelAndTheClose()
+    {
+        // The in-flight wait is clamped, not validated: HostShutdownTimeout 10 s minus the stop
+        // path's two ShutdownTimeout spends (5 s each) leaves nothing, so the stop does not wait at
+        // all — a configuration that started before this wait existed must not overrun its host.
+        var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var dispatcher = RabbitMqMessageDispatcher.Create(
+            async (_, _) =>
+            {
+                started.TrySetResult();
+                await release.Task.ConfigureAwait(false);
+            },
+            new RabbitMqAsyncResponseOptions { HostShutdownTimeout = TimeSpan.FromSeconds(10) },
+            new RabbitMqSubscriberOptions(), // BackgroundDrainTimeout stays at its 20 s default
+            NullLogger.Instance,
+            "worker.q",
+            RabbitMqSubscriberRole.Worker);
+
+        var handling = dispatcher.HandleAsync(Delivery("payload", deliveryTag: 12), new FakeDispatcherChannel(), CancellationToken.None);
+        await started.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        try
+        {
+            Assert.True(dispatcher.DisposeAsync().IsCompleted);
+        }
+        finally
+        {
+            release.TrySetResult();
+            await handling.WaitAsync(TimeSpan.FromSeconds(10));
+        }
+    }
+
+    [Fact]
+    public void ValidateOptions_RejectsANegativeMaxDeliveryAttempts()
+    {
+        // Regression (r1 GS5#10): every cap check is `> 0` / `<= 0`, so -1 silently meant
+        // "unlimited" (ASB, Kafka and NATS reject it).
+        var ex = Assert.Throws<InvalidOperationException>(() => RabbitMqMessageDispatcher.ValidateOptions(
+            new RabbitMqAsyncResponseOptions(),
+            new RabbitMqSubscriberOptions { MaxDeliveryAttempts = -1 },
+            RabbitMqSubscriberRole.Worker));
+
+        Assert.Contains(nameof(RabbitMqSubscriberOptions.MaxDeliveryAttempts), ex.Message, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData("asyncresponse.worker")]   // default WorkerQueue
+    [InlineData("asyncresponse.response")] // default ResponseQueue
+    public void ValidateOptions_RejectsAParkQueueThatIsALiveQueue(string liveQueue)
+    {
+        // Round 42 shipped ParkQueue untested (r1 S7#11): parked into a live queue, a capped message
+        // is redelivered straight back to the subscriber that parked it — past its cap — in a loop.
+        var ex = Assert.Throws<InvalidOperationException>(() => RabbitMqMessageDispatcher.ValidateOptions(
+            new RabbitMqAsyncResponseOptions { ParkQueue = liveQueue },
+            new RabbitMqSubscriberOptions(),
+            RabbitMqSubscriberRole.Worker));
+
+        Assert.Contains(nameof(RabbitMqAsyncResponseOptions.ParkQueue), ex.Message, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(-1)]
+    public void ValidateOptions_RejectsANonPositiveBrokerConsumerTimeout(int minutes)
+    {
+        // r1 S7#11: ValidateConsumerTimeout had no test. Zero or negative leaves the flow engine no
+        // room for any in-process wait; null (the broker's timeout disabled) is the way to say
+        // "no ceiling".
+        var ex = Assert.Throws<InvalidOperationException>(() => RabbitMqMessageDispatcher.ValidateOptions(
+            new RabbitMqAsyncResponseOptions { BrokerConsumerTimeout = TimeSpan.FromMinutes(minutes) },
+            new RabbitMqSubscriberOptions(),
+            RabbitMqSubscriberRole.Worker));
+
+        Assert.Contains(nameof(RabbitMqAsyncResponseOptions.BrokerConsumerTimeout), ex.Message, StringComparison.Ordinal);
+        RabbitMqMessageDispatcher.ValidateOptions(
+            new RabbitMqAsyncResponseOptions { BrokerConsumerTimeout = null },
+            new RabbitMqSubscriberOptions(),
+            RabbitMqSubscriberRole.Worker);
+    }
+
+    [Fact]
+    public async Task Awaiting_AtCapWithXDeath_ParksInTheParkQueue_AheadOfTheDeadLetterQueue()
+    {
+        // r1 S7#11: ParkQueue precedence was untested. With both set, the park goes to ParkQueue
+        // (unbound, so a TTL-retry cycle's hops never land there) — never to DeadLetterQueue.
+        var properties = new BasicProperties
+        {
+            Headers = new Dictionary<string, object?>
+            {
+                ["x-death"] = new List<object?> { new Dictionary<string, object?> { ["count"] = 2L } }
+            }
+        };
+
+        var channel = new FakeDispatcherChannel();
+        await using var dispatcher = RabbitMqMessageDispatcher.Create(
+            (_, _) => throw new InvalidOperationException("handler boom"),
+            new RabbitMqAsyncResponseOptions { DeadLetterExchange = "dlx", DeadLetterQueue = "dead", ParkQueue = "parked" },
+            new RabbitMqSubscriberOptions { MaxDeliveryAttempts = 3 },
+            NullLogger.Instance,
+            "worker.q",
+            RabbitMqSubscriberRole.Worker);
+
+        await dispatcher.HandleAsync(Delivery("payload", properties, deliveryTag: 73), channel, CancellationToken.None);
+
+        var parked = Assert.Single(channel.Publishes);
+        Assert.Equal(string.Empty, parked.Exchange);
+        Assert.Equal("parked", parked.RoutingKey);
+        Assert.Equal(73UL, Assert.Single(channel.Acks));
+    }
+
+    [Fact]
+    public async Task Awaiting_AFailedPark_IsRequeuedAfterABackoff_NotAckedOrLeftUnsettled()
+    {
+        // r1 S7#11: the round-42 failed-park path was untested. A park publish that fails (with
+        // publisher confirms: the queue is missing, a reject-publish queue is full) must hand the
+        // delivery back — NACK with requeue after the subscriber backoff — never ACK it (the
+        // message would be gone) and never leave it unsettled (AMQP does not redeliver while the
+        // channel stays open, so every failed park pinned one prefetch credit).
+        var properties = new BasicProperties
+        {
+            Headers = new Dictionary<string, object?>
+            {
+                ["x-death"] = new List<object?> { new Dictionary<string, object?> { ["count"] = 2L } }
+            }
+        };
+
+        var logger = new ListLogger();
+        var channel = new FakeDispatcherChannel { ThrowOnPublish = new InvalidOperationException("NOT_FOUND - no queue 'parked'") };
+        await using var dispatcher = RabbitMqMessageDispatcher.Create(
+            (_, _) => throw new InvalidOperationException("handler boom"),
+            new RabbitMqAsyncResponseOptions
+            {
+                ParkQueue = "parked",
+                SubscriberRetryBaseDelay = TimeSpan.FromMilliseconds(1),
+                SubscriberRetryMaxDelay = TimeSpan.FromMilliseconds(2)
+            },
+            new RabbitMqSubscriberOptions { MaxDeliveryAttempts = 3 },
+            logger,
+            "worker.q",
+            RabbitMqSubscriberRole.Worker);
+
+        await dispatcher.HandleAsync(Delivery("payload", properties, deliveryTag: 74), channel, CancellationToken.None);
+
+        Assert.Empty(channel.Acks);
+        var nack = Assert.Single(channel.Nacks);
+        Assert.Equal(74UL, nack.DeliveryTag);
+        Assert.True(nack.Requeue);
+        Assert.Contains(
+            logger.Entries,
+            entry => entry.Level == LogLevel.Error
+                && entry.Message.Contains("74", StringComparison.Ordinal)
+                && entry.Message.Contains("parked", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void ResolveDeliveryAttempt_SaturatesAForgedXDeathCount_InsteadOfWrappingBelowEveryCap()
+    {
+        // r1 S7#11: the round-42 saturation was untested. x-death is a publisher-writable header; a
+        // count of long.MaxValue used to wrap on the +1 and cast to attempt 0 — below every cap.
+        var delivery = Delivery("payload", new BasicProperties
+        {
+            Headers = new Dictionary<string, object?>
+            {
+                ["x-death"] = new List<object?> { new Dictionary<string, object?> { ["count"] = long.MaxValue } }
+            }
+        });
+
+        Assert.Equal(int.MaxValue, RabbitMqMessageDispatcher.ResolveDeliveryAttempt(delivery));
+    }
+
+    [Fact]
+    public async Task Queued_ACopyThatCameBackThroughTheDeadLetterExchange_IsParked_InsteadOfCopiedIntoTheCycleAgain()
+    {
+        // Regression (r1 S7#14): with early ACK plus an operator's TTL-retry queue bound to the
+        // dead-letter exchange, the dead-letter copy of a permanently failing job rode the cycle
+        // back into the worker queue, failed again, and was copied to the DLX again — re-executed,
+        // side effects included, once per TTL for ever. A delivery that carries this queue's own
+        // dead-letter marker is now parked through the default exchange instead.
+        var channel = new FakeDispatcherChannel();
+        var dispatcher = RabbitMqMessageDispatcher.Create(
+            (_, _) => throw new InvalidOperationException("still broken"),
+            new RabbitMqAsyncResponseOptions { DeadLetterExchange = "dlx", ParkQueue = "parked" },
+            EnqueueSubscriber(workers: 1, capacity: 8),
+            NullLogger.Instance,
+            "worker.q",
+            RabbitMqSubscriberRole.Worker);
+
+        try
+        {
+            // As it comes back from the broker: string headers arrive as bytes.
+            var cycled = new BasicProperties
+            {
+                Headers = new Dictionary<string, object?>
+                {
+                    ["AR-DeadLetter-Source-Queue"] = Encoding.UTF8.GetBytes("worker.q"),
+                    ["x-death"] = new List<object?> { new Dictionary<string, object?> { ["count"] = 1L } }
+                }
+            };
+            await dispatcher.HandleAsync(Delivery("poison", cycled, routingKey: "worker.route", deliveryTag: 95), channel, CancellationToken.None);
+            await WaitForPublishesAsync(channel, 1);
+
+            var parked = Assert.Single(channel.Publishes);
+            Assert.Equal(string.Empty, parked.Exchange);
+            Assert.Equal("parked", parked.RoutingKey);
+        }
+        finally
+        {
+            await dispatcher.DisposeAsync();
+        }
+    }
+
+    [Fact]
+    public async Task Queued_ACycledCopyWithNowhereToPark_IsDroppedWithAnError_NotCopiedIntoTheCycleAgain()
+    {
+        var channel = new FakeDispatcherChannel();
+        var logger = new ListLogger();
+        var dispatcher = RabbitMqMessageDispatcher.Create(
+            (_, _) => throw new InvalidOperationException("still broken"),
+            new RabbitMqAsyncResponseOptions { DeadLetterExchange = "dlx" },
+            EnqueueSubscriber(workers: 1, capacity: 8),
+            logger,
+            "worker.q",
+            RabbitMqSubscriberRole.Worker);
+
+        try
+        {
+            var cycled = new BasicProperties
+            {
+                Headers = new Dictionary<string, object?> { ["AR-DeadLetter-Source-Queue"] = "worker.q" }
+            };
+            await dispatcher.HandleAsync(Delivery("poison", cycled, deliveryTag: 96), channel, CancellationToken.None);
+        }
+        finally
+        {
+            // The drain waits for the worker, so the settlement has run when this returns.
+            await dispatcher.DisposeAsync();
+        }
+
+        Assert.Empty(channel.Publishes);
+        Assert.Contains(
+            logger.Entries,
+            entry => entry.Level == LogLevel.Error
+                && entry.Message.Contains("96", StringComparison.Ordinal)
+                && entry.Message.Contains("dropped", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task Queued_AFailureCarryingAnotherQueuesDeathHistory_IsStillCopiedToTheDeadLetterExchange()
+    {
+        // Scope guard for the park rule above: x-death alone is not the marker — a delay queue that
+        // dead-letters INTO the worker exchange stamps it on every message — so without this
+        // queue's own dead-letter marker the copy goes to the DLX exactly as before.
+        var channel = new FakeDispatcherChannel();
+        var dispatcher = RabbitMqMessageDispatcher.Create(
+            (_, _) => throw new InvalidOperationException("boom"),
+            new RabbitMqAsyncResponseOptions { DeadLetterExchange = "dlx", ParkQueue = "parked" },
+            EnqueueSubscriber(workers: 1, capacity: 8),
+            NullLogger.Instance,
+            "worker.q",
+            RabbitMqSubscriberRole.Worker);
+
+        try
+        {
+            var delayed = new BasicProperties
+            {
+                Headers = new Dictionary<string, object?>
+                {
+                    ["x-death"] = new List<object?> { new Dictionary<string, object?> { ["count"] = 1L, ["queue"] = "delay.q" } }
+                }
+            };
+            await dispatcher.HandleAsync(Delivery("job", delayed, routingKey: "worker.route", deliveryTag: 97), channel, CancellationToken.None);
+        }
+        finally
+        {
+            await dispatcher.DisposeAsync();
+        }
+
+        var copy = Assert.Single(channel.Publishes);
+        Assert.Equal("dlx", copy.Exchange);
+        Assert.Equal("worker.route", copy.RoutingKey);
+    }
+
+    [Fact]
+    public async Task Queued_DrainLapse_DisposeItselfDeadLettersAndSurfacesTheQueuedDeliveries_BeforeReturning()
+    {
+        // Regression (r1 GS5#4): once the drain budget lapsed, the entries still queued were routed
+        // only by the worker loop's lapse branch — which runs only when a busy worker frees up.
+        // With the one worker still inside a long handler, DisposeAsync returned with nothing
+        // routed, the subscriber closed the channel, and both already-ACKed deliveries were lost
+        // with no DLX copy and no OnBackgroundFailure. A reserved quarter of the budget now routes
+        // them from DisposeAsync itself, on the still-open channel.
+        var channel = new FakeDispatcherChannel();
+        var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var failures = new ConcurrentQueue<RabbitMqBackgroundFailureContext>();
+        var subscriber = EnqueueSubscriber(workers: 1, capacity: 8, drain: TimeSpan.FromSeconds(2)); // a 500 ms reserve: generous on a loaded runner
+        subscriber.OnBackgroundFailure = context =>
+        {
+            failures.Enqueue(context);
+            return ValueTask.CompletedTask;
+        };
+        var dispatcher = RabbitMqMessageDispatcher.Create(
+            async (delivery, _) =>
+            {
+                if (delivery.DeliveryTag == 1)
+                {
+                    started.TrySetResult();
+                    await release.Task.ConfigureAwait(false); // ignores the drain token, like the ingress
+                }
+            },
+            new RabbitMqAsyncResponseOptions { DeadLetterExchange = "dlx" },
+            subscriber,
+            NullLogger.Instance,
+            "worker.q",
+            RabbitMqSubscriberRole.Worker);
+
+        try
+        {
+            await dispatcher.HandleAsync(Delivery("m1", deliveryTag: 1), channel, CancellationToken.None);
+            await started.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            await dispatcher.HandleAsync(Delivery("m2", deliveryTag: 2), channel, CancellationToken.None);
+            await dispatcher.HandleAsync(Delivery("m3", deliveryTag: 3), channel, CancellationToken.None);
+
+            await dispatcher.DisposeAsync();
+
+            // Asserted at the moment DisposeAsync returned — before the channel would close.
+            Assert.Equal([2UL, 3UL], failures.Select(failure => failure.DeliveryTag).Order().ToArray());
+            Assert.Equal(["m2", "m3"], channel.Publishes.Select(publish => Encoding.UTF8.GetString(publish.Body.ToArray())).Order().ToArray());
+            Assert.All(channel.Publishes, publish => Assert.Equal("dlx", publish.Exchange));
+        }
+        finally
+        {
+            release.TrySetResult();
+        }
+    }
+
+    // ---------- Round-1 fixpoint, pre-commit (H) ----------
+
+    [Fact]
+    public async Task Queued_AHostStopHandBack_IsAWarning_SurfacedAndDeadLetteredWithItsOwnReason()
+    {
+        // Pre-commit r1 H6 — one early-ACK hand-back rule across the transports that can
+        // dead-letter: a durable flow handed back at host stop is a stop, not a handler failure (an
+        // Error per deploy was an alert per deploy), but the delivery was ACKed at enqueue and is
+        // never redelivered, so it keeps its OnBackgroundFailure call and its dead-letter copy — the
+        // wake-up's only record, safe to replay — under a reason that tells it apart.
+        var channel = new FakeDispatcherChannel();
+        var logger = new ListLogger();
+        var notified = new TaskCompletionSource<RabbitMqBackgroundFailureContext>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var subscriber = EnqueueSubscriber(workers: 1, capacity: 8);
+        subscriber.OnBackgroundFailure = context =>
+        {
+            notified.TrySetResult(context);
+            return ValueTask.CompletedTask;
+        };
+        var dispatcher = RabbitMqMessageDispatcher.Create(
+            (_, _) => Task.FromException(new DurableFlowInterruptedException("Host is stopping; the wake-up is handed back.")),
+            new RabbitMqAsyncResponseOptions { DeadLetterExchange = "dlx" },
+            subscriber,
+            logger,
+            "worker.q",
+            RabbitMqSubscriberRole.Worker);
+
+        try
+        {
+            await dispatcher.HandleAsync(Delivery("wake-up", routingKey: "worker.route", deliveryTag: 93), channel, CancellationToken.None);
+            var context = await notified.Task.WaitAsync(TimeSpan.FromSeconds(10));
+            await WaitForPublishesAsync(channel, 1);
+
+            Assert.DoesNotContain(logger.Entries, entry => entry.Level >= LogLevel.Error);
+            var warning = Assert.Single(logger.Entries, entry => entry.Level == LogLevel.Warning && entry.Exception is DurableFlowInterruptedException);
+            Assert.Contains("Dead-lettering a copy (handed_back_after_commit)", warning.Message, StringComparison.Ordinal);
+            Assert.IsType<DurableFlowInterruptedException>(context.Exception);
+            var buried = Assert.Single(channel.Publishes);
+            Assert.Equal("dlx", buried.Exchange);
+            Assert.Equal("worker.route", buried.RoutingKey);
+            Assert.Equal(
+                "handed_back_after_commit: Host is stopping; the wake-up is handed back.",
+                Assert.IsType<string>(buried.Properties.Headers!["AR-DeadLetter-Reason"]));
+        }
+        finally
+        {
+            await dispatcher.DisposeAsync();
+        }
+    }
+
+    [Fact]
+    public async Task Queued_AHostStopHandBack_WithoutADeadLetterExchange_IsAnError_ThatSaysTheWakeUpIsLost()
+    {
+        // Pre-commit r1 pass 2 (critic E 1): with no DeadLetterExchange — the default — the
+        // hand-back logged a Warning claiming the delivery "is dead-lettered for replay", but no copy
+        // is written and the broker never redelivers an ACKed delivery: a lost wake-up, reported as
+        // a routine stop. It is an Error that says so; OnBackgroundFailure is still its one record.
+        var channel = new FakeDispatcherChannel();
+        var logger = new ListLogger();
+        var notified = new TaskCompletionSource<RabbitMqBackgroundFailureContext>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var subscriber = EnqueueSubscriber(workers: 1, capacity: 8);
+        subscriber.OnBackgroundFailure = context =>
+        {
+            notified.TrySetResult(context);
+            return ValueTask.CompletedTask;
+        };
+        var dispatcher = RabbitMqMessageDispatcher.Create(
+            (_, _) => Task.FromException(new DurableFlowInterruptedException("Host is stopping; the wake-up is handed back.")),
+            new RabbitMqAsyncResponseOptions(),
+            subscriber,
+            logger,
+            "worker.q",
+            RabbitMqSubscriberRole.Worker);
+
+        try
+        {
+            await dispatcher.HandleAsync(Delivery("wake-up", routingKey: "worker.route", deliveryTag: 94), channel, CancellationToken.None);
+            var context = await notified.Task.WaitAsync(TimeSpan.FromSeconds(10));
+
+            Assert.IsType<DurableFlowInterruptedException>(context.Exception);
+            Assert.DoesNotContain(logger.Entries, entry => entry.Level == LogLevel.Warning && entry.Exception is DurableFlowInterruptedException);
+            var error = Assert.Single(logger.Entries, entry => entry.Level >= LogLevel.Error);
+            Assert.IsType<DurableFlowInterruptedException>(error.Exception);
+            Assert.Contains("no dead-letter destination is configured, so the wake-up is lost", error.Message, StringComparison.Ordinal);
+        }
+        finally
+        {
+            await dispatcher.DisposeAsync();
+        }
+
+        Assert.Empty(channel.Publishes);
+    }
+
+    [Fact]
+    public async Task Awaiting_AHostStopHandBack_DoesNotMarkTheReceiveSpanAsAnError()
+    {
+        // Pre-commit r1 H7: the hand-back was no longer logged as a failure, but the receive span
+        // still got an Error status — every deploy painted a red span per parked flow.
+        using var listener = new ActivityListener
+        {
+            ShouldListenTo = source => source.Name == AsyncResponseDiagnostics.ActivitySourceName,
+            Sample = (ref ActivityCreationOptions<ActivityContext> _) => ActivitySamplingResult.AllDataAndRecorded
+        };
+        ActivitySource.AddActivityListener(listener);
+
+        static async Task<Activity> ReceiveSpanOfAsync(Exception thrown)
+        {
+            Activity? observed = null;
+            await using var dispatcher = RabbitMqMessageDispatcher.Create(
+                (_, _) =>
+                {
+                    observed = Activity.Current;
+                    return Task.FromException(thrown);
+                },
+                new RabbitMqAsyncResponseOptions(),
+                new RabbitMqSubscriberOptions(),
+                NullLogger.Instance,
+                "worker.q",
+                RabbitMqSubscriberRole.Worker);
+
+            await dispatcher.HandleAsync(Delivery("payload", deliveryTag: 14), new FakeDispatcherChannel(), CancellationToken.None);
+            Assert.NotNull(observed);
+            Assert.Equal("asyncresponse.rabbitmq.receive", observed!.OperationName);
+            return observed;
+        }
+
+        var handedBack = await ReceiveSpanOfAsync(new DurableFlowInterruptedException("Host is stopping."));
+        Assert.NotEqual(ActivityStatusCode.Error, handedBack.Status);
+        Assert.Null(handedBack.GetTagItem("error.type"));
+
+        // A real failure still is one.
+        Assert.Equal(ActivityStatusCode.Error, (await ReceiveSpanOfAsync(new InvalidOperationException("handler boom"))).Status);
+    }
+
+    [Fact]
+    public async Task Awaiting_Dispose_WithNoInFlightWaitLeft_SaysSoOnceAtStartup_InsteadOfWarningOnEveryStop()
+    {
+        // Pre-commit r1 H7: with the wait clamped to zero (HostShutdownTimeout 10 s minus the two
+        // 5 s ShutdownTimeout spends — the conformance suite's budget), every stop with a handler in
+        // flight logged "Waiting up to 00:00:00" and then warned the handler was "still running
+        // 00:00:00 after the subscriber began stopping" — a timeout that never happened. The
+        // configuration is now reported once, when the dispatcher is created.
+        var logger = new ListLogger();
+        var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var dispatcher = RabbitMqMessageDispatcher.Create(
+            async (_, _) =>
+            {
+                started.TrySetResult();
+                await release.Task.ConfigureAwait(false);
+            },
+            new RabbitMqAsyncResponseOptions { HostShutdownTimeout = TimeSpan.FromSeconds(10) },
+            new RabbitMqSubscriberOptions(), // BackgroundDrainTimeout stays at its 20 s default
+            logger,
+            "worker.q",
+            RabbitMqSubscriberRole.Worker);
+        var atStartup = logger.Entries.ToArray();
+
+        var handling = dispatcher.HandleAsync(Delivery("payload", deliveryTag: 15), new FakeDispatcherChannel(), CancellationToken.None);
+        await started.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        try
+        {
+            Assert.True(dispatcher.DisposeAsync().IsCompleted);
+            Assert.DoesNotContain(logger.Entries, entry => entry.Level >= LogLevel.Warning);
+            Assert.DoesNotContain(logger.Entries, entry => entry.Message.Contains("00:00:00", StringComparison.Ordinal));
+        }
+        finally
+        {
+            release.TrySetResult();
+            await handling.WaitAsync(TimeSpan.FromSeconds(10));
+        }
+
+        var said = Assert.Single(atStartup, entry => entry.Message.Contains("will not wait for a running handler", StringComparison.Ordinal));
+        Assert.Equal(LogLevel.Information, said.Level);
+        Assert.Contains("HostShutdownTimeout", said.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Queued_ADeliveryArrivingOnceTheDrainHasBegun_IsLeftForTheCloseToRequeue_NotNackedBackIntoALoop()
+    {
+        // Pre-commit r1 H4 follow-on: a stop whose consumer cancel failed now still drains before
+        // the close — with the consumer possibly still registered. Every delivery arriving meanwhile
+        // hit the completed queue and was NACK-requeued, and the broker handed it straight back to
+        // the same consumer: a requeue loop at network rate for the whole drain. Left un-ACKed
+        // instead, it holds a prefetch credit until the close requeues it.
+        var channel = new FakeDispatcherChannel();
+        var gate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var handlerRuns = 0;
+        var dispatcher = RabbitMqMessageDispatcher.Create(
+            async (_, _) =>
+            {
+                Interlocked.Increment(ref handlerRuns);
+                started.TrySetResult();
+                await gate.Task.ConfigureAwait(false);
+            },
+            new RabbitMqAsyncResponseOptions(),
+            EnqueueSubscriber(workers: 1, capacity: 8),
+            NullLogger.Instance,
+            "worker.q",
+            RabbitMqSubscriberRole.Worker);
+
+        await dispatcher.HandleAsync(Delivery("m1", deliveryTag: 1), channel, CancellationToken.None);
+        await started.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        var disposing = dispatcher.DisposeAsync().AsTask(); // the drain waits behind the running m1
+
+        try
+        {
+            for (ulong tag = 2; tag <= 4; tag++)
+                await dispatcher.HandleAsync(Delivery("again", deliveryTag: tag, redelivered: true), channel, new CancellationToken(canceled: true));
+
+            Assert.Empty(channel.Nacks);
+            Assert.Equal([1UL], channel.Acks);
+        }
+        finally
+        {
+            gate.TrySetResult();
+            await disposing.WaitAsync(TimeSpan.FromSeconds(10));
+        }
+
+        Assert.Equal(1, Volatile.Read(ref handlerRuns));
+    }
+
+    private static async Task WaitForPublishesAsync(FakeDispatcherChannel channel, int count)
+    {
+        var guard = TimeProvider.System.GetUtcNow() + TimeSpan.FromSeconds(10);
+        while (true)
+        {
+            lock (channel.Publishes)
+            {
+                if (channel.Publishes.Count >= count)
+                    return;
+            }
+
+            Assert.True(TimeProvider.System.GetUtcNow() < guard, "the expected publishes never happened");
+            await Task.Delay(TimeSpan.FromMilliseconds(5));
+        }
+    }
+
     private static RabbitMqDelivery Delivery(
         string body,
         BasicProperties? properties = null,
@@ -1491,8 +2240,13 @@ public class RabbitMqDispatcherTests
 
         public List<(string Exchange, string RoutingKey, BasicProperties Properties, ReadOnlyMemory<byte> Body)> Publishes { get; } = [];
 
+        public Exception? ThrowOnPublish { get; init; }
+
         public ValueTask BasicPublishAsync(string exchange, string routingKey, BasicProperties properties, ReadOnlyMemory<byte> body, CancellationToken cancellationToken = default)
         {
+            if (ThrowOnPublish is not null)
+                throw ThrowOnPublish;
+
             lock (Publishes)
                 Publishes.Add((exchange, routingKey, properties, body));
             return ValueTask.CompletedTask;

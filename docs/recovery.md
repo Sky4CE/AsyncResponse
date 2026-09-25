@@ -8,11 +8,12 @@ NATS, PostgreSQL, SQL Server, MongoDB) persist it beyond the process. When a res
 resume the flow, fail it — never resume a failure — or, for a non-terminal checkpoint, keep the
 registration armed and wait for the terminal response.
 
-The `OnLostSubscriber*` methods intentionally live only on `IRecoverableAsyncResponseBuilder` and
-its fluent builders. If an app is configured with `.WithInMemoryChannel()`, those methods are absent
-at compile time; switch to a durable channel (`.WithRedisChannel()` / `.WithNatsChannel()` /
-`.WithPostgreSqlChannel(...)` / `.WithSqlServerChannel(...)` / `.WithMongoDbChannel(...)`) and
-inject `IRecoverableAsyncResponseBuilder` for durable recovery flows.
+The `OnLostSubscriber*` methods live on `IRecoverableAsyncResponseBuilder` and its fluent builders,
+which every bundled channel registers — `.WithInMemoryChannel()` included. The in-memory channel's
+recovery is process-local: it spans waiter loss within one process lifetime (and the simulated
+restarts of [AsyncResponse.Testing](testing.md)), not a real process exit. For recovery that
+survives a redeploy, use a durable channel (`.WithRedisChannel()` / `.WithNatsChannel()` /
+`.WithPostgreSqlChannel(...)` / `.WithSqlServerChannel(...)` / `.WithMongoDbChannel(...)`).
 
 **On this page**
 
@@ -192,8 +193,10 @@ distributed claim step in front of the callback — resume must already be re-at
 extra store round-trip per recovery would buy nothing. Treat both callbacks as idempotent: key side
 effects on the correlation id, not on the invocation.
 
-**When the failure callback cannot be invoked.** The dispatcher retries a failure callback four
-times in-process (250 ms → 2 s backoff) for transient faults. If every attempt fails, the publish
+**When the failure callback cannot be invoked.** The dispatcher makes up to four in-process
+attempts at a failure callback for transient faults (jittered backoff of up to 250 ms, 500 ms, then
+1 s between them — under 2 s in all) — on both failure routes, a response that declined to resume
+and a `SetException` alike. If every attempt fails, the publish
 throws `RecoveryCallbackFailedException` (carrying the correlation id and attempt count) instead
 of returning normally: the registration stays armed, the broker ingress passes the exception
 through untouched — no further retry, no `SetException` escalation (that would only invoke the
@@ -203,8 +206,14 @@ a log line while the flow stays stuck: it waits in the broker until the callback
 recovers or an operator replays it from the dead-letter destination. On RabbitMQ's default
 `MaxDeliveryAttempts = 0` that is the same unlimited requeue any failing handler gets — configure
 a cap and a `DeadLetterExchange` there as you would for worker jobs. Deterministic faults — an
-unauthorized or unresolvable target, a method that no longer binds — are still logged and
-acknowledged (redelivery cannot fix them); the kept registration is what the watchdog surfaces.
+unauthorized or unresolvable target, a malformed persisted descriptor (a null parameter list, a
+null entry, a null or blank name), a method that no longer binds, or a persisted argument that no
+longer converts to its parameter's type (for example a failure callback whose payload parameter is
+the registered type, handed a response that could not be materialized as it) — are still logged
+and acknowledged (redelivery cannot fix them); the kept registration is what the watchdog
+surfaces. A resume callback is classified the same way: through the broker ingress, a
+deterministic resume fault escalates to the failure callback at once, without the ingress's own
+retry ladder.
 A direct caller of `SetResponse`/`SetException` (an HTTP callback endpoint) sees the same
 exception; answer the remote system with a retriable status.
 
@@ -275,17 +284,21 @@ registrations, no error", and the health check went from `Degraded` to `Healthy`
 outage. Expect the opposite now — a Redis outage shows up here as
 `Async-response watchdog scan failed: …` until the connection is back.
 
-Before a cluster scan fails over an unreachable node, the scanner asks a connected primary for the
-cluster's own node table (`CLUSTER NODES`) and ignores any unreachable node the table lists as a
-**replica** or as **owning no slots** — only a slot owner can make the scan partial. The client's
-view of a node's role is only as good as its last handshake: a replica that was already down when
-the process started has never been handshaken and reads as "not a replica", and used to fail every
-scan of a cluster whose slot owners were all reachable. The same lookup lets a failed-over cluster
-scan normally as soon as the failover has moved the old primary's slots, instead of failing until
-the node rejoins. It runs only on the path that was about to fail, so a healthy cluster pays
-nothing for it, and every unknown stays a failure: a node the table does not list (a DNS name the
-cluster does not announce), a table that cannot be read (the ACL must allow `CLUSTER NODES` for
-the lookup to help), a slot-owning primary.
+Every cluster scan asks a connected primary for the cluster's own node table (`CLUSTER NODES` —
+one small command next to a walk of the whole keyspace) and ignores any unreachable node the table
+lists as a **replica** or as **owning no slots** — only a slot owner can make the scan partial. The
+client's view of a node's role is only as good as its last handshake: a replica that was already
+down when the process started has never been handshaken and reads as "not a replica", and used to
+fail every scan of a cluster whose slot owners were all reachable. The same lookup lets a
+failed-over cluster scan normally as soon as the failover has moved the old primary's slots,
+instead of failing until the node rejoins. It runs on healthy scans too because it also checks the
+other direction: every slot owner the table lists must be scanned — a promoted node still carrying
+the client's stale "replica" flag is scanned as the slot owner it is, and a slot owner with no
+connected server fails the scan. Every unknown stays a failure: a table that cannot be read while a
+primary-flagged endpoint is unreachable (the ACL must allow `CLUSTER NODES` for the lookup to
+help), a slot-owning primary with no connected server. An unreachable endpoint the table does not
+list (a DNS name the cluster does not announce) is excused only once every slot owner the table
+lists has been scanned.
 
 The Redis scan streams: keys come from `SCAN` asynchronously, and registration blobs are read in
 pipelined batches of 128 (individual `GET`s, so a cluster routes each to its shard) rather than
@@ -303,6 +316,32 @@ Recovery state lives in the durable channel's store and survives a redeploy:
   longest-remaining registration — a fresh registration cannot keep a dead sibling recoverable, nor
   truncate a longer-lived one. Registration-list updates are optimistic (transaction-conditioned
   compare-and-set with retries), so concurrent registrations for one correlation id all survive.
+  Waiter-liveness probing asks every endpoint `PUBSUB NUMSUB` concurrently: a positive count
+  anywhere is proof of a live waiter, and a zero is conclusive once the nodes that could hold the
+  subscription have answered. Every endpoint flagged as a primary must have answered, except one
+  that has been **disconnected for at least 90 seconds** (counted from the first probe in this
+  process that saw it down, and reset when a probe sees it connected again — but a reconnection no
+  probe observed, or one observed while an older probe was still in flight, goes unnoticed, so an
+  earlier outage can shorten a later failover's grace): a node that went down moments ago may be the old owner
+  of a failover whose waiters have not re-subscribed on the promoted node yet (StackExchange.Redis
+  moves a subscription once it learns the new topology — at the latest on its `ConfigCheckSeconds`
+  check, 60 s by default — and the failover itself takes the cluster node timeout or Sentinel's
+  `down-after-milliseconds`), so the promoted node's zero proves nothing during that window. Past
+  it, outside a cluster one answering primary is the whole answer (a failed-over deployment keeps
+  listing the old primary, disconnected, until it rejoins); in a cluster the `CLUSTER NODES` table
+  is read — only then, when a primary-flagged endpoint is disconnected — and the disconnected
+  endpoints are excused only when every slot owner the table lists answered, so a replica that
+  never connected or a seed endpoint the cluster no longer lists does not block the verdict for
+  longer than the grace. Without the table, an endpoint still flagged as a replica is not treated
+  as a possible owner, even after a promotion this process has not seen yet; once the table is
+  read, every slot owner it lists must answer. Anything less is **unprobeable**,
+  and a lost-subscriber publish then throws for its caller to retry (the transport redelivers it)
+  instead of consuming a live waiter's registration; if you raise `ConfigCheckSeconds` above the
+  default, a waiter can take longer than the grace to follow a failover. Inside the grace a lost
+  response survives only through the response transport's redelivery, so its redelivery budget
+  should outlast the 90 s: the defaults of the NATS, PostgreSQL, SQL Server and MongoDB transports
+  (5 attempts × 5 s) do not, nor do Kafka's in-process retries or Service Bus's immediate
+  redeliveries, and a response still unrecovered when the budget runs out is dead-lettered.
 - **NATS** — recovery state lives in a JetStream Key-Value bucket (`RecoveryBucket`), with a
   per-entry expiry layered over the bucket's `MaxAge`. Registration-list updates are
   revision-conditioned (KV compare-and-set with retries), so concurrent registrations for one
@@ -313,7 +352,17 @@ Recovery state lives in the durable channel's store and survives a redeploy:
   answered inside `PresenceProbeTimeout` is reported as **unprobeable**, not dead — the consume
   loop acks a probe only when it reads it, serially, behind the previous message's `Until`
   predicate, so any predicate slower than the 2 s default would otherwise make a healthy waiter
-  look gone (and let the lost-subscriber dispatcher consume its registration).
+  look gone (and let the lost-subscriber dispatcher consume its registration). The same
+  asymmetry applies to a publish, the other way round: a response a subscriber received but did
+  not acknowledge inside `DeliveryConfirmationTimeout` counts as delivered and never reaches
+  recovery — including a response sent to a waiter whose host died without closing its connection,
+  until the server drops that stale subscription at its ping timeout (see
+  [configuration.md](configuration.md#channel-options)). Registrations are keyed by correlation id
+  only, not by `SubjectPrefix`, so deployments sharing one NATS system need their own
+  `RecoveryBucket` each. The bucket is created on first use only when it does not exist — an
+  existing one is used as it is, with drift reported when it is first opened — and every completed waiter
+  leaves a KV delete marker, which the watchdog scan purges once it is 30 minutes old (each purge
+  bounded by the marker's own sequence, so it can never remove a registration written after it).
 - **PostgreSQL** — recovery state lives in `RecoveryStateTable` (default
   `asyncresponse_recovery_state`) as one row per waiter registration. Rows expire by `expires_at`
   and are pruned opportunistically during channel operations.
@@ -358,7 +407,9 @@ missing, null, and unsupported values are rejected rather than inferred. The res
 `Payload` is held to the same standard: on a `Success: true` envelope an **absent** `Payload` is
 rejected exactly like an explicit `"Payload": null` (`JsonException`, permanent — the delivery
 faults instead of completing a waiter with `null`), and a duplicated `Payload` key binds
-last-wins. Add historical versions only alongside a tested migration path.
+last-wins. The envelope's `Success` flag is mandatory as well: an envelope without it is rejected
+("Success is required.") instead of reading as a message-less failure — a foreign producer must
+always send it. Add historical versions only alongside a tested migration path.
 
 Keep all hosts that share recovery or worker storage on the same wire schema during deployment.
 An incompatible writer fails safe—the reader refuses the payload instead of invoking a callback or

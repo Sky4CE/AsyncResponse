@@ -235,6 +235,25 @@ public class RedisTransportTests
         Assert.False(RedisTransportRetry.IsTransient(new InvalidOperationException()));
     }
 
+    /// <summary>
+    /// Fixpoint r1 (S6a#16): the errors a cluster in transition answers with are raised before
+    /// anything runs, and the idempotent append makes a retry safe — yet every server error was
+    /// classified permanent, so each publish in a slot migration (TRYAGAIN on the two-key script)
+    /// or a failover (CLUSTERDOWN, LOADING, MASTERDOWN, READONLY) failed on its first attempt.
+    /// </summary>
+    [Theory]
+    [InlineData(RedisErrorKind.TryAgain, true)]
+    [InlineData(RedisErrorKind.ClusterDown, true)]
+    [InlineData(RedisErrorKind.Loading, true)]
+    [InlineData(RedisErrorKind.MasterDown, true)]
+    [InlineData(RedisErrorKind.ReadOnly, true)]
+    [InlineData(RedisErrorKind.WrongType, false)]
+    [InlineData(RedisErrorKind.NoScript, false)]
+    [InlineData(RedisErrorKind.OutOfMemory, false)]
+    [InlineData(RedisErrorKind.Unknown, false)]
+    public void RedisTransportRetry_ClassifiesClusterTransitionServerErrorsAsTransient(RedisErrorKind kind, bool transient)
+        => Assert.Equal(transient, RedisTransportRetry.IsTransient(new RedisServerException(kind, CommandFlags.None, $"{kind} simulated")));
+
     [Fact]
     public void ReplyTargetProvider_UsesResolvedResponseStreamAsDefaultTarget()
     {
@@ -718,6 +737,12 @@ public class RedisTransportTests
                 minId?.ToString(),
                 maxId?.ToString(),
                 minIdleTimeInMilliseconds));
+
+            // A one-id range (the ack-after-handler claim loop's re-read of a candidate) answers
+            // that entry alone, as Redis does.
+            if (minId is { } only && maxId is { } last && only == last)
+                return Task.FromResult(Array.FindAll(PendingMessages, item => item.MessageId == only));
+
             return Task.FromResult(PendingMessages);
         }
 
@@ -764,6 +789,21 @@ public class RedisTransportTests
 
         /// <summary>JUSTID heartbeat claims. Locked: the renewal loop runs on a background task.</summary>
         public List<ClaimCall> ClaimIdsOnlyCalls { get; } = [];
+
+        /// <summary>Every idle-consumer delete, in call order.</summary>
+        public System.Collections.Concurrent.ConcurrentQueue<DeleteConsumerCall> DeleteConsumerCalls { get; } = new();
+
+        public Task<bool> TryDeleteIdleConsumerAsync(
+            RedisKey stream,
+            RedisValue groupName,
+            RedisValue consumerName,
+            CancellationToken cancellationToken)
+        {
+            DeleteConsumerCalls.Enqueue(new DeleteConsumerCall(stream.ToString(), groupName.ToString(), consumerName.ToString()));
+            return Task.FromResult(true);
+        }
+
+        internal sealed record DeleteConsumerCall(string Stream, string Group, string Consumer);
 
         /// <summary>When set, every JUSTID heartbeat claim throws this exception.</summary>
         public Exception? ClaimIdsOnlyException { get; set; }

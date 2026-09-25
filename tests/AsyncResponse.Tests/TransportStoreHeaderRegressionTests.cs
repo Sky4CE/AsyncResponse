@@ -181,19 +181,12 @@ public sealed class TransportStoreHeaderRegressionTests
         };
 
         var collection = new Mock<IMongoCollection<MongoTransportMessageDocument>>(MockBehavior.Loose).SelfPinning();
-        collection
-            .Setup(c => c.FindOneAndUpdateAsync(
-                It.IsAny<FilterDefinition<MongoTransportMessageDocument>>(),
-                It.IsAny<UpdateDefinition<MongoTransportMessageDocument>>(),
-                It.IsAny<FindOneAndUpdateOptions<MongoTransportMessageDocument, MongoTransportMessageDocument>>(),
-                It.IsAny<CancellationToken>()))
-            .ReturnsAsync(claimed);
-
         var database = new Mock<IMongoDatabase>(MockBehavior.Loose);
         database.Setup(d => d.DatabaseNamespace).Returns(new DatabaseNamespace("asyncresponse_tests"));
         database
             .Setup(d => d.GetCollection<MongoTransportMessageDocument>(It.IsAny<string>(), It.IsAny<MongoCollectionSettings>()))
             .Returns(collection.Object);
+        database.WithRawTransportMessages().ClaimsInOrder(claimed.ToBsonDocument());
 
         // AutoCreateIndexes/UseOwnershipLedger off: EnsureCreatedAsync short-circuits, so the
         // claim runs against the mocked collection alone.
@@ -211,4 +204,106 @@ public sealed class TransportStoreHeaderRegressionTests
         Assert.Single(delivery!.Headers);
         Assert.Equal("second", delivery.Headers["AR-CORRELATION-ID"]);
     }
+    public static TheoryData<string> UnreadableDocuments =>
+    [
+        // A foreign producer's insert with the driver-generated ObjectId _id every Mongo driver
+        // defaults to (GuidSerializer cannot read an ObjectId).
+        "objectid-id",
+        // A payload written as an embedded document, natural for Mongo (the class maps a string).
+        "document-payload"
+    ];
+
+    /// <summary>
+    /// Regression: the claim deserialized the stamped document INSIDE findOneAndUpdate, so a field
+    /// the class map cannot read — a driver-generated ObjectId <c>_id</c>, a payload written as an
+    /// embedded document — threw FormatException after the server had already stamped
+    /// attempts+1/lock_id and before any delivery existed: never dead-lettered, re-claimed every
+    /// LockTimeout forever, faulting the subscriber each time. The claim now reads raw BSON, maps it
+    /// in a try, buries an unreadable document by the lock_id it just stamped (under a dead-letter id
+    /// derived from the raw <c>_id</c>), and moves on to the next document.
+    /// </summary>
+    [Theory]
+    [MemberData(nameof(UnreadableDocuments))]
+    public async Task MongoClaim_UnreadableDocument_IsBuriedByItsLockFence_AndTheClaimMovesOn(string shape)
+    {
+        var rawId = shape == "objectid-id" ? (BsonValue)ObjectId.GenerateNewId() : new BsonBinaryData(Guid.NewGuid(), GuidRepresentation.Standard);
+        var unreadable = new BsonDocument
+        {
+            ["_id"] = rawId,
+            ["queue"] = "worker",
+            ["payload"] = shape == "document-payload" ? new BsonDocument("job", 1) : "{\"job\":1}",
+            ["headers"] = new BsonArray { new BsonDocument { ["k"] = "AR-CorrelationId", ["v"] = "corr-foreign" } },
+            ["attempts"] = 1
+        };
+        Assert.ThrowsAny<Exception>(() => BsonSerializer.Deserialize<MongoTransportMessageDocument>(unreadable));
+
+        var next = new MongoTransportMessageDocument { Id = Guid.NewGuid(), Queue = "worker", Payload = "{}", Attempts = 1 };
+        var collection = new Mock<IMongoCollection<MongoTransportMessageDocument>>(MockBehavior.Loose).SelfPinning();
+        var upserts = new List<(FilterDefinition<MongoTransportMessageDocument> Filter, UpdateDefinition<MongoTransportMessageDocument> Update)>();
+        collection
+            .Setup(c => c.UpdateOneAsync(
+                It.IsAny<FilterDefinition<MongoTransportMessageDocument>>(),
+                It.IsAny<UpdateDefinition<MongoTransportMessageDocument>>(),
+                It.IsAny<UpdateOptions>(),
+                It.IsAny<CancellationToken>()))
+            .Callback((FilterDefinition<MongoTransportMessageDocument> filter, UpdateDefinition<MongoTransportMessageDocument> update, UpdateOptions _, CancellationToken _) => upserts.Add((filter, update)))
+            .ReturnsAsync(new UpdateResult.Acknowledged(0, 0, BsonNull.Value));
+        var database = new Mock<IMongoDatabase>(MockBehavior.Loose).WithTestNamespace();
+        database
+            .Setup(d => d.GetCollection<MongoTransportMessageDocument>(It.IsAny<string>(), It.IsAny<MongoCollectionSettings>()))
+            .Returns(collection.Object);
+        var raw = database.WithRawTransportMessages();
+        var claimUpdates = new List<UpdateDefinition<BsonDocument>>();
+        var claims = new Queue<BsonDocument>([unreadable, next.ToBsonDocument()]);
+        raw
+            .Setup(c => c.FindOneAndUpdateAsync(
+                It.IsAny<FilterDefinition<BsonDocument>>(),
+                It.IsAny<UpdateDefinition<BsonDocument>>(),
+                It.IsAny<FindOneAndUpdateOptions<BsonDocument, BsonDocument>>(),
+                It.IsAny<CancellationToken>()))
+            .Callback((FilterDefinition<BsonDocument> _, UpdateDefinition<BsonDocument> update, FindOneAndUpdateOptions<BsonDocument, BsonDocument> _, CancellationToken _) => claimUpdates.Add(update))
+            .ReturnsAsync(() => claims.Dequeue());
+        var deletes = new List<BsonDocument>();
+        raw
+            .Setup(c => c.DeleteOneAsync(It.IsAny<FilterDefinition<BsonDocument>>(), It.IsAny<CancellationToken>()))
+            .Callback((FilterDefinition<BsonDocument> filter, CancellationToken _) => deletes.Add(filter.Render(RawRenderArgs())))
+            .ReturnsAsync(new DeleteResult.Acknowledged(1));
+        var store = new MongoDbTransportStore(
+            database.Object,
+            Options.Create(new MongoDbAsyncResponseTransportOptions { AutoCreateIndexes = false, UseOwnershipLedger = false }));
+
+        var delivery = await store.TryClaimAsync("worker", TimeSpan.FromSeconds(30), CancellationToken.None);
+
+        // The claim moved on to the next, readable document.
+        Assert.NotNull(delivery);
+        Assert.Equal(next.Id, delivery!.Id);
+
+        // The unreadable one was removed by the lock_id its own claim stamped — no typed _id needed.
+        var stampedLock = claimUpdates[0].Render(RawRenderArgs()).AsBsonArray[0]["$set"]["lock_id"];
+        var fenced = Assert.Single(deletes);
+        Assert.Equal(stampedLock, fenced["lock_id"]);
+
+        // ...after a dead-letter copy under an id derived from its raw _id, keeping payload and headers.
+        var (deadFilter, deadUpdate) = Assert.Single(upserts);
+        Assert.Equal(
+            new BsonBinaryData(MongoDbTransportStore.UnreadableDeadLetterId(rawId), GuidRepresentation.Standard),
+            deadFilter.Render(TypedRenderArgs())["_id"]);
+        var set = deadUpdate.Render(TypedRenderArgs()).AsBsonArray[0]["$set"].AsBsonDocument;
+        Assert.Equal("deadletter", set["queue"]["$literal"].AsString);
+        Assert.Equal(
+            shape == "document-payload" ? new BsonDocument("job", 1).ToJson() : "{\"job\":1}",
+            set["payload"]["$literal"].AsString);
+        var headers = set["headers"]["$ifNull"].AsBsonArray[1]["$literal"].AsBsonArray
+            .Select(entry => entry.AsBsonDocument)
+            .ToDictionary(entry => entry["k"].AsString, entry => entry["v"].AsString);
+        Assert.Equal("corr-foreign", headers["AR-CorrelationId"]);
+        Assert.Equal("worker", headers["AR-DeadLetter-Source-Queue"]);
+        Assert.Contains("could not be read", headers["AR-DeadLetter-Reason"], StringComparison.Ordinal);
+    }
+
+    private static RenderArgs<BsonDocument> RawRenderArgs()
+        => new(BsonSerializer.LookupSerializer<BsonDocument>(), BsonSerializer.SerializerRegistry);
+
+    private static RenderArgs<MongoTransportMessageDocument> TypedRenderArgs()
+        => new(BsonSerializer.LookupSerializer<MongoTransportMessageDocument>(), BsonSerializer.SerializerRegistry);
 }

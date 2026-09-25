@@ -30,7 +30,10 @@ timeline also precedes it under a big jump, and interleavings match real time.
 
 Everything time-driven runs on it: waiter timeouts, execution leases, watchdog scans, in-process
 retry backoff, durable timers, delayed jobs, cron schedules. A five-minute production timeout
-elapses in a microsecond of test time; nothing in a test ever calls a real sleep.
+elapses without anyone waiting five minutes, and no test code sleeps for real. Advancing is not
+free, though: at every armed timer it walks, the harness spends a few real milliseconds letting
+the worker pipeline settle, so the cost of an advance grows with the number of timers it crosses
+(see [Sizing and guard rails](#sizing-and-guard-rails)).
 
 ## FlowTestHarness — testing durable flows
 
@@ -162,7 +165,9 @@ contract, including the `OnRecovery()`-override guard, so what passes here passe
 `SimulateRestartAsync()` models a redeploy: the service provider — and with it every live waiter,
 subscription, and in-flight execution — is discarded and rebuilt, while the durable state a real
 deployment would retain survives: recovery registrations, flow ledgers, and scheduled (delayed)
-worker jobs, re-published with their remaining virtual delay like broker-held scheduled messages.
+worker jobs, re-published with their remaining virtual delay like broker-held scheduled messages
+(all of them, even when a flow suspending during the old incarnation's drain takes the count past
+`DelayedJobCapacity` — a broker keeps every scheduled message).
 
 ```csharp
 _ = await subscriber.CreateRecoverableResponseWaiter<OperationResult>(
@@ -184,21 +189,49 @@ registration in place — exactly what a crashed process leaves behind.
 incarnation's execution leases, but there is no process to kill: a step body that outlives the
 graceful stop (bounded by `options.RealTimeGuard`) — it ignored its cancellation and is blocked
 on something the test controls — keeps running beside the new incarnation and performs its side
-effects *after* the restart returned, which is less than a "restart" claims. An engine-owned park
-does not cost that wait: an awaited step or an in-process timer can only end when the test replies
-or moves the virtual clock, and neither can happen while the test is awaiting the restart, so the
-stop ends as soon as a park is all that is left (the leases are broken immediately after, and the
-new incarnation takes the execution over). Only user code that is genuinely still running waits
-out the guard. `SimulateRestartAsync`
+effects *after* the restart returned, which is less than a "restart" claims. An engine-owned wait
+does not cost that wait: an awaited step, an in-process timer, or a crashed attempt asleep in a
+redelivery backoff taken during the drain can only end when the test replies or moves the virtual
+clock, and neither can happen while the test is awaiting the restart, so the stop ends as soon as
+such waits are all that is left — together with any jobs still queued behind them, which never
+started and run no user code (the leases are broken immediately after, so nothing blocks the new
+incarnation from taking the execution over). A backoff taken *before* the stop is not such a
+wait: the stop ends it — dropping its job, as the transport always does at shutdown — and drains
+the jobs queued behind it. Only user code that is genuinely still running waits out the
+guard. `SimulateRestartAsync`
 therefore refuses with `InvalidOperationException` when user code is still executing after the
-stop lapsed (engine-owned parks — an awaited step or an in-process timer holding its worker slot
-on the virtual clock — are expected and never trip this). Let the step observe its cancellation
+stop lapsed (engine-owned waits — an awaited step or an in-process timer holding its worker slot,
+a redelivery backoff, all on the virtual clock — and queued jobs are expected and never trip
+this). Let the step observe its cancellation
 token or finish before restarting; for crash-*at-a-checkpoint* semantics use
 `FlowTestHarness.CrashBeforeStep` / `CrashAfterStep`, which fail the attempt at the exact
 boundary with nothing left running. A test that deliberately wants the overlap sets
 `options.AbandonLingeringExecutionsOnRestart = true` and then owns it: the abandoned execution's
 side effects land whenever it unblocks. Nothing in the harness is a subprocess kill; a guarantee
 that must hold against abrupt termination needs a real process and a real broker.
+
+**Scheduled jobs and jobs that never started are carried over; interrupted executions are not.**
+A job still queued behind a park the stop could not wait for never started, so nothing can run it
+twice: the new incarnation runs it, as a broker would deliver a message it still holds — a queued
+flow *start* included — under the ambient context (`AsyncLocal` state) it was published under, as
+the in-memory transport runs every job. Breaking a lease does not redeliver the execution that
+held it, though: the wake-up of every execution the stop abandoned — one parked on an awaited
+step or an in-process timer, or a crashed attempt asleep in the redelivery backoff (after
+`CrashAfterStep`, say, when the restart comes before the clock has moved) — dies with the old
+incarnation, and the new one does not deliver it again. Resume those runs explicitly after the
+restart (`run.ResumeAsync()`, `IDurableFlows.ResumeAsync`), or, for an awaited step, publish its
+response — lost-subscriber recovery routes it into the run.
+
+The flow probe's step barriers skip a park the dead incarnation held in process: after a restart,
+`WaitForAwaitingStepAsync` — and `WaitForTimerStepAsync` for a timer at or below
+`TimerInProcessThreshold` — wait for the *new* incarnation to park the step (resume the run
+first), instead of handing back the dead incarnation's park, whose correlation id a re-executed
+step may already have replaced. What is durable stays visible: `WaitForStepCompletedAsync` returns
+for a checkpoint persisted before the restart (by the old incarnation's graceful drain, too), and
+`WaitForTimerStepAsync` for a suspended timer, whose wake-up the restart carried over.
+`ReplyAsync` answers the new incarnation's wait once the run has recorded anything in it; until
+then it answers the wait that survived the restart, which is exactly a response arriving while the
+process is down. `Events` and `StepExecutions` keep the whole history across restarts.
 
 It also breaks the dead incarnation's leases *for* the new one. A process that really dies leaves
 its execution lease persisted and unexpired, and whatever redelivers the run's wake-up has to get
@@ -259,23 +292,30 @@ dead incarnation's task.
 - Every harness wait (`WaitFor*`, `WaitForWorkerIdleAsync`) is bounded by
   `options.RealTimeGuard` (default 10 s of *real* time) and fails with a diagnosis — a hung test
   tells you it hung and why, usually "advance the clock first".
-- Advancing walks every armed timer: if a test forces a long **in-process** sleep, widen the
-  lease cadence (`ExecutionLeaseDuration` / `ExecutionLeaseRenewInterval`) so the walk is a few
-  steps, not thousands. Suspend-path timers (the default for long sleeps) don't have this
-  concern — a 3-day sleep is one timer.
+- Advancing walks every armed timer, and every step costs a few real milliseconds of settle
+  (three 1 ms delays at least — about 15 ms each on Windows' default timer resolution). Anything
+  that holds its execution lease while the clock crosses days renews that lease every
+  `ExecutionLeaseRenewInterval` (20 s by default): a long **in-process** sleep, and an **awaited
+  step** with a long timeout (awaited steps are never hopped). `AdvanceAsync(TimeSpan.FromDays(3))`
+  past either walks about 13,000 renewals — tens of seconds of real time on Linux, minutes on
+  Windows. Widen the lease cadence (`ExecutionLeaseDuration` / `ExecutionLeaseRenewInterval`) in
+  such tests so the walk is a few steps, not thousands. Suspend-path timers (the default for long
+  sleeps) don't have this concern — a 3-day sleep is one timer.
 - The in-memory channel's default wait timeout is 30 minutes; drive scripted conversations with
   advances smaller than that (or set `options.Channel = c => c.DefaultTimeout = …`) unless the
   timeout is what you're testing.
 - Keep flow dependencies as ordinary DI fakes via `options.ConfigureServices` — the harness
   re-applies registrations on every simulated restart, so keep instances you assert on in test
   locals (registered as singletons), like the recorders in the library's suites.
-- Don't register your own `TimeProvider` in `ConfigureServices` — the harness runs the whole engine
-  on its own virtual clock, and construction now fails fast naming the fix instead of letting a
-  registered clock silently displace it (no timer, timeout, lease, or backoff would ever elapse).
-  Drive time through `harness.Clock` / `AdvanceAsync` instead.
-- Call `services.AddLogging(...)` in `ConfigureServices` to see the engine's own diagnostics — it
-  now wins over the harness's `NullLogger<>` fallback, which previously always registered first and
-  swallowed them regardless of what the test configured.
+- Don't register your own `TimeProvider` in `ConfigureServices` or `ConfigureAsyncResponse` (whose
+  builder exposes the same `Services`) — the harness runs the whole engine on its own virtual
+  clock, and construction now fails fast naming the fix instead of letting a registered clock
+  silently displace it (no timer, timeout, lease, or backoff would ever elapse). Drive time
+  through `harness.Clock` / `AdvanceAsync` instead.
+- Call `services.AddLogging(...)` in `ConfigureServices` (or `builder.Services.AddLogging(...)` in
+  `ConfigureAsyncResponse`) to see the engine's own diagnostics — it now wins over the harness's
+  `NullLogger<>` fallback, which previously always registered first and swallowed them regardless
+  of what the test configured.
 
 ### Concurrency and publication regressions
 

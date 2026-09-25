@@ -84,11 +84,11 @@ public sealed class MongoDbSubscriberServiceTests
     public async Task Subscriber_RetriesWithBackoffWhenTheStoreFails()
     {
         var fixture = new Fixture();
-        fixture.Messages
+        fixture.RawMessages
             .Setup(collection => collection.FindOneAndUpdateAsync(
-                It.IsAny<FilterDefinition<MongoTransportMessageDocument>>(),
-                It.IsAny<UpdateDefinition<MongoTransportMessageDocument>>(),
-                It.IsAny<FindOneAndUpdateOptions<MongoTransportMessageDocument, MongoTransportMessageDocument>>(),
+                It.IsAny<FilterDefinition<BsonDocument>>(),
+                It.IsAny<UpdateDefinition<BsonDocument>>(),
+                It.IsAny<FindOneAndUpdateOptions<BsonDocument, BsonDocument>>(),
                 It.IsAny<CancellationToken>()))
             .ThrowsAsync(new InvalidOperationException("mongo offline"));
 
@@ -292,18 +292,19 @@ public sealed class MongoDbSubscriberServiceTests
                     It.IsAny<string>(), It.IsAny<MongoCollectionSettings>()))
                 .Returns(Messages.Object);
 
-            // The claim: hand back the next queued document, or null for "queue empty". With
-            // honourClaimCancellation it also throws on a cancelled token, as the real driver does.
-            Messages
+            // The claim (through the store's untyped handle): hand back the next queued document,
+            // or null for "queue empty". With honourClaimCancellation it also throws on a cancelled
+            // token, as the real driver does.
+            RawMessages
                 .Setup(collection => collection.FindOneAndUpdateAsync(
-                    It.IsAny<FilterDefinition<MongoTransportMessageDocument>>(),
-                    It.IsAny<UpdateDefinition<MongoTransportMessageDocument>>(),
-                    It.IsAny<FindOneAndUpdateOptions<MongoTransportMessageDocument, MongoTransportMessageDocument>>(),
+                    It.IsAny<FilterDefinition<BsonDocument>>(),
+                    It.IsAny<UpdateDefinition<BsonDocument>>(),
+                    It.IsAny<FindOneAndUpdateOptions<BsonDocument, BsonDocument>>(),
                     It.IsAny<CancellationToken>()))
                 .Returns((
-                    FilterDefinition<MongoTransportMessageDocument> _,
-                    UpdateDefinition<MongoTransportMessageDocument> __,
-                    FindOneAndUpdateOptions<MongoTransportMessageDocument, MongoTransportMessageDocument> ___,
+                    FilterDefinition<BsonDocument> _,
+                    UpdateDefinition<BsonDocument> __,
+                    FindOneAndUpdateOptions<BsonDocument, BsonDocument> ___,
                     CancellationToken cancellationToken) =>
                 {
                     ClaimAttempted.TrySetResult();
@@ -319,7 +320,7 @@ public sealed class MongoDbSubscriberServiceTests
                         // The driver's FindOneAndUpdateAsync return is non-null-annotated, but a
                         // null document IS the real empty-queue result — forgive it deliberately
                         // instead of widening the mock signature (which trips CS8619).
-                        return Task.FromResult(_pending.Count > 0 ? _pending.Dequeue() : null!);
+                        return Task.FromResult(_pending.Count > 0 ? _pending.Dequeue().ToBsonDocument() : null!);
                     }
                 });
 
@@ -330,11 +331,16 @@ public sealed class MongoDbSubscriberServiceTests
                 .ReturnsAsync(new DeleteResult.Acknowledged(1));
 
             Database.WithTestNamespace();
+            // After WithTestNamespace: this name-specific setup overrides its BsonDocument catch-all.
+            Database
+                .Setup(database => database.GetCollection<BsonDocument>(_options.Value.MessageCollection, It.IsAny<MongoCollectionSettings>()))
+                .Returns(RawMessages.Object);
             _store = new MongoDbTransportStore(Database.Object, _options);
         }
 
         public Mock<IMongoDatabase> Database { get; } = new(MockBehavior.Loose);
         public Mock<IMongoCollection<MongoTransportMessageDocument>> Messages { get; } = new Mock<IMongoCollection<MongoTransportMessageDocument>>(MockBehavior.Loose).SelfPinning();
+        public Mock<IMongoCollection<BsonDocument>> RawMessages { get; } = new Mock<IMongoCollection<BsonDocument>>(MockBehavior.Loose).SelfPinning();
         public Mock<IAsyncResponseIngress> Ingress { get; } = new();
         public CollectingLogger Logger { get; } = new();
 

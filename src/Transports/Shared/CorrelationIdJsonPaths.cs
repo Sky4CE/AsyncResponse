@@ -44,8 +44,11 @@ internal static class CorrelationIdJsonPaths
         {
             document = JsonDocument.Parse(messageJson);
         }
-        catch (JsonException)
+        catch (Exception ex) when (ex is JsonException or ArgumentException)
         {
+            // ArgumentException: a RAW lone surrogate (a SQL Server nvarchar(max) row stores UTF-16
+            // code units unvalidated) cannot be transcoded to the UTF-8 Parse(string) reads — an
+            // unresolvable body, not a handler failure to retry and dead-letter.
             return null;
         }
 

@@ -68,7 +68,15 @@ public sealed class NatsSubscriberOptions
     /// <summary>Controls when a message is ACKed. Defaults to <see cref="NatsAckMode.AckAfterHandlerCompletes"/>.</summary>
     public NatsAckMode AckMode { get; set; } = NatsAckMode.AckAfterHandlerCompletes;
 
-    /// <summary>Maximum number of in-flight messages pulled from the consumer at once. Default: <c>16</c>.</summary>
+    /// <summary>
+    /// Maximum number of messages one fetch pulls from the consumer in
+    /// <see cref="NatsAckMode.AckAfterEnqueue"/> mode, where each message is settled as it is
+    /// accepted into the background queue. In the default
+    /// <see cref="NatsAckMode.AckAfterHandlerCompletes"/> mode every fetch pulls exactly one
+    /// message, whatever this is set to: JetStream counts a delivery when it hands a message over,
+    /// so messages prefetched behind a handler that kills the process would lose a delivery attempt
+    /// without ever running. Default: <c>16</c>.
+    /// </summary>
     public int BatchSize { get; set; } = 16;
 
     /// <summary>

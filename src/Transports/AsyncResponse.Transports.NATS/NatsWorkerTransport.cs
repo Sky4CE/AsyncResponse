@@ -68,7 +68,10 @@ public sealed class NatsWorkerTransport : IWorkerTransport
             {
                 ["Nats-Msg-Id"] = Guid.NewGuid().ToString("N")
             };
-            if (!string.IsNullOrWhiteSpace(job.CorrelationId))
+            // ASCII only: NATS.Net writes header values in ASCII by default, so a non-ASCII id
+            // would travel as '?' placeholders — a wrong id in every consumer-side log, span and
+            // OnBackgroundFailure report. The body carries the id either way.
+            if (!string.IsNullOrWhiteSpace(job.CorrelationId) && System.Text.Ascii.IsValid(job.CorrelationId))
                 headers[_options.CorrelationIdHeader] = job.CorrelationId!;
 
             var payload = AsyncResponseJson.Serialize(job);

@@ -14,8 +14,9 @@ namespace AsyncResponse.Internal;
 /// collection into the fixed <c>asyncresponse_ownership</c> collection; a claim already held by
 /// a DIFFERENT component (or the same component in a different role) fails startup with an
 /// actionable error naming both claimants — whichever process starts second, whatever the
-/// order. Restarts re-claim idempotently. Deployments that disable auto-creation own their
-/// provisioning and skip the ledger, like the rest of the first-use DDL. Renaming a collection
+/// order. Restarts re-claim idempotently. The claim is independent of index auto-creation: only a
+/// store's <c>UseOwnershipLedger = false</c> skips it (for deployments whose credentials cannot
+/// write the ledger collection). Renaming a collection
 /// in configuration leaves the old claim behind; the error text covers removing a stale claim
 /// document deliberately. Source-linked into the channel, transport, and durable-flow packages.
 /// </summary>

@@ -111,11 +111,13 @@ public class DurableFlowOptions
     /// delivery whose in-flight clock starts again.
     /// <para>
     /// <c>null</c> (the default) derives the hop from the transport: half of the ceiling it
-    /// advertises, or no bound at all — one wait for the whole remainder — when it advertises
-    /// none. A value can only shorten a transport-derived hop (the shorter of the two applies) or
-    /// supply one for a transport that advertises no ceiling, e.g. a custom transport or a broker
-    /// policy the library cannot see. Must be positive and at most the .NET timer ceiling
-    /// (~49.7 days). Awaited-response steps are not hopped; see the durable-flows guide.
+    /// advertises — never more than the delivery has left of that ceiling once the steps before
+    /// the timer ran, less a tenth of it as headroom — or, when it advertises none, one wait for
+    /// the whole remainder up to the ~49.7-day .NET timer ceiling (a longer sleep is waited in hops
+    /// of that length). A value can only shorten a transport-derived hop (the shorter of the two
+    /// applies) or supply one for a transport that advertises no ceiling, e.g. a custom transport
+    /// or a broker policy the library cannot see. Must be positive and at most the .NET timer
+    /// ceiling (~49.7 days). Awaited-response steps are not hopped; see the durable-flows guide.
     /// </para>
     /// </summary>
     public TimeSpan? MaxInProcessParkDuration { get; set; }
@@ -129,9 +131,9 @@ public class DurableFlowOptions
     /// step-results over its lifetime, and the store's <c>MaxStateBytes</c> (or the provider's
     /// item cap) is the hard limit. The warning is the early signal to keep step results small
     /// (persist large data yourself and pass references) or to partition a long history into child
-    /// flows. <c>null</c> disables it. Default: 512 KiB — under the smallest bundled hard cap
-    /// (DynamoDB's 350 KB item, whose store defaults <c>MaxStateBytes</c> to 350 000) users should
-    /// lower it accordingly.
+    /// flows. <c>null</c> disables it. Default: 512 KiB — under the smallest bundled hard cap (the
+    /// DynamoDB store's <c>MaxStateBytes</c>, 350 000 by default, below DynamoDB's 400 KB item cap)
+    /// users should lower it accordingly.
     /// </summary>
     public long? LedgerSizeWarningBytes { get; set; } = 512 * 1024;
 
@@ -155,9 +157,11 @@ public class DurableFlowOptions
     public bool AllowEarlyAckWorkerSubscriber { get; set; }
 
     /// <summary>
-    /// Startup validation of <see cref="MaxInProcessParkDuration"/>: the hop arms a BCL timer, so a
-    /// non-positive or over-ceiling value would pass registration and throw only when the first
-    /// timer parks — inside a delivery, as a retriable failure that dead-letters the run.
+    /// Validation of <see cref="MaxInProcessParkDuration"/>, part of every durable-flow option
+    /// check (<c>FlowStateConcurrency.ValidateOptions</c>: host startup, the executor, the starter):
+    /// the hop arms a BCL timer, so an over-ceiling value would pass registration and throw only
+    /// when the first timer parks — inside a delivery, as a retriable failure that dead-letters the
+    /// run — and a non-positive one turned every in-process timer into a hot hand-over loop.
     /// </summary>
     internal void ValidateInProcessPark()
     {

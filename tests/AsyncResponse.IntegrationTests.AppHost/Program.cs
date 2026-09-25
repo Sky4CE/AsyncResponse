@@ -229,8 +229,9 @@ IResourceBuilder<ContainerResource> AddPubSubContainer()
 
 // `-js` enables JetStream, which the NATS channel's Key-Value recovery store and the NATS transport's
 // streams both require.
+// Pinned to a minor line, not `latest`: only NATS patch releases reach the suite without a commit.
 IResourceBuilder<ContainerResource> AddNatsContainer()
-    => builder.AddContainer("nats", "nats", "latest")
+    => builder.AddContainer("nats", "nats", "2.15")
         .WithArgs("-js")
         .WithEndpoint(targetPort: 4222, scheme: "tcp", name: "nats");
 
@@ -271,7 +272,8 @@ IResourceBuilder<ContainerResource> AddMongoDbContainer()
         .WithEndpoint(targetPort: 27017, scheme: "tcp", name: "mongodb");
 
 // Oracle and Cosmos back durable-flow store contract tests only — no SUT app references them, so
-// they live in the "stores" batch. See SkipOracleCosmos above for the opt-out.
+// they live in the "oracle-cosmos" batch (and the Oracle/Cosmos matrix shards). See SkipOracleCosmos
+// above for the opt-out.
 // INIT_SGA_SIZE/INIT_PGA_SIZE: left to its own devices Oracle sizes its SGA from the host and
 // measured 2,180 MiB here — the single largest container in the suite by a wide margin. The store
 // contract is a handful of small tables, so a 1 GiB SGA is ample and keeps the batch inside a
@@ -285,8 +287,9 @@ IResourceBuilder<ContainerResource> AddOracleContainer()
         .WithEnvironment("INIT_PGA_SIZE", Env("ASYNCRESPONSE_ITEST_ORACLE_PGA_MB", "256"))
         .WithEndpoint(targetPort: 1521, scheme: "tcp", name: "oracle");
 
+// Pinned to a dated release, not `vnext-latest` (moves every drop); bump to a newer non-`pre` vnext-EN* tag.
 IResourceBuilder<ContainerResource> AddCosmosContainer()
-    => builder.AddContainer("cosmos", "mcr.microsoft.com/cosmosdb/linux/azure-cosmos-emulator", "vnext-latest")
+    => builder.AddContainer("cosmos", "mcr.microsoft.com/cosmosdb/linux/azure-cosmos-emulator", "vnext-EN20260907")
         .WithEnvironment("PROTOCOL", "https")
         .WithEndpoint(targetPort: 8081, scheme: "https", name: "gateway")
         .WithEndpoint(targetPort: 8080, scheme: "http", name: "health")
@@ -317,7 +320,8 @@ IResourceBuilder<ContainerResource> AddServiceBusContainer()
         .WithEnvironment("MSSQL_SA_PASSWORD", serviceBusSqlPassword)
         .WithEnvironment("MSSQL_MEMORY_LIMIT_MB", Env("ASYNCRESPONSE_ITEST_SQLSERVER_MEMORY_MB", "1024"));
     var serviceBusConfigPath = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "servicebus-emulator-config.json"));
-    return builder.AddContainer("servicebus", "mcr.microsoft.com/azure-messaging/servicebus-emulator", "latest")
+    // Pinned to a release, not `latest` — which has already crossed a major version (1.x to 2.x).
+    return builder.AddContainer("servicebus", "mcr.microsoft.com/azure-messaging/servicebus-emulator", "2.0.1")
         .WithBindMount(serviceBusConfigPath, "/ServiceBus_Emulator/ConfigFiles/Config.json", isReadOnly: true)
         .WithEnvironment("SQL_SERVER", "servicebus-sql")
         .WithEnvironment("MSSQL_SA_PASSWORD", serviceBusSqlPassword)
@@ -520,8 +524,8 @@ AddSutApp("itest-app-azure-servicebus-early-ack", aotCapable: false, waitFor: [r
     .WithEnvironment("AsyncResponse:Transport", "AzureServiceBus");
 }
 
-// earlyAck: the databases batch needs only the default SQS app (for the durable-flow scenarios); the
-// brokers batch, which owns SqsTransportTests, needs both variants.
+// earlyAck: the data batch needs only the default SQS app (for the durable-flow scenarios); the
+// cloud batch, which owns SqsTransportTests, needs both variants.
 void AddSqsApps(IResourceBuilder<RedisResource> redis, IResourceBuilder<ContainerResource> localstack, bool earlyAck)
 {
     var localstackServiceUrl = LocalStackServiceUrl(localstack);
@@ -725,8 +729,8 @@ AddSutApp("itest-app-mongodb-early-ack", aotCapable: false, waitFor: [mongodb])
 //
 // The split follows the one structural fact that matters: a test either drives a sample app over HTTP
 // or it drives a driver directly. The direct tests need no sample app at all, which is why
-// "conformance", "stores", and "oracle-cosmos" start zero processes. The app-driven half splits by
-// transport family.
+// "oracle-cosmos" and the matrix-* shards start zero processes (the rest of the direct tests share
+// the "data" batch with the database SUTs, below). The app-driven half splits by transport family.
 //
 // Batches are balanced on measured MEMORY, not container count — counting containers hid a 2.3x
 // spread (7 small containers can cost more than 8 large-sounding ones). The two SQL Servers, Oracle,
@@ -760,7 +764,7 @@ switch (Env("ASYNCRESPONSE_ITEST_BATCH", "").ToLowerInvariant())
     }
 
     // Oracle and Cosmos alone. Measured 2,180 MiB and 1,031 MiB — together more than half a default
-    // Docker VM, and between them they back exactly two tests. Kept in "stores" they made that batch
+    // Docker VM, for one small store-contract class. Kept in the former "stores" batch they made it
     // 5.8 GiB, which failed as soon as anything else was running. Isolated, they compete with nothing.
     case "oracle-cosmos":
         if (!SkipOracleCosmos())

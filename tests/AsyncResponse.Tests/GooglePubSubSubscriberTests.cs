@@ -1,3 +1,4 @@
+using AsyncResponse.Testing;
 using AsyncResponse.Transports.GooglePubSub;
 using Google.Cloud.PubSub.V1;
 using Google.Protobuf;
@@ -36,7 +37,7 @@ public class GooglePubSubSubscriberTests
             }),
             ingress.Object,
             NullLogger<GooglePubSubWorkerSubscriber>.Instance,
-            (_, _) => Task.FromResult<IGooglePubSubSubscriberClient>(client));
+            (_, _, _) => Task.FromResult<IGooglePubSubSubscriberClient>(client));
 
         await subscriber.StartAsync(CancellationToken.None);
         var handler = await WaitForHandlerAsync(client);
@@ -70,7 +71,7 @@ public class GooglePubSubSubscriberTests
             Options.Create(options),
             ingress.Object,
             NullLogger<GooglePubSubWorkerSubscriber>.Instance,
-            (subscriptionName, _) =>
+            (subscriptionName, _, _) =>
             {
                 subscriptionNames.Add(subscriptionName);
                 return Task.FromResult<IGooglePubSubSubscriberClient>(client);
@@ -116,7 +117,7 @@ public class GooglePubSubSubscriberTests
             }),
             new Mock<IAsyncResponseIngress>().Object,
             NullLogger<GooglePubSubWorkerSubscriber>.Instance,
-            (_, _) =>
+            (_, _, _) =>
             {
                 if (Interlocked.Increment(ref clientsBuilt) >= 2)
                 {
@@ -152,7 +153,7 @@ public class GooglePubSubSubscriberTests
             }),
             ingress.Object,
             NullLogger<GooglePubSubWorkerSubscriber>.Instance,
-            (_, _) => Task.FromResult<IGooglePubSubSubscriberClient>(client));
+            (_, _, _) => Task.FromResult<IGooglePubSubSubscriberClient>(client));
 
         await subscriber.StartAsync(CancellationToken.None);
         var handler = await WaitForHandlerAsync(client);
@@ -197,7 +198,7 @@ public class GooglePubSubSubscriberTests
             Options.Create(options),
             ingress.Object,
             NullLogger<GooglePubSubWorkerSubscriber>.Instance,
-            (_, _) => Task.FromResult<IGooglePubSubSubscriberClient>(client));
+            (_, _, _) => Task.FromResult<IGooglePubSubSubscriberClient>(client));
 
         await subscriber.StartAsync(CancellationToken.None);
         var handler = await WaitForHandlerAsync(client);
@@ -249,7 +250,7 @@ public class GooglePubSubSubscriberTests
             Options.Create(options),
             ingress.Object,
             NullLogger<GooglePubSubWorkerSubscriber>.Instance,
-            (_, _) => Task.FromResult<IGooglePubSubSubscriberClient>(client));
+            (_, _, _) => Task.FromResult<IGooglePubSubSubscriberClient>(client));
 
         await subscriber.StartAsync(CancellationToken.None);
         var handler = await WaitForHandlerAsync(client);
@@ -283,7 +284,7 @@ public class GooglePubSubSubscriberTests
             }),
             ingress.Object,
             NullLogger<GooglePubSubResponseIngressSubscriber>.Instance,
-            (_, _) => Task.FromResult<IGooglePubSubSubscriberClient>(client));
+            (_, _, _) => Task.FromResult<IGooglePubSubSubscriberClient>(client));
         var message = new PubsubMessage
         {
             MessageId = "message-3",
@@ -326,7 +327,7 @@ public class GooglePubSubSubscriberTests
             Options.Create(options),
             ingress.Object,
             NullLogger<GooglePubSubResponseIngressSubscriber>.Instance,
-            (_, _) => Task.FromResult<IGooglePubSubSubscriberClient>(client));
+            (_, _, _) => Task.FromResult<IGooglePubSubSubscriberClient>(client));
         var message = new PubsubMessage
         {
             MessageId = "message-response-early-ack",
@@ -374,7 +375,7 @@ public class GooglePubSubSubscriberTests
             Options.Create(options),
             ingress.Object,
             NullLogger<GooglePubSubWorkerSubscriber>.Instance,
-            (_, _) => Task.FromResult<IGooglePubSubSubscriberClient>(client));
+            (_, _, _) => Task.FromResult<IGooglePubSubSubscriberClient>(client));
 
         await subscriber.StartAsync(CancellationToken.None);
         var handler = await WaitForHandlerAsync(client);
@@ -646,7 +647,7 @@ public class GooglePubSubSubscriberTests
             }),
             Mock.Of<IAsyncResponseIngress>(),
             logger,
-            (_, _) => Task.FromResult<IGooglePubSubSubscriberClient>(client));
+            (_, _, _) => Task.FromResult<IGooglePubSubSubscriberClient>(client));
 
         await subscriber.StartAsync(CancellationToken.None);
         await WaitForHandlerAsync(client);
@@ -677,7 +678,7 @@ public class GooglePubSubSubscriberTests
             }),
             Mock.Of<IAsyncResponseIngress>(),
             logger,
-            (_, _) => Task.FromResult<IGooglePubSubSubscriberClient>(client));
+            (_, _, _) => Task.FromResult<IGooglePubSubSubscriberClient>(client));
 
         await subscriber.StartAsync(CancellationToken.None);
         await WaitForHandlerAsync(client);
@@ -745,7 +746,7 @@ public class GooglePubSubSubscriberTests
             Options.Create(options),
             ingress.Object,
             logger,
-            (_, _) => Task.FromResult<IGooglePubSubSubscriberClient>(
+            (_, _, _) => Task.FromResult<IGooglePubSubSubscriberClient>(
                 Interlocked.Increment(ref clientsBuilt) == 1 ? first : second));
 
         await subscriber.StartAsync(CancellationToken.None);
@@ -783,6 +784,382 @@ public class GooglePubSubSubscriberTests
             MessageId = body,
             Data = ByteString.CopyFromUtf8(body)
         };
+    }
+
+    [Fact]
+    public async Task WorkerSubscriberService_Stop_DrainsTheRunningHandlerBeforeStoppingTheClient()
+    {
+        // Red-on-old (fixpoint r1, S8#7): the stop called the SDK's StopAsync at once, and with
+        // any timeout under its 30-second hard-stop window the SDK hands every message still in
+        // leasing back immediately — including jobs whose handler is still running — stops their
+        // ack-deadline extension and drops their eventual Ack: every in-flight job ran twice on
+        // every deploy. The stop now waits for the running handler (new deliveries are held for the
+        // client stop meanwhile) before it stops the client, with NackImmediately explicit.
+        var client = new FakeSubscriberClient();
+        var handlerStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseHandler = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var ingress = new Mock<IAsyncResponseIngress>();
+        ingress.Setup(i => i.HandleWorkerMessageAsync("running")).Returns(async () =>
+        {
+            handlerStarted.TrySetResult();
+            await releaseHandler.Task.ConfigureAwait(false);
+        });
+        var logger = new CapturingLogger<GooglePubSubWorkerSubscriber>();
+        var subscriber = new GooglePubSubWorkerSubscriber(
+            Options.Create(new GooglePubSubAsyncResponseOptions
+            {
+                ProjectId = "project-a",
+                WorkerSubscriptionId = "workers",
+                ShutdownTimeout = TimeSpan.FromMilliseconds(250)
+            }),
+            ingress.Object,
+            logger,
+            (_, _, _) => Task.FromResult<IGooglePubSubSubscriberClient>(client));
+
+        await subscriber.StartAsync(CancellationToken.None);
+        var handler = await WaitForHandlerAsync(client);
+        var running = handler(new PubsubMessage { MessageId = "m1", Data = ByteString.CopyFromUtf8("running") }, CancellationToken.None);
+        await handlerStarted.Task.WaitAsync(TimeSpan.FromSeconds(2));
+
+        var stopping = subscriber.StopAsync(CancellationToken.None);
+        await Task.WhenAny(
+            client.Stopped.Task,
+            Eventually(() => logger.Entries.Any(entry => entry.Message.Contains("waiting up to", StringComparison.Ordinal)))).Unwrap();
+        Assert.False(client.Stopped.Task.IsCompleted, "the subscriber client was stopped while a handler was still running");
+
+        // While the running handler drains, the client is NOT stopped, and a new delivery neither
+        // runs nor is answered: it is held for the client stop.
+        var late = handler(new PubsubMessage { MessageId = "m2", Data = ByteString.CopyFromUtf8("late") }, CancellationToken.None);
+        Assert.False(late.IsCompleted, "a delivery arriving during the drain was answered before the client stop");
+        ingress.Verify(i => i.HandleWorkerMessageAsync("late"), Times.Never);
+        Assert.False(client.Stopped.Task.IsCompleted, "the subscriber client was stopped while a handler was still running");
+
+        releaseHandler.TrySetResult();
+        Assert.Equal(SubscriberClient.Reply.Ack, await running.WaitAsync(TimeSpan.FromSeconds(2)));
+        await stopping.WaitAsync(TimeSpan.FromSeconds(10));
+
+        // The held delivery never counted as running — the drain ended with the running handler —
+        // and it went back with the client stop, never having run.
+        Assert.Equal(SubscriberClient.Reply.Nack, await late.WaitAsync(TimeSpan.FromSeconds(2)));
+        ingress.Verify(i => i.HandleWorkerMessageAsync("late"), Times.Never);
+        Assert.Equal(1, client.StopCalls);
+        Assert.Equal(SubscriberClient.ShutdownMode.NackImmediately, client.LastShutdownOptions?.Mode);
+        Assert.Equal(TimeSpan.FromMilliseconds(250), client.LastShutdownOptions?.Timeout);
+    }
+
+    [Fact]
+    public async Task WorkerSubscriberService_Stop_BoundsTheInFlightDrainByTheHostBudgetLeftAfterTheClientStop()
+    {
+        // Fixpoint r1 (S8#7): the drain must end in time for the client stop to fit the host
+        // budget — what HostShutdownTimeout leaves after ShutdownTimeout — however long a handler runs.
+        var client = new FakeSubscriberClient();
+        var handlerStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var ingress = new Mock<IAsyncResponseIngress>();
+        ingress.Setup(i => i.HandleWorkerMessageAsync(It.IsAny<string>())).Returns(async () =>
+        {
+            handlerStarted.TrySetResult();
+            await Task.Delay(Timeout.InfiniteTimeSpan).ConfigureAwait(false);
+        });
+        var subscriber = new GooglePubSubWorkerSubscriber(
+            Options.Create(new GooglePubSubAsyncResponseOptions
+            {
+                ProjectId = "project-a",
+                WorkerSubscriptionId = "workers",
+                ShutdownTimeout = TimeSpan.FromMilliseconds(250),
+                HostShutdownTimeout = TimeSpan.FromMilliseconds(750)
+            }),
+            ingress.Object,
+            NullLogger<GooglePubSubWorkerSubscriber>.Instance,
+            (_, _, _) => Task.FromResult<IGooglePubSubSubscriberClient>(client));
+
+        await subscriber.StartAsync(CancellationToken.None);
+        var handler = await WaitForHandlerAsync(client);
+        _ = handler(new PubsubMessage { MessageId = "stuck", Data = ByteString.CopyFromUtf8("stuck") }, CancellationToken.None);
+        await handlerStarted.Task.WaitAsync(TimeSpan.FromSeconds(2));
+
+        await subscriber.StopAsync(CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(10));
+
+        Assert.Equal(1, client.StopCalls);
+    }
+
+    [Fact]
+    public async Task WorkerSubscriberService_Stop_HoldsLateDeliveriesForTheClientStop_InsteadOfNackingThemIntoTheLivePull()
+    {
+        // Red-on-old (fixpoint r1 pre-commit, I1): the SDK's streaming pull runs until the client
+        // stop, so during the drain every delivery that arrived was Nacked at once — freeing its
+        // flow-control slot for Pub/Sub to redeliver the message straight back, often to this same
+        // stream: a Nack storm for the whole drain, each Nack a delivery attempt under a
+        // DeadLetterPolicy (the flow wake-ups handed over at the stop land exactly here). A late
+        // delivery is now held — keeping its slot, so the pull stalls — and answered only when the
+        // client is stopped, also when the drain lapses on a handler that never returns.
+        var clock = new VirtualTimeProvider();
+        var client = new FakeSubscriberClient();
+        var handlerStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var ingress = new Mock<IAsyncResponseIngress>();
+        ingress.Setup(i => i.HandleWorkerMessageAsync("stuck")).Returns(async () =>
+        {
+            handlerStarted.TrySetResult();
+            await Task.Delay(Timeout.InfiniteTimeSpan).ConfigureAwait(false);
+        });
+        var logger = new CapturingLogger<GooglePubSubWorkerSubscriber>();
+        var subscriber = new GooglePubSubWorkerSubscriber(
+            Options.Create(new GooglePubSubAsyncResponseOptions
+            {
+                ProjectId = "project-a",
+                WorkerSubscriptionId = "workers",
+                WorkerSubscriber = { BackgroundDrainTimeout = TimeSpan.FromSeconds(10) }
+            }),
+            ingress.Object,
+            logger,
+            (_, _, _) => Task.FromResult<IGooglePubSubSubscriberClient>(client))
+        {
+            Clock = clock
+        };
+
+        await subscriber.StartAsync(CancellationToken.None);
+        var handler = await WaitForHandlerAsync(client);
+        _ = handler(new PubsubMessage { MessageId = "m1", Data = ByteString.CopyFromUtf8("stuck") }, CancellationToken.None);
+        await handlerStarted.Task.WaitAsync(TimeSpan.FromSeconds(2));
+
+        var stopping = subscriber.StopAsync(CancellationToken.None);
+        await Eventually(() => clock.NextTimerDueAt is not null); // the drain is waiting
+
+        var late = new[] { "late-1", "late-2", "late-3" }
+            .Select(id => handler(new PubsubMessage { MessageId = id, Data = ByteString.CopyFromUtf8(id) }, CancellationToken.None))
+            .ToArray();
+        Assert.All(late, reply => Assert.False(reply.IsCompleted, "a delivery arriving during the drain was answered before the client stop"));
+        Assert.False(client.Stopped.Task.IsCompleted);
+
+        // The drain lapses on the stuck handler; only then is the client stopped and the held
+        // deliveries handed back, none of them having run.
+        clock.Advance(TimeSpan.FromSeconds(10));
+        await stopping.WaitAsync(TimeSpan.FromSeconds(10));
+
+        Assert.Equal(1, client.StopCalls);
+        foreach (var reply in late)
+            Assert.Equal(SubscriberClient.Reply.Nack, await reply.WaitAsync(TimeSpan.FromSeconds(2)));
+        ingress.Verify(i => i.HandleWorkerMessageAsync(It.Is<string>(body => body.StartsWith("late", StringComparison.Ordinal))), Times.Never);
+    }
+
+    [Theory]
+    [InlineData(30, 5, 20, 0, 20)]   // BackgroundDrainTimeout bounds it, not the 25 s the host budget leaves after the client stop
+    [InlineData(30, 5, 20, 12, 13)]  // measured: the host stop began 12 s ago (the other subscriber drained first)
+    [InlineData(30, 5, 20, 26, 0)]   // nothing left: the client stop goes ahead at once
+    [InlineData(30, 5, 3, 0, 3)]
+    [InlineData(null, 5, 20, 10, 15)] // HostShutdownTimeout validated externally: the host's 30 s default is assumed
+    public void InFlightDrainBudget_IsTheBackgroundDrainTimeout_ClampedToWhatTheHostStopLeaves(
+        int? hostShutdownSeconds,
+        int shutdownSeconds,
+        int drainSeconds,
+        int sinceHostStopSeconds,
+        int expectedSeconds)
+    {
+        // Red-on-old (fixpoint r1 pre-commit, I2): the drain waited HostShutdownTimeout −
+        // ShutdownTimeout whatever else had happened — all of it spent on every deploy with a
+        // handler parked on an awaited flow response (which returns only after the host stop),
+        // and none of it measured, so the second subscriber to stop overran the host budget.
+        var options = new GooglePubSubAsyncResponseOptions
+        {
+            HostShutdownTimeout = hostShutdownSeconds is { } host ? TimeSpan.FromSeconds(host) : null,
+            ShutdownTimeout = TimeSpan.FromSeconds(shutdownSeconds)
+        };
+        var subscriberOptions = new GooglePubSubSubscriberOptions { BackgroundDrainTimeout = TimeSpan.FromSeconds(drainSeconds) };
+
+        Assert.Equal(
+            TimeSpan.FromSeconds(expectedSeconds),
+            GooglePubSubSubscriberService.ResolveInFlightDrainBudget(options, subscriberOptions, TimeSpan.FromSeconds(sinceHostStopSeconds)));
+    }
+
+    [Fact]
+    public async Task WorkerSubscriberService_Stop_MeasuresTheDrainFromTheHostStop()
+    {
+        // Red-on-old (fixpoint r1 pre-commit, I2): hosted services stop one after another, so by
+        // the time this subscriber stops, others — the response subscriber among them — may have
+        // spent most of the host budget. The drain assumed all of it was still free.
+        var clock = new VirtualTimeProvider();
+        using var host = new DurableFlowContextTestSupport.StoppingHost();
+        var client = new FakeSubscriberClient();
+        var handlerStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var ingress = new Mock<IAsyncResponseIngress>();
+        ingress.Setup(i => i.HandleWorkerMessageAsync(It.IsAny<string>())).Returns(async () =>
+        {
+            handlerStarted.TrySetResult();
+            await Task.Delay(Timeout.InfiniteTimeSpan).ConfigureAwait(false);
+        });
+        var logger = new CapturingLogger<GooglePubSubWorkerSubscriber>();
+        var subscriber = new GooglePubSubWorkerSubscriber(
+            Options.Create(new GooglePubSubAsyncResponseOptions
+            {
+                ProjectId = "project-a",
+                WorkerSubscriptionId = "workers"
+            }),
+            ingress.Object,
+            logger,
+            (_, _, _) => Task.FromResult<IGooglePubSubSubscriberClient>(client),
+            host)
+        {
+            Clock = clock
+        };
+
+        await subscriber.StartAsync(CancellationToken.None);
+        var handler = await WaitForHandlerAsync(client);
+        _ = handler(new PubsubMessage { MessageId = "m1", Data = ByteString.CopyFromUtf8("parked") }, CancellationToken.None);
+        await handlerStarted.Task.WaitAsync(TimeSpan.FromSeconds(2));
+
+        host.StopApplication();              // ApplicationStopping: the host's 30 s budget starts
+        clock.Advance(TimeSpan.FromSeconds(12)); // the hosted services stopped before this one spent 12 s
+
+        var stopping = subscriber.StopAsync(CancellationToken.None);
+        await Eventually(() => clock.NextTimerDueAt is not null);
+
+        // 30 s − 12 s spent − 5 s for the client stop leaves 13 s, under the 20 s BackgroundDrainTimeout.
+        Assert.Contains(logger.Entries, entry => entry.Message.Contains("waiting up to 00:00:13", StringComparison.Ordinal));
+        clock.Advance(TimeSpan.FromSeconds(13));
+        await stopping.WaitAsync(TimeSpan.FromSeconds(10));
+        Assert.Equal(1, client.StopCalls);
+    }
+
+    [Fact]
+    public async Task Dispatcher_AckAfterEnqueue_FlowHandBack_WarnsAndSurfacesIt_WithoutAnErrorLog()
+    {
+        // Fixpoint r1 pre-commit (H6): an early-ACK job the flow engine hands back at host stop
+        // cannot be redelivered (it was ACKed at enqueue) and Pub/Sub has no dead-letter write, so
+        // it is surfaced through OnBackgroundFailure — at Warning: nothing failed.
+        var failure = new TaskCompletionSource<GooglePubSubBackgroundFailureContext>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var logger = new CapturingLogger<GooglePubSubWorkerSubscriber>();
+        await using var dispatcher = GooglePubSubMessageDispatcher.Create(
+            (_, _) => throw new DurableFlowInterruptedException("the host is stopping"),
+            new GooglePubSubAsyncResponseOptions(),
+            new GooglePubSubSubscriberOptions
+            {
+                OnBackgroundFailure = context =>
+                {
+                    failure.TrySetResult(context);
+                    return ValueTask.CompletedTask;
+                }
+            }.UseAckAfterEnqueue(1, 8, TimeSpan.FromSeconds(5)),
+            logger,
+            "workers",
+            GooglePubSubSubscriberRole.Worker);
+
+        Assert.Equal(SubscriberClient.Reply.Ack, await dispatcher.HandleAsync(new PubsubMessage { MessageId = "wake-up" }, CancellationToken.None));
+
+        var surfaced = await failure.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.IsType<DurableFlowInterruptedException>(surfaced.Exception);
+        Assert.Contains(logger.Entries, entry => entry.Level == LogLevel.Warning
+            && entry.Message.Contains("handed back by the flow engine", StringComparison.Ordinal));
+        Assert.DoesNotContain(logger.Entries, entry => entry.Level >= LogLevel.Error);
+    }
+
+    [Fact]
+    public async Task SubscriberService_ClientBuild_ObservesTheHostStop()
+    {
+        // Red-on-old (fixpoint r1, GS5#11): the subscriber-client factory took no token, so a
+        // build stalled on a credential or metadata lookup during a supervised rebuild ignored the
+        // host stop and held it for the whole host budget (round 32 fixed only the publisher).
+        var buildStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var subscriber = new GooglePubSubWorkerSubscriber(
+            Options.Create(new GooglePubSubAsyncResponseOptions
+            {
+                ProjectId = "project-a",
+                WorkerSubscriptionId = "workers"
+            }),
+            new Mock<IAsyncResponseIngress>().Object,
+            NullLogger<GooglePubSubWorkerSubscriber>.Instance,
+            async (_, _, cancellationToken) =>
+            {
+                buildStarted.TrySetResult();
+                await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken).ConfigureAwait(false);
+                return new FakeSubscriberClient();
+            });
+
+        await subscriber.StartAsync(CancellationToken.None);
+        await buildStarted.Task.WaitAsync(TimeSpan.FromSeconds(2));
+
+        await subscriber.StopAsync(CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(5));
+    }
+
+    [Fact]
+    public async Task Dispatcher_HostStopInterruption_WhileTheSubscriberTokenIsLive_IsHeldForTheClientStop_WithoutAFailureLog()
+    {
+        // Red-on-old (fixpoint r1, GS5#1): the flow engine throws DurableFlowInterruptedException
+        // on ApplicationStopping, BEFORE the subscriber's own token fires. Keyed on the token
+        // alone the interruption was logged as a handler failure on every rolling deploy.
+        // Fixpoint r1 pre-commit (I1): Nacked at once, it went straight back into the still-live
+        // pull — redelivered, interrupted again, a Nack loop spending the DeadLetterPolicy's
+        // attempts until the subscriber stopped. It is now held and handed back at the client stop.
+        var logger = new CapturingLogger<GooglePubSubWorkerSubscriber>();
+        await using var dispatcher = GooglePubSubMessageDispatcher.Create(
+            (_, _) => throw new DurableFlowInterruptedException("the host is stopping"),
+            new GooglePubSubAsyncResponseOptions(),
+            new GooglePubSubSubscriberOptions(),
+            logger,
+            "workers",
+            GooglePubSubSubscriberRole.Worker);
+
+        var reply = dispatcher.HandleAsync(new PubsubMessage { MessageId = "wake-up" }, CancellationToken.None);
+        Assert.False(reply.IsCompleted, "the interrupted delivery was Nacked back into the live pull");
+
+        // Not counted as running: the stop's drain does not wait for it.
+        await dispatcher.DrainInFlightAsync(TimeSpan.FromMinutes(1), TimeProvider.System).WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.False(reply.IsCompleted);
+
+        dispatcher.ReleaseHeldDeliveries(); // immediately before the client stop
+        Assert.Equal(SubscriberClient.Reply.Nack, await reply.WaitAsync(TimeSpan.FromSeconds(5)));
+        Assert.DoesNotContain(logger.Entries, entry => entry.Level >= LogLevel.Error);
+    }
+
+    [Fact]
+    public async Task Dispatcher_AckAfterEnqueue_DrainLapse_SurfacesEveryStillQueuedEntryBeforeDisposeReturns()
+    {
+        // Red-on-old (fixpoint r1, GS5#4): past the drain budget only a worker that freed up
+        // surfaced a queued entry — and with every worker still inside a handler that ignores the
+        // token, none did before DisposeAsync returned and the process exited, so already-ACKed
+        // work vanished with no OnBackgroundFailure call. The dispose now surfaces the rest itself
+        // within the last quarter of the budget and logs the loss with its count.
+        var failures = new List<string>();
+        var logger = new CapturingLogger<GooglePubSubWorkerSubscriber>();
+        var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var subscriberOptions = new GooglePubSubSubscriberOptions
+        {
+            OnBackgroundFailure = context =>
+            {
+                lock (failures)
+                    failures.Add(context.Message.MessageId);
+                return ValueTask.CompletedTask;
+            }
+        }.UseAckAfterEnqueue(1, 8, TimeSpan.FromMilliseconds(400));
+        var dispatcher = GooglePubSubMessageDispatcher.Create(
+            async (_, _) =>
+            {
+                started.TrySetResult();
+                await release.Task.ConfigureAwait(false);
+            },
+            new GooglePubSubAsyncResponseOptions(),
+            subscriberOptions,
+            logger,
+            "workers",
+            GooglePubSubSubscriberRole.Worker);
+
+        try
+        {
+            Assert.Equal(SubscriberClient.Reply.Ack, await dispatcher.HandleAsync(new PubsubMessage { MessageId = "m1" }, CancellationToken.None));
+            await started.Task.WaitAsync(TimeSpan.FromSeconds(2));
+            Assert.Equal(SubscriberClient.Reply.Ack, await dispatcher.HandleAsync(new PubsubMessage { MessageId = "m2" }, CancellationToken.None));
+            Assert.Equal(SubscriberClient.Reply.Ack, await dispatcher.HandleAsync(new PubsubMessage { MessageId = "m3" }, CancellationToken.None));
+
+            await dispatcher.DisposeAsync(); // the only worker is still blocked in m1's handler
+
+            lock (failures)
+                Assert.Equal(["m2", "m3"], failures);
+            Assert.Contains(logger.Entries, entry => entry.Level == LogLevel.Error
+                && entry.Message.Contains("lapsed with 2 already-ACKed message(s)", StringComparison.Ordinal));
+        }
+        finally
+        {
+            release.TrySetResult();
+        }
     }
 
     [Fact]
@@ -1091,7 +1468,10 @@ public class GooglePubSubSubscriberTests
             elapsed.Stop();
 
             await cancellationObserved.Task.WaitAsync(TimeSpan.FromSeconds(2));
-            Assert.True(elapsed.Elapsed >= TimeSpan.FromMilliseconds(40));
+            // Three quarters of the 50 ms budget wait for the workers before the cancel; the last
+            // quarter is reserved for surfacing still-queued entries (fixpoint r1, GS5#4) and
+            // ends at once here, with nothing queued.
+            Assert.True(elapsed.Elapsed >= TimeSpan.FromMilliseconds(30));
             Assert.True(elapsed.Elapsed < TimeSpan.FromSeconds(2));
         }
         finally
@@ -1115,7 +1495,7 @@ public class GooglePubSubSubscriberTests
             }),
             Mock.Of<IAsyncResponseIngress>(),
             NullLogger<GooglePubSubWorkerSubscriber>.Instance,
-            (_, _) => Interlocked.Increment(ref attempts) == 1
+            (_, _, _) => Interlocked.Increment(ref attempts) == 1
                 ? Task.FromException<IGooglePubSubSubscriberClient>(new InvalidOperationException("pubsub unreachable"))
                 : Task.FromResult<IGooglePubSubSubscriberClient>(client));
 
@@ -1149,7 +1529,7 @@ public class GooglePubSubSubscriberTests
             }),
             Mock.Of<IAsyncResponseIngress>(),
             NullLogger<GooglePubSubWorkerSubscriber>.Instance,
-            (_, _) => Interlocked.Increment(ref clients) == 1
+            (_, _, _) => Interlocked.Increment(ref clients) == 1
                 ? Task.FromResult<IGooglePubSubSubscriberClient>(new FaultingSubscriberClient())
                 : Task.FromResult<IGooglePubSubSubscriberClient>(client));
 
@@ -1192,7 +1572,7 @@ public class GooglePubSubSubscriberTests
             Options.Create(new GooglePubSubAsyncResponseOptions { WorkerSubscriptionId = "workers" }),
             Mock.Of<IAsyncResponseIngress>(),
             NullLogger<GooglePubSubWorkerSubscriber>.Instance,
-            (_, _) =>
+            (_, _, _) =>
             {
                 factoryCalled = true;
                 return Task.FromResult<IGooglePubSubSubscriberClient>(new FakeSubscriberClient());
@@ -1217,7 +1597,7 @@ public class GooglePubSubSubscriberTests
             Options.Create(options),
             Mock.Of<IAsyncResponseIngress>(),
             NullLogger<GooglePubSubWorkerSubscriber>.Instance,
-            (_, _) =>
+            (_, _, _) =>
             {
                 factoryCalled = true;
                 return Task.FromResult<IGooglePubSubSubscriberClient>(new FakeSubscriberClient());
@@ -1252,7 +1632,7 @@ public class GooglePubSubSubscriberTests
             Options.Create(options),
             Mock.Of<IAsyncResponseIngress>(),
             NullLogger<GooglePubSubWorkerSubscriber>.Instance,
-            (_, _) =>
+            (_, _, _) =>
             {
                 factoryCalled = true;
                 return Task.FromResult<IGooglePubSubSubscriberClient>(new FakeSubscriberClient());
@@ -1420,9 +1800,13 @@ public class GooglePubSubSubscriberTests
         {
             StopCalls++;
             LastShutdownOptions = options;
+            Stopped.TrySetResult();
             _run.TrySetResult();
             return Task.CompletedTask;
         }
+
+        /// <summary>Completes when the client is stopped.</summary>
+        public TaskCompletionSource Stopped { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
         /// <summary>Fails the running streaming pull, like a network blip or UNAVAILABLE does mid-run.</summary>
         public void Fault(Exception exception) => _run.TrySetException(exception);
@@ -1508,7 +1892,7 @@ public class GooglePubSubSubscriberTests
             }),
             Mock.Of<IAsyncResponseIngress>(),
             NullLogger<GooglePubSubWorkerSubscriber>.Instance,
-            (_, _) => Task.FromResult<IGooglePubSubSubscriberClient>(null!));
+            (_, _, _) => Task.FromResult<IGooglePubSubSubscriberClient>(null!));
 
         var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => subscriber.StartAsync(CancellationToken.None));
         Assert.Contains("BackgroundWorkerCount", ex.Message, StringComparison.Ordinal);

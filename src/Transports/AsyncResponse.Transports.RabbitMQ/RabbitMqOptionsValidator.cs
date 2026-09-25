@@ -1,3 +1,5 @@
+using RabbitMQ.Client;
+
 namespace AsyncResponse.Transports.RabbitMQ;
 
 internal static class RabbitMqOptionsValidator
@@ -14,7 +16,9 @@ internal static class RabbitMqOptionsValidator
     /// 16-bit seconds (zero disables them). The recovery interval is used directly by the
     /// client's automatic-recovery loop as a <c>Task.Delay</c>: a negative value faults (and
     /// TERMINATES) that loop and zero spins it, so the interval must be strictly positive and
-    /// under the timer ceiling — there is no client-side fallback.
+    /// under the timer ceiling — there is no client-side fallback. The connection string is parsed
+    /// here too (no network): malformed, it failed only at the first connect, so the host started
+    /// cleanly while every subscriber retry-warned forever and every publish threw.
     /// </summary>
     public static void ValidateConnection(RabbitMqAsyncResponseOptions options)
     {
@@ -23,6 +27,28 @@ internal static class RabbitMqOptionsValidator
                 $"{nameof(RabbitMqAsyncResponseOptions)}.{nameof(options.RequestedHeartbeat)} must be between zero (disabled) and {ushort.MaxValue} seconds — AMQP heartbeats are 16-bit seconds.");
 
         AsyncResponseChannelOptions.EnsureTimerBacked(options.NetworkRecoveryInterval, nameof(RabbitMqAsyncResponseOptions), nameof(options.NetworkRecoveryInterval));
+
+        if (!string.IsNullOrWhiteSpace(options.ConnectionString))
+            ValidateConnectionString(options.ConnectionString);
+    }
+
+    /// <summary>
+    /// Applies the connection string exactly as the connection factory will. The failure never
+    /// echoes the value, nor chains the parser's exception: the string usually embeds the password,
+    /// and the client's own messages quote its user-info part verbatim.
+    /// </summary>
+    private static void ValidateConnectionString(string connectionString)
+    {
+        try
+        {
+            _ = new ConnectionFactory { Uri = new Uri(connectionString) };
+        }
+        catch (Exception ex) when (ex is UriFormatException or ArgumentException or FormatException)
+        {
+            throw new InvalidOperationException(
+                $"{nameof(RabbitMqAsyncResponseOptions)}.{nameof(RabbitMqAsyncResponseOptions.ConnectionString)} is not a valid AMQP URI " +
+                $"({ex.GetType().Name}); expected amqp://user:password@host:port/vhost or amqps://…. The value is not echoed because it may contain credentials.");
+        }
     }
 
     /// <summary>

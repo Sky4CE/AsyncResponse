@@ -29,7 +29,10 @@ public sealed class KafkaAsyncResponseTransportOptions
     /// Prefix used when a topic name is not explicitly configured. The default worker topic is
     /// <c>{TopicPrefix}.transport.worker</c> and the default response topic is
     /// <c>{TopicPrefix}.transport.response</c>. Use a unique prefix per app/environment when several
-    /// deployments share one cluster.
+    /// deployments share one cluster — and unique <see cref="WorkerConsumerGroup"/>/<see cref="ResponseConsumerGroup"/>
+    /// values too: the groups are NOT derived from the prefix, so deployments that change only the prefix
+    /// still share both groups, and every member change in one of them (a deploy, a scale event, a crash)
+    /// rebalances — revokes the partitions of — every consumer of the others.
     /// </summary>
     public string TopicPrefix { get; set; } = "asyncresponse";
 
@@ -39,7 +42,11 @@ public sealed class KafkaAsyncResponseTransportOptions
     /// </summary>
     public string? WorkerTopic { get; set; }
 
-    /// <summary>Consumer group used by the hosted worker subscriber.</summary>
+    /// <summary>
+    /// Consumer group used by the hosted worker subscriber. A fixed default, not derived from
+    /// <see cref="TopicPrefix"/>: give each deployment sharing a cluster its own group, or a member
+    /// change in any of them rebalances the consumers of all.
+    /// </summary>
     public string WorkerConsumerGroup { get; set; } = "asyncresponse-workers";
 
     /// <summary>Worker topic handling options.</summary>
@@ -52,7 +59,11 @@ public sealed class KafkaAsyncResponseTransportOptions
     /// </summary>
     public string? ResponseTopic { get; set; }
 
-    /// <summary>Consumer group used by the hosted response-ingress subscriber.</summary>
+    /// <summary>
+    /// Consumer group used by the hosted response-ingress subscriber. A fixed default, not derived
+    /// from <see cref="TopicPrefix"/>: give each deployment sharing a cluster its own group, or a
+    /// member change in any of them rebalances the consumers of all.
+    /// </summary>
     public string ResponseConsumerGroup { get; set; } = "asyncresponse-responses";
 
     /// <summary>Response topic handling options.</summary>

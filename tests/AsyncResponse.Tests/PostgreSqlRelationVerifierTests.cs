@@ -173,6 +173,74 @@ public sealed class PostgreSqlRelationVerifierTests
         Assert.Contains("primary key is (id, queue) instead of (id)", diagnosed.Message, StringComparison.Ordinal);
     }
 
+    [Theory]
+    [MemberData(nameof(AnchorTypes))]
+    public void Evaluate_AcceptsAnAbsentOptionalIndex_ReportsIt_AndStillVerifiesOneThatIsPresent(Type anchor)
+    {
+        var verifier = new Verifier(anchor);
+
+        // Absent: not an error, but reported so the store can warn.
+        var expected = verifier.Relations(verifier.Table("jobs"), verifier.Index("jobs_expires_idx", "jobs", ["expires_at"], optional: true));
+        Assert.Null(verifier.Evaluate(expected, [("jobs", verifier.Row())], absentOptional: out var absent));
+        Assert.Equal(["jobs_expires_idx"], absent);
+
+        // Present with the wrong shape: still refused — optional is about absence only.
+        var misshapen = verifier.Evaluate(
+            expected,
+            [("jobs", verifier.Row()), ("jobs_expires_idx", verifier.IndexRow("jobs", ["created_at"]))],
+            absentOptional: out _);
+        Assert.NotNull(misshapen);
+        Assert.Contains("does not match the expected definition", misshapen.Message, StringComparison.Ordinal);
+
+        // A required relation's absence is still the finding.
+        var required = verifier.Relations(verifier.Table("jobs"), verifier.Index("jobs_expires_idx", "jobs", ["expires_at"], optional: false));
+        var missing = verifier.Evaluate(required, [("jobs", verifier.Row())], absentOptional: out _);
+        Assert.NotNull(missing);
+        Assert.Contains("to exist after schema creation", missing.Message, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void DurableFlowShape_OperatorManaged_AcceptsNoRevisionDefault_AndAMissingExpiryIndex(bool autoCreateSchema)
+    {
+        // Regression: with AutoCreateSchema = false the flow store demanded both the DDL's
+        // `revision DEFAULT 0` — not load-bearing, every insert names the column — and its derived
+        // `_expires_idx` — performance only — so an operator table from a migration tool that named
+        // the index differently, or declared `bigint NOT NULL` without a default, failed every
+        // operation with "expected … to exist after schema creation". Where this build's own DDL ran,
+        // the index it just created is still required.
+        var verifier = new Verifier(typeof(PostgreSqlDurableFlowOptions));
+        var options = new PostgreSqlDurableFlowOptions { AutoCreateSchema = autoCreateSchema };
+        var expected = (Array)typeof(PostgreSqlFlowStateStore)
+            .GetMethod("ExpectedRelations", BindingFlags.NonPublic | BindingFlags.Static)!
+            .Invoke(null, [options])!;
+        var table = options.TableName;
+        var columns = new ((string, string), object)[]
+        {
+            ((table, "flow_id"), verifier.ColumnRow("text", notNull: true, "", writable: false, collation: "default")),
+            ((table, "state_json"), verifier.ColumnRow("text", notNull: true, "", writable: false)),
+            ((table, "expires_at_utc"), verifier.ColumnRow("timestamp with time zone", notNull: true, "", writable: false)),
+            ((table, "updated_at_utc"), verifier.ColumnRow("timestamp with time zone", notNull: true, "", writable: false)),
+            ((table, "revision"), verifier.ColumnRow("bigint", notNull: true, "", writable: false)),
+            ((table, "lease_id"), verifier.ColumnRow("text", notNull: false, "", writable: false)),
+            ((table, "lease_expires_at_utc"), verifier.ColumnRow("timestamp with time zone", notNull: false, "", writable: false)),
+        };
+
+        var diagnosed = verifier.Evaluate(expected, [(table, verifier.Row(primaryKey: ["flow_id"]))], columns, out var absent);
+
+        if (autoCreateSchema)
+        {
+            Assert.NotNull(diagnosed);
+            Assert.Contains($"{table}_expires_idx' to exist", diagnosed.Message, StringComparison.Ordinal);
+        }
+        else
+        {
+            Assert.Null(diagnosed);
+            Assert.Equal([$"{table}_expires_idx"], absent);
+        }
+    }
+
     /// <summary>
     /// Reflection facade over one package's compilation of the verifier. The type name exists in
     /// three assemblies at once, so the C# name is ambiguous and every member is reached through
@@ -210,6 +278,21 @@ public sealed class PostgreSqlRelationVerifierTests
         public object Sequence(string name)
             => Activator.CreateInstance(_expectedRelation, name, 'S', null, null, null, null)!;
 
+        public object Index(string name, string owningTable, string[] keyColumns, bool optional)
+        {
+            var index = Activator.CreateInstance(_expectedRelation, name, 'i', owningTable, keyColumns, null, null)!;
+            _expectedRelation.GetProperty("Optional")!.SetValue(index, optional);
+            return index;
+        }
+
+        /// <summary>A healthy plain btree index row on <paramref name="owningTable"/>.</summary>
+        public object IndexRow(string owningTable, string[] keyColumns)
+            => Activator.CreateInstance(
+                _actualRelation,
+                "i", "p", owningTable, "btree", false, false, true,
+                keyColumns, "", 1L, 1L, false, long.MaxValue,
+                Array.Empty<string>())!;
+
         public Array Relations(params object[] relations) => TypedArray(_expectedRelation, relations);
 
         /// <summary>A healthy permanent-table catalog row; facts override only what they bend.</summary>
@@ -234,7 +317,23 @@ public sealed class PostgreSqlRelationVerifierTests
             Array expected,
             (string Name, object Row)[] relations,
             ((string Table, string Column) Key, object Row)[]? columns = null)
+            => Evaluate(expected, relations, columns, out _);
+
+        /// <summary>As above, also returning the optional relations reported absent.</summary>
+        public InvalidOperationException? Evaluate(
+            Array expected,
+            (string Name, object Row)[] relations,
+            out IReadOnlyList<string> absentOptional)
+            => Evaluate(expected, relations, null, out absentOptional);
+
+        /// <summary>As above, also returning the optional relations reported absent.</summary>
+        public InvalidOperationException? Evaluate(
+            Array expected,
+            (string Name, object Row)[] relations,
+            ((string Table, string Column) Key, object Row)[]? columns,
+            out IReadOnlyList<string> absentOptional)
         {
+            absentOptional = [];
             var relationRows = (IDictionary)Activator.CreateInstance(
                 typeof(Dictionary<,>).MakeGenericType(typeof(string), _actualRelation))!;
             foreach (var (name, row) in relations)
@@ -247,7 +346,7 @@ public sealed class PostgreSqlRelationVerifierTests
 
             try
             {
-                _evaluate.Invoke(null, ["catalog_test", "channel", expected, relationRows, columnRows]);
+                absentOptional = (IReadOnlyList<string>?)_evaluate.Invoke(null, ["catalog_test", "channel", expected, relationRows, columnRows]) ?? [];
                 return null;
             }
             catch (TargetInvocationException wrapped)

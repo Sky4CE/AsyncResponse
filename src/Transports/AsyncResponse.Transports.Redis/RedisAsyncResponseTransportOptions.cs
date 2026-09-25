@@ -1,9 +1,9 @@
 namespace AsyncResponse.Transports.Redis;
 
 /// <summary>
-/// Options for the Redis Streams AsyncResponse transport. Runs against Redis 5+ and any RESP-compatible
-/// server that implements Redis Streams and consumer groups — validated on Redis 8, Valkey, and
-/// Dragonfly. (Garnet does not implement stream commands, so it works as a <em>channel</em> but not as
+/// Options for the Redis Streams AsyncResponse transport. Runs against Redis 6.2+ (the pending-entry
+/// reclaim uses <c>XPENDING … IDLE</c>, added in 6.2) and any RESP-compatible server that implements
+/// Redis Streams and consumer groups — validated on Redis 8, Valkey, and Dragonfly. (Garnet does not implement stream commands, so it works as a <em>channel</em> but not as
 /// this transport.) Publish-time trimming uses plain <c>XADD … MAXLEN ~ N</c> (no Redis 8 trim-mode
 /// token), so it stays portable across all of these servers.
 /// </summary>
@@ -66,9 +66,23 @@ public sealed class RedisAsyncResponseTransportOptions
     public bool CreateConsumerGroups { get; set; } = true;
 
     /// <summary>
-    /// Maximum stream length used by XADD for worker and response messages. Redis trims
-    /// approximately by default, so streams stay bounded without making every publish pay the exact
-    /// trim cost. Set null to disable publish-time trimming.
+    /// Maximum length of the worker stream, applied by every worker publish as
+    /// <c>XADD … MAXLEN ~ N</c> (approximately by default, so publishes do not pay the exact trim
+    /// cost). Set null to disable publish-time trimming.
+    /// <para>
+    /// <b>Trimming deletes unprocessed work.</b> Redis trims by length alone, whatever the consumer
+    /// group has read: once the stream is over the cap, the oldest entries go — jobs never read and
+    /// jobs pending in a handler included — with no dead-letter copy (a trimmed pending entry
+    /// surfaces at most as a Warning when its reclaim finds it gone). Entries are only ACKed, never
+    /// deleted, on settlement, so processed ones count toward the cap until trimmed too. Size it
+    /// well above the deepest backlog a worker outage can build (publish rate × the longest outage
+    /// to survive), or disable it and bound the stream operationally.
+    /// </para>
+    /// <para>
+    /// The library trims only its own worker publishes. The response stream is written by the
+    /// response producers, which must apply their own <c>XADD … MAXLEN ~</c>; the response ingress
+    /// only ACKs.
+    /// </para>
     /// </summary>
     public long? StreamMaxLength { get; set; } = 100_000;
 

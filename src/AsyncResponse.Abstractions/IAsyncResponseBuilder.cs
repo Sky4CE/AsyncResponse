@@ -94,9 +94,10 @@ public interface IAsyncResponseBuilder
 }
 
 /// <summary>
-/// Builder exposed by durable response-channel packages that can recover a response that arrives
-/// after the original waiter disappeared. Use this when the flow registers lost-subscriber resume
-/// or failure callbacks; simple in-memory channels only expose <see cref="IAsyncResponseBuilder"/>.
+/// Builder that can recover a response arriving after the original waiter disappeared. Every
+/// built-in response channel exposes it — the in-memory channel included, whose recovery store is
+/// process-local: it spans waiter loss within one process lifetime, not a process exit. Use this
+/// when the flow registers lost-subscriber resume or failure callbacks.
 /// </summary>
 public interface IRecoverableAsyncResponseBuilder : IAsyncResponseBuilder
 {

@@ -14,8 +14,9 @@ using Xunit.v3;
 namespace AsyncResponse.IntegrationTests;
 
 // The suite splits along the one structural line that actually exists: a test either drives a sample
-// app over HTTP, or it drives a driver directly. The direct half — 170 of the 315 tests — needs no
-// sample app at all, so those batches start zero processes. The app-driven half splits by family.
+// app over HTTP, or it drives a driver directly. The direct tests need no sample app at all (the
+// batches made only of them — oracle-cosmos and the matrix shards — start zero processes); the
+// app-driven half splits by family.
 //
 // Batches are balanced on MEASURED MEMORY, not container count. Counting containers is misleading:
 // the first cut had a 7-container batch at 5.8 GiB next to an 8-container batch at 2.5 GiB, and the
@@ -23,9 +24,9 @@ namespace AsyncResponse.IntegrationTests;
 // everything else — oracle 2,180 MiB, the two SQL Servers ~1,328 MiB each, cosmos 1,031 MiB — so the
 // split is mostly about keeping those apart. Oracle and SQL Server are also capped in the AppHost.
 //
-//   data           8 containers,  9 apps, 224 tests   every database-backed test
-//   oracle-cosmos  2 containers,  0 apps,   2 tests   the two heavyweight stores, isolated
-//   brokers        5 containers, 10 apps,  55 tests   message brokers (all small)
+//   data           8 containers,  9 apps, 359 tests   every database-backed test
+//   oracle-cosmos  2 containers,  0 apps,  16 tests   the two heavyweight stores, isolated
+//   brokers        5 containers, 10 apps,  64 tests   message brokers (all small)
 //   cloud          4 containers,  4 apps,  18 tests   Service Bus + SQS emulators
 //
 // Tests needing no AppHost (in-memory suite, AOT publish gate, these guards) belong to no batch and

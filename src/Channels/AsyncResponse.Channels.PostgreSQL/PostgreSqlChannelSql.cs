@@ -1,3 +1,4 @@
+using Microsoft.Extensions.Logging;
 using Npgsql;
 using NpgsqlTypes;
 using System.Text;
@@ -30,6 +31,7 @@ internal sealed class PostgreSqlChannelSql
 
     private readonly NpgsqlDataSource _dataSource;
     private readonly PostgreSqlAsyncResponseChannelOptions _options;
+    private readonly ILogger<PostgreSqlChannelSql>? _logger;
     private readonly SemaphoreSlim _ensureGate = new(1, 1);
     private bool _created;
     private readonly long _schemaLockKey;
@@ -37,10 +39,14 @@ internal sealed class PostgreSqlChannelSql
     private long _lastMessagePruneTicks;
     private long _lastSubscriberPruneTicks;
 
-    public PostgreSqlChannelSql(NpgsqlDataSource dataSource, Microsoft.Extensions.Options.IOptions<PostgreSqlAsyncResponseChannelOptions> options)
+    public PostgreSqlChannelSql(
+        NpgsqlDataSource dataSource,
+        Microsoft.Extensions.Options.IOptions<PostgreSqlAsyncResponseChannelOptions> options,
+        ILogger<PostgreSqlChannelSql>? logger = null)
     {
         _dataSource = dataSource;
         _options = options.Value;
+        _logger = logger;
         _options.Validate();
 
         Schema = Quote(_options.SchemaName);
@@ -654,7 +660,7 @@ internal sealed class PostgreSqlChannelSql
     {
         await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
         if (ShouldPrune(ref _lastSubscriberPruneTicks))
-            await PruneExpiredSubscribersAsync(correlationId, cancellationToken).ConfigureAwait(false);
+            await PruneExpiredSubscribersAsync(cancellationToken).ConfigureAwait(false);
 
         await using var connection = await _dataSource.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         await using var command = connection.CreateCommand();
@@ -730,7 +736,7 @@ internal sealed class PostgreSqlChannelSql
     {
         await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
         if (ShouldPrune(ref _lastSubscriberPruneTicks))
-            await PruneExpiredSubscribersAsync(correlationId, cancellationToken).ConfigureAwait(false);
+            await PruneExpiredSubscribersAsync(cancellationToken).ConfigureAwait(false);
 
         await using var connection = await _dataSource.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         await using var command = connection.CreateCommand();
@@ -745,52 +751,124 @@ internal sealed class PostgreSqlChannelSql
         return result is long count ? count : 0L;
     }
 
-    public async Task ExecuteListenAsync(Func<string?, Task> onNotification, CancellationToken cancellationToken)
+    /// <summary>
+    /// LISTENs on the notification channel and invokes <paramref name="onNotification"/> with every
+    /// NOTIFY payload until cancellation or a connection failure; <paramref name="onListening"/>
+    /// runs once the LISTEN is established.
+    /// </summary>
+    public async Task ExecuteListenAsync(Func<string?, Task> onNotification, CancellationToken cancellationToken, Action? onListening = null)
     {
         await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
-        await using var connection = await _dataSource.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
-        connection.Notification += (_, args) => _ = onNotification(args.Payload);
-        await using (var command = connection.CreateCommand())
+        // Not `await using`: the release below owns disposal, and may finish it after this returns.
+        var connection = await _dataSource.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
+        var listening = false;
+        try
         {
-            command.CommandText = $"LISTEN {Quote(NotificationChannel)};";
-            await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
-        }
+            connection.Notification += (_, args) => _ = onNotification(args.Payload);
+            await using (var command = connection.CreateCommand())
+            {
+                command.CommandText = $"LISTEN {Quote(NotificationChannel)};";
+                await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+            }
 
-        while (!cancellationToken.IsCancellationRequested)
-            await connection.WaitAsync(cancellationToken).ConfigureAwait(false);
+            listening = true;
+            onListening?.Invoke();
+
+            // A BOUNDED wait with a ping on every quiet interval. An unbounded WaitAsync on a
+            // half-open socket (a NAT or load balancer silently dropping an idle LISTEN
+            // connection; Npgsql's keepalive is off by default) blocked forever while the channel
+            // kept trusting a push wake that could no longer deliver. A failed or timed-out ping
+            // throws into the listen loop's reconnect path.
+            while (!cancellationToken.IsCancellationRequested)
+            {
+                if (!await connection.WaitAsync(ListenLivenessInterval, cancellationToken).ConfigureAwait(false))
+                    await PingListenConnectionAsync(connection, cancellationToken).ConfigureAwait(false);
+            }
+        }
+        finally
+        {
+            // UNLISTEN before the pool gets it back, bounded so a half-open socket cannot hold
+            // disposal (see PostgreSqlListenConnection).
+            await PostgreSqlListenConnection.ReleaseAsync(_dataSource, connection, listening).ConfigureAwait(false);
+        }
     }
 
-    private async Task PruneExpiredRecoveryAsync(string? correlationId, CancellationToken cancellationToken)
+    /// <summary>How long the LISTEN connection may stay silent before it is pinged.</summary>
+    internal static readonly TimeSpan ListenLivenessInterval = TimeSpan.FromSeconds(10);
+
+    /// <summary>Seconds a liveness ping may take before the connection is treated as dead.</summary>
+    private const int ListenPingTimeoutSeconds = 5;
+
+    private static async Task PingListenConnectionAsync(NpgsqlConnection connection, CancellationToken cancellationToken)
+    {
+        await using var ping = connection.CreateCommand();
+        ping.CommandText = "SELECT 1;";
+        ping.CommandTimeout = ListenPingTimeoutSeconds;
+        await ping.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false);
+    }
+
+    // Every prune below is opportunistic housekeeping riding on a publish, a waiter registration,
+    // a liveness probe, or a recovery load/scan, and goes through OpportunisticPrune: bounded
+    // batches drained under a budget, and every failure logged and swallowed. Awaited bare, a prune
+    // that lost a lock wait or a connection failed the operation it rode on (a waiter could not
+    // register, a publish failed) after ShouldPrune had already consumed the interval; and the
+    // unbounded table-wide DELETE on the publish path held that publish for the whole command
+    // timeout over a large expired backlog, rolled back, and never shrank it. Reads filter on
+    // expires_at, so a skipped prune costs only disk until the next window.
+
+    private Task PruneExpiredRecoveryAsync(string? correlationId, CancellationToken cancellationToken)
+        => OpportunisticPrune.DrainQuietlyAsync(
+            token => PruneExpiredRecoveryBatchAsync(correlationId, token),
+            _logger,
+            "PostgreSQL channel recovery-state prune",
+            cancellationToken);
+
+    private async Task<int> PruneExpiredRecoveryBatchAsync(string? correlationId, CancellationToken cancellationToken)
     {
         await using var connection = await _dataSource.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         await using var command = connection.CreateCommand();
         command.CommandText = correlationId is null
-            ? $"DELETE FROM {RecoveryTable} WHERE expires_at <= now();"
+            ? ExpiredPruneSql(RecoveryTable)
             : $"DELETE FROM {RecoveryTable} WHERE correlation_id = @correlation_id AND expires_at <= now();";
         if (correlationId is not null)
             command.Parameters.AddWithValue("correlation_id", correlationId);
-        await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+        return await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
     }
 
-    private async Task PruneExpiredMessagesAsync(CancellationToken cancellationToken)
+    private Task PruneExpiredMessagesAsync(CancellationToken cancellationToken)
+        => OpportunisticPrune.DrainQuietlyAsync(
+            token => PruneExpiredBatchAsync(MessageTable, token),
+            _logger,
+            "PostgreSQL channel message prune",
+            cancellationToken);
+
+    /// <summary>
+    /// Table-wide, not scoped to the calling waiter's correlation id: a scoped prune never reached
+    /// the rows of a process that crashed with waiters in flight (correlation ids are rarely
+    /// reused), so those orphans stayed forever and the expires index built for this delete went
+    /// unused. Bounded, and throttled by <see cref="PostgreSqlAsyncResponseChannelOptions.PruneInterval"/>.
+    /// </summary>
+    private Task PruneExpiredSubscribersAsync(CancellationToken cancellationToken)
+        => OpportunisticPrune.DrainQuietlyAsync(
+            token => PruneExpiredBatchAsync(SubscriberTable, token),
+            _logger,
+            "PostgreSQL channel subscriber prune",
+            cancellationToken);
+
+    private async Task<int> PruneExpiredBatchAsync(string table, CancellationToken cancellationToken)
     {
         await using var connection = await _dataSource.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         await using var command = connection.CreateCommand();
-        command.CommandText = $"DELETE FROM {MessageTable} WHERE expires_at <= now();";
-        await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+        command.CommandText = ExpiredPruneSql(table);
+        return await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
     }
 
-    private async Task PruneExpiredSubscribersAsync(string? correlationId, CancellationToken cancellationToken)
-    {
-        await using var connection = await _dataSource.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
-        await using var command = connection.CreateCommand();
-        command.CommandText = correlationId is null
-            ? $"DELETE FROM {SubscriberTable} WHERE expires_at <= now();"
-            : $"DELETE FROM {SubscriberTable} WHERE correlation_id = @correlation_id AND expires_at <= now();";
-        if (correlationId is not null)
-            command.Parameters.AddWithValue("correlation_id", correlationId);
-        await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
-    }
+    /// <summary>
+    /// One bounded batch of a table-wide expiry prune for <paramref name="table"/> (the durable-flow
+    /// stores' <c>ctid … LIMIT</c> shape, SQL Server channel <c>TOP (1000)</c> parity).
+    /// </summary>
+    internal static string ExpiredPruneSql(string table)
+        => $"DELETE FROM {table} WHERE ctid IN (SELECT ctid FROM {table} WHERE expires_at <= now() LIMIT {OpportunisticPrune.BatchSize});";
 
     public static void ValidateIdentifier(string? value, string name)
     {
@@ -905,16 +983,9 @@ internal sealed class PostgreSqlChannelSql
     /// Time-gates opportunistic pruning so the housekeeping DELETE runs at most once per
     /// <see cref="PostgreSqlAsyncResponseChannelOptions.PruneInterval"/> instead of on every operation.
     /// Read queries already filter on <c>expires_at</c>, so throttling pruning never affects correctness.
+    /// Monotonic (see <see cref="OpportunisticPrune.ShouldRun"/>): a backward wall-clock step no
+    /// longer suspends the housekeeping for the size of the step.
     /// </summary>
     private bool ShouldPrune(ref long lastTicks)
-    {
-        var interval = _options.PruneInterval;
-        if (interval <= TimeSpan.Zero)
-            return true;
-
-        var now = DateTime.UtcNow.Ticks;
-        var last = Interlocked.Read(ref lastTicks);
-        return now - last >= interval.Ticks
-            && Interlocked.CompareExchange(ref lastTicks, now, last) == last;
-    }
+        => OpportunisticPrune.ShouldRun(ref lastTicks, _options.PruneInterval);
 }

@@ -1,4 +1,7 @@
+using Microsoft.Extensions.Logging;
 using NATS.Client.Core;
+using NATS.Client.JetStream;
+using NATS.Client.JetStream.Models;
 using NATS.Client.KeyValueStore;
 using NATS.Net;
 using System.Runtime.CompilerServices;
@@ -12,7 +15,12 @@ internal enum NatsDeliveryOutcome
     /// <summary>A waiter acknowledged the message — confirmed delivery / confirmed live subscriber.</summary>
     Replied,
 
-    /// <summary>Interest existed but no ack arrived within the timeout (the subscriber received the message; only the ack was slow).</summary>
+    /// <summary>
+    /// Interest existed but no ack arrived within the timeout. A publish treats it as delivered
+    /// (usually a live subscriber whose ack was slow — but also a subscriber whose host died without
+    /// closing its connection, see <see cref="NatsAsyncResponseChannelOptions.DeliveryConfirmationTimeout"/>);
+    /// a probe reports it as unprobeable.
+    /// </summary>
     NoReply,
 
     /// <summary>NATS reported no responders: nobody is subscribed, so the lost-subscriber fallback must run.</summary>
@@ -132,10 +140,23 @@ internal sealed class NatsResponseChannelClient(INatsRawRequester _raw) : INatsR
         }
         catch (NatsNoReplyException)
         {
-            // Interest existed but no ack arrived within the timeout. For a publish the live subscriber
-            // still received the message; for a probe it means no live subscriber answered promptly. The
-            // channel interprets this per call site.
+            // Interest existed but no ack arrived within the timeout. A publish treats it as
+            // delivered (normally a live subscriber whose ack was slow; the same answer comes from a
+            // subscription whose host died without closing its connection, which the server keeps
+            // until its ping timeout). A probe reports it as unprobeable. The channel interprets
+            // this per call site.
             return NatsDeliveryOutcome.NoReply;
+        }
+        catch (NatsPayloadTooLargeException ex)
+        {
+            // The client refuses a message above the server's max_payload (1 MiB by default) before
+            // sending it — deterministically, on every attempt. As a NatsException it looked like a
+            // transient connection error, so the ingress ran its whole retry ladder for a response
+            // that can never be delivered on this channel before escalating it. InvalidDataException
+            // is the ingress's "unprocessable, escalate now" signal. The message carries sizes only.
+            throw new InvalidDataException(
+                $"The response for subject '{subject}' exceeds the NATS server's max_payload and cannot be delivered over the NATS channel: {ex.Message}",
+                ex);
         }
     }
 
@@ -182,9 +203,6 @@ internal sealed class NatsResponseChannelClient(INatsRawRequester _raw) : INatsR
 /// </summary>
 internal interface INatsKvStore
 {
-    /// <summary>Stores <paramref name="value"/> under <paramref name="key"/>, creating or replacing it.</summary>
-    Task PutAsync(string key, string value, CancellationToken cancellationToken);
-
     /// <summary>Creates <paramref name="key"/> only when absent; <c>false</c> when it already exists.</summary>
     Task<bool> TryCreateAsync(string key, string value, CancellationToken cancellationToken);
 
@@ -194,14 +212,17 @@ internal interface INatsKvStore
     /// <summary>Returns the stored entry (value plus revision) for <paramref name="key"/>, or <c>null</c> when absent or deleted.</summary>
     Task<NatsKvEntry?> GetAsync(string key, CancellationToken cancellationToken);
 
-    /// <summary>Deletes <paramref name="key"/>; returns <c>true</c> when it existed, <c>false</c> when already gone.</summary>
-    Task<bool> DeleteAsync(string key, CancellationToken cancellationToken);
-
     /// <summary>Deletes <paramref name="key"/> only while its revision still equals <paramref name="expectedRevision"/>; <c>false</c> on a conflict.</summary>
     Task<bool> TryDeleteAsync(string key, ulong expectedRevision, CancellationToken cancellationToken);
 
     /// <summary>Streams the live (non-deleted) keys in the bucket.</summary>
     IAsyncEnumerable<string> GetKeysAsync(CancellationToken cancellationToken);
+
+    /// <summary>
+    /// Removes the delete markers older than <paramref name="olderThan"/> that removals left in the
+    /// bucket, returning how many messages were purged. Never removes a value written after a marker.
+    /// </summary>
+    Task<long> PurgeDeleteMarkersAsync(TimeSpan olderThan, CancellationToken cancellationToken);
 }
 
 /// <summary>A stored value together with the KV revision it was read at, for optimistic conditional writes.</summary>
@@ -209,20 +230,17 @@ internal readonly record struct NatsKvEntry(string Value, ulong Revision);
 
 /// <summary>
 /// Production <see cref="INatsKvStore"/> over a NATS JetStream Key-Value bucket. The bucket
-/// (<c>{RecoveryBucket}</c>, backed by stream <c>KV_{RecoveryBucket}</c>) is created on first use
-/// with a <c>MaxAge</c> ceiling equal to <see cref="AsyncResponseChannelOptions.RecoveryStateExpiry"/>.
+/// (<c>{RecoveryBucket}</c>, backed by stream <c>KV_{RecoveryBucket}</c>) is created on first use,
+/// when it does not exist yet, with a <c>MaxAge</c> ceiling equal to
+/// <see cref="AsyncResponseChannelOptions.RecoveryStateExpiry"/>; an existing bucket is used as it is.
 /// </summary>
-internal sealed class NatsKvStoreAdapter(INatsKVContext _kvContext, NatsAsyncResponseChannelOptions _options) : INatsKvStore
+internal sealed class NatsKvStoreAdapter(INatsKVContext _kvContext, NatsAsyncResponseChannelOptions _options, ILogger? _logger = null) : INatsKvStore
 {
+    // JetStream ApiError.ErrCode for "stream name already in use with a different configuration".
+    private const int StreamNameInUseErrCode = 10058;
+
     private readonly SemaphoreSlim _initGate = new(1, 1);
     private INatsKVStore? _store;
-
-    /// <summary>Runs the PutAsync operation.</summary>
-    public async Task PutAsync(string key, string value, CancellationToken cancellationToken)
-    {
-        var store = await GetStoreAsync(cancellationToken).ConfigureAwait(false);
-        await store.PutAsync(key, value, cancellationToken: cancellationToken).ConfigureAwait(false);
-    }
 
     /// <summary>Runs the TryCreateAsync operation.</summary>
     public async Task<bool> TryCreateAsync(string key, string value, CancellationToken cancellationToken)
@@ -256,44 +274,6 @@ internal sealed class NatsKvStoreAdapter(INatsKVContext _kvContext, NatsAsyncRes
         catch (NatsKVKeyDeletedException)
         {
             return null;
-        }
-    }
-
-    /// <summary>Runs the DeleteAsync operation.</summary>
-    public async Task<bool> DeleteAsync(string key, CancellationToken cancellationToken)
-    {
-        var store = await GetStoreAsync(cancellationToken).ConfigureAwait(false);
-
-        bool existed;
-        try
-        {
-            await store.GetEntryAsync<string>(key, cancellationToken: cancellationToken).ConfigureAwait(false);
-            existed = true;
-        }
-        catch (NatsKVKeyNotFoundException)
-        {
-            existed = false;
-        }
-        catch (NatsKVKeyDeletedException)
-        {
-            existed = false;
-        }
-
-        if (!existed)
-            return false;
-
-        try
-        {
-            await store.DeleteAsync(key, cancellationToken: cancellationToken).ConfigureAwait(false);
-            return true;
-        }
-        catch (NatsKVKeyNotFoundException)
-        {
-            return false;
-        }
-        catch (NatsKVKeyDeletedException)
-        {
-            return false;
         }
     }
 
@@ -331,6 +311,66 @@ internal sealed class NatsKvStoreAdapter(INatsKVContext _kvContext, NatsAsyncRes
             yield return key;
     }
 
+    /// <summary>
+    /// Bounded number of marker purges in flight at once: one JetStream round trip each, so a
+    /// serial pass over a busy bucket's markers would take many times longer than it needs to.
+    /// </summary>
+    private const int MarkerPurgeConcurrency = 8;
+
+    /// <summary>
+    /// Removing a key's last registration writes a KV delete marker, and with <c>History = 1</c>
+    /// that marker stays until the bucket's <c>MaxAge</c> — so storage, server subject state and
+    /// every watchdog scan (which walks the markers too) grew with throughput × RecoveryStateExpiry.
+    /// Each marker is purged with a SEQUENCE-bounded subject purge: only the marker and anything
+    /// older on its subject go, so a registration a waiter wrote under the same key after the marker
+    /// always survives. (NATS.Net's own PurgeDeletesAsync purges the whole subject, which races with
+    /// exactly that re-registration, and collects every marker into memory before purging any.)
+    /// </summary>
+    public async Task<long> PurgeDeleteMarkersAsync(TimeSpan olderThan, CancellationToken cancellationToken)
+    {
+        var store = await GetStoreAsync(cancellationToken).ConfigureAwait(false);
+        var stream = "KV_" + _options.RecoveryBucket;
+        var subjectPrefix = "$KV." + _options.RecoveryBucket + ".";
+        // Marker timestamps are the server's; the threshold dwarfs any clock skew between the two.
+        var cutoff = DateTimeOffset.UtcNow - olderThan;
+        long purged = 0;
+
+        await Parallel.ForEachAsync(
+            StaleDeleteMarkersAsync(store, cutoff, cancellationToken),
+            new ParallelOptions { MaxDegreeOfParallelism = MarkerPurgeConcurrency, CancellationToken = cancellationToken },
+            async (marker, token) =>
+            {
+                var response = await _kvContext.JetStreamContext.PurgeStreamAsync(
+                    stream,
+                    new StreamPurgeRequest { Filter = subjectPrefix + marker.Key, Seq = marker.Revision + 1 },
+                    token).ConfigureAwait(false);
+                Interlocked.Add(ref purged, response.Purged);
+            }).ConfigureAwait(false);
+
+        return purged;
+    }
+
+    /// <summary>
+    /// The markers in a point-in-time snapshot of the bucket (the latest entry per key, metadata
+    /// only), older than <paramref name="cutoff"/>. Ends once the snapshot is exhausted instead of
+    /// watching for later updates.
+    /// </summary>
+    private static async IAsyncEnumerable<(string Key, ulong Revision)> StaleDeleteMarkersAsync(
+        INatsKVStore store,
+        DateTimeOffset cutoff,
+        [EnumeratorCancellation] CancellationToken cancellationToken)
+    {
+        var opts = new NatsKVWatchOpts { MetaOnly = true, IgnoreDeletes = false, OnNoData = static _ => new ValueTask<bool>(true) };
+        await foreach (var entry in store.WatchAsync<int>(opts: opts, cancellationToken: cancellationToken).ConfigureAwait(false))
+        {
+            if (entry.Operation is NatsKVOperation.Del or NatsKVOperation.Purge && entry.Created <= cutoff)
+                yield return (entry.Key, entry.Revision);
+
+            if (entry.Delta == 0)
+                yield break;
+        }
+    }
+
     private async ValueTask<INatsKVStore> GetStoreAsync(CancellationToken cancellationToken)
     {
         if (_store is not null)
@@ -339,14 +379,7 @@ internal sealed class NatsKvStoreAdapter(INatsKVContext _kvContext, NatsAsyncRes
         await _initGate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
-            _store ??= await _kvContext.CreateStoreAsync(
-                new NatsKVConfig(_options.RecoveryBucket)
-                {
-                    MaxAge = _options.RecoveryStateExpiry,
-                    History = 1,
-                    NumberOfReplicas = _options.RecoveryBucketReplicas
-                },
-                cancellationToken).ConfigureAwait(false);
+            _store ??= await OpenOrCreateStoreAsync(cancellationToken).ConfigureAwait(false);
         }
         finally
         {
@@ -354,5 +387,105 @@ internal sealed class NatsKvStoreAdapter(INatsKVContext _kvContext, NatsAsyncRes
         }
 
         return _store;
+    }
+
+    /// <summary>
+    /// Opens the recovery bucket, creating it only when it does not exist. A create-only
+    /// <c>CreateStoreAsync</c> ran on every first use, and JetStream answers a create whose
+    /// configuration differs from the live bucket with 10058 "stream name already in use with a
+    /// different configuration" — so raising <see cref="AsyncResponseChannelOptions.RecoveryStateExpiry"/>
+    /// or <see cref="NatsAsyncResponseChannelOptions.RecoveryBucketReplicas"/>, or an operator
+    /// pre-creating the bucket with its own replica count, failed every save and every
+    /// lost-subscriber read: a full channel outage after a routine configuration change. An
+    /// existing bucket is used as it is; drift that matters is reported, never overwritten (the
+    /// transport's streams follow the same rule).
+    /// </summary>
+    private async Task<INatsKVStore> OpenOrCreateStoreAsync(CancellationToken cancellationToken)
+    {
+        var existing = await TryGetStoreAsync(cancellationToken).ConfigureAwait(false);
+        if (existing is null)
+        {
+            try
+            {
+                // Creating with a configuration identical to the live one is a JetStream no-op, so
+                // replicas of one deployment racing here all succeed.
+                return await _kvContext.CreateStoreAsync(
+                    new NatsKVConfig(_options.RecoveryBucket)
+                    {
+                        MaxAge = _options.RecoveryStateExpiry,
+                        History = 1,
+                        NumberOfReplicas = _options.RecoveryBucketReplicas
+                    },
+                    cancellationToken).ConfigureAwait(false);
+            }
+            catch (NatsJSApiException ex) when (ex.Error.ErrCode == StreamNameInUseErrCode)
+            {
+                // A peer configured differently (mid-rollout) won the creation race: from here on
+                // it is an existing bucket like any other.
+                existing = await TryGetStoreAsync(cancellationToken).ConfigureAwait(false);
+                if (existing is null)
+                    throw;
+            }
+        }
+
+        await ReportDriftAsync(existing, cancellationToken).ConfigureAwait(false);
+        return existing;
+    }
+
+    private async Task<INatsKVStore?> TryGetStoreAsync(CancellationToken cancellationToken)
+    {
+        try
+        {
+            return await _kvContext.GetStoreAsync(_options.RecoveryBucket, cancellationToken).ConfigureAwait(false);
+        }
+        catch (NatsJSApiException ex) when (ex.Error.Code == 404)
+        {
+            return null; // "stream not found" — the only answer that means the bucket may be created
+        }
+    }
+
+    /// <summary>
+    /// Reports the differences between a live bucket and these options that change behaviour.
+    /// Advisory: a bucket whose configuration cannot be read is used regardless.
+    /// </summary>
+    private async Task ReportDriftAsync(INatsKVStore store, CancellationToken cancellationToken)
+    {
+        if (_logger is null)
+            return;
+
+        StreamConfig config;
+        try
+        {
+            config = (await store.GetStatusAsync(cancellationToken).ConfigureAwait(false)).Info.Config;
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _logger.LogDebug(ex, "Could not read the configuration of the NATS recovery bucket {Bucket}; skipping its drift check.", _options.RecoveryBucket);
+            return;
+        }
+
+        // MaxAge is the bucket's garbage-collection ceiling. Below RecoveryStateExpiry it silently
+        // shortens recovery: a registration is collected before its own expiry, and a response
+        // arriving after that finds no callback to resume or fail the flow.
+        if (config.MaxAge > TimeSpan.Zero && config.MaxAge < _options.RecoveryStateExpiry)
+        {
+            _logger.LogWarning(
+                "The NATS recovery bucket {Bucket} already exists with max age {MaxAge}, shorter than RecoveryStateExpiry ({RecoveryStateExpiry}): registrations are collected before they expire, so a response arriving later than {MaxAge} finds no recovery callback. " +
+                "An existing bucket is never modified by this library — raise the bucket's max age, or lower RecoveryStateExpiry.",
+                _options.RecoveryBucket,
+                config.MaxAge,
+                _options.RecoveryStateExpiry,
+                config.MaxAge);
+        }
+
+        if (config.NumReplicas != _options.RecoveryBucketReplicas)
+        {
+            _logger.LogWarning(
+                "The NATS recovery bucket {Bucket} already exists with {Replicas} replica(s); RecoveryBucketReplicas is {DesiredReplicas}. " +
+                "An existing bucket is never modified by this library — apply the change to the bucket yourself, or align the option with it.",
+                _options.RecoveryBucket,
+                config.NumReplicas,
+                _options.RecoveryBucketReplicas);
+        }
     }
 }

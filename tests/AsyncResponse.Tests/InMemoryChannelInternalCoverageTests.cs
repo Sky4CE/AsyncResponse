@@ -170,6 +170,31 @@ public sealed class InMemoryChannelInternalCoverageTests
     }
 
     [Fact]
+    public async Task SetException_RemoteFailureMessage_ReachesTheWaitStatusOnlyAsACappedEscapedExcerpt()
+    {
+        // Wire-channel parity: the waiter's exception carries the whole message, but the wait
+        // activity's status is a line-oriented sink — the durable channels quote a capped, escaped
+        // excerpt, while this channel quoted the raw message (CR/LF and megabytes included).
+        using var activities = new AsyncResponseActivityCollector();
+        var (channel, _) = CreateChannel();
+        var hostile = "boom\r\nFORGED entry " + new string('x', 100_000);
+
+        await using (var waiter = await channel.CreateResponseWaiter<OperationResult>("corr-hostile-status"))
+        {
+            await channel.SetException(new InvalidOperationException(hostile), "corr-hostile-status");
+            var ex = await Assert.ThrowsAnyAsync<Exception>(() => waiter.ResponseTask.WaitAsync(TimeSpan.FromSeconds(5)));
+            Assert.Equal(hostile, ex.Message);
+        }
+
+        var wait = Assert.Single(activities.All(), activity => activity.OperationName == "asyncresponse.wait");
+        var status = Assert.IsType<string>(wait.StatusDescription);
+        Assert.DoesNotContain('\r', status);
+        Assert.DoesNotContain('\n', status);
+        Assert.StartsWith("boom\\u000d\\u000aFORGED", status, StringComparison.Ordinal);
+        Assert.True(status.Length < 1_000, $"The status quoted {status.Length} characters of the remote message.");
+    }
+
+    [Fact]
     public async Task CreateResponseWaiter_WhenStoreThrows_RemovesSubscriptionAndRethrows()
     {
         var (channel, store) = CreateChannel();
@@ -185,6 +210,139 @@ public sealed class InMemoryChannelInternalCoverageTests
             "throw-corr",
             It.IsAny<Guid>(),
             It.IsAny<CancellationToken>()), Times.Once);
+    }
+
+    [Fact]
+    public async Task CreateResponseWaiter_WhenTheStoreAndTheLoggerBothThrow_StillRemovesTheSubscription()
+    {
+        // Pre-fix the create path logged BEFORE cleaning up: a throwing logging provider escaped
+        // first, the cleanup never ran, and a zombie subscription with no timer stayed behind —
+        // read as a live waiter by the probe forever, silently consuming the next response for
+        // the id — while the caller got the logger's exception instead of the store's.
+        var logger = new RecordingThrowingLogger<InMemoryAsyncResponseChannel> { ThrowOnMessageContaining = "Failed to create in-memory waiter" };
+        var (channel, store) = CreateChannel(logger);
+        store.Setup(s => s.SaveAsync(It.IsAny<string>(), It.IsAny<RecoveryState>(), It.IsAny<TimeSpan>(), It.IsAny<CancellationToken>()))
+             .ThrowsAsync(new InvalidOperationException("Store failed"));
+
+        var error = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            channel.CreateResponseWaiter<OperationResult>("zombie-corr"));
+
+        Assert.Equal("Store failed", error.Message);
+        Assert.Equal(0, await channel.CountActiveSubscribersAsync("zombie-corr"));
+    }
+
+    [Fact]
+    public async Task DisposalDrainLapse_WithAThrowingLogger_StillFaultsAsIndeterminateAndCleansUp()
+    {
+        // Pre-fix the disposal drain's lapse branch logged before it settled: the logger's throw
+        // skipped both the indeterminate fault and the cleanup, so ResponseTask stayed pending
+        // behind the wedged delivery and the subscription outlived the dispose.
+        var time = new AsyncResponse.Testing.VirtualTimeProvider();
+        var logger = new RecordingThrowingLogger<InMemoryAsyncResponseChannel> { ThrowOnMessageContaining = "Disposal drain" };
+        var (channel, _) = CreateChannel(logger, time, drainTimeout: TimeSpan.FromSeconds(1));
+        var insidePredicate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releasePredicate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var waiter = await channel.CreateResponseWaiter<OperationResult>(
+            "wedged-dispose",
+            async _ =>
+            {
+                insidePredicate.TrySetResult();
+                await releasePredicate.Task;
+                return true;
+            });
+
+        var publish = channel.SetResponse(new OperationResult { Status = OperationStatus.Completed }, "wedged-dispose");
+        await insidePredicate.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        var dispose = waiter.DisposeAsync().AsTask();
+        await AdvancePastTheDrainAsync(time, dispose);
+
+        // A hang guard, not an assertion window: a stalled walk must fail here, not hang the run
+        // (and ThrowsAnyAsync<Exception> would accept a WaitAsync timeout as the expected fault).
+        Assert.True(await Task.WhenAny(dispose, Task.Delay(TimeSpan.FromSeconds(10))) == dispose, "the disposal never completed");
+        await Assert.ThrowsAnyAsync<Exception>(() => dispose);
+        await Assert.ThrowsAsync<AsyncResponseIndeterminateDeliveryException>(() => waiter.ResponseTask.WaitAsync(TimeSpan.FromSeconds(5)));
+        Assert.Equal(0, await channel.CountActiveSubscribersAsync("wedged-dispose"));
+
+        releasePredicate.TrySetResult();
+        await publish.WaitAsync(TimeSpan.FromSeconds(5));
+    }
+
+    [Fact]
+    public async Task TimeoutDrainLapse_AfterADeliveryAlreadySettledTheWaiter_IsNotReportedAsIndeterminate()
+    {
+        // A delivery completes the waiter and then holds the per-waiter gate through its own
+        // cleanup (a slow recovery-state delete). The waiter's timer is still armed until that
+        // cleanup finishes, so its timeout drain can lapse — pre-fix that lapse logged and tagged
+        // "faulting the waiter as indeterminate" for a waiter that had already succeeded.
+        var time = new AsyncResponse.Testing.VirtualTimeProvider();
+        var logger = new RecordingThrowingLogger<InMemoryAsyncResponseChannel>();
+        var (channel, store) = CreateChannel(logger, time, drainTimeout: TimeSpan.FromSeconds(1), defaultTimeout: TimeSpan.FromSeconds(10));
+        var deleteEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseDelete = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        store.Setup(s => s.TryDeleteAsync(It.IsAny<string>(), It.IsAny<Guid>(), It.IsAny<CancellationToken>()))
+             .Returns(async () =>
+             {
+                 deleteEntered.TrySetResult();
+                 await releaseDelete.Task;
+                 return true;
+             });
+        await using var waiter = await channel.CreateResponseWaiter<OperationResult>("settled-then-slow-cleanup");
+
+        var publish = channel.SetResponse(new OperationResult { Status = OperationStatus.Completed, Message = "delivered" }, "settled-then-slow-cleanup");
+        await deleteEntered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal("delivered", (await waiter.ResponseTask.WaitAsync(TimeSpan.FromSeconds(5))).Message);
+
+        // Fire the (still armed) timeout; its drain queues behind the held gate and lapses.
+        time.Advance(TimeSpan.FromSeconds(10));
+        Assert.Equal(time.GetUtcNow() + TimeSpan.FromSeconds(1), time.NextTimerDueAt);
+        time.Advance(TimeSpan.FromSeconds(1) + TimeSpan.FromMilliseconds(1));
+        Assert.Null(time.NextTimerDueAt);
+
+        releaseDelete.TrySetResult();
+        await publish.WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.True(waiter.ResponseTask.IsCompletedSuccessfully);
+        Assert.False(logger.HasEntry(LogLevel.Warning, "could not run within"));
+    }
+
+    /// <summary>Advances the virtual clock to the disposal drain's timer — never to the waiter's own, later timeout.</summary>
+    private static async Task AdvancePastTheDrainAsync(AsyncResponse.Testing.VirtualTimeProvider time, Task dispose)
+    {
+        var deadline = DateTime.UtcNow.AddSeconds(10);
+        while (!dispose.IsCompleted && DateTime.UtcNow < deadline)
+        {
+            if (time.NextTimerDueAt is { } due && due <= time.GetUtcNow() + TimeSpan.FromSeconds(1))
+                time.AdvanceTo(due + TimeSpan.FromMilliseconds(1));
+            await Task.Delay(10);
+        }
+    }
+
+    private static (InMemoryAsyncResponseChannel Channel, Mock<IRecoveryStateStore> Store) CreateChannel(
+        ILogger<InMemoryAsyncResponseChannel>? logger,
+        TimeProvider timeProvider,
+        TimeSpan drainTimeout,
+        TimeSpan? defaultTimeout = null)
+    {
+        var provider = new ServiceCollection().BuildServiceProvider();
+        var store = new Mock<IRecoveryStateStore>();
+        store.Setup(instance => instance.TryDeleteAsync(
+                It.IsAny<string>(),
+                It.IsAny<Guid>(),
+                It.IsAny<CancellationToken>()))
+            .ReturnsAsync(true);
+        var channel = new InMemoryAsyncResponseChannel(
+            provider.GetRequiredService<IServiceScopeFactory>(),
+            store.Object,
+            Options.Create(new InMemoryAsyncResponseOptions
+            {
+                DefaultTimeout = defaultTimeout ?? TimeSpan.FromMinutes(1),
+                RecoveryStateExpiry = TimeSpan.FromMinutes(1),
+                DisposalDrainTimeout = drainTimeout
+            }),
+            new AsyncResponseContextPropagation([]),
+            logger ?? NullLogger<InMemoryAsyncResponseChannel>.Instance,
+            timeProvider);
+        return (channel, store);
     }
 
     private static (InMemoryAsyncResponseChannel Channel, Mock<IRecoveryStateStore> Store) CreateChannel(

@@ -101,6 +101,22 @@ internal static class DurableFlowContextTestSupport
         }
     }
 
+    /// <summary>A host lifetime whose ApplicationStopping the test fires.</summary>
+    public sealed class StoppingHost : Microsoft.Extensions.Hosting.IHostApplicationLifetime, IDisposable
+    {
+        private readonly CancellationTokenSource _stopping = new();
+
+        public CancellationToken ApplicationStarted => CancellationToken.None;
+
+        public CancellationToken ApplicationStopping => _stopping.Token;
+
+        public CancellationToken ApplicationStopped => CancellationToken.None;
+
+        public void StopApplication() => _stopping.Cancel();
+
+        public void Dispose() => _stopping.Dispose();
+    }
+
     /// <summary>
     /// A worker transport WITHOUT native delayed delivery (the Kafka / RabbitMQ / Pub/Sub / Redis /
     /// NATS shape): every durable timer waits in process. Records what is published and can fail

@@ -89,6 +89,39 @@ public sealed class DurableFlowStoreSharedTests
     }
 
     /// <summary>
+    /// Regression: the prune throttle stamped and compared <c>DateTime.UtcNow</c> ticks, so a
+    /// backward wall-clock step (a VM snapshot restore, an NTP correction) left the stamp AHEAD of
+    /// the clock and suspended every opportunistic prune on that process for the size of the step
+    /// — the tables grew for the whole window. The throttle now measures elapsed time on the
+    /// monotonic clock, which no wall-clock step moves, and a stamp ahead of the clock it reads —
+    /// the state a backward step used to leave behind — never blocks the next window.
+    /// </summary>
+    [Theory]
+    [MemberData(nameof(ProviderOptionTypes))]
+    public void ShouldPrune_ThrottlesOnTheMonotonicClock_SoAWallClockRewindCannotSuspendPruning(Type providerOptionsType)
+    {
+        var shared = providerOptionsType.Assembly.GetType(SharedTypeName, throwOnError: true)!;
+        var interval = TimeSpan.FromHours(1);
+        long StopwatchTicks(TimeSpan span) => (long)(span.TotalSeconds * System.Diagnostics.Stopwatch.Frequency);
+
+        // Stamped just now on the monotonic clock: throttled for the interval.
+        Assert.False(Assert.IsType<bool>(Invoke(shared, "ShouldPrune", System.Diagnostics.Stopwatch.GetTimestamp(), interval)));
+
+        // Stamped more than an interval ago on the monotonic clock: prunes.
+        var elapsed = System.Diagnostics.Stopwatch.GetTimestamp() - StopwatchTicks(interval + TimeSpan.FromSeconds(1));
+        Assert.True(Assert.IsType<bool>(Invoke(shared, "ShouldPrune", elapsed, interval)));
+
+        // A stamp ahead of whichever clock the throttle reads — exactly what a backward wall-clock
+        // step left behind under the wall-clock throttle — prunes at once and re-stamps, after
+        // which the window throttles again.
+        var ahead = Math.Max(DateTime.UtcNow.Ticks + (2 * interval).Ticks, System.Diagnostics.Stopwatch.GetTimestamp() + StopwatchTicks(2 * interval));
+        var args = new object?[] { ahead, interval };
+        Assert.True(Assert.IsType<bool>(Invoke(shared, "ShouldPrune", args)));
+        Assert.NotEqual(ahead, Assert.IsType<long>(args[0]));
+        Assert.False(Assert.IsType<bool>(Invoke(shared, "ShouldPrune", args)));
+    }
+
+    /// <summary>
     /// The size guard, the read-side identity mirror and the saturating clock helpers, exercised in
     /// every store assembly. The shared source is compiled per package, so a helper only some
     /// providers happen to call is otherwise dead code in the rest of them — this walks all nine.
@@ -189,7 +222,7 @@ public sealed class DurableFlowStoreSharedTests
 
         // Round 34: the helper drains batches under a budget and reports; the single-batch shape
         // is the zero budget. See Round34NewApiTests for the batching and reporting pins.
-        Task Quietly(Func<Task<int>> prune) => (Task)pruneQuietly!.Invoke(null, [prune, TimeSpan.Zero, "test", null])!;
+        Task Quietly(Func<Task<int>> prune) => (Task)pruneQuietly!.Invoke(null, [prune, TimeSpan.Zero, "test", null, CancellationToken.None])!;
     }
 
     public static TheoryData<Type> ProviderOptionTypes =>

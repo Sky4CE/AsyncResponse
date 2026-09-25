@@ -74,16 +74,18 @@ internal abstract class SqlServerSubscriberService : BackgroundService
             attemptToken => RunSubscriberAsync(dispatcher, attemptToken),
             stoppingToken,
             failures => AsyncResponseRetry.Backoff(failures, Options.SubscriberRetryBaseDelay, Options.SubscriberRetryMaxDelay),
-            (ex, delay) => Logger.LogWarning(ex, "SQL Server subscriber failed for queue {Queue} ({Role}); retrying in {RetryDelay}.", Queue, Role, delay)).ConfigureAwait(false);
+            (ex, delay) => Logger.LogWarning(ex, "SQL Server subscriber failed for queue {Queue} ({Role}); retrying in {RetryDelay}.", Queue, Role, delay),
+            healthyRunThreshold: Options.SubscriberRetryMaxDelay).ConfigureAwait(false);
     }
 
     private async Task RunSubscriberAsync(SqlServerMessageDispatcher dispatcher, CancellationToken stoppingToken)
     {
         await _store.EnsureCreatedAsync(stoppingToken).ConfigureAwait(false);
 
-        // Same-process wake: publishes to this queue (or a NAK release, queue == null) signal the
-        // loop directly since SQL Server has no LISTEN/NOTIFY; cross-process publishes are picked up
-        // by the EmptyPollDelay poll below.
+        // Same-process wake: publishes to this queue signal the loop directly since SQL Server has
+        // no LISTEN/NOTIFY (a null queue still wakes every subscriber, though the store no longer
+        // raises one); cross-process publishes and NAK releases are picked up by the
+        // EmptyPollDelay poll below.
         Action<string?> onPublished = queue =>
         {
             if (queue is null || string.Equals(queue, Queue, StringComparison.Ordinal))

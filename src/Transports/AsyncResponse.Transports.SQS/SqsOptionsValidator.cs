@@ -12,7 +12,9 @@ internal static class SqsOptionsValidator
         Required(options.CorrelationIdAttribute, nameof(options.CorrelationIdAttribute));
         Required(options.DefaultReplyTargetName, nameof(options.DefaultReplyTargetName));
 
-        if (StringComparer.Ordinal.Equals(options.WorkerQueue, options.ResponseQueue))
+        // Either side may be a name or a URL: two URLs compare normalized. A name against a URL
+        // naming it may be another account's queue, so that only warns (PossibleQueueCollisions).
+        if (SqsQueueAddress.SameQueue(options.WorkerQueue, options.ResponseQueue))
         {
             throw new InvalidOperationException(
                 $"{nameof(SqsAsyncResponseOptions)}.{nameof(options.WorkerQueue)} and " +
@@ -54,19 +56,46 @@ internal static class SqsOptionsValidator
                     continue;
 
                 var deadLetterQueue = SqsQueueAddress.DeriveDeadLetterQueueName(queue, options.DeadLetterQueueSuffix!);
-                if (StringComparer.Ordinal.Equals(deadLetterQueue, options.WorkerQueue)
-                    || StringComparer.Ordinal.Equals(deadLetterQueue, options.ResponseQueue))
+                if (SqsQueueAddress.SameQueue(deadLetterQueue, options.WorkerQueue)
+                    || SqsQueueAddress.SameQueue(deadLetterQueue, options.ResponseQueue))
                 {
                     throw new InvalidOperationException(
                         $"{nameof(SqsAsyncResponseOptions)}: the dead-letter queue derived for '{queue}' with " +
                         $"{nameof(options.DeadLetterQueueSuffix)} '{options.DeadLetterQueueSuffix}' is '{deadLetterQueue}', " +
                         "which collides with a live worker/response queue. Rename the queues or change the suffix.");
                 }
+
+                // Provisioning creates both names, and SQS rejects a bad one with a deterministic
+                // 400 — a 77-character name plus "-dlq" (81), or a suffix with a '.' in it —
+                // which surfaced only after the whole provisioning retry budget, minutes into
+                // host startup.
+                foreach (var provisioned in new[] { queue, deadLetterQueue })
+                {
+                    if (!SqsQueueAddress.IsValidQueueName(provisioned))
+                    {
+                        throw new InvalidOperationException(
+                            $"{nameof(SqsAsyncResponseOptions)}: {nameof(options.CreateQueues)} would create the queue '{provisioned}'" +
+                            (ReferenceEquals(provisioned, queue) ? string.Empty : $" (the dead-letter queue derived for '{queue}' with {nameof(options.DeadLetterQueueSuffix)} '{options.DeadLetterQueueSuffix}')") +
+                            ", which SQS rejects: a queue name is at most 80 characters of ASCII letters, digits, '-' and '_' (a FIFO queue's '.fifo' suffix included in the 80).");
+                    }
+                }
             }
         }
 
         if (SqsQueueAddress.IsFifo(options.WorkerQueue))
+        {
             Required(options.FifoMessageGroupIdFallback, nameof(options.FifoMessageGroupIdFallback));
+
+            // Correlation ids go through ToMessageGroupId; the fallback is sent as it is, so a
+            // value SQS rejects failed every uncorrelated FIFO publish — every durable-flow job
+            // among them — with a non-retryable 400, after a clean startup.
+            if (!SqsWorkerTransport.IsValidMessageGroupId(options.FifoMessageGroupIdFallback))
+            {
+                throw new InvalidOperationException(
+                    $"{nameof(SqsAsyncResponseOptions)}.{nameof(options.FifoMessageGroupIdFallback)} '{options.FifoMessageGroupIdFallback}' is not a valid SQS " +
+                    "MessageGroupId: use 1–128 ASCII letters, digits and punctuation (no spaces).");
+            }
+        }
 
         AsyncResponseChannelOptions.EnsureTimerBacked(options.PublishRetryBaseDelay, nameof(SqsAsyncResponseOptions), nameof(options.PublishRetryBaseDelay));
         AsyncResponseChannelOptions.EnsureTimerBacked(options.PublishRetryMaxDelay, nameof(SqsAsyncResponseOptions), nameof(options.PublishRetryMaxDelay));
@@ -179,5 +208,52 @@ internal static class SqsOptionsValidator
         => !string.IsNullOrWhiteSpace(value)
             ? value
             : throw new InvalidOperationException($"{nameof(SqsAsyncResponseOptions)}.{name} must be configured.");
+
+    /// <summary>
+    /// The pairs the exact collision guards cannot decide: a queue name and a queue URL sharing its
+    /// queue name (<see cref="SqsQueueAddress.MayBeSameQueue"/>), among the worker and response
+    /// queues, the dead-letter queues <see cref="SqsAsyncResponseOptions.CreateQueues"/> derives,
+    /// and the named reply targets. Failing on them rejected a legitimate cross-account pair — at
+    /// startup, or from <c>GetReplyTarget</c> on every enqueue — so the worker subscriber warns
+    /// about each at startup instead.
+    /// </summary>
+    public static IEnumerable<string> PossibleQueueCollisions(SqsAsyncResponseOptions options)
+    {
+        var workerQueue = options.WorkerQueue;
+        var responseQueue = options.ResponseQueue;
+        if (SqsQueueAddress.MayBeSameQueue(workerQueue, responseQueue))
+            yield return $"{nameof(SqsAsyncResponseOptions.WorkerQueue)} '{workerQueue}' and {nameof(SqsAsyncResponseOptions.ResponseQueue)} '{responseQueue}'";
+
+        string[] derivedDeadLetterQueues = string.IsNullOrWhiteSpace(options.DeadLetterQueueSuffix)
+            ? []
+            :
+            [
+                SqsQueueAddress.DeriveDeadLetterQueueName(workerQueue, options.DeadLetterQueueSuffix),
+                SqsQueueAddress.DeriveDeadLetterQueueName(responseQueue, options.DeadLetterQueueSuffix)
+            ];
+        if (options.CreateQueues)
+        {
+            foreach (var deadLetterQueue in derivedDeadLetterQueues.Where(queue => !SqsQueueAddress.IsUrl(queue)))
+            {
+                foreach (var liveQueue in new[] { workerQueue, responseQueue })
+                {
+                    if (SqsQueueAddress.MayBeSameQueue(deadLetterQueue, liveQueue))
+                        yield return $"the derived dead-letter queue '{deadLetterQueue}' and the live queue '{liveQueue}'";
+                }
+            }
+        }
+
+        foreach (var (targetName, target) in options.ReplyTargets)
+        {
+            if (string.IsNullOrWhiteSpace(target.Queue))
+                continue;
+
+            foreach (var guarded in derivedDeadLetterQueues.Prepend(workerQueue))
+            {
+                if (SqsQueueAddress.MayBeSameQueue(target.Queue, guarded))
+                    yield return $"reply target '{targetName}' ('{target.Queue}') and '{guarded}' ({nameof(SqsAsyncResponseOptions.WorkerQueue)} or a derived dead-letter queue)";
+            }
+        }
+    }
 
 }

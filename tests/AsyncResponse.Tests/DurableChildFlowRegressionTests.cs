@@ -53,6 +53,31 @@ public class DurableChildFlowRegressionTests
         }
     }
 
+    /// <summary>
+    /// Flow code that turns the park's cancellation into a terminal failure — the "timed out"
+    /// catch around a context call the docs warn against.
+    /// </summary>
+    public sealed class ConvertingParentFlow(ChildFlowProbe _probe) : IDurableFlow<GatedParentInput>
+    {
+        public async Task ExecuteAsync(IDurableFlowContext flow, GatedParentInput input)
+        {
+            try
+            {
+                await flow.AwaitChildFlowAsync<GatedChildFlow, TestFlowInput>("child-gated", new TestFlowInput(input.Value));
+            }
+            catch (OperationCanceledException ex)
+            {
+                throw new DurableFlowFailedException("The child timed out.", ex);
+            }
+
+            await flow.StepAsync("parent-finish", () =>
+            {
+                _probe.Bump("converting-parent-finish");
+                return Task.CompletedTask;
+            });
+        }
+    }
+
     public sealed record CollisionInput(string ChildId);
 
     public sealed class CollidingParentFlow : IDurableFlow<CollisionInput>
@@ -177,6 +202,53 @@ public class DurableChildFlowRegressionTests
         }
         finally
         {
+            await StopHostedServicesAsync(hosted);
+        }
+    }
+
+    [Fact]
+    public async Task AParentThatConvertsTheParksCancellationIntoAFailure_StaysParked_AndCompletesWithItsChild()
+    {
+        // The park had committed — child enqueued, parent's wake-up guaranteed — when flow code
+        // turned its cancellation into DurableFlowFailedException. Taken at face value that failed
+        // the parent terminally while its child kept running. The park stands.
+        await using var provider = CreateProvider(blockChild: true);
+        var hosted = await StartHostedServicesAsync(provider);
+        var gate = provider.GetRequiredService<ChildGate>();
+        try
+        {
+            var flows = provider.GetRequiredService<IDurableFlows>();
+            var probe = provider.GetRequiredService<ChildFlowProbe>();
+            using (var scope = provider.CreateScope())
+            {
+                Assert.True(await scope.ServiceProvider.GetRequiredService<IFlowStateStore>().TryCreateAsync("converting-root", new FlowState
+                {
+                    FlowId = "converting-root",
+                    FlowTypeName = typeof(ConvertingParentFlow).FullName,
+                    InputTypeName = typeof(GatedParentInput).FullName,
+                    InputJson = JsonSerializer.Serialize(new GatedParentInput(3)),
+                    Status = FlowRunStatus.Running,
+                    CreatedAtUtc = DateTime.UtcNow,
+                    UpdatedAtUtc = DateTime.UtcNow
+                }, TimeSpan.FromMinutes(5)));
+            }
+
+            // The delivery ends cleanly — acknowledged as the park it is, neither failed nor retried.
+            await provider.GetRequiredService<IDurableFlowExecutor>().ExecuteAsync("converting-root");
+            var parked = await flows.GetStateAsync("converting-root");
+            Assert.Equal(FlowRunStatus.Running, parked!.Status);
+            Assert.Equal("converting-root:child-gated", parked.Steps!["child-gated"].ChildFlowId);
+
+            await WaitUntilAsync(() => probe.Count("child-work") == 1);
+            gate.Released.TrySetResult();
+
+            var root = await WaitForStateAsync(flows, "converting-root", FlowRunStatus.Succeeded);
+            Assert.True(root.Steps!["child-gated"].Completed);
+            Assert.Equal(1, probe.Count("converting-parent-finish"));
+        }
+        finally
+        {
+            gate.Released.TrySetResult();
             await StopHostedServicesAsync(hosted);
         }
     }
@@ -358,6 +430,119 @@ public class DurableChildFlowRegressionTests
     }
 
     [Fact]
+    public async Task AwaitChildFlow_CompletedCheckpoint_WhoseOldInputTodaysTypeRejects_ReturnsTheMemoizedChild()
+    {
+        // The child input type gained a guarded member since the child ran: reading the persisted
+        // input back runs the constructor, which throws on the missing member. That is a
+        // mismatch like any other — the completed step answers from its memo with a warning —
+        // not an exception that failed every replay of the parent and ended in the dead-letter queue.
+        var store = new InMemoryFlowStateStore();
+        var child = RegionalChild("regional-completed-root", FlowRunStatus.Succeeded);
+        var parent = ParentAwaiting(child, completed: true);
+        Assert.True(await store.TryCreateAsync(parent.FlowId!, parent, TimeSpan.FromMinutes(5)));
+        await using var lease = await FlowStateConcurrency.TryAcquireExecutionLeaseAsync(store, parent.FlowId!, new DurableFlowOptions(), NullLogger.Instance);
+        var logger = new CollectingLogger();
+
+        var context = CreateContext(parent, store, lease!, logger);
+        var memoized = await context.AwaitChildFlowAsync<RegionalChildFlow, RegionalChildInput>("child", new RegionalChildInput(7, "eu-west"));
+
+        Assert.Equal(child.FlowId, memoized.FlowId);
+        Assert.Equal(FlowRunStatus.Succeeded, memoized.Status);
+        Assert.Contains(logger.Messages, message => message.Contains("memoized outcome", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task AwaitChildFlow_RunningChild_WhoseOldInputTodaysTypeRejects_FailsFastAsAMismatch()
+    {
+        // ...while a child still running keeps the terminal mismatch — never the constructor's
+        // exception, which the executor treats as retriable and redelivers to the dead-letter queue.
+        var store = new InMemoryFlowStateStore();
+        var child = RegionalChild("regional-running-root", FlowRunStatus.Running);
+        var parent = ParentAwaiting(child, completed: false);
+        Assert.True(await store.TryCreateAsync(child.FlowId!, child, TimeSpan.FromMinutes(5)));
+        Assert.True(await store.TryCreateAsync(parent.FlowId!, parent, TimeSpan.FromMinutes(5)));
+        await using var lease = await FlowStateConcurrency.TryAcquireExecutionLeaseAsync(store, parent.FlowId!, new DurableFlowOptions(), NullLogger.Instance);
+
+        var context = CreateContext(parent, store, lease!);
+        var error = await Assert.ThrowsAsync<DurableFlowFailedException>(() =>
+            context.AwaitChildFlowAsync<RegionalChildFlow, RegionalChildInput>("child", new RegionalChildInput(7, "eu-west")));
+
+        Assert.Contains("semantically identical child input", error.Message);
+    }
+
+    [Fact]
+    public async Task AwaitChildFlow_CompletedCheckpoint_OfARenamedChildClass_ReturnsTheMemoizedChild()
+    {
+        // The completed memo is this parent step's own (parent id and step name match), so a
+        // different flow type name is the child class renamed or moved since it finished — not
+        // an id collision. Like a changed input, it answers from the memo with a warning; failing
+        // the parent terminally threw the settled outcome away. (A RUNNING child under a different
+        // type still fails fast: AwaitChildFlow_ChildIdWithDifferentFlowType_FailsParent.)
+        var store = new InMemoryFlowStateStore();
+        var child = new FlowState
+        {
+            FlowId = "renamed-root:child",
+            FlowTypeName = "Contoso.Flows.Legacy.OldChildFlow",
+            InputTypeName = typeof(TestFlowInput).FullName,
+            InputJson = JsonSerializer.Serialize(new TestFlowInput(1)),
+            Status = FlowRunStatus.Succeeded,
+            ParentFlowId = "renamed-root",
+            ParentStepName = "child",
+            CreatedAtUtc = DateTime.UtcNow,
+            UpdatedAtUtc = DateTime.UtcNow
+        };
+        var parent = ParentAwaiting(child, completed: true);
+        Assert.True(await store.TryCreateAsync(parent.FlowId!, parent, TimeSpan.FromMinutes(5)));
+        await using var lease = await FlowStateConcurrency.TryAcquireExecutionLeaseAsync(store, parent.FlowId!, new DurableFlowOptions(), NullLogger.Instance);
+        var logger = new CollectingLogger();
+
+        var context = CreateContext(parent, store, lease!, logger);
+        var memoized = await context.AwaitChildFlowAsync<GatedChildFlow, TestFlowInput>("child", new TestFlowInput(1));
+
+        Assert.Equal(child.FlowId, memoized.FlowId);
+        Assert.Equal(FlowRunStatus.Succeeded, memoized.Status);
+        Assert.Contains(logger.Messages, message => message.Contains("Contoso.Flows.Legacy.OldChildFlow", StringComparison.Ordinal)
+            && message.Contains("memoized outcome", StringComparison.Ordinal));
+    }
+
+    public sealed class ListChildFlow : IDurableFlow<List<int>>
+    {
+        public Task ExecuteAsync(IDurableFlowContext flow, List<int> input) => Task.CompletedTask;
+    }
+
+    [Fact]
+    public async Task AwaitChildFlow_ATerminalChildCreatedUnderAnotherArgumentVersion_CompletesTheParent()
+    {
+        // Fixpoint r1 (GS1#2): the child's input type was compared ordinally, and a generic
+        // argument's assembly version is part of FullName. A child created before a deploy that
+        // moved it failed its parent TERMINALLY on the normal wake path — the parent loads the
+        // now-terminal child with completed: false — although the child ran exactly this input.
+        var store = new InMemoryFlowStateStore();
+        var child = new FlowState
+        {
+            FlowId = "generic-parent:child",
+            FlowTypeName = typeof(ListChildFlow).FullName,
+            InputTypeName = TypeNameIdentityTests.OtherVersion(typeof(List<int>).FullName!),
+            InputJson = "[1,2]",
+            Status = FlowRunStatus.Succeeded,
+            ParentFlowId = "generic-parent",
+            ParentStepName = "child",
+            CreatedAtUtc = DateTime.UtcNow,
+            UpdatedAtUtc = DateTime.UtcNow
+        };
+        var parent = ParentAwaiting(child, completed: false);
+        Assert.True(await store.TryCreateAsync(child.FlowId!, child, TimeSpan.FromMinutes(5)));
+        Assert.True(await store.TryCreateAsync(parent.FlowId!, parent, TimeSpan.FromMinutes(5)));
+        await using var lease = await FlowStateConcurrency.TryAcquireExecutionLeaseAsync(store, parent.FlowId!, new DurableFlowOptions(), NullLogger.Instance);
+
+        var context = CreateContext(parent, store, lease!);
+        var completed = await context.AwaitChildFlowAsync<ListChildFlow, List<int>>("child", [1, 2]);
+
+        Assert.Equal(FlowRunStatus.Succeeded, completed.Status);
+        Assert.True(parent.Steps!["child"].Completed);
+    }
+
+    [Fact]
     public async Task AwaitChildFlow_ReplayWithChangedExplicitChildId_FailsFast()
     {
         var store = new InMemoryFlowStateStore();
@@ -510,6 +695,7 @@ public class DurableChildFlowRegressionTests
         services.AddScoped<GatedChildFlow>();
         services.AddScoped<GatedParentFlow>();
         services.AddScoped<CollidingParentFlow>();
+        services.AddScoped<ConvertingParentFlow>();
         services.AddScoped<RecursiveChildFlow>();
         var builder = services.AddAsyncResponse(options =>
             {
@@ -538,7 +724,8 @@ public class DurableChildFlowRegressionTests
     private static DurableFlowContext CreateContext(
         FlowState state,
         IFlowStateStore store,
-        FlowExecutionLease lease)
+        FlowExecutionLease lease,
+        ILogger? logger = null)
         => new(
             state,
             store,
@@ -547,8 +734,58 @@ public class DurableChildFlowRegressionTests
             new DurableFlowOptions(),
             Mock.Of<IAsyncResponseSubscriber>(),
             recoverableSubscriber: null,
-            NullLogger.Instance,
+            logger ?? NullLogger.Instance,
             lease);
+
+    /// <summary>A child input type that has since gained a member its constructor insists on.</summary>
+    public sealed record RegionalChildInput
+    {
+        public RegionalChildInput(int tenantId, string region)
+        {
+            ArgumentNullException.ThrowIfNull(region);
+            TenantId = tenantId;
+            Region = region;
+        }
+
+        public int TenantId { get; }
+
+        public string Region { get; }
+    }
+
+    public sealed class RegionalChildFlow : IDurableFlow<RegionalChildInput>
+    {
+        public Task ExecuteAsync(IDurableFlowContext flow, RegionalChildInput input) => Task.CompletedTask;
+    }
+
+    /// <summary>A child that ran with the input's OLD shape — before the guarded member existed.</summary>
+    private static FlowState RegionalChild(string parentFlowId, FlowRunStatus status) => new()
+    {
+        FlowId = $"{parentFlowId}:child",
+        FlowTypeName = typeof(RegionalChildFlow).FullName,
+        InputTypeName = typeof(RegionalChildInput).FullName,
+        InputJson = "{\"TenantId\":7}",
+        Status = status,
+        ParentFlowId = parentFlowId,
+        ParentStepName = "child",
+        CreatedAtUtc = DateTime.UtcNow,
+        UpdatedAtUtc = DateTime.UtcNow
+    };
+
+    /// <summary>A parent whose step "child" is bound to <paramref name="child"/> (completed with its snapshot, or still waiting).</summary>
+    private static FlowState ParentAwaiting(FlowState child, bool completed) => new()
+    {
+        FlowId = child.ParentFlowId,
+        FlowTypeName = typeof(GatedParentFlow).FullName,
+        Status = FlowRunStatus.Running,
+        Steps = new Dictionary<string, FlowStepState>(StringComparer.Ordinal)
+        {
+            ["child"] = completed
+                ? new() { Completed = true, ChildFlowId = child.FlowId, ResultJson = FlowStateJson.SerializeSnapshot(child) }
+                : new() { ChildFlowId = child.FlowId }
+        },
+        CreatedAtUtc = DateTime.UtcNow,
+        UpdatedAtUtc = DateTime.UtcNow
+    };
 
     /// <summary>
     /// Gives each simulated process its own store client while sharing persisted state. Once a

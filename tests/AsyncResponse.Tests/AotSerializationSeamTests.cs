@@ -201,6 +201,38 @@ public class AotSerializationSeamTests
         }
     }
 
+    [Fact]
+    public void UnsupportedValue_OnAReflectionEnabledApp_IsNotBlamedOnTrimmingOrAMissingRegistration()
+    {
+        // Regression: both metadata-failure wrappers said "This app runs without reflection-based
+        // System.Text.Json (trimmed/Native AOT)" unconditionally. A JIT app enqueuing a job whose
+        // argument is a System.Type — unsupported by the serializer in every mode — was told it
+        // runs trimmed and that registering a context would fix it. This process runs with
+        // reflection enabled, so the wording must say so.
+        Assert.True(JsonSerializer.IsReflectionEnabledByDefault);
+        var midGraph = new WorkerJobEnvelope
+        {
+            Call = new ReflectionCallDto
+            {
+                ServiceInterfaceFullName = "X",
+                MethodName = "Y",
+                Params = [CallbackParam.ForValue(typeof(int))]
+            }
+        };
+
+        var memberFailure = Assert.Throws<NotSupportedException>(() => AsyncResponseJson.Serialize(midGraph));
+        // The root-type wrapper, reached through caller options whose own resolver lacks the type.
+        var rootFailure = Assert.Throws<NotSupportedException>(() => AsyncResponseJson.GetTypeInfo(
+            typeof(SeamProbePayload), new JsonSerializerOptions { TypeInfoResolver = new TrackingResolver() }));
+
+        foreach (var failure in new[] { memberFailure, rootFailure })
+        {
+            Assert.DoesNotContain("This app runs without reflection-based", failure.Message, StringComparison.Ordinal);
+            Assert.Contains("Reflection-based System.Text.Json is enabled in this app", failure.Message, StringComparison.Ordinal);
+            Assert.NotNull(failure.InnerException);
+        }
+    }
+
     private sealed class TrackingResolver : IJsonTypeInfoResolver
     {
         private readonly List<Type> _seenTypes = [];

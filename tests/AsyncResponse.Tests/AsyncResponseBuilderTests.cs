@@ -1,3 +1,6 @@
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 using Moq;
 using Xunit;
 
@@ -121,6 +124,34 @@ public class AsyncResponseBuilderTests
 
         // The operation never started: subscription and recovery state must be torn down.
         _waiter.Verify(w => w.DisposeAsync(), Times.Once);
+    }
+
+    [Fact]
+    public async Task WaitAsync_WithAnUnresolvableReplyTarget_ThrowsBeforeCreatingTheWaiter()
+    {
+        // Regression: the reply target was resolved AFTER the waiter was created, so on the
+        // recoverable builder a missing provider (or a bad target name) subscribed and persisted a
+        // recovery row, then threw and tore both down — durable writes on every failed call.
+        var noProvider = new RecoverableAsyncResponseBuilder(_recoverableSubscriber.Object).For<OperationResult>();
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            noProvider.WithReplyTarget().WaitAsync(_ => Task.CompletedTask));
+        Assert.Contains("reply target provider", ex.Message, StringComparison.Ordinal);
+
+        var provider = new Mock<IAsyncResponseReplyTargetProvider>();
+        provider.Setup(p => p.GetReplyTarget("missing")).Throws(new KeyNotFoundException("no reply target named 'missing'"));
+        var badName = new RecoverableAsyncResponseBuilder(_recoverableSubscriber.Object, replyTargetProvider: provider.Object)
+            .For<OperationResult>("corr-bad-target");
+        await Assert.ThrowsAsync<KeyNotFoundException>(() =>
+            badName.WithReplyTarget("missing").WaitAsync());
+
+        _recoverableSubscriber.Verify(
+            s => s.CreateRecoverableResponseWaiter<OperationResult>(
+                It.IsAny<string>(),
+                It.IsAny<ReflectionCallDto?>(),
+                It.IsAny<ReflectionCallDto?>(),
+                It.IsAny<Func<OperationResult, ValueTask<bool>>?>(),
+                It.IsAny<TimeSpan?>()),
+            Times.Never);
     }
 
     [Fact]
@@ -801,6 +832,162 @@ public class AsyncResponseBuilderTests
                 Assert.Equal(42, Assert.Single(call.Params).Value);
             },
             call => Assert.Equal(nameof(IExpressionWorker.RunAsync), call.MethodName));
+    }
+
+    [Fact]
+    public void UpperBoundEstimate_ToleratesAReplyTargetWithNullProperties()
+    {
+        // Regression: an inbound job's "Properties":null overwrites the initializer, and the
+        // estimator's foreach over it threw NullReferenceException.
+        var envelope = new WorkerJobEnvelope
+        {
+            Call = new ReflectionCallDto { ServiceInterfaceFullName = "S", MethodName = "M", Params = [] },
+            ReplyTarget = new AsyncResponseReplyTarget { Name = "default", Transport = "test", Address = "test://default", Properties = null! }
+        };
+
+        Assert.True(AsyncResponseBuilderBase.TryEstimateUpperBound(envelope, out var upperBound));
+        Assert.True(upperBound >= AsyncResponseJson.Serialize(envelope).Length);
+    }
+
+    [Fact]
+    public async Task WorkerJobWithANullReplyTargetPropertiesMap_CanStillEnqueueFromItsHandler()
+    {
+        // Regression: the worker executor pushes the job's reply target ambiently, every enqueue
+        // the handler makes copies it, and the producer-side size estimate dereferenced its
+        // Properties — so a job carrying "Properties":null failed on EVERY delivery for any
+        // handler that enqueues (a durable flow's own wake-ups included).
+        var transport = new Mock<IWorkerTransport>();
+        var published = new List<WorkerJobEnvelope>();
+        transport
+            .Setup(t => t.PublishAsync(It.IsAny<WorkerJobEnvelope>(), It.IsAny<CancellationToken>()))
+            .Callback<WorkerJobEnvelope, CancellationToken>((job, _) => published.Add(job))
+            .Returns(Task.CompletedTask);
+        var services = new ServiceCollection();
+        services.AddSingleton(typeof(ILogger<>), typeof(NullLogger<>));
+        services.AddSingleton(transport.Object);
+        services.AddSingleton<IChainingWorker, ChainingWorker>();
+        services.AddAsyncResponse().WithInMemoryChannel();
+        await using var provider = services.BuildServiceProvider();
+
+        var json = AsyncResponseJson.Serialize(new WorkerJobEnvelope
+        {
+            Call = new ReflectionCallDto
+            {
+                ServiceInterfaceFullName = typeof(IChainingWorker).FullName!,
+                MethodName = nameof(IChainingWorker.ChainAsync),
+                Params = []
+            },
+            ReplyTarget = ReplyTarget("default")
+        }).Replace("\"Properties\":{}", "\"Properties\":null", StringComparison.Ordinal);
+        Assert.Contains("\"Properties\":null", json, StringComparison.Ordinal);
+
+        await provider.GetRequiredService<IAsyncResponseIngress>().HandleWorkerMessageAsync(json);
+
+        var chained = Assert.Single(published);
+        Assert.Equal(nameof(IExpressionWorker.Run), chained.Call.MethodName);
+        Assert.Equal("default", chained.ReplyTarget?.Name);
+    }
+
+    public interface IChainingWorker
+    {
+        Task ChainAsync();
+    }
+
+    public sealed class ChainingWorker(IAsyncResponseBuilder builder) : IChainingWorker
+    {
+        public Task ChainAsync() => builder.EnqueueWorkerAsync<IExpressionWorker>(worker => worker.Run(1));
+    }
+
+    [Fact]
+    public async Task DelayedEnqueue_ThatOnlyFitsTheBudgetBeforeItsRedelayHop_ThrowsAtTheProducer()
+    {
+        // Regression: the producer measured a delayed envelope as published, with
+        // "LastRedelayRemaining":null. The worker executor re-publishes an early delivery (a hop
+        // capped by MaxPublishDelay) after stamping the remaining delay there, so an envelope
+        // within a few characters of the limit passed the producer check and its hop was then
+        // acknowledged WITHOUT executing by the consuming ingress: the job silently never ran.
+        var clock = new FixedClock(new DateTimeOffset(2026, 1, 1, 0, 0, 0, TimeSpan.Zero));
+        var delay = TimeSpan.FromHours(1);
+        var padding = new string('x', 2000);
+
+        var measuring = new CapturingDelayedTransport();
+        await Producer(measuring, clock, limit: null).EnqueueWorkerAsync<IPaddedWorker>(worker => worker.RunAsync(padding), delay);
+        var envelope = Assert.Single(measuring.Published);
+        var published = AsyncResponseJson.Serialize(envelope).Length;
+
+        // What the ingress measures on the re-published hop: longer than the budget used below.
+        envelope.LastRedelayRemaining = new TimeSpan(0, 44, 59) + TimeSpan.FromTicks(9_876_543);
+        Assert.True(AsyncResponseJson.Serialize(envelope).Length > published + 5);
+
+        var budgeted = new CapturingDelayedTransport();
+        var ex = await Assert.ThrowsAsync<WorkerJobTooLargeException>(() =>
+            Producer(budgeted, clock, limit: published + 5).EnqueueWorkerAsync<IPaddedWorker>(worker => worker.RunAsync(padding), delay));
+        Assert.Equal(published + 5, ex.Limit);
+        Assert.Empty(budgeted.Published);
+
+        // The worst-case hop is accounted for exactly, not with extra slack...
+        var exact = new CapturingDelayedTransport();
+        await Producer(exact, clock, limit: published + AsyncResponseBuilderBase.MaxRedelayHopGrowth)
+            .EnqueueWorkerAsync<IPaddedWorker>(worker => worker.RunAsync(padding), delay);
+        Assert.Single(exact.Published);
+
+        // ...and an immediate job, which is never re-published, keeps the plain comparison.
+        var immediate = new CapturingDelayedTransport();
+        await Producer(immediate, clock, limit: published + 5).EnqueueWorkerAsync<IPaddedWorker>(worker => worker.RunAsync(padding));
+        Assert.Single(immediate.Published);
+    }
+
+    [Fact]
+    public void MaxRedelayHopGrowth_CoversTheWidestStampedRemainder()
+    {
+        var envelope = new WorkerJobEnvelope
+        {
+            Call = new ReflectionCallDto { ServiceInterfaceFullName = "S", MethodName = "M", Params = [] },
+            NotBeforeUtc = DateTime.UnixEpoch
+        };
+        var published = AsyncResponseJson.Serialize(envelope).Length;
+
+        foreach (var remaining in new[] { TimeSpan.MinValue, TimeSpan.MaxValue, AsyncResponseChannelOptions.MaxPersistenceTtl })
+        {
+            envelope.LastRedelayRemaining = remaining;
+            envelope.RedelayStallCount = 3;
+            var growth = AsyncResponseJson.Serialize(envelope).Length - published;
+            Assert.True(growth <= AsyncResponseBuilderBase.MaxRedelayHopGrowth, $"{remaining}: the hop grows by {growth}");
+        }
+    }
+
+    private AsyncResponseBuilder Producer(IWorkerTransport transport, TimeProvider clock, int? limit)
+        => new(
+            _subscriber.Object,
+            transport,
+            timeProvider: clock,
+            options: Microsoft.Extensions.Options.Options.Create(new AsyncResponseOptions { MaxInboundMessageChars = limit }));
+
+    public interface IPaddedWorker
+    {
+        Task RunAsync(string payload);
+    }
+
+    private sealed class FixedClock(DateTimeOffset now) : TimeProvider
+    {
+        public override DateTimeOffset GetUtcNow() => now;
+    }
+
+    /// <summary>A delayed-capable transport whose per-hop cap is shorter than the delays above, so jobs travel in hops.</summary>
+    private sealed class CapturingDelayedTransport : IDelayedWorkerTransport
+    {
+        public List<WorkerJobEnvelope> Published { get; } = [];
+
+        public TimeSpan MaxPublishDelay => TimeSpan.FromMinutes(15);
+
+        public Task PublishAsync(WorkerJobEnvelope job, CancellationToken cancellationToken = default)
+        {
+            Published.Add(job);
+            return Task.CompletedTask;
+        }
+
+        public Task PublishAsync(WorkerJobEnvelope job, TimeSpan delay, CancellationToken cancellationToken = default)
+            => PublishAsync(job, cancellationToken);
     }
 
     private static AsyncResponseReplyTarget ReplyTarget(string name) => new()

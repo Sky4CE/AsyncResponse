@@ -76,17 +76,26 @@ public sealed class GooglePubSubAsyncResponseOptions
     public TimeSpan SubscriberRetryMaxDelay { get; set; } = TimeSpan.FromSeconds(5);
 
     /// <summary>
-    /// Bounds the subscriber-client stop and publisher shutdown while hosted services stop. These
-    /// complete in milliseconds when healthy; when they do not, the client is abandoned anyway, so
-    /// keep this short — it counts against the host's shutdown budget. Default: <c>5s</c>.
+    /// Bounds the subscriber-client stop (which hands every message still in leasing back for
+    /// redelivery and flushes the queued acks) and the publisher shutdown while hosted services
+    /// stop. In <see cref="GooglePubSubAckMode.AckAfterHandlerCompletes"/> the subscriber first
+    /// lets the handlers already running finish — new deliveries are held for the client stop
+    /// meanwhile — for up to <see cref="GooglePubSubSubscriberOptions.BackgroundDrainTimeout"/>,
+    /// shortened to what <see cref="HostShutdownTimeout"/> still leaves after this value, so a job
+    /// whose handler completes in that window keeps its lease and its Ack. Keep this short: it
+    /// counts against the host's shutdown budget, and startup validates it fits. Default:
+    /// <c>5s</c>.
     /// </summary>
     public TimeSpan ShutdownTimeout { get; set; } = TimeSpan.FromSeconds(5);
 
     /// <summary>
-    /// The hosting shutdown budget that must contain Pub/Sub client shutdown plus
-    /// <see cref="GooglePubSubSubscriberOptions.BackgroundDrainTimeout"/> when a subscriber uses
-    /// <see cref="GooglePubSubAckMode.AckAfterEnqueue"/>. Defaults to the Generic Host default of
-    /// 30 seconds. Set to <c>null</c> only when this budget is validated externally.
+    /// The hosting shutdown budget that must contain Pub/Sub client shutdown
+    /// (<see cref="ShutdownTimeout"/>) plus <see cref="GooglePubSubSubscriberOptions.BackgroundDrainTimeout"/>
+    /// when a subscriber uses <see cref="GooglePubSubAckMode.AckAfterEnqueue"/>; in
+    /// <see cref="GooglePubSubAckMode.AckAfterHandlerCompletes"/> what is left of it — measured from
+    /// <c>ApplicationStopping</c> — caps how long the stop waits for in-flight handlers. Defaults to
+    /// the Generic Host default of 30 seconds. Set to <c>null</c> only when this budget is
+    /// validated externally (the in-flight drain then assumes the 30-second default).
     /// </summary>
     public TimeSpan? HostShutdownTimeout { get; set; } = TimeSpan.FromSeconds(30);
 

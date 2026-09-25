@@ -315,6 +315,116 @@ public sealed class DurableFlowStateStorePackageIntegrationTests(DataBatchFixtur
         }
     }
 
+    [Fact]
+    public async Task EFCorePackageStore_PruneUnderRcsi_DoesNotDeleteALedgerReplacedInPlaceWhileItRan()
+    {
+        // Regression: the prune's row-limited ExecuteDelete rendered as `DELETE … WHERE EXISTS
+        // (SELECT TOP(n) … WHERE expired …)` with no predicate on the deleted row itself. Under
+        // READ_COMMITTED_SNAPSHOT (the Azure SQL default) the batch subquery reads row versions,
+        // while the delete's own scan blocks on a concurrent in-place replace and then deletes the
+        // row it finds once that commits — the replaced, LIVE ledger of a new run whose create had
+        // already returned true. Its own database, because RCSI is a database setting.
+        var database = NewIdentifier("df_ef_rcsi", 64);
+        var master = new SqlConnectionStringBuilder(Fixture.SqlServerConnectionString) { InitialCatalog = "master" }.ConnectionString;
+        var connectionString = new SqlConnectionStringBuilder(Fixture.SqlServerConnectionString) { InitialCatalog = database }.ConnectionString;
+        await ExecuteSqlServerAsync(master, $"CREATE DATABASE [{database}]; ALTER DATABASE [{database}] SET READ_COMMITTED_SNAPSHOT ON;");
+        try
+        {
+            var services = new ServiceCollection();
+            services.AddDbContextFactory<EFCoreDefaultSchemaFlowDbContext>(options => options.UseSqlServer(connectionString));
+            await using var provider = services.BuildServiceProvider(new ServiceProviderOptions { ValidateScopes = true });
+            var factory = provider.GetRequiredService<IDbContextFactory<EFCoreDefaultSchemaFlowDbContext>>();
+            await using (var context = await factory.CreateDbContextAsync())
+                await context.GetService<IRelationalDatabaseCreator>().CreateTablesAsync();
+
+            var store = new EFCoreFlowStateStore<EFCoreDefaultSchemaFlowDbContext>(
+                provider.GetRequiredService<IServiceScopeFactory>(),
+                Options.Create(new EFCoreDurableFlowOptions { PruneInterval = TimeSpan.Zero }));
+            var expired = CreateState("reused-flow");
+            await ExecuteSqlServerAsync(
+                connectionString,
+                "INSERT INTO asyncresponse_flow_state (flow_id, state_json, expires_at_utc, updated_at_utc, revision) " +
+                "VALUES (N'reused-flow', @json, DATEADD(MINUTE, -5, SYSUTCDATETIME()), SYSUTCDATETIME(), 0);",
+                ("@json", JsonSerializer.Serialize(expired)));
+
+            // The new run's in-place replace, held open: it has taken the expired row and made it live.
+            await using var replacer = new SqlConnection(connectionString);
+            await replacer.OpenAsync();
+            await using var replace = (SqlTransaction)await replacer.BeginTransactionAsync();
+            await using (var command = replacer.CreateCommand())
+            {
+                command.Transaction = replace;
+                command.CommandText =
+                    "UPDATE asyncresponse_flow_state SET state_json = N'{\"replaced\":true}', " +
+                    "expires_at_utc = DATEADD(MINUTE, 5, SYSUTCDATETIME()), updated_at_utc = SYSUTCDATETIME() " +
+                    "WHERE flow_id = N'reused-flow' AND expires_at_utc <= SYSUTCDATETIME();";
+                Assert.Equal(1, await command.ExecuteNonQueryAsync());
+            }
+
+            int replacerSession;
+            await using (var command = replacer.CreateCommand())
+            {
+                command.Transaction = replace;
+                command.CommandText = "SELECT @@SPID;";
+                replacerSession = Convert.ToInt32(await command.ExecuteScalarAsync());
+            }
+
+            // Any create prunes first (PruneInterval zero). Its batch reads the expired version; its
+            // delete then blocks on the replacer's lock — or finishes without touching the row.
+            var pruning = store.TryCreateAsync("trigger-flow", CreateState("trigger-flow"), TimeSpan.FromMinutes(5));
+            await PollAsync(
+                async () => pruning.IsCompleted || await IsBlockedByAsync(master, replacerSession),
+                done => done,
+                TimeSpan.FromSeconds(20));
+
+            await replace.CommitAsync();
+            Assert.True(await pruning);
+
+            await using var check = new SqlConnection(connectionString);
+            await check.OpenAsync();
+            await using var read = check.CreateCommand();
+            read.CommandText = "SELECT state_json FROM asyncresponse_flow_state WHERE flow_id = N'reused-flow';";
+            Assert.Equal("{\"replaced\":true}", await read.ExecuteScalarAsync() as string);
+        }
+        finally
+        {
+            SqlConnection.ClearPool(new SqlConnection(connectionString));
+            await ExecuteSqlServerAsync(master, $"IF DB_ID(N'{database}') IS NOT NULL BEGIN ALTER DATABASE [{database}] SET SINGLE_USER WITH ROLLBACK IMMEDIATE; DROP DATABASE [{database}]; END");
+        }
+
+        static async Task<bool> IsBlockedByAsync(string connectionString, int session)
+        {
+            await using var connection = new SqlConnection(connectionString);
+            await connection.OpenAsync();
+            await using var command = connection.CreateCommand();
+            command.CommandText = "SELECT COUNT(*) FROM sys.dm_exec_requests WHERE blocking_session_id = @session;";
+            command.Parameters.AddWithValue("@session", session);
+            return Convert.ToInt32(await command.ExecuteScalarAsync()) > 0;
+        }
+    }
+
+    private static async Task ExecuteSqlServerAsync(string connectionString, string sql, params (string Name, object Value)[] parameters)
+    {
+        await using var connection = new SqlConnection(connectionString);
+        await connection.OpenAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText = sql;
+        foreach (var (name, value) in parameters)
+            command.Parameters.AddWithValue(name, value);
+        await command.ExecuteNonQueryAsync();
+    }
+
+    /// <summary>
+    /// Default schema, and its own type: EF Core caches one model per context type, so a context
+    /// whose model depends on a per-test schema cannot be shared with a test that needs another.
+    /// </summary>
+    private sealed class EFCoreDefaultSchemaFlowDbContext(DbContextOptions<EFCoreDefaultSchemaFlowDbContext> options)
+        : DbContext(options)
+    {
+        protected override void OnModelCreating(ModelBuilder modelBuilder)
+            => modelBuilder.ConfigureAsyncResponseDurableFlows(flowIdCollation: AsyncResponseFlowIdCollations.SqlServer);
+    }
+
     private sealed record EFCoreFlowSchema(string Name);
 
     private sealed class EFCoreFlowDbContext(DbContextOptions<EFCoreFlowDbContext> options, EFCoreFlowSchema schema)

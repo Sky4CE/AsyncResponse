@@ -647,6 +647,110 @@ public class KafkaSubscriberTests
         Assert.True(first.Closed);
     }
 
+    // ---------- Round-1 fixpoint (G10) ----------
+
+    [Fact]
+    public async Task WorkerSubscriber_EarlyAck_APollLoopFaultNeitherDrainsNorBuriesTheQueuedWork()
+    {
+        // Regression (r1 S7#3): the ACK-after-enqueue dispatcher was created per supervised
+        // attempt and its fault teardown was the full stop-time drain, so one transient consume
+        // error on a healthy host stopped every partition for the drain budget (20 s here) and
+        // then produced the committed-but-unstarted work to the dead-letter topic as "lapsed" —
+        // or lost it, when the fault was the dead-letter topic itself. The dispatcher now belongs
+        // to the hosted service: the consumer is rebuilt at once and the queued work just runs.
+        var first = new FakeKafkaConsumerClient();
+        first.Enqueue(KafkaTestData.Message("workers", offset: 1, payload: "job-1"));
+        first.Enqueue(KafkaTestData.Message("workers", offset: 2, payload: "job-2"));
+        var second = new FakeKafkaConsumerClient();
+        var factory = new FakeKafkaConsumerClientFactory(first, second);
+        var producer = new FakeKafkaProducerClient();
+        var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var handled = new System.Collections.Concurrent.ConcurrentQueue<string>();
+        var ingress = new Mock<IAsyncResponseIngress>();
+        ingress.Setup(i => i.HandleWorkerMessageAsync(It.IsAny<string>()))
+            .Returns(async (string payload) =>
+            {
+                if (payload == "job-1")
+                {
+                    started.TrySetResult();
+                    await release.Task.ConfigureAwait(false);
+                }
+
+                handled.Enqueue(payload);
+            });
+
+        var subscriber = new KafkaWorkerSubscriber(
+            Options.Create(NewOptions(options =>
+            {
+                options.WorkerTopic = "workers";
+                options.WorkerSubscriber.UseAckAfterEnqueue(1, 8, TimeSpan.FromSeconds(20));
+            })),
+            factory,
+            producer,
+            new FakeKafkaAdminClient(),
+            ingress.Object,
+            NullLogger<KafkaWorkerSubscriber>.Instance);
+
+        await subscriber.StartAsync(CancellationToken.None);
+        try
+        {
+            await started.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            await KafkaTestData.WaitUntilAsync(() => first.StoredOffsets.Count == 2); // job-2 committed and queued
+
+            first.NextConsumeException = new InvalidOperationException("broker hiccup");
+
+            // Rebuilt at once — not after a 20 s drain parked behind the running job.
+            await KafkaTestData.WaitUntilAsync(() => factory.CreatedRoles.Count >= 2);
+
+            release.TrySetResult();
+            await KafkaTestData.WaitUntilAsync(() => handled.Count == 2);
+        }
+        finally
+        {
+            release.TrySetResult();
+            await subscriber.StopAsync(CancellationToken.None);
+        }
+
+        Assert.Equal(["job-1", "job-2"], handled.ToArray());
+        Assert.Empty(producer.Publishes); // nothing "lapsed", nothing buried
+        Assert.True(first.Closed);
+    }
+
+    [Fact]
+    public async Task Subscriber_MaxPollIntervalBelowTheSessionTimeout_FailsStartup()
+    {
+        // Regression (r1 S7#13): librdkafka refuses to build a classic-protocol consumer whose
+        // max.poll.interval.ms is below session.timeout.ms (45 s by default). That check runs only
+        // at construction, inside the supervised loop, so a 30 s MaxPollInterval started the host
+        // cleanly and then failed every attempt forever with nothing consumed.
+        var subscriber = CreateWorkerSubscriber(
+            new FakeKafkaConsumerClient(),
+            Mock.Of<IAsyncResponseIngress>(),
+            options => options.WorkerSubscriber.MaxPollInterval = TimeSpan.FromSeconds(30));
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => subscriber.StartAsync(CancellationToken.None));
+
+        Assert.Contains(nameof(KafkaSubscriberOptions.MaxPollInterval), ex.Message, StringComparison.Ordinal);
+        Assert.Contains("session.timeout.ms", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Subscriber_AShortMaxPollInterval_StartsOnceConfigureConsumerLowersTheSessionTimeout()
+    {
+        var subscriber = CreateWorkerSubscriber(
+            new FakeKafkaConsumerClient(),
+            Mock.Of<IAsyncResponseIngress>(),
+            options =>
+            {
+                options.WorkerSubscriber.MaxPollInterval = TimeSpan.FromSeconds(30);
+                options.ConfigureConsumer = config => config.SessionTimeoutMs = 6_000;
+            });
+
+        await subscriber.StartAsync(CancellationToken.None);
+        await subscriber.StopAsync(CancellationToken.None);
+    }
+
     // ---------- Helpers ----------
 
     private static readonly Dictionary<KafkaSubscriberService, FakeKafkaConsumerClientFactory> Factories = [];

@@ -43,23 +43,27 @@ owns the full story — this page is the map, not the territory.
 ### Azure Service Bus: `MessageLockLostException` redeliveries of already-processed messages
 
 - **Symptom:** handlers complete, yet messages reappear and Service Bus reports lost locks.
-- **Cause:** the peek-lock budget. A receive batch is processed sequentially, so the last message
-  in a batch waits up to `MaxMessagesPerReceive × handler latency` before settlement — past the
-  queue's lock duration, the lock is gone.
-- **Fix:** keep that product well under the queue's lock duration, lower `MaxMessagesPerReceive`,
-  or enable the transport's lock-renewal option for long handlers. See
-  [transport options](configuration.md#transport-options).
+- **Cause:** the peek-lock budget. A handler that outlives the queue's lock duration (60 s by
+  default) loses its lock unless it is renewed — and prefetched messages (`PrefetchCount > 0`) are
+  locked while they wait in the client buffer, where no renewal reaches them.
+- **Fix:** keep `WorkerSubscriber.LockRenewalInterval` on (the default) for long handlers, or keep
+  handler latency well under the lock duration; leave `PrefetchCount` at 0 unless handlers are fast.
+  (In ack-after-handler mode the worker subscriber receives one message at a time, so batch size no longer
+  adds to the budget.) See [transport options](configuration.md#transport-options).
 
 ### SQS: duplicate executions, or FIFO settings that don't apply
 
 - **Symptom:** already-processed messages run again; or `MessageGroupId` ordering never engages.
-- **Cause:** the visibility budget, same shape as the Service Bus lock budget — a sequentially
-  processed batch must finish within the queue's visibility timeout. FIFO behavior is opt-in by
-  **queue naming**, not an option flag.
-- **Fix:** keep `MaxMessagesPerReceive × handler latency` under the visibility timeout (raise
-  `WorkerSubscriber.VisibilityTimeout`, lower the batch size, or use visibility renewal for long
-  handlers), and name the queue `*.fifo` to opt into FIFO publishing. See
-  [transport options](configuration.md#transport-options).
+- **Cause:** the visibility budget, same shape as the Service Bus lock budget — a handler must
+  finish within the message's visibility timeout (the queue's own, 30 s unless configured, when
+  `WorkerSubscriber.VisibilityTimeout` is unset). FIFO behavior is opt-in by **queue naming**, not
+  an option flag.
+- **Fix:** keep handler latency under the visibility timeout (raise
+  `WorkerSubscriber.VisibilityTimeout`, or use visibility renewal for long handlers — up to the
+  12-hour SQS in-flight maximum), and name the queue `*.fifo` to opt into FIFO publishing. When
+  durable flows run on SQS, set `VisibilityTimeout` explicitly (the startup warning says so) and
+  prefer a standard worker queue: on FIFO every uncorrelated job shares one serial message group.
+  See [transport options](configuration.md#transport-options).
 
 ### Kafka: rebalances or duplicate runs while long handlers execute
 
@@ -107,7 +111,9 @@ owns the full story — this page is the map, not the territory.
   smaller, so redelivering it would hot-loop), so before this check the transport took the job,
   the ingress dropped it, and the caller held a flow id for a `Running` run nothing would ever
   execute. JSON escaping counts: quotes, non-ASCII and control characters serialize to several
-  times their length.
+  times their length. A delayed job is measured as its largest re-published hop: when an early
+  delivery is re-published for the remaining delay, the stamped remainder makes the envelope up
+  to 24 characters longer.
 - **Fix:** put the large argument behind a claim check — persist it yourself and pass a reference
   (see the [durable-flows ledger budgets](durable-flows.md#supported-ledger-budgets)) — rather
   than raising the limit; if you do raise it, raise it identically on every producer and consumer
@@ -166,11 +172,33 @@ owns the full story — this page is the map, not the territory.
   not the retry cycle: to make a cap above 2 reachable, declare a dead-letter queue with
   `x-message-ttl` that dead-letters back to the source exchange in your own topology. The cap
   then **terminates** that cycle: a message reaching it with `x-death` present is parked — copied
-  to `DeadLetterQueue` through the default exchange (bypassing the cycling exchange) and ACKed, or
-  ACKed and dropped with an error log when no `DeadLetterQueue` is configured — instead of
-  re-entering the cycle at its TTL rate forever, so configure `DeadLetterQueue` as well if the
-  parked copy must be kept. Otherwise keep `MaxDeliveryAttempts` at 2 or below and silence the
-  warning. See [transport options](configuration.md#transport-options).
+  to `ParkQueue` (or, without one, `DeadLetterQueue`) through the default exchange (bypassing the
+  cycling exchange) and ACKed, or ACKed and dropped with an error log when neither is configured —
+  instead of re-entering the cycle at its TTL rate forever. Prefer `ParkQueue` with a TTL-retry
+  cycle: it is declared unbound, so it holds only parked messages, whereas `DeadLetterQueue` is
+  bound to the dead-letter exchange and also collects a copy of every retry hop. A park the broker
+  cannot route (the queue is missing, a `reject-publish` queue is full) fails under publisher
+  confirms and is NACKed with requeue after the subscriber backoff, so it retries until the queue
+  is fixed — watch for `Failed to park capped RabbitMQ delivery`. Otherwise keep
+  `MaxDeliveryAttempts` at 2 or below and silence the warning. See
+  [transport options](configuration.md#transport-options).
+- **Quorum queues (RabbitMQ 4.x):** the broker applies its own `delivery-limit` — 20 by default —
+  whatever `MaxDeliveryAttempts` says, and past it dead-letters the message, or **drops** it when
+  no dead-letter exchange is set. `MaxDeliveryAttempts = 0` is therefore not "forever" on a quorum
+  queue (the vhost's default queue type may make the worker queue one): configure a dead-letter
+  exchange, or raise/disable `delivery-limit` by policy.
+- **Replaying a parked or dead-lettered message:** the copy keeps the original headers, `x-death`
+  included, so a message republished into the worker queue as-is resolves its attempt from that
+  count. The check before the handler is strict (`attempt > cap`): a copy whose count puts it
+  exactly at the cap runs its handler **once more** and, if it fails, is parked; one past the cap
+  (with `MaxDeliveryAttempts = 1`, every copy carrying `x-death`) is parked again without its
+  handler running. Strip `x-death` (and the `AR-DeadLetter-*` headers)
+  when replaying so the replay starts from attempt 1, or, for a durable flow, call
+  `ResumeAsync(flowId)` instead of replaying its wake-up.
+- **`MaxDeliveryAttempts = 1` with durable flows:** a startup warning. Every delivery the broker
+  requeues on its own — a flow handed back at host stop, a channel closed under a running handler —
+  comes back `redelivered`, resolves to attempt 2 and is rejected before its handler runs, so a
+  flow's wake-up can be lost on a routine deploy. Use 2 or more (or 0).
 
 ## Durable flows
 
@@ -182,6 +210,8 @@ owns the full story — this page is the map, not the territory.
   expired yet. A run with `Attempts == 0` was never picked up: its wake-up is queued behind a busy
   worker, or was lost in transit (an early-ACK worker subscriber, a broker that dropped it).
 - **Fix:** check the transport's dead-letter queue first — the DLQ entry is the alarm. Replay it
+  (on RabbitMQ strip its `x-death` header first — see
+  [above](#rabbitmq-startup-warns-about-maxdeliveryattempts-or-a-poison-message-loops-forever))
   or call `ResumeAsync(flowId)` to re-enqueue the run. After a crash, expect up to the crashed
   owner's `ExecutionLeaseDuration` — the value it was *running with*, which a later deployment may
   have changed — before another replica may take the run over; the redelivered wake-up waits for
@@ -192,20 +222,29 @@ owns the full story — this page is the map, not the territory.
 
 - **Symptom:** a worker job for a flow retries (and may dead-letter) with *"could not acquire the
   execution lease and cannot prove the run is executing elsewhere"*.
-- **Cause:** the wake-up found the execution lease held, waited, and saw neither the lease come
-  free nor proof of a live holder (the lease being renewed or taken over). The engine never
-  acknowledges a wake-up in that state — it may be the run's only one. The reason in the message
-  says which case it is: *"the flow state store does not report leases"* — an application-owned
-  `IFlowStateStore` that does not implement `ObserveLeaseAsync`, so a duplicate of a long-running
-  execution cannot be recognized as one; *"neither changed nor became acquirable … past that
-  expiry"* — the store still refuses the lease a full lease window after the expiry it reports,
-  which points at clock skew between this host and the store (or a store bug); or *"its persisted
-  expiry lies further out than that budget lets one delivery wait"* — the expiry the store reports
-  is more than `MaxLeaseContentionWait` (default 1 hour) away, which is either a deployment that
-  really issues leases that long, or a store clock (or expiry column) far ahead of this host.
+- **Cause:** the wake-up found the execution lease held and waited, and either saw neither the
+  lease come free nor proof of a live holder (the lease being renewed or taken over), or proved a
+  live holder that is executing *this same job*. The engine never acknowledges a wake-up in either
+  state — it may be the run's only one. The reason in the message says which case it is:
+  *"the flow state store does not report leases"* — an application-owned `IFlowStateStore` that
+  does not implement `ObserveLeaseAsync`, so a duplicate of a long-running execution cannot be
+  recognized as one; *"although the store reports no holder"* — `ObserveLeaseAsync` kept reporting
+  no lease while every acquire failed for this host's whole lease window, so the store's lease
+  report and its acquire disagree (a store or decorator bug); *"neither changed nor became
+  acquirable … past that expiry"* — the store still refuses the lease a full lease window after
+  the expiry it reports, which points at clock skew between this host and the store (or a store
+  bug); *"its persisted expiry lies further out than that budget lets one delivery wait"* — the
+  expiry the store reports is more than `MaxLeaseContentionWait` (default 1 hour) away, which is
+  either a deployment that really issues leases that long, or a store clock (or expiry column) far
+  ahead of this host; or *"held by a live execution of this same worker job"* — the broker
+  redelivered a job whose handler is still running because an in-flight ceiling lapsed under it
+  (Pub/Sub `MaxTotalAckExtension`, RabbitMQ `consumer_timeout`, the SQS 12-hour visibility cap, a
+  Kafka rebalance), and the transport cannot re-publish it delayed past the holder's lease.
 - **Fix:** implement `ObserveLeaseAsync` in the custom store (and forward it from any decorator
   around a built-in one); fix time synchronization; raise `MaxLeaseContentionWait` when leases
-  longer than it are intended. The redelivered job completes the run once
+  longer than it are intended; for the same-job case, keep a single in-process wait shorter than
+  the broker's in-flight ceiling (`DurableFlowOptions.MaxInProcessParkDuration`) or raise the
+  ceiling. The redelivered job completes the run once
   the lease is free — a dead-lettered one needs a replay or `ResumeAsync(flowId)`. See
   [lease contention](durable-flow-state-stores.md#lease-contention-and-deployments-that-change-the-lease-duration).
 
@@ -219,7 +258,8 @@ owns the full story — this page is the map, not the territory.
 - **Fix:** keep large results out of the ledger (persist them yourself and pass references),
   partition a long history into child flows, or — if the sizes are expected — raise
   `DurableFlowOptions.LedgerSizeWarningBytes` (set `null` to disable). On DynamoDB lower it: the
-  350 KB item cap sits under the 512 KiB default. See
+  store's 350 KB `MaxStateBytes` default (headroom under DynamoDB's 400 KB item cap) sits under the
+  512 KiB default. See
   [ledger growth](durable-flows.md#storage-where-flow-state-lives).
 
 ### Every attempt of an awaited step fails with an `OnRecovery` error

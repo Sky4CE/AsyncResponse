@@ -71,7 +71,14 @@ public sealed class RedisSubscriberOptions
     /// </summary>
     public RedisAckMode AckMode { get; set; } = RedisAckMode.AckAfterHandlerCompletes;
 
-    /// <summary>Maximum number of new stream entries read per polling command. Default: <c>16</c>.</summary>
+    /// <summary>
+    /// Maximum number of new stream entries read per polling command under
+    /// <see cref="RedisAckMode.AckAfterEnqueue"/>. Default: <c>16</c>.
+    /// <see cref="RedisAckMode.AckAfterHandlerCompletes"/> reads one entry at a time: Redis counts
+    /// a delivery when it hands the entry over, so every entry read behind a handler that crashes
+    /// the process or runs for hours would have its delivery count bumped, or sit pinned here,
+    /// without ever having run.
+    /// </summary>
     public int BatchSize { get; set; } = 16;
 
     /// <summary>Delay between empty XREADGROUP polls. Default: <c>50ms</c>.</summary>
@@ -89,7 +96,12 @@ public sealed class RedisSubscriberOptions
     /// </summary>
     public TimeSpan PendingClaimInterval { get; set; } = TimeSpan.FromSeconds(5);
 
-    /// <summary>Maximum number of pending entries inspected/claimed per scan. Default: <c>16</c>.</summary>
+    /// <summary>
+    /// Maximum number of pending entries inspected per scan. Default: <c>16</c>. Under
+    /// <see cref="RedisAckMode.AckAfterEnqueue"/> they are claimed together; under
+    /// <see cref="RedisAckMode.AckAfterHandlerCompletes"/> each is claimed (XCLAIM, which bumps its
+    /// delivery count) only right before it runs.
+    /// </summary>
     public int PendingClaimBatchSize { get; set; } = 16;
 
     /// <summary>

@@ -145,7 +145,7 @@ public sealed class RelationalSharedHelperTests
     /// constructor, and its internal signatures differ across versions, so the arguments are
     /// matched by name and type rather than positionally.
     /// </summary>
-    private static SqlException SqlExceptionWith(int number, byte errorClass = 0)
+    internal static SqlException SqlExceptionWith(int number, byte errorClass = 0)
     {
         var errorConstructor = typeof(SqlError).GetConstructors(BindingFlags.NonPublic | BindingFlags.Instance)[0];
         var errorParameters = errorConstructor.GetParameters();

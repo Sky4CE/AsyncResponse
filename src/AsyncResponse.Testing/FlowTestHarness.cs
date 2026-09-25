@@ -121,14 +121,14 @@ public sealed class FlowRunHandle
         // Counted so AdvanceAsync's settle treats this attempt like a worker job: it holds no
         // worker slot, so a step it parks would otherwise tip ParkedCount past OutstandingJobs
         // and let the clock advance mid-attempt.
-        _harness.Engine.OnDirectRunStarted();
+        var directRun = _harness.Engine.OnDirectRunStarted();
         try
         {
             await _harness.Engine.FlowExecutor.ExecuteAsync(FlowId).ConfigureAwait(false);
         }
         finally
         {
-            _harness.Engine.OnDirectRunFinished();
+            _harness.Engine.OnDirectRunFinished(directRun);
         }
     }
 
@@ -146,7 +146,9 @@ public sealed class FlowRunHandle
 
     /// <summary>
     /// Waits (bounded by the harness real-time guard) until <paramref name="stepName"/> is parked
-    /// awaiting its response, and returns the correlation id to answer.
+    /// awaiting its response, and returns the correlation id to answer. The park is held in
+    /// process, so after <see cref="AsyncResponseTestHarness.SimulateRestartAsync"/> only the NEW
+    /// incarnation's park satisfies it (resume the run first) — never the dead incarnation's.
     /// </summary>
     public async Task<string> WaitForAwaitingStepAsync(string stepName)
     {
@@ -158,7 +160,14 @@ public sealed class FlowRunHandle
         return stepEvent.Step.CorrelationId!;
     }
 
-    /// <summary>Waits until a timer step is parked, returning its due time (advance the clock past it to wake the run).</summary>
+    /// <summary>
+    /// Waits until a timer step is parked, returning its due time (advance the clock past it to
+    /// wake the run). After <see cref="AsyncResponseTestHarness.SimulateRestartAsync"/>, a timer
+    /// that waited in process (at or below <see cref="DurableFlowOptions.TimerInProcessThreshold"/>)
+    /// counts only once the new incarnation parks it again, like
+    /// <see cref="WaitForAwaitingStepAsync"/>; a suspended timer's wake-up is carried over, so its
+    /// wait still counts.
+    /// </summary>
     public async Task<DateTime> WaitForTimerStepAsync(string stepName)
     {
         var stepEvent = await _harness.Probe.WaitForAsync(
@@ -169,7 +178,11 @@ public sealed class FlowRunHandle
         return stepEvent.Step.WakeAtUtc!.Value;
     }
 
-    /// <summary>Waits until the given step's completion checkpoint persists.</summary>
+    /// <summary>
+    /// Waits until the given step's completion checkpoint persists. A checkpoint is durable, so
+    /// one persisted before <see cref="AsyncResponseTestHarness.SimulateRestartAsync"/> still
+    /// satisfies it.
+    /// </summary>
     public Task WaitForStepCompletedAsync(string stepName)
         => _harness.Probe.WaitForAsync(
             FlowId,
@@ -191,6 +204,14 @@ public sealed class FlowRunHandle
     /// Answers the run's currently awaited step: replies to the correlation id of the most recent
     /// awaited-step wait (optionally the named step's). Progress-aware steps take several replies —
     /// non-terminal payloads keep the wait open exactly as in production.
+    /// <para>
+    /// After <see cref="AsyncResponseTestHarness.SimulateRestartAsync"/>, the new incarnation's
+    /// wait once the run has recorded anything in it; until then — nothing has re-executed the run
+    /// — the wait that survived the restart, which lost-subscriber recovery routes into the run.
+    /// When the re-executed step may arm a fresh correlation id (its deadline lapsed while the
+    /// engine was down), resume the run and await <see cref="WaitForAwaitingStepAsync"/> before
+    /// replying.
+    /// </para>
     /// </summary>
     public async Task ReplyAsync<T>(T response, string? stepName = null) where T : IAsyncResponsePayload
     {
@@ -244,11 +265,43 @@ public sealed class FlowProbe : IDurableFlowExecutionObserver
     }
 
     private readonly object _gate = new();
-    private readonly ConcurrentDictionary<string, List<FlowProbeEvent>> _events = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<string, List<Recorded>> _events = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, DurableFlowRunEvent> _finished = new(StringComparer.Ordinal);
     private readonly List<Waiter> _waiters = [];
     private readonly List<RunWaiter> _runWaiters = [];
     private (string Step, bool Before, string? FlowId)? _armedCrash;
+
+    /// <summary>
+    /// The engine incarnation events are recorded in, bumped by each simulated restart (under
+    /// <c>_gate</c>). The history keeps every incarnation — counts and the event timeline span
+    /// restarts — but a barrier skips an IN-PROCESS park an earlier incarnation recorded: that
+    /// park died with its process, and handing it back let a test answer a correlation id the
+    /// re-executed step had already replaced. Everything else stays visible across a restart —
+    /// a completion checkpoint, a suspended timer whose wake-up the restart carried over — because
+    /// it describes durable state that is still true.
+    /// </summary>
+    private int _incarnation;
+
+    /// <summary>The engine clock and in-process timer threshold (see <see cref="ParksInProcess"/>); set under <c>_gate</c>.</summary>
+    private TimeProvider _clock = TimeProvider.System;
+    private TimeSpan _timerInProcessThreshold;
+
+    /// <summary>Starts a new incarnation (<see cref="AsyncResponseTestHarness.SimulateRestartAsync"/>).</summary>
+    internal void BeginIncarnation()
+    {
+        lock (_gate)
+            _incarnation++;
+    }
+
+    /// <summary>Binds the engine clock and the current incarnation's in-process timer threshold.</summary>
+    internal void Arm(TimeProvider clock, TimeSpan timerInProcessThreshold)
+    {
+        lock (_gate)
+        {
+            _clock = clock;
+            _timerInProcessThreshold = timerInProcessThreshold;
+        }
+    }
 
     internal void ArmCrash(string stepName, bool beforeStep, string? flowId = null)
     {
@@ -330,7 +383,8 @@ public sealed class FlowProbe : IDurableFlowExecutionObserver
         Waiter[] due;
         lock (_gate)
         {
-            list.Add(recorded);
+            var nowUtc = _clock.GetUtcNow().UtcDateTime;
+            list.Add(new Recorded(recorded, _incarnation, kind == EventKind.Waiting && ParksInProcess(list, step, nowUtc), nowUtc));
             due = [.. _waiters.Where(w => w.FlowId == step.FlowId && w.Predicate(recorded))];
             foreach (var waiter in due)
                 _waiters.Remove(waiter);
@@ -340,13 +394,52 @@ public sealed class FlowProbe : IDurableFlowExecutionObserver
             waiter.Completion.TrySetResult(recorded);
     }
 
+    /// <summary>
+    /// Whether a step's Waiting event is a park held IN PROCESS, which dies with its incarnation:
+    /// an awaited step, or a timer whose remainder is at or below the in-process threshold (the
+    /// engine decides the same way, against the same clock). A longer timer — and a child-flow
+    /// step — suspends instead: the job ends and the wake-up is a scheduled job a restart carries
+    /// over. Caller holds <c>_gate</c>.
+    /// <para>
+    /// A timer's remainder is measured from the clock at the step's Starting event: the engine
+    /// computes the remainder it decides on right after that notification, and a first pass then
+    /// saves its breadcrumb before notifying Waiting — a clock advanced during that save made a
+    /// suspended timer look in process here, and a restart then hid its carried-over wait.
+    /// </para>
+    /// </summary>
+    private bool ParksInProcess(List<Recorded> list, DurableFlowStepEvent step, DateTime nowUtc)
+    {
+        switch (step.Kind)
+        {
+            case DurableFlowStepKind.Awaited:
+                return true;
+            case DurableFlowStepKind.Timer when step.WakeAtUtc is { } wakeAtUtc:
+                var decidedAtUtc = nowUtc;
+                for (var index = list.Count - 1; index >= 0; index--)
+                {
+                    var started = list[index];
+                    if (started.Event.Kind == EventKind.Starting
+                        && started.Event.Step.Kind == DurableFlowStepKind.Timer
+                        && string.Equals(started.Event.Step.StepName, step.StepName, StringComparison.Ordinal))
+                    {
+                        decidedAtUtc = started.ClockUtc;
+                        break;
+                    }
+                }
+
+                return wakeAtUtc - decidedAtUtc <= _timerInProcessThreshold;
+            default:
+                return false;
+        }
+    }
+
     internal int CountEvents(string flowId, string stepName, EventKind kind)
     {
         if (!_events.TryGetValue(flowId, out var list))
             return 0;
 
         lock (_gate)
-            return list.Count(e => e.Kind == kind && e.Step.StepName == stepName);
+            return list.Count(r => r.Event.Kind == kind && r.Event.Step.StepName == stepName);
     }
 
     internal IReadOnlyList<FlowProbeEvent> EventsFor(string flowId)
@@ -355,7 +448,7 @@ public sealed class FlowProbe : IDurableFlowExecutionObserver
             return [];
 
         lock (_gate)
-            return [.. list];
+            return [.. list.Select(r => r.Event)];
     }
 
     internal string? LatestAwaitedCorrelationId(string flowId, string? stepName)
@@ -379,11 +472,22 @@ public sealed class FlowProbe : IDurableFlowExecutionObserver
         // of each step is considered live at all: a faulted attempt leaves no Completed event
         // behind, and returning its abandoned correlation id (an older Waiting of a step the
         // run has since restarted with a fresh id) would park the caller's reply forever.
+        //
+        // Across a simulated restart: once the run has recorded anything in the new incarnation,
+        // only that incarnation counts (its wait may carry a fresh id). Before that — nothing has
+        // re-executed the run yet — the wait that survived the restart is still the live one: a
+        // reply to it is routed into the run by lost-subscriber recovery, as for a response that
+        // arrives while a real process is down.
+        var incarnation = _incarnation;
+        var currentOnly = list.Exists(r => r.Incarnation == incarnation);
         HashSet<string>? answered = null;
         HashSet<string>? seenWaitingSteps = null;
         for (var index = list.Count - 1; index >= 0; index--)
         {
-            var candidate = list[index];
+            if (currentOnly && list[index].Incarnation != incarnation)
+                break;
+
+            var candidate = list[index].Event;
             if (candidate.Kind == EventKind.Completed
                 && candidate.Step.Kind == DurableFlowStepKind.Awaited
                 && candidate.Step.CorrelationId is { } answeredCid)
@@ -466,11 +570,18 @@ public sealed class FlowProbe : IDurableFlowExecutionObserver
                 // step the run has since restarted with a fresh correlation id (nothing ever
                 // Completes the abandoned one), so front-to-back replay handed back the abandoned
                 // event — a reply to its correlation id was silently dropped and the live wait
-                // never resolved.
+                // never resolved. An in-process park an earlier incarnation recorded is skipped:
+                // after a simulated restart it came straight back, before the new incarnation had
+                // parked at all (and with the old id, when the re-executed step arms a fresh one).
+                // Only the park: a checkpoint or a suspended timer recorded before the restart is
+                // still true, and the replay records neither again.
                 for (var index = list.Count - 1; index >= 0; index--)
                 {
-                    if (predicate(list[index]))
-                        return list[index];
+                    if (list[index].InProcessPark && list[index].Incarnation != _incarnation)
+                        continue;
+
+                    if (predicate(list[index].Event))
+                        return list[index].Event;
                 }
             }
 
@@ -544,6 +655,8 @@ public sealed class FlowProbe : IDurableFlowExecutionObserver
                 "finishes — it stays Running with its wake-up dropped; check the logs for 'dropping it'.");
         }
     }
+
+    private readonly record struct Recorded(FlowProbeEvent Event, int Incarnation, bool InProcessPark, DateTime ClockUtc);
 
     private sealed record Waiter(string FlowId, Func<FlowProbeEvent, bool> Predicate, TaskCompletionSource<FlowProbeEvent> Completion);
 

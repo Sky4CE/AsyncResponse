@@ -42,9 +42,9 @@ internal static class JsonSafety
         {
             throw ParseFailure(json, jsonException);
         }
-        catch (NotSupportedException)
+        catch (NotSupportedException notSupported)
         {
-            throw UnsupportedPayload(json.Length, "UTF-16 code units");
+            throw Unsupported(notSupported, json.Length, "UTF-16 code units");
         }
     }
 
@@ -65,9 +65,9 @@ internal static class JsonSafety
         {
             throw ParseFailure(utf8Json.Length, "UTF-8 bytes", jsonException);
         }
-        catch (NotSupportedException)
+        catch (NotSupportedException notSupported)
         {
-            throw UnsupportedPayload(utf8Json.Length, "UTF-8 bytes");
+            throw Unsupported(notSupported, utf8Json.Length, "UTF-8 bytes");
         }
     }
 
@@ -88,9 +88,9 @@ internal static class JsonSafety
         {
             throw ParseFailure(json, jsonException);
         }
-        catch (NotSupportedException)
+        catch (NotSupportedException notSupported)
         {
-            throw UnsupportedPayload(json.Length, "UTF-16 code units");
+            throw Unsupported(notSupported, json.Length, "UTF-16 code units");
         }
     }
 
@@ -114,15 +114,22 @@ internal static class JsonSafety
             // GetRawText only on the failure path, and only for its length.
             throw ParseFailure(element.GetRawText(), jsonException);
         }
-        catch (NotSupportedException)
+        catch (NotSupportedException notSupported)
         {
-            throw UnsupportedPayload(element.GetRawText().Length, "UTF-16 code units");
+            throw Unsupported(notSupported, element.GetRawText().Length, "UTF-16 code units");
         }
     }
 
     // STJ appends body-derived paths to NotSupportedException too (for example a missing
     // polymorphic discriminator). Never chain it. Resolve metadata before the reader's try
-    // block so safe AOT registration guidance remains actionable.
+    // block so safe AOT registration guidance remains actionable — and where metadata is only
+    // resolved INSIDE the read (the response envelope's converter resolves its payload type
+    // there), STJ re-wraps the guidance with the reader's path appended: rethrow the library's
+    // own guidance from the chain, which names the TYPE and never a byte of the body, instead of
+    // replacing it with the generic message below.
+    private static Exception Unsupported(NotSupportedException notSupported, int length, string unit)
+        => (Exception?)AsyncResponseJson.FindRegistrationGuidance(notSupported) ?? UnsupportedPayload(length, unit);
+
     private static InvalidDataException UnsupportedPayload(int length, string unit)
         => new($"Cannot deserialize JSON payload ({length} {unit}): an unsupported value or missing type discriminator was encountered. The reader's message and path are omitted.");
 

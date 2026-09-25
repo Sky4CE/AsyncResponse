@@ -36,6 +36,60 @@ public sealed class DurableFlowStoreReviewFixesTests
     // ---------------------------------------------------------------------------------------
 
     [Fact]
+    public void SqlServerStore_EveryRowCountedStatement_TurnsNocountOffForItself()
+    {
+        // Regression: with NOCOUNT on by default (`sp_configure 'user options', 512`, re-applied to
+        // every pooled connection by sp_reset_connection) ExecuteNonQuery returns -1. The store
+        // decides create, checkpoint, lease and delete from `> 0`, so every create read as "exists",
+        // every checkpoint as a lost revision race and every acquire as contended although it took
+        // the lease — flows churned through lease contention into the dead-letter queue. Every
+        // statement whose count the store reads now turns the count back on for itself.
+        var store = new SqlServerFlowStateStore(Options.Create(new SqlServerDurableFlowOptions { ConnectionString = "Server=unused" }));
+
+        foreach (var sql in new[] { store.CreateSql, store.UpdateSql, store.DeleteSql, store.PruneSql, store.LeaseSql(acquire: true), store.LeaseSql(acquire: false) })
+            Assert.StartsWith("SET NOCOUNT OFF;", sql, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task MySqlStore_CreateDecision_InsertsIntoTheGapAPeersPruneLeft_ButStillTrustsALiveOwnerAndRethrowsAForeignKey()
+    {
+        // Regression: after a 1062, a peer's prune could delete the expired row the insert collided
+        // with before the existence check (the create then rethrew the raw 1062 — a wasted delivery
+        // attempt for a create that would now succeed), or between the existence check and the
+        // expired-row replace (the create answered "exists" with no row at all — the executor then
+        // acknowledged the start job and the run was never created). Scripted over the three
+        // statements, since MySqlConnector offers no in-process interception.
+        var duplicate = new InvalidOperationException("1062 Duplicate entry");
+
+        // Pruned before the existence check: insert again, into the gap.
+        Assert.True(await Create(inserts: [duplicate, null], exists: [false], replaces: []));
+
+        // Pruned between the existence check and the replace: insert again, into the gap.
+        Assert.True(await Create(inserts: [duplicate, null], exists: [true, false], replaces: [false]));
+
+        // An expired row replaced in place, and a live owner — unchanged.
+        Assert.True(await Create(inserts: [duplicate], exists: [true], replaces: [true]));
+        Assert.False(await Create(inserts: [duplicate], exists: [true, true], replaces: [false]));
+
+        // A 1062 with no row under the id, twice, is some OTHER unique key (a legacy prefix key):
+        // never "exists" — the second 1062 surfaces.
+        var second = new InvalidOperationException("1062 on a prefix key");
+        Assert.Same(second, await Assert.ThrowsAsync<InvalidOperationException>(
+            () => Create(inserts: [duplicate, second], exists: [false, false], replaces: [])));
+
+        static Task<bool> Create(Exception?[] inserts, bool[] exists, bool[] replaces)
+        {
+            var insertQueue = new Queue<Exception?>(inserts);
+            var existsQueue = new Queue<bool>(exists);
+            var replaceQueue = new Queue<bool>(replaces);
+            return MySqlFlowStateStore.CreateAsync(
+                () => Task.FromResult(insertQueue.Dequeue()),
+                () => Task.FromResult(existsQueue.Dequeue()),
+                () => Task.FromResult(replaceQueue.Dequeue()));
+        }
+    }
+
+    [Fact]
     public void MaxStateBytes_Defaults_MatchProviderItemCaps()
     {
         // Document stores default to just under their hard item caps; the effectively-unbounded
@@ -278,6 +332,21 @@ public sealed class DurableFlowStoreReviewFixesTests
 
         var expired = Render(MongoDbFlowStateStore.BuildExpiredReplaceFilter("flow"));
         Assert.Equal(new BsonArray { "$expires_at_utc", "$$NOW" }, FindExpr(expired, "$lte"));
+    }
+
+    [Fact]
+    public void MongoDbStore_OnlyADateExpiryIsReplaceable_AndAnythingElseIsProbedAsMalformed()
+    {
+        // A missing or non-date expiry compares `$lte $$NOW` by BSON type order, so create's
+        // expired-replace filter overwrote a corrupt, still-present ledger. It now replaces only
+        // a BSON date, and the load path probes exactly the complement.
+        var expired = Render(MongoDbFlowStateStore.BuildExpiredReplaceFilter("flow"));
+        Assert.Equal((int)BsonType.DateTime, expired["expires_at_utc"]["$type"].ToInt32());
+        Assert.Equal(new BsonArray { "$expires_at_utc", "$$NOW" }, FindExpr(expired, "$lte"));
+
+        var malformed = Render(MongoDbFlowStateStore.BuildMalformedExpiryFilter("flow"));
+        Assert.Equal("flow", malformed["_id"].AsString);
+        Assert.Equal((int)BsonType.DateTime, malformed["expires_at_utc"]["$not"]["$type"].ToInt32());
     }
 
     [Fact]

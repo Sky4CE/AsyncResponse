@@ -163,6 +163,35 @@ internal sealed class FakeKafkaConsumerClient : IKafkaConsumerClient
         }
     }
 
+    private readonly Dictionary<int, long> _generations = [];
+
+    public long GetAssignmentGeneration(string topic, int partition)
+    {
+        lock (_gate)
+        {
+            return _generations.TryGetValue(partition, out var generation) ? generation : 0;
+        }
+    }
+
+    /// <summary>
+    /// Simulates a rebalance revoking (and, for the dispatcher's purposes, possibly handing back)
+    /// the partitions: their assignment generation advances and their pause state resets. That is
+    /// the ADAPTER's contract for a per-partition pause (<see cref="KafkaConsumerClientAdapter.OnPartitionsRemoved"/>
+    /// resumes the revoked partitions it paused), not librdkafka's own behaviour: librdkafka keeps an
+    /// application pause across a revoke and a re-assignment (verified against a real broker, r1).
+    /// </summary>
+    public void Revoke(params int[] partitions)
+    {
+        lock (_gate)
+        {
+            foreach (var partition in partitions)
+            {
+                _generations[partition] = (_generations.TryGetValue(partition, out var generation) ? generation : 0) + 1;
+                _pausedPartitions.Remove(partition);
+            }
+        }
+    }
+
     public void PauseAssignment()
     {
         lock (_gate)

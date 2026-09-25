@@ -306,75 +306,66 @@ internal sealed class RedisRecoveryStateStore : IRecoveryStateStore, IRecoverySt
         // The multiplexer's view of who is a primary is only as good as each node's last
         // handshake, in BOTH directions, so a cluster scan is checked against the cluster's own
         // node table (CLUSTER NODES — one small command next to a walk of the whole keyspace).
-        // Conservative in every unknown: a table that cannot be read or lists nothing changes
-        // nothing below, and the multiplexer's view decides as before.
-        var nodes = await ReadClusterNodeTableAsync(primaries).ConfigureAwait(false);
-
-        if (unreachable is not null)
+        // Conservative in every unknown: a table that cannot be read or lists nothing leaves the
+        // multiplexer's view to decide, and every unreachable "primary" in it fails the scan.
+        var nodes = await RedisClusterNodeTable.TryReadFromAnyAsync(primaries, _logger).ConfigureAwait(false);
+        if (nodes is null)
         {
-            // A node that has NEVER connected since this process started (a replica that was down
-            // at startup) still reports the default — not a replica — so it landed here as an
-            // "unreachable primary" and failed every scan of a cluster whose slot owners were all
-            // reachable. Only a node that owns slots can make the scan partial; a node the table
-            // does not list stays unreachable.
-            if (nodes is not null)
-                unreachable = unreachable.FindAll(server => !RedisClusterNodeTable.OwnsNoSlots(nodes, server.EndPoint));
-
-            if (unreachable.Count > 0)
+            if (unreachable is not null)
             {
                 throw ScanUnavailable(
                     $"Recovery-state scan failed: Redis cluster primary {string.Join(", ", unreachable.Select(static server => server.EndPoint?.ToString() ?? "(unknown endpoint)"))} is not connected, " +
                     "so the registrations in its slots cannot be read. A partial scan is reported as failed rather than as a verdict over the reachable shards.");
             }
+
+            return primaries;
         }
 
-        if (nodes is not null)
-            RequireSlotCoverage(nodes, primaries, connectedReplicas);
-
-        return primaries;
-    }
-
-    private async Task<List<RedisClusterNodeTable.Node>?> ReadClusterNodeTableAsync(List<IServer> primaries)
-    {
-        foreach (var primary in primaries)
-        {
-            if (primary.ServerType == ServerType.Cluster
-                && await RedisClusterNodeTable.TryReadAsync(primary, _logger).ConfigureAwait(false) is { } nodes)
-                return nodes;
-        }
-
-        return null;
-    }
-
-    /// <summary>
-    /// Every slot owner the node table lists must be one of the servers about to be scanned.
-    /// Excusing the unreachable nodes that own nothing is not the same as knowing every shard is
-    /// covered: after a failover the old primary is listed WITHOUT slots (excused, correctly),
-    /// while the promoted node can still carry the multiplexer's pre-failover "replica" flag and
-    /// be skipped as one — so the scan walked the remaining shards, found them healthy, and
-    /// reported a complete, possibly empty keyspace with a whole shard's registrations unread. A
-    /// connected node the table names as a slot owner is scanned whatever the stale flag says; a
-    /// slot owner with no connected server at all fails the scan, like any other partial one.
-    /// </summary>
-    private static void RequireSlotCoverage(List<RedisClusterNodeTable.Node> nodes, List<IServer> primaries, List<IServer>? connectedReplicas)
-    {
-        List<string>? uncovered = null;
-        foreach (var node in nodes)
-        {
-            if (!node.IsSlotOwner || primaries.Exists(primary => RedisClusterNodeTable.IsSameNode(node, primary.EndPoint)))
-                continue;
-
-            if (connectedReplicas?.Find(server => RedisClusterNodeTable.IsSameNode(node, server.EndPoint)) is { } promoted)
-                primaries.Add(promoted);
-            else
-                (uncovered ??= []).Add($"{node.Address}:{node.Port}");
-        }
-
-        if (uncovered is not null)
+        // With the table read, coverage decides: every slot owner it lists must be one of the
+        // servers about to be scanned, and once that holds, an unreachable endpoint cannot hold a
+        // shard the scan misses. That excuses a node that has NEVER connected since this process
+        // started (a replica down at startup still reports the default — not a replica — and
+        // failed every scan of a cluster whose slot owners were all reachable), and equally a
+        // configured seed endpoint the cluster no longer lists (a decommissioned node, a DNS name
+        // that stopped resolving), which the multiplexer never prunes and which failed every scan
+        // until a restart although every shard was scanned. The shared rule is the liveness
+        // probe's too (RedisClusterNodeTable.UncoveredSlotOwners).
+        PromoteListedSlotOwners(nodes, primaries, connectedReplicas);
+        var uncovered = RedisClusterNodeTable.UncoveredSlotOwners(
+            nodes,
+            primaries.ConvertAll(static primary => primary.EndPoint),
+            unreachable?.ConvertAll(static server => server.EndPoint) ?? [],
+            _logger,
+            "Recovery-state scan");
+        if (uncovered.Count > 0)
         {
             throw ScanUnavailable(
                 $"Recovery-state scan failed: Redis cluster slot owner {string.Join(", ", uncovered)} has no connected server to scan, " +
                 "so the registrations in its slots cannot be read. A partial scan is reported as failed rather than as a verdict over the reachable shards.");
+        }
+
+        return primaries;
+    }
+
+    /// <summary>
+    /// A connected node the table names as a slot owner is scanned whatever the multiplexer's
+    /// flag says. After a failover the promoted node can still carry the pre-failover "replica"
+    /// flag and be skipped as one — so the scan walked the remaining shards, found them healthy,
+    /// and reported a complete, possibly empty keyspace with a whole shard's registrations unread.
+    /// </summary>
+    private static void PromoteListedSlotOwners(List<RedisClusterNodeTable.Node> nodes, List<IServer> primaries, List<IServer>? connectedReplicas)
+    {
+        if (connectedReplicas is null)
+            return;
+
+        foreach (var node in nodes)
+        {
+            if (node.IsSlotOwner
+                && !primaries.Exists(primary => RedisClusterNodeTable.IsSameNode(node, primary.EndPoint))
+                && connectedReplicas.Find(server => RedisClusterNodeTable.IsSameNode(node, server.EndPoint)) is { } promoted)
+            {
+                primaries.Add(promoted);
+            }
         }
     }
 

@@ -13,9 +13,10 @@ namespace AsyncResponse;
 /// invoking <see cref="ReflectionInvocationDto"/>s against the DI container.
 /// </summary>
 /// <summary>
-/// A callback could not be WIRED UP — it is unauthorized, its persisted service type no longer
-/// resolves on this build, or that service is not registered in DI. Distinct from a failure thrown
-/// by the callback BODY, which is ordinary application code and may well be transient.
+/// A callback could not be WIRED UP — it is unauthorized, its persisted descriptor is malformed,
+/// its persisted service type no longer resolves on this build, that service is not registered in
+/// DI, or a persisted argument no longer converts to its parameter's type. Distinct from a failure
+/// thrown by the callback BODY, which is ordinary application code and may well be transient.
 /// <para>
 /// Derives from <see cref="InvalidOperationException"/> so every existing catch and message
 /// assertion keeps working; it exists purely so retry policies can tell "this call can never
@@ -24,7 +25,18 @@ namespace AsyncResponse;
 /// publish path for every lost response.
 /// </para>
 /// </summary>
-internal sealed class CallbackTargetUnresolvableException(string message) : InvalidOperationException(message);
+internal sealed class CallbackTargetUnresolvableException : InvalidOperationException
+{
+    public CallbackTargetUnresolvableException(string message)
+        : base(message)
+    {
+    }
+
+    public CallbackTargetUnresolvableException(string message, Exception innerException)
+        : base(message, innerException)
+    {
+    }
+}
 
 internal static class ReflectionExtensions
 {
@@ -37,6 +49,43 @@ internal static class ReflectionExtensions
     // non-hit, so the next lookup rescans against the current resolver set.
     private static readonly ConcurrentDictionary<string, (Type Type, int Generation)> ServiceTypes = new(StringComparer.Ordinal);
     private static int _resolvedServiceTypeGeneration;
+
+    /// <summary>
+    /// Most names either positive type-resolution cache (this one, and the payload classifier's)
+    /// holds. The caches are keyed by the persisted SPELLING, and a store or stream writer chooses
+    /// the spelling: every Version/Culture/token/casing variant of a loaded assembly's name
+    /// resolves to the same type, so without a count bound each novel variant was a new permanent
+    /// entry — before the payload or flow gate had even looked at the type. The legitimate key set
+    /// is the application's own payload, service, flow and input type names, far below this.
+    /// </summary>
+    internal const int ResolvedTypeCacheCapacity = 1024;
+
+    /// <summary>
+    /// Stores a resolved persisted type name in one of the positive caches — the single insert
+    /// policy both share. Collectible (plugin) types are never cached: a strong process-wide entry
+    /// would pin the plugin's AssemblyLoadContext after unload. A full cache is CLEARED rather than
+    /// frozen: a cache that merely stopped adding would let an attacker pin every legitimate name
+    /// into the per-call slow path for good (positive entries only leave on a resolver
+    /// unregister), while a clear lets the names in real use re-enter on their next resolve.
+    /// Correctness never depends on the cache — a miss rescans. Runs only after a full scan, so
+    /// the <see cref="ConcurrentDictionary{TKey, TValue}.Count"/> it reads is off every hot path.
+    /// </summary>
+    internal static void CacheResolvedType(
+        ConcurrentDictionary<string, (Type Type, int Generation)> cache,
+        string persistedName,
+        Type resolved,
+        int generationBeforeScan)
+    {
+        if (resolved.Assembly.IsCollectible)
+            return;
+
+        if (cache.Count >= ResolvedTypeCacheCapacity && !cache.ContainsKey(persistedName))
+            cache.Clear();
+
+        // Indexer, not TryAdd: a stale-stamped survivor of a raced unregister must be replaced by
+        // the fresh scan's answer, not shadow it.
+        cache[persistedName] = (resolved, generationBeforeScan);
+    }
 
     /// <summary>
     /// Invalidates the shared negative type-resolution cache (a new resolver or assembly may
@@ -161,7 +210,28 @@ internal static class ReflectionExtensions
         string serviceInterfaceFullName,
         string methodName)
     {
-        if (authorizer is not null && !authorizer.IsAllowed(serviceInterfaceFullName, methodName))
+        if (authorizer is null)
+            return;
+
+        // The authorizer is user code, and nothing stops a custom authorizer or an Allow predicate
+        // from parsing the name (Type.GetType to check a namespace or an attribute). A name past
+        // the resolution limits can overflow the stack inside that parser — an uncatchable crash on
+        // every redelivery — and is unresolvable anyway, so it is refused here, before the
+        // authorizer ever sees it; so is a descriptor with no name at all. Neither is quoted raw.
+        if (serviceInterfaceFullName is null || methodName is null)
+        {
+            throw new CallbackTargetUnresolvableException(
+                "Callback target names no service or no method; it is refused before authorization.");
+        }
+
+        if (!AsyncResponseTypeResolution.IsWithinResolutionLimits(serviceInterfaceFullName))
+        {
+            throw new CallbackTargetUnresolvableException(
+                $"Callback target '{AsyncResponseTypeResolution.DescribeForDiagnostics(serviceInterfaceFullName)}' is outside the persisted " +
+                "type-name limits; it is refused before authorization.");
+        }
+
+        if (!authorizer.IsAllowed(serviceInterfaceFullName, methodName))
         {
             throw new CallbackTargetUnresolvableException(
                 $"Callback target '{AsyncResponseTypeResolution.DescribeForDiagnostics(serviceInterfaceFullName)}.{DiagnosticText.EscapedExcerpt(methodName, 256)}' is not authorized by the registered " +
@@ -214,8 +284,10 @@ internal static class ReflectionExtensions
         // must not become a cache key either — the caches are name-keyed and sit in front of
         // callback authorization for the payload and flow paths, so without this an unauthorized
         // writer chose how many megabytes each of their entries held. Answered as any other
-        // unresolvable name, so every caller keeps the drop/dead-letter route it already has.
-        if (!AsyncResponseTypeResolution.IsWithinResolutionLimits(serviceInterfaceFullName))
+        // unresolvable name, so every caller keeps the drop/dead-letter route it already has. A
+        // null name (a malformed descriptor that reached here past the shape gates) is answered
+        // the same way instead of as a NullReferenceException.
+        if (serviceInterfaceFullName is null || !AsyncResponseTypeResolution.IsWithinResolutionLimits(serviceInterfaceFullName))
         {
             AsyncResponseDiagnostics.RecordTypeResolutionFailure("service");
             return null;
@@ -271,15 +343,11 @@ internal static class ReflectionExtensions
     /// Caches a resolved service type — unless its assembly is collectible: a strong process-wide
     /// cache entry would pin the plugin's AssemblyLoadContext and keep an unloaded plugin's
     /// assemblies alive until process exit. Collectible-context types stay resolve-per-call (a
-    /// cold path only plugin hosts hit); the negative cache is name-keyed and unaffected.
+    /// cold path only plugin hosts hit); the negative cache is name-keyed and unaffected. Bounded
+    /// by <see cref="ResolvedTypeCacheCapacity"/> (see <see cref="CacheResolvedType"/>).
     /// </summary>
     private static void CacheServiceType(string serviceInterfaceFullName, Type resolved, int generationBeforeScan)
-    {
-        // Indexer, not TryAdd: a stale-stamped survivor of a raced unregister must be replaced by
-        // the fresh scan's answer, not shadow it.
-        if (!resolved.Assembly.IsCollectible)
-            ServiceTypes[serviceInterfaceFullName] = (resolved, generationBeforeScan);
-    }
+        => CacheResolvedType(ServiceTypes, serviceInterfaceFullName, resolved, generationBeforeScan);
 
     [UnconditionalSuppressMessage("Trimming", "IL2075",
         Justification = "The service type reaching this plan was rooted at registration: expression-based registration APIs " +
@@ -554,12 +622,22 @@ internal static class ReflectionExtensions
     /// <see cref="ReflectionInvocationDto"/> whose <c>Params</c> are the real objects
     /// (payload, exception, correlation id, or literal values).
     /// </summary>
+    /// <exception cref="CallbackTargetUnresolvableException">
+    /// The persisted descriptor is malformed (see <see cref="ReflectionCallDtoGuard"/>). Its members
+    /// are <c>required</c>, which enforces presence on the wire, not non-null: a registration-time
+    /// DTO, a foreign producer or a store writer can persist <c>"Params": null</c>, a null entry, or
+    /// a null name, and the plain <see cref="ArgumentNullException"/> / <see cref="NullReferenceException"/>
+    /// those hit read as TRANSIENT to the dispatcher — so the response was redelivered forever.
+    /// </exception>
     public static ReflectionInvocationDto ResolveCallback(
         ReflectionCallDto template,
         object? payload,
         Exception? exception,
         string? correlationId)
     {
+        if (ReflectionCallDtoGuard.FindDefect(template) is { } defect)
+            throw new CallbackTargetUnresolvableException($"The persisted callback descriptor is malformed: {defect}.");
+
         var args = template.Params
             .Select(p => p.Placeholder switch
             {
@@ -582,7 +660,15 @@ internal static class ReflectionExtensions
 
     private sealed class InvocationPlan(ConversionPlan[] converters, AsyncMethodInvoker invoker, MethodInfo? voidMethod)
     {
-        /// <summary>Runs the ConvertArguments operation.</summary>
+        /// <summary>
+        /// Converts each argument to its parameter's type. A conversion failure is a WIRING fault,
+        /// raised as <see cref="CallbackTargetUnresolvableException"/> with the original as its
+        /// inner exception: the same persisted argument (or the same unmaterializable payload)
+        /// fails identically on every attempt, so classifying it as transient ran the retry
+        /// ladder and then redelivered the message forever — e.g. a failure callback taking the
+        /// typed payload, handed a response that could not be materialized as that type. The
+        /// value is never quoted; the inner exception is body-free by the JSON reader's contract.
+        /// </summary>
         public object?[] ConvertArguments(object?[] args)
         {
             object?[]? converted = null;
@@ -590,7 +676,18 @@ internal static class ReflectionExtensions
             for (var i = 0; i < converters.Length; i++)
             {
                 var raw = args[i];
-                var value = converters[i].Convert(raw);
+                object? value;
+                try
+                {
+                    value = converters[i].Convert(raw);
+                }
+                catch (Exception ex)
+                {
+                    throw new CallbackTargetUnresolvableException(
+                        $"Argument {i} no longer binds to its parameter type '{converters[i].TargetType.Name}'; the persisted value cannot be converted.",
+                        ex);
+                }
+
                 if (!ReferenceEquals(value, raw))
                 {
                     converted ??= CopyPrefix(args, i);
@@ -626,6 +723,9 @@ internal static class ReflectionExtensions
 
     private sealed class ConversionPlan(Type targetType)
     {
+        /// <summary>The parameter type this plan converts to.</summary>
+        public Type TargetType => targetType;
+
         private readonly Type? _underlyingType = Nullable.GetUnderlyingType(targetType);
         private readonly Type _conversionType = Nullable.GetUnderlyingType(targetType) ?? targetType;
         private readonly bool _isNonNullableValueType = targetType.IsValueType && Nullable.GetUnderlyingType(targetType) is null;

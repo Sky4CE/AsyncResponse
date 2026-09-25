@@ -352,6 +352,196 @@ public class LostSubscriberRecoveryRegressionTests
         Assert.Equal(keepWaitingRegistration, remaining.RegistrationId);
     }
 
+    // ----- deterministic failure-callback faults are acknowledged on BOTH failure routes -----
+
+    [Fact]
+    public async Task SetException_FailureCallbackCannotBeWiredUp_IsAcknowledgedAndKeepsTheRegistration()
+    {
+        // The exception route IS the SetException escalation, and it rethrew a deterministic
+        // failure-callback fault raw: a direct caller got an internal exception type, and through
+        // the ingress the transport redelivered the same fault forever (RabbitMQ's default requeue
+        // has no cap). The Fail route already logged and acknowledged the identical fault; so does
+        // this one now, keeping the registration for the watchdog.
+        await using var harness = Harness.Create();
+        await harness.ArmRegistrationAsync(
+            typeof(IncidentStepResult).FullName,
+            resume: IncidentResumeCallback(),
+            failure: UnregisteredFailureCallback());
+
+        await harness.Publisher.SetException(new InvalidOperationException("remote boom"), CorrelationId);
+
+        Assert.Empty(harness.Spy.Failed);
+        Assert.Single(await harness.RecoveryStateStore.GetAllAsync(CorrelationId));
+    }
+
+    [Fact]
+    public async Task Ingress_UnparseableBody_WithAnUnresolvableFailureCallback_IsAcknowledgedInsteadOfRedelivered()
+    {
+        // An unparseable body escalates straight to SetException; with a failure callback nothing
+        // can wire up, that escalation used to throw, so the ingress rethrew and the transport
+        // redelivered a message no attempt could ever handle.
+        await using var harness = Harness.Create();
+        await harness.ArmRegistrationAsync(
+            typeof(IncidentStepResult).FullName,
+            resume: IncidentResumeCallback(),
+            failure: UnregisteredFailureCallback());
+
+        await harness.Ingress.HandleResponseMessageAsync("<html>bad gateway</html>", CorrelationId);
+
+        Assert.Empty(harness.Spy.Failed);
+        Assert.Single(await harness.RecoveryStateStore.GetAllAsync(CorrelationId));
+    }
+
+    [Theory]
+    [InlineData(nameof(ITypedFailureFlowSpy.FailTyped))]
+    [InlineData(nameof(ITypedFailureFlowSpy.FailViaInterface))]
+    public async Task Ingress_UnmaterializablePayload_WithATypedFailureCallback_IsAcknowledgedNotRetriedForever(string method)
+    {
+        // The payload cannot be materialized as the registered type (an enum value this build does
+        // not know), so the failure route carries the raw JSON — and a failure callback whose
+        // payload parameter is the registered type (or IAsyncResponsePayload) re-ran the same
+        // failed conversion. Classified TRANSIENT, it burned the 4-attempt ladder and threw
+        // RecoveryCallbackFailedException, which the transport redelivered forever. A persisted
+        // argument that no longer converts is a wiring fault: deterministic, logged, acknowledged.
+        await using var harness = Harness.Create();
+        await harness.ArmRegistrationAsync(
+            typeof(IncidentStepResult).FullName,
+            resume: IncidentResumeCallback(),
+            failure: new ReflectionCallDto
+            {
+                ServiceInterfaceFullName = typeof(ITypedFailureFlowSpy).FullName!,
+                MethodName = method,
+                Params =
+                [
+                    CallbackParam.ForPlaceholder(PlaceholderType.Payload),
+                    CallbackParam.ForPlaceholder(PlaceholderType.Exception)
+                ]
+            });
+
+        await harness.Ingress.HandleResponseMessageAsync("""{"Status":"NotAStatusThisBuildKnows"}""", CorrelationId);
+
+        Assert.Equal(0, harness.Spy.TypedFailures);
+        Assert.Empty(harness.Spy.Resumed);
+        Assert.Single(await harness.RecoveryStateStore.GetAllAsync(CorrelationId));
+    }
+
+    public static TheoryData<string> MalformedDescriptorShapes => ["null-params", "null-entry", "null-method", "blank-service"];
+
+    [Theory]
+    [MemberData(nameof(MalformedDescriptorShapes))]
+    public async Task SetException_MalformedFailureDescriptor_IsAcknowledgedAndKeepsTheRegistration(string shape)
+    {
+        // `required` enforces presence on the wire, not non-null: a DTO registration, a foreign
+        // producer or a store writer can persist "Params": null, a null entry, or a null name.
+        // Resolving one threw ArgumentNullException / NullReferenceException — read as TRANSIENT,
+        // wrapped for redelivery, and redelivered forever. It is a wiring fault like any other.
+        await using var harness = Harness.Create();
+        await harness.ArmRegistrationAsync(
+            typeof(IncidentStepResult).FullName,
+            resume: IncidentResumeCallback(),
+            failure: Malformed(IncidentFailureCallback(), shape));
+
+        await harness.Publisher.SetException(new InvalidOperationException("remote boom"), CorrelationId);
+
+        Assert.Empty(harness.Spy.Failed);
+        Assert.Single(await harness.RecoveryStateStore.GetAllAsync(CorrelationId));
+    }
+
+    [Theory]
+    [MemberData(nameof(MalformedDescriptorShapes))]
+    public async Task Ingress_FailClassifiedResponse_MalformedFailureDescriptor_IsAcknowledged(string shape)
+    {
+        // The response route's failure callback resolved the descriptor OUTSIDE its settlement, so
+        // even a deterministic fault there skipped the log-and-acknowledge branch.
+        await using var harness = Harness.Create();
+        await harness.ArmRegistrationAsync(
+            typeof(IncidentStepResult).FullName,
+            resume: IncidentResumeCallback(),
+            failure: Malformed(IncidentFailureCallback(), shape));
+
+        await harness.Ingress.HandleResponseMessageAsync("""{"Status":3,"Message":"pipeline failed"}""", CorrelationId);
+
+        Assert.Empty(harness.Spy.Failed);
+        Assert.Single(await harness.RecoveryStateStore.GetAllAsync(CorrelationId));
+    }
+
+    [Theory]
+    [MemberData(nameof(MalformedDescriptorShapes))]
+    public async Task Ingress_ResumableResponse_MalformedResumeDescriptor_EscalatesToTheFailureCallback(string shape)
+    {
+        // A resume that can never be wired up is deterministic: the response route rethrows it
+        // raw, and the ingress escalates it through SetException — the flow is failed through its
+        // (well-formed) failure callback instead of the message being redelivered forever.
+        await using var harness = Harness.Create();
+        await harness.ArmRegistrationAsync(
+            typeof(IncidentStepResult).FullName,
+            resume: Malformed(IncidentResumeCallback(), shape),
+            failure: IncidentFailureCallback());
+
+        await harness.Ingress.HandleResponseMessageAsync("""{"Status":2,"Message":"pipeline succeeded"}""", CorrelationId);
+
+        Assert.Empty(harness.Spy.Resumed);
+        var (_, exception) = Assert.Single(harness.Spy.Failed);
+        Assert.Contains("malformed", exception.Message, StringComparison.Ordinal);
+    }
+
+    // ----- the consumed registration's delete is bookkeeping, not the publisher's I/O -----
+
+    [Fact]
+    public async Task SetResponse_PublisherCancelsAfterTheCallbackRan_StillDeletesTheConsumedRegistration()
+    {
+        // The publisher's token scopes its own I/O. Pre-fix it also scoped the delete that follows
+        // a SUCCESSFUL resume, so a caller cancelling late (an HTTP RequestAborted while the resume
+        // ran) left the consumed registration armed: the watchdog then flagged a resumed flow as
+        // stuck, and a retried publish re-invoked the callback.
+        await using var harness = Harness.Create();
+        await harness.ArmIncidentRegistrationAsync();
+        using var publish = new CancellationTokenSource();
+        harness.Spy.OnResume = publish.Cancel;
+
+        await harness.Publisher.SetResponse(
+            new IncidentStepResult { Status = IncidentStepStatus.Succeeded, Message = "done" },
+            CorrelationId,
+            publish.Token);
+
+        Assert.Single(harness.Spy.Resumed);
+        Assert.Empty(await harness.RecoveryStateStore.GetAllAsync(CorrelationId));
+    }
+
+    private static ReflectionCallDto UnregisteredFailureCallback() => new()
+    {
+        ServiceInterfaceFullName = typeof(IUnregisteredIncidentFlowSpy).FullName!,
+        MethodName = nameof(IUnregisteredIncidentFlowSpy.FailStep),
+        Params =
+        [
+            CallbackParam.ForPlaceholder(PlaceholderType.Payload),
+            CallbackParam.ForPlaceholder(PlaceholderType.Exception)
+        ]
+    };
+
+    private static ReflectionCallDto Malformed(ReflectionCallDto descriptor, string shape)
+    {
+        switch (shape)
+        {
+            case "null-params":
+                descriptor.Params = null!;
+                break;
+            case "null-entry":
+                descriptor.Params = [descriptor.Params[0], null!];
+                break;
+            case "null-method":
+                descriptor.MethodName = null!;
+                break;
+            case "blank-service":
+                descriptor.ServiceInterfaceFullName = "  ";
+                break;
+            default:
+                throw new ArgumentOutOfRangeException(nameof(shape), shape, null);
+        }
+
+        return descriptor;
+    }
+
     // ----- harness -----
 
     private static ReflectionCallDto IncidentResumeCallback() => new()
@@ -399,6 +589,7 @@ public class LostSubscriberRecoveryRegressionTests
             services.AddSingleton<IIncidentFlowSpy>(spy);
             services.AddSingleton<ITypedParameterFlowSpy>(spy);
             services.AddSingleton<IBaseParameterFlowSpy>(spy);
+            services.AddSingleton<ITypedFailureFlowSpy>(spy);
             if (failDeletes)
             {
                 // Registered BEFORE AddAsyncResponse: the library's TryAddSingleton yields to it.
@@ -535,6 +726,19 @@ public interface IBaseParameterFlowSpy
     Task ResumeBase(BaseStepResult payload);
 }
 
+/// <summary>Failure callbacks whose payload parameter is typed — the registered type, or the marker interface.</summary>
+public interface ITypedFailureFlowSpy
+{
+    Task FailTyped(IncidentStepResult payload, Exception exception);
+    Task FailViaInterface(IAsyncResponsePayload payload, Exception exception);
+}
+
+/// <summary>A callback target no test registers in DI — a failure callback nothing can wire up.</summary>
+public interface IUnregisteredIncidentFlowSpy
+{
+    Task FailStep(object payload, Exception exception);
+}
+
 /// <summary>
 /// A working in-memory recovery store whose deletes always fail — the post-callback cleanup
 /// fault the dispatcher must treat as bookkeeping, never as a failed response.
@@ -567,9 +771,15 @@ internal sealed class DeleteFailingRecoveryStateStore : IRecoveryStateStore
         => throw new InvalidOperationException("recovery store rejected the delete");
 }
 
-public sealed class IncidentFlowSpy : IIncidentFlowSpy, ITypedParameterFlowSpy, IBaseParameterFlowSpy
+public sealed class IncidentFlowSpy : IIncidentFlowSpy, ITypedParameterFlowSpy, IBaseParameterFlowSpy, ITypedFailureFlowSpy
 {
     private readonly object _gate = new();
+    private int _typedFailures;
+
+    /// <summary>Runs inside every resume, after it is recorded.</summary>
+    public Action? OnResume { get; set; }
+
+    public int TypedFailures => Volatile.Read(ref _typedFailures);
     private readonly List<(object Payload, string CorrelationId)> _resumed = [];
     private readonly List<(object Payload, Exception Exception)> _failed = [];
     private readonly List<IAsyncResponsePayload> _resumedTyped = [];
@@ -598,6 +808,19 @@ public sealed class IncidentFlowSpy : IIncidentFlowSpy, ITypedParameterFlowSpy, 
     public Task ResumeStep(object payload, string correlationId)
     {
         lock (_gate) _resumed.Add((payload, correlationId));
+        OnResume?.Invoke();
+        return Task.CompletedTask;
+    }
+
+    public Task FailTyped(IncidentStepResult payload, Exception exception)
+    {
+        Interlocked.Increment(ref _typedFailures);
+        return Task.CompletedTask;
+    }
+
+    public Task FailViaInterface(IAsyncResponsePayload payload, Exception exception)
+    {
+        Interlocked.Increment(ref _typedFailures);
         return Task.CompletedTask;
     }
 

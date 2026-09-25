@@ -31,7 +31,6 @@ public sealed class MongoDbChannelCoverageTests
         await channel.SetException(new InvalidOperationException("blank"), " ");
 
         await channel.SetResponse(new OperationResult { Status = OperationStatus.Completed }, "lost-response");
-        await raw.SetRawResponse(new OperationResult(), "lost-untyped", CancellationToken.None);
         await raw.SetRawResponseJson("""{"Status":2}""", "lost-raw", CancellationToken.None);
         await channel.SetException(new InvalidOperationException("lost-error"), "lost-exception");
 
@@ -169,7 +168,7 @@ public sealed class MongoDbChannelCoverageTests
         Assert.True(Invoke<bool>(success.Instance, "MarkSeen", firstId));
         Assert.True(Invoke<bool>(success.Instance, "HasSeen", firstId));
         Assert.False(Invoke<bool>(success.Instance, "MarkSeen", firstId));
-        Invoke(success.Instance, "PruneSeen", DateTimeOffset.UtcNow.AddMinutes(1));
+        Invoke(success.Instance, "PruneSeen", TimeSpan.Zero); // Evicts every entry: none is younger than a zero age.
         Assert.False(Invoke<bool>(success.Instance, "HasSeen", firstId));
 
         await InvokeTaskAsync(success.Instance, "ProcessAsync", Message("""{"SchemaVersion":1,"Success":true,"Payload":{"Status":1,"Message":"progress"}}"""));
@@ -332,7 +331,11 @@ public sealed class MongoDbChannelCoverageTests
         // a queued signal no longer postpones it), so against the 1 ms interval above nearly every
         // collect is a due sweep — which used to be papered over here with a 20-attempt retry
         // loop. A long interval makes the branch deterministic: the signal wins, the scope is it.
-        var scopedChannel = new ChannelFixture(listenerPollInterval: TimeSpan.FromSeconds(30)).Channel;
+        var scopedFixture = new ChannelFixture(listenerPollInterval: TimeSpan.FromSeconds(30));
+        var scopedChannel = scopedFixture.Channel;
+        // A wake is kept only for an id with a local waiter (fixpoint r1 S5#4).
+        AddSubscription(scopedChannel, "corr-id-1", scopedFixture.Subscription(_ => new ValueTask<bool>(true), "corr-id-1").Instance);
+        AddSubscription(scopedChannel, "corr-id-2", scopedFixture.Subscription(_ => new ValueTask<bool>(true), "corr-id-2").Instance);
         signalMethod.Invoke(scopedChannel, ["corr-id-1"]);
         signalMethod.Invoke(scopedChannel, ["corr-id-2"]);
         var resultScope = await (Task<HashSet<string>?>)collectMethod.Invoke(scopedChannel, [CancellationToken.None])!;

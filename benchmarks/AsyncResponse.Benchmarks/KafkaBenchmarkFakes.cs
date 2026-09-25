@@ -17,6 +17,8 @@ internal sealed class BenchmarkKafkaConsumerClient : IKafkaConsumerClient
     public void StoreOffset(string topic, int partition, long offset)
         => Interlocked.Increment(ref _storedOffsets);
 
+    public long GetAssignmentGeneration(string topic, int partition) => 0;
+
     public void PauseAssignment()
     {
     }

@@ -15,8 +15,15 @@ name a service interface and method that the receiving process will resolve from
 invoke. Anyone who can write to the recovery store or worker stream can therefore ask a consuming
 process to invoke any registered (service, method) pair with attacker-influenced arguments.
 Persisted type names are resolved only against assemblies already loaded into the process — a
-name never makes the process load one — so that reach is bounded to what the consuming process
-has itself loaded. A persisted name is also bounded in **shape** before it is resolved at all
+name never makes the process load a file its author supplies — so that reach is bounded to what the
+consuming process has itself loaded. One exception is outside the library's control: the framework
+facades nearly every process has loaded (`netstandard`, `mscorlib`, `System.Runtime`) forward to
+most of the framework, and asking one for a forwarded name makes the runtime load the framework
+assembly that defines it. The resolution that caused the load refuses the result, but the
+assembly stays loaded, so a later resolution of the same name (a redelivery) finds it — the reach
+extends to the framework's own assemblies, never beyond. Such a type still has to pass the
+caller's own gate (the payload marker interface, a DI registration, the flow contract) before
+anything uses it. A persisted name is also bounded in **shape** before it is resolved at all
 (length, generic nesting, total bracket count; by-ref and pointer decorations are refused): the
 runtime's type-name parser recurses per generic argument, and a few hundred kilobytes of
 `A\`1[[A\`1[[…` — comfortably inside the message budget — overflows the parsing thread's stack.
@@ -78,6 +85,13 @@ The builder offers several `Allow` shapes, plus a fully custom authorizer:
 // …or supply your own:
 .AuthorizeCallbacks(new MyCustomAuthorizer());              // IAsyncResponseCallbackAuthorizer
 ```
+
+Configure authorization in **one** `AuthorizeCallbacks` call. Every consumer resolves a single
+authorizer — the last one registered — so a second call (a module's allowlist followed by the
+application's) would silently discard the first, and its targets would be refused; the host
+therefore fails to start when more than one authorizer is registered. Combine the allowances
+(`a => a.Allow<IModuleService>().Allow<IAppService>()`), or merge the rules in one custom
+authorizer.
 
 When an incoming descriptor names a (service, method) pair the authorizer rejects, the invocation is
 refused rather than executed. Use this as defense-in-depth: even if a malicious or corrupted entry
@@ -154,7 +168,10 @@ message and path are dropped, not chained.
 `NotSupportedException` from the reader is scrubbed too: missing polymorphic discriminators
 also cause the serializer to append inbound dictionary keys to that exception. Its original
 message and inner exception are discarded; size and a safe failure category remain. Metadata
-resolution errors raised before reading the body retain their configuration guidance.
+resolution errors keep their configuration guidance — both those raised before reading the body
+and the library's own register-your-type guidance raised while the reader resolves the payload
+type mid-read (how the Redis, NATS, and database channels read a response envelope), which names
+the type and never a byte of the body.
 
 The same scrubbing covers the **second** reader pass —
 converting an already-parsed worker-job argument or recovery payload into the callback's
@@ -177,8 +194,8 @@ wait activity's error status, into telemetry. It faults the waiter with the same
 
 **But not our own diagnostics.** The distinction is who wrote the message. `System.Text.Json`'s
 messages quote the body, so they are dropped; the envelope reader's own contract violations —
-`SchemaVersion is required.`, `Payload is null or absent on a Success envelope`, `Success must be
-a boolean.` — name only the wire contract's own property names and are preserved verbatim. They
+`SchemaVersion is required.`, `Success is required.`, `Payload is null or absent on a Success
+envelope`, `Success must be a boolean.` — name only the wire contract's own property names and are preserved verbatim. They
 are the primary operator diagnosis for the commonest malformed-envelope cause in production, a
 foreign or mismatched producer writing to the response channel, and scrubbing them to "failed at
 line 0, byte position 2" would cost the diagnosis while protecting nothing. Such a failure stays
@@ -234,10 +251,13 @@ logged and skipped rather than throwing, so bad input cannot crash ingress.
 Recovery callbacks and worker payloads are persisted as **type name strings** and resolved on the
 receiving side — against the assemblies **already loaded** into the process only, every component
 of the name included: a generic argument naming an assembly the process has not loaded resolves
-the whole name to unresolved rather than forcing that assembly to load. If your callback/payload
-types live in assemblies loaded into a non-default `AssemblyLoadContext` (plugins, add-ins,
-dynamically loaded modules), the default resolver may not find them. Register them explicitly
-(opt-in):
+the whole name to unresolved rather than forcing that assembly to load. "Loaded" spans every
+`AssemblyLoadContext`: a plugin's types resolve once its context has loaded them, and a name
+defined in several loaded assemblies (the same plugin in two contexts) resolves to the first one
+loaded. If your callback/payload types may not be loaded yet when a persisted name arrives
+(plugins, add-ins, dynamically loaded modules), register them explicitly (opt-in) — registered
+resolvers are consulted only when the default scan finds nothing, so they cannot pick between
+copies the scan already sees:
 
 ```csharp
 using AsyncResponse;
@@ -270,7 +290,8 @@ context.Unload();
 Type names that still can't be resolved are surfaced via the
 `asyncresponse.type_resolution.unresolved` metric (tag `kind = service|payload`) — see
 [observability.md](observability.md) — so an unresolved plugin type shows up as an observable signal
-rather than a silent drop. Unresolvable names are negatively cached (bounded), and the cache is
+rather than a silent drop. A registered resolver that **throws** is skipped and counted under
+`kind = resolver`, once per throw — even when a later resolver then answers the name. Unresolvable names are negatively cached (bounded), and the cache is
 invalidated automatically when a new assembly loads or a resolver registers — a plugin that
 registers late is picked up immediately, while a poisoned/renamed type name stops costing a full
 assembly scan per redelivery.

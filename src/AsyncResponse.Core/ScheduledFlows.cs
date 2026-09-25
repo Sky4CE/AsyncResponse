@@ -30,12 +30,16 @@ public sealed class ScheduledFlowOptions
     /// <summary>
     /// How far back the scheduler looks at startup for occurrences of this schedule whose ledger
     /// exists, is still <see cref="FlowRunStatus.Running"/>, and has never been executed
-    /// (<see cref="FlowState.Attempts"/> is zero) — the shape a process crash between the ledger
-    /// commit and the job publish leaves behind, and the shape an in-process re-drive queue lost
-    /// with its process. Each such occurrence is re-driven (at most the 64 most recent in the
+    /// (<see cref="FlowState.Attempts"/> is zero) — the shape of a start whose job was published and
+    /// then lost in transit (an early-ACK worker subscriber, a broker that dropped it), which nothing
+    /// else would find. (A start whose publish failed persisted nothing — the publish is the start's
+    /// commit point — so the probe cannot see it; the in-process re-drive queue covers that case
+    /// while its process lives.) Each such occurrence is re-driven (at most the 64 most recent in the
     /// window). A run that is merely queued behind a busy worker looks the same and is re-driven
-    /// too, harmlessly: the duplicate wake-up is deduplicated by the execution lease. Default:
-    /// 1 hour; zero disables the probe.
+    /// too, harmlessly: the execution lease keeps the two wake-ups from running the flow at the
+    /// same time, and completed steps replay from their checkpoints — though a run that has parked
+    /// by then replays once more and carries a second wake-up chain (extra executions, never a
+    /// repeated step). Default: 1 hour; zero disables the probe.
     /// </summary>
     public TimeSpan StartupRedriveWindow { get; set; } = TimeSpan.FromHours(1);
 }
@@ -59,8 +63,11 @@ internal sealed class ScheduledFlowRegistration
 /// <para>
 /// <b>Exactly-once per occurrence across replicas, with no coordinator:</b> every replica runs the
 /// same loop and computes the same occurrence id; the flow store's atomic create accepts exactly
-/// one, and the losers re-enqueue the same run (a duplicate wake-up the execution lease already
-/// dedups). Occurrences missed while every replica was down are <em>skipped</em> — on restart the
+/// one, and the losers re-enqueue the same run. The execution lease keeps those duplicate wake-ups
+/// from executing it concurrently — it does not deduplicate them: one that finds the run already
+/// parked replays it (completed steps skip) and re-parks it, so a run that parks early can carry
+/// one wake-up chain per replica (extra executions and ledger writes, never a repeated step).
+/// Occurrences missed while every replica was down are <em>skipped</em> — on restart the
 /// loop resumes from "now", by design (an at-most-once schedule; the run history shows the gap).
 /// A late timer fire (seconds) still starts its own occurrence — only occurrences whose successor
 /// is already due are skipped.
@@ -221,8 +228,15 @@ internal sealed class ScheduledFlowService(
             while (!stoppingToken.IsCancellationRequested)
             {
                 var now = timeProvider.GetUtcNow();
-                if (next is { } occurrence && occurrence <= now)
+                if (next is { } due && due <= now)
                 {
+                    // The loop woke late (a paused VM, a clock jump, a start that blocked on the
+                    // store): several occurrences may be due at once. The skip policy keeps the
+                    // LATEST of them — an occurrence whose successor is already due is the one
+                    // skipped. Starting `due` itself ran an hours-stale occurrence, with input
+                    // built for it, and then skipped every newer one.
+                    var latest = RecentOccurrences(schedule, now, now - due, 1);
+                    var occurrence = latest.Count > 0 ? latest[^1] : due;
                     if (!await StartOccurrenceAsync(registration, occurrence, stoppingToken).ConfigureAwait(false))
                         Enqueue(undispatched, registration, occurrence, timeProvider.GetUtcNow());
 
@@ -233,7 +247,7 @@ internal sealed class ScheduledFlowService(
                     continue;
                 }
 
-                await RedriveDueAsync(registration, undispatched, timeProvider, stoppingToken).ConfigureAwait(false);
+                await RedriveDueAsync(registration, undispatched, next, timeProvider, stoppingToken).ConfigureAwait(false);
 
                 if (next is null && undispatched.Count == 0)
                 {
@@ -266,8 +280,9 @@ internal sealed class ScheduledFlowService(
     }
 
     /// <summary>
-    /// Starts one occurrence. Returns <c>false</c> only when the occurrence's ledger is committed
-    /// but its worker job was not published — the one outcome the loop must keep re-driving.
+    /// Starts one occurrence. Returns <c>false</c> only when its start job was not published
+    /// (<see cref="DurableFlowNotDispatchedException"/>) — nothing was persisted, since the publish
+    /// is the start's commit point — the one outcome the loop must keep re-driving.
     /// </summary>
     private async Task<bool> StartOccurrenceAsync(
         ScheduledFlowRegistration registration,
@@ -347,14 +362,26 @@ internal sealed class ScheduledFlowService(
         });
     }
 
+    /// <summary>
+    /// Re-drives the due entries of the undispatched queue — yielding to the schedule itself: the
+    /// pass stops as soon as <paramref name="nextOccurrence"/> is due, and the entries it did not
+    /// reach keep their due time for the next pass. Each entry costs a state read and a whole start
+    /// retry ladder, so during an outage a queue of a few dozen entries held the loop for minutes;
+    /// every occurrence that fell due meanwhile was then skipped by the loop's missed-occurrence
+    /// rule — silently, and although the loop was alive the whole time.
+    /// </summary>
     private async Task RedriveDueAsync(
         ScheduledFlowRegistration registration,
         List<UndispatchedOccurrence> undispatched,
+        DateTimeOffset? nextOccurrence,
         TimeProvider timeProvider,
         CancellationToken stoppingToken)
     {
         for (var i = 0; i < undispatched.Count;)
         {
+            if (nextOccurrence is { } next && next <= timeProvider.GetUtcNow())
+                return;
+
             var entry = undispatched[i];
             if (entry.DueUtc > timeProvider.GetUtcNow())
             {
@@ -492,7 +519,7 @@ internal sealed class ScheduledFlowService(
                 continue;
 
             _logger.LogWarning(
-                "Scheduled flow '{Schedule}' found occurrence {FlowId} committed but never executed (Running, 0 attempts) — its worker job was lost before publish (a crash or an outage in a previous process). Re-driving it.",
+                "Scheduled flow '{Schedule}' found occurrence {FlowId} created but never executed (Running, 0 attempts) — its start job was published and then lost in transit (an early-ACK worker subscriber, a broker that dropped it). Re-driving it.",
                 registration.Name, flowId);
             undispatched.Add(new UndispatchedOccurrence { FlowId = flowId, Occurrence = occurrence, DueUtc = now, AwaitingFirstPublish = false });
         }

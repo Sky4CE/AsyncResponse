@@ -11,7 +11,7 @@ namespace AsyncResponse.Transports.AzureServiceBus;
 /// operations are explicitly awaited so the method completes only after Service Bus accepts the
 /// transfer or the Azure SDK reports a failure.
 /// </remarks>
-public sealed class AzureServiceBusWorkerTransport : IWorkerTransport, IDelayedWorkerTransport, IAsyncDisposable
+public sealed class AzureServiceBusWorkerTransport : IWorkerTransport, IDelayedWorkerTransport, IWorkerTransportInFlightLimit, IAsyncDisposable
 {
     private readonly AzureServiceBusAsyncResponseOptions _options;
     private readonly IAzureServiceBusClient _client;
@@ -52,6 +52,10 @@ public sealed class AzureServiceBusWorkerTransport : IWorkerTransport, IDelayedW
 
     private async Task<IAzureServiceBusSender> GetSenderAsync(CancellationToken cancellationToken)
     {
+        // The lock-free fast path checks disposal too: dispose leaves the cached sender in place,
+        // so every publish after the first one reached the SDK's own disposed sender instead of
+        // the transport-named ObjectDisposedException the gated path throws.
+        ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed), this);
         var sender = Volatile.Read(ref _sender);
         if (sender is not null)
             return sender;
@@ -76,6 +80,23 @@ public sealed class AzureServiceBusWorkerTransport : IWorkerTransport, IDelayedW
     /// <inheritdoc/>
     /// <remarks>Service Bus scheduled messages accept any future enqueue time; no per-hop chunking is needed.</remarks>
     public TimeSpan MaxPublishDelay => AsyncResponseChannelOptions.MaxPersistenceTtl;
+
+    /// <inheritdoc/>
+    /// <remarks>
+    /// Service Bus redelivers a message the moment its peek lock lapses, however alive its handler
+    /// is. With <see cref="AzureServiceBusSubscriberOptions.LockRenewalInterval"/> set, the worker
+    /// subscriber renews the lock for as long as the handler runs and Service Bus caps neither the
+    /// renewals nor their total, so there is no ceiling (<c>null</c>). Without renewal the entity's
+    /// <c>LockDuration</c> is the ceiling — a value this transport never reads — so its 5-minute
+    /// maximum is reported: an upper bound, but it keeps the durable-flow engine's
+    /// wait-outlives-the-ceiling warning alive instead of advertising no ceiling at all. <c>null</c>
+    /// in <see cref="AzureServiceBusAckMode.AckAfterEnqueue"/>, where the message is completed
+    /// before its handler runs and nothing stays locked at the broker.
+    /// </remarks>
+    public TimeSpan? MaxInFlightDuration
+        => _options.WorkerSubscriber is { AckMode: AzureServiceBusAckMode.AckAfterHandlerCompletes, LockRenewalInterval: null }
+            ? AzureServiceBusOptionsValidator.MaxLockDuration
+            : null;
 
     /// <inheritdoc/>
     public Task PublishAsync(WorkerJobEnvelope job, TimeSpan delay, CancellationToken cancellationToken = default)

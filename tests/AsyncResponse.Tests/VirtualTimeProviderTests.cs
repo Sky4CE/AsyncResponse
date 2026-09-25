@@ -124,6 +124,38 @@ public class VirtualTimeProviderTests
     }
 
     [Fact]
+    public void ArmSequence_AdvancesWhenATimerIsArmed_NeverWhenOneIsDisposed()
+    {
+        // Regression (fixpoint r1): the harness's settle watched NextTimerDueAt for "a job just
+        // began a virtual-time wait", but disposing the EARLIEST timer changes that too — the
+        // settle then ended while the job that disposed it was still running code, and the clock
+        // advanced under it. The arm sequence moves only when a timer is armed.
+        var clock = new VirtualTimeProvider();
+        var start = clock.ArmSequence;
+
+        var earliest = clock.CreateTimer(_ => { }, null, TimeSpan.FromSeconds(1), Timeout.InfiniteTimeSpan);
+        using var later = clock.CreateTimer(_ => { }, null, TimeSpan.FromMinutes(1), Timeout.InfiniteTimeSpan);
+        var armed = clock.ArmSequence;
+        Assert.Equal(start + 2, armed);
+
+        // Disposing the earliest timer moves NextTimerDueAt, but arms nothing.
+        var nextBefore = clock.NextTimerDueAt;
+        earliest.Dispose();
+        Assert.NotEqual(nextBefore, clock.NextTimerDueAt);
+        Assert.Equal(armed, clock.ArmSequence);
+
+        // Disarming (an infinite due time) arms nothing either; re-arming does — even to a due
+        // time LATER than the earliest, which NextTimerDueAt cannot show.
+        later.Change(Timeout.InfiniteTimeSpan, Timeout.InfiniteTimeSpan);
+        Assert.Equal(armed, clock.ArmSequence);
+        using var earliestAgain = clock.CreateTimer(_ => { }, null, TimeSpan.FromSeconds(1), Timeout.InfiniteTimeSpan);
+        var dueBefore = clock.NextTimerDueAt;
+        later.Change(TimeSpan.FromMinutes(5), Timeout.InfiniteTimeSpan);
+        Assert.Equal(dueBefore, clock.NextTimerDueAt);
+        Assert.Equal(armed + 2, clock.ArmSequence);
+    }
+
+    [Fact]
     public void AdvancingBackwards_Throws()
     {
         var clock = new VirtualTimeProvider();

@@ -13,6 +13,378 @@ work that has landed on `main` but not yet shipped. Security reporters credited 
 
 ### Changed
 
+- **Round-43 review (2026-09-25, whole repository): round 42's "every transport" fixes finished,
+  host stop reaches in-process timers, and the database channels no longer lose a response behind
+  their dispatch cursor.**
+  - *Breaking or operator-visible.* The PostgreSQL transport's `payload_json`/`headers_json` columns
+    are now `text`: an existing auto-created table converts once at startup in a single `ALTER
+    TABLE` (one rewrite under `ACCESS EXCLUSIVE` with an hour-long command timeout and a 5 s
+    `lock_timeout`: on a busy table it fails fast, and that host fails its transport operations at
+    once, naming the lock wait, until it retries after a jittered 30–60 s); managed schemas get the
+    migration SQL in the startup error. The conversion is one-way — a previous-build host that
+    restarts afterwards fails its schema check, a rollback needs a manual reverse `ALTER` that fails
+    once a payload holding `\u0000` exists, and operator-owned objects that depend on the jsonb
+    columns (GIN or expression indexes, views) must be dropped before the upgrade. The PostgreSQL
+    and SQL Server transports build a `{table}_ready_idx` dequeue index over `(queue, available_at,
+    created_at)` when it is absent, under an hour-long command timeout (the same lock-wait bound and
+    retry window apply) — pre-create it on a large table (SQL Server `WITH (ONLINE = ON)`; on
+    PostgreSQL once the columns are `text` — the one-time conversion itself waits behind a running
+    `CONCURRENTLY` build and rebuilds every index — then `CONCURRENTLY`); on PostgreSQL an invalid
+    or not-yet-ready index is a warning. Enabling `AckAfterEnqueue` on both the worker and the
+    response subscriber of the NATS, PostgreSQL, SQL Server or MongoDB transport validates the sum
+    of both roles' shutdown spends against `HostShutdownTimeout` — with stock timeouts that now
+    fails startup on all four (NATS and SQL Server 40 s, PostgreSQL and MongoDB 50 s against 30 s).
+    The NATS channel needs `$JS.API.STREAM.INFO.KV_<RecoveryBucket>` permission (the bucket is
+    looked up before it would be created; without it every registration times out). NATS durable
+    consumers are created when missing and never modified: a changed `AckWait` no longer reaches an
+    existing consumer (the drift is logged once), and a consumer whose finite max deliver the old
+    code silently reset (one at or below the cap — any finite one when `MaxDeliveryAttempts` is 0)
+    now leaves its subscriber (worker or response) consuming nothing, with warnings, until it is
+    fixed by hand; a push or non-explicit-ack consumer, on which the old update was refused, now
+    fails by name. The MongoDB channel requires MongoDB 4.4 or newer. A response envelope without
+    `Success` is rejected ("Success is required."), so a foreign producer must always send it.
+    Registering more than one `IAsyncResponseCallbackAuthorizer` fails startup, Service Bus
+    `LockRenewalInterval` must be under 5 minutes, and Pub/Sub validates `ShutdownTimeout` in both
+    ack modes. SQS and Service Bus worker subscribers receive one message at a time in
+    ack-after-handler mode, and RabbitMQ's advertised in-flight ceiling is divided by
+    `PrefetchCount` (floored at one minute), so in-process timers hop more often. A MongoDB
+    flow-store ledger whose `expires_at_utc` is not a BSON date (written under a host-wide
+    String/Document/Int64 `DateTime` serializer) now reads as unreadable instead of absent; once no
+    run needs them, remove such documents with `deleteMany({ expires_at_utc: { $not: { $type: "date"
+    } } })` — the exception carries the command. `IFlowStateStore` gains `LoadCurrentAsync` (a
+    default interface member), and `DurableFlowStateRecord` is no longer sealed, so a context using
+    lazy-loading proxies can map it. Not recorded when round 21 added them: Kafka fails startup when
+    `WorkerTopic` and `ResponseTopic` resolve to the same topic or a dead-letter topic resolves to a
+    live one, and NATS when worker, response or dead-letter subjects or streams collide, including
+    after name sanitizing (`a.b` versus `a_b`).
+  - *A park lets go of its run.* Lease renewal stops (an in-flight renewal is joined) before the
+    wake-up is published, and the lease is released right after, so a child that finishes at once,
+    or a timer hand-over, is no longer acknowledged as a "duplicate" of a holder still unwinding its
+    `finally` blocks. Flow code that turns the park's cancellation into another exception no longer
+    fails or retries a parked run.
+  - *Host stop reaches in-process timers.* Round 42 said in-process waits observe host shutdown;
+    that was never wired. An in-process timer at host stop is now handed over to a fresh delivery
+    (checkpoint, immediate wake-up, acknowledge), so a long sleep across many deploys no longer
+    burns broker delivery attempts until the run is dead-lettered. If that publish fails, or the
+    timer is reached on a host already stopping, the delivery is handed back with
+    `DurableFlowInterruptedException`, and the interruption is sticky. Awaited responses are
+    deliberately not interrupted, so their recovery registration survives until the channel shuts
+    down. The lease-contention wait throws `DurableFlowInterruptedException` too when the stop cuts
+    it short, so every transport recognises the hand-back by type. In ack-after-handler mode the
+    database and broker dispatchers leave such a delivery unsettled (the in-memory transport
+    abandons it with a warning that the flow must be resumed explicitly) and never count it `failed`
+    (the ingress no longer logs it at Error, nor any transport's receive span as an error), Kafka
+    never skips past its offset, and the Redis, NATS, SQS and Service Bus subscribers read nothing
+    more until they stop; where the broker or store counts attempts the redelivery still spends one
+    (not Kafka; on RabbitMQ only a first delivery moves to attempt 2), so a hand-back at the cap is
+    dead-lettered on redelivery (on Service Bus only against the entity's own `MaxDeliveryCount`).
+    Under early ACK, where the broker already forgot the message, it is reported through
+    `OnBackgroundFailure` and logged as a warning, and on Kafka, RabbitMQ, Redis, NATS and the
+    database transports (with `DeadLetterEnabled`, the default) it is dead-lettered with a reason
+    starting `handed_back_after_commit` — Kafka, RabbitMQ, Redis and NATS log the loss as an error
+    instead when no dead-letter destination is configured. Flow code that converts the interruption
+    into another exception (`DurableFlowFailedException` included) is overruled like a converted
+    park.
+  - *Timer hops fit the delivery.* In-process timer hops are capped at what the delivery has left of
+    the broker's in-flight ceiling; timers longer than ~49.7 days on a transport with neither
+    delayed delivery nor a ceiling wait in hops instead of failing. `MaxInProcessParkDuration` and
+    every other `DurableFlowOptions` bound are validated at host start and by the executor.
+  - *Replay survives type drift.* Completed child steps answer from their memo despite a renamed
+    child class or an input type whose constructor rejects old JSON. Root and scheduled starts
+    compare input by value — also for flows executed by reflection (in DI without
+    `WithDurableFlow`), after the flow-contract and DI checks. Flow and input type identity — and
+    the callback allowlist — ignore only a well-formed `Version` of the assemblies inside generic
+    type names; a different `PublicKeyToken` or `Culture` is a different type.
+  - *Leases and starts.* A failed lease renewal retries on a short backoff; a caller-cancelled save
+    is no longer read as a lost lease; a won response whose settle save fails is checkpointed
+    without the lease. A lost create against an already-expired ledger is retried instead of
+    acknowledged, a caller-chosen id bound to other work is refused before publishing, and no store
+    failure after the publish costs the caller the id (a conflict found only by the post-publish
+    create, or a size/argument rejection a store's preflight missed, still throws — the doc names
+    them). A failure signal that reads a lagging `Suspended` copy re-checks the current ledger, the
+    lost-create re-read uses `LoadCurrentAsync`, and renewal resumed after a failed park publish
+    renews at once. A late scheduler wake starts the latest due occurrence, and the re-drive pass
+    yields to the next occurrence.
+  - *Flow hygiene.* The step guard refuses parallel context calls inside a step body (timers take
+    the guard first). Retention floors are anchored to the wait's end, so ancestors are no longer
+    rewritten twice per park. The contention poll re-reads the ledger about every 30 s instead of
+    every 2 s. The redundant end-of-body progress write is gone, the ledger-size warning no longer
+    repeats on every wake-up (and fires at once for a run whose first execution starts past the
+    threshold, and for a crossing made between executions by the write that makes it — a recovered
+    response or a won response checkpointed without the lease), and flow ids and persisted type
+    names are escaped in messages.
+  - *Failure callbacks: one policy on both routes.* The exception route (`SetException` with no live
+    waiter) now applies the Fail route's failure-callback policy — four in-process attempts for a
+    transient fault, log-and-acknowledge with the registration kept for a deterministic one — where
+    a failure callback nothing could wire up made the transport redeliver forever. A malformed
+    recovery descriptor (null `Params`, a null entry, a null or blank name) and a persisted argument
+    that no longer converts to its parameter type are deterministic wiring faults, and
+    `EnqueueWorkerAsync(ReflectionCallDto)`/`OnLostSubscriber*(ReflectionCallDto)` reject a
+    malformed descriptor with `ArgumentException` in the caller's stack. The broker ingress
+    escalates a deterministic resume fault on the first attempt instead of after its retry ladder.
+  - *Ingress and authorization.* The worker ingress drops and acknowledges an envelope whose reply
+    target has a null or blank member. A worker job refused by the callback authorizer is counted as
+    worker outcome `rejected` (still thrown, so the transport's redelivery or dead-letter policy
+    decides). The authorizer never receives a null name or one past the type-name limits, and
+    registering more than one `IAsyncResponseCallbackAuthorizer` (two `AuthorizeCallbacks` calls)
+    fails startup instead of silently discarding the earlier allowlist. The positive type-resolution
+    caches are bounded to 1,024 entries.
+  - *Shared executors are retired only when idle.* The Redis and database channels no longer retire
+    a per-correlation executor while a sibling waiter on the same id is still registered (on Redis
+    the survivor could be faulted as "overloaded"), and executor tombstones expire on the monotonic
+    clock.
+  - *Hosting.* The durable-flow store probe disposes its scope asynchronously, so a scoped store
+    that implements only `IAsyncDisposable` no longer fails host start. Keyed registrations are
+    ignored by the lifetime audits. The one-version package check runs from a gate registered as the
+    first hosted service, compares against the executing Core, and skips load contexts carrying
+    their own Core. The recovery health check's freshness budget includes `IntervalJitter`, and a
+    throwing logging provider can no longer end the watchdog's scan loop (under the default
+    `StopHost` behaviour that took the host down).
+  - *Producer budget and wire contract.* A delayed worker job is measured as its largest
+    re-published hop, so a job the consuming ingress would drop on its re-delay hop throws
+    `WorkerJobTooLargeException` at the producer. A reply target whose `Properties` is `null` no
+    longer makes every enqueue inside the job throw, and `WithReplyTarget()` resolves the target
+    before subscribing. A response envelope without `Success` is rejected ("Success is required.")
+    instead of reading as a message-less failure.
+  - *Diagnostics.* Escaped excerpts also escape `\` and bidirectional formatting controls; worker
+    target activity tags, executor logs and stream-written names in the ingress Debug routing log
+    are bounded and escaped; the remote failure message reaches a waiter's activity status only as a
+    capped, escaped excerpt. Register-your-type guidance raised while a channel reads a response
+    reaches the waiter, and JIT metadata errors no longer claim the app is trimmed.
+  - *The in-memory channel matches the durable ones more closely.* An unserializable payload throws
+    to the publisher, `error.type` is `remote_failure`, captured callback arguments are snapshotted
+    on save, the watchdog scans the recovery store actually in use, waiters settle before they log,
+    and the indeterminate diagnostic appears only when the fault actually won.
+  - *In-memory worker transport and executor.* A chain of follow-ups no longer starves the queue: a
+    worker runs only the overflow present when its job finished before reading the queue again. A
+    throwing logging provider can no longer stop the only worker loop, leak the outstanding count,
+    or abort the shutdown drain. A host-stop interruption is abandoned without a retry or a
+    `dropped` outcome, and the shared executor no longer counts `DurableFlowInterruptedException` as
+    `failed`; any other cancellation a job throws (an `HttpClient` timeout) is an ordinary failure
+    and is retried, during the drain too. A publish from code that outlived its job after the drain
+    completed throws `ChannelClosedException` instead of being reported published and never run, and
+    `StartAsync` no longer runs a pre-start backlog inline — the workers start on the thread pool,
+    never on the caller's `SynchronizationContext`. Re-delay hops are copies (stall counters stamped
+    on the delivered envelope could "prove" clock skew and fire a timer early), the skew marker is
+    cleared per job, and a `NotBeforeUtc` written with an offset compares as UTC.
+  - *Testing kit.* `SimulateRestartAsync` no longer waits out its real-time guard for a job queued
+    behind a park or a crashed attempt, no longer hangs re-publishing retained wake-ups beyond
+    `DelayedJobCapacity`, and reads the retention list under its lock. It carries over jobs still
+    queued behind a park (they never started; they run under their enqueuer's ambient context), and
+    an ordinary retry backoff no longer cuts its graceful stop short. After a restart, barriers skip
+    only in-process parks (awaited steps, timers at or below `TimerInProcessThreshold`) —
+    `WaitForStepCompletedAsync` still sees checkpoints persisted before the restart and
+    `WaitForTimerStepAsync` a suspended timer's carried-over wait — and a timer's wait is classified
+    at the moment the engine decided, not when it is recorded; settle/quiesce counters no longer go
+    stale or negative, and the clock guard and `NullLogger<>` fallback also see registrations made
+    in `ConfigureAsyncResponse`.
+  - *Database channels no longer lose a response behind the cursor.* A response whose insert
+    committed after a later row had been read is found by a short lookback window (half of
+    `DeliveryConfirmationTimeout`, at most 2 s) instead of waiting for history reconciliation, which
+    — with seen-message aging — runs on the real monotonic clock. The lookback no longer re-queues
+    rows still waiting in the executor, and a refused revisit page no longer leaves the cursor
+    behind (and keeps the late-commit window open while refusals last). PostgreSQL applies the full
+    `FullSweepInterval` throttle only while its `LISTEN` is established and MongoDB only while a
+    change stream is open — while the wake is down the sweep runs every `min(FullSweepInterval,
+    DeliveryConfirmationTimeout / 4)` (MongoDB without change streams still sweeps every tick), the
+    reconnect backoff starts over only after a listener stayed up at least 5 s (a connection
+    accepted and dropped at once keeps backing off), and each re-established wake triggers one full
+    sweep; and a silent PostgreSQL listen connection is pinged after 10 s so a half-open socket
+    reconnects. Wakes for ids with no local waiter are dropped, and an overflowing signal queue
+    requests a full sweep instead of evicting an older wake. When the first 8 ids of a dispatch pass
+    all fail with a transient store fault (an outage), the rest of the pass is skipped instead of
+    costing one failing store call per waiter; the logged exception carries the first 3 failures and
+    counts the others.
+  - *Database channel publishes.* A publish from the waiter's own process treats its live local
+    subscription as live even after the subscriber row lapsed, and failed heartbeat rounds retry
+    within about a second (warning on the first failure, then at most once per heartbeat interval).
+    A transient fault in the delivery-confirmation poll or the recovery claim no longer fails a
+    publish whose row is already stored (a retry duplicated the response). The same-process fast
+    path no longer blocks on executor capacity and runs on the channel's own token. The full sweep
+    dispatches up to 8 ids concurrently, one failing id no longer stops the rest, and it records
+    `asyncresponse.channel.sweep.duration`. SQL Server hydrates acknowledged rows in chunks of 1,000
+    ids (error 8003 at 2,100). The MongoDB channel stores `$`-prefixed ids correctly, ignores
+    unknown elements, and stops shipping the envelope in change-stream events and claims. PostgreSQL
+    channel and transport `LISTEN` connections run `UNLISTEN *` before returning to the pool,
+    waiting at most 1 s; a connection whose `UNLISTEN` fails after an established `LISTEN` is kept
+    out of the pool by clearing the data source's pool.
+  - *Database transports keep their lease through the stop.* The lease heartbeat is no longer
+    cancelled when the subscriber stops, so a running handler keeps its lease through the host's
+    stop budget; each renew attempt is bounded by the beat interval, and SQL Server reads the
+    renewal row count from `@@ROWCOUNT`. A host-stop hand-back leaves the claim unsettled (and no
+    longer marks the receive span as an error), and an early-ACK park that loses its lease drops the
+    delivery instead of running it again. Retention prunes (PostgreSQL and SQL Server in bounded
+    1,000-row batches for up to 2 s, MongoDB in one `deleteMany`) run on a monotonic throttle and
+    never fail the operation they ride on, and SQL Server's dead-letter and channel prunes drain
+    past the first batch under a server-wide `NOCOUNT`; the PostgreSQL/SQL Server channels also
+    prune expired subscriber rows table-wide.
+  - *MongoDB writes are bounded.* The channel and flow store, and the transport's publishes, dead
+    letters and deletes, write with `w:"majority"` and a `wtimeout` (an inherited
+    `wtimeoutMS`/`journal` is kept, otherwise 10 s), ending the unbounded block on a
+    primary-secondary-arbiter set with its secondary down. The transport's lease writes (claim,
+    renew, NAK) and index creation keep the connection's own write concern: a claim that applied but
+    hit the `wtimeout` would have burned an attempt of a job that never ran. A transport document it
+    cannot read is dead-lettered on sight, and a non-numeric `attempts` no longer fails the claim.
+  - *PostgreSQL and SQL Server transport claims.* The PostgreSQL LISTEN wake is scoped to the
+    subscriber's own queue, an invalid or not-yet-ready dequeue index is a warning, and only an
+    absent index is created (so, once the columns are `text`, a host starting during a
+    `CONCURRENTLY` build no longer queues behind it). Both claim in `available_at, created_at`
+    order; operator-managed SQL Server tables warn when no index leads on `queue`, and a NAK no
+    longer raises an in-process wake. The SQL Server collision diagnosis rolls back the failed DDL
+    transaction first and never replaces the original error, and a raw lone surrogate in a response
+    body or `headers_json` is unresolvable instead of throwing.
+  - *Durable-flow stores.* The EF Core prune filters on expiry inside the `DELETE` and deletes in
+    expiry order, so a ledger a concurrent create just replaced in place is no longer deleted;
+    create makes two attempts and judges expiry after the prune, and a negative row count
+    (`NOCOUNT`) throws an actionable error. SQL Server runs `SET NOCOUNT OFF` wherever a row count
+    is read. The executor reads through `LoadCurrentAsync` before acknowledging a recovered
+    response, a correlation-scoped failure or a no-write resume, and, when a start job's plain load
+    finds no ledger or one bound to different work, before it retries the create or drops the job (a
+    normal start still decides on the plain load) (Cosmos confirms on the write path first). Cosmos
+    normalizes document times to UTC, reads a ledger its write path still sees but Session or Strong
+    reads hide (expired by its server ttl, not yet purged) as absent instead of unreadable, treats a
+    missing `expiresAtUtc` as unreadable, and sets `EnableScanInQuery`. MongoDB pins dates to BSON
+    dates on the members themselves (a host-registered custom `IBsonSerializer<DateTime>` neither
+    rewrites them nor breaks the class map), treats a missing or non-date expiry as unreadable,
+    accepts an equivalent TTL index under another name, and retries once more on a duplicate key;
+    MySQL re-inserts after a 1062 whose colliding row a peer's prune removed. PostgreSQL manual
+    schemas verify the expiry index when present and no longer need `revision DEFAULT 0`; SQL Server
+    `nvarchar` widths are minimums. Opportunistic prunes take the create's token and measure their
+    throttle on the monotonic clock.
+  - *Redis.* The round-42 transport claims now hold here: ack-after-handler reads one entry at a
+    time and claims each reclaim candidate right before it runs, the early-ACK queue belongs to the
+    hosted service (a failed read no longer drains a host that is not stopping), and on stop nothing
+    new starts while the idle-reset heartbeat lasts until the running handler lets go. In
+    ack-after-handler mode a host-stop hand-back stays pending instead of being dead-lettered (its
+    redelivery still counts), after it the subscriber reads and claims nothing more until it stops,
+    and the attempt number comes from each candidate's own pending entry re-read just before its
+    claim. Every burial of a still-pending entry is guarded, publish retries treat
+    `TRYAGAIN`/`CLUSTERDOWN`/`LOADING`/ `MASTERDOWN`/`READONLY` as transient, the claim schedule
+    runs on the monotonic clock, abandoned commands are observed, and a stopping subscriber deletes
+    its own generated consumer when it has no pending entries. The channel's liveness probe follows
+    the recovery scan's rules — a disconnected old primary outside a cluster, a replica that never
+    connected, or a seed endpoint the cluster no longer lists no longer makes every lost-subscriber
+    publish throw, endpoints are asked concurrently, and a disconnected primary is excused only
+    after 90 s down, counted from the first probe in this process that sees it disconnected (a
+    reconnection no probe saw does not restart the count) — inside that window a zero is "unknown"
+    and the publish throws for redelivery, so the response transport's redelivery budget should
+    outlast 90 s during a failover — and the cluster scan excuses endpoints the node table proves
+    own no slot (a single-node cluster whose own line has no address is complete). A recovery-routed
+    publish no longer retires a shared executor a live waiter still uses. Docs: the transport
+    requires Redis 6.2+, `StreamMaxLength` trimming evicts unprocessed and pending jobs, response
+    producers must trim their own stream, and the channel's `KeyPrefix` should not be hash-tagged.
+  - *NATS.* A host-stop hand-back is left unsettled for redelivery instead of being NAKed or, at the
+    cap, dead-lettered and terminated; after it the fetch loop starts nothing more until the
+    subscriber stops, and a message waiting for room in a full early-ACK queue at that moment is
+    NAKed with no delay instead of being enqueued. Waiter registration is bounded by the waiter
+    timeout, so a reconnecting connection no longer hangs subscribe, flush or the recovery save; the
+    recovery registration is deleted before unsubscribing, and the subscription no longer dies with
+    the timeout (a response in that window fired a recovery callback while the waiter reported a
+    timeout), and a waiter timeout during an outage settles within `DisposalDrainTimeout` (as
+    indeterminate) instead of waiting for the registration delete. The recovery bucket is opened,
+    not re-created, so a changed `RecoveryStateExpiry`/`RecoveryBucketReplicas` or an
+    operator-provisioned bucket no longer fails every operation with 10058 (drift is logged when the
+    channel first opens it), and the watchdog scan purges delete markers older than 30 minutes, each
+    purge bounded by the marker's own sequence. Durable consumers are created when missing and never
+    rewritten; an existing consumer the transport cannot work with (push, non-explicit acks, a
+    finite max deliver at or below `MaxDeliveryAttempts` — any finite one when it is 0) fails every
+    subscriber attempt by name at Warning until it is fixed, while an ack-wait drift is only logged
+    once and the in-progress heartbeat follows the shorter of the two ack waits. The early-ACK drain
+    reserves a quarter of `BackgroundDrainTimeout` for burying already-acknowledged jobs, and early
+    ACK on both roles validates the sum of both drains (stock 20 s + 20 s against 30 s now fails
+    startup). The dead-letter republish drops every `Nats-*` header (a producer's `Nats-Expected-*`
+    made the burial NAK-loop forever) and caps the reason at 512 characters. Payloads above the
+    server's `max_payload` fail at once instead of running the retry ladder; a correlation header
+    that is the `?`-mangled form of a non-ASCII body id yields the body id; invalid explicit
+    stream/consumer names, an invalid `CorrelationIdHeader` and `RecoveryBucketReplicas` outside 1–5
+    fail startup; a non-default `SubjectPrefix` with the default `RecoveryBucket` warns that
+    registrations are shared.
+  - *RabbitMQ.* The early-ACK queue belongs to the hosted subscriber, so a channel fault no longer
+    runs the stop-time drain and dead-letter copies ride the next attempt's channel; the drain is
+    split 3/4 + 1/4 and the stop itself dead-letters and reports what is still queued. A graceful
+    stop in ack-after-handler mode starts no buffered delivery and waits for the running handler (up
+    to `BackgroundDrainTimeout`, shortened to fit `HostShutdownTimeout`) so its ACK lands before the
+    channel closes. Publisher confirms are on whenever `DeadLetterExchange`, `DeadLetterQueue` or
+    `ParkQueue` is set, and an early-ACK copy that comes back through the dead-letter exchange and
+    fails again is parked instead of cycling. `MaxInFlightDuration` is now `BrokerConsumerTimeout /
+    WorkerSubscriber.PrefetchCount` (prefetched deliveries share the consumer timeout), never below
+    one minute (with durable flows in ack-after-handler mode a startup warning names the largest
+    safe prefetch when the share falls below it), so at the default prefetch in-process timers hop
+    about every minute — `PrefetchCount = 1` restores the full timeout. A durable-flow deployment
+    with a worker `MaxDeliveryAttempts` of 1 warns at startup (a handed-back wake-up returns as
+    attempt 2 and is rejected unrun). A consumer cancel that fails at stop no longer skips the
+    drain, and a delivery arriving after the early-ACK drain began is left for the channel close to
+    requeue instead of being NACKed back to the same consumer. Correlation ids over 255 UTF-8 bytes
+    travel in the header only, a reply target collides with the dead-letter route only on (DLX,
+    routing key), reply targets carry `correlationIdHeader`, the pre-execution cap reject is logged,
+    and a malformed `ConnectionString` or a negative `MaxDeliveryAttempts` fails startup (the error
+    never echoes the connection string).
+  - *Kafka.* The early-ACK queue belongs to the hosted subscriber (a poll-loop fault neither drains
+    nor buries queued work), its drain is split 3/4 + 1/4, and a message whose retry backoff the
+    drain cut short is dead-lettered, not only reported. Detached handlers are revocation-aware: a
+    revoke or loss lifts the pause a partition had behind a detached handler (librdkafka keeps it
+    across re-assignment, so a partition re-assigned to the same member stayed parked for the
+    consumer's life); a partition handed straight back by an eager rebalance keeps its still-running
+    handler and the re-fetched copy waits behind it; a handler whose partition moved on while it ran
+    is orphaned — its offset is never stored (no group rewind), nothing of the new assignment waits
+    behind it, and a stop does not wait for it; a store refused for a revoked partition is logged at
+    Information. `MaxPollInterval` below the consumer's `session.timeout.ms` (classic group
+    protocol) fails startup. Publishing no longer retries `Local_MsgTimedOut`, message/record-size
+    or authorization errors, and dead-letter copies replace a replayed record's earlier burial
+    headers (only when it carries a previous burial set, so user headers of the same names survive)
+    and shorten the exception headers to fit the producer's `message.max.bytes`.
+  - *Azure Service Bus, SQS and Google Pub/Sub.* Service Bus's early-ACK queue now outlives a
+    reconnect as well (a receive fault on a healthy host refused already-completed work as "drain
+    budget lapsed"). Service Bus lock renewal lasts the batch instead of ending at the stop, both of
+    its loops stop starting new work once the host is stopping, unstarted messages are abandoned for
+    a peer, the receiver close is budgeted on every stop path, and a lock reported lost is no longer
+    renewed or warned about on every beat; without renewal, handing back unstarted messages and the
+    receiver close share one `ShutdownTimeout`. SQS and Service Bus worker subscribers read one
+    message per receive in ack-after-handler mode (the broker counts every received message, so a
+    process-killing handler took its batch-mates' receive counts with it; this also removes SQS's
+    stacked visibility windows and FIFO reordering) — `MaxMessagesPerReceive` now applies to early
+    ACK and to the response subscribers, at the cost of more worker receive calls. In
+    ack-after-handler mode Pub/Sub drains running handlers before stopping the client (the SDK's
+    stop handed every leased message back at once, so each in-flight job was redelivered to a peer
+    mid-run on every deploy), waiting up to `BackgroundDrainTimeout`, cut to what the host budget
+    still leaves after `ShutdownTimeout` measured from `ApplicationStopping`, and holding new
+    deliveries until the client stop instead of Nacking them into the live pull (a Nack storm that
+    spent a `DeadLetterPolicy`'s attempts) — a handler parked on an awaited flow response therefore
+    costs a stop up to `BackgroundDrainTimeout` (20 s by default) — and `ShutdownTimeout` is
+    validated in both ack modes. All three hand back a host-stop interruption instead of treating it
+    as a failure (SQS and Service Bus then stop receiving; Pub/Sub holds it for the client stop;
+    under early ACK it is a warning reported through `OnBackgroundFailure`), split the early-ACK
+    drain 3/4 + 1/4 with the dispose itself reporting every entry still queued, and throw the
+    transport-named `ObjectDisposedException` for a publish after dispose even once the first
+    publish cached its sender. Startup validation: SQS collision guards compare two names or two
+    URLs exactly and warn for a name and a URL that share it, Service Bus guards ignore case,
+    `FifoMessageGroupIdFallback` must be a valid group id, names `CreateQueues` would create must
+    pass the SQS name rule, SQS provisioning retries transient failures (client-side ones included —
+    credentials or instance metadata not ready, the SDK's own HTTP timeout) and fails fast on
+    deterministic rejections, and Service Bus `LockRenewalInterval` must be under 5 minutes. SQS
+    short polling backs off between empty receives; SQS and Pub/Sub publish without the correlation
+    attribute when the broker would reject it; Service Bus advertises its 5-minute maximum lock as
+    the in-flight ceiling when renewal is off and warns about `PrefetchCount > 0` in
+    ack-after-handler mode; Pub/Sub reply targets name `correlationIdAttribute` and the
+    subscriber-client build honours the host stop. With durable flows registered, SQS warns at
+    startup that a FIFO worker queue does not order per flow (uncorrelated jobs share one group) and
+    that without `VisibilityTimeout` it advertises the 12-hour maximum rather than the queue's own
+    timeout. SQS's payload limit is 1 MiB since August 2025.
+  - *Subscriber restarts back off as designed.* The supervisor's "a healthy run starts the failure
+    streak over" threshold was drawn once from the half-jittered backoff policy — a random value
+    between half and all of `SubscriberRetryMaxDelay` — so runs that died well short of the maximum
+    reset the streak and reconnected at the base delay up to twice as often as designed, on all ten
+    transports. The threshold is now `SubscriberRetryMaxDelay` itself.
+  - *Test harness and docs.* The delayed-delivery transport contract settles before counting, the
+    batch guards see nested test classes and pin each matrix shard class to its own cells,
+    real-broker tests cover a Kafka rebalance under a detached handler, a RabbitMQ graceful stop
+    during a running job, the NATS delete-marker purge and the Pub/Sub emulator's stop drain, and
+    the integration emulator images are pinned (NATS `2.15`, Service Bus emulator `2.0.1`, Cosmos
+    `vnext-EN20260907`). Docs brought in line with the code: round-42 lease contention and child
+    replay, Redis `CLUSTER NODES`, conformance and batch test counts, the AOT SUT set, `worker.jobs`
+    outcomes, the DynamoDB 400 KB item cap versus the 350 KB `MaxStateBytes` default, Mongo's
+    `$$NOW` due time, the per-table ack sequence, single-row claims, and older `[Unreleased]`
+    entries that later changes had overtaken.
 - **Round-42 review (2026-09-21, whole repository): a live holder is not proof that a second
   delivery is redundant.**
   - *A wake-up is never acknowledged as a duplicate of the job it IS.* Round 40 acknowledged a
@@ -36,8 +408,8 @@ work that has landed on `main` but not yet shipped. Security reporters credited 
     that must wait in process parks in hops inside it — park, checkpoint, publish an immediate
     wake-up, end the delivery — instead of holding one delivery for the whole sleep. New
     `DurableFlowOptions.MaxInProcessParkDuration` shortens the hop or supplies one for a transport
-    that advertises no ceiling. In-process waits also observe host shutdown now: the delivery is
-    handed back for redelivery instead of being killed mid-wait when the shutdown budget lapses.
+    that advertises no ceiling. (Round 42 also claimed in-process waits observed host shutdown; that
+    was wired only in round 43, above.)
   - *Persisted type names are bounded in shape before they are resolved.* Length, generic nesting
     and bracket count are checked — and by-ref/pointer decorations refused — ahead of the resolvers
     and the caches in front of them. The runtime's type-name parser recurses per generic argument,
@@ -709,8 +1081,8 @@ work that has landed on `main` but not yet shipped. Security reporters credited 
   the broker requeued it with `redelivered`) is judged against the cap before executing
   (NATS/database-transport parity). At the cap with `x-death` present — the message has already
   ridden the operator's TTL-retry dead-letter cycle — it is parked terminally: copied to
-  `DeadLetterQueue` through the default exchange (bypassing the cycling DLX) and ACKed, or ACKed
-  and dropped with an error log when no `DeadLetterQueue` is configured; previously the reject
+  `ParkQueue` (or, without one, `DeadLetterQueue`) through the default exchange (bypassing the
+  cycling DLX) and ACKed, or ACKed and dropped with an error log when neither is configured; previously the reject
   re-entered the cycle at TTL rate forever. Startup validation now sums `ShutdownTimeout` twice
   (consumer cancel, then channel/connection close) plus `BackgroundDrainTimeout` against
   `HostShutdownTimeout`.
@@ -795,8 +1167,7 @@ work that has landed on `main` but not yet shipped. Security reporters credited 
   raised after host shutdown was requested (broker clients throw their own connection-closed
   errors, not `OperationCanceledException`; those faulted the `BackgroundService` on every clean
   redeploy). RabbitMQ arms a fresh `ShutdownTimeout` budget for the channel/connection closes
-  after the background drain. The database transports bound the lease-renewal join by
-  `LockTimeout`. Six ACK-after-enqueue dispatchers now dispose their drain token source when a
+  after the background drain. Six ACK-after-enqueue dispatchers now dispose their drain token source when a
   worker faults with something other than a timeout. The in-memory worker transport's retry
   backoff honors the stopping token (a stop during it drops the failing job loudly so the jobs
   queued behind it still drain).
@@ -812,9 +1183,9 @@ work that has landed on `main` but not yet shipped. Security reporters credited 
 - The in-memory channel's `AbandonAsync` (used by `AsyncResponseTestHarness.SimulateRestartAsync`)
   latches cleanup so the zombie waiter's later disposal cannot delete the recovery registration
   the simulated crash must leave behind.
-- `.github/workflows/auto-retry.yml` re-runs a failed `main` run once unconditionally; further
-  re-runs (up to five attempts) need a failed job's log to match a known infrastructure flake
-  signature, so an intermittently failing product bug gets two chances instead of five. Job logs
+- `.github/workflows/auto-retry.yml` re-runs a failed `main` run only when every failed job's log
+  matches a known infrastructure flake signature (up to five attempts), so an intermittently
+  failing product bug is not retried into green. Job logs
   are fetched with `curl` — the runner's `gh` refuses to print a response carrying ANSI colour
   codes, which had silently disabled the gate.
 - **The in-memory channel now faults waiters with the wire failure shape**: `SetException`
@@ -838,8 +1209,7 @@ work that has landed on `main` but not yet shipped. Security reporters credited 
   that lacked it (NATS, RabbitMQ, SQS, Azure Service Bus, Kafka) now stop starting fresh work
   once the drain budget lapses and dead-letter/surface the remainder instead of losing it at
   process exit. Redis's early-ACK dispatcher now enforces `MaxDeliveryAttempts` on reclaimed
-  entries. Kafka's at-the-cap and unprocessable-message burials no longer fault the subscriber
-  when the dead-letter topic is unavailable. RabbitMQ drains the background queue **before**
+  entries. RabbitMQ drains the background queue **before**
   closing the channel (so shutdown-window failures still reach the DLX) and enables publisher
   confirmations on the subscriber channel when a `DeadLetterExchange` is configured (an
   unroutable DLX publish now fails loudly instead of logging a false success). The MongoDB
@@ -1031,14 +1401,14 @@ work that has landed on `main` but not yet shipped. Security reporters credited 
   with `ASYNCRESPONSE_MATRIX_FILTER=PostgreSql+Kafka+MongoDb`. See
   [operations](docs/operations.md#the-provider-cross-product).
 - **`TransportConformanceSuite`** — the worker-transport behavioral contract, the counterpart to the
-  channel contract that already existed. Ten `Contract_*` facts run against all eleven transports:
+  channel contract that already existed. Thirteen `Contract_*` facts run against all eleven transports:
   exactly-once delivery of a successful job, ambient-context restoration, responses published from a
   worker, concurrency, large payloads, redelivery after a transient failure, poison-message bounds,
   early-ACK execution, durability across a consumer outage, and idle-shutdown latency. Previously
   each transport had its own ad-hoc list and none of them covered dead-lettering, redelivery,
   drain, or payload limits. `TransportCapabilities` records where the guarantees come from rather
   than letting the difference become an untested gap: every transport bounds redelivery, but through
-  a subscriber knob on six, the in-process retry budget on the in-memory queue, the queue's redrive
+  a subscriber knob on eight, the in-process retry budget on the in-memory queue, the queue's redrive
   policy on SQS, and the subscription's `DeadLetterPolicy` on Google Pub/Sub. Two constrain the bound
   itself — RabbitMQ cannot count past two without an application-owned TTL-retry cycle, and a Pub/Sub
   `DeadLetterPolicy` rejects anything under five — and payload ceilings differ by two orders of
@@ -1147,8 +1517,8 @@ work that has landed on `main` but not yet shipped. Security reporters credited 
   is reported as a concurrent write instead of a phantom "lost its execution lease", and the
   failure the checkpoint was recording travels as the inner exception instead of being discarded.
 - Lost-subscriber **failure** callbacks are retried in-process (bounded, jittered — same policy as
-  ingress) before the deliberate swallow, so a transient dependency blip no longer silently drops
-  the only delivery of a domain-failure signal.
+  ingress) before the failure is handed back to the transport for redelivery, so a transient
+  dependency blip no longer silently drops the only delivery of a domain-failure signal.
 - The PostgreSQL, SQL Server, and MongoDB transport message dispatchers and correlation-id
   extractors now share one source-included implementation (previously three ~280-line and three
   ~106-line near-verbatim copies). Internal only: rendered log text and telemetry are unchanged,
@@ -1158,8 +1528,8 @@ work that has landed on `main` but not yet shipped. Security reporters credited 
 - Shutdown-budget defaults now fit the .NET host's 30 s `HostOptions.ShutdownTimeout` out of the
   box: `BackgroundDrainTimeout` defaults dropped from 30 s to 20 s on all transports, transport
   `ShutdownTimeout` defaults dropped from 15 s to 5 s where the value is actually consumed (Azure
-  Service Bus, RabbitMQ, Google Pub/Sub, PostgreSQL, MongoDB), and the property was removed on the
-  five transports where nothing consumed it (SQL Server, Kafka, Redis, NATS, SQS). The documented
+  Service Bus, RabbitMQ, Google Pub/Sub, PostgreSQL, MongoDB, SQS), and the property was removed on
+  the four transports where nothing consumed it (SQL Server, Kafka, Redis, NATS). The documented
   early-ACK opt-in (`UseAckAfterEnqueue(workers, capacity)` with stock defaults) previously failed
   the startup budget validation on every transport. The check itself is now one shared
   implementation that sums only the components a transport actually spends during shutdown.
@@ -1234,8 +1604,8 @@ work that has landed on `main` but not yet shipped. Security reporters credited 
 - **A worker job's correlation id is validated before its handler runs.** An id arriving over a
   broker got no portability check, so a padded or over-long one executed the handler and only then
   failed on the implicit response publish — after the side effects, with the transport redelivering
-  to repeat them. It is now rejected up front, which turns the job into an ordinary poison message.
-  A null or blank id still runs: that is a fire-and-forget job with no response to publish.
+  to repeat them. It is now rejected up front: the job is dropped and acknowledged with an Error log
+  and a `rejected` worker outcome, never redelivered. A null or blank id still runs: that is a fire-and-forget job with no response to publish.
 - **MySQL flow-table verification covers the character set and extra columns.** A
   `latin1 COLLATE latin1_bin` flow_id passed the collation check and then rejected most non-Latin
   ids; an extra `NOT NULL` column with no default passed everything and made every create fail,
@@ -1321,7 +1691,7 @@ work that has landed on `main` but not yet shipped. Security reporters credited 
   or synonym failed with raw error 2714. The new verifier — running inside the DDL transaction, so
   under the application lock the SQL Server stores already share — checks object kind, every
   declared column's type and nullability, sequence monotonicity, extra columns that would break
-  inserts, and that identity columns carry a case-sensitive collation, each with remediation in
+  inserts, and that identity columns carry a binary (`_BIN`) collation, each with remediation in
   the message. A collision that breaks the DDL batch before verification can run (an index over
   columns another component's table does not have) is wrapped with the same guidance instead of
   surfacing as a raw `SqlException`.
@@ -1494,8 +1864,8 @@ work that has landed on `main` but not yet shipped. Security reporters credited 
   container boundary, every store also claims its collections in a PERSISTED ledger — one
   atomic upsert per collection into the reserved `asyncresponse_ownership` collection at first
   use — so two independent hosts (or a directly constructed store) sharing a database fail the
-  same way, in either startup order; restarts re-claim idempotently, deployments that disable
-  auto-creation own their provisioning and skip the ledger, and the error text covers removing
+  same way, in either startup order; restarts re-claim idempotently, deployments that cannot
+  write the ledger opt out with `UseOwnershipLedger = false`, and the error text covers removing
   a stale claim after a deliberate reconfiguration. The namespace byte limit is now enforced at
   MongoDB's SHARDED bound (235 bytes, was 255): a 236–255-byte namespace is only valid while
   the collection stays unsharded, and a later shard-enable would strand it.
@@ -1522,8 +1892,8 @@ work that has landed on `main` but not yet shipped. Security reporters credited 
   renewal intervals, the watchdog interval and startup delay, the NATS channel's confirmation
   and probe timeouts that feed `NatsSubOpts.Timeout`) are bounded by the ~49.7-day .NET timer
   ceiling; values that become persisted or server-side "now + value" stamps (DB `LockTimeout`
-  renewal aside, redelivery-delay stamps, dead-letter retention, NATS `AckWait`/NAK delays,
-  Redis XAUTOCLAIM min-idle) carry the 3650-day persistence bound instead — and deliberately
+  renewal aside, redelivery-delay stamps, dead-letter retention, NATS NAK delays) carry the
+  3650-day persistence bound instead — and deliberately
   accept beyond-timer-ceiling values. Client-specific domains are tighter still and enforced
   with their own reasons: the Kafka client passes timeouts as 32-bit milliseconds
   (`OperationTimeout`, `PollTimeout` ≤ ~24.8 days) and librdkafka caps
@@ -1579,15 +1949,14 @@ work that has landed on `main` but not yet shipped. Security reporters credited 
   sequence check. Pinned end-to-end with maximum-length table names on real PostgreSQL and
   SQL Server.
 - **Interval and TTL options are bounded by what the runtime can represent.** Timer-armed knobs
-  (poll/heartbeat intervals, retry delays, step timeouts, lease durations) are validated against
+  (poll/heartbeat intervals, retry delays, step timeouts, lease renew intervals) are validated against
   the ~49.7-day .NET timer ceiling, and persisted-TTL/deadline knobs (retentions, expiries,
   confirmation timeouts, `DurableFlowOptions.StateExpiry`) against a 10-year stamp-arithmetic
   bound — closing the "passes validation, throws mid-operation" family: a `TimeSpan.MaxValue`
   confirmation timeout overflowed AFTER the publisher's insert (reporting failure for a possibly
   delivered response), and an over-ceiling poll interval killed its background loop. The
   in-memory flow store additionally saturates caller-supplied TTL stamps like every external
-  store, and a durable-flow execution lease acquired in the store is released if local lease
-  construction fails.
+  store.
 - **A NATS consume-loop failure during waiter registration now throws instead of returning a
   faulted waiter.** The loop's death faults the response task with a TRANSPORT error — nothing
   was delivered and nothing ever will be — but registration treated any settled task as a

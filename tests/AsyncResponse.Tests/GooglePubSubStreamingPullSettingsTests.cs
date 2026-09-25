@@ -179,7 +179,7 @@ public class GooglePubSubStreamingPullSettingsTests
             Options.Create(options),
             Mock.Of<IAsyncResponseIngress>(),
             NullLogger<GooglePubSubResponseIngressSubscriber>.Instance,
-            (_, _) =>
+            (_, _, _) =>
             {
                 factoryCalled = true;
                 return Task.FromResult<IGooglePubSubSubscriberClient>(null!);

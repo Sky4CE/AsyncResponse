@@ -51,6 +51,42 @@ internal static class NatsTransportOptionsValidator
                 "so longer values fail stream/consumer creation at first use instead of at startup.");
     }
 
+    /// <summary>
+    /// JetStream stream and consumer names are single tokens: no whitespace or control characters,
+    /// no '.', '*' or '>' (subject syntax), and no '/' or '\' (nats-server stores each one as a
+    /// directory). NATS.Net or the server rejects such a name only at first use, inside the
+    /// subscriber retry loop, where it is retried forever as an opaque failure. Derived stream
+    /// names are sanitized already; this guards the explicitly configured ones.
+    /// </summary>
+    private static void EnsureJetStreamName(string? value, string name)
+    {
+        if (string.IsNullOrEmpty(value))
+            return;
+
+        foreach (var c in value)
+        {
+            if (char.IsWhiteSpace(c) || char.IsControl(c) || c is '.' or '*' or '>' or '/' or '\\')
+                throw new InvalidOperationException(
+                    $"{nameof(NatsAsyncResponseTransportOptions)}.{name} '{value}' is not a valid JetStream name: " +
+                    "it must not contain whitespace, control characters, '.', '*', '>', '/' or '\\'.");
+        }
+    }
+
+    /// <summary>
+    /// A NATS header name is printable ASCII without ':' — NATS.Net refuses anything else on every
+    /// publish that carries the header, which the publish retry classified as transient.
+    /// </summary>
+    private static void EnsureHeaderName(string value, string name)
+    {
+        foreach (var c in value)
+        {
+            if (c is < '!' or > '~' or ':')
+                throw new InvalidOperationException(
+                    $"{nameof(NatsAsyncResponseTransportOptions)}.{name} '{value}' is not a valid NATS header name: " +
+                    "use printable ASCII characters other than ':' (no spaces).");
+        }
+    }
+
     private static void EnsureDistinct(string left, string right, string kind, string leftName, string rightName)
     {
         if (StringComparer.Ordinal.Equals(left, right))
@@ -68,6 +104,13 @@ internal static class NatsTransportOptionsValidator
         _ = Required(options.ResponseConsumer, nameof(options.ResponseConsumer));
         _ = Required(options.CorrelationIdHeader, nameof(options.CorrelationIdHeader));
         _ = Required(options.DefaultReplyTargetName, nameof(options.DefaultReplyTargetName));
+
+        EnsureHeaderName(options.CorrelationIdHeader, nameof(options.CorrelationIdHeader));
+        EnsureJetStreamName(options.WorkerStream, nameof(options.WorkerStream));
+        EnsureJetStreamName(options.ResponseStream, nameof(options.ResponseStream));
+        EnsureJetStreamName(options.DeadLetterStream, nameof(options.DeadLetterStream));
+        EnsureJetStreamName(options.WorkerConsumer, nameof(options.WorkerConsumer));
+        EnsureJetStreamName(options.ResponseConsumer, nameof(options.ResponseConsumer));
 
         // A subject prefix becomes leading tokens of every transport subject; it must not contain
         // whitespace, the NATS subject wildcards, or an empty token.
@@ -166,12 +209,37 @@ internal static class NatsTransportOptionsValidator
             return;
 
         // NATS subscribers spend only the background drain at shutdown; the consume loop stops
-        // with the host token and the connection teardown is not separately bounded.
+        // with the host token and the connection teardown is not separately bounded. The worker
+        // and response subscribers are two hosted services, and the host stops them ONE AFTER THE
+        // OTHER (HostOptions.ServicesStopConcurrently defaults to false) inside one shutdown
+        // budget — each drain validated alone let two 20 s drains pass against 30 s, and the
+        // second one was cut off with its already-ACKed jobs still queued. With both roles in
+        // early ACK their drains are summed.
+        var drain = ($"{nameof(NatsSubscriberOptions)}.{nameof(subscriber.BackgroundDrainTimeout)} ({role})", subscriber.BackgroundDrainTimeout);
+        var (other, otherRole) = role switch
+        {
+            nameof(NatsSubscriberRole.Worker) => (transportOptions.ResponseSubscriber, nameof(NatsSubscriberRole.ResponseIngress)),
+            nameof(NatsSubscriberRole.ResponseIngress) => (transportOptions.WorkerSubscriber, nameof(NatsSubscriberRole.Worker)),
+            _ => (null, null)
+        };
+
+        (string, TimeSpan)[] components;
+        if (other is { AckMode: NatsAckMode.AckAfterEnqueue } && !ReferenceEquals(other, subscriber))
+        {
+            // Validated first so the sum below only ever adds timer-backed values.
+            ValidateSubscriber(other, otherRole!);
+            components = [drain, ($"{nameof(NatsSubscriberOptions)}.{nameof(other.BackgroundDrainTimeout)} ({otherRole})", other.BackgroundDrainTimeout)];
+        }
+        else
+        {
+            components = [drain];
+        }
+
         ShutdownBudgetValidator.Validate(
             "NATS",
             $"{nameof(NatsAsyncResponseTransportOptions)}.{nameof(transportOptions.HostShutdownTimeout)}",
             transportOptions.HostShutdownTimeout,
-            ($"{nameof(NatsSubscriberOptions)}.{nameof(subscriber.BackgroundDrainTimeout)} ({role})", subscriber.BackgroundDrainTimeout));
+            components);
     }
 
     /// <summary>Validates the supplied options.</summary>

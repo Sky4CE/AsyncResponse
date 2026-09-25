@@ -1011,6 +1011,42 @@ public abstract class ChannelConformanceSuite
     }
 
     [Fact]
+    public async Task Contract_TimeoutWhileDeliveryWedged_FaultsAsIndeterminate()
+    {
+        // The waiter's own timeout drains an in-flight delivery exactly as disposal does, bounded
+        // by the same DisposalDrainTimeout. Unbounded (the in-memory channel before round 42), a
+        // wedged Until predicate held the timeout forever and the wait never ended; reported as a
+        // plain TimeoutException, a consumed response would read as "never delivered".
+        await using var harness = await CreateHarnessAsync(
+            options => options.DisposalDrainTimeout = TimeSpan.FromSeconds(1));
+        var correlationId = NewCorrelationId("timeout-wedged");
+        using var predicateEntered = new SemaphoreSlim(0);
+        using var releasePredicate = new SemaphoreSlim(0);
+
+        // The timeout is Generous so it fires only once the delivery is inside the predicate on
+        // every channel (polling ones included); the predicate stays wedged past timeout + drain.
+        var waiter = await harness.Subscriber.CreateResponseWaiter<ConformanceResult>(
+            correlationId,
+            async _ =>
+            {
+                predicateEntered.Release();
+                return await releasePredicate.WaitAsync(WaitBudget + WaitBudget);
+            },
+            timeout: Generous);
+
+        var publish = harness.Publisher.SetResponse(Result(ConformanceStatus.Completed, "wedged"), correlationId);
+        Assert.True(await predicateEntered.WaitAsync(WaitBudget), "the delivery never reached the Until predicate");
+
+        var fault = await Assert.ThrowsAsync<AsyncResponseIndeterminateDeliveryException>(
+            () => waiter.ResponseTask.WaitAsync(WaitBudget + WaitBudget));
+        Assert.Equal(correlationId, fault.CorrelationId);
+
+        releasePredicate.Release();
+        await publish.WaitAsync(WaitBudget);
+        await waiter.DisposeAsync();
+    }
+
+    [Fact]
     public async Task Contract_UnsupportedTimeout_FailsFastWithoutSideEffects()
     {
         // One timeout rule on every channel: positive (zero used to be accepted by some channels

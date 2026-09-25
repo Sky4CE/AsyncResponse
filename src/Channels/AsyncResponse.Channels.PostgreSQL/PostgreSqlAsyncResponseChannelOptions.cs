@@ -76,9 +76,13 @@ public sealed class PostgreSqlAsyncResponseChannelOptions : DurableAsyncResponse
     /// tick with W in-flight waiters. On this provider the sweep only covers wake notifications
     /// lost in failure windows (NOTIFY carries normal delivery), so this bounds idle
     /// database load without touching normal delivery latency — it stretches only the worst-case
-    /// recovery of a LOST wake. Default: 5 seconds (an unbounded null swept every waiter on every
-    /// 250 ms tick — W sequential queries per tick of pure idle load). Set null to sweep on every
-    /// poll tick.
+    /// recovery of a LOST wake. It applies only while a <c>LISTEN</c> is established: before the
+    /// first one and from a listen-connection failure until the next successful <c>LISTEN</c> the
+    /// sweep is the only cross-process wake and runs every
+    /// <c>min(FullSweepInterval, DeliveryConfirmationTimeout / 4)</c> (1.25 s on defaults), and
+    /// each (re)established <c>LISTEN</c> triggers one immediate full sweep. Default: 5 seconds
+    /// (an unbounded null swept every waiter on every 250 ms tick — W sequential queries per tick
+    /// of pure idle load). Set null to sweep on every poll tick.
     /// </summary>
     public TimeSpan? FullSweepInterval { get; set; } = TimeSpan.FromSeconds(5);
 

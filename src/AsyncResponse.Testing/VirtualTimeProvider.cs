@@ -157,22 +157,20 @@ public sealed class VirtualTimeProvider : TimeProvider
         }
     }
 
-    internal void Schedule(VirtualTimer timer)
+    /// <summary>
+    /// Advances every time a timer is ARMED — created with a due time, re-armed by
+    /// <see cref="ITimer.Change"/>, or re-armed by a periodic fire — and never when one is disposed
+    /// or fires for the last time. The harness's settle reads it beside <see cref="NextTimerDueAt"/>
+    /// to tell "a job just began a virtual-time wait" apart from a timer going away, which moves
+    /// the earliest due time too.
+    /// </summary>
+    internal long ArmSequence
     {
-        lock (_gate)
-            _armed.Add(timer);
-    }
-
-    internal void Unschedule(VirtualTimer timer)
-    {
-        lock (_gate)
-            _armed.Remove(timer);
-    }
-
-    internal long NextSequence()
-    {
-        lock (_gate)
-            return _sequence++;
+        get
+        {
+            lock (_gate)
+                return _sequence;
+        }
     }
 
     /// <inheritdoc/>

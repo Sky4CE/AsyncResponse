@@ -66,9 +66,10 @@ public sealed class PostgreSqlDurableFlowOptions : DurableFlowOptions
     public bool AutoCreateSchema { get; set; } = true;
 
     /// <summary>
-    /// How often <see cref="PostgreSqlFlowStateStore.TryCreateAsync"/> opportunistically deletes one
-    /// bounded batch (1000 rows) of expired rows (loads already treat expired state as absent;
-    /// pruning bounds table growth). Zero or negative prunes on every save. Default: 5 minutes.
+    /// How often <see cref="PostgreSqlFlowStateStore.TryCreateAsync"/> opportunistically runs a
+    /// budgeted prune of expired rows: batches of 1000 until one comes back short or
+    /// <see cref="PruneBudget"/> lapses (loads already treat expired state as absent; pruning
+    /// bounds table growth). Zero or negative prunes on every save. Default: 5 minutes.
     /// </summary>
     public TimeSpan PruneInterval { get; set; } = TimeSpan.FromMinutes(5);
 
@@ -165,7 +166,7 @@ public sealed class PostgreSqlFlowStateStore : IFlowStateStore, IDisposable, IAs
         var stateJson = DurableFlowStoreShared.SerializeBounded(flowId, state, _options.MaxStateBytes, "PostgreSQL");
         await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
         if (DurableFlowStoreShared.ShouldPrune(ref _lastPruneTicks, _options.PruneInterval))
-            await DurableFlowStoreShared.PruneQuietlyAsync(() => PruneExpiredAsync(cancellationToken), _options.PruneBudget, "PostgreSQL", _logger).ConfigureAwait(false);
+            await DurableFlowStoreShared.PruneQuietlyAsync(() => PruneExpiredAsync(cancellationToken), _options.PruneBudget, "PostgreSQL", _logger, cancellationToken).ConfigureAwait(false);
 
         await using var connection = await _dataSource.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         await using var command = connection.CreateCommand();
@@ -386,25 +387,25 @@ public sealed class PostgreSqlFlowStateStore : IFlowStateStore, IDisposable, IAs
             // an operator-provisioned table can carry the wrong shape. Verify against the catalog
             // that both relations actually ARE what this store reads and writes, definitions
             // included (under the shared DDL lock when this build just ran the DDL).
-            await AsyncResponse.Internal.PostgreSqlRelationVerifier.VerifyAsync(
+            var absent = await AsyncResponse.Internal.PostgreSqlRelationVerifier.VerifyAsync(
                 connection,
                 transaction,
                 _options.SchemaName,
                 "durable-flow",
-                [
-                    new(_options.TableName, 'r', Columns:
-                        [
-                            new("flow_id", "text", Nullable: false, RequiresDeterministicCollation: true),
-                            new("state_json", "text", Nullable: false),
-                            new("expires_at_utc", "timestamp with time zone", Nullable: false),
-                            new("updated_at_utc", "timestamp with time zone", Nullable: false),
-                            new("revision", "bigint", Nullable: false, DefaultExpression: "0"),
-                            new("lease_id", "text", Nullable: true),
-                            new("lease_expires_at_utc", "timestamp with time zone", Nullable: true),
-                        ], PrimaryKey: ["flow_id"]),
-                    new(DurableFlowStoreShared.DerivedName(_options.TableName, "_expires_idx", 63), 'i', _options.TableName, ["expires_at_utc"]),
-                ],
+                ExpectedRelations(_options),
                 cancellationToken).ConfigureAwait(false);
+            // The verifier matches the index by NAME, so all this knows is that {table}_expires_idx
+            // is absent — an operator's migration may carry the same index under another name.
+            foreach (var index in absent)
+            {
+                _logger?.LogWarning(
+                    "PostgreSQL durable-flow table {Schema}.{Table} has no index named {Index} and AutoCreateSchema is disabled. " +
+                    "If an index on (expires_at_utc) exists under another name, prunes use it and nothing needs doing; otherwise " +
+                    "each prune batch scans for expired rows — performance only; create one as described in docs/durable-flow-state-stores.md.",
+                    _options.SchemaName,
+                    _options.TableName,
+                    index);
+            }
 
             await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
             _created = true;
@@ -414,6 +415,35 @@ public sealed class PostgreSqlFlowStateStore : IFlowStateStore, IDisposable, IAs
             _ensureGate.Release();
         }
     }
+
+    /// <summary>
+    /// The catalog shape this store needs. The expiry index is REQUIRED only where this build's DDL
+    /// just guaranteed it (<see cref="PostgreSqlDurableFlowOptions.AutoCreateSchema"/>); on an
+    /// operator-managed schema it is verified when present and only warned about when absent —
+    /// it is prune performance, not correctness (loads filter on expiry either way), and a table
+    /// whose migration tool named or omitted it differently must not fail every operation.
+    /// <c>revision</c> declares no expected default: every insert names the column, so no default
+    /// is load-bearing, and requiring the DDL's <c>DEFAULT 0</c> refused an operator table that
+    /// declares <c>bigint NOT NULL</c> without one.
+    /// </summary>
+    internal static AsyncResponse.Internal.PostgreSqlRelationVerifier.ExpectedRelation[] ExpectedRelations(PostgreSqlDurableFlowOptions options)
+        =>
+        [
+            new(options.TableName, 'r', Columns:
+                [
+                    new("flow_id", "text", Nullable: false, RequiresDeterministicCollation: true),
+                    new("state_json", "text", Nullable: false),
+                    new("expires_at_utc", "timestamp with time zone", Nullable: false),
+                    new("updated_at_utc", "timestamp with time zone", Nullable: false),
+                    new("revision", "bigint", Nullable: false),
+                    new("lease_id", "text", Nullable: true),
+                    new("lease_expires_at_utc", "timestamp with time zone", Nullable: true),
+                ], PrimaryKey: ["flow_id"]),
+            new(DurableFlowStoreShared.DerivedName(options.TableName, "_expires_idx", 63), 'i', options.TableName, ["expires_at_utc"])
+            {
+                Optional = !options.AutoCreateSchema
+            },
+        ];
 
     /// <summary>
     /// Reports whether ANY relation occupies the configured name (any relkind: a view or foreign

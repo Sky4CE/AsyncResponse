@@ -72,6 +72,7 @@ AsyncResponse.Transports.AzureServiceBus.AzureServiceBusSubscriberOptions.UseAck
 AsyncResponse.Transports.AzureServiceBus.AzureServiceBusWorkerTransport
 AsyncResponse.Transports.AzureServiceBus.AzureServiceBusWorkerTransport.AzureServiceBusWorkerTransport(Microsoft.Extensions.Options.IOptions<AsyncResponse.Transports.AzureServiceBus.AzureServiceBusAsyncResponseOptions!>! options) -> void
 AsyncResponse.Transports.AzureServiceBus.AzureServiceBusWorkerTransport.DisposeAsync() -> System.Threading.Tasks.ValueTask
+AsyncResponse.Transports.AzureServiceBus.AzureServiceBusWorkerTransport.MaxInFlightDuration.get -> System.TimeSpan?
 AsyncResponse.Transports.AzureServiceBus.AzureServiceBusWorkerTransport.MaxPublishDelay.get -> System.TimeSpan
 AsyncResponse.Transports.AzureServiceBus.AzureServiceBusWorkerTransport.PublishAsync(AsyncResponse.WorkerJobEnvelope! job, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task!
 AsyncResponse.Transports.AzureServiceBus.AzureServiceBusWorkerTransport.PublishAsync(AsyncResponse.WorkerJobEnvelope! job, System.TimeSpan delay, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task!

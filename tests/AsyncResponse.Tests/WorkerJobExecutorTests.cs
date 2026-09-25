@@ -1,3 +1,4 @@
+using AsyncResponse.Testing;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
@@ -155,14 +156,23 @@ public class WorkerJobExecutorTests
     {
         var probe = new WorkerProbe();
         var provider = new ServiceCollection().AddSingleton<IWorkerProbe>(probe).BuildServiceProvider();
-        var transport = new InMemoryWorkerTransport();
+
+        // The failed job rides the whole default retry ladder (5 attempts, 100/200/400/800 ms of
+        // backoff) before the job behind it can run. On the system clock that was ~1.5 s of REAL
+        // sleep inside a 2 s real-time window, so the test failed whenever the machine was loaded.
+        // The backoff now runs on a virtual clock the test moves itself: it elapses exactly when
+        // advanced, whatever the load.
+        var clock = new VirtualTimeProvider();
+        var logger = new CollectingLogger();
+        var transport = new InMemoryWorkerTransport(Options.Create(new InMemoryWorkerTransportOptions()), clock);
         var executor = new WorkerJobExecutor(
             provider.GetRequiredService<IServiceScopeFactory>(),
             NullLogger<WorkerJobExecutor>.Instance);
         var host = new InMemoryWorkerHost(
             transport,
             executor,
-            NullLogger<InMemoryWorkerHost>.Instance);
+            logger.For<InMemoryWorkerHost>(),
+            clock);
 
         var flow = ExecutionContext.SuppressFlow();
         try
@@ -194,10 +204,22 @@ public class WorkerJobExecutorTests
             flow.Undo();
         }
 
+        var start = clock.GetUtcNow();
         await host.StartAsync(CancellationToken.None);
         try
         {
-            await WaitUntilAsync(() => probe.SeenCorrelationId == "cid-direct");
+            // Step the virtual clock to each backoff timer as the ladder arms it. The real-time
+            // bound is only a hang guard: no amount of load can make a backoff elapse early or
+            // late, so nothing here races the wall clock.
+            var guard = DateTime.UtcNow + TimeSpan.FromSeconds(10);
+            while (probe.SeenCorrelationId != "cid-direct")
+            {
+                Assert.True(DateTime.UtcNow < guard, $"the job behind the failed one never ran. Logged: {string.Join(" | ", logger.Messages)}");
+                if (clock.NextTimerDueAt is { } due)
+                    clock.AdvanceTo(due);
+                else
+                    await Task.Delay(TimeSpan.FromMilliseconds(1));
+            }
         }
         finally
         {
@@ -205,20 +227,147 @@ public class WorkerJobExecutorTests
         }
 
         Assert.Equal("cid-direct", probe.SeenCorrelationId);
+
+        // The failed job was retried to the end of its budget and dropped — the worker loop kept
+        // serving — and every backoff was spent on the virtual clock: exactly 100+200+400+800 ms.
+        Assert.Contains(logger.Messages, message => message.Contains("failed after 5 attempts; dropping it", StringComparison.Ordinal));
+        Assert.Equal(TimeSpan.FromMilliseconds(1500), clock.GetUtcNow() - start);
     }
 
-    private static async Task WaitUntilAsync(Func<bool> condition)
+    public interface IExecutorEdgeProbe
     {
-        var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(2);
-        while (DateTime.UtcNow < deadline)
+        Task InterruptedAsync();
+
+        Task ObserveSkewMarkerAsync();
+    }
+
+    private sealed class ExecutorEdgeProbe : IExecutorEdgeProbe
+    {
+        public bool? SawForcedEarly { get; private set; }
+
+        public Task InterruptedAsync()
+            => throw new DurableFlowInterruptedException("Host is stopping; the delivery is handed back.");
+
+        public Task ObserveSkewMarkerAsync()
         {
-            if (condition())
+            SawForcedEarly = WorkerJobSkewScope.IsForcedEarlyExecution;
+            return Task.CompletedTask;
+        }
+    }
+
+    private static WorkerJobEnvelope EdgeJob(string method, string correlationId) => new()
+    {
+        CorrelationId = correlationId,
+        Call = new ReflectionCallDto
+        {
+            ServiceInterfaceFullName = typeof(IExecutorEdgeProbe).FullName!,
+            MethodName = method,
+            Params = []
+        }
+    };
+
+    [Fact]
+    public async Task DurableFlowInterruption_PropagatesWithoutAFailedOutcomeOrAnErrorSpan()
+    {
+        // Regression (fixpoint r1): the flow engine's host-stop hand-back is a cancellation by
+        // contract, yet the shared executor counted it as a `failed` job and marked its span as
+        // an error — on every parked flow of every deploy, on every transport.
+        var probe = new ExecutorEdgeProbe();
+        await using var provider = new ServiceCollection().AddSingleton<IExecutorEdgeProbe>(probe).BuildServiceProvider();
+        var executor = new WorkerJobExecutor(provider.GetRequiredService<IServiceScopeFactory>(), NullLogger<WorkerJobExecutor>.Instance);
+
+        using var activities = new AsyncResponseActivityCollector();
+        var traceId = System.Diagnostics.Activity.Current!.TraceId;
+        var outcomes = new List<string?>();
+        using var listener = new System.Diagnostics.Metrics.MeterListener
+        {
+            InstrumentPublished = (instrument, l) =>
+            {
+                if (instrument.Meter.Name == AsyncResponseDiagnostics.MeterName && instrument.Name == "asyncresponse.worker.jobs")
+                    l.EnableMeasurementEvents(instrument);
+            }
+        };
+        listener.SetMeasurementEventCallback<long>((_, _, tags, _) =>
+        {
+            // This test's own trace only: the meter is process-wide and other tests run alongside.
+            if (System.Diagnostics.Activity.Current?.TraceId != traceId)
                 return;
 
-            await Task.Delay(20);
+            foreach (var tag in tags)
+            {
+                if (tag.Key == "outcome")
+                    lock (outcomes) outcomes.Add(tag.Value as string);
+            }
+        });
+        listener.Start();
+
+        await Assert.ThrowsAsync<DurableFlowInterruptedException>(() =>
+            executor.ExecuteAsync(EdgeJob(nameof(IExecutorEdgeProbe.InterruptedAsync), "cid-interrupted")));
+
+        lock (outcomes) Assert.DoesNotContain("failed", outcomes);
+        var span = activities.Single("asyncresponse.worker.execute", "asyncresponse.correlation_id", "cid-interrupted");
+        Assert.NotEqual(System.Diagnostics.ActivityStatusCode.Error, span.Status);
+    }
+
+    [Fact]
+    public async Task EveryJob_StartsWithoutTheSkewMarkerItsEnqueuerHeld()
+    {
+        // Regression (fixpoint r1): the in-memory transport runs a job under its ENQUEUER's
+        // captured execution context, and unlike WorkerJobScope the skew marker was not cleared
+        // per job — a follow-up published by a job the stall guard released early inherited the
+        // unconsumed marker, and a durable timer in it spent the one-shot proof.
+        var probe = new ExecutorEdgeProbe();
+        await using var provider = new ServiceCollection().AddSingleton<IExecutorEdgeProbe>(probe).BuildServiceProvider();
+        var executor = new WorkerJobExecutor(provider.GetRequiredService<IServiceScopeFactory>(), NullLogger<WorkerJobExecutor>.Instance);
+
+        using (WorkerJobSkewScope.Enter())
+        {
+            Assert.True(WorkerJobSkewScope.IsForcedEarlyExecution);
+            await executor.ExecuteAsync(EdgeJob(nameof(IExecutorEdgeProbe.ObserveSkewMarkerAsync), "cid-unmarked"));
+            // The caller's own marker is untouched.
+            Assert.True(WorkerJobSkewScope.IsForcedEarlyExecution);
         }
 
-        throw new TimeoutException("Condition was not met in time.");
+        Assert.False(probe.SawForcedEarly);
+    }
+
+    [Fact]
+    public async Task UntrustedNamesAndIds_AreEscapedInTheExecutorsLogLines()
+    {
+        // Regression (fixpoint r1): the executor quoted wire text raw — the correlation id of a
+        // schema-rejected job (logged at Warning before the portability check ever ran) and the
+        // still-unresolved target type and method of a job about to execute — so a CR/LF in any
+        // of them ended the real log line and started a forged one.
+        var logger = new CollectingLogger();
+        await using var provider = new ServiceCollection().BuildServiceProvider();
+        var executor = new WorkerJobExecutor(provider.GetRequiredService<IServiceScopeFactory>(), logger.For<WorkerJobExecutor>());
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() => executor.ExecuteAsync(new WorkerJobEnvelope
+        {
+            SchemaVersion = WorkerJobEnvelopeSchema.Current + 1,
+            Call = new ReflectionCallDto { ServiceInterfaceFullName = "Svc", MethodName = "M", Params = [] },
+            CorrelationId = "cid\r\nFORGED schema entry"
+        }));
+
+        await Assert.ThrowsAnyAsync<Exception>(() => executor.ExecuteAsync(new WorkerJobEnvelope
+        {
+            Call = new ReflectionCallDto
+            {
+                ServiceInterfaceFullName = "My.IService\r\nFORGED type entry",
+                MethodName = "Run\nFORGED method entry",
+                Params = []
+            },
+            CorrelationId = "cid-escaped",
+            ReplyTarget = new AsyncResponseReplyTarget { Name = "reply\r\nFORGED target entry", Transport = "test", Address = "test://reply" }
+        }));
+
+        Assert.Contains(logger.Messages, message => message.Contains("unsupported schema version", StringComparison.Ordinal));
+        Assert.Contains(logger.Messages, message => message.Contains("Executing worker job", StringComparison.Ordinal));
+        Assert.All(logger.Messages, message =>
+        {
+            Assert.DoesNotContain('\r', message);
+            Assert.DoesNotContain('\n', message);
+        });
     }
 
     private static WorkerJobEnvelope CreateJob(string correlationId)

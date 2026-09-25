@@ -29,4 +29,33 @@ internal sealed class DurableFlowRegistration
 
     /// <summary>Invokes <c>((TFlow)flow).ExecuteAsync(context, (TInput)input)</c> statically.</summary>
     public required Func<object, IDurableFlowContext, object?, Task> ExecuteAsync { get; init; }
+
+    /// <summary>
+    /// Whether two serialized inputs of this flow hold the same VALUE, whatever shape a serializer
+    /// once gave them (see <see cref="FlowStateJson.InputEquivalent{TInput}"/>): both sides are read
+    /// through <see cref="DeserializeInput"/> and written back the same way, so a member added to
+    /// the input type since one of them was written does not make them differ. A side this build
+    /// cannot read is a mismatch, never an exception.
+    /// </summary>
+    public bool InputEquivalent(string? persisted, string requested)
+    {
+        if (FlowStateJson.JsonEquivalent(persisted, requested))
+            return true;
+        if (persisted is null)
+            return false;
+
+        try
+        {
+            return FlowStateJson.JsonEquivalent(Normalize(persisted), Normalize(requested));
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            return false;
+        }
+    }
+
+    // Written back by the runtime type — the one this registration's typed read produced — on
+    // BOTH sides, so the normalization is symmetric even where it differs from a declared-type write.
+    private string Normalize(string json)
+        => DeserializeInput(json) is { } value ? AsyncResponseJson.Serialize(value, value.GetType()) : "null";
 }

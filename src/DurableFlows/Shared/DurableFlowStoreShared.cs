@@ -35,13 +35,18 @@ internal static class DurableFlowStoreShared
     /// skipped prune costs nothing but disk until the next interval. The outcome is never silent:
     /// deleted rows, a lapsed budget with rows remaining, and failures are counted on the
     /// <c>AsyncResponse</c> meter and logged when the store has a logger. Cancellation still
-    /// propagates.
+    /// propagates — including a cancellation the driver reports as its own exception
+    /// (SqlClient's "Operation cancelled by user" <c>SqlException</c>, ODP.NET's ORA-01013), which
+    /// is told apart from a failure by <paramref name="cancellationToken"/> and surfaces as an
+    /// <see cref="OperationCanceledException"/>: counted as a prune failure and logged as "the
+    /// flow creation it rode on is unaffected", it misreported a create that was being cancelled.
     /// </summary>
     /// <param name="pruneBatch">Deletes one batch and returns the rows it deleted.</param>
     /// <param name="budget">Wall-clock budget for batches after the first.</param>
     /// <param name="providerName">Metric/log tag for the store ("PostgreSQL", "SQL Server", …).</param>
     /// <param name="logger">The store's logger when DI supplied one.</param>
-    public static async Task PruneQuietlyAsync(Func<Task<int>> pruneBatch, TimeSpan budget, string providerName, ILogger? logger)
+    /// <param name="cancellationToken">The token the batches run under — the create's own.</param>
+    public static async Task PruneQuietlyAsync(Func<Task<int>> pruneBatch, TimeSpan budget, string providerName, ILogger? logger, CancellationToken cancellationToken)
     {
         var started = Stopwatch.GetTimestamp();
         var deleted = 0L;
@@ -72,6 +77,11 @@ internal static class DurableFlowStoreShared
         {
             AsyncResponseDiagnostics.RecordFlowStatePruned(providerName, deleted);
             throw;
+        }
+        catch (Exception ex) when (cancellationToken.IsCancellationRequested)
+        {
+            AsyncResponseDiagnostics.RecordFlowStatePruned(providerName, deleted);
+            throw new OperationCanceledException($"The {providerName} durable-flow prune was cancelled.", ex, cancellationToken);
         }
         catch (Exception ex)
         {
@@ -156,12 +166,21 @@ internal static class DurableFlowStoreShared
         if (leaseId is null)
             return FlowLeaseObservation.Unheld;
 
-        return new FlowLeaseObservation(
-            leaseId,
-            leaseExpiresAt is { } expiry
-                ? expiry.Kind == DateTimeKind.Local ? expiry.ToUniversalTime() : DateTime.SpecifyKind(expiry, DateTimeKind.Utc)
-                : null);
+        return new FlowLeaseObservation(leaseId, AsUtc(leaseExpiresAt));
     }
+
+    /// <summary>
+    /// A persisted UTC instant as the driver or serializer handed it back, stamped
+    /// <see cref="DateTimeKind.Utc"/>: a <see cref="DateTimeKind.Local"/> value (local ticks) is
+    /// converted, anything else keeps its ticks. <see cref="DateTime"/> comparison ignores the
+    /// kind, so a value compared with <see cref="DateTime.UtcNow"/> must be normalized first.
+    /// </summary>
+    public static DateTime AsUtc(DateTime instant)
+        => instant.Kind == DateTimeKind.Local ? instant.ToUniversalTime() : DateTime.SpecifyKind(instant, DateTimeKind.Utc);
+
+    /// <inheritdoc cref="AsUtc(DateTime)"/>
+    public static DateTime? AsUtc(DateTime? instant)
+        => instant is { } value ? AsUtc(value) : null;
 
     /// <summary>
     /// The ledger has exactly ONE wire format: Core's <c>FlowStateJson</c> (source-generated
@@ -258,16 +277,34 @@ internal static class DurableFlowStoreShared
     /// Throttles opportunistic expired-state pruning: returns <c>true</c> at most once per
     /// <paramref name="interval"/> (a non-positive interval prunes on every operation, matching the
     /// channel packages). Loads already filter on expiry, so throttling never affects correctness.
+    /// <para>
+    /// <paramref name="lastStamp"/> holds a <see cref="Stopwatch.GetTimestamp"/> value, 0 meaning
+    /// "never pruned" (the first call always prunes, however recently the machine booted — the
+    /// monotonic clock counts from boot). Elapsed time is measured on that monotonic clock: the
+    /// wall-clock stamp this used to keep was left AHEAD of the clock by a backward step (a VM
+    /// snapshot restore, an NTP correction), which suspended every prune on the process for the
+    /// size of the step. A stamp ahead of the clock can no longer arise, and is treated as elapsed
+    /// rather than waited out if it ever does.
+    /// </para>
     /// </summary>
-    public static bool ShouldPrune(ref long lastTicks, TimeSpan interval)
+    public static bool ShouldPrune(ref long lastStamp, TimeSpan interval)
     {
         if (interval <= TimeSpan.Zero)
             return true;
 
-        var now = DateTime.UtcNow.Ticks;
-        var last = Interlocked.Read(ref lastTicks);
-        return now - last >= interval.Ticks
-            && Interlocked.CompareExchange(ref lastTicks, now, last) == last;
+        // The stamp is read BEFORE the clock: a peer's stamp was taken before it was published,
+        // so the clock read afterwards is never behind it, and a negative elapsed time can only
+        // be a stamp this clock never produced.
+        var last = Interlocked.Read(ref lastStamp);
+        var now = Stopwatch.GetTimestamp();
+        if (last != 0)
+        {
+            var elapsed = Stopwatch.GetElapsedTime(last, now);
+            if (elapsed >= TimeSpan.Zero && elapsed < interval)
+                return false;
+        }
+
+        return Interlocked.CompareExchange(ref lastStamp, now == 0 ? 1 : now, last) == last;
     }
 
     /// <summary>

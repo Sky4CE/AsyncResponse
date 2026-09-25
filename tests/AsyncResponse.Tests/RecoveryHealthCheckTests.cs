@@ -179,6 +179,28 @@ public class RecoveryHealthCheckTests
         Assert.Equal(true, result.Data["scanning"]);
     }
 
+    [Fact]
+    public void SnapshotPastTwiceTheInterval_WithinTheJitterSlack_StaysHealthy()
+    {
+        // A healthy next snapshot lands up to Interval + jitter + scan duration after the last
+        // one. Pre-fix the budget was a bare 2 x Interval, so at the maximum legal jitter
+        // (IntervalJitter == Interval) any draw near the bound plus a scan of a few seconds read
+        // as "stopped reporting" while the watchdog was doing exactly what it was configured to.
+        var startedUtc = new DateTime(2026, 6, 11, 12, 0, 0, DateTimeKind.Utc);
+        var state = new AsyncResponseWatchdogState();
+        state.MarkScanning(startedUtc, startupDelay: TimeSpan.Zero, interval: Interval, intervalJitter: Interval);
+        var lastScan = new AsyncResponseWatchdogSnapshot(startedUtc, Interval, CleanReport(0, 0), Error: null);
+
+        var withinSlack = AsyncResponseRecoveryHealthCheck.Evaluate(
+            lastScan, state.Activation, utcNow: startedUtc + Interval * 2 + TimeSpan.FromSeconds(5));
+        var pastSlack = AsyncResponseRecoveryHealthCheck.Evaluate(
+            lastScan, state.Activation, utcNow: startedUtc + Interval * 3 + TimeSpan.FromSeconds(1));
+
+        Assert.Equal(HealthStatus.Healthy, withinSlack.Status);
+        Assert.Equal(HealthStatus.Degraded, pastSlack.Status);
+        Assert.Contains("stopped reporting", pastSlack.Description!, StringComparison.Ordinal);
+    }
+
     private static async Task<HealthCheckResult> CheckAsync(Action<AsyncResponseWatchdogState> arrange)
     {
         var state = new AsyncResponseWatchdogState();

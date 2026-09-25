@@ -488,6 +488,36 @@ public sealed class SqlServerDispatcherTests
             "Worker");
     }
 
+    /// <summary>
+    /// Regression: each early-ACK subscriber was checked ALONE against the host budget, but the host
+    /// stops hosted services one after another (default <c>ServicesStopConcurrently = false</c>), so
+    /// with BOTH roles early-ACK the response subscriber's drain ran first
+    /// and the worker's drain got only what was left — stock defaults passed per role while
+    /// already-ACKed rows were abandoned mid-drain. Both roles' spends are now summed.
+    /// </summary>
+    [Fact]
+    public void ValidateSubscriber_BothRolesEarlyAck_SumBothDrainsAgainstTheHostBudget()
+    {
+        var options = new SqlServerAsyncResponseTransportOptions
+        {
+            ConnectionString = "Server=localhost;Database=unused;User ID=sa;Password=unused;TrustServerCertificate=True",
+        };
+        options.WorkerSubscriber.UseAckAfterEnqueue(4, 256);
+        options.ResponseSubscriber.UseAckAfterEnqueue(2, 64);
+
+        var ex = Assert.Throws<InvalidOperationException>(() =>
+            SqlServerTransportOptionsValidator.ValidateSubscriber(options, options.WorkerSubscriber, "Worker"));
+        Assert.Contains("(Worker)", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("(ResponseIngress)", ex.Message, StringComparison.Ordinal);
+
+        // A budget that fits the sum passes, and so does a single early-ACK role on stock defaults.
+        options.HostShutdownTimeout = TimeSpan.FromSeconds(60);
+        SqlServerTransportOptionsValidator.ValidateSubscriber(options, options.ResponseSubscriber, "ResponseIngress");
+        options.HostShutdownTimeout = TimeSpan.FromSeconds(30);
+        options.ResponseSubscriber.AckMode = SqlServerAckMode.AckAfterHandlerCompletes;
+        SqlServerTransportOptionsValidator.ValidateSubscriber(options, options.WorkerSubscriber, "Worker");
+    }
+
     [Fact]
     public void ValidateSubscriber_NonPositiveHostShutdownTimeout_Throws()
     {
@@ -631,7 +661,7 @@ public sealed class SqlServerDispatcherTests
                 calls.DeadLettered.TrySetResult();
                 return ValueTask.FromResult(calls.DeadLetterResult);
             },
-            () =>
+            _ =>
             {
                 calls.Renew++;
                 return ValueTask.FromResult(calls.RenewResult);

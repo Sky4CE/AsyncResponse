@@ -85,8 +85,9 @@ start with `FlowTestHarness`, `DurableFlowTimer`, `ScheduledFlow`, and `TestingH
 as the reference examples for testing applications the same way.
 
 The Docker-backed integration suite can also run against the **Native AOT-published** sample as
-the system under test — the same tests, with every SUT resource switched from the JIT project to
-the trimmed native binary (MongoDB SUTs stay JIT; see [aot.md](aot.md#vendor-sdk-compatibility)):
+the system under test — the same tests, with every SUT whose whole driver stack is AOT-capable (today
+the NATS and PostgreSQL pairs) switched from the JIT project to the trimmed native binary; the rest
+stay JIT (see [aot.md](aot.md#vendor-sdk-compatibility)):
 
 ```bash
 dotnet publish samples/AsyncResponse.Sample/AsyncResponse.Sample.csproj -c Release -o ./artifacts/sut-aot
@@ -127,7 +128,8 @@ dotnet run --project tests/AsyncResponse.IntegrationTests
 
 The Aspire-orchestrated tests are split into **batches**. A batch is a named subset of the fleet: the
 AppHost declares only that batch's containers and sample apps, and each batch has its own xUnit
-collection and fixture. Collections run sequentially (`DisableTestParallelization`), so xUnit tears
+collection and fixture. Collections run sequentially (`[assembly: Parallelization(Mode = ParallelMode.None)]`
+in `Batches.cs`), so xUnit tears
 one batch's containers down before the next batch's fixture boots. Peak footprint is therefore the
 largest batch, not the whole fleet — and running a single test only boots its own batch.
 
@@ -141,11 +143,11 @@ containers dominate everything else, so the split is mostly about keeping them a
 
 | Batch | Collection | Containers | Apps | Tests | What's in it |
 | --- | --- | --- | --- | --- | --- |
-| `data` | `DataCollection` | 8 | 9 | 224 | Everything database-backed: channel conformance, store contracts, the "direct" driver tests, and the database channel/transport SUTs |
-| `oracle-cosmos` | `OracleCosmosCollection` | 2 | 0 | 2 | Oracle and Cosmos store contracts, isolated — the two largest containers in the suite |
-| `brokers` | `BrokersCollection` | 5 | 10 | 55 | Message brokers proper (Redis, Pub/Sub, RabbitMQ, NATS, Kafka) |
+| `data` | `DataCollection` | 8 | 9 | 359 | Everything database-backed: channel conformance, store contracts, the "direct" driver tests, and the database channel/transport SUTs |
+| `oracle-cosmos` | `OracleCosmosCollection` | 2 | 0 | 16 | Oracle and Cosmos store contracts, isolated — the two largest containers in the suite |
+| `brokers` | `BrokersCollection` | 5 | 10 | 64 | Message brokers proper (Redis, Pub/Sub, RabbitMQ, NATS, Kafka) |
 | `cloud` | `CloudCollection` | 4 | 4 | 18 | Azure Service Bus + SQS emulators. Service Bus brings its own SQL Server |
-| `matrix-*` | nine collections | 5–10 | 0 | 2,080 | The provider cross product and the transport contract — see [The provider cross product](#the-provider-cross-product) |
+| `matrix-*` | nine collections | 5–10 | 0 | 2,111 | The provider cross product and the transport contract — see [The provider cross product](#the-provider-cross-product) — plus the Pub/Sub emulator's stop-drain test (`matrix-cloud-light`) |
 
 Peak footprint across a full run is ~3.3 GiB, against 5.8 GiB when the store contracts shared a batch.
 That earlier arrangement fit when the suite ran alone and failed wholesale when anything else used the
@@ -155,9 +157,11 @@ Batch count is a trade-off in both directions, and more batches is not automatic
 batch is another AppHost boot, and every container it shares with another batch is started twice.
 Conformance, the store contracts, and the database SUTs were three separate batches at one point; all
 three wanted PostgreSQL, SQL Server, and MongoDB, so SQL Server — the slowest container here to accept
-logins — was booted three times for no benefit. They are one batch now, and every heavy container in
-the suite starts exactly once per run. Only Redis, NATS, Pub/Sub, and LocalStack start more than once,
-and those are the cheap ones.
+logins — was booted three times for no benefit. They are one batch now, and among the app-driven and
+store batches every heavy container starts exactly once per run; only Redis, NATS, Pub/Sub, and
+LocalStack start more than once, and those are the cheap ones. The nine `matrix-*` shards are
+separate CI legs, and each boots its own fleet: SQL Server, PostgreSQL, and MongoDB start in every
+shard (the channel axis is complete within each one), Oracle and Cosmos in three shards each.
 
 Two containers are explicitly capped, because both size themselves from the host and neither needs
 what it takes: Oracle via `INIT_SGA_SIZE`/`INIT_PGA_SIZE` (2,180 → 518 MiB) and both SQL Servers via
@@ -229,8 +233,9 @@ ASYNCRESPONSE_MATRIX_FILTER=PostgreSql+Kafka+MongoDb dotnet test --project tests
 `MatrixCompletenessTests` keeps the product honest: it reflects over the shipped `With…Channel`,
 `With…Transport`, and `With…DurableFlows` registrations and fails when one has no matrix axis member,
 asserts the shards partition every cell exactly once, and requires each shard to have a test class
-carrying its trait. A new provider package therefore fails the build the day it lands, rather than
-shipping with no cross-product coverage.
+carrying its trait — one whose theories run exactly the cells of the shard that trait names, so a
+class copied from another shard cannot run that shard twice and its own never. A new provider package
+therefore fails the build the day it lands, rather than shipping with no cross-product coverage.
 
 Because these shards start **no sample app**, they own two responsibilities the app-driven batches get
 for free. First, backend readiness: an app-driven batch waits for its sample apps to report healthy,
@@ -255,8 +260,8 @@ than per combination — so adding a scenario costs N runs, not 660:
 
 | Suite | Facts | Derivations |
 | --- | --- | --- |
-| `ChannelConformanceSuite` | 30 | 6 channels |
-| `TransportConformanceSuite` | 10 | 11 transports |
+| `ChannelConformanceSuite` | 34 | 6 channels |
+| `TransportConformanceSuite` | 13 | 11 transports |
 | `FlowStoreContract` | one composed contract | 10 stores |
 
 `TransportConformanceSuite` covers what the per-broker suites never did: dead-lettering, redelivery
@@ -265,26 +270,31 @@ context restoration, and durability across a consumer outage.
 
 Transports differ in *where* a guarantee comes from, and `TransportCapabilities` records that rather
 than letting it become a skipped test. Every transport bounds redelivery, but the bound lives in a
-different place: a `MaxDeliveryAttempts` subscriber knob on six of them, the in-process retry budget
+different place: a `MaxDeliveryAttempts` subscriber knob on eight of them, the in-process retry budget
 on the in-memory queue, the queue's redrive policy on SQS, and the subscription's `DeadLetterPolicy`
 on Google Pub/Sub — which the package deliberately leaves to infrastructure and warns about at startup
 when it cannot see one. Two transports constrain the bound itself: RabbitMQ cannot count past two
 without an application-owned TTL-retry cycle (a plain `basic.nack` requeue does not increment
 `x-death`), and a Pub/Sub `DeadLetterPolicy` rejects anything under five. Payload ceilings differ by
-two orders of magnitude, so the payload fact is sized per transport — SQS and Service Bus standard
-tier both reject messages over 256 KiB outright.
+two orders of magnitude, so the payload fact is sized per transport — Service Bus standard tier
+rejects messages over 256 KB outright, and SQS over 1 MiB (since August 2025; a queue's
+`MaximumMessageSize` may be set lower, and LocalStack and older queues still apply 256 KiB). NATS
+rejects anything above the server's `max_payload` (1 MiB by default) before it is sent — for the
+JetStream transport's jobs and the NATS channel's responses alike — and fails such a message at
+once rather than retrying it as a transient error.
 
 Where a capability is genuinely absent the contract still asserts it rather than skipping. The
 in-memory transport has no early-ACK mode and no life beyond its host, so those two facts assert the
 absence — a mode appearing later fails the test and forces the capability table to be updated with it.
 
-`BatchAssignmentTests` holds the whole arrangement together. It fails if a class asks for a fixture
-without declaring its batch, declares one batch and takes another's fixture, carries no batch trait,
-or carries a trait that disagrees with its collection. The trait one matters most: an untagged class
+`BatchAssignmentTests` holds the whole arrangement together. It fails if a class — nested public
+classes included, which xUnit runs like any other — asks for a fixture without declaring its batch,
+declares one batch and takes another's fixture, carries no batch trait, or carries a trait that
+disagrees with its collection. The trait one matters most: an untagged class
 is in no matrix leg, so CI would quietly stop running it and stay green.
 
 `DurableFlowIntegrationTests` is the one class that spans families — it drives flows across
-PostgreSQL, SQL Server, MongoDB, NATS, and SQS at once. It sits in `databases` because adding NATS and
+PostgreSQL, SQL Server, MongoDB, NATS, and SQS at once. It sits in `data` because adding NATS and
 LocalStack there costs less than adding three database servers to another batch.
 
 To add a batch: add a `case` to the AppHost's switch on `ASYNCRESPONSE_ITEST_BATCH` composing the
@@ -440,10 +450,11 @@ the mixed profiles are better at finding interference between flows. The sample 
 reuses its publisher client, while Azure Service Bus and RabbitMQ response emits open short-lived
 broker clients per request to model an external producer. It writes an HTML/CSV/Markdown report to
 `nbomber-report/`.
-The [load-test workflow](../.github/workflows/loadtest.yml) runs it on every push to `main` (and on demand),
+The [load-test workflow](../.github/workflows/loadtest.yml) runs it on every push to `main` that touches
+code or build files (a `paths:` filter), and on demand,
 publishing per-scenario throughput and latency to the **same dashboard** as the benchmarks and
 uploading the full report as an artifact. Push runs execute the broad profile at a conservative
-`5` requests/sec per scenario so every defined provider scenario can run together on a shared GitHub
+`3` requests/sec per scenario so every defined provider scenario can run together on a shared GitHub
 runner without overloading one backing service. Manual workflow runs keep `profile`, `rate`, and
 `duration` as first-class inputs. Put any current or future `AsyncResponse.LoadTests` CLI switches in
 `extra_args`, for example `--azure-servicebus-url http://host --azure-servicebus-early-ack-url
@@ -456,7 +467,8 @@ changing the workflow. The pushed JSON still uses github-action-benchmark's `cus
 and `customSmallerIsBetter` formats, so new scenario series appear automatically under `dev/bench` on
 `gh-pages`.
 
-**Performance over time.** Every push to `main` runs the micro-benchmarks and the stress harness
+**Performance over time.** Every push to `main` that touches code or build files (a `paths:` filter)
+runs the micro-benchmarks and the stress harness
 ([`benchmarks.yml`](../.github/workflows/benchmarks.yml)) and publishes them with
 [github-action-benchmark](https://github.com/benchmark-action/github-action-benchmark) as
 interactive, per-commit charts: micro-benchmark timings & allocations, the in-process stress suites,
@@ -464,8 +476,9 @@ and — from the load-test workflow — end-to-end throughput & latency over the
 
 **📈 [Benchmark dashboard](https://sky4ce.github.io/AsyncResponse/dev/bench/)**
 
-A change that moves a number stands out immediately; a regression beyond the alert threshold is posted
-as a comment on the offending commit, and every run prints a results table to its
+A change that moves a number stands out immediately on the dashboard. Alerting is off (the workflows
+set both `comment-on-alert` and `fail-on-alert` to `false`, so no annotation, comment or failure is
+raised for a regression); every run prints a results table to its
 [workflow summary](https://github.com/Sky4CE/AsyncResponse/actions/workflows/benchmarks.yml). The
 numbers come from shared CI runners, so read them as **trends** rather than absolute hardware figures —
 run the benchmarks locally (above) for stable measurements.

@@ -113,13 +113,22 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
         _registrations = new Dictionary<string, DurableFlowRegistration>(StringComparer.Ordinal);
         foreach (var registration in registrations ?? [])
         {
-            // Last registration wins, matching DI's usual override semantics.
-            _registrations[registration.FlowTypeFullName] = registration;
+            // Last registration wins, matching DI's usual override semantics. Keyed by type
+            // identity (TypeNameIdentity): a generic flow class persisted by a build whose argument
+            // assemblies carried another version still finds its registration.
+            _registrations[TypeNameIdentity.Normalize(registration.FlowTypeFullName)!] = registration;
         }
     }
 
     /// <inheritdoc />
-    public async Task ExecuteAsync(string flowId)
+    public Task ExecuteAsync(string flowId) => ExecuteCoreAsync(flowId, _timeProvider.GetUtcNow().UtcDateTime);
+
+    /// <param name="flowId">The run to execute.</param>
+    /// <param name="deliveryStartedUtc">
+    /// When this delivery's handler started — before any lease-contention wait — so an in-process
+    /// timer can tell how much of the broker's in-flight ceiling the delivery has already used.
+    /// </param>
+    private async Task ExecuteCoreAsync(string flowId, DateTime deliveryStartedUtc)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(flowId);
 
@@ -157,7 +166,7 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
 
         using var activity = AsyncResponseDiagnostics.StartActivity("asyncresponse.flow.execute");
         activity?.SetTag("asyncresponse.flow_id", flowId);
-        activity?.SetTag("asyncresponse.flow_type", state.FlowTypeName);
+        activity?.SetTag("asyncresponse.flow_type", AsyncResponseTypeResolution.DescribeForDiagnostics(state.FlowTypeName));
 
         state.Attempts++;
         await lease.SaveAsync(state, _options.StateExpiry).ConfigureAwait(false);
@@ -168,7 +177,7 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
 
         try
         {
-            var suspended = await InvokeFlowAsync(scope.ServiceProvider, store, state, lease).ConfigureAwait(false);
+            var suspended = await InvokeFlowAsync(scope.ServiceProvider, store, state, lease, deliveryStartedUtc).ConfigureAwait(false);
             if (suspended)
             {
                 // The context persisted the suspended state BEFORE enqueueing the child; saving here
@@ -290,7 +299,7 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
         // The 2s poll delay is capped by the renew interval so short test-sized leases still get polled.
         var window = _options.ExecutionLeaseDuration + _options.ExecutionLeaseRenewInterval;
         var startedWaitingUtc = _timeProvider.GetUtcNow().UtcDateTime;
-        var deadline = AddSaturating(startedWaitingUtc, window);
+        var deadline = FlowStateRetention.AddSaturating(startedWaitingUtc, window);
 
         // The store-driven extension below follows DATA this host does not control. A store clock
         // hours ahead of this one, or an expiry column read back shifted, used to move the deadline
@@ -299,7 +308,7 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
         // the contention exception whose message says "check for clock skew" was unreachable in
         // exactly the case it names. MaxLeaseContentionWait bounds the extension — never this
         // host's own window above, which is always waited.
-        var extensionCeiling = AddSaturating(startedWaitingUtc, _options.MaxLeaseContentionWait);
+        var extensionCeiling = FlowStateRetention.AddSaturating(startedWaitingUtc, _options.MaxLeaseContentionWait);
         var extensionCapped = false;
         var pollDelay = _options.ExecutionLeaseRenewInterval < TimeSpan.FromSeconds(2)
             ? _options.ExecutionLeaseRenewInterval
@@ -308,27 +317,45 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
         var storeReportsLeases = true;
         string? ownJobHolderLeaseId = null;
 
+        // The ledger is re-read on the first poll, on the poll after the lease was seen to change
+        // (or to have no holder), and otherwise every ~30 s — not on every poll. Only its status is
+        // needed, and a full-ledger load per 2 s poll cost a dead holder's every parked wake-up about
+        // seventy whole-ledger reads while it waited the lease out. A lease that never changes
+        // holds nothing that could turn the run terminal except a lease-less writer (a recovery
+        // failure signal, an operator), which the periodic re-read still notices; a store that
+        // reports no leases is re-read every poll, as before.
+        var ledgerRereadEvery = Math.Max(1, (int)(TimeSpan.FromSeconds(30).Ticks / Math.Max(1, pollDelay.Ticks)));
+        var pollsSinceLedgerRead = ledgerRereadEvery;
+        FlowLeaseObservation? previousObservation = null;
+
         while (true)
         {
-            // Between attempts, look at the state itself: a terminal or absent flow needs no
-            // execution, and reporting it accurately beats a misleading "already executing" log.
-            var state = await store.LoadAsync(flowId).ConfigureAwait(false);
-            if (state is null)
+            if (pollsSinceLedgerRead >= ledgerRereadEvery)
             {
-                _logger.LogWarning("Durable flow {FlowId} has no state (unknown, expired, or unreadable); nothing to execute.", flowId);
-                return null;
+                pollsSinceLedgerRead = 0;
+
+                // Between attempts, look at the state itself: a terminal or absent flow needs no
+                // execution, and reporting it accurately beats a misleading "already executing" log.
+                var state = await store.LoadAsync(flowId).ConfigureAwait(false);
+                if (state is null)
+                {
+                    _logger.LogWarning("Durable flow {FlowId} has no state (unknown, expired, or unreadable); nothing to execute.", flowId);
+                    return null;
+                }
+
+                if (state.Status != FlowRunStatus.Running)
+                {
+                    _logger.LogDebug("Durable flow {FlowId} is already {Status}; skipping duplicate delivery.", flowId, state.Status);
+                    // Same at-least-once re-notify as ExecuteAsync's terminal early return: the prior
+                    // delivery may have died in the run-finished notification itself.
+                    if (state.Status is FlowRunStatus.Succeeded or FlowRunStatus.Failed)
+                        await NotifyRunFinishedAsync(state).ConfigureAwait(false);
+                    await NotifyParentAsync(state).ConfigureAwait(false);
+                    return null;
+                }
             }
 
-            if (state.Status != FlowRunStatus.Running)
-            {
-                _logger.LogDebug("Durable flow {FlowId} is already {Status}; skipping duplicate delivery.", flowId, state.Status);
-                // Same at-least-once re-notify as ExecuteAsync's terminal early return: the prior
-                // delivery may have died in the run-finished notification itself.
-                if (state.Status is FlowRunStatus.Succeeded or FlowRunStatus.Failed)
-                    await NotifyRunFinishedAsync(state).ConfigureAwait(false);
-                await NotifyParentAsync(state).ConfigureAwait(false);
-                return null;
-            }
+            pollsSinceLedgerRead++;
 
             lease = await FlowStateConcurrency.TryAcquireExecutionLeaseAsync(
                 store,
@@ -343,6 +370,15 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
             var observed = storeReportsLeases
                 ? await store.ObserveLeaseAsync(flowId).ConfigureAwait(false)
                 : null;
+            if (observed?.LeaseId is null
+                || previousObservation is null
+                || !string.Equals(observed.LeaseId, previousObservation.LeaseId, StringComparison.Ordinal)
+                || observed.ExpiresAtUtc != previousObservation.ExpiresAtUtc)
+            {
+                pollsSinceLedgerRead = ledgerRereadEvery;
+            }
+
+            previousObservation = observed;
             if (observed is null)
             {
                 storeReportsLeases = false;
@@ -357,7 +393,7 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
                         // A dead holder's lease is acquirable once ITS expiry passes, whichever
                         // deployment's lease duration issued it; the extra window absorbs clock
                         // skew between this host and the store before the wait is declared stuck.
-                        var persistedDeadline = AddSaturating(persistedExpiry, window);
+                        var persistedDeadline = FlowStateRetention.AddSaturating(persistedExpiry, window);
                         if (persistedDeadline > extensionCeiling)
                         {
                             persistedDeadline = extensionCeiling;
@@ -439,13 +475,17 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
             {
                 await Task.Delay(pollDelay, _timeProvider, _hostStopping).ConfigureAwait(false);
             }
-            catch (OperationCanceledException)
+            catch (OperationCanceledException ex)
             {
                 // Host shutdown must not leave this delivery parked in the poll — but acking it
-                // would silently drop the flow's only wake-up. Propagate as cancellation so the
-                // transport treats the job as not executed and redelivers it after restart.
-                throw new OperationCanceledException(
-                    $"Host is stopping; durable flow '{flowId}' wake-up is abandoned for redelivery.");
+                // would silently drop the flow's only wake-up. Propagate as the engine's
+                // hand-back signal so the transport treats the job as not executed and redelivers
+                // it after restart. The TYPE is the signal: ApplicationStopping fires before any
+                // hosted service stops, so the worker subscriber's own token is usually still
+                // live here, and a plain cancellation read as a handler failure — a NAK, a retry
+                // ladder, a dead-lettered wake-up.
+                throw new DurableFlowInterruptedException(
+                    $"Host is stopping; durable flow '{flowId}' wake-up is abandoned for redelivery.", ex);
             }
         }
 
@@ -474,9 +514,6 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
                         ? $"the lease held by '{baseline.LeaseId}' (persisted expiry {baseline.ExpiresAtUtc:O}) neither changed nor became acquirable within {nameof(DurableFlowOptions)}.{nameof(DurableFlowOptions.MaxLeaseContentionWait)} ({_options.MaxLeaseContentionWait}), and its persisted expiry lies further out than that budget lets one delivery wait; raise the budget if a deployment legitimately issues leases that long, otherwise check for clock skew between this host and the store"
                         : $"the lease held by '{baseline.LeaseId}' (persisted expiry {baseline.ExpiresAtUtc:O}) neither changed nor became acquirable within a full lease window past that expiry; check for clock skew between this host and the store");
     }
-
-    private static DateTime AddSaturating(DateTime instant, TimeSpan span)
-        => span > DateTime.MaxValue - instant ? DateTime.MaxValue : instant + span;
 
     /// <summary>
     /// Re-publishes <paramref name="job"/> — the job this delivery AND the live lease holder both
@@ -508,7 +545,7 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
         if (delay > transport.MaxPublishDelay)
             delay = transport.MaxPublishDelay;
 
-        var hop = CopyForRedelay(job, AddSaturating(nowUtc, delay));
+        var hop = CopyForRedelay(job, FlowStateRetention.AddSaturating(nowUtc, delay));
         await transport.PublishAsync(hop, delay).ConfigureAwait(false);
 
         _logger.LogInformation(
@@ -540,6 +577,7 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(flowId);
         ArgumentException.ThrowIfNullOrWhiteSpace(initialStateJson);
+        var deliveryStartedUtc = _timeProvider.GetUtcNow().UtcDateTime;
 
         // The carrier is the ledger wire format itself. A carrier this build cannot read is
         // deterministic: FlowStateUnreadableException propagates to the transport's retry and
@@ -549,12 +587,24 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
         if (!string.Equals(initial.FlowId, flowId, StringComparison.Ordinal))
         {
             throw new InvalidOperationException(
-                $"The start job for durable flow '{flowId}' carries initial state for '{initial.FlowId}'; refusing to create a ledger under the wrong id.");
+                $"The start job for durable flow '{DiagnosticText.EscapedExcerpt(flowId)}' carries initial state for '{DiagnosticText.EscapedExcerpt(initial.FlowId ?? string.Empty)}'; refusing to create a ledger under the wrong id.");
         }
 
         await using (var scope = _scopeFactory.CreateAsyncScope())
         {
             var store = scope.ServiceProvider.GetRequiredService<IFlowStateStore>();
+            var registered = initial.FlowTypeName is not null && _registrations.TryGetValue(TypeNameIdentity.Normalize(initial.FlowTypeName)!, out var registration)
+                ? registration
+                : null;
+            var serviceProvider = scope.ServiceProvider;
+
+            bool IsSameStart(FlowState existing)
+            {
+                Func<string?, string, bool> inputEquivalent = registered is not null
+                    ? registered.InputEquivalent
+                    : (persisted, requested) => ReflectedInputEquivalent(serviceProvider, existing, persisted, requested);
+                return FlowStateConcurrency.IsSameStart(existing, initial.FlowTypeName, initial.InputTypeName, initial.InputJson, inputEquivalent);
+            }
 
             // A start job outlives the run it started: a dead-letter replay, or a Kafka consumer
             // group rewound past it, delivers it again long after the run finished and its ledger
@@ -565,51 +615,90 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
             // would equally find gone): dropped, loudly. Checked only when the ledger is absent —
             // a live run past StateExpiry (a long park keeps its ledger through the retention
             // floor) still owns this job as its wake-up and takes the ordinary path below.
-            if (StartedBeyondStateExpiry(initial, out var age)
-                && await store.LoadAsync(flowId).ConfigureAwait(false) is null)
+            for (var createAttempt = 1; ; createAttempt++)
             {
-                _logger.LogError(
-                    "Durable flow {FlowId} ({FlowType}) start job dropped: the start is {Age} old — past {StateExpiryOption} ({StateExpiry}) — and no ledger exists, so the run it started has finished and expired (or never ran within its ledger's lifetime). Re-creating it would re-execute completed work; start the flow again if it is still wanted.",
-                    flowId, initial.FlowTypeName, age, $"{nameof(DurableFlowOptions)}.{nameof(DurableFlowOptions.StateExpiry)}", _options.StateExpiry);
-                return;
-            }
-
-            if (await FlowStateConcurrency.TryCreateAsync(store, flowId, initial, _options.StateExpiry).ConfigureAwait(false))
-            {
-                // The starter died (or has not got there yet) between its publish and its own
-                // create: the job is the durable record of the start, so the ledger comes from it.
-                _logger.LogInformation("Durable flow {FlowId} ({FlowType}) ledger created from its start job.", flowId, initial.FlowTypeName);
-            }
-            else
-            {
-                var existing = await store.LoadAsync(flowId).ConfigureAwait(false);
-                if (existing is null)
+                if (StartedBeyondStateExpiry(initial, out var age)
+                    && await store.LoadAsync(flowId).ConfigureAwait(false) is null)
                 {
-                    // Created and already expired or pruned between the two calls: genuinely gone,
-                    // the one case where acknowledging the start is right (ExecuteAsync's rule).
-                    _logger.LogWarning("Durable flow {FlowId} exists but its ledger is expired or gone; nothing to execute.", flowId);
+                    _logger.LogError(
+                        "Durable flow {FlowId} ({FlowType}) start job dropped: the start is {Age} old — past {StateExpiryOption} ({StateExpiry}) — and no ledger exists, so the run it started has finished and expired (or never ran within its ledger's lifetime). Re-creating it would re-execute completed work; start the flow again if it is still wanted.",
+                        flowId, AsyncResponseTypeResolution.DescribeForDiagnostics(initial.FlowTypeName), age, $"{nameof(DurableFlowOptions)}.{nameof(DurableFlowOptions.StateExpiry)}", _options.StateExpiry);
                     return;
                 }
 
-                if (!FlowStateConcurrency.IsSameStart(existing, initial.FlowTypeName, initial.InputTypeName, initial.InputJson))
+                if (await FlowStateConcurrency.TryCreateAsync(store, flowId, initial, _options.StateExpiry).ConfigureAwait(false))
+                {
+                    // The starter died (or has not got there yet) between its publish and its own
+                    // create: the job is the durable record of the start, so the ledger comes from it.
+                    _logger.LogInformation("Durable flow {FlowId} ({FlowType}) ledger created from its start job.", flowId, AsyncResponseTypeResolution.DescribeForDiagnostics(initial.FlowTypeName));
+                    break;
+                }
+
+                // A plain load decides the common case — StartAsync publishes before its own
+                // create, so this job's create normally loses to the starter's — and executing ends
+                // in lease- and revision-fenced writes. It is read again currently only where its
+                // answer would otherwise end the job: a store whose loads can lag behind another
+                // process's writes (Cosmos session reads) may not show this process the starter's
+                // fresh create yet (each such miss cost a create round trip, and three of them
+                // handed a perfectly good start back to the transport), or may still show an older
+                // run under a reused id, and the drop below writes nothing for a fence to correct.
+                var existing = await store.LoadAsync(flowId).ConfigureAwait(false);
+                if (existing is null || !IsSameStart(existing))
+                    existing = await store.LoadCurrentAsync(flowId).ConfigureAwait(false);
+
+                if (existing is null)
+                {
+                    // The create lost to a ledger that is gone by the time it is read: a previous
+                    // run under a reused id expiring (or being pruned) right between the two calls —
+                    // every store has that window, and some widen it. Acknowledging here lost the
+                    // new run outright (the starter, for its part, leaves the create to this job),
+                    // so the create is simply tried again; a start that has meanwhile aged past the
+                    // ledger lifetime is still dropped above. Bounded: a store that keeps answering
+                    // "exists" for a row it cannot load is a store fault, and the transport's retry
+                    // and dead-letter policy is the alarm for it.
+                    if (createAttempt < MaxStartCreateAttempts)
+                    {
+                        _logger.LogDebug(
+                            "Durable flow {FlowId} start job lost its create to a ledger that is already expired or gone; creating again (attempt {Attempt}).",
+                            flowId, createAttempt + 1);
+                        continue;
+                    }
+
+                    throw new InvalidOperationException(
+                        $"The start job for durable flow '{flowId}' could neither create its ledger nor load the one the store reports as existing, " +
+                        $"on each of {MaxStartCreateAttempts} attempts; the start is handed back to the worker transport.");
+                }
+
+                if (!IsSameStart(existing))
                 {
                     // The id was reused for different work. The starter that published this job
                     // saw the same conflict on its own create and threw DurableFlowIdConflictException
-                    // to its caller; executing the EXISTING run here would wake a flow nobody asked
-                    // to wake, and creating a second one is impossible. Drop the job, loudly.
+                    // to its caller (a caller-chosen id already bound is refused before anything is
+                    // published at all); executing the EXISTING run here would wake a flow nobody
+                    // asked to wake, and a second one cannot live under the same id. Drop the job,
+                    // loudly.
                     _logger.LogError(
                         "Durable flow {FlowId} start job dropped: the id is already bound to flow type {ExistingFlowType} with different input, not {RequestedFlowType}. Idempotent retries must use the same flow type, input type, and semantically identical input.",
-                        flowId, existing.FlowTypeName, initial.FlowTypeName);
+                        flowId,
+                        AsyncResponseTypeResolution.DescribeForDiagnostics(existing.FlowTypeName),
+                        AsyncResponseTypeResolution.DescribeForDiagnostics(initial.FlowTypeName));
                     return;
                 }
 
                 // Same start, ledger already there (the starter's own create won, or this is a
                 // redelivery / an idempotent re-start of a live run): fall through and execute it.
+                break;
             }
         }
 
-        await ExecuteAsync(flowId).ConfigureAwait(false);
+        await ExecuteCoreAsync(flowId, deliveryStartedUtc).ConfigureAwait(false);
     }
+
+    /// <summary>
+    /// How often a start job tries its create when each attempt loses to a ledger that is gone by
+    /// the time it is read (see <see cref="CreateAndExecuteAsync"/>).
+    /// </summary>
+    internal const int MaxStartCreateAttempts = 3;
 
     /// <summary>
     /// Whether the start job's carried ledger was stamped longer ago than a ledger lives
@@ -637,6 +726,14 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
         var store = scope.ServiceProvider.GetRequiredService<IFlowStateStore>();
 
         var state = await store.LoadAsync(flowId).ConfigureAwait(false);
+
+        // Ignoring the resume writes nothing, so no fence corrects a stale read behind it: a store
+        // whose loads can serve an older copy of a present ledger (Cosmos session reads from
+        // another process) may still show the Suspended run an operator has just set back to
+        // Running. Look again, authoritatively, before dropping the resume.
+        if (state is not null && state.Status != FlowRunStatus.Running)
+            state = await store.LoadCurrentAsync(flowId).ConfigureAwait(false);
+
         if (state is null)
         {
             _logger.LogWarning("Durable flow {FlowId} cannot resume: no state (unknown, expired, or unreadable).", flowId);
@@ -666,44 +763,60 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
         var running = false;
         var lastStatus = FlowRunStatus.Running;
         string? recoveredStep = null;
+        FlowState? checkpointedState = null;
+        long estimateBefore = 0;
 
-        var found = await FlowStateConcurrency.MutateAsync(
-            store,
-            flowId,
-            _options.StateExpiry,
-            _timeProvider,
-            state =>
-            {
-                checkpointed = false;
-                recoveredStep = null;
-                lastStatus = state.Status;
-                running = state.Status == FlowRunStatus.Running;
+        bool CheckpointRecovered(FlowState state)
+        {
+            checkpointed = false;
+            recoveredStep = null;
+            checkpointedState = null;
+            lastStatus = state.Status;
+            running = state.Status == FlowRunStatus.Running;
 
-                // Suspended runs still CHECKPOINT the recovered terminal payload — the response
-                // exists nowhere else once this callback returns — but are never woken (see
-                // below): suspension means an operator took manual control, and ResumeAsync
-                // continues from the checkpoint instead of re-running the remote step.
-                var checkpointable = running || state.Status == FlowRunStatus.Suspended;
-                if (!checkpointable || state.Steps is null)
-                    return false;
+            // Suspended runs still CHECKPOINT the recovered terminal payload — the response
+            // exists nowhere else once this callback returns — but are never woken (see
+            // below): suspension means an operator took manual control, and ResumeAsync
+            // continues from the checkpoint instead of re-running the remote step.
+            var checkpointable = running || state.Status == FlowRunStatus.Suspended;
+            if (!checkpointable || state.Steps is null)
+                return false;
 
-                var pending = state.Steps.FirstOrDefault(pair =>
-                    string.Equals(pair.Value.PendingCorrelationId, correlationId, StringComparison.Ordinal));
-                if (pending.Value is null)
-                    return false;
+            var pending = state.Steps.FirstOrDefault(pair =>
+                string.Equals(pair.Value.PendingCorrelationId, correlationId, StringComparison.Ordinal));
+            if (pending.Value is null)
+                return false;
 
-                pending.Value.Completed = true;
-                pending.Value.ResultJson = SerializeRecoveredResult(payload, pending.Value.PendingPayloadTypeFullName);
-                pending.Value.PendingCorrelationId = null;
-                pending.Value.PendingPayloadTypeFullName = null;
-                pending.Value.Faulted = false;
-                pending.Value.Message = "Terminal response recovered after subscriber loss.";
-                pending.Value.CompletedAtUtc = _timeProvider.GetUtcNow().UtcDateTime;
-                state.LastMessage = $"Step '{pending.Key}' recovered after subscriber loss.";
-                checkpointed = true;
-                recoveredStep = pending.Key;
-                return true;
-            }).ConfigureAwait(false);
+            estimateBefore = FlowStateJson.EstimateLedgerChars(state);
+            pending.Value.Completed = true;
+            pending.Value.ResultJson = SerializeRecoveredResult(payload, pending.Value.PendingPayloadTypeFullName);
+            pending.Value.PendingCorrelationId = null;
+            pending.Value.PendingPayloadTypeFullName = null;
+            pending.Value.Faulted = false;
+            pending.Value.Message = "Terminal response recovered after subscriber loss.";
+            pending.Value.CompletedAtUtc = _timeProvider.GetUtcNow().UtcDateTime;
+            state.LastMessage = $"Step '{pending.Key}' recovered after subscriber loss.";
+            checkpointed = true;
+            recoveredStep = pending.Key;
+            checkpointedState = state;
+            return true;
+        }
+
+        var found = await FlowStateConcurrency.MutateAsync(store, flowId, _options.StateExpiry, _timeProvider, CheckpointRecovered)
+            .ConfigureAwait(false);
+
+        // No pending step matched on a run that could take the payload. That conclusion writes
+        // NOTHING — no revision fence stands behind it to correct a stale read — and the callback
+        // is acknowledged with the payload gone. A store whose loads can serve an older copy of a
+        // present ledger (Cosmos session reads from a process that never received the holder's
+        // session token) may simply not show this process the breadcrumb yet: look again,
+        // authoritatively, before concluding.
+        if (found && !checkpointed && (running || lastStatus == FlowRunStatus.Suspended))
+        {
+            found = await FlowStateConcurrency.MutateAsync(
+                    new CurrentReadFlowStateStore(store), flowId, _options.StateExpiry, _timeProvider, CheckpointRecovered)
+                .ConfigureAwait(false);
+        }
 
         if (!found)
         {
@@ -727,6 +840,10 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
             await _builder.EnqueueWorkerAsync<IDurableFlowExecutor>(executor => executor.ExecuteAsync(flowId)).ConfigureAwait(false);
             return;
         }
+
+        // A recovered response can be the write that takes the ledger past a warning band, and no
+        // context saw it: the next execution seeds its warning above the ledger's new size.
+        DurableFlowContext.WarnIfWriteCrossedLedgerWarning(_logger, _options, checkpointedState!, estimateBefore);
 
         // The completion recorded here is the ONLY chance observers get to see this step finish:
         // the replayed execution short-circuits the now-memoized step without notifying. Notified
@@ -800,36 +917,46 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
         FlowState? updated = null;
         var failedNow = false;
         var stale = false;
-        var found = await FlowStateConcurrency.MutateAsync(
-            store,
-            flowId,
-            _options.StateExpiry,
-            _timeProvider,
-            state =>
+        bool MarkFailed(FlowState state)
+        {
+            updated = state;
+            failedNow = false;
+            stale = false;
+            if (state.Status != FlowRunStatus.Running)
+                return false;
+
+            // A correlation-scoped failure only counts against the step still pending on
+            // that id (RecoverAsync parity): a dead worker's registration outlives the
+            // replacement's, so a late error for a superseded or already-settled correlation
+            // id must not fail a run that is live on another one.
+            if (correlationId is not null
+                && (state.Steps is null
+                    || !state.Steps.Values.Any(step => string.Equals(step.PendingCorrelationId, correlationId, StringComparison.Ordinal))))
             {
-                updated = state;
-                failedNow = false;
-                stale = false;
-                if (state.Status != FlowRunStatus.Running)
-                    return false;
+                stale = true;
+                return false;
+            }
 
-                // A correlation-scoped failure only counts against the step still pending on
-                // that id (RecoverAsync parity): a dead worker's registration outlives the
-                // replacement's, so a late error for a superseded or already-settled correlation
-                // id must not fail a run that is live on another one.
-                if (correlationId is not null
-                    && (state.Steps is null
-                        || !state.Steps.Values.Any(step => string.Equals(step.PendingCorrelationId, correlationId, StringComparison.Ordinal))))
-                {
-                    stale = true;
-                    return false;
-                }
+            state.Status = FlowRunStatus.Failed;
+            state.LastMessage = exception.Message;
+            failedNow = true;
+            return true;
+        }
 
-                state.Status = FlowRunStatus.Failed;
-                state.LastMessage = exception.Message;
-                failedNow = true;
-                return true;
-            }).ConfigureAwait(false);
+        var found = await FlowStateConcurrency.MutateAsync(store, flowId, _options.StateExpiry, _timeProvider, MarkFailed)
+            .ConfigureAwait(false);
+
+        // "Stale" is concluded without a write, so nothing fences it: a store whose loads can serve
+        // an older copy of a present ledger may not show this process the step now pending on
+        // this id (RecoverAsync parity). Look again, authoritatively, before ignoring the failure.
+        // Likewise a run that reads Suspended — not terminal, so an operator may just have set it
+        // back to Running, and a lagging copy would drop the failure its resumed run still waits on.
+        if (found && (stale || updated is { Status: not (FlowRunStatus.Running or FlowRunStatus.Succeeded or FlowRunStatus.Failed) }))
+        {
+            found = await FlowStateConcurrency.MutateAsync(
+                    new CurrentReadFlowStateStore(store), flowId, _options.StateExpiry, _timeProvider, MarkFailed)
+                .ConfigureAwait(false);
+        }
 
         if (!found || updated is null)
         {
@@ -868,7 +995,8 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
         IServiceProvider serviceProvider,
         IFlowStateStore store,
         FlowState state,
-        FlowExecutionLease lease)
+        FlowExecutionLease lease,
+        DateTime deliveryStartedUtc)
     {
         var context = new DurableFlowContext(
             state,
@@ -883,12 +1011,14 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
             _timeProvider,
             _observers,
             _workerTransport,
-            _channelDefaultWaitTimeout);
+            _channelDefaultWaitTimeout,
+            _hostStopping,
+            deliveryStartedUtc);
 
         // Statically-typed path for flows registered via WithDurableFlow<TFlow, TInput>(): no
         // type-name resolution, no MakeGenericType, no MethodInfo.Invoke — the path trimmed and
         // Native AOT apps rely on.
-        if (state.FlowTypeName is not null && _registrations.TryGetValue(state.FlowTypeName, out var registration))
+        if (state.FlowTypeName is not null && _registrations.TryGetValue(TypeNameIdentity.Normalize(state.FlowTypeName)!, out var registration))
         {
             // Fail closed exactly like the reflection fallback: a run persisted with a different
             // input type than the registration's TInput would otherwise silently parse the old
@@ -896,23 +1026,73 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
             // the remaining steps against wrong input. Null tolerated: ledgers written before the
             // stamp existed carry no input type name.
             if (state.InputTypeName is not null
-                && !string.Equals(state.InputTypeName, registration.InputTypeFullName, StringComparison.Ordinal))
+                && !TypeNameIdentity.Same(state.InputTypeName, registration.InputTypeFullName))
             {
                 throw new InvalidOperationException(
                     $"Durable flow type '{state.FlowTypeName}' is registered with input type '{registration.InputTypeFullName}', " +
-                    $"but the persisted run carries input type '{state.InputTypeName}'; the flow state was written by an " +
+                    // Store data, rendered like ResolveType's names (below): raw, a ledger's type name
+                    // copied megabytes of store-written text or its line breaks into this message.
+                    $"but the persisted run carries input type '{AsyncResponseTypeResolution.DescribeForDiagnostics(state.InputTypeName)}'; the flow state was written by an " +
                     "incompatible flow definition.");
             }
 
             var flow = ResolveFlowFromDi(serviceProvider, registration.FlowType);
             var input = state.InputJson is null ? null : registration.DeserializeInput(state.InputJson);
-            await registration.ExecuteAsync(flow, context, input).ConfigureAwait(false);
+            try
+            {
+                await registration.ExecuteAsync(flow, context, input).ConfigureAwait(false);
+            }
+            catch (Exception ex) when (context.IsSuspended && ex is not DurableFlowSuspendedException)
+            {
+                throw ParkOutranConversion(state, ex);
+            }
+            catch (Exception ex) when (context.Interruption is { } interruption && ex is not DurableFlowInterruptedException)
+            {
+                InterruptionOutranConversion(state, ex);
+                interruption.Throw();
+                throw;
+            }
+
             await context.FlushProgressAsync().ConfigureAwait(false);
             return context.IsSuspended;
         }
 
         return await InvokeFlowByReflectionAsync(serviceProvider, state, context).ConfigureAwait(false);
     }
+
+    /// <summary>
+    /// A park committed — its wake-up is published and its lease released — and flow code then
+    /// turned the park's cancellation into another exception (<c>catch (OperationCanceledException)
+    /// { throw new DurableFlowFailedException(...); }</c> around a context call, or a wrapping
+    /// rethrow). Taken at face value that failed the run terminally with its child still running,
+    /// or retried a delivery whose continuation was already queued — and saved through a lease the
+    /// park had released. The park stands: the conversion is logged and the execution ends
+    /// suspended.
+    /// </summary>
+    private DurableFlowSuspendedException ParkOutranConversion(FlowState state, Exception converted)
+    {
+        _logger.LogWarning(
+            converted,
+            "Durable flow {FlowId} parked (its wake-up is already published), but flow code converted the park's cancellation into {ExceptionType}; the run stays parked. Let DurableFlowInterruptedException — an OperationCanceledException — propagate from context calls.",
+            state.FlowId,
+            converted.GetType().FullName);
+        return new DurableFlowSuspendedException(state.LastMessage ?? $"Flow {state.FlowId} is suspended.");
+    }
+
+    /// <summary>
+    /// The host-stop counterpart of <see cref="ParkOutranConversion"/>: an in-process timer was
+    /// interrupted and handed back — no wake-up exists, the delivery must be redelivered — and flow
+    /// code turned the interruption into another exception. A <see cref="DurableFlowFailedException"/>
+    /// taken at face value failed the run terminally on a deploy; any other type read as a handler
+    /// failure, costing the wake-up a broker delivery attempt and in the end dead-lettering it. The
+    /// caller rethrows the interruption itself, which the transport recognises as a hand-back.
+    /// </summary>
+    private void InterruptionOutranConversion(FlowState state, Exception converted)
+        => _logger.LogWarning(
+            converted,
+            "Durable flow {FlowId} was interrupted by host stop (its delivery is handed back for redelivery), but flow code converted the interruption into {ExceptionType}; the delivery is still handed back. Let DurableFlowInterruptedException — an OperationCanceledException — propagate from context calls.",
+            state.FlowId,
+            converted.GetType().FullName);
 
     [UnconditionalSuppressMessage("Trimming", "IL2026",
         Justification = "Reflection fallback for flows not registered via WithDurableFlow<TFlow, TInput>(). In a trimmed app an " +
@@ -935,13 +1115,17 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
 
         var contract = typeof(IDurableFlow<>).MakeGenericType(inputType);
 
+        // The TYPE is checked before anything is resolved: the ledger's FlowTypeName is store data,
+        // and resolving first constructed (and later disposed) whatever DI service it named — any
+        // registered type's constructor ran on flow-store content before the check rejected it,
+        // the same exposure the input type is bounded against below. The instance check stays for
+        // registrations whose factory returns something other than the service type.
+        if (!contract.IsAssignableFrom(flowType))
+            throw FlowContractMismatch(flowType, inputType);
+
         var flow = ResolveFlowFromDi(serviceProvider, flowType);
         if (!contract.IsInstanceOfType(flow))
-        {
-            throw new InvalidOperationException(
-                $"Durable flow type '{flowType.FullName}' does not implement IDurableFlow<{inputType.Name}> " +
-                "matching the persisted input type; the flow state was written by an incompatible flow definition.");
-        }
+            throw FlowContractMismatch(flowType, inputType);
 
         // Deserialize only AFTER the contract check above has passed: the ledger's InputTypeName is
         // attacker-controlled to anyone who can write the flow store, and STJ construction runs
@@ -953,18 +1137,87 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
         var execute = contract.GetMethod(nameof(IDurableFlow<object>.ExecuteAsync))!;
         try
         {
-            await ((Task)execute.Invoke(flow, [context, input])!).ConfigureAwait(false);
-            await context.FlushProgressAsync().ConfigureAwait(false);
-            return context.IsSuspended;
+            try
+            {
+                await ((Task)execute.Invoke(flow, [context, input])!).ConfigureAwait(false);
+            }
+            catch (System.Reflection.TargetInvocationException ex) when (ex.InnerException is not null)
+            {
+                // A synchronously-thrown flow exception arrives wrapped; unwrap so terminal
+                // DurableFlowFailedException handling (and user-visible stack traces) see the real one.
+                System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(ex.InnerException).Throw();
+                throw;
+            }
         }
-        catch (System.Reflection.TargetInvocationException ex) when (ex.InnerException is not null)
+        catch (Exception ex) when (context.IsSuspended && ex is not DurableFlowSuspendedException)
         {
-            // A synchronously-thrown flow exception arrives wrapped; unwrap so terminal
-            // DurableFlowFailedException handling (and user-visible stack traces) see the real one.
-            System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(ex.InnerException).Throw();
+            throw ParkOutranConversion(state, ex);
+        }
+        catch (Exception ex) when (context.Interruption is { } interruption && ex is not DurableFlowInterruptedException)
+        {
+            InterruptionOutranConversion(state, ex);
+            interruption.Throw();
             throw;
         }
+
+        await context.FlushProgressAsync().ConfigureAwait(false);
+        return context.IsSuspended;
     }
+
+    /// <summary>
+    /// The start job's input comparison for a flow with no <see cref="DurableFlowRegistration"/> (one
+    /// started through <c>IDurableFlows.StartAsync</c> but executed by reflection) — the counterpart of
+    /// <see cref="DurableFlowRegistration.InputEquivalent"/>. The starter always compares by value (it
+    /// knows <c>TInput</c>); comparing the JSON shape here instead made the two disagree once the input
+    /// type gained a member: the starter logged "re-enqueues the existing run" and this job, reading
+    /// <c>{"TenantId":7}</c> and <c>{"TenantId":7,"Region":null}</c> as different work, was dropped.
+    /// <para>
+    /// Both inputs are read as the ledger's input type and written back the same way — but only once
+    /// the checks <see cref="InvokeFlowByReflectionAsync"/> makes before IT deserializes anything have
+    /// passed, without constructing the flow: the type names are store data, so the input type must be
+    /// one that a DI-registered flow class declares through <c>IDurableFlow&lt;TInput&gt;</c>. A name
+    /// that does not resolve or pass those checks leaves the shape comparison standing; an input
+    /// today's type cannot read is a mismatch, never an exception.
+    /// </para>
+    /// </summary>
+    [UnconditionalSuppressMessage("AOT", "IL3050",
+        Justification = "Same reflection fallback as InvokeFlowByReflectionAsync, reached only for flows not registered via " +
+                        "WithDurableFlow<TFlow, TInput>(): MakeGenericType re-materializes an interface instantiation the flow " +
+                        "class already implements statically, and a failure leaves the JSON-shape comparison standing.")]
+    private static bool ReflectedInputEquivalent(IServiceProvider serviceProvider, FlowState existing, string? persisted, string requested)
+    {
+        if (FlowStateJson.JsonEquivalent(persisted, requested))
+            return true;
+        if (persisted is null)
+            return false;
+
+        try
+        {
+            if (existing.FlowTypeName is not { } flowTypeName
+                || existing.InputTypeName is not { } inputTypeName
+                || ReflectionExtensions.ResolveServiceType(flowTypeName) is not { } flowType
+                || ReflectionExtensions.ResolveServiceType(inputTypeName) is not { } inputType
+                || !typeof(IDurableFlow<>).MakeGenericType(inputType).IsAssignableFrom(flowType)
+                || serviceProvider.GetService<IServiceProviderIsService>()?.IsService(flowType) != true)
+            {
+                return false;
+            }
+
+            return FlowStateJson.JsonEquivalent(Normalize(persisted), Normalize(requested));
+
+            string Normalize(string json)
+                => JsonSafety.SafeDeserialize(json, inputType) is { } value ? AsyncResponseJson.Serialize(value, value.GetType()) : "null";
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            return false;
+        }
+    }
+
+    private static InvalidOperationException FlowContractMismatch(Type flowType, Type inputType)
+        => new(
+            $"Durable flow type '{flowType.FullName}' does not implement IDurableFlow<{inputType.Name}> " +
+            "matching the persisted input type; the flow state was written by an incompatible flow definition.");
 
     private static object ResolveFlowFromDi(IServiceProvider serviceProvider, Type flowType)
     {

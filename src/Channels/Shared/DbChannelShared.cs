@@ -3,7 +3,9 @@ using Microsoft.Extensions.Logging;
 using System.Buffers;
 using System.Collections.Concurrent;
 using System.Diagnostics;
+using System.Diagnostics.Metrics;
 using System.Runtime.CompilerServices;
+using System.Runtime.ExceptionServices;
 using System.Text;
 using System.Text.Json;
 using System.Threading.Channels;
@@ -45,12 +47,24 @@ internal abstract class DbAsyncResponseChannelBase :
 
     // A signal carries the correlation id to scan (targeted), or null to scan every subscribed
     // correlation id (the periodic sweep that is the missed-wake safety net).
+    //
+    // Bounded but never lossy: a write that finds the channel full raises _fullSweepRequested
+    // instead of evicting anything. DropOldest silently discarded the EARLIEST queued signals —
+    // during one long pass a burst of wakes filled the channel, and the targeted wakes and
+    // backpressure rescans it evicted then waited for the next throttled full sweep, past the
+    // publisher's delivery-confirmation budget, so their responses were claimed for
+    // lost-subscriber recovery under live waiters. A full sweep covers every id a refused signal
+    // could have named.
     private readonly Channel<string?> _signals = Channel.CreateBounded<string?>(new BoundedChannelOptions(1024)
     {
         SingleReader = true,
         SingleWriter = false,
-        FullMode = BoundedChannelFullMode.DropOldest
+        FullMode = BoundedChannelFullMode.Wait
     });
+
+    // 1 when a signal was refused by a full channel, or a targeted pass the breaker cut short; the
+    // next dispatch pass then sweeps in full.
+    private int _fullSweepRequested;
 
     // Maps a just-published message id to a completion the local dispatch loop trips the instant it
     // delivers the message to a live waiter. Same-process delivery (the overwhelmingly common case)
@@ -76,6 +90,11 @@ internal abstract class DbAsyncResponseChannelBase :
 
     private readonly object _listenerGate = new();
     private protected CancellationTokenSource? _listenerCts;
+
+    // The listener CTS's token, captured when the loops start (a disposed CTS refuses .Token, the
+    // captured struct stays usable): what the same-process fast path's work items run on, so they
+    // stop with the channel rather than with whichever publisher queued them. None until then.
+    private CancellationToken _dispatchToken;
     private protected Task? _listenTask;
     private protected Task? _dispatchTask;
     private protected Task? _heartbeatTask;
@@ -323,9 +342,6 @@ internal abstract class DbAsyncResponseChannelBase :
     public Task SetResponse<T>(T response, string correlationId, CancellationToken cancellationToken = default) where T : IAsyncResponsePayload
         => SetResponseCore(response, correlationId, cancellationToken);
 
-    Task IRawAsyncResponsePublisher.SetRawResponse(object? response, string correlationId, CancellationToken cancellationToken)
-        => SetResponseCore(response, correlationId, cancellationToken);
-
     Task IRawAsyncResponsePublisher.SetRawResponseJson(string responseJson, string correlationId, CancellationToken cancellationToken)
         => SetRawResponseJsonCore(responseJson, correlationId, cancellationToken);
 
@@ -431,7 +447,7 @@ internal abstract class DbAsyncResponseChannelBase :
 
         var subscribers = await _store.CountActiveSubscribersAsync(correlationId, cancellationToken).ConfigureAwait(false);
         activity?.SetTag("asyncresponse.subscribers", subscribers);
-        if (subscribers <= 0)
+        if (subscribers <= 0 && !HasLocalLiveSubscription(correlationId))
         {
             var dispatchResult = await DispatchToRecoveryAsync(
                     hasLiveSubscriber: () => HasLiveSubscriberAsync(correlationId, cancellationToken))
@@ -478,7 +494,7 @@ internal abstract class DbAsyncResponseChannelBase :
         {
             var subscribers = await _store.CountActiveSubscribersAsync(correlationId, cancellationToken).ConfigureAwait(false);
             activity?.SetTag("asyncresponse.subscribers", subscribers);
-            if (subscribers <= 0)
+            if (subscribers <= 0 && !HasLocalLiveSubscription(correlationId))
             {
                 var dispatchResult = await _lostSubscriberDispatcher
                     .DispatchLostExceptions(
@@ -577,10 +593,34 @@ internal abstract class DbAsyncResponseChannelBase :
 
     /// <summary>
     /// Re-probes waiter liveness for the lost-subscriber dispatcher's snapshot-race re-check,
-    /// using the same active-subscriber count the publish path consulted.
+    /// using the same liveness rule the publish path consulted: a live local subscription, or
+    /// the store's active-subscriber count.
     /// </summary>
     private async ValueTask<bool> HasLiveSubscriberAsync(string correlationId, CancellationToken cancellationToken)
-        => await _store.CountActiveSubscribersAsync(correlationId, cancellationToken).ConfigureAwait(false) > 0;
+        => HasLocalLiveSubscription(correlationId)
+           || await _store.CountActiveSubscribersAsync(correlationId, cancellationToken).ConfigureAwait(false) > 0;
+
+    /// <summary>
+    /// Whether THIS process holds a live (not dropped) subscription for the id — proof of a live
+    /// waiter whatever the subscriber store says. The store's row lapses once heartbeats have
+    /// failed for longer than the heartbeat timeout (a database outage), and a publish in that
+    /// window counted no subscriber, consumed the registration and fired the recovery callback
+    /// under a waiter still waiting in this very process. Publishing live instead hands the
+    /// response to it through the same-process fast path.
+    /// </summary>
+    private bool HasLocalLiveSubscription(string correlationId)
+    {
+        if (!_subscriptions.TryGetValue(correlationId, out var group))
+            return false;
+
+        foreach (var subscription in group.Values)
+        {
+            if (!subscription.Dropped)
+                return true;
+        }
+
+        return false;
+    }
 
     private protected void AddSubscription(string correlationId, IDbSubscription subscription)
     {
@@ -665,6 +705,48 @@ internal abstract class DbAsyncResponseChannelBase :
     /// </summary>
     protected virtual TimeSpan? CurrentFullSweepInterval() => _options.FullSweepInterval;
 
+    /// <summary>
+    /// The full-sweep interval while a provider's push wake is expected but not established (a
+    /// <c>LISTEN</c> or change stream that is down or reconnecting):
+    /// <c>min(FullSweepInterval, DeliveryConfirmationTimeout / 4)</c>, or every tick when
+    /// <c>FullSweepInterval</c> is null.
+    /// <para>
+    /// The sweep is then the only cross-process wake, so the regular throttle — whose 5 s default
+    /// equals the publisher's confirmation budget — would let responses be claimed for
+    /// lost-subscriber recovery under live waiters. But sweeping on EVERY tick held up to
+    /// <see cref="FullSweepParallelism"/> pooled connections back to back for as long as the
+    /// wake stayed down, which is exactly when the database (an outage, an exhausted pool — the
+    /// conditions that drop the wake) can least afford it, and the listener reconnecting through
+    /// the same pool competed with it. A quarter of the confirmation budget bounds the wait for
+    /// the next sweep and leaves three quarters for the sweep itself (which warns past half the
+    /// budget) and the delivery claim; on defaults that is one sweep per 1.25 s instead of per
+    /// 250 ms tick.
+    /// </para>
+    /// </summary>
+    private protected TimeSpan? WakeDownFullSweepInterval()
+    {
+        if (_options.FullSweepInterval is not { } configured)
+            return null;
+
+        var floor = _options.DeliveryConfirmationTimeout / 4;
+        return floor < configured ? floor : configured;
+    }
+
+    /// <summary>The longest reconnect backoff of a wake listener (the PostgreSQL <c>LISTEN</c> loop, the MongoDB change-stream loop).</summary>
+    private protected static readonly TimeSpan WakeListenerMaxRetryDelay = TimeSpan.FromSeconds(5);
+
+    /// <summary>
+    /// How long an established wake listener must stay up before its failure starts a new run of
+    /// reconnect backoff instead of continuing the current one: the backoff's cap, the healthy-run
+    /// rule <c>SubscriberSupervisor</c> applies to transport subscribers. Resetting on every
+    /// successful connect removed the backoff's bound on a server or proxy that accepts the
+    /// <c>LISTEN</c> (or opens the stream) and then drops the session — a crash-looping server, a
+    /// short <c>idle_session_timeout</c>: it reconnected every 50–100 ms for good, each time
+    /// requesting an immediate full sweep and logging a warning. Never resetting escalated every
+    /// flap of a long-lived process toward the cap. A field only so a test can shorten it.
+    /// </summary>
+    private protected readonly TimeSpan _wakeListenerHealthyRun = WakeListenerMaxRetryDelay;
+
     private void ThrowIfDisposed()
     {
         lock (_listenerGate)
@@ -688,13 +770,15 @@ internal abstract class DbAsyncResponseChannelBase :
 
             var listenerCts = new CancellationTokenSource();
             _listenerCts = listenerCts;
+            _dispatchToken = listenerCts.Token;
             _listenTask = StartWakeListener(listenerCts.Token);
             _dispatchTask = Task.Run(() => DispatchLoopAsync(listenerCts.Token));
             _heartbeatTask = Task.Run(() => HeartbeatLoopAsync(listenerCts.Token));
         }
     }
 
-    // The REAL clock, deliberately — here and in the dispatch loop's poll and rescan delays —
+    // The REAL clock, deliberately — here, in the dispatch loop's poll and rescan delays, in the
+    // history-reconciliation interval, in the late-commit lookback window and in seen-set aging —
     // although waiter timeouts and the delivery-confirmation wait arm on _timeProvider. These
     // loops keep pace with state that lives in the database and moves in real time whatever clock
     // the process was handed: subscriber rows expire on the SERVER's clock, and another process's
@@ -704,13 +788,28 @@ internal abstract class DbAsyncResponseChannelBase :
     // response at all. What the injected clock owns is time the process itself defines.
     private async Task HeartbeatLoopAsync(CancellationToken cancellationToken)
     {
+        // Consecutive failed rounds. A failed round is retried on a short backoff (capped at one
+        // second, and never later than the regular interval) instead of a full interval: the
+        // subscriber rows lapse SubscriberHeartbeatTimeout after the last successful round, so
+        // across a database outage longer than that every row expires, and a loop parked in a
+        // full-interval delay then left a window of up to one interval after the database came
+        // back in which every publish saw no live subscriber and routed live waiters' responses
+        // to lost-subscriber recovery. Same shape as the DB transports' lease-renewal retry.
+        var failures = 0;
+        // Stopwatch timestamp of the last failure logged at Warning. The retry runs about once a
+        // second through an outage, and a Warning per retry was ten times the volume of the old
+        // full-interval cadence for no extra information: the first failure of a run warns, later
+        // ones at most once per heartbeat interval, the rest at Debug.
+        long? lastFailureWarningAt = null;
         while (!cancellationToken.IsCancellationRequested)
         {
             try
             {
-                await Task.Delay(_options.SubscriberHeartbeatInterval, cancellationToken).ConfigureAwait(false);
+                await Task.Delay(failures == 0 ? _options.SubscriberHeartbeatInterval : HeartbeatRetryDelay(failures), cancellationToken).ConfigureAwait(false);
                 var registrations = SnapshotActiveRegistrations();
-                if (registrations.Count > 0)
+                if (registrations.Count == 0)
+                    failures = 0;
+                else
                 {
                     try
                     {
@@ -719,6 +818,7 @@ internal abstract class DbAsyncResponseChannelBase :
                             registrations,
                             _options.SubscriberHeartbeatTimeout,
                             cancellationToken).ConfigureAwait(false);
+                        failures = 0;
                     }
                     catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
                     {
@@ -726,12 +826,29 @@ internal abstract class DbAsyncResponseChannelBase :
                     }
                     catch (Exception ex)
                     {
+                        failures++;
                         // The round still compensates below: SQL Server commits per-batch,
                         // MongoDB bulk-writes unordered, and any provider can fail after some
                         // upserts landed — a registration dropped mid-round may already be
                         // resurrected even though the round as a whole threw. Skipping the
                         // re-check on failure left exactly those rows phantom until TTL.
-                        _logger.LogWarning(ex, "{Provider} subscriber heartbeat failed; retrying for all local waiters.", _providerName);
+                        if (failures == 1
+                            || lastFailureWarningAt is not { } warnedAt
+                            || Stopwatch.GetElapsedTime(warnedAt) >= _options.SubscriberHeartbeatInterval)
+                        {
+                            lastFailureWarningAt = Stopwatch.GetTimestamp();
+                            _logger.LogWarning(
+                                ex,
+                                "{Provider} subscriber heartbeat failed ({ConsecutiveFailures} consecutive); retrying for all local waiters.",
+                                _providerName, failures);
+                        }
+                        else
+                        {
+                            _logger.LogDebug(
+                                ex,
+                                "{Provider} subscriber heartbeat retry {ConsecutiveFailures} failed; retrying for all local waiters (warnings are limited to one per heartbeat interval).",
+                                _providerName, failures);
+                        }
                     }
 
                     await DeleteRegistrationsDroppedDuringHeartbeatAsync(registrations, cancellationToken).ConfigureAwait(false);
@@ -756,6 +873,15 @@ internal abstract class DbAsyncResponseChannelBase :
             }
         }
     }
+
+    private TimeSpan HeartbeatRetryDelay(int failures)
+    {
+        var backoff = AsyncResponseRetry.Backoff(failures, HeartbeatRetryBaseDelay, HeartbeatRetryMaxDelay);
+        return backoff < _options.SubscriberHeartbeatInterval ? backoff : _options.SubscriberHeartbeatInterval;
+    }
+
+    private static readonly TimeSpan HeartbeatRetryBaseDelay = TimeSpan.FromMilliseconds(100);
+    private static readonly TimeSpan HeartbeatRetryMaxDelay = TimeSpan.FromSeconds(1);
 
     private List<(string CorrelationId, Guid RegistrationId)> SnapshotActiveRegistrations()
     {
@@ -853,8 +979,8 @@ internal abstract class DbAsyncResponseChannelBase :
     /// <c>Task.Delay</c> per pass that only counted when it won the race, so a steady stream of
     /// targeted signals cancelled every delay and the full sweep never ran: a response published
     /// from another process with no local signal — every cross-process response on SQL Server,
-    /// any missed or dropped notification elsewhere (the signal channel itself drops its oldest
-    /// entry when full) — sat undelivered for as long as unrelated local traffic continued.
+    /// any missed or dropped notification elsewhere — sat undelivered for as long as unrelated
+    /// local traffic continued.
     /// </para>
     /// </summary>
     private protected async Task<HashSet<string>?> CollectDispatchScopeAsync(CancellationToken cancellationToken)
@@ -907,8 +1033,10 @@ internal abstract class DbAsyncResponseChannelBase :
             {
                 // Queued signals stay queued: the sweep covers their correlation ids, and the
                 // next pass re-scans them as a cheap targeted scope instead of this pass having
-                // to reason about signals written while the sweep was running.
+                // to reason about signals written while the sweep was running. A refused signal
+                // is covered by this sweep too.
                 _lastFullSweepAt = Stopwatch.GetTimestamp();
+                Interlocked.Exchange(ref _fullSweepRequested, 0);
                 return null;
             }
         }
@@ -922,6 +1050,11 @@ internal abstract class DbAsyncResponseChannelBase :
             else
                 scope.Add(correlationId);
         }
+
+        // Judged after the drain: a signal refused while the channel was full named an id that
+        // is in none of the entries just read, so only a full sweep is sure to cover it.
+        if (Interlocked.Exchange(ref _fullSweepRequested, 0) != 0)
+            fullSweep = true;
 
         if (fullSweep || (signalled && scope.Count == 0))
         {
@@ -952,24 +1085,227 @@ internal abstract class DbAsyncResponseChannelBase :
 
     private protected async Task DispatchPendingMessagesAsync(HashSet<string>? scope, CancellationToken cancellationToken)
     {
+        // Per-correlation isolation: one id's failure (a transient fault, a poisoned row) used to
+        // abort the pass at that id, in the same order every time, so every id enumerated after
+        // it lost its delivery on every pass until the failing waiter went away. Each id is now
+        // dispatched on its own, and the pass still reports a failure afterwards so the loop logs
+        // it and backs off as before.
+        //
+        // Isolation must not turn an outage into one failing store call per waiter per pass,
+        // though: SweepFailures trips a breaker once the first ids of a pass all failed
+        // transiently (the store is down, not one id poisoned), the rest of the pass is left to
+        // the next one, and the reported exception carries only the first few failures.
         if (scope is not null)
         {
+            // The not-yet-due poll tick: nothing to scan, and nothing to allocate for it.
+            if (scope.Count == 0)
+                return;
+
             // A publish signals exactly one correlation id, so a targeted scan must cost
             // O(scope), not O(live waiters): enumerating the whole registry made every publish
             // quadratic under load, and the not-yet-due poll tick (an empty scope) paid the same
-            // walk to match nothing.
+            // walk to match nothing. The failure record is allocated by the first failure (this
+            // runs on every publish and registration), so the settle order is counted here until then.
+            SweepFailures? failures = null;
+            var attempted = 0;
+            var settled = 0;
             foreach (var correlationId in scope)
             {
-                if (_subscriptions.TryGetValue(correlationId, out var group))
-                    await DispatchPendingCorrelationAsync(correlationId, group, cancellationToken).ConfigureAwait(false);
+                attempted++;
+                if (!_subscriptions.TryGetValue(correlationId, out var group))
+                    continue;
+
+                settled++;
+                var failure = await TryDispatchPendingCorrelationAsync(correlationId, group, cancellationToken).ConfigureAwait(false);
+                if (failure is null && failures is null)
+                    continue;
+
+                failures ??= new SweepFailures(settledBefore: settled - 1);
+                if (failures.Record(failure))
+                {
+                    // These ids' signals are consumed: only a full sweep is sure to come back
+                    // for the ones this pass skips.
+                    Interlocked.Exchange(ref _fullSweepRequested, 1);
+                    break;
+                }
             }
 
+            failures?.ThrowIfAny(_providerName, notAttempted: scope.Count - attempted);
             return;
         }
 
-        foreach (var (correlationId, group) in _subscriptions)
-            await DispatchPendingCorrelationAsync(correlationId, group, cancellationToken).ConfigureAwait(false);
+        // The full sweep costs at least one store query per subscribed correlation id. Walked
+        // sequentially its duration grew as waiters × round trip, and past the publisher's
+        // delivery-confirmation budget every response only this sweep delivers (every
+        // cross-process response on SQL Server; a lost wake elsewhere) was claimed for
+        // lost-subscriber recovery under its live waiter. Distinct ids share no scan state (each
+        // group owns its cursor, the seen sets lock, admission is non-blocking) and each id's own
+        // executor keeps its delivery order, so a bounded number run side by side.
+        var startedAt = Stopwatch.GetTimestamp();
+        var visited = 0;
+        var sweepFailures = new SweepFailures();
+        // The breaker stops only the scheduling of further ids; the ids already in flight finish
+        // on the loop's own token.
+        using var breaker = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        try
+        {
+            await Parallel.ForEachAsync(
+                _subscriptions,
+                new ParallelOptions { MaxDegreeOfParallelism = FullSweepParallelism, CancellationToken = breaker.Token },
+                async (entry, _) =>
+                {
+                    // Judged per id as well as through the token: a worker that took its next id
+                    // just as the breaker tripped leaves it alone.
+                    if (sweepFailures.Tripped)
+                        return;
+                    Interlocked.Increment(ref visited);
+                    if (sweepFailures.Record(await TryDispatchPendingCorrelationAsync(entry.Key, entry.Value, cancellationToken).ConfigureAwait(false)))
+                        breaker.Cancel();
+                }).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (sweepFailures.Tripped && !cancellationToken.IsCancellationRequested)
+        {
+            // Tripped: the unvisited ids wait for the next scheduled sweep, reported below.
+        }
+
+        // An idle channel keeps ticking over an empty map; only sweeps that visited a waiter
+        // count — and a tripped one measured the outage, not the sweep.
+        if (visited > 0 && !sweepFailures.Tripped)
+            ReportFullSweep(Stopwatch.GetElapsedTime(startedAt), visited);
+        sweepFailures.ThrowIfAny(_providerName, notAttempted: sweepFailures.Tripped ? Math.Max(0, _subscriptions.Count - Volatile.Read(ref visited)) : 0);
     }
+
+    /// <summary>One correlation id's pass; returns its failure instead of throwing it (cancellation of the loop still propagates).</summary>
+    private async Task<Exception?> TryDispatchPendingCorrelationAsync(
+        string correlationId,
+        ConcurrentDictionary<Guid, IDbSubscription> group,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            await DispatchPendingCorrelationAsync(correlationId, group, cancellationToken).ConfigureAwait(false);
+            return null;
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException || !cancellationToken.IsCancellationRequested)
+        {
+            return ex;
+        }
+    }
+
+    /// <summary>
+    /// The per-correlation outcomes of one dispatch pass: reported as one exception once the pass
+    /// is over, and a breaker that trips when the first <see cref="FullSweepParallelism"/> ids to
+    /// settle all failed with a transient store fault.
+    /// <para>
+    /// Per-id isolation made a database outage cost one failing store call (a connection attempt,
+    /// up to its timeout) per subscribed correlation id per pass, and one exception per id in the
+    /// Warning the loop logs — at 1,000 waiters, megabytes of stack traces every poll tick where
+    /// the pre-isolation loop had logged one. A first wave in which every id failed transiently
+    /// says the store is down, not that one id is poisoned: the rest of the pass is skipped, and only
+    /// the first <see cref="MaxReportedFailures"/> failures travel with the exception. A poisoned
+    /// id or a non-transient fault never trips it, so the isolation still holds for those.
+    /// </para>
+    /// </summary>
+    private sealed class SweepFailures(int settledBefore = 0)
+    {
+        private readonly List<Exception> _reported = [];
+        private int _count;
+        // Ids that settled before this record was created (the targeted pass allocates it on its
+        // first failure), so the breaker still judges the first ids to settle.
+        private int _settled = settledBefore;
+        private int _leadingTransientFailures;
+        private volatile bool _tripped;
+
+        public bool Tripped => _tripped;
+
+        /// <summary>Records one settled id (<c>null</c> = dispatched); <c>true</c> when this outcome tripped the breaker.</summary>
+        public bool Record(Exception? failure)
+        {
+            // One lock for the settle order AND the trip decision: no id can settle between the
+            // wave's last failure and the trip, so an id that starts after it sees Tripped, and at
+            // most one id per other worker is still in flight when it trips.
+            lock (_reported)
+            {
+                // Settle order, not start order: the breaker judges the first ids to come back.
+                var order = ++_settled;
+                if (failure is null)
+                    return false;
+
+                _count++;
+                if (_reported.Count < MaxReportedFailures)
+                    _reported.Add(failure);
+
+                // Reaching the wave size counts only transient failures among the first ids to
+                // settle, so it means every one of them failed transiently — a success or a
+                // non-transient failure in that wave leaves the count short for good.
+                if (_tripped
+                    || order > FullSweepParallelism
+                    || !DbChannelStore.IsTransient(failure)
+                    || ++_leadingTransientFailures < FullSweepParallelism)
+                {
+                    return false;
+                }
+
+                _tripped = true;
+                return true;
+            }
+        }
+
+        public void ThrowIfAny(string providerName, int notAttempted)
+        {
+            lock (_reported)
+            {
+                if (_count == 0)
+                    return;
+                if (_count == 1 && !_tripped)
+                    ExceptionDispatchInfo.Capture(_reported[0]).Throw();
+
+                var attached = _count > _reported.Count
+                    ? $" (the first {_reported.Count} attached, and {_count - _reported.Count} more)"
+                    : string.Empty;
+                var rest = Tripped
+                    ? $"; the first {FullSweepParallelism} to settle all failed transiently, so the store looks unavailable and the remaining {notAttempted} were left to a later pass"
+                    : "; every other id was still dispatched";
+                throw new AggregateException($"The {providerName} dispatch pass failed for {_count} correlation ids{attached}{rest}.", _reported);
+            }
+        }
+    }
+
+    /// <summary>Most per-correlation failures one pass's exception carries; the message counts the rest.</summary>
+    private const int MaxReportedFailures = 3;
+
+    /// <summary>Most correlation ids one full sweep dispatches concurrently (each holds one store connection while it runs).</summary>
+    private const int FullSweepParallelism = 8;
+
+    private static readonly Histogram<double> FullSweepDuration = AsyncResponseDiagnostics.Meter.CreateHistogram<double>(
+        "asyncresponse.channel.sweep.duration",
+        unit: "s",
+        description: "Duration of one database-channel full dispatch sweep over every subscribed correlation id. A sweep approaching DeliveryConfirmationTimeout lets cross-process responses be claimed for lost-subscriber recovery under live waiters.");
+
+    // Stopwatch timestamp of the last slow-sweep warning; touched only by the dispatch loop.
+    private long? _lastSlowSweepWarningAt;
+
+    private void ReportFullSweep(TimeSpan duration, int correlationIds)
+    {
+        FullSweepDuration.Record(duration.TotalSeconds, new KeyValuePair<string, object?>("asyncresponse.channel", _activityTag));
+
+        // Half the confirmation budget: past it, a response the sweep reaches last is claimed for
+        // recovery before its waiter is handed it. Rate-limited — a persistently slow sweep runs
+        // every poll tick on SQL Server, and one line a minute says as much as one per tick.
+        if (duration <= _options.DeliveryConfirmationTimeout / 2
+            || (_lastSlowSweepWarningAt is { } lastWarning && Stopwatch.GetElapsedTime(lastWarning) < SlowSweepWarningInterval))
+        {
+            return;
+        }
+
+        _lastSlowSweepWarningAt = Stopwatch.GetTimestamp();
+        _logger.LogWarning(
+            "{Provider} full dispatch sweep over {CorrelationIdCount} correlation ids took {Duration}, more than half the {DeliveryConfirmationTimeout} delivery-confirmation timeout. " +
+            "Cross-process responses only the sweep delivers can be claimed for lost-subscriber recovery under live waiters; reduce the number of concurrent waiters per process or raise DeliveryConfirmationTimeout.",
+            _providerName, correlationIds, duration, _options.DeliveryConfirmationTimeout);
+    }
+
+    private static readonly TimeSpan SlowSweepWarningInterval = TimeSpan.FromMinutes(1);
 
     // The group owns its scan progress: removing the last subscription also makes the cursor
     // collectible, without another per-correlation registry or a cleanup race on reused ids.
@@ -984,17 +1320,66 @@ internal abstract class DbAsyncResponseChannelBase :
         public void Advance(DbChannelMessage message) { CreatedAtUtc = message.CreatedAtUtc; Id = message.Id; }
     }
 
+    // Cursor positions compared by creation time only: the stores order ids by their own binary
+    // rules, which Guid.CompareTo does not reproduce, so within one tick all that is knowable is
+    // whether the last row read is a different one.
+    private static bool IsBehind(MessageCursor cursor, MessageCursor reference)
+        => cursor.CreatedAtUtc is { } at && reference.CreatedAtUtc is { } referenceAt && at < referenceAt;
+
+    private static bool IsAhead(MessageCursor cursor, MessageCursor reference)
+        => cursor.CreatedAtUtc is { } at
+           && (reference.CreatedAtUtc is not { } referenceAt || at > referenceAt || (at == referenceAt && cursor.Id != reference.Id));
+
     private sealed class DispatchScan
     {
         public HashSet<Guid> Registrations = [];
         public MessageCursor Forward = new();
         public bool ForwardCaughtUp;
+        // Stopwatch timestamp of the last pass whose forward read moved past every row seen
+        // before it, or whose lookback revisit the executor refused — what opens the late-commit
+        // lookback window (see LateCommitLookback).
+        public long? ForwardAdvancedAt;
         public MessageCursor? Reconciliation;
         public DateTimeOffset? ReconciliationEndUtc;
         public Guid? ReconciliationEndId;
-        public DateTimeOffset ReconcileAfter;
+        // Stopwatch timestamp the reconciliation interval runs from: a pure interval over
+        // commits that land in real time, so a wall clock stepping back must not postpone it and
+        // a virtual clock nobody advances must not suspend it.
+        public long ReconciledAt;
         public int RewindRequested;
+        // Ids this scan admitted to the executor whose work item has not finished yet. Rows are
+        // marked seen only when their work item runs, so without this the lookback window, the
+        // last-tick revisit and reconciliation re-read a row that is still queued and queued it
+        // again on every pass — behind a slow Until predicate, duplicates that took executor
+        // slots ahead of new rows. Dropped (never cleared) on a reset: a new registration set
+        // must re-admit what the old one queued, since a queued item delivers only to the
+        // subscriptions it captured; each item removes itself from the set it was added to.
+        // Created by the first admission: a scan is built and reset once per correlation id's
+        // lifecycle, and most admit a row or two.
+        public ConcurrentDictionary<Guid, byte>? Queued;
     }
+
+    /// <summary>
+    /// How far behind its last row a caught-up forward read looks while the cursor is fresh:
+    /// half the delivery-confirmation budget, at most two seconds.
+    /// <para>
+    /// A row's <c>created_at</c> is stamped when its INSERT runs, not when it commits. A response
+    /// whose insert was stamped before a row this scan already read, but whose transaction
+    /// committed after that read, lands BEHIND the cursor, where no forward read sees it again —
+    /// only history reconciliation, which runs one page per pass a whole interval after the last
+    /// one (5 s by default, the same as the publisher's confirmation budget). Its publisher in
+    /// another process then won the recovery claim first: the lost-subscriber callback fired
+    /// under a live waiter, and reconciliation later lost the delivery claim and dropped the row.
+    /// A commit slower than this window from its stamp still waits for reconciliation.
+    /// </para>
+    /// </summary>
+    private TimeSpan LateCommitLookback()
+    {
+        var half = _options.DeliveryConfirmationTimeout / 2;
+        return half < MaxLateCommitLookback ? half : MaxLateCommitLookback;
+    }
+
+    private static readonly TimeSpan MaxLateCommitLookback = TimeSpan.FromSeconds(2);
 
     private async Task DispatchPendingCorrelationAsync(
         string correlationId,
@@ -1020,25 +1405,30 @@ internal abstract class DbAsyncResponseChannelBase :
             return;
 
         var since = oldestStartedAtUtc.AddSeconds(-1);
-        var seenCutoff = _timeProvider.GetUtcNow() - _options.MessageRetention - TimeSpan.FromMinutes(1);
+        // Seen entries age out on the real monotonic clock (see MarkSeen), a little past the
+        // server-side retention they stand in for.
+        var seenMaxAge = _options.MessageRetention + TimeSpan.FromMinutes(1);
         foreach (var subscription in subscriptions)
-            subscription.PruneSeen(seenCutoff);
+            subscription.PruneSeen(seenMaxAge);
 
         var scan = _dispatchScans.GetOrCreateValue(group);
         var registrations = subscriptions.Select(subscription => subscription.Id).ToHashSet();
-        var now = _timeProvider.GetUtcNow();
         if (!scan.Registrations.SetEquals(registrations) || Interlocked.Exchange(ref scan.RewindRequested, 0) != 0)
         {
             scan.Registrations = registrations;
             scan.Forward = new MessageCursor();
             scan.ForwardCaughtUp = false;
+            scan.ForwardAdvancedAt = null;
             scan.Reconciliation = null;
-            scan.ReconcileAfter = now + _options.HistoryReconciliationInterval;
+            scan.ReconciledAt = Stopwatch.GetTimestamp();
+            scan.Queued = null;
         }
 
         // Normal polls and targeted signals continue after the last admitted page. A new waiter
         // resets progress so its own watermark, not another waiter's seen set, decides fan-out.
-        var previousForward = scan.Forward;
+        // A snapshot, not the live cursor: a walk that continues from an earlier pass advances
+        // the cursor object in place, and this pass must still see where it started.
+        var previousForward = new MessageCursor { CreatedAtUtc = scan.Forward.CreatedAtUtc, Id = scan.Forward.Id };
         if (scan.ForwardCaughtUp && scan.Forward.CreatedAtUtc is { } lastTick && lastTick > DateTimeOffset.MinValue)
         {
             // A database clock tick can contain several random ids. A newly committed message
@@ -1046,7 +1436,21 @@ internal abstract class DbAsyncResponseChannelBase :
             // id sorts before the previous message. Revisit that tick, not the entire history.
             // The provider may truncate the sub-tick timestamp to milliseconds/microseconds;
             // the maximum id excludes rows at that preceding, truncated timestamp.
-            scan.Forward = new MessageCursor { CreatedAtUtc = lastTick.AddTicks(-1), Id = LastMessageId };
+            //
+            // While the cursor is fresh, revisit a whole lookback window behind it instead: a
+            // late commit stamped inside it becomes visible within the window's length of the
+            // read that moved the cursor past it. The box stays open for TWICE the window, since
+            // the wake for such a commit lands only after the commit itself; after that, idle
+            // polls fall back to the single last tick, so they stay cheap. Re-read rows are
+            // screened before admission: processed ones by the seen sets, admitted ones still
+            // waiting in the executor by the scan's queued set, so none is enqueued twice.
+            var lookback = LateCommitLookback();
+            var revisitFrom = scan.ForwardAdvancedAt is { } advancedAt
+                              && Stopwatch.GetElapsedTime(advancedAt) < lookback + lookback
+                              && lastTick - DateTimeOffset.MinValue > lookback
+                ? lastTick - lookback
+                : lastTick.AddTicks(-1);
+            scan.Forward = new MessageCursor { CreatedAtUtc = revisitFrom, Id = LastMessageId };
         }
         scan.ForwardCaughtUp = false;
         var forwardReadAny = false;
@@ -1054,7 +1458,25 @@ internal abstract class DbAsyncResponseChannelBase :
         {
             var (more, admitted, _) = await DispatchPageAsync(scan.Forward).ConfigureAwait(false);
             if (!admitted)
+            {
+                // A refused page inside the revisit window: put the cursor back where this pass
+                // found it, caught up, as if the revisit had not run. Left at the window's start
+                // and no longer caught up, every rescan re-read the whole window from there —
+                // whether or not the window was still open — and re-offered the same rows to the
+                // executor that had just refused them. The refused rows are behind the restored
+                // cursor only if they were inside the window, and the next pass revisits it again
+                // while it is open — so the refusal keeps it open: a restored cursor does not
+                // advance, and a window left to age out while refusals lasted (an executor full for
+                // longer than twice the lookback) stranded a refused late row behind it for
+                // reconciliation. Re-reads are screened by the seen and queued sets.
+                if (IsBehind(scan.Forward, previousForward))
+                {
+                    scan.Forward = previousForward;
+                    scan.ForwardCaughtUp = true;
+                    scan.ForwardAdvancedAt = Stopwatch.GetTimestamp();
+                }
                 return;
+            }
             if (!more)
             {
                 scan.ForwardCaughtUp = true;
@@ -1063,14 +1485,20 @@ internal abstract class DbAsyncResponseChannelBase :
             if (page == MaxForwardPagesPerPass - 1)
                 ScheduleBackpressureRescan(correlationId, cancellationToken);
         }
-        if (!forwardReadAny)
-            scan.Forward = previousForward; // Expired/pruned tail: do not walk backward on idle polls.
+        // Expired/pruned tail, or a lookback revisit that ended inside the range already read: do
+        // not walk backward on idle polls.
+        if (!forwardReadAny || IsBehind(scan.Forward, previousForward))
+            scan.Forward = previousForward;
+        else if (IsAhead(scan.Forward, previousForward))
+            scan.ForwardAdvancedAt = Stopwatch.GetTimestamp();
 
         // Creation keys are NOT commit order: a transaction can become visible behind the
         // cursor, even with the same timestamp and a lower id, and another process may already
         // have acknowledged it. Reconcile retained history periodically, one page per pass.
         // Both unacked and acked rows participate; filtering acked rows would break fan-out.
-        if (scan.Reconciliation is null && now >= scan.ReconcileAfter && scan.Forward.Id is not null)
+        if (scan.Reconciliation is null
+            && Stopwatch.GetElapsedTime(scan.ReconciledAt) >= _options.HistoryReconciliationInterval
+            && scan.Forward.Id is not null)
         {
             scan.Reconciliation = new MessageCursor();
             scan.ReconciliationEndUtc = scan.Forward.CreatedAtUtc;
@@ -1082,7 +1510,7 @@ internal abstract class DbAsyncResponseChannelBase :
             if (admitted && (!more || reachedEnd))
             {
                 scan.Reconciliation = null;
-                scan.ReconcileAfter = _timeProvider.GetUtcNow() + _options.HistoryReconciliationInterval;
+                scan.ReconciledAt = Stopwatch.GetTimestamp();
             }
             else
                 ScheduleBackpressureRescan(correlationId, cancellationToken);
@@ -1112,14 +1540,15 @@ internal abstract class DbAsyncResponseChannelBase :
                     _logger.LogError(
                         "The {Provider} channel store returned a message for correlationId '{ReturnedCorrelationId}' when asked for '{RequestedCorrelationId}'. " +
                         "The correlation-id column is not using a case-sensitive/binary collation, so distinct correlation ids collide in the database. " +
-                        "The message was NOT delivered to the wrong waiter. Re-create the AsyncResponse tables (or ALTER the correlation_id columns) with a binary collation.",
+                        "The message was NOT delivered to the wrong waiter. Re-create the AsyncResponse tables or collections (or alter the correlation_id columns) with a binary collation — on MongoDB, the simple collation.",
                         _providerName, message.CorrelationId, correlationId);
                     continue;
                 }
 
-                // Reconciliation and last-tick overlap revisit seen headers; keep those out of
-                // the executor queue. The work item re-checks after admission as well.
-                if (!WouldDeliverToAnySubscription(message, subscriptions))
+                // Reconciliation, the lookback window and last-tick overlap revisit seen headers
+                // and rows still queued from an earlier pass; keep those out of the executor
+                // queue. The work item re-checks after admission as well.
+                if (scan.Queued?.ContainsKey(message.Id) == true || !WouldDeliverToAnySubscription(message, subscriptions))
                     continue;
 
                 (eligible ??= []).Add(message);
@@ -1127,8 +1556,17 @@ internal abstract class DbAsyncResponseChannelBase :
                     (headerOnly ??= []).Add(message.Id);
             }
 
-            if (eligible is not null && !await EnqueueEligibleAsync(correlationId, eligible, headerOnly, subscriptions, cancellationToken).ConfigureAwait(false))
+            if (eligible is not null
+                && !await EnqueueEligibleAsync(
+                    correlationId,
+                    eligible,
+                    headerOnly,
+                    subscriptions,
+                    scan.Queued ??= new ConcurrentDictionary<Guid, byte>(concurrencyLevel: 1, capacity: eligible.Count),
+                    cancellationToken).ConfigureAwait(false))
+            {
                 return (false, false, false); // Retry this page: never advance past refused work.
+            }
 
             if (messages.Count > 0)
             {
@@ -1153,6 +1591,7 @@ internal abstract class DbAsyncResponseChannelBase :
         List<DbChannelMessage> eligible,
         List<Guid>? headerOnly,
         List<IDbSubscription> subscriptions,
+        ConcurrentDictionary<Guid, byte> queued,
         CancellationToken cancellationToken)
     {
         Dictionary<Guid, DbChannelMessage>? hydrated = null;
@@ -1195,9 +1634,15 @@ internal abstract class DbAsyncResponseChannelBase :
             // capacity the rest of this correlation id's messages are left unclaimed in the
             // store, in order (nothing later is enqueued ahead of them), and a rescan of just
             // this id is scheduled for when the executor has had a poll interval to drain.
+            //
+            // Marked queued BEFORE the admission: an admitted item can run and unmark itself
+            // before TryEnqueue even returns, and a mark set after that would never be cleared.
+            queued.TryAdd(deliverable.Id, 0);
             var outcome = _executors.TryEnqueue(
                 ChannelName(correlationId),
-                new LocalDispatchWorkItem(this, deliverable, subscriptions, cancellationToken).InvokeAsync);
+                new LocalDispatchWorkItem(this, deliverable, subscriptions, cancellationToken, queued).InvokeAsync);
+            if (outcome != SerialExecutorRegistry.TryEnqueueOutcome.Accepted)
+                queued.TryRemove(deliverable.Id, out _);
             if (outcome == SerialExecutorRegistry.TryEnqueueOutcome.Full)
             {
                 ScheduleBackpressureRescan(correlationId, cancellationToken);
@@ -1243,7 +1688,7 @@ internal abstract class DbAsyncResponseChannelBase :
         // because LoadMessagesAsync reads acked_at.
         var message = await _store.InsertMessageAsync(messageId, correlationId, envelopeJson, _options.MessageRetention, cancellationToken)
             .ConfigureAwait(false);
-        await TryDispatchLocalSubscribersAsync(message, cancellationToken).ConfigureAwait(false);
+        TryDispatchLocalSubscribers(message);
         SignalDispatcher(correlationId);
     }
 
@@ -1404,7 +1849,7 @@ internal abstract class DbAsyncResponseChannelBase :
         return false;
     }
 
-    private async Task TryDispatchLocalSubscribersAsync(DbChannelMessage message, CancellationToken cancellationToken)
+    private void TryDispatchLocalSubscribers(DbChannelMessage message)
     {
         if (!_subscriptions.TryGetValue(message.CorrelationId, out var group))
             return;
@@ -1423,10 +1868,18 @@ internal abstract class DbAsyncResponseChannelBase :
         // invocation on every channel, and a direct dispatch here could otherwise run concurrently
         // with a sweep-enqueued dispatch of a different message for the same subscription. MarkSeen
         // keeps the sweep from double-processing this message.
-        await _executors.EnqueueAsync(
+        //
+        // NON-BLOCKING admission, like the sweep's: the publisher used to AWAIT executor capacity
+        // here, and behind a sibling waiter's executor retirement that meant waiting out its
+        // drain (up to 30 s + 30 s behind a slow Until predicate) — a stalled serial ingress. The
+        // row is already stored, so a full or mid-retirement executor just leaves it to the
+        // targeted signal the publish sends next; the sweep admits it in store order. The work
+        // item runs on the CHANNEL's dispatch token, never the publisher's: a publisher that gave
+        // up after its response was stored must not abort the local delivery of it (the claim
+        // then threw, and every such item was logged as an executor error).
+        _ = _executors.TryEnqueue(
             ChannelName(message.CorrelationId),
-            new LocalDispatchWorkItem(this, message, subscriptions, cancellationToken).InvokeAsync,
-            cancellationToken).ConfigureAwait(false);
+            new LocalDispatchWorkItem(this, message, subscriptions, _dispatchToken).InvokeAsync);
     }
 
     /// <summary>
@@ -1451,10 +1904,34 @@ internal abstract class DbAsyncResponseChannelBase :
         if (await WaitForAcknowledgementAsync(confirmation, cancellationToken).ConfigureAwait(false))
             return true;
 
-        return !await _store.TryClaimForRecoveryAsync(confirmation.MessageId, cancellationToken).ConfigureAwait(false);
+        // Retried on the insert's policy. The claim runs AFTER the row is stored, so a single
+        // transient fault here failed the publish, and the ingress's own retry then re-published
+        // the response under a NEW message id — a duplicate an Until waiter received twice. It is
+        // idempotent: it sets recovery_claimed only while acked_at is null, delivery claims
+        // refuse a recovery-claimed row, so a retry after a lost reply finds its own claim.
+        return !await AsyncResponseRetry.ExecuteAsync(
+            token => _store.TryClaimForRecoveryAsync(confirmation.MessageId, token),
+            DbChannelStore.IsTransient,
+            _options.PublishMaxAttempts,
+            _options.PublishRetryBaseDelay,
+            _options.PublishRetryMaxDelay,
+            cancellationToken).ConfigureAwait(false);
     }
 
-    private protected void SignalDispatcher(string? correlationId = null) => _signals.Writer.TryWrite(correlationId);
+    private protected void SignalDispatcher(string? correlationId = null)
+    {
+        // Every process receives every wake on the database (each NOTIFY, each change event)
+        // whether or not it holds a waiter for the id, and only a local subscription can use one:
+        // a targeted scan of an unsubscribed id reads nothing. Dropping those here — the single
+        // choke point every wake source goes through — keeps the cluster-wide wake rate out of
+        // the bounded channel. A registration racing this check is safe: a new waiter signals its
+        // own id right after it becomes discoverable (CreateResponseWaiterCore).
+        if (!string.IsNullOrEmpty(correlationId) && !_subscriptions.ContainsKey(correlationId))
+            return;
+
+        if (!_signals.Writer.TryWrite(correlationId))
+            Interlocked.Exchange(ref _fullSweepRequested, 1);
+    }
 
     /// <summary>
     /// Correlation ids whose executor was at capacity during a sweep and that have a rescan
@@ -1545,12 +2022,32 @@ internal abstract class DbAsyncResponseChannelBase :
             }
 
             // Slow path: a delivery in another process only set acked_at, so poll for it.
-            if (await _store.IsMessageAcknowledgedAsync(confirmation.MessageId, cancellationToken).ConfigureAwait(false))
+            if (await IsAcknowledgedToleratingTransientFaultsAsync(confirmation.MessageId, cancellationToken).ConfigureAwait(false))
                 return true;
         }
 
         return confirmation.Delivered.IsCompletedSuccessfully
-            || await _store.IsMessageAcknowledgedAsync(confirmation.MessageId, cancellationToken).ConfigureAwait(false);
+            || await IsAcknowledgedToleratingTransientFaultsAsync(confirmation.MessageId, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// One acknowledgement poll, reading a transient store fault as "not acknowledged yet". The
+    /// poll runs AFTER the response row is stored, and one transient fault among its ~100 polls
+    /// failed the whole publish — the ingress then re-published the response under a new
+    /// message id, a duplicate for any Until waiter that had already received the first copy.
+    /// Nothing is lost by polling on: the recovery claim at the deadline arbitrates atomically.
+    /// </summary>
+    private async Task<bool> IsAcknowledgedToleratingTransientFaultsAsync(Guid messageId, CancellationToken cancellationToken)
+    {
+        try
+        {
+            return await _store.IsMessageAcknowledgedAsync(messageId, cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (DbChannelStore.IsTransient(ex))
+        {
+            _logger.LogDebug(ex, "{Provider} delivery-confirmation poll for message {MessageId} failed transiently; polling on.", _providerName, messageId);
+            return false;
+        }
     }
 
     private static string SerializeRawSuccessEnvelope(string payloadJson)
@@ -1622,15 +2119,41 @@ internal abstract class DbAsyncResponseChannelBase :
         DbAsyncResponseChannelBase owner,
         DbChannelMessage message,
         IReadOnlyList<IDbSubscription> subscriptions,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        ConcurrentDictionary<Guid, byte>? queued = null)
     {
         public async Task InvokeAsync()
         {
             try
             {
+                await InvokeCoreAsync().ConfigureAwait(false);
+            }
+            finally
+            {
+                // Settled (delivered, seen, or failed into a rewind): a later read may admit the
+                // row again, and the seen sets decide from here on.
+                queued?.TryRemove(message.Id, out _);
+            }
+        }
+
+        private async Task InvokeCoreAsync()
+        {
+            try
+            {
                 await owner.DispatchMessageToSubscribersAsync(message, subscriptions, cancellationToken).ConfigureAwait(false);
             }
-            catch (Exception ex) when (ex is not OperationCanceledException || !cancellationToken.IsCancellationRequested)
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                // The channel is stopping — its dispatch token is the only token a work item runs
+                // on. Not a delivery failure and nothing left to rescan for; escaping, it reached
+                // ChannelSerialExecutor, which logged every item still queued at a graceful
+                // shutdown as an executor error.
+                owner._logger.LogDebug(
+                    "Local {Provider} response dispatch for correlationId {CorrelationId} stopped with the channel.",
+                    owner._providerName,
+                    message.CorrelationId);
+            }
+            catch (Exception ex)
             {
                 if (owner._subscriptions.TryGetValue(message.CorrelationId, out var group)
                     && owner._dispatchScans.TryGetValue(group, out var scan))
@@ -1720,12 +2243,15 @@ internal abstract class DbAsyncResponseChannelBase :
         Func<DbChannelMessage, Task> ProcessUnderContextAsync { get; set; }
         bool HasSeen(Guid messageId);
         bool MarkSeen(Guid messageId);
-        void PruneSeen(DateTimeOffset cutoffUtc);
+        void PruneSeen(TimeSpan maxAge);
         Task ProcessAsync(DbChannelMessage message);
         ValueTask CleanupOnceAsync(bool deleteRecoveryState);
         ValueTask DrainThenCleanupAsync(bool deleteRecoveryState, Exception? terminalIfUndelivered = null);
         ValueTask DropLocalAsync(CancellationToken cancellationToken);
     }
+
+    /// <summary>Most characters of a remote failure's message the waiter's activity status quotes.</summary>
+    private const int RemoteFailureStatusMaxLength = 512;
 
     private sealed class DbSubscription<T> : IDbSubscription where T : IAsyncResponsePayload
     {
@@ -1735,7 +2261,7 @@ internal abstract class DbAsyncResponseChannelBase :
         private readonly TaskCompletionSource<T> _tcs;
         private readonly Activity? _activity;
         private readonly HashSet<Guid> _seen = [];
-        private readonly Queue<(Guid Id, DateTimeOffset SeenAtUtc)> _seenOrder = [];
+        private readonly Queue<(Guid Id, long SeenAt)> _seenOrder = [];
         private readonly object _seenGate = new();
         private int _cleanupStarted;
         private volatile bool _dropped;
@@ -1791,19 +2317,22 @@ internal abstract class DbAsyncResponseChannelBase :
 
                 // Use the local observation time, not the database creation time. This keeps the
                 // pruning queue monotonic and avoids immediate eviction when app and DB clocks differ.
-                // It MUST come from the same clock PruneSeen's cutoff is computed on: mixing a
-                // wall-clock stamp with a TimeProvider cutoff makes every entry look either
-                // permanently fresh or permanently expired under a virtual clock.
-                _seenOrder.Enqueue((messageId, _owner._timeProvider.GetUtcNow()));
+                // A monotonic Stopwatch stamp, not the injected clock: an entry stands in for a row
+                // the SERVER retains for MessageRetention of real time, so a wall clock stepped
+                // forward — or a virtual clock a test advanced past the retention — must not evict
+                // the seen set of a live waiter while the rows are still there to be re-read (the
+                // last-tick overlap and reconciliation re-delivered them). PruneSeen ages entries
+                // on the same Stopwatch.
+                _seenOrder.Enqueue((messageId, Stopwatch.GetTimestamp()));
                 return true;
             }
         }
 
-        public void PruneSeen(DateTimeOffset cutoffUtc)
+        public void PruneSeen(TimeSpan maxAge)
         {
             lock (_seenGate)
             {
-                while (_seenOrder.TryPeek(out var entry) && entry.SeenAtUtc < cutoffUtc)
+                while (_seenOrder.TryPeek(out var entry) && Stopwatch.GetElapsedTime(entry.SeenAt) >= maxAge)
                 {
                     _seenOrder.Dequeue();
                     _seen.Remove(entry.Id);
@@ -1848,7 +2377,10 @@ internal abstract class DbAsyncResponseChannelBase :
                     var remoteFailure = new Exception(envelope.ExceptionMessage ?? "Unknown error during asynchronous processing.");
                     if (!string.IsNullOrEmpty(envelope.ExceptionStackTrace))
                         remoteFailure.Data["RemoteStackTrace"] = RemoteStackTrace.Cap(envelope.ExceptionStackTrace, _owner._options.MaxRemoteStackTraceLength);
-                    AsyncResponseDiagnostics.SetError(_activity, "remote_failure", remoteFailure.Message);
+                    // The status quotes a capped, escaped excerpt: the message is REMOTE text (up to
+                    // the inbound size limit, CR/LF included), the same exposure the stack trace
+                    // cap exists for. The waiter's exception still carries it verbatim.
+                    AsyncResponseDiagnostics.SetError(_activity, "remote_failure", DiagnosticText.EscapedExcerpt(remoteFailure.Message, RemoteFailureStatusMaxLength));
                     _tcs.TrySetException(remoteFailure);
                 }
                 else
@@ -2019,13 +2551,15 @@ internal abstract class DbAsyncResponseChannelBase :
                 // so DisposeAsync's own retirement loop will not see it, and an untracked
                 // retirement could still be inside its 30-second drain budget when the host tears
                 // down the logger and exits — logging into a disposed logger, or being killed
-                // mid-drain. DisposeAsync awaits whatever is still outstanding here.
+                // mid-drain. DisposeAsync awaits whatever is still outstanding here. Retired only
+                // once no sibling subscription on this correlation id remains registered: the
+                // executor is shared, and the last cleanup out retires it.
                 var channelName = _owner.ChannelName(_correlationId);
                 _owner.TrackRetirement(Task.Run(async () =>
                 {
                     try
                     {
-                        await _owner._executors.RemoveAsync(channelName).ConfigureAwait(false);
+                        await _owner._executors.RetireIfUnreferencedAsync(channelName).ConfigureAwait(false);
                     }
                     catch (Exception ex)
                     {

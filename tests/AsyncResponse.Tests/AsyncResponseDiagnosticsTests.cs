@@ -183,6 +183,40 @@ public class AsyncResponseDiagnosticsTests
         Assert.Equal("custom.error", Tag(activity, "error.type"));
     }
 
+    [Fact]
+    public void SetWorker_TagsStreamWrittenNamesBoundedAndEscaped()
+    {
+        // Regression: the worker target's names were tagged raw. On the consuming side they come
+        // off the worker stream — written by whoever can publish to it — and are tagged before
+        // authorization, so megabytes of text and its raw line breaks went into the trace backend.
+        using var activity = new Activity("diagnostics").Start();
+
+        AsyncResponseDiagnostics.SetWorker(activity, new ReflectionCallDto
+        {
+            ServiceInterfaceFullName = "Evil.Service\r\nFORGED " + new string('s', 100_000),
+            MethodName = "Run\nFORGED " + new string('m', 10_000),
+            Params = []
+        });
+
+        var service = Assert.IsType<string>(Tag(activity, "asyncresponse.worker.service"));
+        var method = Assert.IsType<string>(Tag(activity, "asyncresponse.worker.method"));
+        Assert.DoesNotContain("\r", service, StringComparison.Ordinal);
+        Assert.DoesNotContain("\n", service, StringComparison.Ordinal);
+        Assert.DoesNotContain("\n", method, StringComparison.Ordinal);
+        Assert.True(service.Length < 1_000, $"service tag is {service.Length} characters");
+        Assert.True(method.Length < 2_000, $"method tag is {method.Length} characters");
+
+        // An ordinary target is tagged exactly as before.
+        AsyncResponseDiagnostics.SetWorker(activity, new ReflectionCallDto
+        {
+            ServiceInterfaceFullName = typeof(IRecoverySpy).FullName!,
+            MethodName = nameof(IRecoverySpy.OnWorkerJob),
+            Params = []
+        });
+        Assert.Equal(typeof(IRecoverySpy).FullName, Tag(activity, "asyncresponse.worker.service"));
+        Assert.Equal(nameof(IRecoverySpy.OnWorkerJob), Tag(activity, "asyncresponse.worker.method"));
+    }
+
     private static ServiceProvider CreateProvider()
     {
         var services = new ServiceCollection();

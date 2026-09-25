@@ -185,6 +185,105 @@ public sealed class InMemoryWorkerTransportDrainTests
         await provider.DisposeAsync();
     }
 
+    public interface ISelfRepublishingProbe
+    {
+        Task RunAsync(int link);
+    }
+
+    private sealed class SelfRepublishingProbe : ISelfRepublishingProbe
+    {
+        /// <summary>The id the job queued behind the chain runs under.</summary>
+        public const int Queued = -1;
+
+        private readonly List<int> _executed = [];
+
+        public InMemoryWorkerTransport? Transport { get; set; }
+        public int LastLink { get; init; }
+        public TaskCompletionSource FirstStarted { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public TaskCompletionSource ReleaseFirst { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public TaskCompletionSource AllRan { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public IReadOnlyList<int> Executed
+        {
+            get { lock (_executed) return _executed.ToArray(); }
+        }
+
+        public async Task RunAsync(int link)
+        {
+            lock (_executed)
+            {
+                _executed.Add(link);
+                if (_executed.Count == LastLink + 2)
+                    AllRan.TrySetResult();
+            }
+
+            if (link == Queued)
+                return;
+
+            if (link == 0)
+            {
+                FirstStarted.TrySetResult();
+                await ReleaseFirst.Task;
+            }
+
+            // A paged job re-enqueueing itself, or a sequential child orchestration: every link
+            // publishes the next one from inside the running job.
+            if (link < LastLink)
+                await Transport!.PublishAsync(Job(link + 1));
+        }
+
+        public static WorkerJobEnvelope Job(int link) => new()
+        {
+            Call = new ReflectionCallDto
+            {
+                ServiceInterfaceFullName = typeof(ISelfRepublishingProbe).FullName!,
+                MethodName = nameof(ISelfRepublishingProbe.RunAsync),
+                Params = [CallbackParam.ForValue(link)]
+            },
+            CorrelationId = $"chain-link-{link}"
+        };
+    }
+
+    [Fact]
+    public async Task FollowUpChain_AgainstAFullQueue_DoesNotStarveTheJobQueuedBehindIt()
+    {
+        // Regression (fixpoint r1): the round-42 "follow-ups first" loop ran the overflow until it
+        // was empty before reading the queue again. A follow-up's own follow-up finds the queue
+        // just as full — nothing has read it — so a chain of in-job publishes (a job re-enqueueing
+        // itself, a sequential child orchestration) ran link after link while the job already
+        // waiting in the queue never got a turn, for as long as the chain kept going. Each burst
+        // is now bounded by the overflow present when it starts.
+        var probe = new SelfRepublishingProbe { LastLink = 6 };
+        var provider = new ServiceCollection()
+            .AddSingleton<ISelfRepublishingProbe>(probe)
+            .BuildServiceProvider();
+        var transport = new InMemoryWorkerTransport(
+            Options.Create(new InMemoryWorkerTransportOptions { QueueCapacity = 1, WorkerCount = 1 }));
+        probe.Transport = transport;
+        var executor = new WorkerJobExecutor(
+            provider.GetRequiredService<IServiceScopeFactory>(),
+            NullLogger<WorkerJobExecutor>.Instance);
+        var host = new InMemoryWorkerHost(transport, executor, NullLogger<InMemoryWorkerHost>.Instance);
+
+        await host.StartAsync(CancellationToken.None);
+
+        await transport.PublishAsync(SelfRepublishingProbe.Job(0));
+        await probe.FirstStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        // Fill the single queue slot behind the running link, so link 1 spills into the overflow.
+        await transport.PublishAsync(SelfRepublishingProbe.Job(SelfRepublishingProbe.Queued));
+        probe.ReleaseFirst.TrySetResult();
+
+        await probe.AllRan.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        await host.StopAsync(CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(10));
+
+        // Link 1 was the one follow-up waiting when link 0 finished, so it still goes first (the
+        // [1, 3, 2] guarantee above); what link 1 published waits for the queued job. Unbounded,
+        // the queued job ran only after the whole chain: [0, 1, 2, 3, 4, 5, 6, -1].
+        Assert.Equal([0, 1, SelfRepublishingProbe.Queued, 2, 3, 4, 5, 6], probe.Executed);
+        await provider.DisposeAsync();
+    }
+
     public interface IChainProbe
     {
         Task RunAsync();
@@ -496,6 +595,228 @@ public sealed class InMemoryWorkerTransportDrainTests
                 Params = []
             }
         };
+
+    [Fact]
+    public async Task ThrowingLogger_WhileTheDrainDropsDelayedJobs_StillCompletesTheWriter()
+    {
+        // Regression (fixpoint r1): the drain logs each delayed job it drops from inside the
+        // host's stop cancellation. A logging provider that threw there aborted the drain before
+        // it completed the writer: the workers stayed parked in their reads, StopAsync waited out
+        // its whole budget and then rethrew.
+        var logger = new CollectingLogger { ThrowOnMessageContaining = "Dropping delayed" };
+        await using var provider = new ServiceCollection().BuildServiceProvider();
+        var transport = new InMemoryWorkerTransport();
+        var executor = new WorkerJobExecutor(provider.GetRequiredService<IServiceScopeFactory>(), NullLogger<WorkerJobExecutor>.Instance);
+        var host = new InMemoryWorkerHost(transport, executor, logger.For<InMemoryWorkerHost>());
+
+        await host.StartAsync(CancellationToken.None);
+        await transport.PublishAsync(DelayedJob(), TimeSpan.FromHours(1));
+
+        using var cutoff = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        await host.StopAsync(cutoff.Token);
+
+        Assert.False(cutoff.IsCancellationRequested, "the stop should have drained on its own, not been cut off");
+        Assert.True(transport.Reader.Completion.IsCompleted, "the drain must complete the writer even when its log line throws");
+        Assert.Contains(logger.Messages, message => message.Contains("Dropping delayed", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task ThrowingLogger_OnTheDrainDebugLine_StillRunsTheJobAndFinishesTheDrain()
+    {
+        // Regression (fixpoint r1): the "draining job X" Debug line ran before RunJobAsync's try.
+        // When it threw, the job never ran, its outstanding count was never released (so the
+        // drain could never complete the writer), and the exception ended the worker loop.
+        var probe = new DrainProbe();
+        var logger = new CollectingLogger { ThrowOnMessageContaining = "Draining in-memory worker job" };
+        await using var provider = new ServiceCollection().AddSingleton<IDrainProbe>(probe).BuildServiceProvider();
+        var transport = new InMemoryWorkerTransport();
+        var executor = new WorkerJobExecutor(provider.GetRequiredService<IServiceScopeFactory>(), NullLogger<WorkerJobExecutor>.Instance);
+        var host = new InMemoryWorkerHost(transport, executor, logger.For<InMemoryWorkerHost>());
+
+        await host.StartAsync(CancellationToken.None);
+        await transport.PublishAsync(OverflowJob("drain-log-1"));
+        await transport.PublishAsync(OverflowJob("drain-log-2"));
+        await probe.FirstStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        // The second job starts only after the stop began, so its start logs the drain line.
+        using var cutoff = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        var stop = host.StopAsync(cutoff.Token);
+        probe.ReleaseFirst.TrySetResult();
+        await stop;
+
+        Assert.False(cutoff.IsCancellationRequested, "the stop should have drained on its own, not been cut off");
+        Assert.Equal(2, probe.Executed);
+        Assert.Equal(0, transport.OutstandingJobs);
+    }
+
+    public interface IFireAndForgetProbe
+    {
+        Task RunAsync();
+    }
+
+    private sealed class FireAndForgetProbe : IFireAndForgetProbe
+    {
+        public InMemoryWorkerTransport? Transport { get; set; }
+        public TaskCompletionSource Spawned { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public TaskCompletionSource ReleasePublish { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public Task? Publish { get; private set; }
+
+        public Task RunAsync()
+        {
+            // Fire-and-forget: the task inherits the job's execution context (and with it the
+            // in-job flag) and publishes long after the job has returned.
+            Publish = Task.Run(async () =>
+            {
+                await ReleasePublish.Task;
+                await Transport!.PublishAsync(OverflowJob("orphan"));
+            });
+            Spawned.TrySetResult();
+            return Task.CompletedTask;
+        }
+    }
+
+    [Fact]
+    public async Task PublishFromCodeThatOutlivedItsJob_AfterTheDrainCompleted_IsRejectedNotSilentlyAccepted()
+    {
+        // Regression (fixpoint r1): the in-job path fell back to the overflow whenever the queue
+        // refused a write — including a queue the drain had already completed. Nothing reads the
+        // overflow once the workers have left their read loops, so a fire-and-forget task that
+        // inherited the in-job flag and published after shutdown was told its job was accepted,
+        // and the job never ran (an external publisher gets ChannelClosedException there).
+        var probe = new FireAndForgetProbe();
+        await using var provider = new ServiceCollection().AddSingleton<IFireAndForgetProbe>(probe).BuildServiceProvider();
+        var transport = new InMemoryWorkerTransport();
+        probe.Transport = transport;
+        var executor = new WorkerJobExecutor(provider.GetRequiredService<IServiceScopeFactory>(), NullLogger<WorkerJobExecutor>.Instance);
+        var host = new InMemoryWorkerHost(transport, executor, NullLogger<InMemoryWorkerHost>.Instance);
+
+        await host.StartAsync(CancellationToken.None);
+        await transport.PublishAsync(new WorkerJobEnvelope
+        {
+            Call = new ReflectionCallDto
+            {
+                ServiceInterfaceFullName = typeof(IFireAndForgetProbe).FullName!,
+                MethodName = nameof(IFireAndForgetProbe.RunAsync),
+                Params = []
+            }
+        });
+        await probe.Spawned.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        await host.StopAsync(CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(10));
+        await transport.Reader.Completion.WaitAsync(TimeSpan.FromSeconds(10));
+
+        probe.ReleasePublish.TrySetResult();
+        await Assert.ThrowsAsync<ChannelClosedException>(() => probe.Publish!.WaitAsync(TimeSpan.FromSeconds(10)));
+        Assert.Equal(0, transport.OutstandingJobs);
+    }
+
+    public interface IBlockingProbe
+    {
+        Task RunAsync();
+    }
+
+    private sealed class BlockingProbe : IBlockingProbe
+    {
+        public SemaphoreSlim Gate { get; } = new(0);
+        public TaskCompletionSource Entered { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public Task RunAsync()
+        {
+            Entered.TrySetResult();
+            Gate.Wait(); // a synchronous (CPU-bound or blocking) handler
+            return Task.CompletedTask;
+        }
+    }
+
+    [Fact]
+    public async Task StartAsync_WithABacklogQueuedBeforeStart_DoesNotRunItsHandlersInline()
+    {
+        // Regression (fixpoint r1): a queue that already held jobs completed the first read
+        // synchronously, so the backlog's synchronous handler prefixes ran INSIDE StartAsync —
+        // host startup waited for them (and deadlocked on a handler waiting for a service started
+        // later). The workers now leave the caller's thread before their first read.
+        var probe = new BlockingProbe();
+        await using var provider = new ServiceCollection().AddSingleton<IBlockingProbe>(probe).BuildServiceProvider();
+        var transport = new InMemoryWorkerTransport();
+        var executor = new WorkerJobExecutor(provider.GetRequiredService<IServiceScopeFactory>(), NullLogger<WorkerJobExecutor>.Instance);
+        var host = new InMemoryWorkerHost(transport, executor, NullLogger<InMemoryWorkerHost>.Instance);
+
+        // Published before the host starts, e.g. by an earlier hosted service's StartAsync.
+        await transport.PublishAsync(new WorkerJobEnvelope
+        {
+            Call = new ReflectionCallDto
+            {
+                ServiceInterfaceFullName = typeof(IBlockingProbe).FullName!,
+                MethodName = nameof(IBlockingProbe.RunAsync),
+                Params = []
+            }
+        });
+
+        var start = Task.Run(() => host.StartAsync(CancellationToken.None));
+        try
+        {
+            // Old behavior: StartAsync is still inside the blocked handler here.
+            await start.WaitAsync(TimeSpan.FromSeconds(10));
+        }
+        finally
+        {
+            probe.Gate.Release();
+        }
+
+        // The job still ran — on a worker, not on the starting thread.
+        await probe.Entered.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        await host.StopAsync(CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(10));
+        Assert.Equal(0, transport.OutstandingJobs);
+    }
+
+    /// <summary>A single-threaded context whose thread never pumps: whatever is posted to it never runs.</summary>
+    private sealed class NeverPumpedSynchronizationContext : SynchronizationContext
+    {
+        private int _posted;
+
+        public int Posted => Volatile.Read(ref _posted);
+
+        public override void Post(SendOrPostCallback d, object? state) => Interlocked.Increment(ref _posted);
+
+        public override void Send(SendOrPostCallback d, object? state) => throw new NotSupportedException();
+    }
+
+    [Fact]
+    public async Task StartAsync_OnAThreadWithASynchronizationContext_StartsTheWorkersOnThePool()
+    {
+        // Regression (fixpoint r1 pre-commit review): the workers' first hop off the starting
+        // thread was Task.Yield, which posts to the caller's SynchronizationContext — so a host
+        // started on a UI thread or under any single-threaded context had no worker running until
+        // that thread pumped, and deadlocked if it then blocked on a job's result.
+        var probe = new DrainProbe();
+        probe.ReleaseFirst.TrySetResult();
+        await using var provider = new ServiceCollection().AddSingleton<IDrainProbe>(probe).BuildServiceProvider();
+        var transport = new InMemoryWorkerTransport();
+        var executor = new WorkerJobExecutor(provider.GetRequiredService<IServiceScopeFactory>(), NullLogger<WorkerJobExecutor>.Instance);
+        var host = new InMemoryWorkerHost(transport, executor, NullLogger<InMemoryWorkerHost>.Instance);
+
+        var context = new NeverPumpedSynchronizationContext();
+        var previous = SynchronizationContext.Current;
+        Task start;
+        SynchronizationContext.SetSynchronizationContext(context);
+        try
+        {
+            start = host.StartAsync(CancellationToken.None);
+        }
+        finally
+        {
+            SynchronizationContext.SetSynchronizationContext(previous);
+        }
+
+        await start;
+        await transport.PublishAsync(OverflowJob("context-free"));
+
+        // Hang guard only: the old workers were stuck in the context's never-pumped queue.
+        await probe.FirstStarted.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        Assert.Equal(0, context.Posted);
+        await host.StopAsync(CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(10));
+        Assert.Equal(0, transport.OutstandingJobs);
+    }
 
     [Fact]
     public async Task PumpOverflow_UnderConcurrentPumpers_NeitherDuplicatesNorLosesJobs()

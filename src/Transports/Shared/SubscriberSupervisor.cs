@@ -14,7 +14,7 @@ namespace AsyncResponse.Transports;
 /// caused by host shutdown, e.g. a transport-internal timeout — increments the failure count, asks
 /// the caller-supplied delay policy how long to wait, reports the retry through the caller-supplied
 /// callback, and waits before trying again. The count is of CONSECUTIVE failures: a run that stayed
-/// up at least as long as the policy's saturated delay before failing starts the count over.
+/// up at least as long as the configured maximum retry delay before failing starts the count over.
 /// </summary>
 internal static class SubscriberSupervisor
 {
@@ -22,9 +22,12 @@ internal static class SubscriberSupervisor
     /// Runs <paramref name="run"/> until it completes or <paramref name="stoppingToken"/> requests
     /// shutdown. <paramref name="delayPolicy"/> receives the 1-based consecutive-failure count and
     /// returns how long to wait before the next attempt; <paramref name="logRetry"/> renders the
-    /// per-transport log line for that wait. The policy must saturate: it is also asked for
-    /// <see cref="int.MaxValue"/> failures, and that answer — its longest delay — is the healthy-run
-    /// threshold past which a failed run no longer counts as consecutive with the one before it.
+    /// per-transport log line for that wait. <paramref name="healthyRunThreshold"/> — the policy's
+    /// configured maximum delay — is the healthy-run threshold past which a failed run no longer
+    /// counts as consecutive with the one before it. It is passed, not asked of the policy: every
+    /// transport's policy is the half-jittered <c>AsyncResponseRetry.Backoff</c>, whose answer for
+    /// any failure count is only a sample in [max/2, max], so a threshold drawn from it once reset
+    /// the streak for runs that died well short of the maximum.
     /// <paramref name="timeProvider"/> clocks both the run and the wait (a test seam; the system
     /// clock when omitted).
     /// </summary>
@@ -33,11 +36,11 @@ internal static class SubscriberSupervisor
         CancellationToken stoppingToken,
         Func<int, TimeSpan> delayPolicy,
         Action<Exception, TimeSpan> logRetry,
+        TimeSpan healthyRunThreshold,
         TimeProvider? timeProvider = null)
     {
         var clock = timeProvider ?? TimeProvider.System;
         var failures = 0;
-        TimeSpan? healthyRun = null;
         while (!stoppingToken.IsCancellationRequested)
         {
             var startedAt = clock.GetTimestamp();
@@ -64,7 +67,7 @@ internal static class SubscriberSupervisor
                 // outlived the longest delay the policy can impose was healthy, so this failure
                 // starts a new streak. (A run that merely took that long to fail — a black-holed
                 // connect — resets too, harmlessly: its own duration already paces the retries.)
-                if (failures > 0 && clock.GetElapsedTime(startedAt) >= (healthyRun ??= delayPolicy(int.MaxValue)))
+                if (failures > 0 && clock.GetElapsedTime(startedAt) >= healthyRunThreshold)
                     failures = 0;
 
                 failures++;

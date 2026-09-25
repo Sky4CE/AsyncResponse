@@ -54,10 +54,16 @@ internal sealed class SerialExecutorRegistry(
     // branch in EnqueueAsync (and tombstone pruning) could not be covered deterministically.
     private readonly TimeProvider _timeProvider = timeProvider ?? TimeProvider.System;
 
-    private DateTimeOffset UtcNow => _timeProvider.GetUtcNow();
+    // Tombstone deadlines are MONOTONIC timestamps, not wall-clock instants: a tombstone bounds
+    // how long an in-flight enqueue may still arrive, which is elapsed time. On the wall clock a
+    // forward step (NTP, a resumed VM) expired a fresh tombstone early, and the straggler it
+    // exists to drop recreated an executor that nothing would ever retire.
+    private long Now => _timeProvider.GetTimestamp();
+
+    private long TombstoneLifetimeTicks => (long)(TombstoneLifetime.TotalSeconds * _timeProvider.TimestampFrequency);
 
     private readonly Dictionary<string, ExecutorEntry> _executors = new(StringComparer.Ordinal);
-    private readonly Dictionary<string, DateTimeOffset> _tombstones = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, long> _tombstones = new(StringComparer.Ordinal);
 
     /// <summary>
     /// Expiry-ordered index over <see cref="_tombstones"/> (constant lifetime, so insertion order
@@ -67,14 +73,15 @@ internal sealed class SerialExecutorRegistry(
     /// stale (the channel was re-tombstoned later, or the tombstone was cleared); the dictionary
     /// stays the source of truth and each popped head is validated against it.
     /// </summary>
-    private readonly Queue<(string Channel, DateTimeOffset ExpiresAtUtc)> _tombstoneOrder = new();
+    private readonly Queue<(string Channel, long ExpiresAt)> _tombstoneOrder = new();
     private readonly Dictionary<string, int> _registrations = new(StringComparer.Ordinal);
     private readonly object _gate = new();
 
     /// <summary>
     /// Records a live subscription for <paramref name="channel"/>. While any subscription is
     /// registered, retirement tombstones do not drop work — a retired executor is legitimately
-    /// recreated, and the remaining subscription's own cleanup retires it again (no leak).
+    /// recreated, and the remaining subscription's own cleanup retires it again (no leak) — and a
+    /// sibling's cleanup does not retire the executor at all (see <see cref="RetireIfUnreferencedAsync"/>).
     /// </summary>
     public void OnSubscriptionRegistered(string channel)
     {
@@ -189,22 +196,13 @@ internal sealed class SerialExecutorRegistry(
         Accepted,
 
         /// <summary>
-        /// Not accepted right now — the executor's bounded queue is full, or (for a caller that did
-        /// not ask to tell the two apart) the channel's executor is mid-retirement. The work was not
-        /// queued; the producer should come back later.
+        /// Not accepted right now — the executor's bounded queue is full, or the channel's executor
+        /// is mid-retirement. The work was not queued; the producer should come back later.
         /// </summary>
         Full,
 
         /// <summary>Suppressed by a tombstone (retired executor, no registration left): nothing will ever run it.</summary>
-        Suppressed,
-
-        /// <summary>
-        /// Not accepted right now because the channel's executor is mid-retirement — nothing is
-        /// overloaded, and <see cref="EnqueueAsync"/> would wait the retirement out and admit the
-        /// work onto a fresh executor. Reported only to a caller that passes
-        /// <c>distinguishRetiring</c>; everyone else keeps reading it as <see cref="Full"/>.
-        /// </summary>
-        Retiring
+        Suppressed
     }
 
     /// <summary>
@@ -216,16 +214,14 @@ internal sealed class SerialExecutorRegistry(
     /// executor drained. A <see cref="TryEnqueueOutcome.Full"/> result leaves the message
     /// unclaimed in the store for a later rescan of that one correlation id.
     /// <para>
-    /// <paramref name="distinguishRetiring"/> is for a producer whose <see cref="TryEnqueueOutcome.Full"/>
-    /// is TERMINAL rather than "come back later". The sweep above answers a full queue and a
-    /// retiring executor the same way — the message stays in the store — so it keeps one case. The
-    /// Redis channel has no store to come back to: a full queue faults the wait as overloaded, and
-    /// reading a mid-retirement executor (a previous waiter on the same correlation id still
-    /// tearing down) as that overload faulted a fan-out sibling or a re-attached waiter as
-    /// indeterminate with nothing overloaded at all.
+    /// The Redis channel has no store to come back to: a <see cref="TryEnqueueOutcome.Full"/> there
+    /// faults the wait as overloaded. A mid-retirement executor reads as full too, which is why
+    /// per-waiter cleanups retire through <see cref="RetireIfUnreferencedAsync"/>: a fan-out
+    /// sibling still registered on the correlation id keeps the shared executor live instead of
+    /// finding it retiring and being faulted as indeterminate with nothing overloaded at all.
     /// </para>
     /// </summary>
-    public TryEnqueueOutcome TryEnqueue(string channel, Func<Task> work, bool distinguishRetiring = false)
+    public TryEnqueueOutcome TryEnqueue(string channel, Func<Task> work)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(channel);
         ArgumentNullException.ThrowIfNull(work);
@@ -251,7 +247,7 @@ internal sealed class SerialExecutorRegistry(
             // Mid-retirement: EnqueueAsync would wait for the drain and then recreate; a
             // non-blocking caller simply comes back after it.
             if (current.Retiring)
-                return distinguishRetiring ? TryEnqueueOutcome.Retiring : TryEnqueueOutcome.Full;
+                return TryEnqueueOutcome.Full;
 
             // TryWrite is synchronous and never blocks, so it can run under the gate; no in-flight
             // enqueue bookkeeping is needed because nothing is left waiting for capacity.
@@ -265,8 +261,24 @@ internal sealed class SerialExecutorRegistry(
     /// Retires the channel's serial executor (if present), draining its queued work. Safe to call
     /// concurrently with <see cref="EnqueueAsync"/>: admitted enqueues finish against the retiring
     /// executor, while later enqueues wait until it is fully drained before creating a replacement.
+    /// Unconditional — for disposal paths that tear every subscription down; a single waiter's
+    /// cleanup uses <see cref="RetireIfUnreferencedAsync"/>.
     /// </summary>
-    public async ValueTask RemoveAsync(string channel)
+    public ValueTask RemoveAsync(string channel) => RetireAsync(channel, onlyIfUnreferenced: false);
+
+    /// <summary>
+    /// Retires the channel's serial executor only when no subscription is registered for it any
+    /// more — the per-waiter cleanup's retirement. The executor is keyed by channel, not by waiter:
+    /// two waiters on one correlation id (fan-out, or a re-attached waiter overlapping the old one)
+    /// share it, and one waiter's cleanup retiring it unconditionally left the survivor's
+    /// deliveries meeting a retiring executor for the whole drain — up to the dispose budget when
+    /// the departed waiter's predicate was wedged. Each cleanup retires its registration BEFORE it
+    /// calls this, and the check runs under the same lock as the retirement itself, so the last
+    /// cleanup always sees zero and retires; an earlier one leaves the executor to it.
+    /// </summary>
+    public ValueTask RetireIfUnreferencedAsync(string channel) => RetireAsync(channel, onlyIfUnreferenced: true);
+
+    private async ValueTask RetireAsync(string channel, bool onlyIfUnreferenced)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(channel);
 
@@ -275,6 +287,9 @@ internal sealed class SerialExecutorRegistry(
         var ownsRetirement = false;
         lock (_gate)
         {
+            if (onlyIfUnreferenced && _registrations.ContainsKey(channel))
+                return;
+
             if (!_executors.TryGetValue(channel, out entry))
                 return;
 
@@ -350,9 +365,9 @@ internal sealed class SerialExecutorRegistry(
                 // Tombstone the retired channel so an enqueue that raced this retirement cannot
                 // recreate a leaked executor; ClearTombstone lifts it the moment a new
                 // subscription legitimately reuses the channel.
-                var tombstoneExpiresAtUtc = UtcNow + TombstoneLifetime;
-                _tombstones[channel] = tombstoneExpiresAtUtc;
-                _tombstoneOrder.Enqueue((channel, tombstoneExpiresAtUtc));
+                var tombstoneExpiresAt = Now + TombstoneLifetimeTicks;
+                _tombstones[channel] = tombstoneExpiresAt;
+                _tombstoneOrder.Enqueue((channel, tombstoneExpiresAt));
                 PruneTombstonesUnderLock();
             }
 
@@ -362,10 +377,10 @@ internal sealed class SerialExecutorRegistry(
 
     private bool IsTombstonedUnderLock(string channel)
     {
-        if (!_tombstones.TryGetValue(channel, out var expiresAtUtc))
+        if (!_tombstones.TryGetValue(channel, out var expiresAt))
             return false;
 
-        if (expiresAtUtc > UtcNow)
+        if (expiresAt > Now)
             return true;
 
         _tombstones.Remove(channel);
@@ -377,8 +392,8 @@ internal sealed class SerialExecutorRegistry(
         if (_tombstoneOrder.Count == 0)
             return;
 
-        var now = UtcNow;
-        while (_tombstoneOrder.TryPeek(out var head) && head.ExpiresAtUtc <= now)
+        var now = Now;
+        while (_tombstoneOrder.TryPeek(out var head) && head.ExpiresAt <= now)
         {
             _tombstoneOrder.Dequeue();
 

@@ -75,6 +75,43 @@ public class NatsTransportOptionsAndSchemaTests
         });
     }
 
+    public static TheoryData<Action<NatsAsyncResponseTransportOptions>, string> InvalidJetStreamNames => new()
+    {
+        { o => o.WorkerStream = "work.stream", nameof(NatsAsyncResponseTransportOptions.WorkerStream) },
+        { o => o.ResponseStream = "responses stream", nameof(NatsAsyncResponseTransportOptions.ResponseStream) },
+        { o => o.DeadLetterStream = "dead/letters", nameof(NatsAsyncResponseTransportOptions.DeadLetterStream) },
+        { o => o.WorkerConsumer = "workers.*", nameof(NatsAsyncResponseTransportOptions.WorkerConsumer) },
+        { o => o.ResponseConsumer = "responses>", nameof(NatsAsyncResponseTransportOptions.ResponseConsumer) },
+        { o => o.CorrelationIdHeader = "AR Correlation", nameof(NatsAsyncResponseTransportOptions.CorrelationIdHeader) },
+        { o => o.CorrelationIdHeader = "AR:Correlation", nameof(NatsAsyncResponseTransportOptions.CorrelationIdHeader) }
+    };
+
+    /// <summary>
+    /// Explicit stream/consumer names were only length-checked and the correlation header only
+    /// required, so a name with '.', '*', '>', whitespace or a path separator (or a header name
+    /// with a space or ':') failed at first use — stream/consumer creation retried forever inside
+    /// the subscriber loop, or every publish classified as transient — instead of at startup.
+    /// </summary>
+    [Theory]
+    [MemberData(nameof(InvalidJetStreamNames))]
+    public void ValidateCommon_Throws_ForNamesJetStreamOrNatsHeadersReject(Action<NatsAsyncResponseTransportOptions> configure, string option)
+    {
+        var options = new NatsAsyncResponseTransportOptions();
+        configure(options);
+
+        var ex = Assert.Throws<InvalidOperationException>(() => NatsTransportOptionsValidator.ValidateCommon(options));
+        Assert.Contains(option, ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void ValidateCommon_Accepts_DashAndUnderscoreNames()
+        => NatsTransportOptionsValidator.ValidateCommon(new NatsAsyncResponseTransportOptions
+        {
+            WorkerStream = "orders_work-1",
+            WorkerConsumer = "orders-workers_1",
+            CorrelationIdHeader = "X-Correlation-Id"
+        });
+
     [Fact]
     public void ValidateCommon_Throws_WhenRetryBaseExceedsMax()
         => Assert.Throws<InvalidOperationException>(() => NatsTransportOptionsValidator.ValidateCommon(
@@ -268,6 +305,34 @@ public class NatsTransportOptionsAndSchemaTests
     }
 
     [Fact]
+    public void ValidateSubscriber_BothRolesInEarlyAck_ValidatesTheSumOfBothDrains()
+    {
+        // The worker and response subscribers are two hosted services the host stops one after
+        // the other inside ONE shutdown budget. Validated per role, two stock 20 s drains passed
+        // against 30 s, and the second subscriber's drain was cut off with already-ACKed jobs
+        // still queued.
+        var options = new NatsAsyncResponseTransportOptions();
+        options.WorkerSubscriber.UseAckAfterEnqueue(4, 256);
+        options.ResponseSubscriber.UseAckAfterEnqueue(4, 256);
+
+        var worker = Assert.Throws<InvalidOperationException>(() =>
+            NatsTransportOptionsValidator.ValidateSubscriber(options, options.WorkerSubscriber, nameof(NatsSubscriberRole.Worker)));
+        var response = Assert.Throws<InvalidOperationException>(() =>
+            NatsTransportOptionsValidator.ValidateSubscriber(options, options.ResponseSubscriber, nameof(NatsSubscriberRole.ResponseIngress)));
+
+        Assert.Contains("(Worker)", worker.Message, StringComparison.Ordinal);
+        Assert.Contains("(ResponseIngress)", worker.Message, StringComparison.Ordinal);
+        Assert.Contains("00:00:40", worker.Message, StringComparison.Ordinal);
+        Assert.Equal(worker.Message.Length, response.Message.Length);
+
+        // Two drains that fit together pass, and so does early ACK on one role only.
+        options.WorkerSubscriber.BackgroundDrainTimeout = TimeSpan.FromSeconds(15);
+        options.ResponseSubscriber.BackgroundDrainTimeout = TimeSpan.FromSeconds(15);
+        NatsTransportOptionsValidator.ValidateSubscriber(options, options.WorkerSubscriber, nameof(NatsSubscriberRole.Worker));
+        NatsTransportOptionsValidator.ValidateSubscriber(options, options.ResponseSubscriber, nameof(NatsSubscriberRole.ResponseIngress));
+    }
+
+    [Fact]
     public void ValidateSubscriber_DocumentedEarlyAckDefaults_Pass()
     {
         // Regression: the documented two-arg early-ACK opt-in with stock defaults
@@ -397,6 +462,28 @@ public class NatsCorrelationIdExtractorTests
     {
         var headers = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase) { ["AR-Correlation-Id"] = "from-header" };
         Assert.Equal("from-header", NatsCorrelationIdExtractor.Extract(headers, """{"CorrelationId":"from-body"}""", _options));
+    }
+
+    [Theory]
+    [InlineData("??-123")]      // written by NATS.Net: one '?' per non-ASCII character
+    [InlineData("??????-123")]  // written as UTF-8 by another client, read back as ASCII: one '?' per byte
+    public void Extract_HeaderThatIsTheAsciiMangledFormOfTheBodyId_YieldsTheBodyId(string mangledHeader)
+    {
+        // NATS.Net's default header encoding is ASCII, so a non-ASCII correlation id arrived as '?'
+        // placeholders. The extractor trusted any non-blank header, so the response was routed to
+        // an id nobody waits on and dropped, while the real waiter timed out.
+        var headers = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase) { ["AR-Correlation-Id"] = mangledHeader };
+
+        Assert.Equal("订单-123", NatsCorrelationIdExtractor.Extract(headers, """{"CorrelationId":"订单-123"}""", _options));
+    }
+
+    [Fact]
+    public void Extract_HeaderWithAQuestionMarkThatIsNotAMangledBodyId_StillWins()
+    {
+        var headers = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase) { ["AR-Correlation-Id"] = "what?-7" };
+
+        Assert.Equal("what?-7", NatsCorrelationIdExtractor.Extract(headers, """{"CorrelationId":"other-7"}""", _options));
+        Assert.Equal("what?-7", NatsCorrelationIdExtractor.Extract(headers, """{"CorrelationId":"what?-7"}""", _options));
     }
 
     [Fact]
@@ -586,6 +673,20 @@ public class NatsWorkerTransportTests
     }
 
     [Fact]
+    public async Task PublishAsync_OmitsCorrelationHeader_ForANonAsciiCorrelationId()
+    {
+        // NATS.Net writes header values as ASCII by default, so a non-ASCII id would travel as '?'
+        // placeholders — a wrong id in every consumer-side log, span and OnBackgroundFailure report.
+        // The body still carries it.
+        var transport = CreateTransport();
+        await transport.PublishAsync(CreateJob(correlationId: "订单-123"));
+
+        var (_, payload, headers) = _jetStream.Published[0];
+        Assert.DoesNotContain("AR-Correlation-Id", headers!);
+        Assert.Equal("订单-123", JsonSerializer.Deserialize<WorkerJobEnvelope>(payload)!.CorrelationId);
+    }
+
+    [Fact]
     public async Task PublishAsync_CarriesDedupMsgId_DistinctPerLogicalPublish()
     {
         var transport = CreateTransport(new NatsAsyncResponseTransportOptions
@@ -639,6 +740,31 @@ public class NatsWorkerTransportTests
 
         await Assert.ThrowsAsync<InvalidOperationException>(() => transport.PublishAsync(CreateJob()));
         Assert.Empty(_jetStream.Published);
+    }
+
+    [Fact]
+    public async Task PublishAsync_PayloadAboveTheServersMaxPayload_FailsOnTheFirstAttempt()
+    {
+        // The client refuses a message above the server's max_payload before sending it, the same
+        // way on every attempt. As a NatsException it classified as transient, so a job between
+        // max_payload (1 MiB by default) and the 8 Mi-char producer-side budget ran the whole
+        // publish retry ladder before failing.
+        var attempts = 0;
+        _jetStream.PublishFailureForAttempt = attempt =>
+        {
+            attempts = attempt;
+            return new NATS.Client.Core.NatsPayloadTooLargeException("Payload size 2000000 exceeds server's maximum payload size 1048576");
+        };
+        var transport = CreateTransport(new NatsAsyncResponseTransportOptions
+        {
+            PublishMaxAttempts = 3,
+            PublishRetryBaseDelay = TimeSpan.FromMilliseconds(1),
+            PublishRetryMaxDelay = TimeSpan.FromMilliseconds(2)
+        });
+
+        await Assert.ThrowsAsync<NATS.Client.Core.NatsPayloadTooLargeException>(() => transport.PublishAsync(CreateJob()));
+        Assert.Equal(1, attempts);
+        Assert.False(NatsTransportRetry.IsTransient(new NATS.Client.Core.NatsPayloadTooLargeException("x")));
     }
 
     [Fact]

@@ -166,6 +166,63 @@ public class RedisSubscriberTests
         ingress.Verify(i => i.HandleWorkerMessageAsync("worker-json"), Times.Once);
     }
 
+    /// <summary>
+    /// Fixpoint r1 (S6a#14). Every process start generates a fresh consumer name and nothing ever
+    /// removed the old ones, so each group's consumer list grew by one entry per start. When the
+    /// subscriber stops for good — not when a supervised attempt fails and is rebuilt — it now asks
+    /// Redis to delete its own generated consumer if that consumer has no pending entries.
+    /// Pre-fix: no delete is ever requested.
+    /// </summary>
+    [Fact]
+    public async Task WorkerSubscriber_OnStopForGood_RetiresItsOwnGeneratedConsumer_ButNotPerAttempt()
+    {
+        var database = new RedisTransportTests.FakeRedisStreamDatabase
+        {
+            ReadFailuresBeforeSuccess = 1
+        };
+        database.ReadBatches.Enqueue(
+        [
+            RedisTransportTests.Entry("1-0", ("payload", "worker-json"), ("correlationId", "corr-worker"))
+        ]);
+        var ingress = new Mock<IAsyncResponseIngress>();
+        var handled = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        ingress.Setup(i => i.HandleWorkerMessageAsync("worker-json"))
+            .Returns(() =>
+            {
+                handled.TrySetResult();
+                return Task.CompletedTask;
+            });
+        var subscriber = WorkerSubscriber(database, ingress.Object);
+
+        await subscriber.StartAsync(CancellationToken.None);
+        await handled.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        Assert.Empty(database.DeleteConsumerCalls); // the failed first attempt retired nothing
+        await subscriber.StopAsync(CancellationToken.None);
+
+        Assert.True(database.ReadGroupCalls.Count >= 2);
+        var retired = Assert.Single(database.DeleteConsumerCalls);
+        Assert.Equal("workers", retired.Stream);
+        Assert.Equal("workers-group", retired.Group);
+        Assert.Equal(database.ReadGroupCalls[0].Consumer, retired.Consumer);
+    }
+
+    /// <summary>A configured consumer name is stable across restarts, so it is left in the group.</summary>
+    [Fact]
+    public async Task WorkerSubscriber_OnStop_LeavesAConfiguredConsumerInTheGroup()
+    {
+        var database = new RedisTransportTests.FakeRedisStreamDatabase();
+        var subscriber = WorkerSubscriber(
+            database,
+            Mock.Of<IAsyncResponseIngress>(),
+            options => options.ConsumerName = "configured-consumer");
+
+        await subscriber.StartAsync(CancellationToken.None);
+        await WaitUntilAsync(() => database.CreateGroupCalls.Count >= 1);
+        await subscriber.StopAsync(CancellationToken.None);
+
+        Assert.Empty(database.DeleteConsumerCalls);
+    }
+
     [Fact]
     public async Task WorkerSubscriber_FreshEntryMissingPayload_DeadLettersAndContinues()
     {
@@ -262,9 +319,23 @@ public class RedisSubscriberTests
         await WaitUntilAsync(() => database.Adds.Count == 1);
         await subscriber.StopAsync(CancellationToken.None);
 
-        var pending = Assert.Single(database.PendingCalls);
-        Assert.Equal(3, pending.Count);
-        Assert.Equal(10, pending.MinIdleTimeInMilliseconds);
+        // The listing, then the candidate's own entry re-read right before its claim (its
+        // delivery count as of the claim, not as of the listing).
+        Assert.Collection(
+            database.PendingCalls,
+            listing =>
+            {
+                Assert.Equal(3, listing.Count);
+                Assert.Null(listing.MinId);
+                Assert.Equal(10, listing.MinIdleTimeInMilliseconds);
+            },
+            reread =>
+            {
+                Assert.Equal(1, reread.Count);
+                Assert.Equal("1-0", reread.MinId);
+                Assert.Equal("1-0", reread.MaxId);
+                Assert.Equal(10, reread.MinIdleTimeInMilliseconds);
+            });
         var claim = Assert.Single(database.ClaimCalls);
         Assert.Equal(["1-0"], claim.MessageIds);
         Assert.Equal("max_delivery_attempts_exceeded", RedisTransportTests.Field(Assert.Single(database.Adds).Values, "reason"));

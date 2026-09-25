@@ -230,7 +230,7 @@ public class InMemoryRecoveryStateStoreTests
     }
 
     [Fact]
-    public async Task SaveAndRead_CoverGeneratedIdsMismatchesMissingEntriesAndUnreadableStates()
+    public async Task SaveAndRead_CoverGeneratedIdsMismatchesMissingEntries()
     {
         var store = new InMemoryRecoveryStateStore();
         var generated = new RecoveryState { CorrelationId = "generated" };
@@ -246,14 +246,6 @@ public class InMemoryRecoveryStateStoreTests
                 new RecoveryState { CorrelationId = "different" },
                 TimeSpan.FromMinutes(1)));
 
-        generated.SchemaVersion = RecoveryStateSchema.Current + 1;
-        Assert.Empty(await store.GetAllAsync("generated"));
-
-        var scanned = new List<RecoveryState>();
-        await foreach (var state in store.ScanAsync())
-            scanned.Add(state);
-        Assert.Empty(scanned);
-
         using var canceled = new CancellationTokenSource();
         await canceled.CancelAsync();
         await Assert.ThrowsAsync<OperationCanceledException>(() =>
@@ -261,21 +253,66 @@ public class InMemoryRecoveryStateStoreTests
     }
 
     [Fact]
-    public async Task Reads_FilterUnreadableEntriesFromManyBucket()
+    public async Task SaveAsync_SnapshotsACapturedArgument_AsADurableStoreWould()
     {
+        // A literal the callback expression captured is a live object. Durable stores serialize it
+        // at save; pre-fix this store kept the instance, so a change made after registration (and
+        // [JsonIgnore] state) reached the recovery callback in tests only.
         var store = new InMemoryRecoveryStateStore();
-        var unreadable = State(Guid.NewGuid(), "unreadable");
-        var readable = State(Guid.NewGuid(), "readable");
-        await store.SaveAsync("corr-a", unreadable, TimeSpan.FromMinutes(1));
-        await store.SaveAsync("corr-a", readable, TimeSpan.FromMinutes(1));
-        unreadable.SchemaVersion = RecoveryStateSchema.Current + 1;
+        var order = new CapturedOrder { Reference = "ORD-1", Secret = "in-process only" };
+        var state = State(Guid.NewGuid(), "snapshot");
+        state.ResumeCallback = new ReflectionCallDto
+        {
+            ServiceInterfaceFullName = "Contoso.IOrderFlow",
+            MethodName = "Resume",
+            Params = [CallbackParam.ForValue(order), CallbackParam.ForValue("ORD-1"), CallbackParam.ForPlaceholder(PlaceholderType.Payload)]
+        };
+        await store.SaveAsync("corr-a", state, TimeSpan.FromMinutes(1));
 
-        Assert.Same(readable, Assert.Single(await store.GetAllAsync("corr-a")));
+        order.Reference = "mutated after registration";
 
-        var scanned = new List<RecoveryState>();
-        await foreach (var state in store.ScanAsync())
-            scanned.Add(state);
-        Assert.Same(readable, Assert.Single(scanned));
+        var stored = Assert.Single(await store.GetAllAsync("corr-a")).ResumeCallback!.Params;
+        var materialized = stored[0].Value.As<CapturedOrder>();
+        Assert.Equal("ORD-1", materialized.Reference);
+        Assert.Null(materialized.Secret);
+        // Immutable scalars keep the caller's instance: nothing to diverge, nothing to pay for.
+        Assert.Same(state.ResumeCallback.Params[1].Value, stored[1].Value);
+        Assert.Equal(PlaceholderType.Payload, stored[2].Placeholder);
+        // The caller's descriptor is never rewritten in place.
+        Assert.Same(order, state.ResumeCallback.Params[0].Value);
+    }
+
+    [Fact]
+    public async Task SaveAsync_AnArgumentWithNoWireForm_ThrowsAtSave_AsADurableStoreWould()
+    {
+        // Pre-fix a cyclic argument passed every in-memory test and then threw at waiter creation
+        // on Redis or a database, whose save serializes it.
+        var store = new InMemoryRecoveryStateStore();
+        var cyclic = new CyclicArgument();
+        cyclic.Self = cyclic;
+        var state = State(Guid.NewGuid(), "cyclic");
+        state.FailureCallback = new ReflectionCallDto
+        {
+            ServiceInterfaceFullName = "Contoso.IOrderFlow",
+            MethodName = "Fail",
+            Params = [CallbackParam.ForValue(cyclic)]
+        };
+
+        await Assert.ThrowsAnyAsync<System.Text.Json.JsonException>(() => store.SaveAsync("corr-a", state, TimeSpan.FromMinutes(1)));
+        Assert.Empty(await store.GetAllAsync("corr-a"));
+    }
+
+    public sealed class CapturedOrder
+    {
+        public string? Reference { get; set; }
+
+        [System.Text.Json.Serialization.JsonIgnore]
+        public string? Secret { get; set; }
+    }
+
+    public sealed class CyclicArgument
+    {
+        public CyclicArgument? Self { get; set; }
     }
 
     private static RecoveryState State(Guid registrationId, string payloadType)

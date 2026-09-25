@@ -997,6 +997,67 @@ public class RedisRecoveryStateStoreTests
         Assert.Equal(["corr-a", "corr-b"], states.Select(state => state.CorrelationId).OrderBy(id => id, StringComparer.Ordinal));
     }
 
+    /// <summary>
+    /// Fixpoint r1 (GS4#6): a configured seed endpoint the cluster no longer lists — resharded
+    /// away and forgotten, or a DNS name that stopped resolving — stays in the multiplexer's
+    /// endpoint list (configured endpoints are never pruned) as a disconnected non-replica. The
+    /// table does not list it, so it used to stay "unknown" and fail every scan until a restart,
+    /// although every slot owner was connected and scanned. Coverage proves the scan complete.
+    /// </summary>
+    [Fact]
+    public async Task ScanAsync_ClusterWithAnUnlistedDisconnectedEndpoint_IsCompleteOnceEverySlotOwnerIsScanned()
+    {
+        var shardA = ClusterPrimary("10.0.0.1", "ar:recovery:corr-a");
+        var shardB = ClusterPrimary("10.0.0.2", "ar:recovery:corr-b");
+        shardA.Setup(s => s.ClusterNodesRawAsync(It.IsAny<CommandFlags>())).ReturnsAsync(ClusterNodeTable);
+        var forgottenSeed = new Mock<IServer>();
+        forgottenSeed.SetupGet(s => s.IsConnected).Returns(false);
+        forgottenSeed.SetupGet(s => s.EndPoint).Returns(new IPEndPoint(IPAddress.Parse("10.0.0.9"), 6379));
+        SetupServers(shardA, shardB, forgottenSeed);
+        SetupRegistrations("corr-a", "corr-b");
+
+        var states = await DrainScanAsync();
+
+        Assert.Equal(["corr-a", "corr-b"], states.Select(state => state.CorrelationId).OrderBy(id => id, StringComparer.Ordinal));
+    }
+
+    /// <summary>
+    /// Fixpoint r1 (S6a#7): a one-node cluster that was never MEET-ed (and has no
+    /// cluster-announce-ip) prints its own line with an empty IP — <c>:6379@16379</c>. The parser
+    /// kept that slot owner under an address no endpoint can match, so round 42's coverage check
+    /// failed every scan ("slot owner :0 has no connected server") of a cluster whose only node
+    /// was connected. The <c>myself</c> line is the node the reply came from and now resolves to
+    /// the endpoint that was asked.
+    /// </summary>
+    [Fact]
+    public async Task ScanAsync_SingleNodeClusterWithAnUnannouncedSelf_IsACompleteScan()
+    {
+        var node = ClusterPrimary("127.0.0.1", "ar:recovery:corr-a");
+        node.Setup(s => s.ClusterNodesRawAsync(It.IsAny<CommandFlags>()))
+            .ReturnsAsync("07c37dfeb235213a872192d90877d0cd55635b91 :6379@16379 myself,master - 0 0 1 connected 0-16383\n");
+        SetupServers(node);
+        SetupRegistrations("corr-a");
+
+        var state = Assert.Single(await DrainScanAsync());
+
+        Assert.Equal("corr-a", state.CorrelationId);
+    }
+
+    [Fact]
+    public void ClusterNodeTable_AnUnannouncedSelfLine_ResolvesToTheAskedEndpoint_OnlyForMyself()
+    {
+        var origin = new IPEndPoint(IPAddress.Parse("10.0.0.1"), 6379);
+        var nodes = RedisClusterNodeTable.Parse(
+            "a :6379@16379 myself,master - 0 0 1 connected 0-8191\n" +
+            "b :0@0 master,noaddr - 0 0 2 disconnected 8192-16383\n",
+            origin);
+
+        Assert.Equal(2, nodes.Count);
+        Assert.True(RedisClusterNodeTable.IsSameNode(nodes[0], origin));
+        Assert.False(RedisClusterNodeTable.IsSameNode(nodes[1], origin)); // a peer's missing address stays unmatched
+        Assert.False(RedisClusterNodeTable.IsSameNode(RedisClusterNodeTable.Parse("a :6379@16379 myself,master - 0 0 1 connected 0-16383")[0], origin));
+    }
+
     [Fact]
     public async Task ScanAsync_ClusterWithAnUnreachableSlotOwner_StillFails_AndNamesOnlyThatNode()
     {

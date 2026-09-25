@@ -43,6 +43,28 @@ public sealed class InMemorySetExceptionTests
     }
 
     [Fact]
+    public async Task SetException_TagsTheWaitActivityAsARemoteFailure_LikeEveryWireChannel()
+    {
+        // The concrete exception type never crosses the wire, so the Redis, NATS and database
+        // channels tag the wait activity error.type = "remote_failure". Pre-fix this channel tagged
+        // the publisher's concrete type — the divergence its wire-parity exception exists to avoid.
+        using var activities = new AsyncResponseActivityCollector();
+        await using var provider = CreateProvider();
+        var subscriber = provider.GetRequiredService<IAsyncResponseSubscriber>();
+        var publisher = provider.GetRequiredService<IAsyncResponsePublisher>();
+        var correlationId = $"remote-failure-{Guid.NewGuid():N}";
+
+        await using (var waiter = await subscriber.CreateResponseWaiter<OperationResult>(correlationId, timeout: TimeSpan.FromSeconds(5)))
+        {
+            await publisher.SetException(new InvalidOperationException("remote technical error"), correlationId);
+            await Assert.ThrowsAsync<Exception>(() => waiter.ResponseTask.WaitAsync(TimeSpan.FromSeconds(5)));
+        }
+
+        var wait = activities.Single("asyncresponse.wait", "error.type", "remote_failure");
+        Assert.Equal("remote technical error", wait.StatusDescription);
+    }
+
+    [Fact]
     public async Task SetException_PublishesToExplicitCorrelationId()
     {
         await using var provider = CreateProvider();

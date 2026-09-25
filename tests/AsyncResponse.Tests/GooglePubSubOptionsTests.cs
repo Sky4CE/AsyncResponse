@@ -70,6 +70,26 @@ public class GooglePubSubOptionsTests
             () => new GooglePubSubWorkerTransport(Options.Create(new GooglePubSubAsyncResponseOptions())));
 
     [Fact]
+    public void DispatcherValidateOptions_AckAfterHandler_ShutdownTimeoutPastTheHostBudget_Throws()
+    {
+        // Red-on-old (fixpoint r1, S8#11): ShutdownTimeout bounds the subscriber-client stop in
+        // BOTH ack modes, but ACK-after-handler returned without checking it against the host
+        // budget — a raised value passed startup and the host killed the process mid-stop
+        // (SQS / Azure Service Bus parity).
+        var ex = Assert.Throws<InvalidOperationException>(() => GooglePubSubMessageDispatcher.ValidateOptions(
+            new GooglePubSubAsyncResponseOptions { ShutdownTimeout = TimeSpan.FromSeconds(60) },
+            new GooglePubSubSubscriberOptions(),
+            GooglePubSubSubscriberRole.Worker));
+        Assert.Contains(nameof(GooglePubSubAsyncResponseOptions.ShutdownTimeout), ex.Message, StringComparison.Ordinal);
+
+        // At the budget it still starts (and the in-flight drain gets nothing).
+        GooglePubSubMessageDispatcher.ValidateOptions(
+            new GooglePubSubAsyncResponseOptions { ShutdownTimeout = TimeSpan.FromSeconds(30) },
+            new GooglePubSubSubscriberOptions(),
+            GooglePubSubSubscriberRole.Worker);
+    }
+
+    [Fact]
     public void WorkerTransport_Ctor_RequiresWorkerTopicId()
         => Assert.Throws<InvalidOperationException>(
             () => new GooglePubSubWorkerTransport(Options.Create(new GooglePubSubAsyncResponseOptions { ProjectId = "p" })));

@@ -180,7 +180,9 @@ builder.Services.AddAsyncResponse()
 
 Change-stream wake requires a replica set; a single-node replica set is enough. On a standalone
 server (or with `UseChangeStreams = false`) the channel falls back to `ListenerPollInterval`
-polling with the full sweep on every tick — `FullSweepInterval` is ignored there. A registered
+polling with the full sweep on every tick — `FullSweepInterval` is ignored there. While a stream
+is down between re-opens the full sweep runs every
+`min(FullSweepInterval, DeliveryConfirmationTimeout / 4)` until it is back. The channel requires MongoDB 4.4 or newer. A registered
 `IMongoDatabase`, or an `IMongoClient` plus `DatabaseName`, is reused automatically.
 
 ## Transport examples
@@ -238,13 +240,20 @@ builder.Services.AddAsyncResponse()
     .WithInMemoryDurableFlows();
 ```
 
-The transport uses consumer groups, pending-entry reclaim, and a dead-letter stream. Redis Streams
-requires Redis 5 or a compatible server that implements the Streams command set.
+The transport uses consumer groups, pending-entry reclaim, and a dead-letter stream. It requires
+Redis 6.2 or later (the reclaim uses `XPENDING … IDLE`), or a compatible server that implements the
+Streams command set.
+
+`StreamMaxLength` trims the worker stream by length alone: past the cap Redis deletes the oldest
+entries whether or not a worker has read or finished them, with no dead-letter copy. Size it well
+above the deepest backlog a worker outage can build, or set `null`. Response producers trim the
+response stream themselves (`XADD … MAXLEN ~`); the library only ACKs it.
 
 Each process joins its groups under a generated consumer name, `{machine}-{pid}-{guid}` plus the
 subscriber role, kept within 64 characters by shortening the machine name only: the process id and
 the GUID are what keep two processes on one host apart, and consumers that share a name share one
-pending-entry list. Set `ConsumerName` yourself only when your orchestrator guarantees a unique
+pending-entry list. A stopping subscriber deletes its generated consumer from the group when it has
+no pending entries left. Set `ConsumerName` yourself only when your orchestrator guarantees a unique
 value per running process.
 
 ### RabbitMQ transport

@@ -100,6 +100,16 @@ internal abstract class GooglePubSubMessageDispatcher : IAsyncDisposable
         switch (subscriberOptions.AckMode)
         {
             case GooglePubSubAckMode.AckAfterHandlerCompletes:
+                // The stop drains the in-flight handlers for at most BackgroundDrainTimeout,
+                // clamped (not validated) to what the host budget leaves after the bounded client
+                // stop (ShutdownTimeout) — so ShutdownTimeout itself must fit: unvalidated, a
+                // raised value passed startup and the host killed the process mid-stop (SQS/Azure
+                // Service Bus parity).
+                ShutdownBudgetValidator.Validate(
+                    "Pub/Sub",
+                    $"{nameof(GooglePubSubAsyncResponseOptions)}.{nameof(GooglePubSubAsyncResponseOptions.HostShutdownTimeout)}",
+                    transportOptions.HostShutdownTimeout,
+                    ($"{nameof(GooglePubSubAsyncResponseOptions)}.{nameof(GooglePubSubAsyncResponseOptions.ShutdownTimeout)}", transportOptions.ShutdownTimeout));
                 return;
 
             case GooglePubSubAckMode.AckAfterEnqueue:
@@ -144,6 +154,22 @@ internal abstract class GooglePubSubMessageDispatcher : IAsyncDisposable
     /// <summary>Releases resources held by this instance.</summary>
     public virtual ValueTask DisposeAsync() => ValueTask.CompletedTask;
 
+    /// <summary>
+    /// Host stop, before the subscriber client is stopped: stops starting deliveries (each one
+    /// arriving from now on is held, unstarted, until <see cref="ReleaseHeldDeliveries"/>) and
+    /// waits up to <paramref name="budget"/> on <paramref name="clock"/> for the handlers already
+    /// running. A no-op for the early-ACK dispatcher, whose handlers run off the SDK callback.
+    /// </summary>
+    public virtual Task DrainInFlightAsync(TimeSpan budget, TimeProvider clock) => Task.CompletedTask;
+
+    /// <summary>
+    /// Hands back (Nack) every delivery held since <see cref="DrainInFlightAsync"/> began; called
+    /// immediately before the subscriber client is stopped. A no-op for the early-ACK dispatcher.
+    /// </summary>
+    public virtual void ReleaseHeldDeliveries()
+    {
+    }
+
     /// <summary>Runs the ExecuteHandlerAsync operation.</summary>
     protected async Task ExecuteHandlerAsync(
         PubsubMessage message,
@@ -167,6 +193,14 @@ internal abstract class GooglePubSubMessageDispatcher : IAsyncDisposable
         {
             await _handler(message, cancellationToken).ConfigureAwait(false);
         }
+        catch (Exception ex) when (ex is DurableFlowInterruptedException || (logFailures && IsHostStop(ex, cancellationToken)))
+        {
+            // The inline (ACK-after-handler) path hands the delivery back on a host stop, and the
+            // flow engine's hand-back is not a failure on the early-ACK path either (its caller
+            // warns and surfaces it): nothing failed, so no error log and no error span on every
+            // rolling deploy.
+            throw;
+        }
         catch (Exception ex)
         {
             if (logFailures)
@@ -175,6 +209,16 @@ internal abstract class GooglePubSubMessageDispatcher : IAsyncDisposable
             throw;
         }
     }
+
+    /// <summary>
+    /// Whether <paramref name="exception"/> is the host stopping rather than a handler failure: a
+    /// cancellation once the subscriber's own token has fired, or the durable-flow engine's
+    /// <see cref="DurableFlowInterruptedException"/>, which it throws on <c>ApplicationStopping</c>
+    /// — BEFORE any hosted service stops, so usually while the subscriber's token is still live.
+    /// </summary>
+    protected static bool IsHostStop(Exception exception, CancellationToken subscriberCancellationToken)
+        => exception is OperationCanceledException
+            && (subscriberCancellationToken.IsCancellationRequested || exception is DurableFlowInterruptedException);
 
     /// <summary>Runs the NotifyBackgroundFailureAsync operation.</summary>
     protected async ValueTask NotifyBackgroundFailureAsync(
@@ -215,29 +259,130 @@ internal sealed class AwaitingGooglePubSubMessageDispatcher(
     GooglePubSubSubscriberRole role)
     : GooglePubSubMessageDispatcher(handler, transportOptions, subscriberOptions, logger, subscriptionId, role)
 {
+    private readonly TaskCompletionSource _drained = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private readonly TaskCompletionSource _clientStopping = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private int _inFlight;
+    private int _stopping;
+
     /// <summary>Handles the delivered message.</summary>
     public override async Task<SubscriberClient.Reply> HandleAsync(
         PubsubMessage message,
         CancellationToken subscriberCancellationToken)
     {
+        // Counted BEFORE the stop flag is read (and the stop sets its flag with a full fence
+        // before reading the count), so a delivery either sees the stop or is waited for.
+        Interlocked.Increment(ref _inFlight);
+        if (Volatile.Read(ref _stopping) != 0)
+        {
+            // The host is stopping: start nothing the stop budget cannot cover — and do not count
+            // this delivery as running, so the drain never waits for it.
+            LeaveInFlight();
+            return await HoldUntilClientStopAsync(subscriberCancellationToken).ConfigureAwait(false);
+        }
+
         try
         {
             await ExecuteHandlerAsync(message, subscriberCancellationToken).ConfigureAwait(false);
             return SubscriberClient.Reply.Ack;
         }
-        catch (OperationCanceledException) when (subscriberCancellationToken.IsCancellationRequested)
+        catch (Exception ex) when (IsHostStop(ex, subscriberCancellationToken))
         {
             // Host shutdown, not a handler failure. Pub/Sub's handler contract offers no
             // "leave unsettled": the only redelivery primitive is Nack (an expired ack
             // deadline counts a delivery attempt exactly the same), so Nack is returned here
             // too — but through this explicit branch so shutdown cancellation is never
             // mistaken for (or later routed through) a failure policy.
-            return SubscriberClient.Reply.Nack;
+            if (subscriberCancellationToken.IsCancellationRequested)
+                return SubscriberClient.Reply.Nack;
+
+            // The flow engine saw the host stop (ApplicationStopping) before this subscriber's
+            // stop, while the pull is still live: a Nack now is redelivered at once, often to
+            // this same stream, interrupted again — a Nack loop spending a DeadLetterPolicy's
+            // attempts until the stop begins. Held below instead, like a delivery arriving during
+            // the drain (ASB/SQS stop-receiving parity). Falls through once out of the in-flight
+            // count, so the drain never waits for it.
         }
         catch
         {
             return SubscriberClient.Reply.Nack;
         }
+        finally
+        {
+            LeaveInFlight();
+        }
+
+        return await HoldUntilClientStopAsync(subscriberCancellationToken).ConfigureAwait(false);
+    }
+
+    private void LeaveInFlight()
+    {
+        if (Interlocked.Decrement(ref _inFlight) == 0 && Volatile.Read(ref _stopping) != 0)
+            _drained.TrySetResult();
+    }
+
+    /// <summary>
+    /// Holds a delivery that arrived during the stop's drain — or that the flow engine handed back
+    /// at host stop — until the client stop, then hands it back. The streaming pull runs until the
+    /// client is stopped, so a Nack returned at once freed
+    /// its flow-control slot at once and Pub/Sub redelivered the message straight away — often to
+    /// this same stream — for the whole drain: a Nack storm that spent a DeadLetterPolicy's
+    /// delivery attempts on healthy backlog and on the flow wake-ups handed over at the stop.
+    /// Held, the delivery keeps its slot (the SDK keeps extending its lease), so the pull stalls
+    /// once the slots are full, and the client stop's NackImmediately hands it back exactly once.
+    /// </summary>
+    private async Task<SubscriberClient.Reply> HoldUntilClientStopAsync(CancellationToken subscriberCancellationToken)
+    {
+        try
+        {
+            await _clientStopping.Task.WaitAsync(subscriberCancellationToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (subscriberCancellationToken.IsCancellationRequested)
+        {
+            // The SDK's own hard stop: hand it back now.
+        }
+
+        return SubscriberClient.Reply.Nack;
+    }
+
+    /// <summary>
+    /// Waits, before the client is stopped, for the handlers already running. The SDK's stop hands
+    /// every message still in leasing back at once — any stop timeout under its 30-second
+    /// hard-stop window skips WaitForProcessing — so a job whose handler was still running lost its
+    /// ack-deadline extension, was redelivered to a peer mid-run, and its eventual Ack was dropped:
+    /// every in-flight job ran twice on every rolling deploy. Draining first keeps each running
+    /// handler's lease and lets its Ack reach the client's ack queue before the stop.
+    /// </summary>
+    public override async Task DrainInFlightAsync(TimeSpan budget, TimeProvider clock)
+    {
+        Interlocked.Exchange(ref _stopping, 1);
+        var inFlight = Volatile.Read(ref _inFlight);
+        if (inFlight == 0)
+            _drained.TrySetResult();
+
+        Logger.LogInformation(
+            "Pub/Sub subscriber is stopping: holding new deliveries for the client stop and waiting up to {Budget} for {InFlight} running handler(s) before stopping the client.",
+            budget,
+            inFlight);
+        try
+        {
+            await _drained.Task.WaitAsync(budget, clock).ConfigureAwait(false);
+        }
+        catch (TimeoutException)
+        {
+            Logger.LogWarning(
+                "Pub/Sub handlers still running on stop did not finish within {Budget} (BackgroundDrainTimeout, shortened to what the host shutdown budget leaves); stopping the subscriber client hands their messages back for redelivery.",
+                budget);
+        }
+    }
+
+    /// <summary>Hands the deliveries held since the drain began back to the client, which is stopped next.</summary>
+    public override void ReleaseHeldDeliveries() => _clientStopping.TrySetResult();
+
+    /// <summary>Releases anything still held, should the client stop never have been reached.</summary>
+    public override ValueTask DisposeAsync()
+    {
+        _clientStopping.TrySetResult();
+        return ValueTask.CompletedTask;
     }
 }
 
@@ -358,9 +503,14 @@ internal sealed class QueuedGooglePubSubMessageDispatcher : GooglePubSubMessageD
             RunningCount);
         _queue.Writer.TryComplete();
 
+        // BackgroundDrainTimeout is the whole spend the shutdown-budget validator sums for this
+        // dispatcher, so it is split rather than exceeded (database-transport parity): most of it
+        // lets queued and running handlers finish, and the last quarter is RESERVED for surfacing
+        // whatever is still queued once that lapses.
+        var surfacingReserve = TimeSpan.FromTicks(_drainTimeout.Ticks / 4);
         try
         {
-            await Task.WhenAll(_workers).WaitAsync(_drainTimeout).ConfigureAwait(false);
+            await Task.WhenAll(_workers).WaitAsync(_drainTimeout - surfacingReserve).ConfigureAwait(false);
             _drainCancellation.Dispose();
             Logger.LogInformation(
                 "Drained Pub/Sub ACK-after-enqueue dispatcher for {SubscriptionId}. Pending={PendingCount}, Running={RunningCount}.",
@@ -377,6 +527,12 @@ internal sealed class QueuedGooglePubSubMessageDispatcher : GooglePubSubMessageD
                 _subscriptionId,
                 PendingCount,
                 RunningCount);
+
+            // The workers surface a lapsed entry only once one of them frees up — and with every
+            // worker still inside a handler that ignores the token, none does before this returns,
+            // the host finishes stopping and the process exits: the entries still queued vanished
+            // with no OnBackgroundFailure call at all. So the dispose surfaces them itself.
+            await SurfaceUndrainedAsync(surfacingReserve).ConfigureAwait(false);
 
             // The workers are still running and read _drainCancellation.Token each loop, so disposing
             // it now would throw ObjectDisposedException inside them. Dispose once they actually finish,
@@ -397,6 +553,62 @@ internal sealed class QueuedGooglePubSubMessageDispatcher : GooglePubSubMessageD
         }
     }
 
+    /// <summary>
+    /// Surfaces every entry still queued after the drain budget lapsed through
+    /// <c>OnBackgroundFailure</c>, within <paramref name="reserve"/>, and logs the loss at Error
+    /// with its count. Runs inline on the stop path, so a callback that is slow asynchronously is
+    /// cut off at the reserve; entries left then are counted as lost.
+    /// </summary>
+    private async Task SurfaceUndrainedAsync(TimeSpan reserve)
+    {
+        var started = Stopwatch.GetTimestamp();
+        var surfaced = 0;
+        while (true)
+        {
+            var remaining = reserve - Stopwatch.GetElapsedTime(started);
+            if (remaining <= TimeSpan.Zero || !_queue.Reader.TryRead(out var message))
+                break;
+
+            Interlocked.Decrement(ref _pendingCount);
+            surfaced++;
+            try
+            {
+                await SurfaceLapsedAsync(message).AsTask().WaitAsync(remaining).ConfigureAwait(false);
+            }
+            catch (TimeoutException)
+            {
+                break;
+            }
+        }
+
+        var lost = _queue.Reader.Count;
+        if (surfaced == 0 && lost == 0)
+            return;
+
+        Logger.LogError(
+            "The Pub/Sub ACK-after-enqueue drain budget for {SubscriptionId} lapsed with {Count} already-ACKed message(s) never handled — Pub/Sub cannot redeliver them. Surfaced {Surfaced} via OnBackgroundFailure within the reserved {Reserve}; {Lost} could not be surfaced before shutdown.",
+            _subscriptionId,
+            surfaced + lost,
+            surfaced,
+            reserve,
+            lost);
+    }
+
+    private ValueTask SurfaceLapsedAsync(PubsubMessage message)
+    {
+        Logger.LogWarning(
+            "Pub/Sub background handler for already-ACKed message {MessageId} on {SubscriptionId} was not started: the dispatcher's drain budget had lapsed. Surfacing via OnBackgroundFailure.",
+            message.MessageId,
+            _subscriptionId);
+
+        return NotifyBackgroundFailureAsync(
+            message,
+            new OperationCanceledException(
+                "The ACK-after-enqueue drain budget lapsed before this already-ACKed message was handled."),
+            _subscriptionId,
+            _role);
+    }
+
     private async Task RunWorkerAsync(int workerIndex)
     {
         await foreach (var message in _queue.Reader.ReadAllAsync().ConfigureAwait(false))
@@ -411,18 +623,7 @@ internal sealed class QueuedGooglePubSubMessageDispatcher : GooglePubSubMessageD
             // redeliver them). Route them through OnBackgroundFailure instead of losing them.
             if (_drainCancellation.IsCancellationRequested)
             {
-                Logger.LogWarning(
-                    "Pub/Sub background handler for already-ACKed message {MessageId} on {SubscriptionId} was not started: the dispatcher's drain budget had lapsed. Surfacing via OnBackgroundFailure.",
-                    message.MessageId,
-                    _subscriptionId);
-
-                await NotifyBackgroundFailureAsync(
-                    message,
-                    new OperationCanceledException(
-                        "The ACK-after-enqueue drain budget lapsed before this already-ACKed message was handled."),
-                    _subscriptionId,
-                    _role).ConfigureAwait(false);
-
+                await SurfaceLapsedAsync(message).ConfigureAwait(false);
                 Interlocked.Decrement(ref _runningCount);
                 continue;
             }
@@ -440,6 +641,21 @@ internal sealed class QueuedGooglePubSubMessageDispatcher : GooglePubSubMessageD
                     message,
                     _drainCancellation.Token,
                     logFailures: false).ConfigureAwait(false);
+            }
+            catch (DurableFlowInterruptedException ex)
+            {
+                // The flow engine handed the job back because the host is stopping (Redis/NATS
+                // parity): not a handler failure, so no Error — but the message was ACKed at
+                // enqueue and Pub/Sub will not redeliver it, so surface the hand-back.
+                Logger.LogWarning(
+                    "Pub/Sub background handler for already-ACKed message {MessageId} on {SubscriptionId} was handed back by the flow engine because the host is stopping; Pub/Sub will not redeliver it. Surfacing via OnBackgroundFailure.",
+                    message.MessageId,
+                    _subscriptionId);
+                await NotifyBackgroundFailureAsync(
+                    message,
+                    ex,
+                    _subscriptionId,
+                    _role).ConfigureAwait(false);
             }
             catch (Exception ex)
             {

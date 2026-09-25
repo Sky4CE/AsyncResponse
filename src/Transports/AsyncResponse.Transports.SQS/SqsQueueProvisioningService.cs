@@ -127,7 +127,7 @@ internal sealed class SqsQueueProvisioningService(
             {
                 return await operation().ConfigureAwait(false);
             }
-            catch (Exception ex) when (attempt < MaxAttempts && !cancellationToken.IsCancellationRequested)
+            catch (Exception ex) when (attempt < MaxAttempts && !cancellationToken.IsCancellationRequested && IsTransientProvisioningFailure(ex))
             {
                 // Startup ordering against a fresh endpoint (LocalStack still booting, transient
                 // networking) resolves within a few retries; anything persistent still surfaces.
@@ -136,5 +136,33 @@ internal sealed class SqsQueueProvisioningService(
                 await Task.Delay(delay, cancellationToken).ConfigureAwait(false);
             }
         }
+    }
+
+    /// <summary>
+    /// Only what can still succeed is worth another attempt: throttling and 5xx
+    /// (<see cref="SqsWorkerTransport.IsTransient"/>), an endpoint that is not accepting
+    /// connections yet (LocalStack still booting), SQS's eventual consistency right after a
+    /// create or a recent delete, a client-side SDK failure that is no service answer at all
+    /// (credentials or the instance-metadata endpoint not ready yet at pod start), and the SDK's
+    /// own client-side timeout, which surfaces as a <see cref="TaskCanceledException"/> with the
+    /// caller's token untouched (the caller's filter excludes our own cancellation). A
+    /// deterministic rejection — AccessDenied, InvalidAttributeValue, an invalid queue name — used
+    /// to burn all 40 attempts (minutes of backoff) inside host startup before failing it anyway.
+    /// </summary>
+    internal static bool IsTransientProvisioningFailure(Exception exception)
+    {
+        for (var current = exception; current is not null; current = current.InnerException)
+        {
+            if (SqsWorkerTransport.IsTransient(current)
+                || current is QueueDoesNotExistException or QueueDeletedRecentlyException
+                || current is HttpRequestException or System.Net.Sockets.SocketException or IOException
+                || current is OperationCanceledException
+                || current is Amazon.Runtime.AmazonClientException)
+            {
+                return true;
+            }
+        }
+
+        return false;
     }
 }

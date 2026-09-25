@@ -86,10 +86,10 @@ public sealed class AsyncResponseWatchdogOptions
         AsyncResponseChannelOptions.EnsureTimerBackedAllowZero(
             Interval + ResolvedJitter, nameof(AsyncResponseWatchdogOptions), $"{nameof(Interval)} + {nameof(IntervalJitter)}");
 
-        // Jitter is a de-synchronization offset, not a second interval. Allowing it to exceed the
-        // interval lets a perfectly healthy next scan be scheduled beyond the freshness budget the
-        // recovery health check derives from Interval, so readiness reports the watchdog dead while
-        // it is doing exactly what it was configured to do.
+        // Jitter is a de-synchronization offset, not a second interval. The health check's
+        // freshness budget is twice the interval PLUS this bound (a healthy next scan lands up to
+        // Interval + jitter + scan duration after the last one), so capping it at the interval
+        // keeps a full interval of slack for the scan itself at any legal value.
         if (ResolvedJitter > Interval)
         {
             throw new InvalidOperationException(
@@ -188,8 +188,8 @@ public sealed class AsyncResponseWatchdogState
     /// Marks this host's watchdog as armed, so the health check can hold it to a first-scan
     /// deadline instead of attesting "no scan yet" for a loop that died before ever publishing.
     /// </summary>
-    internal void MarkScanning(DateTime startedUtc, TimeSpan startupDelay, TimeSpan interval)
-        => _activation = new WatchdogActivation(Scanning: true, IdleReason: null, startedUtc, startupDelay, interval);
+    internal void MarkScanning(DateTime startedUtc, TimeSpan startupDelay, TimeSpan interval, TimeSpan intervalJitter = default)
+        => _activation = new WatchdogActivation(Scanning: true, IdleReason: null, startedUtc, startupDelay, interval, intervalJitter);
 
     /// <summary>
     /// Marks this host's watchdog as deliberately idle, so the health check can attest "this host
@@ -199,12 +199,22 @@ public sealed class AsyncResponseWatchdogState
         => _activation = new WatchdogActivation(Scanning: false, reason, StartedUtc: null, default, default);
 
     /// <summary>How the watchdog resolved its startup guards. Single writer: the watchdog.</summary>
+    /// <param name="Scanning">Whether the scan loop is armed.</param>
+    /// <param name="IdleReason">Why it is not, when it is not.</param>
+    /// <param name="StartedUtc">When the armed loop started.</param>
+    /// <param name="StartupDelay">The configured delay before the first scan.</param>
+    /// <param name="Interval">The configured scan interval.</param>
+    /// <param name="IntervalJitter">
+    /// The resolved random offset bound added to every interval wait — part of the freshness
+    /// budget the health check holds published snapshots to.
+    /// </param>
     internal sealed record WatchdogActivation(
         bool Scanning,
         string? IdleReason,
         DateTime? StartedUtc,
         TimeSpan StartupDelay,
-        TimeSpan Interval);
+        TimeSpan Interval,
+        TimeSpan IntervalJitter = default);
 }
 
 /// <summary>Result of evaluating a snapshot of the persisted recovery state.</summary>
@@ -368,7 +378,9 @@ internal sealed class AsyncResponseWatchdog : BackgroundService
         ILogger<AsyncResponseWatchdog> logger,
         TimeProvider? timeProvider = null)
     {
-        _scanner = scanners.FirstOrDefault();
+        // Null-tolerant: a channel registers its scanner as the capability of the store in use,
+        // which resolves to null when that (custom) store cannot scan — the watchdog then idles.
+        _scanner = scanners.FirstOrDefault(static scanner => scanner is not null);
         _subscriberProbe = subscriberProbes.FirstOrDefault();
         _state = state;
         _options = options.Value.Watchdog;
@@ -411,7 +423,7 @@ internal sealed class AsyncResponseWatchdog : BackgroundService
         // Only a watchdog that actually scans may take over the process-wide gauge holder: a
         // disabled or scanner-less host (the documented multi-host pattern) would otherwise
         // permanently zero the gauges for the host that does scan.
-        _state.MarkScanning(_timeProvider.GetUtcNow().UtcDateTime, _options.StartupDelay, _options.Interval);
+        _state.MarkScanning(_timeProvider.GetUtcNow().UtcDateTime, _options.StartupDelay, _options.Interval, _options.ResolvedJitter);
         AsyncResponseDiagnostics.EnsureWatchdogGauges(_state);
 
         _logger.LogInformation("Recovery watchdog started. Interval: {Interval}, stale threshold: {StaleAfter}.", _options.Interval, _options.StaleAfter);
@@ -433,8 +445,20 @@ internal sealed class AsyncResponseWatchdog : BackgroundService
                 }
                 catch (Exception ex)
                 {
-                    _logger.LogError(ex, "Recovery watchdog scan failed; next attempt in {Interval}.", _options.Interval);
+                    // Publish first, report second: the log call is the part that can throw (a
+                    // failing logging provider — the same fault that may have failed the scan's
+                    // own logging). Unguarded, it escaped ExecuteAsync, whose outer catch takes
+                    // only cancellation, and under the default StopHost behaviour a report-only
+                    // watchdog took the whole host down; now the loop carries on to its next scan.
                     _state.Publish(new AsyncResponseWatchdogSnapshot(_timeProvider.GetUtcNow().UtcDateTime, _options.Interval, Report: null, Error: ex.Message));
+                    try
+                    {
+                        _logger.LogError(ex, "Recovery watchdog scan failed; next attempt in {Interval}.", _options.Interval);
+                    }
+                    catch
+                    {
+                        // The logger is what is failing; the snapshot above already carries the error.
+                    }
                 }
 
                 await Task.Delay(NextWait(_options.Interval), _timeProvider, stoppingToken).ConfigureAwait(false);

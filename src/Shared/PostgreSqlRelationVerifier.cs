@@ -59,9 +59,18 @@ internal static class PostgreSqlRelationVerifier
         string? OwningTable = null,
         string[]? KeyColumns = null,
         ExpectedColumn[]? Columns = null,
-        string[]? PrimaryKey = null);
+        string[]? PrimaryKey = null)
+    {
+        /// <summary>
+        /// Verified in full when present, but its ABSENCE is not an error: a performance-only
+        /// index on an operator-managed schema, which a migration tool may have named or omitted
+        /// differently. <see cref="VerifyAsync"/> returns the absent ones so the store can warn.
+        /// </summary>
+        public bool Optional { get; init; }
+    }
 
-    public static async Task VerifyAsync(
+    /// <returns>The <see cref="ExpectedRelation.Optional"/> relations that do not exist.</returns>
+    public static async Task<IReadOnlyList<string>> VerifyAsync(
         NpgsqlConnection connection,
         NpgsqlTransaction? transaction,
         string schemaName,
@@ -71,7 +80,7 @@ internal static class PostgreSqlRelationVerifier
     {
         var relations = await LoadRelationsAsync(connection, transaction, schemaName, expected, cancellationToken).ConfigureAwait(false);
         var columns = await LoadTableColumnsAsync(connection, transaction, schemaName, expected, cancellationToken).ConfigureAwait(false);
-        Evaluate(schemaName, componentName, expected, relations, columns);
+        return Evaluate(schemaName, componentName, expected, relations, columns);
     }
 
     // Both primary-key columns and index key columns come from indkey sliced to indnkeyatts:
@@ -202,7 +211,7 @@ internal static class PostgreSqlRelationVerifier
         return actual;
     }
 
-    internal static void Evaluate(
+    internal static IReadOnlyList<string> Evaluate(
         string schemaName,
         string componentName,
         IReadOnlyList<ExpectedRelation> expected,
@@ -267,13 +276,24 @@ internal static class PostgreSqlRelationVerifier
 
         EvaluateTableColumns(schemaName, componentName, expected, relations, columns);
 
+        List<string>? absentOptional = null;
         foreach (var relation in expected)
         {
-            if (!relations.ContainsKey(relation.Name))
-                throw new InvalidOperationException(
-                    $"The PostgreSQL {componentName} store expected '{schemaName}.{relation.Name}' to exist after schema creation, " +
-                    "but it does not. " + CollisionGuidance);
+            if (relations.ContainsKey(relation.Name))
+                continue;
+
+            if (relation.Optional)
+            {
+                (absentOptional ??= []).Add(relation.Name);
+                continue;
+            }
+
+            throw new InvalidOperationException(
+                $"The PostgreSQL {componentName} store expected '{schemaName}.{relation.Name}' to exist after schema creation, " +
+                "but it does not. " + CollisionGuidance);
         }
+
+        return absentOptional ?? (IReadOnlyList<string>)[];
     }
 
     /// <summary>

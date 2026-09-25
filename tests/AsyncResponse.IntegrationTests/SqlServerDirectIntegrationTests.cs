@@ -1116,13 +1116,6 @@ public sealed class SqlServerDirectIntegrationTests(DataBatchFixture fixture) : 
                 Assert.Equal("raw", result.Message);
             }
 
-            var rawObjectCorrelationId = NewId("raw-object");
-            await using (var waiter = await subscriber.CreateResponseWaiter<OperationResult>(rawObjectCorrelationId, timeout: TimeSpan.FromSeconds(5)))
-            {
-                await rawPublisher.SetRawResponse(new OperationResult { Status = OperationStatus.Completed, Message = "raw-object" }, rawObjectCorrelationId);
-                var result = await waiter.ResponseTask.WaitAsync(TimeSpan.FromSeconds(5));
-                Assert.Equal("raw-object", result.Message);
-            }
 
             var exceptionCorrelationId = NewId("exception");
             await using (var waiter = await subscriber.CreateResponseWaiter<OperationResult>(exceptionCorrelationId, timeout: TimeSpan.FromSeconds(5)))
@@ -1547,7 +1540,10 @@ public sealed class SqlServerDirectIntegrationTests(DataBatchFixture fixture) : 
             // flight turns that assertion into a stopwatch race against the database — which is how
             // it failed in CI. The delay is not what is under test here; the invisibility is.
             await retry.NakAsync(TimeSpan.FromMinutes(10));
-            Assert.Contains(null, published); // a NAK release wakes every queue's subscriber
+            // No wake on a NAK (PostgreSQL parity): the released row is not claimable until its
+            // delay has passed, so the old null wake only sent every same-process subscriber into
+            // a claim that found nothing.
+            Assert.DoesNotContain(null, published);
             Assert.Null(await store.TryClaimAsync(options.WorkerQueue, options.LockTimeout, CancellationToken.None));
 
             // Bring the row forward by hand so redelivery is a fact rather than a wait: the release
@@ -1699,6 +1695,189 @@ public sealed class SqlServerDirectIntegrationTests(DataBatchFixture fixture) : 
             Assert.Equal(ackedRow.AckedSeq, full.AckedSeq);
             Assert.Empty(await sql.LoadMessagesByIdAsync("some-other-correlation", [acked], CancellationToken.None));
         });
+    }
+
+    /// <summary>
+    /// Fixpoint r1 S5#12: the by-id hydration bound one parameter per id with no batching, so a
+    /// sweep page of 2,100+ acknowledged rows (<c>PendingMessageBatchSize</c> is bounded only
+    /// below) failed with error 8003 — at the same row on every pass. It now reads in chunks of at
+    /// most 1,000 ids and keeps page order across them. Pre-fix: SqlException 8003.
+    /// </summary>
+    [Fact]
+    public async Task LoadMessagesById_MoreIdsThanTheParameterCap_HydratesInPageOrder()
+    {
+        await WithSchemaAsync("hydrate_chunks", async schema =>
+        {
+            var options = ChannelOptions(schema);
+            var sql = new SqlServerChannelSql(Options.Create(options));
+            await sql.EnsureCreatedAsync();
+            var correlationId = $"hydrate-{Guid.NewGuid():N}";
+            const int rows = 2_500;
+            // Acknowledged rows: exactly what the sweep hands to the hydration header-only.
+            await ExecuteAsync(
+                $$"""
+                WITH n AS (SELECT TOP ({{rows}}) ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS i FROM sys.all_objects a CROSS JOIN sys.all_objects b)
+                INSERT INTO {{Quote(schema)}}.{{Quote(options.MessageTable)}} (id, correlation_id, envelope_json, created_at, expires_at, acked_at)
+                SELECT NEWID(), N'{{correlationId}}', N'{"Success":true,"Payload":' + CAST(i AS nvarchar(10)) + N'}',
+                       DATEADD(MICROSECOND, i, SYSUTCDATETIME()), DATEADD(MINUTE, 5, SYSUTCDATETIME()), SYSUTCDATETIME()
+                FROM n;
+                """);
+
+            var ids = new List<Guid>(rows);
+            await using (var connection = new SqlConnection(Fixture.SqlServerConnectionString))
+            {
+                await connection.OpenAsync();
+                await using var command = connection.CreateCommand();
+                command.CommandText = $"SELECT id FROM {Quote(schema)}.{Quote(options.MessageTable)} WHERE correlation_id = @correlation_id ORDER BY created_at, id;";
+                command.Parameters.AddWithValue("@correlation_id", correlationId);
+                await using var reader = await command.ExecuteReaderAsync();
+                while (await reader.ReadAsync())
+                    ids.Add(reader.GetGuid(0));
+            }
+            Assert.Equal(rows, ids.Count);
+
+            var hydrated = await sql.LoadMessagesByIdAsync(correlationId, ids, CancellationToken.None);
+
+            Assert.Equal(ids, hydrated.Select(message => message.Id));
+            Assert.All(hydrated, message => Assert.NotNull(message.EnvelopeJson));
+        });
+    }
+
+    [Fact]
+    public async Task Transport_DeadLetterPrune_DrainsABacklogBeyondOneBatch()
+    {
+        // Regression: one DELETE TOP (1000) per one-minute window was a hard ceiling — a poison
+        // storm with retention set outgrew it. The prune now drains full batches for up to 2 s.
+        await WithSchemaAsync("sql_dlq_drain", async schema =>
+        {
+            var options = TransportOptions(schema);
+            options.DeadLetterRetention = TimeSpan.FromSeconds(1);
+            var store = new SqlServerTransportStore(Options.Create(options));
+            await store.EnsureCreatedAsync();
+            await ExecuteAsync($"""
+                INSERT INTO [{schema}].[{options.MessageTable}] (id, queue, payload_json, created_at)
+                SELECT TOP (2500) NEWID(), N'{options.DeadLetterQueue}', N'{EmptyJson}', DATEADD(minute, -5, SYSUTCDATETIME())
+                FROM sys.all_objects a CROSS JOIN sys.all_objects b;
+                """);
+
+            await store.PublishAsync(Guid.NewGuid(), options.WorkerQueue, EmptyJson, null, CancellationToken.None);
+
+            Assert.Equal(0, await ScalarIntAsync($"SELECT COUNT(*) FROM [{schema}].[{options.MessageTable}] WHERE queue = N'{options.DeadLetterQueue}';"));
+        });
+    }
+
+    [Fact]
+    public async Task Transport_Publish_SucceedsWhenTheDeadLetterPruneFails()
+    {
+        // Regression: the prune ran bare after the committed insert, so a prune that threw (a
+        // 1205/1222, the caller's token) failed a publish whose job was already claimable — and the
+        // transient-fault retry then inserted it again. The trigger below fails every DELETE.
+        await WithSchemaAsync("sql_prune_fail", async schema =>
+        {
+            var options = TransportOptions(schema);
+            var store = new SqlServerTransportStore(Options.Create(options));
+            await store.EnsureCreatedAsync();
+            await ExecuteAsync($"""
+                CREATE TRIGGER [{schema}].[no_deletes] ON [{schema}].[{options.MessageTable}] AFTER DELETE
+                AS THROW 50000, N'deletes are failing', 1;
+                """);
+
+            var id = Guid.NewGuid();
+            await store.PublishAsync(id, options.WorkerQueue, EmptyJson, null, CancellationToken.None);
+
+            Assert.Equal(1, await ScalarIntAsync($"SELECT COUNT(*) FROM [{schema}].[{options.MessageTable}] WHERE id = '{id}';"));
+        });
+    }
+
+    [Fact]
+    public async Task Transport_ClaimOrder_IsAvailabilityOrder_OverTheReadyIndex()
+    {
+        // PostgreSQL round-42 parity: the claim orders by (available_at, created_at) behind
+        // {table}_ready_idx, so a delayed or redelivered row queues by when it became due.
+        await WithSchemaAsync("sql_claim_order", async schema =>
+        {
+            var options = TransportOptions(schema);
+            var store = new SqlServerTransportStore(Options.Create(options));
+            var first = Guid.NewGuid();
+            var second = Guid.NewGuid();
+            await store.PublishAsync(first, options.WorkerQueue, EmptyJson, null, CancellationToken.None);
+            await store.PublishAsync(second, options.WorkerQueue, EmptyJson, null, CancellationToken.None);
+            await ExecuteAsync($"""
+                UPDATE [{schema}].[{options.MessageTable}] SET available_at = DATEADD(second, -1, SYSUTCDATETIME()) WHERE id = '{first}';
+                UPDATE [{schema}].[{options.MessageTable}] SET available_at = DATEADD(minute, -1, SYSUTCDATETIME()) WHERE id = '{second}';
+                """);
+
+            var claimed = await store.TryClaimAsync(options.WorkerQueue, TimeSpan.FromSeconds(30), CancellationToken.None);
+            Assert.Equal(second, claimed!.Id);
+            Assert.Equal(1, await ScalarIntAsync(
+                $"SELECT COUNT(*) FROM sys.indexes WHERE object_id = OBJECT_ID(N'[{schema}].[{options.MessageTable}]') AND name = N'{SqlServerTransportStore.IndexName(options.MessageTable, "ready")}';"));
+        });
+    }
+
+    [Fact]
+    public async Task Transport_OperatorSchema_WithoutAQueueIndex_Warns()
+    {
+        // PostgreSQL / MongoDB parity: an operator table with no index leading on queue claims by a
+        // full scan under UPDLOCK on every poll — now with a warning instead of silence.
+        await WithSchemaAsync("sql_no_index", async schema =>
+        {
+            var options = TransportOptions(schema);
+            await new SqlServerTransportStore(Options.Create(options)).EnsureCreatedAsync();
+            await ExecuteAsync($"""
+                DROP INDEX [{SqlServerTransportStore.IndexName(options.MessageTable, "ready")}] ON [{schema}].[{options.MessageTable}];
+                """);
+
+            options.AutoCreateSchema = false;
+            var logger = new RecordingLogger<SqlServerTransportStore>();
+            await new SqlServerTransportStore(Options.Create(options), logger).EnsureCreatedAsync();
+
+            Assert.Contains(logger.Warnings, warning => warning.Contains("no index leading on 'queue'", StringComparison.Ordinal));
+        });
+    }
+
+    [Fact]
+    public async Task Channel_MessagePrune_DrainsABacklogBeyondOneBatch_AndSubscriberOrphansArePrunedTableWide()
+    {
+        // S5#1: one DELETE TOP (1000) per PruneInterval was ~33 rows/s per process, which any
+        // instance publishing faster outgrew forever. S5#9: subscriber rows were pruned only for the
+        // CALLING correlation id, so a crashed process's rows stayed forever.
+        await WithSchemaAsync("sql_chan_drain", async schema =>
+        {
+            var sql = new SqlServerChannelSql(Options.Create(ChannelOptions(schema)));
+            await sql.EnsureCreatedAsync();
+            await ExecuteAsync($"""
+                INSERT INTO {sql.MessageTable} (id, correlation_id, envelope_json, expires_at)
+                SELECT TOP (2500) NEWID(), CONCAT(N'expired-', ROW_NUMBER() OVER (ORDER BY (SELECT NULL))), N'{EmptyJson}', DATEADD(minute, -1, SYSUTCDATETIME())
+                FROM sys.all_objects a CROSS JOIN sys.all_objects b;
+                INSERT INTO {sql.SubscriberTable} (correlation_id, registration_id, instance_id, expires_at)
+                VALUES (N'crashed-waiter', NEWID(), N'dead-instance', DATEADD(minute, -1, SYSUTCDATETIME()));
+                """);
+
+            await sql.InsertMessageAsync(Guid.NewGuid(), "fresh", EmptyJson, TimeSpan.FromMinutes(1), CancellationToken.None);
+            Assert.Equal(0, await ScalarIntAsync($"SELECT COUNT(*) FROM {sql.MessageTable} WHERE expires_at <= SYSUTCDATETIME();"));
+
+            await sql.CountActiveSubscribersAsync("some-other-id", CancellationToken.None);
+            Assert.Equal(0, await ScalarIntAsync($"SELECT COUNT(*) FROM {sql.SubscriberTable} WHERE correlation_id = N'crashed-waiter';"));
+        });
+    }
+
+    private const string EmptyJson = "{}";
+
+    private sealed class RecordingLogger<T> : ILogger<T>
+    {
+        private readonly ConcurrentQueue<string> _warnings = new();
+
+        public IReadOnlyCollection<string> Warnings => _warnings.ToArray();
+
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+
+        public bool IsEnabled(LogLevel logLevel) => true;
+
+        public void Log<TState>(LogLevel logLevel, EventId eventId, TState state, Exception? exception, Func<TState, Exception?, string> formatter)
+        {
+            if (logLevel >= LogLevel.Warning)
+                _warnings.Enqueue(formatter(state, exception));
+        }
     }
 
     private async Task WithSchemaAsync(string prefix, Func<string, Task> body)

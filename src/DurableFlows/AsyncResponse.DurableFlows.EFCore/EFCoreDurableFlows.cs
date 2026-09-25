@@ -46,9 +46,10 @@ namespace AsyncResponse.DurableFlows.EFCore
 public sealed class EFCoreDurableFlowOptions : DurableFlowOptions
 {
     /// <summary>
-    /// How often <see cref="EFCoreFlowStateStore{TContext}.TryCreateAsync"/> opportunistically deletes
-    /// one bounded batch (1000 rows) of expired rows (loads already treat expired state as absent;
-    /// pruning bounds table growth). Zero or negative prunes on every save. Default: 5 minutes.
+    /// How often <see cref="EFCoreFlowStateStore{TContext}.TryCreateAsync"/> opportunistically runs a
+    /// budgeted prune of expired rows: batches of 1000 until one comes back short or
+    /// <see cref="PruneBudget"/> lapses (loads already treat expired state as absent; pruning
+    /// bounds table growth). Zero or negative prunes on every save. Default: 5 minutes.
     /// </summary>
     public TimeSpan PruneInterval { get; set; } = TimeSpan.FromMinutes(5);
 
@@ -78,8 +79,15 @@ public sealed class EFCoreDurableFlowOptions : DurableFlowOptions
 /// <see cref="EFCoreDurableFlowModelBuilderExtensions.ConfigureAsyncResponseDurableFlows"/>.
 /// Column names match the other AsyncResponse.DurableFlows.* relational packages, so the table is
 /// interchangeable with theirs.
+/// <para>
+/// Not sealed, so an application context that uses lazy-loading proxies
+/// (<c>UseLazyLoadingProxies</c>) can map it — EF Core refuses every sealed entity type there, and
+/// this is the only supported way to host the ledger. The properties are not virtual: a context
+/// using change-tracking proxies (<c>UseChangeTrackingProxies</c>) needs a dedicated
+/// <see cref="DbContext"/> for the ledger.
+/// </para>
 /// </summary>
-public sealed class DurableFlowStateRecord
+public class DurableFlowStateRecord
 {
     /// <summary>The flow run id (primary key).</summary>
     public string FlowId { get; set; } = string.Empty;
@@ -249,6 +257,9 @@ public sealed class EFCoreFlowStateStore<[DynamicallyAccessedMembers(Dynamically
     // provider-specific relational stores, which run all time math on the database clock.
     private readonly IServiceScopeFactory _scopeFactory;
     private readonly EFCoreDurableFlowOptions _options;
+    /// <summary>Insert attempts one <see cref="TryCreateAsync"/> makes before it trusts a duplicate-key failure.</summary>
+    private const int MaxCreateAttempts = 2;
+
     private long _lastPruneTicks;
     private volatile bool _modelChecked;
 
@@ -297,58 +308,84 @@ public sealed class EFCoreFlowStateStore<[DynamicallyAccessedMembers(Dynamically
         var stateJson = DurableFlowStoreShared.SerializeBounded(flowId, state, _options.MaxStateBytes, "EF Core");
         await using var lease = await LeaseContextAsync(cancellationToken).ConfigureAwait(false);
         var db = lease.Context;
-        var now = DateTime.UtcNow;
 
         if (DurableFlowStoreShared.ShouldPrune(ref _lastPruneTicks, _options.PruneInterval))
-            await DurableFlowStoreShared.PruneQuietlyAsync(() => PruneExpiredAsync(db, cancellationToken), _options.PruneBudget, "EF Core", _logger).ConfigureAwait(false);
+            await DurableFlowStoreShared.PruneQuietlyAsync(() => PruneExpiredAsync(db, cancellationToken), _options.PruneBudget, "EF Core", _logger, cancellationToken).ConfigureAwait(false);
 
-        // Replace an expired ledger IN PLACE, in one statement (sibling parity: PostgreSQL
-        // `ON CONFLICT ... DO UPDATE ... WHERE expired`, SQL Server/Oracle `MERGE ... WHEN MATCHED
-        // ... WHERE`). Delete-then-insert spanned two transactions, and a failure between them
-        // destroyed the expired row with no replacement. The lease columns are cleared as the
-        // siblings clear them: the replaced ledger is a fresh, unleased run.
-        var expiresAtUtc = DurableFlowStoreShared.AddSaturating(now, ttl);
-        var revision = state.Revision;
-        var replaced = await Records(db)
-            .Where(r => r.FlowId == flowId && r.ExpiresAtUtc <= now)
-            .ExecuteUpdateAsync(setters => setters
-                .SetProperty(r => r.StateJson, stateJson)
-                .SetProperty(r => r.ExpiresAtUtc, expiresAtUtc)
-                .SetProperty(r => r.UpdatedAtUtc, now)
-                .SetProperty(r => r.Revision, revision)
-                .SetProperty(r => r.LeaseId, (string?)null)
-                .SetProperty(r => r.LeaseExpiresAtUtc, (DateTime?)null), cancellationToken)
-            .ConfigureAwait(false);
-        if (replaced > 0)
-            return true;
+        // Two tries. An insert that collides with a row that is NOT live — one that expired after
+        // this attempt's replace judged it live, or one a peer's prune deleted before the check
+        // below could see it — is neither "exists" nor a failure: the next attempt replaces the
+        // expired row in place, or inserts into the gap. Answering "exists" there made the executor
+        // load the ledger, find it expired, and acknowledge the start job, so the new run was never
+        // created; rethrowing cost the job a delivery attempt for a create that would now succeed.
+        for (var attempt = 1; ; attempt++)
+        {
+            // Read per attempt and AFTER the prune, which may run for up to PruneBudget: a `now`
+            // taken before it judged a row that expired meanwhile as live, so the replace missed it.
+            var now = DateTime.UtcNow;
 
-        db.Add(new DurableFlowStateRecord
-        {
-            FlowId = flowId,
-            StateJson = stateJson,
-            ExpiresAtUtc = expiresAtUtc,
-            UpdatedAtUtc = now,
-            Revision = revision
-        });
-        try
-        {
-            await db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
-            return true;
+            // Replace an expired ledger IN PLACE, in one statement (sibling parity: PostgreSQL
+            // `ON CONFLICT ... DO UPDATE ... WHERE expired`, SQL Server/Oracle `MERGE ... WHEN MATCHED
+            // ... WHERE`). Delete-then-insert spanned two transactions, and a failure between them
+            // destroyed the expired row with no replacement. The lease columns are cleared as the
+            // siblings clear them: the replaced ledger is a fresh, unleased run.
+            var expiresAtUtc = DurableFlowStoreShared.AddSaturating(now, ttl);
+            var revision = state.Revision;
+            var replaced = RowCount(
+                await Records(db)
+                    .Where(r => r.FlowId == flowId && r.ExpiresAtUtc <= now)
+                    .ExecuteUpdateAsync(setters => setters
+                        .SetProperty(r => r.StateJson, stateJson)
+                        .SetProperty(r => r.ExpiresAtUtc, expiresAtUtc)
+                        .SetProperty(r => r.UpdatedAtUtc, now)
+                        .SetProperty(r => r.Revision, revision)
+                        .SetProperty(r => r.LeaseId, (string?)null)
+                        .SetProperty(r => r.LeaseExpiresAtUtc, (DateTime?)null), cancellationToken)
+                    .ConfigureAwait(false),
+                "create");
+            if (replaced > 0)
+                return true;
+
+            db.Add(new DurableFlowStateRecord
+            {
+                FlowId = flowId,
+                StateJson = stateJson,
+                ExpiresAtUtc = expiresAtUtc,
+                UpdatedAtUtc = now,
+                Revision = revision
+            });
+            try
+            {
+                await db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+                return true;
+            }
+            catch (DbUpdateException) when (attempt < MaxCreateAttempts)
+            {
+                db.ChangeTracker.Clear();
+                if (await LiveRowExistsAsync(db, flowId, cancellationToken).ConfigureAwait(false))
+                    return false;
+            }
+            catch (DbUpdateException)
+            {
+                db.ChangeTracker.Clear();
+                // Provider-agnostic duplicate-key detection is not reliable. Verify that another
+                // creator actually owns this id — with a LIVE ledger; an expired row is not an owner —
+                // otherwise preserve the real database failure instead of misreporting truncation,
+                // trigger, permission, or schema errors as "already exists".
+                if (await LiveRowExistsAsync(db, flowId, cancellationToken).ConfigureAwait(false))
+                    return false;
+
+                throw;
+            }
         }
-        catch (DbUpdateException)
-        {
-            db.ChangeTracker.Clear();
-            // Provider-agnostic duplicate-key detection is not reliable. Verify that another
-            // creator actually owns this id; otherwise preserve the real database failure instead
-            // of misreporting truncation, trigger, permission, or schema errors as "already exists".
-            if (await Records(db)
-                    .AsNoTracking()
-                    .AnyAsync(r => r.FlowId == flowId, cancellationToken)
-                    .ConfigureAwait(false))
-                return false;
+    }
 
-            throw;
-        }
+    private static Task<bool> LiveRowExistsAsync(TContext db, string flowId, CancellationToken cancellationToken)
+    {
+        var now = DateTime.UtcNow;
+        return Records(db)
+            .AsNoTracking()
+            .AnyAsync(r => r.FlowId == flowId && r.ExpiresAtUtc > now, cancellationToken);
     }
 
     public async Task<bool> TryUpdateAsync(
@@ -375,7 +412,7 @@ public sealed class EFCoreFlowStateStore<[DynamicallyAccessedMembers(Dynamically
                 .SetProperty(r => r.UpdatedAtUtc, now)
                 .SetProperty(r => r.Revision, state.Revision), cancellationToken)
             .ConfigureAwait(false);
-        return updated > 0;
+        return RowCount(updated, "checkpoint") > 0;
     }
 
     public Task<bool> TryAcquireLeaseAsync(string flowId, string leaseId, TimeSpan leaseDuration, CancellationToken cancellationToken = default)
@@ -429,7 +466,7 @@ public sealed class EFCoreFlowStateStore<[DynamicallyAccessedMembers(Dynamically
             .Where(r => r.FlowId == flowId)
             .ExecuteDeleteAsync(cancellationToken)
             .ConfigureAwait(false);
-        return deleted > 0;
+        return RowCount(deleted, "delete") > 0;
     }
 
     private static async Task<int> PruneExpiredAsync(TContext db, CancellationToken cancellationToken)
@@ -438,17 +475,46 @@ public sealed class EFCoreFlowStateStore<[DynamicallyAccessedMembers(Dynamically
         // the PruneBudget while batches come back full (policy shared by all relational stores):
         // an unbatched delete over a large expired backlog holds row locks and bloats one
         // transaction for the unlucky create that triggered the prune. Loads already filter on
-        // expiry, so any backlog beyond the budget just waits for the next interval. The OrderBy
-        // makes the row-limited delete deterministic (and keeps providers from warning about an
-        // unordered Take).
+        // expiry, so any backlog beyond the budget just waits for the next interval.
+        //
+        // The expiry predicate sits on the DELETE's OWN WHERE, not only inside the batch. A
+        // row-limited ExecuteDelete is not a valid single-table delete for the relational
+        // providers, which rewrite it as `DELETE … WHERE <key> IN/EXISTS (SELECT … WHERE expired
+        // … LIMIT n)` — and a delete whose only predicate is that key match deletes whatever row
+        // carries the key by the time it gets there, including a ledger TryCreateAsync replaced in
+        // place after the batch read the expired one (PostgreSQL READ COMMITTED re-checks only the
+        // DELETE's own predicate; SQL Server reads the batch from row versions under RCSI). With
+        // the predicate on the target, a replaced row no longer qualifies — sibling parity with
+        // `DELETE TOP … WHERE expired` and the ctid re-check. The batch is taken in expiry order,
+        // which the expires index serves directly (flow-id order made each batch sort or walk the
+        // whole expired backlog), and an ordered Take keeps providers from warning about it.
         var now = DateTime.UtcNow;
+        var batch = Records(db)
+            .Where(x => x.ExpiresAtUtc <= now)
+            .OrderBy(x => x.ExpiresAtUtc)
+            .Take(DurableFlowStoreShared.PruneBatchSize);
         return await Records(db)
-            .Where(r => r.ExpiresAtUtc <= now)
-            .OrderBy(r => r.FlowId)
-            .Take(DurableFlowStoreShared.PruneBatchSize)
+            .Where(r => r.ExpiresAtUtc <= now && batch.Any(x => x.FlowId == r.FlowId))
             .ExecuteDeleteAsync(cancellationToken)
             .ConfigureAwait(false);
     }
+
+    /// <summary>
+    /// A row count the store decides on, refused when the provider could not report one. A SQL
+    /// Server session that starts with <c>SET NOCOUNT ON</c> (<c>sp_configure 'user options', 512</c>,
+    /// or a connection-level setting) reports -1 for every statement, and read as "no rows" that
+    /// turned every acquire, renewal, checkpoint and delete into a lost race although the row was
+    /// written — runs churned through lease contention into the dead-letter queue with no hint at
+    /// the cause.
+    /// </summary>
+    private static int RowCount(int affected, string operation)
+        => affected >= 0
+            ? affected
+            : throw new InvalidOperationException(
+                $"The EF Core durable-flow store's {operation} could not tell how many rows it changed: the provider reported " +
+                $"{affected}. Every create, checkpoint, lease and delete is decided from that count. On SQL Server this means the " +
+                "session runs with SET NOCOUNT ON (a server-wide 'user options' default of 512, or a connection-level setting) — " +
+                "turn NOCOUNT off for the durable-flow store's connections.");
 
     private static DbSet<DurableFlowStateRecord> Records(TContext db) => db.Set<DurableFlowStateRecord>();
 
@@ -474,7 +540,7 @@ public sealed class EFCoreFlowStateStore<[DynamicallyAccessedMembers(Dynamically
                 .SetProperty(r => r.LeaseId, leaseId)
                 .SetProperty(r => r.LeaseExpiresAtUtc, leaseExpiresAtUtc), cancellationToken)
             .ConfigureAwait(false);
-        return updated > 0;
+        return RowCount(updated, acquire ? "lease acquire" : "lease renewal") > 0;
     }
 
     /// <summary>

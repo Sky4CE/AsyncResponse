@@ -48,8 +48,15 @@ internal static class FlowStateRetention
     /// returns the instant the floor now sits at.
     /// </summary>
     public static DateTime RaiseFloor(FlowState state, DateTime nowUtc, TimeSpan ttl)
+        => RaiseFloorTo(state, FloorAt(nowUtc, ttl));
+
+    /// <summary>
+    /// Raises the floor of <paramref name="state"/> to the absolute instant <paramref name="until"/>
+    /// when that is further out than the current one (never lowers it) and returns the instant the
+    /// floor now sits at.
+    /// </summary>
+    public static DateTime RaiseFloorTo(FlowState state, DateTime until)
     {
-        var until = FloorAt(nowUtc, ttl);
         if (state.RetainUntilUtc is not { } floor || until > floor)
             state.RetainUntilUtc = until;
 
@@ -66,6 +73,12 @@ internal static class FlowStateRetention
     private static bool IsTerminal(FlowRunStatus status)
         => status is FlowRunStatus.Succeeded or FlowRunStatus.Failed;
 
-    private static DateTime AddSaturating(DateTime instant, TimeSpan ttl)
-        => ttl > DateTime.MaxValue - instant ? DateTime.MaxValue : instant + ttl;
+    /// <summary>
+    /// <paramref name="instant"/> + <paramref name="span"/>, saturating at
+    /// <see cref="DateTime.MaxValue"/> instead of throwing. The one copy in Core — the in-memory
+    /// store's expiry and lease stamps, the execution lease's deadline and the executor's
+    /// contention deadlines all use it (the provider stores share DurableFlowStoreShared's).
+    /// </summary>
+    internal static DateTime AddSaturating(DateTime instant, TimeSpan span)
+        => span > DateTime.MaxValue - instant ? DateTime.MaxValue : instant + span;
 }

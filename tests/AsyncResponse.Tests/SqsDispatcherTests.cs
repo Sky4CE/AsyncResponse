@@ -355,6 +355,40 @@ public sealed class SqsDispatcherTests
     }
 
     [Fact]
+    public async Task AckAfterEnqueue_FlowHandBack_WarnsAndSurfacesIt_WithoutAnErrorLog()
+    {
+        // Fixpoint r1 pre-commit (H6): an early-ACK job the flow engine hands back at host stop
+        // cannot be redelivered (it was deleted at enqueue) and SQS has no dead-letter write, so it
+        // is surfaced through OnBackgroundFailure — at Warning, not as a handler failure at Error.
+        var calls = new SettlementCalls();
+        var failure = new TaskCompletionSource<SqsBackgroundFailureContext>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var logger = new CapturingLogger<SqsDispatcherTests>();
+        await using var dispatcher = SqsMessageDispatcher.Create(
+            (_, _) => throw new DurableFlowInterruptedException("the host is stopping"),
+            new SqsAsyncResponseOptions(),
+            new SqsSubscriberOptions
+            {
+                OnBackgroundFailure = context =>
+                {
+                    failure.TrySetResult(context);
+                    return ValueTask.CompletedTask;
+                }
+            }.UseAckAfterEnqueue(1, 8, TimeSpan.FromSeconds(5)),
+            logger,
+            "workers",
+            SqsSubscriberRole.Worker);
+
+        await dispatcher.HandleAsync(Delivery(calls), CancellationToken.None);
+
+        var surfaced = await failure.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.IsType<DurableFlowInterruptedException>(surfaced.Exception);
+        Assert.Equal(1, calls.Delete);
+        Assert.Contains(logger.Entries, entry => entry.Level == Microsoft.Extensions.Logging.LogLevel.Warning
+            && entry.Message.Contains("handed back by the flow engine", StringComparison.Ordinal));
+        Assert.DoesNotContain(logger.Entries, entry => entry.Level >= Microsoft.Extensions.Logging.LogLevel.Error);
+    }
+
+    [Fact]
     public async Task AckAfterEnqueue_BackgroundFailure_InvokesCallback()
     {
         var calls = new SettlementCalls();
@@ -726,6 +760,83 @@ public sealed class SqsDispatcherTests
 
         Assert.Equal(0, calls.Delete);
         Assert.Empty(calls.VisibilityChanges);
+    }
+
+    [Fact]
+    public async Task HostStopInterruption_WhileTheSubscriberTokenIsLive_LeavesVisibilityUntouched()
+    {
+        // Red-on-old (fixpoint r1, GS5#1): the flow engine throws DurableFlowInterruptedException
+        // on ApplicationStopping, which fires BEFORE the hosted subscriber's own token. Keyed on
+        // that token alone, the dispatcher took the failure path — an Error log, then
+        // RedeliveryDelay — so the still-running loop re-received the wake-up quickly and burned
+        // the redrive policy's maxReceiveCount toward the dead-letter queue.
+        var calls = new SettlementCalls();
+        var logger = new CollectingLogger();
+        await using var dispatcher = SqsMessageDispatcher.Create(
+            (_, _) => throw new DurableFlowInterruptedException("the host is stopping"),
+            new SqsAsyncResponseOptions(),
+            new SqsSubscriberOptions { RedeliveryDelay = TimeSpan.FromSeconds(1) },
+            logger,
+            "workers",
+            SqsSubscriberRole.Worker);
+
+        // Returns normally: the receive loop is live and must not enter the supervisor's failure path.
+        await dispatcher.HandleAsync(Delivery(calls), CancellationToken.None);
+
+        Assert.Equal(0, calls.Delete);
+        Assert.Empty(calls.VisibilityChanges);
+        Assert.DoesNotContain(logger.Messages, message => message.Contains("handling failed", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task AckAfterEnqueue_DrainLapse_SurfacesEveryStillQueuedEntryBeforeDisposeReturns()
+    {
+        // Red-on-old (fixpoint r1, GS5#4): past the drain budget only a worker that freed up
+        // surfaced a queued entry — and with every worker still inside a handler that ignores the
+        // token, none did before DisposeAsync returned and the process exited, so already-deleted
+        // work vanished with no OnBackgroundFailure call. The dispose now surfaces the rest itself
+        // within the last quarter of the budget and logs the loss with its count.
+        var failures = new List<string>();
+        var logger = new CollectingLogger();
+        var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var dispatcher = SqsMessageDispatcher.Create(
+            async (_, _) =>
+            {
+                started.TrySetResult();
+                await release.Task.ConfigureAwait(false);
+            },
+            new SqsAsyncResponseOptions(),
+            new SqsSubscriberOptions
+            {
+                OnBackgroundFailure = context =>
+                {
+                    lock (failures)
+                        failures.Add(context.MessageId);
+                    return ValueTask.CompletedTask;
+                }
+            }.UseAckAfterEnqueue(1, 8, TimeSpan.FromMilliseconds(400)),
+            logger,
+            "workers",
+            SqsSubscriberRole.Worker);
+
+        try
+        {
+            await dispatcher.HandleAsync(Delivery(new SettlementCalls(), messageId: "m1"), CancellationToken.None);
+            await started.Task.WaitAsync(TimeSpan.FromSeconds(2));
+            await dispatcher.HandleAsync(Delivery(new SettlementCalls(), messageId: "m2"), CancellationToken.None);
+            await dispatcher.HandleAsync(Delivery(new SettlementCalls(), messageId: "m3"), CancellationToken.None);
+
+            await dispatcher.DisposeAsync(); // the only worker is still blocked in m1's handler
+
+            lock (failures)
+                Assert.Equal(["m2", "m3"], failures);
+            Assert.Contains(logger.Messages, message => message.Contains("lapsed with 2 already-deleted message(s)", StringComparison.Ordinal));
+        }
+        finally
+        {
+            release.TrySetResult();
+        }
     }
 
     [Fact]

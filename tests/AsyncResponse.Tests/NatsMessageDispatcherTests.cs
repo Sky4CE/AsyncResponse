@@ -13,7 +13,8 @@ public class NatsMessageDispatcherTests
     private NatsMessageDispatcher CreateDispatcher(
         Func<NatsJobDelivery, CancellationToken, Task> handler,
         NatsSubscriberOptions subscriber,
-        NatsAsyncResponseTransportOptions? options = null)
+        NatsAsyncResponseTransportOptions? options = null,
+        Microsoft.Extensions.Logging.ILogger? logger = null)
     {
         options ??= new NatsAsyncResponseTransportOptions();
         return new NatsMessageDispatcher(
@@ -22,7 +23,7 @@ public class NatsMessageDispatcherTests
             options,
             subscriber,
             new NatsTransportSubjectSchema(options),
-            new TestLogger(),
+            logger ?? new TestLogger(),
             NatsSubscriberRole.Worker,
             "test-consumer");
     }
@@ -207,6 +208,108 @@ public class NatsMessageDispatcherTests
     }
 
     [Fact]
+    public async Task FlowHostStopInterruption_WithLiveSubscriberToken_LeavesDeliveryUnsettled()
+    {
+        // The flow engine hands a delivery back on ApplicationStopping, which fires BEFORE any
+        // hosted service stops — so the worker subscriber's own token is usually still live when
+        // DurableFlowInterruptedException arrives. The old filter keyed on that token only, so the
+        // interruption went through HandleFailureAsync: at the cap it dead-lettered and TERMed a
+        // healthy flow wake-up (below it, a NAK logged as a handler failure).
+        var rec = new RecordingDelivery();
+        await using var dispatcher = CreateDispatcher(
+            (_, _) => throw new DurableFlowInterruptedException("Host is stopping."),
+            new NatsSubscriberOptions { MaxDeliveryAttempts = 5 });
+
+        await dispatcher.HandleAsync(rec.Create("payload", numDelivered: 5), CancellationToken.None);
+
+        Assert.Equal(0, rec.Acks);
+        Assert.Empty(rec.Naks);
+        Assert.Equal(0, rec.Terms);
+        Assert.Empty(_jetStream.Published);
+        Assert.True(dispatcher.HandBackSignalled); // the subscriber stops fetching on it
+    }
+
+    [Fact]
+    public async Task EarlyAck_FlowHostStopInterruption_IsSurfacedAndDeadLetteredAsHandedBackAfterCommit()
+    {
+        // A host-stop hand-back of an already-ACKed job is a shutdown, not a handler failure (no
+        // Error log). The early-ACK hand-back rule of the pre-commit review of fixpoint round 1:
+        // JetStream will never redeliver it, so besides the OnBackgroundFailure report it gets a
+        // dead-letter copy whose reason names it (only the report was made before, contradicting
+        // the drain path's own "the dead-letter copy is its only record"). Replay is safe: the run
+        // resumes from its last checkpoint.
+        var failure = new TaskCompletionSource<NatsBackgroundFailureContext>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var subscriber = new NatsSubscriberOptions { OnBackgroundFailure = ctx => { failure.TrySetResult(ctx); return ValueTask.CompletedTask; } }
+            .UseAckAfterEnqueue(backgroundWorkerCount: 1, backgroundQueueCapacity: 4, backgroundDrainTimeout: TimeSpan.FromSeconds(5));
+        var logger = new RecordingThrowingLogger<NatsMessageDispatcherTests>();
+        await using var dispatcher = CreateDispatcher((_, _) => throw new DurableFlowInterruptedException("Host is stopping."), subscriber, logger: logger);
+
+        var rec = new RecordingDelivery();
+        await dispatcher.HandleAsync(rec.Create("payload", numDelivered: 1), CancellationToken.None);
+
+        var context = await failure.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        Assert.IsType<DurableFlowInterruptedException>(context.Exception);
+        var published = Assert.Single(_jetStream.Published); // the burial precedes the report
+        Assert.Equal(DeadLetterSubject, published.Subject);
+        Assert.Equal("handed_back_after_commit: Host is stopping.", published.Headers!["AR-DeadLetter-Reason"]);
+        Assert.Equal(1, rec.Acks); // ACKed at enqueue; never NAKed or TERMed afterwards
+        Assert.True(dispatcher.HandBackSignalled);
+        Assert.True(logger.HasEntry(Microsoft.Extensions.Logging.LogLevel.Warning, "Dead-lettering a copy"));
+        Assert.False(logger.HasEntry(Microsoft.Extensions.Logging.LogLevel.Error, string.Empty));
+    }
+
+    [Fact]
+    public async Task EarlyAck_FlowHostStopInterruption_WithDeadLetteringDisabled_LogsTheLossAtError()
+    {
+        // Pass 2 of the pre-commit review of fixpoint round 1: with dead-lettering disabled the
+        // burial is skipped, yet the hand-back still logged a Warning claiming "Dead-lettering a
+        // copy" — a wake-up JetStream will never redeliver was lost at Warning under a false
+        // claim. Without a destination the loss is now logged at Error and says so.
+        var failure = new TaskCompletionSource<NatsBackgroundFailureContext>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var subscriber = new NatsSubscriberOptions { OnBackgroundFailure = ctx => { failure.TrySetResult(ctx); return ValueTask.CompletedTask; } }
+            .UseAckAfterEnqueue(backgroundWorkerCount: 1, backgroundQueueCapacity: 4, backgroundDrainTimeout: TimeSpan.FromSeconds(5));
+        var logger = new RecordingThrowingLogger<NatsMessageDispatcherTests>();
+        await using var dispatcher = CreateDispatcher(
+            (_, _) => throw new DurableFlowInterruptedException("Host is stopping."),
+            subscriber,
+            new NatsAsyncResponseTransportOptions { DeadLetterEnabled = false },
+            logger);
+
+        var rec = new RecordingDelivery();
+        await dispatcher.HandleAsync(rec.Create("payload", numDelivered: 1), CancellationToken.None);
+
+        var context = await failure.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        Assert.IsType<DurableFlowInterruptedException>(context.Exception);
+        Assert.Empty(_jetStream.Published);
+        Assert.True(logger.HasEntry(Microsoft.Extensions.Logging.LogLevel.Error, "no dead-letter destination is configured"));
+        Assert.False(logger.HasEntry(Microsoft.Extensions.Logging.LogLevel.Warning, "Dead-lettering a copy"));
+        Assert.True(dispatcher.HandBackSignalled);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task FlowHostStopInterruption_DoesNotMarkTheReceiveSpanError(bool earlyAck)
+    {
+        // Pass 2 of the pre-commit review of fixpoint round 1: the shared handler execution marked
+        // the receive span as an error for every exception, the flow engine's host-stop hand-back
+        // included, so every rolling deploy produced error spans (HandlerFailure_MarksNatsReceiveSpanError
+        // pins that a real failure still does).
+        using var collector = new AsyncResponseActivityCollector();
+        var subscriber = earlyAck
+            ? new NatsSubscriberOptions().UseAckAfterEnqueue(backgroundWorkerCount: 1, backgroundQueueCapacity: 4, backgroundDrainTimeout: TimeSpan.FromSeconds(5))
+            : new NatsSubscriberOptions();
+        await using var dispatcher = CreateDispatcher((_, _) => throw new DurableFlowInterruptedException("Host is stopping."), subscriber);
+
+        await dispatcher.HandleAsync(new RecordingDelivery().Create("payload", numDelivered: 1), CancellationToken.None);
+
+        await WaitUntilAsync(() => collector.Count("asyncresponse.nats.receive") == 1);
+        var activity = collector.Single("asyncresponse.nats.receive", "asyncresponse.transport", "nats");
+        Assert.NotEqual(ActivityStatusCode.Error, activity.Status);
+        Assert.Null(AsyncResponseActivityCollector.Tag(activity, "error.type"));
+    }
+
+    [Fact]
     public async Task EarlyAck_FastPathAckFailure_IsSwallowedAndDoesNotNak()
     {
         // Regression (r23): the fast-path ACK after a successful TryWrite was unguarded, so a
@@ -384,6 +487,43 @@ public class NatsMessageDispatcherTests
         Assert.DoesNotContain("Nats-Msg-Id", deadLettered.Headers!.Keys);
         // The rest of the inbound headers still travel with the buried copy.
         Assert.Equal("corr-1", deadLettered.Headers["AR-Correlation-Id"]);
+    }
+
+    [Fact]
+    public async Task DeadLetterPublish_DropsEveryJetStreamDirective_AndCapsTheReason()
+    {
+        // A producer's Nats-Expected-Stream (or -Last-Sequence, Nats-Rollup, Nats-TTL) was copied
+        // into the burial, where the server applied it to the DLQ publish and refused it; the
+        // dispatcher then NAKed, and under MaxDeliver = -1 the message looped forever. The reason
+        // header was also unbounded, so a long exception message could push the burial past the
+        // server's max_payload the same way.
+        var rec = new RecordingDelivery();
+        var headers = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["Nats-Msg-Id"] = "live-publish-id",
+            ["Nats-Expected-Stream"] = "asyncresponse_transport_worker",
+            ["Nats-Expected-Last-Subject-Sequence"] = "41",
+            ["Nats-Rollup"] = "sub",
+            ["Nats-TTL"] = "1h",
+            ["AR-Correlation-Id"] = "corr-dlq",
+            ["X-App"] = "kept"
+        };
+        var longMessage = "line one\r\nline two " + new string('x', 10_000);
+        await using var dispatcher = CreateDispatcher(
+            (_, _) => throw new InvalidOperationException(longMessage),
+            new NatsSubscriberOptions { MaxDeliveryAttempts = 1 });
+
+        await dispatcher.HandleAsync(rec.Create("payload", numDelivered: 1, headers: headers), CancellationToken.None);
+
+        var buried = Assert.Single(_jetStream.Published);
+        Assert.DoesNotContain(buried.Headers!.Keys, name => name.StartsWith("Nats-", StringComparison.OrdinalIgnoreCase));
+        Assert.Equal("corr-dlq", buried.Headers!["AR-Correlation-Id"]);
+        Assert.Equal("kept", buried.Headers!["X-App"]);
+        var reason = buried.Headers!["AR-DeadLetter-Reason"];
+        Assert.Equal(NatsMessageDispatcher.MaxDeadLetterReasonLength, reason.Length);
+        Assert.DoesNotContain('\r', reason);
+        Assert.DoesNotContain('\n', reason);
+        Assert.Equal(1, rec.Terms);
     }
 
     [Fact]
@@ -696,6 +836,50 @@ public class NatsMessageDispatcherTests
         var buried = Assert.Single(_jetStream.Published);
         Assert.Equal("p2", buried.Payload);
         Assert.Contains("drain budget lapsed", buried.Headers!["AR-DeadLetter-Reason"], StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task DisposeAsync_WithEveryWorkerStuckInAHandler_BuriesTheQueuedEntriesBeforeReturning()
+    {
+        // Entries still queued when the drain lapses mean every worker is inside a handler — and
+        // the real handler takes no token. The drain-lapsed routing lived only in the worker loop,
+        // so it ran once some handler happened to finish: after DisposeAsync had returned and the
+        // host had torn the connection down (or exited). Those already-ACKed jobs vanished. The
+        // dispatcher now buries them itself inside a reserved slice of the drain budget.
+        var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var failures = 0;
+        var subscriber = new NatsSubscriberOptions
+        {
+            OnBackgroundFailure = _ =>
+            {
+                Interlocked.Increment(ref failures);
+                return ValueTask.CompletedTask;
+            }
+        }.UseAckAfterEnqueue(
+            backgroundWorkerCount: 1,
+            backgroundQueueCapacity: 4,
+            backgroundDrainTimeout: TimeSpan.FromSeconds(1));
+        var dispatcher = CreateDispatcher(
+            async (_, _) =>
+            {
+                started.TrySetResult();
+                await release.Task; // ignores the cancellation, like the real ingress handler
+            },
+            subscriber);
+
+        await dispatcher.HandleAsync(new RecordingDelivery().Create("running", 1), CancellationToken.None);
+        await started.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        await dispatcher.HandleAsync(new RecordingDelivery().Create("queued-1", 1), CancellationToken.None);
+        await dispatcher.HandleAsync(new RecordingDelivery().Create("queued-2", 1), CancellationToken.None);
+
+        await dispatcher.DisposeAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.Equal(["queued-1", "queued-2"], _jetStream.Published.Select(p => p.Payload).Order().ToArray());
+        Assert.All(_jetStream.Published, p => Assert.Equal(DeadLetterSubject, p.Subject));
+        Assert.Equal(2, Volatile.Read(ref failures));
+
+        release.TrySetResult();
     }
 
     [Fact]

@@ -54,10 +54,11 @@ internal static class CrashWorkerProgram
 
     private static IHost BuildHost(string[] args, CrashWorkerSettings settings)
     {
-        // Empty on purpose: the suite runs this assembly from the integration tests' output
-        // directory, where the sample app's appsettings.json also lands — the default builder would
-        // load it (content root = working directory) and let it reconfigure this process.
-        // Everything here comes from CrashWorkerSettings and nothing else.
+        // Empty on purpose: everything here comes from CrashWorkerSettings and nothing else. The
+        // suite launches this assembly from its own build output, but the default builder would
+        // load any appsettings.json in its content root (the working directory) — the copy of this
+        // assembly beside the integration tests, for one, shares a folder with the sample app's —
+        // and let it reconfigure this process.
         var builder = Host.CreateEmptyApplicationBuilder(new HostApplicationBuilderSettings { Args = args });
 
         // stdout is the suite's diagnostic transcript. Debug for the engine: the line that matters

@@ -1,4 +1,6 @@
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Diagnostics.HealthChecks;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
 using Xunit;
@@ -156,6 +158,57 @@ public class WatchdogScanAttestationTests
         Assert.Equal(3, snapshot.Report!.TotalEntries);
         Assert.Equal(1, snapshot.Report.EntriesWithActiveWaiter);
         Assert.Equal("stale-a", Assert.Single(snapshot.Report.StaleEntries).CorrelationId);
+    }
+
+    [Fact]
+    public async Task InMemoryChannel_WithACustomStoreThatCannotScan_IdlesInsteadOfScanningTheUnusedBuiltInStore()
+    {
+        // Pre-fix the in-memory channel bound the scanner to its built-in store unconditionally.
+        // With an app's own IRecoveryStateStore registered, the channel wrote there while the
+        // watchdog scanned the never-written built-in map and attested "no stale state" forever.
+        var services = new ServiceCollection();
+        services.AddSingleton(typeof(ILogger<>), typeof(NullLogger<>));
+        services.AddSingleton<IRecoveryStateStore>(new DeleteFailingRecoveryStateStore());
+        services.AddAsyncResponse().WithInMemoryChannel();
+        await using var provider = services.BuildServiceProvider();
+        var state = new AsyncResponseWatchdogState();
+        var watchdog = new AsyncResponseWatchdog(
+            provider.GetServices<IRecoveryStateScanner>(),
+            provider.GetServices<IActiveSubscriberProbe>(),
+            state,
+            Options(),
+            NullLogger<AsyncResponseWatchdog>.Instance);
+
+        await watchdog.StartAsync(CancellationToken.None);
+        try
+        {
+            var result = await CheckUntilAsync(state, r => r.Data.ContainsKey("scanning"), TimeSpan.FromSeconds(10));
+
+            Assert.Equal(false, result.Data["scanning"]);
+            Assert.Null(state.Latest);
+        }
+        finally
+        {
+            await watchdog.StopAsync(CancellationToken.None);
+        }
+    }
+
+    [Fact]
+    public async Task InMemoryChannel_WithACustomScanningStore_ScansTheStoreTheChannelWritesTo()
+    {
+        // The other half: registered AFTER the channel (last registration wins for the channel's
+        // store), a custom store that can scan must be the one the watchdog scans.
+        var services = new ServiceCollection();
+        services.AddSingleton(typeof(ILogger<>), typeof(NullLogger<>));
+        services.AddAsyncResponse().WithInMemoryChannel();
+        services.AddSingleton<IRecoveryStateStore, InMemoryRecoveryStateStore>();
+        await using var provider = services.BuildServiceProvider();
+
+        var store = provider.GetRequiredService<IRecoveryStateStore>();
+        var scanner = provider.GetServices<IRecoveryStateScanner>().First(candidate => candidate is not null);
+
+        Assert.Same(store, scanner);
+        Assert.NotSame(provider.GetRequiredService<InMemoryRecoveryStateStore>(), scanner);
     }
 
     private static AsyncResponseWatchdog Build(

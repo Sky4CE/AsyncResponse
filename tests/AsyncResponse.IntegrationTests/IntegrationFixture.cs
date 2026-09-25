@@ -9,7 +9,7 @@ namespace AsyncResponse.IntegrationTests;
 /// Boots the Aspire AppHost once per <em>batch</em>. A batch is a named subset of the fleet: the
 /// AppHost declares only that batch's containers and sample apps, and this fixture only resolves
 /// endpoints for what its batch declared. Because collections run sequentially (the assembly-level
-/// <c>DisableTestParallelization</c> in Batches.cs), xUnit disposes one batch's fixture — tearing its
+/// <c>Parallelization(Mode = ParallelMode.None)</c> in Batches.cs), xUnit disposes one batch's fixture — tearing its
 /// containers down — before the next batch's fixture initializes. Peak footprint is therefore the
 /// largest batch, not the whole fleet.
 /// <para>

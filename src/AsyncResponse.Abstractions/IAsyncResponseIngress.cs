@@ -19,9 +19,17 @@ public interface IAsyncResponseIngress
     /// Handles an inbound response message (raw JSON) for the given correlation id.
     /// Transient handling failures are retried in-process, then escalated through
     /// <see cref="IAsyncResponsePublisher.SetException"/> so the registered failure callback
-    /// runs, keeping broker subscription loops alive. It throws only when that escalation
-    /// itself fails — the response would otherwise be acknowledged while existing nowhere —
-    /// so the transport's redelivery/dead-letter policy gets to retry the delivery.
+    /// runs, keeping broker subscription loops alive; failures no retry can fix (an unparseable
+    /// body, a recovery callback that can never be wired up) escalate on the first attempt.
+    /// <para>
+    /// A throw means "do not acknowledge — redeliver", and it happens in exactly three cases, none
+    /// of which is escalated: the escalation itself failed (the response would otherwise be
+    /// acknowledged while existing nowhere); a <c>RecoveryCallbackFailedException</c> — the
+    /// lost-subscriber failure callback already exhausted its own in-process retries, and
+    /// escalating would only invoke it again; or an <see cref="OperationCanceledException"/>,
+    /// which is not a handler failure (a durable flow lost its execution lease, or the host is
+    /// stopping). The transport's redelivery/dead-letter policy then retries the delivery.
+    /// </para>
     /// </summary>
     /// <param name="messageJson">The raw message body.</param>
     /// <param name="correlationId">

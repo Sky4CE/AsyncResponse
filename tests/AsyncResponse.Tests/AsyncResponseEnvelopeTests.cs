@@ -145,6 +145,29 @@ public class AsyncResponseEnvelopeTests
     }
 
     /// <summary>
+    /// Regression: <c>Success</c> was optional and defaulted to <c>false</c>, so a foreign
+    /// producer's <c>{"SchemaVersion":1,"Payload":{...}}</c> read as a message-less FAILURE — the
+    /// waiter faulted with "Unknown error during asynchronous processing." and the delivered
+    /// payload was discarded — instead of failing as the wire-contract violation it is. Every
+    /// library writer has always emitted <c>Success</c>, so requiring it rejects no envelope the
+    /// library produced.
+    /// </summary>
+    [Theory]
+    [InlineData("""{"SchemaVersion":1,"Payload":{"Status":2}}""")]
+    [InlineData("""{"SchemaVersion":1,"Payload":null,"ExceptionMessage":"boom"}""")]
+    [InlineData("""{"SchemaVersion":1,"success":true,"Payload":{"Status":2}}""")]
+    public void AbsentSuccess_ThrowsTheBodyFreeWireContractJsonException(string json)
+    {
+        Assert.Throws<JsonException>(() => JsonSerializer.Deserialize<AsyncResponseEnvelope<OperationResult>>(
+            json, AsyncResponseEnvelopeOptions<OperationResult>.Instance));
+
+        // Through the ingress entry point the reason survives the body-free scrub.
+        var ingressFailure = Assert.ThrowsAny<JsonException>(
+            () => AsyncResponseEnvelopeJson.SafeDeserialize<OperationResult>(json));
+        Assert.Equal("Success is required.", ingressFailure.Message);
+    }
+
+    /// <summary>
     /// Round 33: a duplicate Payload key is legal JSON and binds last-wins like every other STJ
     /// property, so a null occurrence followed by a value IS a value. Pre-fix the null latched the
     /// guard and the envelope was rejected although a payload followed.

@@ -3,6 +3,7 @@ using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using System.Reflection;
+using System.Runtime.Loader;
 
 namespace AsyncResponse;
 
@@ -79,7 +80,9 @@ internal sealed class AsyncResponseDurableFlowStoreMarker(
         if (services is null || forwardLifetime is null)
             return;
 
-        var finalLifetime = services.LastOrDefault(descriptor => descriptor.ServiceType == StoreType)?.Lifetime;
+        // Keyed registrations are a different service: MS.DI's non-keyed resolution (the forward's
+        // GetRequiredService<TStore>) never picks one, so neither may this check.
+        var finalLifetime = services.LastOrDefault(descriptor => descriptor.ServiceType == StoreType && !descriptor.IsKeyedService)?.Lifetime;
         if (finalLifetime is null || finalLifetime == forwardLifetime)
             return;
 
@@ -113,8 +116,11 @@ internal sealed class DurableFlowObserverLifetimeAudit(IServiceCollection servic
         if (services is null)
             return;
 
+        // Non-keyed only: the executor resolves GetServices<IDurableFlowExecutionObserver>(), which
+        // never returns a keyed registration, so a keyed scoped observer is not a hazard to it.
         var nonSingleton = services.FirstOrDefault(descriptor =>
             descriptor.ServiceType == typeof(IDurableFlowExecutionObserver)
+            && !descriptor.IsKeyedService
             && descriptor.Lifetime != ServiceLifetime.Singleton);
         if (nonSingleton is not null)
         {
@@ -136,14 +142,21 @@ internal sealed class DurableFlowObserverLifetimeAudit(IServiceCollection servic
 /// builds, and starts, and then throws <see cref="MissingMethodException"/> or
 /// <see cref="TypeLoadException"/> at the first call into a changed internal: usually inside a
 /// background consume loop, long after startup, where it reads as a broker fault. Evaluated by
-/// <see cref="AsyncResponseStartupValidator"/> before anything else, so the mismatch fails the
-/// host start with both assemblies named instead.
+/// <see cref="AsyncResponsePackageVersionGate"/> when the host resolves its hosted services —
+/// before any hosted service registered after <c>AddAsyncResponse()</c> is constructed: every
+/// provider subscriber, and the startup validator with the provider-built markers it reads —
+/// and again first thing in <see cref="AsyncResponseStartupValidator.StartAsync"/>, so the
+/// mismatch fails the host start with both assemblies named instead. Provider code that runs
+/// even earlier — a <c>With*</c> registration body, at service-registration time — is outside
+/// its reach. (An options <c>ValidateOnStart</c> hook would not be earlier: the Generic Host
+/// resolves its hosted services before it runs the startup validators.)
 /// <para>
 /// The version compared is <see cref="AssemblyInformationalVersionAttribute"/> without its
 /// <c>+build-metadata</c> suffix — the package version. <c>AssemblyVersion</c> cannot tell
 /// <c>1.2.0-rc.1</c> from <c>1.2.0-rc.2</c>, and the metadata suffix is the source-control
-/// revision, which legitimately differs between assemblies of one incremental local build. Only
-/// plain attribute and name reads: nothing here needs trimming annotations.
+/// revision, which legitimately differs between assemblies of one incremental local build. The
+/// baseline is the Core running the check — never whichever Core copy the process happened to
+/// load first. Only plain attribute and name reads: nothing here needs trimming annotations.
 /// </para>
 /// </summary>
 internal static class AsyncResponsePackageVersions
@@ -164,65 +177,89 @@ internal static class AsyncResponsePackageVersions
            || assemblySimpleName.StartsWith("AsyncResponse.Transports.", StringComparison.Ordinal)
            || assemblySimpleName.StartsWith("AsyncResponse.DurableFlows.", StringComparison.Ordinal);
 
-    /// <summary>
-    /// The package assemblies loaded right now. Provider assemblies are loaded by the time the
-    /// host starts — their registration extension ran — so the ones that can fail are the ones
-    /// seen. An assembly that merely borrows a family name is told apart by its strong-name
-    /// token: every shipped package is signed with Core's key.
-    /// </summary>
-    internal static IReadOnlyList<LoadedPackage> Loaded()
+    /// <summary>Compares every loaded package bound to the executing Core against that Core.</summary>
+    internal static void EnsureSingleVersion()
     {
-        var coreAssembly = typeof(AsyncResponsePackageVersions).Assembly;
-        var coreToken = coreAssembly.GetName().GetPublicKeyToken() ?? [];
+        var core = typeof(AsyncResponsePackageVersions).Assembly;
+        EnsureSingleVersion(PackageVersion(core), Loaded(core, AppDomain.CurrentDomain.GetAssemblies()));
+    }
+
+    /// <summary>
+    /// The package assemblies among <paramref name="assemblies"/> that bind to
+    /// <paramref name="core"/>. Provider assemblies are loaded by the time the host starts — their
+    /// registration extension ran — so the ones that can fail are the ones seen. An assembly that
+    /// merely borrows a family name is told apart by its strong-name token: every shipped package
+    /// is signed with Core's key. The process-wide list spans every
+    /// <see cref="AssemblyLoadContext"/>: a context that loaded a Core copy of its own — an
+    /// isolated plugin carrying its own AsyncResponse packages — binds its packages to that copy,
+    /// never to this Core, so its assemblies are skipped whatever their version.
+    /// </summary>
+    internal static IReadOnlyList<LoadedPackage> Loaded(Assembly core, IReadOnlyList<Assembly> assemblies)
+    {
+        var coreToken = core.GetName().GetPublicKeyToken() ?? [];
+        var coreContext = AssemblyLoadContext.GetLoadContext(core);
+
+        HashSet<AssemblyLoadContext>? ownCoreContexts = null;
+        foreach (var assembly in assemblies)
+        {
+            if (assembly != core
+                && PackageName(assembly, coreToken) == Core
+                && AssemblyLoadContext.GetLoadContext(assembly) is { } context
+                && context != coreContext)
+            {
+                (ownCoreContexts ??= []).Add(context);
+            }
+        }
 
         var packages = new List<LoadedPackage>();
-        foreach (var assembly in AppDomain.CurrentDomain.GetAssemblies())
+        foreach (var assembly in assemblies)
         {
-            var name = assembly.GetName();
-            if (name.Name is not { } simpleName
-                || !IsPackageAssembly(simpleName)
-                || !coreToken.AsSpan().SequenceEqual(name.GetPublicKeyToken() ?? []))
+            if (PackageName(assembly, coreToken) is not { } simpleName)
+                continue;
+
+            if (ownCoreContexts is not null
+                && AssemblyLoadContext.GetLoadContext(assembly) is { } context
+                && ownCoreContexts.Contains(context))
             {
                 continue;
             }
 
-            packages.Add(new LoadedPackage(simpleName, PackageVersion(assembly, name)));
+            packages.Add(new LoadedPackage(simpleName, PackageVersion(assembly)));
         }
 
         return packages;
     }
 
-    private static string PackageVersion(Assembly assembly, AssemblyName name)
+    /// <summary>The simple name of a shipped package assembly signed with Core's key, or <c>null</c>.</summary>
+    private static string? PackageName(Assembly assembly, byte[] coreToken)
     {
-        var informational = assembly.GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion;
-        if (string.IsNullOrEmpty(informational))
-            return name.Version?.ToString() ?? string.Empty;
-
-        var metadata = informational.IndexOf('+', StringComparison.Ordinal);
-        return metadata < 0 ? informational : informational[..metadata];
+        var name = assembly.GetName();
+        return name.Name is { } simpleName
+               && IsPackageAssembly(simpleName)
+               && coreToken.AsSpan().SequenceEqual(name.GetPublicKeyToken() ?? [])
+            ? simpleName
+            : null;
     }
 
-    /// <summary>
-    /// Throws when any of <paramref name="loaded"/> is a different version from Core. A set
-    /// without Core (never the real one — this code IS Core) has nothing to compare against.
-    /// </summary>
-    internal static void EnsureSingleVersion(IEnumerable<LoadedPackage> loaded)
+    private static string PackageVersion(Assembly assembly)
+        => PackageVersion(
+            assembly.GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion,
+            assembly.GetName().Version);
+
+    /// <summary>The package version: the informational version without its <c>+build-metadata</c> suffix, else the assembly version.</summary>
+    internal static string PackageVersion(string? informationalVersion, Version? assemblyVersion)
     {
-        var packages = loaded as IReadOnlyCollection<LoadedPackage> ?? [.. loaded];
-        string? coreVersion = null;
-        foreach (var package in packages)
-        {
-            if (package.Name == Core)
-            {
-                coreVersion = package.Version;
-                break;
-            }
-        }
+        if (string.IsNullOrEmpty(informationalVersion))
+            return assemblyVersion?.ToString() ?? string.Empty;
 
-        if (coreVersion is null)
-            return;
+        var metadata = informationalVersion.IndexOf('+', StringComparison.Ordinal);
+        return metadata < 0 ? informationalVersion : informationalVersion[..metadata];
+    }
 
-        foreach (var package in packages)
+    /// <summary>Throws when any of <paramref name="loaded"/> is a different version from <paramref name="coreVersion"/>.</summary>
+    internal static void EnsureSingleVersion(string coreVersion, IEnumerable<LoadedPackage> loaded)
+    {
+        foreach (var package in loaded)
         {
             if (string.Equals(package.Version, coreVersion, StringComparison.Ordinal))
                 continue;
@@ -239,6 +276,27 @@ internal static class AsyncResponsePackageVersions
 }
 
 /// <summary>
+/// Runs <see cref="AsyncResponsePackageVersions.EnsureSingleVersion()"/> from its constructor.
+/// Registered by <c>AddAsyncResponse()</c> as the first of the library's hosted services, and the
+/// host constructs hosted services in registration order — so the version check runs before any
+/// provider subscriber, the startup validator, or the provider-built markers the validator reads
+/// is constructed. Those are provider code bound to Core internals; on a mixed install the first
+/// of them to touch a changed internal would otherwise fail first, with a
+/// <see cref="MissingMethodException"/> instead of the named-version error. Does nothing when
+/// started or stopped.
+/// </summary>
+internal sealed class AsyncResponsePackageVersionGate : IHostedService
+{
+    public AsyncResponsePackageVersionGate() => AsyncResponsePackageVersions.EnsureSingleVersion();
+
+    /// <summary>Starts this service (no-op; the check ran at construction).</summary>
+    public Task StartAsync(CancellationToken cancellationToken) => Task.CompletedTask;
+
+    /// <summary>Stops this service.</summary>
+    public Task StopAsync(CancellationToken cancellationToken) => Task.CompletedTask;
+}
+
+/// <summary>
 /// Validates at host startup that <c>AddAsyncResponse()</c> was paired with exactly one response
 /// channel, one worker transport, and one durable-flow state store. These are mandatory core
 /// choices; making each explicit keeps the fluent registration complete and prevents silently
@@ -252,16 +310,20 @@ internal sealed class AsyncResponseStartupValidator(
     IEnumerable<DurableFlowOptions>? _flowOptions = null,
     ILogger<AsyncResponseStartupValidator>? _logger = null,
     DurableFlowObserverLifetimeAudit? _observerAudit = null,
-    IServiceProvider? _serviceProvider = null) : IHostedService
+    IServiceProvider? _serviceProvider = null,
+    IEnumerable<IAsyncResponseCallbackAuthorizer>? _authorizers = null) : IHostedService
 {
     /// <summary>Starts this service.</summary>
-    public Task StartAsync(CancellationToken cancellationToken)
+    public async Task StartAsync(CancellationToken cancellationToken)
     {
-        // First: every check below may already run provider code bound to Core internals.
-        AsyncResponsePackageVersions.EnsureSingleVersion(AsyncResponsePackageVersions.Loaded());
+        // First: every check below may already run provider code bound to Core internals. (The
+        // gate registered ahead of this validator normally ran it already; this covers a host
+        // that starts the validator without resolving the gate.)
+        AsyncResponsePackageVersions.EnsureSingleVersion();
 
         ValidateWatchdogOptions(_options.Value.Watchdog);
         ValidateInboundMessageBudget(_options.Value);
+        ValidateSingleCallbackAuthorizer();
         _observerAudit?.Validate();
 
         var channelNames = _channels.Select(c => c.Name).Distinct(StringComparer.Ordinal).ToArray();
@@ -311,6 +373,10 @@ internal sealed class AsyncResponseStartupValidator(
             storeMarker.ValidateForwardLifetime();
 
         ValidateSingleFlowOptions();
+        // The engine's own option bounds, at startup: the executor is built lazily inside the first
+        // flow job, so a bad knob otherwise first threw inside the worker transport's retry loop.
+        if (_flowOptions?.LastOrDefault() is { } engineOptions)
+            FlowStateConcurrency.ValidateOptions(engineOptions);
         ValidateEarlyAckDeclarations();
         ValidateAwaitedStepLedgerCoverage();
 
@@ -318,15 +384,16 @@ internal sealed class AsyncResponseStartupValidator(
         // constructor, but the store is otherwise resolved only inside per-execution scopes — so a
         // misconfigured table name (or any other store option) previously passed startup and first
         // threw inside the worker transport's retry loop, burning a real production run to the
-        // delivery cap. Constructors do no I/O by convention; the scope disposes what it built.
+        // delivery cap. Constructors do no I/O by convention; the scope disposes what it built —
+        // asynchronously, like every runtime flow scope: a scoped application store that
+        // implements only IAsyncDisposable makes a synchronous scope disposal throw, which failed
+        // the host start although every execution path would have disposed it cleanly.
         // (Null only in unit tests that construct the validator directly; DI always supplies it.)
         if (_serviceProvider is not null)
         {
-            using var scope = _serviceProvider.CreateScope();
+            await using var scope = _serviceProvider.CreateAsyncScope();
             _ = scope.ServiceProvider.GetRequiredService<IFlowStateStore>();
         }
-
-        return Task.CompletedTask;
     }
 
     /// <summary>
@@ -356,6 +423,28 @@ internal sealed class AsyncResponseStartupValidator(
                 "(e.g. a provider registration such as .WithPostgreSqlDurableFlows(...) followed by .WithDurableFlows<TStore>(...)). " +
                 "The flow engine consumes only the last registration, so settings from the earlier call are silently ignored. " +
                 "Configure every durable-flow setting in the single registration's callback.");
+        }
+    }
+
+    /// <summary>
+    /// Every consumer resolves ONE <see cref="IAsyncResponseCallbackAuthorizer"/> — the last
+    /// registration — so a second <c>AuthorizeCallbacks</c> call (a module's allowlist followed by
+    /// the application's) silently discarded the first: its targets were refused, recovery
+    /// callbacks for them logged and dropped as permanent failures, and their worker jobs
+    /// redelivered to the dead-letter queue. Same class as the duplicate
+    /// <see cref="DurableFlowOptions"/> check, so the same answer: fail on the duplicate.
+    /// The same instance registered twice drops nothing and passes.
+    /// </summary>
+    private void ValidateSingleCallbackAuthorizer()
+    {
+        var registered = _authorizers?.Distinct().ToArray() ?? [];
+        if (registered.Length > 1)
+        {
+            throw new InvalidOperationException(
+                $"{nameof(IAsyncResponseCallbackAuthorizer)} is registered {registered.Length} times — AuthorizeCallbacks was called more than " +
+                "once (or an authorizer was also registered directly). Callback authorization consults only the last registration, so the " +
+                "targets allowed by the earlier ones are silently refused. Allow every target in one AuthorizeCallbacks call " +
+                "(e.g. a => a.Allow<IModuleService>().Allow<IAppService>()), or combine the rules in a single custom authorizer.");
         }
     }
 

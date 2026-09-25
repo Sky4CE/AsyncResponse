@@ -98,6 +98,93 @@ public sealed class Round34RegressionTests
     }
 
     /// <summary>
+    /// Fixpoint r1 (S1#11): the settle path's OWN fenced save had no lease-less fallback. The
+    /// attempt unwinds with a response already won (here: an observer throws after the response
+    /// landed), the lease still reads as held, and then the store refuses the fenced completion
+    /// save — a lease that lapsed in that window. The claimed, channel-acked response was dropped
+    /// with the breadcrumb still pending on a consumed correlation id; now the response is
+    /// checkpointed through the lease-less path before the takeover signal is raised.
+    /// </summary>
+    [Fact]
+    public async Task AwaitStep_WonResponse_WhoseSettleSaveIsRefused_IsCheckpointedWithoutTheLease()
+    {
+        var store = new TakeoverStore("remote", takeover: _ => { });
+        var state = new FlowState { FlowId = "fixpoint-settle-save-refused" };
+        Assert.True(await store.TryCreateAsync(state.FlowId!, state, TimeSpan.FromMinutes(5)));
+        var observer = new Mock<IDurableFlowExecutionObserver>();
+        observer.Setup(instance => instance.OnStepStartingAsync(It.IsAny<DurableFlowStepEvent>())).Returns(ValueTask.CompletedTask);
+        observer.Setup(instance => instance.OnStepWaitingAsync(It.IsAny<DurableFlowStepEvent>()))
+            .Returns(ValueTask.FromException(new InvalidOperationException("observer crashed")));
+
+        var won = new OperationResult { Status = OperationStatus.Completed, Message = "the-won-response" };
+        await using (var lease = await AcquireLeaseAsync(store, state.FlowId!))
+        {
+            var context = new DurableFlowContext(
+                state,
+                store,
+                Mock.Of<IAsyncResponseBuilder>(),
+                new AsyncResponseContextPropagation([]),
+                new DurableFlowOptions(),
+                SubscriberReturning(Task.FromResult(won)),
+                null,
+                NullLogger.Instance,
+                lease,
+                observers: [observer.Object]);
+
+            var surfaced = await Assert.ThrowsAsync<InvalidOperationException>(() => context.AwaitStepAsync<OperationResult>("remote", _ => Task.CompletedTask));
+            Assert.Contains("lost its execution lease", surfaced.Message, StringComparison.Ordinal);
+        }
+
+        Assert.Equal(1, store.Takeovers);
+        var step = (await store.LoadAsync(state.FlowId!))!.Steps!["remote"];
+        Assert.True(step.Completed);
+        Assert.Null(step.PendingCorrelationId);
+        Assert.Contains("the-won-response", step.ResultJson, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Pass-2 precommit review (A3 residual): the same lease-less checkpoint can be the write that
+    /// takes the ledger past <see cref="DurableFlowOptions.LedgerSizeWarningBytes"/>, and no context
+    /// save follows it — the takeover's execution seeds its first warning at the next doubling above
+    /// the ledger it finds, so that crossing was never logged. The lease-less write warns now.
+    /// </summary>
+    [Fact]
+    public async Task AwaitStep_WonResponse_CheckpointedWithoutTheLease_PastTheLedgerWarningThreshold_IsWarned()
+    {
+        var store = new TakeoverStore("remote", takeover: _ => { });
+        var state = new FlowState { FlowId = "fixpoint-lease-less-ledger-warning", Attempts = 2 };
+        Assert.True(await store.TryCreateAsync(state.FlowId!, state, TimeSpan.FromMinutes(5)));
+        var observer = new Mock<IDurableFlowExecutionObserver>();
+        observer.Setup(instance => instance.OnStepStartingAsync(It.IsAny<DurableFlowStepEvent>())).Returns(ValueTask.CompletedTask);
+        observer.Setup(instance => instance.OnStepWaitingAsync(It.IsAny<DurableFlowStepEvent>()))
+            .Returns(ValueTask.FromException(new InvalidOperationException("observer crashed")));
+        var logger = new CollectingLogger();
+
+        var won = new OperationResult { Status = OperationStatus.Completed, Message = new string('x', 700) };
+        await using (var lease = await AcquireLeaseAsync(store, state.FlowId!))
+        {
+            var context = new DurableFlowContext(
+                state,
+                store,
+                Mock.Of<IAsyncResponseBuilder>(),
+                new AsyncResponseContextPropagation([]),
+                new DurableFlowOptions { LedgerSizeWarningBytes = 512 },
+                SubscriberReturning(Task.FromResult(won)),
+                null,
+                logger,
+                lease,
+                observers: [observer.Object]);
+
+            await Assert.ThrowsAsync<InvalidOperationException>(() => context.AwaitStepAsync<OperationResult>("remote", _ => Task.CompletedTask));
+        }
+
+        Assert.Equal(1, store.Takeovers);
+        Assert.True((await store.LoadAsync(state.FlowId!))!.Steps!["remote"].Completed);
+        var warning = Assert.Single(logger.Messages, message => message.Contains("LedgerSizeWarningBytes threshold", StringComparison.Ordinal));
+        Assert.Contains(state.FlowId!, warning, StringComparison.Ordinal);
+    }
+
+    /// <summary>
     /// Rejects the FIRST lease-fenced completion save for <c>stepName</c> exactly as a store answers
     /// a lost lease — and, before answering, applies <paramref name="takeover"/> to the persisted
     /// ledger through a lease-less write, so the rescue's reload sees what a real takeover wrote.
@@ -594,6 +681,58 @@ public sealed class Round34RegressionTests
         {
             await scheduler.StopAsync(CancellationToken.None);
         }
+    }
+
+    /// <summary>
+    /// Fixpoint r1 (GS1#3): the re-drive pass walked every due entry back to back, each a state read
+    /// plus a whole start retry ladder. During an outage a queue of a few entries held the loop past
+    /// the next occurrence, and the loop's missed-occurrence rule then skipped every occurrence that
+    /// fell due meanwhile — silently, with the loop alive. The pass now yields as soon as the next
+    /// occurrence is due. Here each failing start costs 25 virtual seconds, four probe-queued
+    /// entries are due at startup, and the schedule fires every minute: every occurrence must still
+    /// be attempted.
+    /// </summary>
+    [Fact]
+    public async Task ScheduledFlow_ALongRedrivePass_YieldsToTheNextOccurrence_InsteadOfSkippingIt()
+    {
+        var time = new VirtualTimeProvider(new DateTimeOffset(2030, 1, 1, 0, 0, 30, TimeSpan.Zero));
+        var flows = new FakeFlows();
+        foreach (var queued in new[] { "20291231T235700Z", "20291231T235800Z", "20291231T235900Z", "20300101T000000Z" })
+            flows.States[$"sched:per-minute:{queued}"] = new FlowState { FlowId = $"sched:per-minute:{queued}", Status = FlowRunStatus.Running, Attempts = 0 };
+        var brokerBack = new DateTimeOffset(2030, 1, 1, 0, 5, 0, TimeSpan.Zero);
+        flows.OnStart = flowId =>
+        {
+            if (time.GetUtcNow() >= brokerBack)
+                return null;
+
+            // The broker is down: each start burns its retry ladder (virtual time), then fails
+            // undispatched. The loop is busy back to back, so it moves the clock itself.
+            time.Advance(TimeSpan.FromSeconds(25));
+            return new DurableFlowNotDispatchedException(flowId, new TimeoutException("broker down"));
+        };
+
+        using var scheduler = new ScheduledFlowService(flows, [Registration("per-minute", "* * * * *")], NullLogger<ScheduledFlowService>.Instance, time);
+        await scheduler.StartAsync(CancellationToken.None);
+        try
+        {
+            var deadline = DateTime.UtcNow.AddSeconds(30);
+            while (time.GetUtcNow() < brokerBack)
+            {
+                Assert.True(DateTime.UtcNow < deadline, $"virtual time stalled at {time.GetUtcNow():O}");
+                if (time.NextTimerDueAt is { } due)
+                    time.AdvanceTo(due);
+                else
+                    await Task.Delay(5);
+            }
+        }
+        finally
+        {
+            await scheduler.StopAsync(CancellationToken.None);
+        }
+
+        var attempted = flows.Starts.ToHashSet(StringComparer.Ordinal);
+        foreach (var occurrence in new[] { "20300101T000100Z", "20300101T000200Z", "20300101T000300Z", "20300101T000400Z" })
+            Assert.Contains($"sched:per-minute:{occurrence}", attempted);
     }
 
     private static async Task WaitForArmedTimerAsync(VirtualTimeProvider time)

@@ -50,7 +50,24 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
         _subjects = new NatsSubjectSchema(_options.SubjectPrefix);
         _logger = logger;
         _lostSubscriberDispatcher = new LostSubscriberCallbackDispatcher(scopeFactory, propagation, logger, _timeProvider);
+
+        // Recovery keys are not scoped by SubjectPrefix, so a prefix chosen to isolate a
+        // deployment isolates its response subjects but not its registrations: every deployment
+        // left on the default bucket shares one keyspace.
+        if (!string.Equals(_options.SubjectPrefix, NatsAsyncResponseChannelOptions.DefaultSubjectPrefix, StringComparison.Ordinal)
+            && string.Equals(_options.RecoveryBucket, NatsAsyncResponseChannelOptions.DefaultRecoveryBucket, StringComparison.Ordinal))
+        {
+            _logger.LogWarning(
+                "The NATS channel's SubjectPrefix is '{SubjectPrefix}' but its RecoveryBucket is still the default '{RecoveryBucket}'. Recovery registrations are keyed by correlation id only, " +
+                "so every deployment sharing this bucket sees the others' registrations (their long waits reported as stale by each watchdog, a shared correlation id's registration consumed by the wrong one). " +
+                "Give each deployment its own RecoveryBucket as well.",
+                _options.SubjectPrefix,
+                _options.RecoveryBucket);
+        }
     }
+
+    /// <summary>Longest excerpt of a remote failure message copied into the wait span's status.</summary>
+    private const int MaxRemoteFailureStatusLength = 256;
 
     // ---------------------------------------------------------------------------------------
     // IAsyncResponseSubscriber / IRecoverableAsyncResponseSubscriber
@@ -152,11 +169,20 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
         CancellationTokenRegistration timeoutRegistration = default;
         INatsChannelSubscription? subscription = null;
 
+        // The subscription's lifetime, deliberately NOT the timeout source: NATS.Net ends a
+        // subscription the moment its subscribe token is cancelled, so a subscription bound to
+        // the timeout lost its server-side interest at CancelAfter — before the drain below had
+        // deleted the recovery registration. A publish landing in that window saw "no responders,
+        // registration present" and fired a recovery callback while the waiter reported a
+        // timeout. Cancelled only as the teardown backstop.
+        var subscriptionLifetime = new CancellationTokenSource();
+
         // -------------------------------------------------------------------------
         // Local: CleanupOnceAsync — ends the stream (which ends the consume loop), deletes
         // recovery state, and tears down the timeout, exactly once.
         int cleanupStarted = 0;
         int teardownBudgetSpent = 0;
+        int registrationDeleted = 0;
         var subscriptionTornDown = false;
         var cleanupGate = new object();
         Task? cleanupTask = null;
@@ -237,14 +263,32 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
             if (Volatile.Read(ref cleanupStarted) == 0)
             {
                 var drainTimeout = _options.DisposalDrainTimeout;
-                // ONE budget for the whole disposal: the latched cleanup below skips its own
-                // teardown wait when a drain already spent this budget on the same latched
-                // teardown task — a second full wait there made disposal cost double the
-                // configured DisposalDrainTimeout.
-                Volatile.Write(ref teardownBudgetSpent, 1);
+                var streamEndStarted = false;
                 try
                 {
                     using var budget = new CancellationTokenSource(drainTimeout);
+
+                    // Delete the recovery registration FIRST, while the subscription is still
+                    // live — the same "delete before unsubscribe" order the cleanup core keeps,
+                    // for the same reason. This drain ends the stream before the core runs, so
+                    // leaving the delete to the core reopened the window on the timeout and
+                    // dispose paths: a publish landing after the UNSUB but before the delete saw
+                    // "no responders, registration present" and fired a recovery callback while
+                    // this waiter reported a timeout (or was cancelled). A response landing now
+                    // reaches the live subscription instead. Inside the drain budget: during an
+                    // outage the KV delete waits for the connection to come back, and awaited
+                    // unbounded it held a timed-out waiter's ResponseTask pending for the whole
+                    // outage. On a lapse registrationDeleted stays unset, so the cleanup core
+                    // retries the delete — after the waiter is settled, still before the stream
+                    // ends (the abandoned attempt never faults: it logs its own failure).
+                    await DeleteRegistrationAsync().WaitAsync(budget.Token).ConfigureAwait(false);
+
+                    // ONE budget for the whole disposal: the latched cleanup below skips its own
+                    // teardown wait when a drain already spent this budget on the same latched
+                    // teardown task — a second full wait there made disposal cost double the
+                    // configured DisposalDrainTimeout.
+                    Volatile.Write(ref teardownBudgetSpent, 1);
+                    streamEndStarted = true;
                     await EndStreamOnce().WaitAsync(budget.Token).ConfigureAwait(false);
 
                     // A failed teardown surfaces as "completed, subscriptionTornDown false" (the
@@ -260,6 +304,15 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
                     // ended with nothing in flight and the cleanup's cancel below is truthful.
                     await consumeLoop.WaitAsync(budget.Token).ConfigureAwait(false);
                 }
+                catch (OperationCanceledException) when (!streamEndStarted && consumeLoop.IsCompleted)
+                {
+                    // The delete lapsed with nothing that could be in flight — no subscription
+                    // (an abandoned registration) or a loop that already ended — so there is no
+                    // settlement to prove. The cleanup core retries the delete.
+                    _logger.LogDebug(
+                        "Deleting the recovery registration for correlationId {CorrelationId} did not complete within {DrainTimeout}; the cleanup retries it.",
+                        correlationId, drainTimeout);
+                }
                 catch (Exception drainEx)
                 {
                     _logger.LogWarning(
@@ -273,7 +326,15 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
                     if (drainEx is not OperationCanceledException)
                         _logger.LogDebug(drainEx, "Disposal drain failed for subject {Subject}.", subject);
                     tcs.TrySetException(new AsyncResponseIndeterminateDeliveryException(correlationId, drainTimeout));
-                    await DisarmThenCancelSubscriptionTokenAsync().ConfigureAwait(false);
+
+                    // A lapse inside the delete leaves the registration in place: cancelling the
+                    // subscription now would unsubscribe before it is gone — the window the delete
+                    // runs first to close. The cleanup core deletes, then ends the stream; only
+                    // the timeout registration is disarmed here.
+                    if (streamEndStarted)
+                        await DisarmThenCancelSubscriptionTokenAsync().ConfigureAwait(false);
+                    else
+                        await timeoutRegistration.DisposeAsync().ConfigureAwait(false);
                 }
             }
 
@@ -289,20 +350,49 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
             await CleanupOnceAsync().ConfigureAwait(false);
         }
 
+        async Task CleanupAbandonedRegistrationAsync()
+        {
+            try
+            {
+                await DrainThenCleanupAsync().ConfigureAwait(false);
+            }
+            catch (Exception cleanupEx)
+            {
+                // Fire-and-forget: nothing awaits this task, so an escaped fault would vanish.
+                _logger.LogError(cleanupEx, "Cleanup of the abandoned registration for correlationId {CorrelationId} failed.", correlationId);
+            }
+        }
+
         async ValueTask DisarmThenCancelSubscriptionTokenAsync()
         {
-            // Disarm the waiter-timeout registration BEFORE the backstop cancel — the cancel
-            // would otherwise fire it and stamp a spurious TimeoutException plus a waiter-timeout
-            // metric onto a disposal that is not a timeout. Idempotent with the cleanup core's
-            // own registration disposal.
+            // Disarm the waiter-timeout registration BEFORE the backstop cancel: this runs on
+            // disposal paths, and a timeout firing behind it would stamp a spurious
+            // TimeoutException plus a waiter-timeout metric onto a disposal that is not a timeout.
+            // Idempotent with the cleanup core's own registration disposal.
             await timeoutRegistration.DisposeAsync().ConfigureAwait(false);
             try
             {
-                cancellationTokenSource.Cancel();
+                subscriptionLifetime.Cancel();
             }
             catch (ObjectDisposedException)
             {
                 // Cleanup already ran and disposed the source; the loop is ending regardless.
+            }
+        }
+
+        // Best-effort: the KV entry expires on its own, and a transient store failure must not
+        // skip the subscription teardown that follows. Marked once it succeeded so the cleanup
+        // core does not repeat a delete the drain already made.
+        async Task DeleteRegistrationAsync()
+        {
+            try
+            {
+                await _recoveryStateStore.TryDeleteAsync(correlationId, registrationId).ConfigureAwait(false);
+                Volatile.Write(ref registrationDeleted, 1);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Failed to delete recovery state for correlationId {CorrelationId}.", correlationId);
             }
         }
 
@@ -312,22 +402,14 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
 
             try
             {
-                try
-                {
-                    // Delete the recovery state BEFORE disposing the subscription. In the reverse
-                    // order a publish landing in the window sees "no responders, state present" and
-                    // fires a spurious recovery callback for a wait that already reached a terminal
-                    // state. In this order the window shows a subscriber that drops the message — a
-                    // late or duplicate terminal message is droppable; a resurrected recovery callback
-                    // is not.
-                    await _recoveryStateStore.TryDeleteAsync(correlationId, registrationId).ConfigureAwait(false);
-                }
-                catch (Exception ex)
-                {
-                    // Best-effort: the KV entry expires on its own, and a transient store failure
-                    // must not skip the subscription teardown below.
-                    _logger.LogError(ex, "Failed to delete recovery state for correlationId {CorrelationId}.", correlationId);
-                }
+                // Delete the recovery state BEFORE disposing the subscription. In the reverse
+                // order a publish landing in the window sees "no responders, state present" and
+                // fires a spurious recovery callback for a wait that already reached a terminal
+                // state. In this order the window shows a subscriber that drops the message — a
+                // late or duplicate terminal message is droppable; a resurrected recovery callback
+                // is not. (A drain that preceded this core already deleted it, the same way.)
+                if (Volatile.Read(ref registrationDeleted) == 0)
+                    await DeleteRegistrationAsync().ConfigureAwait(false);
 
                 // End the stream if the drain has not already — dispatch-triggered cleanup (a
                 // terminal delivery, a loop fault) reaches here without a drain. The task-latch
@@ -358,9 +440,8 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
                     // DisposeAsync did not complete, so the server-side subscription may still be
                     // pumping messages. Its lifetime is bound to this token (SubscribeAsync received
                     // it), and disposing a CTS never cancels — an explicit cancel is the backstop
-                    // that ends the consume loop. Safe only after the timeout registration above is
-                    // gone, or the cancel would fire a spurious waiter timeout.
-                    cancellationTokenSource.Cancel();
+                    // that ends the consume loop.
+                    subscriptionLifetime.Cancel();
                 }
 
                 // A waiter disposed before any terminal signal must not leave ResponseTask pending
@@ -370,6 +451,7 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
                 tcs.TrySetCanceled();
 
                 cancellationTokenSource.Dispose();
+                subscriptionLifetime.Dispose();
                 activity?.Dispose();
             }
         }
@@ -421,8 +503,12 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
                         // a remote we do not control can push at us.
                         remoteFailure.Data["RemoteStackTrace"] = RemoteStackTrace.Cap(envelope.ExceptionStackTrace, _options.MaxRemoteStackTraceLength);
 
-                    _logger.LogWarning("Received error response for correlationId {CorrelationId}: {ErrorMessage}", correlationId, envelope.ExceptionMessage);
-                    AsyncResponseDiagnostics.SetError(activity, "remote_failure", remoteFailure.Message);
+                    // The remote's message is NOT logged (DB-channel parity) and reaches the span
+                    // status only as a capped, escaped excerpt: like the stack trace above, it is
+                    // text a remote we do not control chose — up to the whole inbound budget, with
+                    // line breaks that forge log entries. The waiter's exception still carries it.
+                    _logger.LogWarning("Received error response for correlationId {CorrelationId}.", correlationId);
+                    AsyncResponseDiagnostics.SetError(activity, "remote_failure", DiagnosticText.EscapedExcerpt(remoteFailure.Message, MaxRemoteFailureStatusLength));
                     if (!tcs.TrySetException(remoteFailure))
                         _logger.LogWarning(remoteFailure, "TaskCompletionSource already completed for correlationId {CorrelationId}.", correlationId);
                 }
@@ -534,9 +620,22 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
             });
         });
 
+        // Registration budget: the resolved waiter timeout. While the NATS connection is
+        // reconnecting, subscribe, flush and the KV save all wait for it to reopen (NATS.Net
+        // retries the reconnect forever) and the waiter timeout is only armed AFTER registration
+        // — so an outage held CreateResponseWaiter for its whole duration, past any caller budget.
+        // The subscribe is NOT handed this token: NATS.Net binds a subscribe token to the
+        // subscription's lifetime, so a registration token there would end the live subscription
+        // the moment the budget lapsed. It is bounded from outside instead.
+        var lifetimeToken = subscriptionLifetime.Token;
+        using var registrationBudget = new CancellationTokenSource(timeout.Value, _timeProvider);
+        using var registrationCancellation = CancellationTokenSource.CreateLinkedTokenSource(lifetimeToken, registrationBudget.Token);
+        Task<INatsChannelSubscription>? pendingSubscribe = null;
+
         try
         {
-            subscription = await _client.SubscribeAsync(subject, cancellationTokenSource.Token).ConfigureAwait(false);
+            pendingSubscribe = _client.SubscribeAsync(subject, lifetimeToken);
+            subscription = await pendingSubscribe.WaitAsync(registrationBudget.Token).ConfigureAwait(false);
             consumeLoop = Task.Run(() => ConsumeLoopAsync(subscription));
 
             // Round-trip to the server so the subscription is guaranteed registered BEFORE the
@@ -547,10 +646,10 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
             // subscription, and consumed a live waiter's recovery arm — the waiter then resumed
             // twice (recovery callback now, live delivery to its timeout). Skipped once cleanup
             // started: the wait already settled terminally, so there is no trigger race left to
-            // close — and cleanup's teardown disposes the lifetime source this flush reads its
-            // token from, so attempting it would throw for nothing.
+            // close — and cleanup may already have torn the subscription down (or backstop-
+            // cancelled the lifetime this flush is linked to), so attempting it would be for nothing.
             if (Volatile.Read(ref cleanupStarted) == 0)
-                await _client.FlushAsync(cancellationTokenSource.Token).ConfigureAwait(false);
+                await _client.FlushAsync(registrationCancellation.Token).ConfigureAwait(false);
 
             var recoveryState = new RecoveryState
             {
@@ -570,7 +669,7 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
                 RegisteredAtUtc = _timeProvider.GetUtcNow().UtcDateTime,
                 Context = _propagation.Capture()
             };
-            await _recoveryStateStore.SaveAsync(correlationId, recoveryState, _options.RecoveryStateExpiry).ConfigureAwait(false);
+            await _recoveryStateStore.SaveAsync(correlationId, recoveryState, _options.RecoveryStateExpiry, registrationCancellation.Token).ConfigureAwait(false);
             if (Volatile.Read(ref cleanupStarted) != 0)
             {
                 // A terminal delivery on the already-running consume loop started cleanup while
@@ -610,6 +709,33 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
             _logger.LogWarning(ex,
                 "Registration step failed after a delivery settled correlationId {CorrelationId}; returning the completed waiter.",
                 correlationId);
+        }
+        catch (Exception ex) when (registrationBudget.IsCancellationRequested && ex is OperationCanceledException)
+        {
+            _logger.LogError(ex, "Registering the response waiter on subject {Subject} for correlationId {CorrelationId} did not complete within {Timeout}.", subject, correlationId, timeout.Value);
+            AsyncResponseDiagnostics.SetError(activity, "subscribe_failure", "Registration did not complete within the waiter timeout.");
+
+            if (subscription is null)
+            {
+                // The abandoned subscribe is still waiting for the connection. Cancel the lifetime
+                // token it was handed so it fails instead of installing server-side interest after
+                // the reconnect — orphan interest nobody reads, which later publishes would read
+                // as "a subscriber received it" and drop. Cleanup only DISPOSES the lifetime source
+                // when there is no subscription, and disposing never cancels.
+                await DisarmThenCancelSubscriptionTokenAsync().ConfigureAwait(false);
+                _ = DisposeLateSubscriptionAsync(pendingSubscribe, subject);
+            }
+
+            // Cleanup in the background: its recovery-state delete rides the same connection that
+            // just failed to answer, so awaiting it here would hold the caller for the outage
+            // after all. TTL and the watchdog back a delete that never lands.
+            _ = CleanupAbandonedRegistrationAsync();
+
+            // Throw so the builder never fires the trigger for a waiter that is not registered.
+            throw new TimeoutException(
+                $"Registering the NATS response waiter for correlationId {correlationId} did not complete within {timeout.Value}; " +
+                "the NATS connection may be unavailable. No remote operation was triggered.",
+                ex);
         }
         catch (Exception ex)
         {
@@ -653,14 +779,33 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
         return new NatsAsyncResponseWaiter<T>(UnwrapConsumeLoopFaults(tcs.Task), () => DrainThenCleanupAsync());
     }
 
+    /// <summary>
+    /// Settles the subscribe a lapsed registration budget abandoned. Its lifetime token is already
+    /// cancelled, so it normally fails once the connection answers; one that completed anyway is
+    /// disposed so its server-side interest ends. Observed either way, so the fault never surfaces
+    /// as an unobserved task exception.
+    /// </summary>
+    private async Task DisposeLateSubscriptionAsync(Task<INatsChannelSubscription>? pending, string subject)
+    {
+        if (pending is null)
+            return;
+
+        try
+        {
+            var late = await pending.ConfigureAwait(false);
+            await late.DisposeAsync().ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "Abandoned subscribe for subject {Subject} ended.", subject);
+        }
+    }
+
     // ---------------------------------------------------------------------------------------
     // IAsyncResponsePublisher
 
     /// <inheritdoc/>
     public Task SetResponse<T>(T response, string correlationId, CancellationToken cancellationToken = default) where T : IAsyncResponsePayload
-        => SetResponseCore(response, correlationId, cancellationToken);
-
-    Task IRawAsyncResponsePublisher.SetRawResponse(object? response, string correlationId, CancellationToken cancellationToken)
         => SetResponseCore(response, correlationId, cancellationToken);
 
     Task IRawAsyncResponsePublisher.SetRawResponseJson(string responseJson, string correlationId, CancellationToken cancellationToken)
@@ -720,12 +865,13 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
                     if (dispatchResult.RetryLive)
                     {
                         // Second contradiction: delivery keeps reporting no responders while the
-                        // probe keeps reporting a live subscriber (interest not yet visible
-                        // server-side, or a stale heartbeat). Consuming registrations on this
-                        // evidence would strip a live waiter of its recovery arm — leave all state
-                        // intact and surface the non-delivery to the caller, whose retry/redelivery
-                        // machinery re-attempts once the subscription is visible (bounded by the
-                        // heartbeat's liveness expiry, after which normal recovery takes over).
+                        // probe keeps getting an answer from a live subscriber (its interest not
+                        // yet visible on the route the delivery took, e.g. still propagating
+                        // across a cluster). Consuming registrations on this evidence would strip a
+                        // live waiter of its recovery arm — leave all state intact and surface the
+                        // non-delivery to the caller, whose retry/redelivery machinery re-attempts
+                        // once the subscription is visible (or, once the waiter is gone, the probe
+                        // answers no responders too and normal recovery takes over).
                         // Returning here instead would silently drop the payload: the caller
                         // reports success, the broker message is acked, and the response then
                         // exists nowhere.
@@ -809,12 +955,13 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
                     if (dispatchResult.RetryLive)
                     {
                         // Second contradiction: delivery keeps reporting no responders while the
-                        // probe keeps reporting a live subscriber (interest not yet visible
-                        // server-side, or a stale heartbeat). Consuming registrations on this
-                        // evidence would strip a live waiter of its recovery arm — leave all state
-                        // intact and surface the non-delivery to the caller, whose retry/redelivery
-                        // machinery re-attempts once the subscription is visible (bounded by the
-                        // heartbeat's liveness expiry, after which normal recovery takes over).
+                        // probe keeps getting an answer from a live subscriber (its interest not
+                        // yet visible on the route the delivery took, e.g. still propagating
+                        // across a cluster). Consuming registrations on this evidence would strip a
+                        // live waiter of its recovery arm — leave all state intact and surface the
+                        // non-delivery to the caller, whose retry/redelivery machinery re-attempts
+                        // once the subscription is visible (or, once the waiter is gone, the probe
+                        // answers no responders too and normal recovery takes over).
                         // Returning here instead would silently drop the payload: the caller
                         // reports success, the broker message is acked, and the response then
                         // exists nowhere.
@@ -908,12 +1055,13 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
                     if (dispatchResult.RetryLive)
                     {
                         // Second contradiction: delivery keeps reporting no responders while the
-                        // probe keeps reporting a live subscriber (interest not yet visible
-                        // server-side, or a stale heartbeat). Consuming registrations on this
-                        // evidence would strip a live waiter of its recovery arm — leave all state
-                        // intact and surface the non-delivery to the caller, whose retry/redelivery
-                        // machinery re-attempts once the subscription is visible (bounded by the
-                        // heartbeat's liveness expiry, after which normal recovery takes over).
+                        // probe keeps getting an answer from a live subscriber (its interest not
+                        // yet visible on the route the delivery took, e.g. still propagating
+                        // across a cluster). Consuming registrations on this evidence would strip a
+                        // live waiter of its recovery arm — leave all state intact and surface the
+                        // non-delivery to the caller, whose retry/redelivery machinery re-attempts
+                        // once the subscription is visible (or, once the waiter is gone, the probe
+                        // answers no responders too and normal recovery takes over).
                         // Returning here instead would silently drop the payload: the caller
                         // reports success, the broker message is acked, and the response then
                         // exists nowhere.

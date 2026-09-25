@@ -314,14 +314,17 @@ public sealed class PostgreSqlDirectIntegrationTests(DataBatchFixture fixture) :
     }
 
     [Fact]
-    public async Task OperatorProvisionedFlowSchema_WrongColumnShape_IsReportedBeforeAMissingIndex()
+    public async Task OperatorProvisionedFlowSchema_WrongColumnShape_IsReported_AndAMissingIndexIsNotAnError()
     {
         // A misprovisioned schema is usually wrong in several ways at once. The verifier used to
         // report the index the operator forgot ("does not exist") while the wrong column type on
-        // the table they DID provide — the actionable finding — went unreported; and the absence
-        // error carried no shared-namespace guidance at all. The wrong shape seeded here is
-        // state_json jsonb — the pre-round-29 column type, i.e. exactly what a manually-migrated
-        // deployment presents after upgrading (the expected type is now text; see the store DDL).
+        // the table they DID provide — the actionable finding — went unreported. The wrong shape
+        // seeded here is state_json jsonb — the pre-round-29 column type, i.e. exactly what a
+        // manually-migrated deployment presents after upgrading (the expected type is now text;
+        // see the store DDL). The expiry index itself is performance-only: on an operator-managed
+        // schema it is verified when present and only warned about when absent, so once the column
+        // is fixed the store runs — and a revision column without the DDL's DEFAULT 0 is accepted
+        // too, since every insert names it.
         await WithDataSourceAsync("flow_cause_order", async (schema, dataSource) =>
         {
             await using (var connection = await dataSource.OpenConnectionAsync())
@@ -335,7 +338,7 @@ public sealed class PostgreSqlDirectIntegrationTests(DataBatchFixture fixture) :
                         state_json jsonb NOT NULL,
                         expires_at_utc timestamptz NOT NULL,
                         updated_at_utc timestamptz NOT NULL,
-                        revision bigint NOT NULL DEFAULT 0,
+                        revision bigint NOT NULL,
                         lease_id text NULL,
                         lease_expires_at_utc timestamptz NULL
                     );
@@ -355,8 +358,7 @@ public sealed class PostgreSqlDirectIntegrationTests(DataBatchFixture fixture) :
             Assert.Contains("column 'state_json'", ex.Message, StringComparison.Ordinal);
             Assert.DoesNotContain("to exist after schema creation", ex.Message, StringComparison.Ordinal);
 
-            // With the shape fixed, the forgotten index is reported — as the absence it is, now
-            // carrying the shared-namespace guidance like every other verifier error.
+            // With the shape fixed, the forgotten index no longer fails every operation.
             await using (var connection = await dataSource.OpenConnectionAsync())
             await using (var repair = connection.CreateCommand())
             {
@@ -373,10 +375,28 @@ public sealed class PostgreSqlDirectIntegrationTests(DataBatchFixture fixture) :
                     TableName = "flow_state",
                     AutoCreateSchema = false
                 }));
-            var missingIndex = await Assert.ThrowsAsync<InvalidOperationException>(() => repaired.LoadAsync("missing"));
-            Assert.Contains("_expires_idx", missingIndex.Message, StringComparison.Ordinal);
-            Assert.Contains("to exist after schema creation", missingIndex.Message, StringComparison.Ordinal);
-            Assert.Contains("share one namespace", missingIndex.Message, StringComparison.Ordinal);
+            Assert.Null(await repaired.LoadAsync("missing"));
+            Assert.True(await repaired.TryCreateAsync("flow-a", FlowStoreContract.CreateState("flow-a"), TimeSpan.FromMinutes(5)));
+
+            // Present but mis-shaped, the index is still refused: optional covers absence only.
+            await using (var connection = await dataSource.OpenConnectionAsync())
+            await using (var misshape = connection.CreateCommand())
+            {
+                misshape.CommandText = $"""CREATE INDEX "flow_state_expires_idx" ON "{schema}"."flow_state" (updated_at_utc);""";
+                await misshape.ExecuteNonQueryAsync();
+            }
+
+            var misshapen = new PostgreSqlFlowStateStore(
+                dataSource,
+                Options.Create(new PostgreSqlDurableFlowOptions
+                {
+                    SchemaName = schema,
+                    TableName = "flow_state",
+                    AutoCreateSchema = false
+                }));
+            var wrongIndex = await Assert.ThrowsAsync<InvalidOperationException>(() => misshapen.LoadAsync("missing"));
+            Assert.Contains("flow_state_expires_idx", wrongIndex.Message, StringComparison.Ordinal);
+            Assert.Contains("does not match the expected definition", wrongIndex.Message, StringComparison.Ordinal);
         });
     }
 
@@ -462,8 +482,8 @@ public sealed class PostgreSqlDirectIntegrationTests(DataBatchFixture fixture) :
                     CREATE TABLE "{schema}"."jobs" (
                         id uuid PRIMARY KEY,
                         queue text COLLATE "{schema}".case_insensitive NOT NULL,
-                        payload_json jsonb NOT NULL,
-                        headers_json jsonb NOT NULL DEFAULT jsonb_build_object(),
+                        payload_json text NOT NULL,
+                        headers_json text NOT NULL DEFAULT '{EmptyJson}',
                         created_at timestamptz NOT NULL DEFAULT now(),
                         available_at timestamptz NOT NULL DEFAULT now(),
                         locked_until timestamptz NULL,
@@ -875,13 +895,6 @@ public sealed class PostgreSqlDirectIntegrationTests(DataBatchFixture fixture) :
                 Assert.Equal("raw", result.Message);
             }
 
-            var rawObjectCorrelationId = NewId("raw-object");
-            await using (var waiter = await subscriber.CreateResponseWaiter<OperationResult>(rawObjectCorrelationId, timeout: TimeSpan.FromSeconds(5)))
-            {
-                await rawPublisher.SetRawResponse(new OperationResult { Status = OperationStatus.Completed, Message = "raw-object" }, rawObjectCorrelationId);
-                var result = await waiter.ResponseTask.WaitAsync(TimeSpan.FromSeconds(5));
-                Assert.Equal("raw-object", result.Message);
-            }
 
             var exceptionCorrelationId = NewId("exception");
             await using (var waiter = await subscriber.CreateResponseWaiter<OperationResult>(exceptionCorrelationId, timeout: TimeSpan.FromSeconds(5)))
@@ -1418,6 +1431,572 @@ public sealed class PostgreSqlDirectIntegrationTests(DataBatchFixture fixture) :
             Assert.Equal(ackedRow.AckedSeq, full.AckedSeq);
             Assert.Empty(await sql.LoadMessagesByIdAsync("some-other-correlation", [acked], CancellationToken.None));
         });
+    }
+
+    /// <summary>
+    /// Fixpoint r1 S5#19 / GS3#6: the channel's and the transport's LISTEN connections come from
+    /// the shared pool, and Npgsql keeps a connector usable after a cancelled wait. With
+    /// <c>No Reset On Close=true</c> (the setting docs/postgresql.md recommends) nothing ever ran
+    /// <c>DISCARD ALL</c> on it, so a disposed channel — and every transport subscriber restart —
+    /// returned a still-LISTENing connection to the pool. Both now <c>UNLISTEN *</c> before the
+    /// connection goes back. A one-connection pool hands the listener's connector straight to the
+    /// probe. Pre-fix: <c>pg_listening_channels()</c> still listed the channel.
+    /// <para>
+    /// The probe must also be that SAME backend (pre-commit fix, fixpoint r1 pass 2): an UNLISTEN
+    /// that fails on a still-open connection makes the release clear the pool instead, and a fresh
+    /// backend lists no channels either — so without the pid check this passed whether or not
+    /// UNLISTEN works after a cancelled wait, which is the premise of the release, and a failing
+    /// one clears the application's shared pool on every listener teardown.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task ListenConnections_GoBackToThePoolWithoutTheirSubscription()
+    {
+        var schema = NewSchema("unlisten");
+        var pooled = new NpgsqlConnectionStringBuilder(Fixture.PostgreSqlConnectionString)
+        {
+            NoResetOnClose = true,
+            MaxPoolSize = 1
+        }.ConnectionString;
+        await using var dataSource = NpgsqlDataSource.Create(pooled);
+        await using var notifier = NpgsqlDataSource.Create(Fixture.PostgreSqlConnectionString);
+        try
+        {
+            var channelOptions = ChannelOptions(schema);
+            var channel = new PostgreSqlChannelSql(dataSource, Options.Create(channelOptions));
+            await channel.EnsureCreatedAsync();
+            await AssertListenReleasesItsSubscriptionAsync(
+                dataSource,
+                notifier,
+                channelOptions.NotificationChannel,
+                (wake, token) => channel.ExecuteListenAsync(_ => wake(), token));
+
+            var transportOptions = TransportOptions(schema);
+            var transport = new PostgreSqlTransportStore(dataSource, Options.Create(transportOptions));
+            await transport.EnsureCreatedAsync();
+            await AssertListenReleasesItsSubscriptionAsync(
+                dataSource,
+                notifier,
+                transportOptions.NotificationChannel,
+                (wake, token) => transport.ExecuteListenAsync(wake, token));
+        }
+        finally
+        {
+            await DropSchemaAsync(notifier, schema);
+        }
+    }
+
+    private static async Task AssertListenReleasesItsSubscriptionAsync(
+        NpgsqlDataSource dataSource,
+        NpgsqlDataSource notifier,
+        string notificationChannel,
+        Func<Func<Task>, CancellationToken, Task> listen)
+    {
+        // The pool's one backend, which the listener is about to take.
+        int listenerBackend;
+        await using (var before = await dataSource.OpenConnectionAsync())
+        await using (var pid = before.CreateCommand())
+        {
+            pid.CommandText = "SELECT pg_backend_pid();";
+            listenerBackend = (int)(await pid.ExecuteScalarAsync())!;
+        }
+
+        using var cts = new CancellationTokenSource();
+        var received = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var listenTask = Task.Run(() => listen(() =>
+        {
+            received.TrySetResult();
+            return Task.CompletedTask;
+        }, cts.Token));
+
+        // LISTEN is established once a NOTIFY from another connection reaches it.
+        await EventuallyAsync(async () =>
+        {
+            await NotifyAsync(notifier, notificationChannel, "unlisten-probe");
+            return received.Task.IsCompleted;
+        });
+        await cts.CancelAsync();
+        await IgnoreCancellationAsync(listenTask);
+
+        await using var connection = await dataSource.OpenConnectionAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText = "SELECT pg_backend_pid(), (SELECT count(*) FROM pg_listening_channels());";
+        await using var reader = await command.ExecuteReaderAsync();
+        Assert.True(await reader.ReadAsync());
+        Assert.Equal(listenerBackend, reader.GetInt32(0));
+        Assert.Equal(0L, reader.GetInt64(1));
+    }
+
+    [Fact]
+    public async Task Transport_PublishesAndClaimsAPayloadCarryingANul_ByteIdentical()
+    {
+        // Regression (round-29 parity): payload_json/headers_json were jsonb, which REJECTS the
+        // \u0000 escape System.Text.Json emits for U+0000 (22P05) — a job whose string argument or
+        // context value carried a NUL was unpublishable on PostgreSQL alone.
+        await WithDataSourceAsync("nul_payload", async (schema, dataSource) =>
+        {
+            var options = TransportOptions(schema);
+            var store = new PostgreSqlTransportStore(dataSource, Options.Create(options));
+            var payload = JsonSerializer.Serialize(new { Note = "before\u0000after", Keys = new { b = 1, a = 2 } });
+            var headers = new Dictionary<string, string> { ["X-Note"] = "nul\u0000header" };
+
+            await store.PublishAsync(Guid.NewGuid(), options.WorkerQueue, payload, headers, CancellationToken.None);
+            var delivery = await store.TryClaimAsync(options.WorkerQueue, TimeSpan.FromSeconds(30), CancellationToken.None);
+
+            Assert.NotNull(delivery);
+            Assert.Equal(payload, delivery!.Payload);
+            Assert.Equal("nul\u0000header", delivery.Headers["X-Note"]);
+        });
+    }
+
+    [Fact]
+    public async Task Transport_AutoCreate_ConvertsAnExistingJsonbQueueTableToText_InPlace()
+    {
+        // A table created by an older build is converted once, in place, on the auto-create path —
+        // rows survive, headers_json keeps a (text) default, and a NUL payload then publishes. And in
+        // ONE rewrite: a statement per column rewrote the table (and rebuilt every index) twice under
+        // ACCESS EXCLUSIVE. The table_rewrite event trigger counts them (database-wide, so it filters
+        // to this test's table and is dropped with the schema — and explicitly, below).
+        await WithDataSourceAsync("jsonb_upgrade", async (schema, dataSource) =>
+        {
+            var options = TransportOptions(schema);
+            options.MessageTable = "jobs";
+            var existing = Guid.NewGuid();
+            await CreatePreTextQueueTableAsync(dataSource, schema, options, existing);
+            await ExecuteAsync(dataSource, $"""
+                CREATE TABLE "{schema}".rewrites (n integer NOT NULL);
+                INSERT INTO "{schema}".rewrites VALUES (0);
+                CREATE FUNCTION "{schema}".count_rewrite() RETURNS event_trigger LANGUAGE plpgsql AS $$
+                BEGIN
+                    IF EXISTS (
+                        SELECT 1 FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+                        WHERE c.oid = pg_event_trigger_table_rewrite_oid() AND n.nspname = '{schema}' AND c.relname = 'jobs')
+                    THEN
+                        UPDATE "{schema}".rewrites SET n = n + 1;
+                    END IF;
+                END $$;
+                CREATE EVENT TRIGGER "{schema}_rewrites" ON table_rewrite EXECUTE FUNCTION "{schema}".count_rewrite();
+                """);
+
+            var store = new PostgreSqlTransportStore(dataSource, Options.Create(options));
+            try
+            {
+                await store.EnsureCreatedAsync();
+            }
+            finally
+            {
+                await ExecuteAsync(dataSource, $"""DROP EVENT TRIGGER IF EXISTS "{schema}_rewrites";""");
+            }
+
+            Assert.Equal(1L, await CountAsync(dataSource, $"""SELECT n FROM "{schema}".rewrites;"""));
+
+            await using (var connection = await dataSource.OpenConnectionAsync())
+            await using (var command = connection.CreateCommand())
+            {
+                command.CommandText =
+                    $"""
+                    SELECT string_agg(column_name || ':' || data_type || ':' || coalesce(column_default, ''), ',' ORDER BY column_name)
+                    FROM information_schema.columns
+                    WHERE table_schema = '{schema}' AND table_name = 'jobs' AND column_name IN ('payload_json', 'headers_json');
+                    """;
+                Assert.Equal("headers_json:text:'{}'::text,payload_json:text:", (string)(await command.ExecuteScalarAsync())!);
+            }
+
+            var old = await store.TryClaimAsync(options.WorkerQueue, TimeSpan.FromSeconds(30), CancellationToken.None);
+            Assert.Equal(existing, old!.Id);
+            await old.AckAsync();
+
+            var nul = JsonSerializer.Serialize(new { Note = "a\u0000b" });
+            await store.PublishAsync(Guid.NewGuid(), options.WorkerQueue, nul, null, CancellationToken.None);
+            Assert.Equal(nul, (await store.TryClaimAsync(options.WorkerQueue, TimeSpan.FromSeconds(30), CancellationToken.None))!.Payload);
+        });
+    }
+
+    [Fact]
+    public async Task Transport_AutoCreate_TheJsonbConversionFailsFastOnABusyTable_AndConvertsOnceItIsFree()
+    {
+        // Regression: the conversion waited for its ACCESS EXCLUSIVE lock with no lock bound — every
+        // later statement on the queue queued behind the waiting request — until the data source's
+        // 30 s command timeout rolled it back, and every later operation then retried it the same
+        // way. The DDL transaction's lock_timeout now fails it fast (55P03), changing nothing, and
+        // the store waits out a retry-after window before its next attempt instead of queueing
+        // another lock request behind the same holder at once.
+        await WithDataSourceAsync("jsonb_busy", async (schema, dataSource) =>
+        {
+            var options = TransportOptions(schema);
+            options.MessageTable = "jobs";
+            await CreatePreTextQueueTableAsync(dataSource, schema, options, Guid.NewGuid());
+            var clock = new ManualClock();
+            var store = new PostgreSqlTransportStore(dataSource, Options.Create(options)) { Clock = clock };
+
+            await using (var holder = await dataSource.OpenConnectionAsync())
+            await using (var transaction = await holder.BeginTransactionAsync())
+            {
+                await using (var read = holder.CreateCommand())
+                {
+                    read.Transaction = transaction;
+                    read.CommandText = $"""SELECT count(*) FROM "{schema}"."jobs";""";
+                    await read.ExecuteScalarAsync();
+                }
+
+                var busy = await Assert.ThrowsAsync<PostgresException>(() => store.EnsureCreatedAsync());
+                Assert.Equal(PostgresErrorCodes.LockNotAvailable, busy.SqlState);
+
+                // Inside the window the next operation fails at once, without a second lock request
+                // (which would have answered 55P03 again: the holder is still open).
+                var latched = await Assert.ThrowsAsync<InvalidOperationException>(() => store.EnsureCreatedAsync());
+                Assert.Same(busy, latched.InnerException);
+                await transaction.CommitAsync();
+            }
+
+            Assert.Equal(2L, await CountAsync(dataSource, $"""
+                SELECT count(*) FROM information_schema.columns
+                WHERE table_schema = '{schema}' AND table_name = 'jobs' AND column_name IN ('payload_json', 'headers_json') AND data_type = 'jsonb';
+                """));
+
+            await Assert.ThrowsAsync<InvalidOperationException>(() => store.EnsureCreatedAsync());
+            clock.Advance(2 * PostgreSqlTransportStore.DdlLockTimeoutBackoff);
+            await store.EnsureCreatedAsync();
+
+            Assert.Equal(0L, await CountAsync(dataSource, $"""
+                SELECT count(*) FROM information_schema.columns
+                WHERE table_schema = '{schema}' AND table_name = 'jobs' AND column_name IN ('payload_json', 'headers_json') AND data_type = 'jsonb';
+                """));
+        });
+    }
+
+    [Fact]
+    public async Task Transport_DeadLettersAFailureWhoseMessageCarriesANul()
+    {
+        // dead_letter_reason is text, and PostgreSQL text rejects a NUL character outright (22021):
+        // a failure whose exception message carried one could never be dead-lettered.
+        await WithDataSourceAsync("nul_reason", async (schema, dataSource) =>
+        {
+            var options = TransportOptions(schema);
+            var store = new PostgreSqlTransportStore(dataSource, Options.Create(options));
+            await store.PublishAsync(Guid.NewGuid(), options.WorkerQueue, "{}", null, CancellationToken.None);
+            var delivery = (await store.TryClaimAsync(options.WorkerQueue, TimeSpan.FromSeconds(30), CancellationToken.None))!;
+
+            Assert.True(await delivery.DeadLetterAsync(new InvalidOperationException("bad\u0000byte"), true, CancellationToken.None));
+
+            await using var connection = await dataSource.OpenConnectionAsync();
+            await using var command = connection.CreateCommand();
+            command.CommandText = $"""SELECT dead_letter_reason FROM "{schema}"."{options.MessageTable}" WHERE queue = '{options.DeadLetterQueue}';""";
+            Assert.Equal("bad\uFFFDbyte", (string)(await command.ExecuteScalarAsync())!);
+        });
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task Transport_AnInvalidDequeueIndex_WarnsInsteadOfFailingStartup(bool autoCreateSchema)
+    {
+        // A CREATE INDEX CONCURRENTLY still running (or one that failed) leaves the index in
+        // pg_class with indisvalid = false. Verified as present, it failed EnsureCreated — and so
+        // every publish — on every host that started during the build, and forever after a failed
+        // one. It is claim performance, like an absent index: a warning — on the auto-create path
+        // too, where docs/postgresql.md has large tables pre-build it CONCURRENTLY.
+        await WithDataSourceAsync("invalid_ready", async (schema, dataSource) =>
+        {
+            var options = TransportOptions(schema);
+            options.MessageTable = "jobs";
+            await new PostgreSqlTransportStore(dataSource, Options.Create(options)).EnsureCreatedAsync();
+            var readyIndex = PostgreSqlTransportStore.IndexName("jobs", "ready");
+            await ExecuteAsync(dataSource, $"""UPDATE pg_index SET indisvalid = false WHERE indexrelid = '"{schema}"."{readyIndex}"'::regclass;""");
+
+            options.AutoCreateSchema = autoCreateSchema;
+            var logger = new RecordingLogger<PostgreSqlTransportStore>();
+            var store = new PostgreSqlTransportStore(dataSource, Options.Create(options), logger);
+            await store.EnsureCreatedAsync();
+
+            Assert.Contains(logger.Warnings, warning => warning.Contains("not valid and ready", StringComparison.Ordinal));
+            await store.PublishAsync(Guid.NewGuid(), options.WorkerQueue, "{}", null, CancellationToken.None);
+        });
+    }
+
+    [Fact]
+    public async Task Transport_OperatorSchema_WithoutTheDequeueIndex_Warns()
+    {
+        // Round 42 (S9#15): an operator table carrying no ready index still starts, with a warning.
+        await WithDataSourceAsync("absent_ready", async (schema, dataSource) =>
+        {
+            var options = TransportOptions(schema);
+            options.MessageTable = "jobs";
+            await new PostgreSqlTransportStore(dataSource, Options.Create(options)).EnsureCreatedAsync();
+            await ExecuteAsync(dataSource, $"""DROP INDEX "{schema}"."{PostgreSqlTransportStore.IndexName("jobs", "ready")}";""");
+
+            options.AutoCreateSchema = false;
+            var logger = new RecordingLogger<PostgreSqlTransportStore>();
+            await new PostgreSqlTransportStore(dataSource, Options.Create(options), logger).EnsureCreatedAsync();
+
+            Assert.Contains(logger.Warnings, warning => warning.Contains("has no dequeue index", StringComparison.Ordinal));
+        });
+    }
+
+    [Fact]
+    public async Task Transport_OperatorSchema_StillOnJsonb_FailsWithTheMigration()
+    {
+        await WithDataSourceAsync("managed_jsonb", async (schema, dataSource) =>
+        {
+            var options = TransportOptions(schema);
+            options.MessageTable = "jobs";
+            await ExecuteAsync(dataSource, $"""
+                CREATE SCHEMA IF NOT EXISTS "{schema}";
+                CREATE TABLE "{schema}"."jobs" (
+                    id uuid PRIMARY KEY,
+                    queue text NOT NULL,
+                    payload_json jsonb NOT NULL,
+                    headers_json jsonb NOT NULL DEFAULT jsonb_build_object(),
+                    created_at timestamptz NOT NULL DEFAULT now(),
+                    available_at timestamptz NOT NULL DEFAULT now(),
+                    locked_until timestamptz NULL,
+                    lock_id uuid NULL,
+                    attempts integer NOT NULL DEFAULT 0,
+                    dead_letter_reason text NULL
+                );
+                """);
+
+            options.AutoCreateSchema = false;
+            var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+                new PostgreSqlTransportStore(dataSource, Options.Create(options)).EnsureCreatedAsync());
+            Assert.Contains("TYPE text USING payload_json::text", ex.Message, StringComparison.Ordinal);
+        });
+    }
+
+    [Fact]
+    public async Task Transport_DeadLetterPrune_DrainsABacklogBeyondOneBatch()
+    {
+        // Regression: the prune was ONE unbounded DELETE. The statement trigger below stands in for
+        // a command timeout on a big backlog: any single statement deleting more than 1,000 rows
+        // fails — so the old prune failed (swallowed) and nothing shrank, while the bounded drain
+        // removes the whole backlog in batches within its budget.
+        await WithDataSourceAsync("dlq_drain", async (schema, dataSource) =>
+        {
+            var options = TransportOptions(schema);
+            var store = new PostgreSqlTransportStore(dataSource, Options.Create(options));
+            await store.EnsureCreatedAsync();
+            var table = $"\"{schema}\".\"{options.MessageTable}\"";
+            await ExecuteAsync(dataSource, $"""
+                INSERT INTO {table} (id, queue, payload_json, created_at)
+                SELECT gen_random_uuid(), '{options.DeadLetterQueue}', '{EmptyJson}', now() - interval '1 hour'
+                FROM generate_series(1, 2500);
+                CREATE FUNCTION "{schema}".cap_delete() RETURNS trigger LANGUAGE plpgsql AS $$
+                BEGIN
+                    IF (SELECT count(*) FROM old_rows) > 1000 THEN
+                        RAISE EXCEPTION 'unbounded delete';
+                    END IF;
+                    RETURN NULL;
+                END $$;
+                CREATE TRIGGER cap_delete AFTER DELETE ON {table}
+                    REFERENCING OLD TABLE AS old_rows FOR EACH STATEMENT EXECUTE FUNCTION "{schema}".cap_delete();
+                """);
+
+            await store.PublishAsync(Guid.NewGuid(), options.WorkerQueue, "{}", null, CancellationToken.None);
+
+            Assert.Equal(0L, await CountAsync(dataSource, $"SELECT count(*) FROM {table} WHERE queue = '{options.DeadLetterQueue}';"));
+        });
+    }
+
+    [Fact]
+    public async Task Transport_ClaimOrder_IsAvailabilityOrder()
+    {
+        // Round 42 (S9#15): a delayed or redelivered row queues by when it became due.
+        await WithDataSourceAsync("claim_order", async (schema, dataSource) =>
+        {
+            var options = TransportOptions(schema);
+            var store = new PostgreSqlTransportStore(dataSource, Options.Create(options));
+            var first = Guid.NewGuid();
+            var second = Guid.NewGuid();
+            await store.PublishAsync(first, options.WorkerQueue, "{}", null, CancellationToken.None);
+            await store.PublishAsync(second, options.WorkerQueue, "{}", null, CancellationToken.None);
+            await ExecuteAsync(dataSource, $"""
+                UPDATE "{schema}"."{options.MessageTable}" SET available_at = now() - interval '1 second' WHERE id = '{first}';
+                UPDATE "{schema}"."{options.MessageTable}" SET available_at = now() - interval '1 minute' WHERE id = '{second}';
+                """);
+
+            var claimed = await store.TryClaimAsync(options.WorkerQueue, TimeSpan.FromSeconds(30), CancellationToken.None);
+            Assert.Equal(second, claimed!.Id);
+        });
+    }
+
+    [Fact]
+    public async Task WorkerSubscriber_IsWokenOnlyByItsOwnQueuesNotify()
+    {
+        // Regression: the subscriber's LISTEN never named its queue, so every publish to ANY queue
+        // on the shared notification channel woke it. A worker row inserted without a NOTIFY is
+        // picked up only by the poll (5 min here) or by a wake — a NOTIFY carrying the RESPONSE
+        // queue must not claim it; one carrying the worker queue must.
+        await WithDataSourceAsync("scoped_wake", async (schema, dataSource) =>
+        {
+            var options = TransportOptions(schema);
+            options.WorkerSubscriber.EmptyPollDelay = TimeSpan.FromMinutes(5);
+            var store = new PostgreSqlTransportStore(dataSource, Options.Create(options));
+            await store.EnsureCreatedAsync();
+
+            // Evidence the subscriber's first (empty) claim has run, instead of a fixed sleep: its
+            // ExecuteAsync is queued to the thread pool (Hosting 10.0.10+), so on a loaded runner a
+            // late first claim picked up the row inserted below — no wake involved — and failed the
+            // test as if a response-queue NOTIFY had woken it. A statement-level trigger fires once
+            // per UPDATE statement even when the claim updates nothing.
+            await ExecuteAsync(dataSource, $"""
+                CREATE TABLE "{schema}".claim_statements (n bigint NOT NULL);
+                INSERT INTO "{schema}".claim_statements VALUES (0);
+                CREATE FUNCTION "{schema}".count_claim() RETURNS trigger LANGUAGE plpgsql AS $$
+                BEGIN
+                    UPDATE "{schema}".claim_statements SET n = n + 1;
+                    RETURN NULL;
+                END $$;
+                CREATE TRIGGER count_claim AFTER UPDATE ON "{schema}"."{options.MessageTable}"
+                    FOR EACH STATEMENT EXECUTE FUNCTION "{schema}".count_claim();
+                """);
+
+            var ingress = new RecordingIngress();
+            var handled = ingress.WorkerReceived;
+            var subscriber = new PostgreSqlWorkerSubscriber(Options.Create(options), store, ingress, NullLogger<PostgreSqlWorkerSubscriber>.Instance);
+            await subscriber.StartAsync(CancellationToken.None);
+            try
+            {
+                // Wait (hang guard only) for the first empty claim to have committed and for the
+                // LISTEN session to exist — the subscriber then sits in its 5-minute idle wait.
+                using (var ready = new CancellationTokenSource(TimeSpan.FromSeconds(60)))
+                {
+                    while (await CountAsync(dataSource, $"""SELECT n FROM "{schema}".claim_statements;""") == 0
+                           || await CountAsync(dataSource, $"""SELECT count(*) FROM pg_stat_activity WHERE pid <> pg_backend_pid() AND query LIKE 'LISTEN "{options.NotificationChannel}"%';""") == 0)
+                    {
+                        await Task.Delay(50, ready.Token);
+                    }
+                }
+
+                await ExecuteAsync(dataSource, $"""INSERT INTO "{schema}"."{options.MessageTable}" (id, queue, payload_json) VALUES ('{Guid.NewGuid()}', '{options.WorkerQueue}', '{EmptyJson}');""");
+
+                for (var i = 0; i < 5; i++)
+                {
+                    await ExecuteAsync(dataSource, $"SELECT pg_notify('{options.NotificationChannel}', '{options.ResponseQueue}');");
+                    await Task.Delay(200);
+                }
+
+                Assert.False(handled.Task.IsCompleted, "a NOTIFY for the response queue woke the worker subscriber");
+
+                using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+                while (!handled.Task.IsCompleted && !deadline.IsCancellationRequested)
+                {
+                    await ExecuteAsync(dataSource, $"SELECT pg_notify('{options.NotificationChannel}', '{options.WorkerQueue}');");
+                    await Task.WhenAny(handled.Task, Task.Delay(200));
+                }
+
+                Assert.True(handled.Task.IsCompleted, "a NOTIFY for the worker queue did not wake the worker subscriber");
+            }
+            finally
+            {
+                await subscriber.StopAsync(CancellationToken.None);
+            }
+        });
+    }
+
+    [Fact]
+    public async Task Channel_MessagePrune_DrainsABacklogBeyondOneBatch_AndSubscriberOrphansArePrunedTableWide()
+    {
+        // S5#18: the publish-path message prune was one unbounded DELETE (the trigger below stands
+        // in for a command timeout); S5#9: subscriber rows were only ever pruned for the CALLING
+        // correlation id, so rows orphaned by a crashed process stayed forever.
+        await WithDataSourceAsync("chan_drain", async (schema, dataSource) =>
+        {
+            var sql = new PostgreSqlChannelSql(dataSource, Options.Create(ChannelOptions(schema)));
+            await sql.EnsureCreatedAsync();
+            await ExecuteAsync(dataSource, $"""
+                INSERT INTO {sql.MessageTable} (id, correlation_id, envelope_json, expires_at)
+                SELECT gen_random_uuid(), 'expired-' || g, '{EmptyJson}', now() - interval '1 minute'
+                FROM generate_series(1, 2500) AS g;
+                INSERT INTO {sql.SubscriberTable} (correlation_id, registration_id, instance_id, expires_at)
+                VALUES ('crashed-waiter', gen_random_uuid(), 'dead-instance', now() - interval '1 minute');
+                CREATE FUNCTION "{schema}".cap_delete() RETURNS trigger LANGUAGE plpgsql AS $$
+                BEGIN
+                    IF (SELECT count(*) FROM old_rows) > 1000 THEN
+                        RAISE EXCEPTION 'unbounded delete';
+                    END IF;
+                    RETURN NULL;
+                END $$;
+                CREATE TRIGGER cap_delete AFTER DELETE ON {sql.MessageTable}
+                    REFERENCING OLD TABLE AS old_rows FOR EACH STATEMENT EXECUTE FUNCTION "{schema}".cap_delete();
+                """);
+
+            await sql.InsertMessageAsync(Guid.NewGuid(), "fresh", "{}", TimeSpan.FromMinutes(1), CancellationToken.None);
+            Assert.Equal(0L, await CountAsync(dataSource, $"SELECT count(*) FROM {sql.MessageTable} WHERE expires_at <= now();"));
+
+            await sql.CountActiveSubscribersAsync("some-other-id", CancellationToken.None);
+            Assert.Equal(0L, await CountAsync(dataSource, $"SELECT count(*) FROM {sql.SubscriberTable} WHERE correlation_id = 'crashed-waiter';"));
+        });
+    }
+
+    private const string EmptyJson = "{}";
+    private const string OldJson = "{\"old\":1}";
+
+    /// <summary>The queue table as a pre-text build created it (jsonb documents), with both indexes.</summary>
+    private static Task CreatePreTextQueueTableAsync(NpgsqlDataSource dataSource, string schema, PostgreSqlAsyncResponseTransportOptions options, Guid existing)
+        => ExecuteAsync(dataSource, $"""
+            CREATE SCHEMA IF NOT EXISTS "{schema}";
+            CREATE TABLE "{schema}"."{options.MessageTable}" (
+                id uuid PRIMARY KEY,
+                queue text NOT NULL,
+                payload_json jsonb NOT NULL,
+                headers_json jsonb NOT NULL DEFAULT jsonb_build_object(),
+                created_at timestamptz NOT NULL DEFAULT now(),
+                available_at timestamptz NOT NULL DEFAULT now(),
+                locked_until timestamptz NULL,
+                lock_id uuid NULL,
+                attempts integer NOT NULL DEFAULT 0,
+                dead_letter_reason text NULL
+            );
+            CREATE INDEX "{PostgreSqlTransportStore.IndexName(options.MessageTable, "ready")}" ON "{schema}"."{options.MessageTable}" (queue, available_at, created_at);
+            CREATE INDEX "{PostgreSqlTransportStore.IndexName(options.MessageTable, "created")}" ON "{schema}"."{options.MessageTable}" (created_at);
+            INSERT INTO "{schema}"."{options.MessageTable}" (id, queue, payload_json) VALUES ('{existing}', '{options.WorkerQueue}', '{OldJson}');
+            """);
+
+    /// <summary>A clock that moves only when told to (the transport store's retry-after window).</summary>
+    private sealed class ManualClock : TimeProvider
+    {
+        private long _ticks = new DateTimeOffset(2030, 1, 1, 0, 0, 0, TimeSpan.Zero).UtcTicks;
+
+        public void Advance(TimeSpan delta) => Interlocked.Add(ref _ticks, delta.Ticks);
+
+        public override DateTimeOffset GetUtcNow() => new(Interlocked.Read(ref _ticks), TimeSpan.Zero);
+
+        public override long TimestampFrequency => TimeSpan.TicksPerSecond;
+
+        public override long GetTimestamp() => Interlocked.Read(ref _ticks);
+    }
+
+    private static async Task ExecuteAsync(NpgsqlDataSource dataSource, string sql)
+    {
+        await using var connection = await dataSource.OpenConnectionAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText = sql;
+        await command.ExecuteNonQueryAsync();
+    }
+
+    private static async Task<long> CountAsync(NpgsqlDataSource dataSource, string sql)
+    {
+        await using var connection = await dataSource.OpenConnectionAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText = sql;
+        return Convert.ToInt64(await command.ExecuteScalarAsync(), System.Globalization.CultureInfo.InvariantCulture);
+    }
+
+    private sealed class RecordingLogger<T> : ILogger<T>
+    {
+        private readonly ConcurrentQueue<string> _warnings = new();
+
+        public IReadOnlyCollection<string> Warnings => _warnings.ToArray();
+
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+
+        public bool IsEnabled(LogLevel logLevel) => true;
+
+        public void Log<TState>(LogLevel logLevel, EventId eventId, TState state, Exception? exception, Func<TState, Exception?, string> formatter)
+        {
+            if (logLevel >= LogLevel.Warning)
+                _warnings.Enqueue(formatter(state, exception));
+        }
     }
 
     private async Task WithDataSourceAsync(string prefix, Func<string, NpgsqlDataSource, Task> body)

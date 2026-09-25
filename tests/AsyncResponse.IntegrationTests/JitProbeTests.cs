@@ -7,10 +7,13 @@ using Xunit;
 
 namespace AsyncResponse.IntegrationTests;
 
-// TEMPORARY diagnostic: forces the JIT to compile every method of every AsyncResponse assembly in
-// this test host, so an assembly whose IL the in-process coverage instrumentation corrupts fails
-// HERE with the exact method list instead of as InvalidProgramException deep inside a container
-// test. Delete once the CI InvalidProgramException investigation is over.
+// Permanent probe for IL corrupted by the coverage instrumenter: forces the JIT to compile every
+// method of every AsyncResponse assembly in this test host, so an assembly whose IL the coverage
+// instrumentation corrupted fails HERE with the exact method list instead of as
+// InvalidProgramException deep inside a container test. It runs in the batch=none leg, which CI runs
+// under scripts/coverage-collect.sh — the probe that script relies on to validate the pipeline
+// against ANY instrumenter, not just the dynamic CLR profiler whose invalid IL it was written to
+// chase before the move to coverlet. Keep it.
 [Trait(Batches.Trait, Batches.None)]
 public sealed class JitProbeTests
 {
@@ -31,39 +34,6 @@ public sealed class JitProbeTests
         var publisher = provider.GetRequiredService<IAsyncResponsePublisher>();
 
         await publisher.SetResponse(new ConformanceResult { Message = "jit" }, " ");
-    }
-
-    [Fact]
-    public async Task RedisSetResponse_RealRedis_LiveWaiterRoundTrip()
-    {
-        // Faithful re-run of Contract_ResponseCompletesLiveWaiter without the batch fixture: set
-        // ASYNCRESPONSE_JITPROBE_REDIS to a Redis connection string to enable. Used to chase the
-        // CI-only InvalidProgramException with a real multiplexer + live waiter in the process.
-        var connectionString = Environment.GetEnvironmentVariable("ASYNCRESPONSE_JITPROBE_REDIS");
-        Assert.SkipWhen(string.IsNullOrEmpty(connectionString), "ASYNCRESPONSE_JITPROBE_REDIS not set.");
-
-        var multiplexer = await ConnectionMultiplexer.ConnectAsync(connectionString!);
-        var services = new ServiceCollection();
-        services.AddLogging();
-        services.AddSingleton<IConnectionMultiplexer>(multiplexer);
-        services.AddAsyncResponse().WithRedisChannel(options =>
-        {
-            options.KeyPrefix = $"jitprobe:{Guid.NewGuid():N}";
-            options.RecoveryStateExpiry = TimeSpan.FromMinutes(2);
-        });
-        await using var provider = services.BuildServiceProvider();
-
-        var correlationId = $"jitprobe-{Guid.NewGuid():N}";
-        await using (var waiter = await provider.GetRequiredService<IAsyncResponseSubscriber>()
-            .CreateResponseWaiter<ConformanceResult>(correlationId, timeout: TimeSpan.FromSeconds(20)))
-        {
-            await provider.GetRequiredService<IAsyncResponsePublisher>()
-                .SetResponse(new ConformanceResult { Status = ConformanceStatus.Completed, Message = "done" }, correlationId);
-            var result = await waiter.ResponseTask.WaitAsync(TimeSpan.FromSeconds(10));
-            Assert.Equal("done", result.Message);
-        }
-
-        multiplexer.Dispose();
     }
 
     public class NoOpProxy : DispatchProxy

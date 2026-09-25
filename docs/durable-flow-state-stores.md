@@ -171,8 +171,15 @@ case drops the run's only wake-up, so the engine acknowledges a contended wake-u
   `ExecutionLeaseRenewInterval`, at most every 2 seconds);
 - a later observation with a **different owner**, or the **same owner and a later expiry**, can
   only have been written by a worker that acquired or renewed the lease in the meantime — a live
-  holder whose own unacknowledged job covers the run. The wake-up is acknowledged, typically within
-  one renewal interval of the holder rather than after a full lease window;
+  holder. When that holder is driven by a *different* job, its own unacknowledged job covers the
+  run, and the wake-up is acknowledged, typically within one renewal interval of the holder rather
+  than after a full lease window. When the lease records **this delivery's own job** (a broker
+  in-flight ceiling lapsed under the running handler), the proof is no licence to acknowledge: the
+  delivery is the last copy of the wake-up, so it is re-published delayed past the holder's lease
+  on a transport with delayed delivery and otherwise keeps waiting, ending in
+  `DurableFlowLeaseContendedException` — see
+  [what happens when things die](durable-flows.md#what-happens-when-things-die). A lease or a job
+  written before job identities were recorded cannot be told apart and is acknowledged as before;
 - an observation that **never changes** is a dead holder's lease. The wake-up waits for the
   *persisted* expiry, then acquires the lease and executes from the last checkpoint;
 - if neither happens within one local lease window past the persisted expiry (a store clock far
@@ -264,6 +271,11 @@ builder.Services.AddAsyncResponse()
 
 The connection string must name an existing database. Automatic provisioning creates the schema,
 table, and expiry index, not the database itself.
+
+Every statement whose row count the store decides on — create, checkpoint, lease acquire and
+renewal, delete, prune — turns `SET NOCOUNT OFF` on for itself, so a server whose sessions start
+with NOCOUNT on (`sp_configure 'user options', 512`) works unchanged. Without it every count read
+as -1: creates reported "exists", checkpoints a lost revision race, and acquires a contended lease.
 
 ### PostgreSQL
 
@@ -421,7 +433,8 @@ builder.Services.AddAsyncResponse()
 
 Oracle 12.1 and earlier have a 30-character identifier limit. If the generated expiry-index name
 would exceed it, shorten `TableName`. Startup also rejects a `TableName` that collides with its own
-derived index name — e.g. one already ending `_EXPIRES_IDX` — since Oracle shares one namespace for
+derived index name — a 128-character name already ending `_EXPIRES_IDX`, which the truncated index
+name reproduces exactly — since Oracle shares one namespace for
 tables and indexes and the index create would otherwise fail with an error indistinguishable from a
 benign already-exists race, silently leaving the expiry index never created.
 
@@ -454,8 +467,39 @@ Ledger writes — creates, checkpoints, lease acquire/renew/release, deletes —
 `w: "majority"` regardless of the registered connection's write concern. Under an inherited `w=1`
 the primary acknowledges a lease or checkpoint before any secondary has it, and a failover rolls
 it back: the lease a worker is executing under, or the step result it just recorded, disappears
-and the step's side effect runs again. The read concern is left as registered — primary reads
-already see every write the store had acknowledged.
+and the step's side effect runs again. The majority write is **bounded**: an inherited
+`wtimeoutMS` (and `journal`) is kept, and without one the store applies a 10 s `wtimeout`. An
+unbounded majority blocked every ledger write indefinitely on a primary-secondary-arbiter replica
+set whose secondary was down (the majority of data-bearing nodes can then never acknowledge, which
+is why MongoDB 5.0+ defaults such sets to `w: 1`). A lapsed `wtimeout` fails the write as a
+retriable error even though the primary applied it; the revision and lease fences already make
+the retry safe. Restore the secondary — or remove the arbiter — rather than lowering the write
+concern. The read concern is left as registered — primary reads already see every write the store
+had acknowledged. The MongoDB channel pins the same bounded majority, and so does the transport
+on its publishes, dead letters and deletes (its claim/renew/NAK lease writes keep the connection's
+own concern — see [transport semantics](transport-semantics.md)).
+
+The ledger's instants are always written as BSON dates, whatever `DateTime` serializer the host
+registered globally — every expiry and lease filter compares them with `$$NOW`, and the TTL
+monitor reaps only dates. The members carry their own serializer, so a host-registered custom
+`IBsonSerializer<DateTime>` neither changes them nor fails the ledger's class map. A document whose
+`expires_at_utc` is missing or not a date is refused as unreadable (`FlowStateUnreadableException`),
+never read as absent or replaced by a create.
+
+**Upgrading a host that registered a non-date `DateTime` serializer globally** (for example
+`BsonSerializer.RegisterSerializer(new DateTimeSerializer(BsonType.String))`, or a `Document` or
+`Int64` representation): earlier releases wrote such ledgers' `expires_at_utc` in that
+representation. Those documents used to read as absent and be replaced by the next create; now no
+create replaces them (and, as before, the TTL monitor never reaps them), so every reuse of such an
+id — a caller-chosen id or a scheduler occurrence — runs into an unreadable ledger:
+`StartAsync` still returns the id (with a warning), but the start job fails with
+`FlowStateUnreadableException` on every delivery until it is dead-lettered, and `GetStateAsync`
+throws, until the document is removed. Once no run needs them, delete them (the exception's reason carries the same
+command; add an `_id` condition to clear one flow):
+
+```javascript
+db.getCollection("asyncresponse_flow_state").deleteMany({ expires_at_utc: { $not: { $type: "date" } } })
+```
 
 With `AutoCreateIndexes = false` the store verifies at startup that the provisioned collection
 carries a TTL index on `expires_at_utc` (`createIndex({ expires_at_utc: 1 }, { expireAfterSeconds: 0 })`)
@@ -504,28 +548,52 @@ A sub-status `0` is still only one replica's answer. Session consistency is read
 the client that wrote; a **different process** never received the writer's session token, so its
 read can be served by a replica that has not applied the write yet — a plain `404`, or an older
 version of the document, never a `1002`. Cosmos cannot strengthen a read per request (unlike
-DynamoDB's `ConsistentRead` or MongoDB's primary reads), so the two reads whose answer lets a
-wake-up be acknowledged go through the **write path** first: a conditional `PatchItemAsync` whose
+DynamoDB's `ConsistentRead` or MongoDB's primary reads), so the three reads whose answer lets a
+delivery be acknowledged go through the **write path** first: a conditional `PatchItemAsync` whose
 `If-Match` can never hold. Writes are served by the write region's primary, so its `404` is an
 authoritative "no such ledger" and its `412` means the ledger exists; the SDK also records the
 `412`'s session token, so the read that follows cannot be served by a replica behind it.
 
 - `LoadAsync` does this only when its read says the ledger is absent or logically expired — a load
   that finds its document costs nothing extra. If the write path keeps reporting the ledger present
-  while reads keep answering `404`, the load throws `FlowStateUnreadableException` rather than
-  report "no state".
+  while reads keep answering `404`, the answer depends on the client's effective consistency (its
+  `ConsistencyLevel` override, else the account default): under Session or Strong each `412` made
+  the re-read current, so the ledger is physically present but hidden by its server ttl and not yet
+  purged — the load reports "no state"; under Bounded Staleness, Consistent Prefix or Eventual
+  nothing a read returns can prove absence, so it throws `FlowStateUnreadableException` instead.
 - `ObserveLeaseAsync` does it before every observation, because a stale baseline makes a renewal
   written *before* the delivery started waiting look like proof of a live holder. It costs one
   extra bodiless request per poll (every two seconds, or each `ExecutionLeaseRenewInterval` when
   that is shorter) while a delivery waits behind a held lease.
+- `LoadCurrentAsync` does it before every read. The engine calls it where a load's answer would
+  let it acknowledge a delivery **without writing** — a recovered response that matches no pending
+  step, a correlation-scoped failure for an id no step is pending on, a failure signal for a run
+  that reads `Suspended` (an operator may just have set it back to `Running`), and a resume of a
+  run that does not read `Running` — and only after a plain `LoadAsync` has already reached that
+  conclusion. A decision that ends in a revision- or lease-fenced write is corrected by the fence
+  when its read was stale; these are not, and an older copy of a present ledger (the holder
+  checkpointed the breadcrumb, this process's replica has not applied it) dropped the recovered
+  payload, the failure, or the operator's resume for good. A start job whose create reported an
+  existing ledger also reads it back this way when its plain load finds no ledger, or one bound to
+  different work, so the starter's fresh create is not missed and the start is not dropped.
 
 What that guarantees depends on the client's effective consistency level: **Strong**, and **Bounded
 Staleness** read from the write region, were already current; **Session** (the account default)
 is made current by the recorded token; **Bounded Staleness** read from another region,
 **Consistent Prefix**, and **Eventual** send no session token on reads, so only the absence answer
-is authoritative there and an observation can still lag — run the store at Session or stronger.
+is authoritative there and an observation can still lag — run the store at Session or Strong.
 An account with **multiple write regions** has no single authoritative write path (two regions can
 both win the same ETag-fenced lease write), so none of these guarantees hold on one.
+
+Document instants are normalized to UTC as they are read: a registered serializer with local time
+zone handling (Newtonsoft `DateTimeZoneHandling.Local`) hands them back as `DateTimeKind.Local`
+with local ticks, and comparing those with the UTC clock shifted every expiry and lease decision by
+the host's zone offset. A document without its `expiresAtUtc` is refused as unreadable — never read
+as absent, replaced by a create, checkpointed, or leased.
+
+The lease projection query filters on `id` with `EnableScanInQuery` set, so a container provisioned
+with `IndexingMode.None` (a pure key-value container) serves leases too; the scan covers one
+document in one partition.
 
 Lease maintenance — acquire, the renewal heartbeat (every `ExecutionLeaseRenewInterval`, 20 seconds
 by default), and release — never moves the ledger body. Each reads a projection of the lease
@@ -557,6 +625,13 @@ builder.Services.AddAsyncResponse()
     });
 ```
 
+Run every worker against **one Region's replica** of the table. With a global table in the default
+multi-Region eventual consistency mode, conditional writes and `ConsistentRead` are evaluated
+against the local Region's replica and concurrent writes to one item resolve last-writer-wins, so
+workers in two Regions can both win the same create, lease acquire, or revision-checked
+checkpoint — the run executes twice and one checkpoint silently replaces the other. This is the
+same hole as a Cosmos DB account with multiple write regions.
+
 ### Entity Framework Core
 
 The ledger becomes part of the application's own relational model and migration pipeline. The
@@ -576,7 +651,8 @@ public sealed class AppDbContext(DbContextOptions<AppDbContext> options)
             // Flow ids are compared ORDINALLY, so the key column must be case-sensitive. This
             // package runs no DDL and cannot know your provider — and the SQL Server and MySQL
             // defaults are case-INSENSITIVE, which folds "flow-a" and "FLOW-A" onto one key.
-            // The bundled PostgreSQL/SQL Server/MySQL stores pin this in their own DDL.
+            // The bundled SQL Server/MySQL stores pin this in their own DDL; the PostgreSQL
+            // store verifies the column's collation is deterministic.
             flowIdCollation: AsyncResponseFlowIdCollations.PostgreSql);
     }
 }
@@ -595,17 +671,26 @@ builder.Services.AddAsyncResponse()
 
 The EF Core store prefers `IDbContextFactory<TContext>` when registered; otherwise it creates a
 scope for `TContext`. Parallel flow executions never share a context. Reads are no-tracking and
-conditional updates/deletes execute in the database.
+conditional updates/deletes execute in the database. Those decide from the affected-row count, so
+a provider that reports none (SQL Server sessions with NOCOUNT on by default) fails with an
+actionable `InvalidOperationException` instead of reading every write as lost. The opportunistic
+prune deletes in expiry order and re-checks expiry on every row it deletes, so a ledger a
+concurrent create has just replaced in place is never removed with the expired batch.
 
 After adding `ConfigureAsyncResponseDurableFlows()`, generate and deploy a normal EF migration.
 The package never creates or alters the schema itself.
+
+A context that uses lazy-loading proxies (`UseLazyLoadingProxies()`) can map the ledger entity.
+Change-tracking proxies (`UseChangeTrackingProxies()`) require every mapped property to be
+`virtual`, which `DurableFlowStateRecord`'s are not: give the ledger its own `DbContext` there.
 
 **Set `flowIdCollation`.** The schema is yours, so the collation of the `flow_id` key column is
 too — and on SQL Server and MySQL the database default is case-insensitive, which makes two flow
 ids differing only in case a single primary key: the second `StartAsync` fails as a duplicate and
 a load returns the other run's state. Pass the constant for your provider
 (`AsyncResponseFlowIdCollations.SqlServer` / `.MySql` / `.PostgreSql` / `.Sqlite`); the bundled
-relational stores pin the equivalent in their own DDL. On those two providers the store **fails at
+SQL Server and MySQL stores pin the equivalent in their own DDL, and the PostgreSQL store verifies
+its column's collation is deterministic. On SQL Server and MySQL the EF Core store **fails at
 startup** if the mapping does not declare one, and equally if it declares one that is not ordinal —
 `_BIN2` on SQL Server, `_bin` on MySQL. Only a binary collation qualifies: a merely case-sensitive
 one still folds accents (`_CS_AI`) or full-width forms (any collation without `_WS`).
@@ -672,9 +757,19 @@ The library does not silently upgrade an incomplete concurrency schema:
 
 - SQL packages create the complete table when missing. If a table exists without revision or lease
   columns, operations fail; deploy the correct migration before the application.
+- With automatic DDL disabled, the SQL packages verify an existing table's shape on first use.
+  String widths are minimums (SQL Server, MySQL, Oracle): a `flow_id nvarchar(450)` or
+  `lease_id nvarchar(100)` passes, a narrower column does not, and the binary `flow_id` collation
+  and full-precision timestamps stay required. No `revision` default is required — every insert
+  names the column. The expiry index is performance-only and never fails startup: PostgreSQL
+  verifies `{table}_expires_idx` when it is present and logs a warning when no index carries that
+  name (harmless when your migration created an index on `expires_at_utc` under another name), and
+  the other packages do not check theirs.
 - MongoDB creates the required TTL index when missing (and, with `AutoCreateIndexes = false`,
   verifies an equivalent one exists — the TTL index is its only cleanup mechanism). It does not
-  drop or rewrite a conflicting application-owned index.
+  drop or rewrite a conflicting application-owned index; an equivalent TTL index under another
+  name (such as `expires_at_utc_1`, what `createIndex({ expires_at_utc: 1 }, { expireAfterSeconds: 0 })`
+  creates) is accepted as it stands.
 - Cosmos auto-create uses the configured partition key and enables per-item TTL on a new container.
   An existing container must already use that partition key and have TTL enabled, or first use fails.
 - DynamoDB validates that TTL is enabled or being enabled on the configured attribute. A table with
@@ -728,6 +823,10 @@ a custom store in production, test all of these against the real backend:
   renewal; and the old owner, unchanged, for a lease that has expired but not been re-acquired.
   A decorator around a store must forward it — the interface default silently downgrades the
   inner store to "cannot report leases";
+- `LoadCurrentAsync` reflects every write the backend acknowledged before the call, including
+  another process's. The default (`LoadAsync`) is right for a backend whose reads cannot return an
+  older copy of a present record; override it when they can (replica or session reads). A
+  decorator must forward it for the same reason as `ObserveLeaseAsync`;
 - TTL refresh and expired-record replacement are atomic;
 - **unreadable is not missing:** malformed JSON, an unknown schema version, a revision inside
   the JSON that disagrees with the stored one, and a stored `flowId` that is not the key all throw

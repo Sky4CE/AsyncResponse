@@ -5,8 +5,8 @@ using System.Text;
 namespace AsyncResponse.Internal;
 
 /// <summary>
-/// In-transaction catalog verification that every object a SQL Server store just ensured actually
-/// IS what its DDL intended — the SQL Server counterpart of <c>PostgreSqlRelationVerifier</c>.
+/// Catalog verification that every object a SQL Server store just ensured actually IS what its DDL
+/// intended — the SQL Server counterpart of <c>PostgreSqlRelationVerifier</c>.
 /// <para>
 /// The stores guard their DDL with <c>IF OBJECT_ID(N'…', N'U') IS NULL</c>, which answers only
 /// "is there a user table with this name". That leaves two silent failure modes. A name occupied
@@ -16,10 +16,13 @@ namespace AsyncResponse.Internal;
 /// does not exist. Both are caught here with an actionable message instead.
 /// </para>
 /// <para>
-/// Runs under the schema-keyed <c>sp_getapplock</c> the AsyncResponse SQL Server stores share, so
-/// a sibling component's objects are either committed and visible or serialized behind this
-/// transaction. Source-linked into the channel, transport, and durable-flow packages (separate
-/// packages cannot share compiled code).
+/// Every store runs it AFTER its DDL transaction committed, outside any transaction (a transaction
+/// that has just run DDL still holds schema-modification locks, and catalog reads under those
+/// deadlocked against the store's own live traffic). The schema-keyed <c>sp_getapplock</c> the
+/// AsyncResponse SQL Server stores share serialized the DDL itself, and what these checks look for
+/// is somebody ELSE'S committed object occupying a name, never a store's own uncommitted work.
+/// Source-linked into the channel, transport, and durable-flow packages (separate packages cannot
+/// share compiled code).
 /// </para>
 /// </summary>
 internal static class SqlServerRelationVerifier
@@ -51,7 +54,16 @@ internal static class SqlServerRelationVerifier
         string? Type,
         bool Nullable,
         bool RequiresBinaryCollation = false,
-        string? DefaultExpression = null);
+        string? DefaultExpression = null)
+    {
+        /// <summary>
+        /// Treats the width of a <c>nvarchar(n)</c>/<c>varchar(n)</c> <c>Type</c> as a MINIMUM: the
+        /// same base type at a larger width (or <c>max</c>) is accepted, as the MySQL and Oracle
+        /// verifiers accept a more generous schema. Opt-in per column, for a store that has
+        /// reviewed its queries against any wider width; everything else stays exact.
+        /// </summary>
+        public bool MinimumWidth { get; init; }
+    }
 
     /// <summary>
     /// One expected object: a user table (verified against <paramref name="Columns"/> when given),
@@ -129,10 +141,11 @@ internal static class SqlServerRelationVerifier
         await VerifyPrimaryKeysAsync(connection, transaction, schemaName, componentName, present, cancellationToken).ConfigureAwait(false);
         await VerifyIndexesAsync(connection, transaction, schemaName, componentName, expected, reportAbsence, cancellationToken).ConfigureAwait(false);
 
-        // In diagnosis mode absence proves nothing: the failed batch rolled back whatever it did
-        // create, so the expected objects are missing BECAUSE the batch failed — reporting one
-        // would bury the real error (permissions, a full disk, a killed session) under a phantom
-        // collision. Reaching this point there, the caller rethrows the original failure.
+        // In diagnosis mode absence proves nothing: the failed batch's transaction was rolled back
+        // before the diagnosis ran, so the expected objects are missing BECAUSE the batch failed —
+        // reporting one would bury the real error (permissions, a full disk, a killed session)
+        // under a phantom collision. Reaching this point there, the caller rethrows the original
+        // failure.
         if (!reportAbsence)
             return;
 
@@ -156,40 +169,65 @@ internal static class SqlServerRelationVerifier
     /// FRESH connection (the colliding objects are somebody else's and already committed) recovers
     /// the precise reason. When they find nothing, the caller rethrows: a failure from permissions,
     /// a full disk, or a dropped connection is not a collision and must not be reported as one.
+    /// <para>
+    /// <paramref name="failedTransaction"/> is rolled back FIRST (best effort). Without
+    /// XACT_ABORT a statement-level error leaves the batch running, so objects created before the
+    /// failing statement sat uncommitted in the still-open transaction — and the fresh
+    /// connection's catalog read of exactly those names waited on its locks until the command
+    /// timeout. And only the verifier's OWN diagnosis may replace the original error: anything
+    /// else the diagnosis hits (a pool-timeout <see cref="InvalidOperationException"/> on open, a
+    /// <see cref="SqlException"/> from a catalog query) returns, so the caller's <c>throw;</c>
+    /// surfaces the real failure instead of an unrelated one.
+    /// </para>
     /// </summary>
     public static async Task ThrowDiagnosedCollisionAsync(
         Func<CancellationToken, Task<SqlConnection>> openConnectionAsync,
         SqlException failure,
+        SqlTransaction? failedTransaction,
         string schemaName,
         string componentName,
         IReadOnlyList<ExpectedObject> expected,
         CancellationToken cancellationToken)
     {
-        SqlConnection diagnosis;
-        try
-        {
-            diagnosis = await openConnectionAsync(cancellationToken).ConfigureAwait(false);
-        }
-        catch (SqlException)
-        {
-            return; // The server is the problem, not the schema; the original error says so.
-        }
-
-        await using (diagnosis)
+        if (failedTransaction is not null)
         {
             try
             {
-                // reportAbsence: false — the failed batch's own objects were rolled back, so on
-                // this fresh connection every expected object may legitimately be missing; only
-                // something PRESENT and wrong is evidence of a collision.
-                await VerifyCoreAsync(diagnosis, transaction: null, schemaName, componentName, expected, reportAbsence: false, cancellationToken).ConfigureAwait(false);
+                await failedTransaction.RollbackAsync(CancellationToken.None).ConfigureAwait(false);
             }
-            catch (InvalidOperationException diagnosed)
+            catch (Exception)
             {
-                throw new InvalidOperationException(diagnosed.Message, failure);
+                // Already rolled back by the server (a doomed or zombied transaction) or the
+                // connection is gone; either way nothing of ours is holding locks any more.
             }
         }
+
+        try
+        {
+            await using var diagnosis = await openConnectionAsync(cancellationToken).ConfigureAwait(false);
+
+            // reportAbsence: false — the failed batch's own objects were rolled back, so on this
+            // fresh connection every expected object may legitimately be missing; only something
+            // PRESENT and wrong is evidence of a collision.
+            await VerifyCoreAsync(diagnosis, transaction: null, schemaName, componentName, expected, reportAbsence: false, cancellationToken).ConfigureAwait(false);
+        }
+        catch (InvalidOperationException diagnosed) when (IsDiagnosis(diagnosed, componentName))
+        {
+            throw new InvalidOperationException(diagnosed.Message, failure);
+        }
+        catch (Exception)
+        {
+            // The server (or the diagnosis itself) is the problem, not the schema; the original
+            // error says so.
+        }
     }
+
+    /// <summary>
+    /// Whether <paramref name="exception"/> is one of this verifier's own findings — every one
+    /// names the store it verified — rather than a provider failure the diagnosis ran into.
+    /// </summary>
+    private static bool IsDiagnosis(InvalidOperationException exception, string componentName)
+        => exception.Message.StartsWith($"The SQL Server {componentName} store", StringComparison.Ordinal);
 
     private static async Task<Dictionary<string, string>> LoadObjectKindsAsync(
         SqlConnection connection,
@@ -242,7 +280,10 @@ internal static class SqlServerRelationVerifier
         command.Transaction = transaction;
         command.CommandText =
             $"""
-            SELECT sq.name, t.name, CAST(sq.increment AS bigint), sq.is_cycling, CAST(sq.maximum_value AS bigint)
+            SELECT sq.name, t.name,
+                   CASE WHEN t.name = N'bigint' THEN CAST(sq.increment AS bigint) END,
+                   sq.is_cycling,
+                   CASE WHEN t.name = N'bigint' THEN CAST(sq.maximum_value AS bigint) END
             FROM sys.sequences sq
             JOIN sys.schemas s ON s.schema_id = sq.schema_id
             JOIN sys.types t ON t.user_type_id = sq.user_type_id
@@ -255,9 +296,13 @@ internal static class SqlServerRelationVerifier
         {
             var name = reader.GetString(0);
             var type = reader.GetString(1);
-            var increment = reader.GetInt64(2);
+            // NULL for a non-bigint sequence: a same-name decimal/numeric sequence keeps its default
+            // MAXVALUE of 10^38-1, which an unconditional CAST AS bigint turned into arithmetic
+            // overflow 8115 — pre-empting EvaluateSequence's actionable "found decimal" message,
+            // and in diagnosis mode replacing the original DDL error altogether.
+            long? increment = reader.IsDBNull(2) ? null : reader.GetInt64(2);
             var cycles = reader.GetBoolean(3);
-            var maximum = reader.GetInt64(4);
+            long? maximum = reader.IsDBNull(4) ? null : reader.GetInt64(4);
             EvaluateSequence(schemaName, componentName, name, type, increment, cycles, maximum);
         }
     }
@@ -273,16 +318,19 @@ internal static class SqlServerRelationVerifier
         string componentName,
         string name,
         string type,
-        long increment,
+        long? increment,
         bool cycles,
-        long maximum)
+        long? maximum)
     {
         if (!string.Equals(type, "bigint", StringComparison.Ordinal) || increment != 1 || cycles || maximum != long.MaxValue)
         {
             throw new InvalidOperationException(
                 $"The SQL Server {componentName} store's sequence '{schemaName}.{name}' exists but is not a monotonic counter: " +
-                $"expected bigint INCREMENT BY 1 NO CYCLE MAXVALUE {long.MaxValue}; found {type} INCREMENT BY {increment.ToString(CultureInfo.InvariantCulture)}" +
-                $"{(cycles ? " CYCLE" : " NO CYCLE")} MAXVALUE {maximum.ToString(CultureInfo.InvariantCulture)}. Acknowledgement ordering is derived " +
+                $"expected bigint INCREMENT BY 1 NO CYCLE MAXVALUE {long.MaxValue}; found {type}" +
+                (increment is { } step ? $" INCREMENT BY {step.ToString(CultureInfo.InvariantCulture)}" : "") +
+                $"{(cycles ? " CYCLE" : " NO CYCLE")}" +
+                (maximum is { } max ? $" MAXVALUE {max.ToString(CultureInfo.InvariantCulture)}" : "") +
+                ". Acknowledgement ordering is derived " +
                 "from this sequence, so a descending or wrapping sequence silently reorders delivery, and a restricted maximum exhausts it. Fix it with " +
                 $"ALTER SEQUENCE {schemaName}.{name} INCREMENT BY 1 NO CYCLE NO MAXVALUE; (recreate it if the type is wrong).");
         }
@@ -366,7 +414,7 @@ internal static class SqlServerRelationVerifier
                         "or a partial manual creation occupies the name. " + CollisionGuidance);
 
                 // An unconstrained (null) type compares and reports nullability alone.
-                if ((column.Type is { } expectedType && !string.Equals(found.Type, expectedType, StringComparison.OrdinalIgnoreCase))
+                if ((column.Type is { } expectedType && !TypeMatches(found.Type, expectedType, column.MinimumWidth))
                     || found.Nullable != column.Nullable)
                 {
                     throw new InvalidOperationException(
@@ -639,6 +687,38 @@ internal static class SqlServerRelationVerifier
         "datetime2" or "datetimeoffset" or "time" => $"{typeName}({scale})",
         _ => typeName
     };
+
+    private static bool TypeMatches(string found, string expected, bool minimumWidth)
+    {
+        if (string.Equals(found, expected, StringComparison.OrdinalIgnoreCase))
+            return true;
+
+        return minimumWidth
+            && VariableWidth(expected) is ({ } expectedBase, var expectedWidth)
+            && VariableWidth(found) is ({ } foundBase, var foundWidth)
+            && string.Equals(expectedBase, foundBase, StringComparison.OrdinalIgnoreCase)
+            && foundWidth >= expectedWidth;
+    }
+
+    // "nvarchar(400)" → ("nvarchar", 400); "(max)" is the widest. Only the variable-width
+    // character types: a fixed-width nchar pads its values, which is a different column.
+    private static (string? BaseType, int Width) VariableWidth(string type)
+    {
+        var open = type.IndexOf('(');
+        if (open <= 0 || !type.EndsWith(')'))
+            return (null, 0);
+
+        var baseType = type[..open];
+        if (!baseType.Equals("nvarchar", StringComparison.OrdinalIgnoreCase) && !baseType.Equals("varchar", StringComparison.OrdinalIgnoreCase))
+            return (null, 0);
+
+        var width = type[(open + 1)..^1];
+        if (width.Equals("max", StringComparison.OrdinalIgnoreCase))
+            return (baseType, int.MaxValue);
+        return int.TryParse(width, System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out var value)
+            ? (baseType, value)
+            : (null, 0);
+    }
 
     private static string Shape(string? type, bool nullable)
         => $"{(type is null ? "" : type + " ")}{(nullable ? "NULL" : "NOT NULL")}";

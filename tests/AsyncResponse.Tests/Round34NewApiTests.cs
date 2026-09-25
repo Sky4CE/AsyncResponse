@@ -183,13 +183,54 @@ public sealed class Round34NewApiTests
         await Assert.ThrowsAnyAsync<OperationCanceledException>(() => Quietly(pruneQuietly, () => Task.FromCanceled<int>(new CancellationToken(canceled: true)), TimeSpan.Zero, provider, logger));
     }
 
+    /// <summary>
+    /// Regression: SqlClient reports the cancellation of a running command as a SqlException
+    /// ("Operation cancelled by user") and ODP.NET as ORA-01013 — neither an
+    /// OperationCanceledException — so a create cancelled mid-prune counted a prune failure and
+    /// logged "the flow creation it rode on is unaffected" while that creation was being cancelled.
+    /// The helper now runs under the create's token and tells the two apart by it.
+    /// </summary>
+    [Theory]
+    [MemberData(nameof(RelationalOptionTypes))]
+    public async Task PruneQuietly_ADriverReportedCancellation_SurfacesAsCancellation_NotAsAPruneFailure(Type providerOptionsType)
+    {
+        var pruneQuietly = PruneQuietlyMethod(providerOptionsType);
+        var logger = new CollectingLogger();
+        var provider = $"cancel-{providerOptionsType.Name}";
+        using var cancellation = new CancellationTokenSource();
+
+        var measurements = await CollectAsync(async () =>
+        {
+            var cancelled = await Assert.ThrowsAnyAsync<OperationCanceledException>(() => Quietly(
+                pruneQuietly,
+                () =>
+                {
+                    cancellation.Cancel();
+                    throw new InvalidOperationException("Operation cancelled by user.");
+                },
+                TimeSpan.FromSeconds(1),
+                provider,
+                logger,
+                cancellation.Token));
+            Assert.IsType<InvalidOperationException>(cancelled.InnerException);
+            Assert.Equal(cancellation.Token, cancelled.CancellationToken);
+        });
+
+        Assert.DoesNotContain(measurements, m => m.Instrument == "asyncresponse.flow_state.prune_failures" && Equals(m.Tags["provider"], provider));
+        Assert.DoesNotContain(logger.Entries, e => e.Message.Contains("prune failed", StringComparison.Ordinal));
+
+        // A failure under a LIVE token is still a contained, counted failure.
+        await Quietly(pruneQuietly, () => throw new InvalidOperationException("deadlock victim"), TimeSpan.Zero, provider, logger, CancellationToken.None);
+        Assert.Single(logger.Entries, e => e.Message.Contains("prune failed", StringComparison.Ordinal));
+    }
+
     private static MethodInfo PruneQuietlyMethod(Type providerOptionsType)
     {
         var shared = providerOptionsType.Assembly.GetType(SharedTypeName, throwOnError: true)!;
         var method = shared.GetMethod("PruneQuietlyAsync", BindingFlags.Public | BindingFlags.Static);
         Assert.NotNull(method);
         Assert.Equal(
-            [typeof(Func<Task<int>>), typeof(TimeSpan), typeof(string), typeof(ILogger)],
+            [typeof(Func<Task<int>>), typeof(TimeSpan), typeof(string), typeof(ILogger), typeof(CancellationToken)],
             method!.GetParameters().Select(p => p.ParameterType).ToArray());
         return method;
     }
@@ -202,8 +243,14 @@ public sealed class Round34NewApiTests
         return (int)field!.GetRawConstantValue()!;
     }
 
-    private static Task Quietly(MethodInfo pruneQuietly, Func<Task<int>> batch, TimeSpan budget, string provider, ILogger? logger)
-        => (Task)pruneQuietly.Invoke(null, [batch, budget, provider, logger])!;
+    private static Task Quietly(
+        MethodInfo pruneQuietly,
+        Func<Task<int>> batch,
+        TimeSpan budget,
+        string provider,
+        ILogger? logger,
+        CancellationToken cancellationToken = default)
+        => (Task)pruneQuietly.Invoke(null, [batch, budget, provider, logger, cancellationToken])!;
 
     private sealed record Measurement(string Instrument, long Value, Dictionary<string, object?> Tags);
 

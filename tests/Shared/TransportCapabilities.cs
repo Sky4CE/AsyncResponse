@@ -62,9 +62,10 @@ public sealed record TransportCapabilities
     /// The largest single argument the payload contract sends through this transport, chosen to sit
     /// under the broker's hard message ceiling with room for the envelope around it.
     /// <para>
-    /// The ceilings are real and enforced by the broker, not by the library: SQS and Service Bus
-    /// (standard tier, which the emulator implements) both reject anything over 256 KiB outright, NATS
-    /// defaults to a 1 MiB max payload, and Kafka to a 1 MiB message. AsyncResponse has no claim-check
+    /// The ceilings are real and enforced by the broker, not by the library: Service Bus (standard
+    /// tier, which the emulator implements) rejects anything over 256 KB outright, SQS anything over
+    /// 1 MiB since August 2025 (a queue's MaximumMessageSize may be lower, and LocalStack and older
+    /// queues still apply 256 KiB), NATS defaults to a 1 MiB max payload, and Kafka to a 1 MiB message. AsyncResponse has no claim-check
     /// — a payload over the ceiling fails the publish — so the contract pins the supported size per
     /// transport rather than asserting one number everywhere.
     /// </para>
@@ -163,8 +164,10 @@ public sealed record TransportCapabilities
         {
             BoundedRedelivery = true,
             BrokerDeadLetter = true,
-            // SQS rejects anything over 262,144 bytes for the whole message; 128 KiB of argument
-            // leaves room for the envelope and the message attributes around it.
+            // SQS takes up to 1 MiB since August 2025, but LocalStack — and queues whose
+            // MaximumMessageSize predates the change — still reject anything over 262,144 bytes for
+            // the whole message; 128 KiB of argument leaves room for the envelope and the message
+            // attributes around it under either ceiling.
             LargePayloadBytes = 128 * 1024,
             EarlyAck = true,
             ReplyTarget = true,

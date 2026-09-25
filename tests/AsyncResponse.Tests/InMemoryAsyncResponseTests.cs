@@ -349,28 +349,6 @@ public class InMemoryAsyncResponseTests
     }
 
     [Fact]
-    public async Task RawObjectResponse_WhenMaterializationFails_FaultsWaiterAndCleansUp()
-    {
-        var provider = CreateProvider();
-        var subscriber = provider.GetRequiredService<IAsyncResponseSubscriber>();
-        var rawPublisher = provider.GetRequiredService<IRawAsyncResponsePublisher>();
-        var probe = provider.GetRequiredService<IActiveSubscriberProbe>();
-        var correlationId = $"{CorrelationId}-raw-object-invalid";
-
-        await using var waiter = await subscriber.CreateResponseWaiter<OperationResult>(
-            correlationId,
-            timeout: TimeSpan.FromSeconds(5));
-
-        await rawPublisher.SetRawResponse("not-json", correlationId);
-
-        // Body-free since round 34: materialization goes through the JSON safety helper, so the
-        // waiter's fault names size and position, never the body (a JsonException quoted it).
-        var thrown = await Assert.ThrowsAsync<InvalidDataException>(() => waiter.ResponseTask.WaitAsync(TimeSpan.FromSeconds(2)));
-        Assert.DoesNotContain("not-json", thrown.Message, StringComparison.Ordinal);
-        Assert.Equal(0, await probe.CountActiveSubscribersAsync(correlationId));
-    }
-
-    [Fact]
     public async Task RawJsonResponse_LiteralNullBody_FaultsWaiterInsteadOfCompletingWithNull()
     {
         var provider = CreateProvider();
@@ -394,13 +372,13 @@ public class InMemoryAsyncResponseTests
     }
 
     [Fact]
-    public async Task RawObjectResponse_Null_FaultsWaiterInsteadOfCompletingWithNull()
+    public async Task TypedResponse_Null_FaultsWaiterInsteadOfCompletingWithNull()
     {
         var provider = CreateProvider();
         var subscriber = provider.GetRequiredService<IAsyncResponseSubscriber>();
-        var rawPublisher = provider.GetRequiredService<IRawAsyncResponsePublisher>();
+        var publisher = provider.GetRequiredService<IAsyncResponsePublisher>();
         var probe = provider.GetRequiredService<IActiveSubscriberProbe>();
-        var correlationId = $"{CorrelationId}-raw-null-object";
+        var correlationId = $"{CorrelationId}-typed-null-object";
 
         await using var waiter = await subscriber.CreateResponseWaiter<OperationResult>(
             correlationId,
@@ -408,7 +386,7 @@ public class InMemoryAsyncResponseTests
 
         // The typed conversion path has the same hazard as the raw body: a published null must
         // fault the waiter — the broker channels reject the equivalent envelope shape.
-        await rawPublisher.SetRawResponse(null, correlationId);
+        await publisher.SetResponse<OperationResult>(null!, correlationId);
 
         var ex = await Assert.ThrowsAsync<InvalidDataException>(() => waiter.ResponseTask.WaitAsync(TimeSpan.FromSeconds(2)));
         Assert.Contains("materialized to null", ex.Message, StringComparison.Ordinal);
@@ -512,27 +490,6 @@ public class InMemoryAsyncResponseTests
         var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
             waiter.ResponseTask.WaitAsync(TimeSpan.FromSeconds(2)));
         Assert.Equal("raw predicate failed", ex.Message);
-        Assert.Equal(0, await probe.CountActiveSubscribersAsync(correlationId));
-    }
-
-    [Fact]
-    public async Task RawObjectResponse_CompletesWaiterThroughRawPublisher()
-    {
-        var provider = CreateProvider();
-        var subscriber = provider.GetRequiredService<IAsyncResponseSubscriber>();
-        var rawPublisher = provider.GetRequiredService<IRawAsyncResponsePublisher>();
-        var probe = provider.GetRequiredService<IActiveSubscriberProbe>();
-        var correlationId = $"{CorrelationId}-raw-object";
-
-        await using var waiter = await subscriber.CreateResponseWaiter<OperationResult>(
-            correlationId,
-            timeout: TimeSpan.FromSeconds(5));
-
-        await rawPublisher.SetRawResponse(
-            new OperationResult { Status = OperationStatus.Completed, Message = "raw object" },
-            correlationId);
-
-        Assert.Equal("raw object", (await waiter.ResponseTask.WaitAsync(TimeSpan.FromSeconds(2))).Message);
         Assert.Equal(0, await probe.CountActiveSubscribersAsync(correlationId));
     }
 
@@ -653,8 +610,13 @@ public class InMemoryAsyncResponseTests
     }
 
     [Fact]
-    public async Task SetResponse_NoSubscriberWhenPayloadJsonCannotBeSerialized_StillInvokesFailureCallback()
+    public async Task SetResponse_NoSubscriberWhenPayloadCannotBeSerialized_ThrowsToThePublisherAndKeepsTheRegistration()
     {
+        // Wire parity with every durable channel, which serializes its envelope before publishing
+        // and so throws to the publisher with the registration intact. Pre-fix the in-memory lost
+        // path ran BEFORE any serialization: the unserializable instance reached the dispatcher,
+        // classified as unclassifiable, took the failure route — the flow was FAILED and the
+        // registration consumed — for a payload no broker could ever have carried.
         var spy = new RecoverySpy();
         var provider = CreateProvider(services => services.AddSingleton<IRecoverySpy>(spy));
         var store = provider.GetRequiredService<IRecoveryStateStore>();
@@ -674,23 +636,20 @@ public class InMemoryAsyncResponseTests
             },
             TimeSpan.FromMinutes(5));
 
-        await publisher.SetResponse(payload, correlationId);
+        await Assert.ThrowsAnyAsync<System.Text.Json.JsonException>(() => publisher.SetResponse(payload, correlationId));
 
-        var failure = Assert.IsType<AsyncResponseDomainFailureException>(Assert.Single(spy.Failures));
-        Assert.Equal(correlationId, failure.CorrelationId);
-        Assert.Equal(typeof(SelfReferencingFailurePayload).FullName, failure.PayloadTypeFullName);
-        Assert.Null(failure.PayloadJson);
-        Assert.Empty(await store.GetAllAsync(correlationId));
+        Assert.Empty(spy.Failures);
+        Assert.Single(await store.GetAllAsync(correlationId));
     }
 
     [Fact]
-    public async Task RawObjectResponse_NoSubscriberWithNullPayload_InvokesFailureCallback()
+    public async Task TypedResponse_NoSubscriberWithNullPayload_InvokesFailureCallback()
     {
         var spy = new RecoverySpy();
         var provider = CreateProvider(services => services.AddSingleton<IRecoverySpy>(spy));
         var store = provider.GetRequiredService<IRecoveryStateStore>();
-        var rawPublisher = provider.GetRequiredService<IRawAsyncResponsePublisher>();
-        var correlationId = $"{CorrelationId}-raw-null";
+        var publisher = provider.GetRequiredService<IAsyncResponsePublisher>();
+        var correlationId = $"{CorrelationId}-typed-null";
 
         await store.SaveAsync(
             correlationId,
@@ -703,7 +662,7 @@ public class InMemoryAsyncResponseTests
             },
             TimeSpan.FromMinutes(5));
 
-        await rawPublisher.SetRawResponse(null, correlationId);
+        await publisher.SetResponse<OperationResult>(null!, correlationId);
 
         var failure = Assert.IsType<AsyncResponseDomainFailureException>(Assert.Single(spy.Failures));
         Assert.Equal(correlationId, failure.CorrelationId);

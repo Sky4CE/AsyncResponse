@@ -411,8 +411,11 @@ public class LostSubscriberRoutingTests
         var thrown = await Assert.ThrowsAsync<RecoveryCallbackFailedException>(() =>
             Publisher.SetException(new InvalidOperationException("technical error"), CorrelationId));
 
+        // The same bounded in-process ladder as the response route's failure callback (the
+        // exception route made a single attempt before the round-1 fix pass).
         Assert.Equal("handler exploded", Assert.IsType<InvalidOperationException>(thrown.InnerException).Message);
-        Assert.Single(_spy.Failures);
+        Assert.Equal(4, thrown.Attempts);
+        Assert.Equal(4, _spy.Failures.Count);
         _database.Verify(d => d.KeyDeleteAsync(It.IsAny<RedisKey>(), It.IsAny<CommandFlags>()), Times.Never);
     }
 

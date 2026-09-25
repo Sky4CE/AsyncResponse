@@ -382,6 +382,66 @@ public class AsyncResponseWatchdogLoopTests
         }
     }
 
+    [Fact]
+    public async Task ScanFailure_WithAThrowingLogger_KeepsTheLoopRunning()
+    {
+        // Pre-fix the scan-failure catch logged before anything else, outside any guard: a logging
+        // provider that throws escaped ExecuteAsync (its outer catch takes only cancellation), and
+        // under the default StopHost behaviour a report-only watchdog stopped the whole host.
+        var time = new AsyncResponse.Testing.VirtualTimeProvider();
+        var state = new AsyncResponseWatchdogState();
+        var scanner = new CountingThrowingScanner();
+        var logger = new RecordingThrowingLogger<AsyncResponseWatchdog> { ThrowOnMessageContaining = "scan failed" };
+        var interval = TimeSpan.FromMinutes(10);
+        var watchdog = new AsyncResponseWatchdog(
+            [scanner],
+            [new FakeProbe(0)],
+            state,
+            Microsoft.Extensions.Options.Options.Create(new AsyncResponseOptions
+            {
+                Watchdog = new AsyncResponseWatchdogOptions
+                {
+                    Enabled = true,
+                    StartupDelay = TimeSpan.Zero,
+                    Interval = interval,
+                    IntervalJitter = TimeSpan.Zero
+                }
+            }),
+            logger,
+            time);
+
+        await watchdog.StartAsync(CancellationToken.None);
+        try
+        {
+            await WaitUntilAsync(() => scanner.Calls >= 1 && (state.Latest is not null || watchdog.ExecuteTask!.IsCompleted));
+            Assert.False(watchdog.ExecuteTask!.IsCompleted, "the scan-failure log escaped and ended the watchdog loop");
+            Assert.Equal("scan boom", state.Latest!.Error);
+
+            // The loop is alive: the next interval runs another scan.
+            await WaitUntilAsync(() => time.NextTimerDueAt is not null);
+            time.Advance(interval);
+            await WaitUntilAsync(() => scanner.Calls >= 2);
+            Assert.False(watchdog.ExecuteTask.IsCompleted);
+        }
+        finally
+        {
+            await watchdog.StopAsync(CancellationToken.None);
+        }
+    }
+
+    private sealed class CountingThrowingScanner : IRecoveryStateScanner
+    {
+        private int _calls;
+
+        public int Calls => Volatile.Read(ref _calls);
+
+        public IAsyncEnumerable<RecoveryState> ScanAsync(CancellationToken cancellationToken = default)
+        {
+            Interlocked.Increment(ref _calls);
+            throw new InvalidOperationException("scan boom");
+        }
+    }
+
     private static AsyncResponseWatchdog Build(
         AsyncResponseWatchdogState state,
         IOptions<AsyncResponseOptions> options,

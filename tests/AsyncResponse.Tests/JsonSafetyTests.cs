@@ -138,6 +138,47 @@ public class JsonSafetyTests
         Assert.Contains("unsupported value", ex.Message, StringComparison.Ordinal);
     }
 
+    /// <summary>
+    /// Regression: the response envelope's converter resolves the PAYLOAD type's metadata inside
+    /// the read, so in a trimmed/AOT app with an unregistered payload type the library's own
+    /// register-your-type guidance was raised there, re-wrapped by the serializer with the
+    /// reader's path appended — and then discarded by the unconditional
+    /// <see cref="NotSupportedException"/> catch in favour of "an unsupported value or missing type
+    /// discriminator". The Redis, NATS and database channels all read envelopes this way. A
+    /// resolver that lacks the payload type reproduces the missing metadata on JIT.
+    /// </summary>
+    [Theory]
+    [InlineData(0)]
+    [InlineData(1)]
+    public void PayloadMetadataMissingMidRead_SurfacesTheRegistrationGuidance(int reader)
+    {
+        var options = new JsonSerializerOptions { TypeInfoResolver = new EnvelopeWithoutPayloadResolver() };
+        var metadata = (System.Text.Json.Serialization.Metadata.JsonTypeInfo<AsyncResponseEnvelope<OperationResult>>)
+            options.GetTypeInfo(typeof(AsyncResponseEnvelope<OperationResult>));
+        var json = "{\"SchemaVersion\":1,\"Success\":true,\"Payload\":{\"" + Secret + "\":1}}";
+        Action read = reader == 0
+            ? () => JsonSafety.SafeDeserialize(json, metadata)
+            : () => JsonSafety.SafeDeserialize(System.Text.Encoding.UTF8.GetBytes(json), metadata);
+
+        var ex = Assert.Throws<NotSupportedException>(read);
+
+        Assert.Contains(nameof(OperationResult), ex.Message, StringComparison.Ordinal);
+        Assert.Contains(nameof(AsyncResponseJsonSerialization.RegisterResolver), ex.Message, StringComparison.Ordinal);
+        // The library's own guidance, not the serializer's re-wrap: no reader path, no body.
+        Assert.DoesNotContain(" Path: ", ex.Message, StringComparison.Ordinal);
+        AssertNoBodyAnywhereIn(ex);
+    }
+
+    /// <summary>Supplies the envelope's converter-backed metadata and nothing else — the payload type is "unregistered".</summary>
+    private sealed class EnvelopeWithoutPayloadResolver : System.Text.Json.Serialization.Metadata.IJsonTypeInfoResolver
+    {
+        public System.Text.Json.Serialization.Metadata.JsonTypeInfo? GetTypeInfo(Type type, JsonSerializerOptions options)
+            => type == typeof(AsyncResponseEnvelope<OperationResult>)
+                ? System.Text.Json.Serialization.Metadata.JsonMetadataServices.CreateValueInfo<AsyncResponseEnvelope<OperationResult>>(
+                    options, new AsyncResponseEnvelopeConverter<OperationResult>())
+                : null;
+    }
+
     [System.Text.Json.Serialization.JsonPolymorphic]
     [System.Text.Json.Serialization.JsonDerivedType(typeof(ConcreteInput), "concrete")]
     public abstract class AbstractInput;

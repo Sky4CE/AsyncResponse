@@ -540,6 +540,48 @@ public class NatsRecoveryStateStoreTests
     }
 
     [Fact]
+    public async Task ScanAsync_PurgesDeleteMarkersPastTheRetention_AndKeepsFreshOnes()
+    {
+        // Every completed waiter leaves a KV delete marker, and with History = 1 the bucket keeps
+        // it for its whole MaxAge (RecoveryStateExpiry, 7 days by default): storage, server subject
+        // state and every watchdog scan grew with throughput x expiry. The watchdog scan now drives
+        // a purge of the markers older than the retention.
+        await _store.SaveAsync("corr-done", new RecoveryState { CorrelationId = "corr-done", RegistrationId = Guid.NewGuid() }, TimeSpan.FromMinutes(5));
+        var registration = (await _store.GetAllAsync("corr-done"))[0].RegistrationId;
+        Assert.True(await _store.TryDeleteAsync("corr-done", registration));
+        Assert.True(_kv.DeleteMarkers.ContainsKey(NatsSubjectSchema.RecoveryKey("corr-done")));
+        _kv.DeleteMarkers["stale-marker"] = DateTimeOffset.UtcNow - TimeSpan.FromHours(2);
+
+        await foreach (var _ in _store.ScanAsync())
+        {
+        }
+
+        await _kv.PurgeCompleted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal([NatsRecoveryStateStore.DeleteMarkerRetention], _kv.PurgeRequests);
+        Assert.False(_kv.DeleteMarkers.ContainsKey("stale-marker"));
+        Assert.True(_kv.DeleteMarkers.ContainsKey(NatsSubjectSchema.RecoveryKey("corr-done")));
+    }
+
+    [Fact]
+    public async Task ScanAsync_DoesNotWaitForTheDeleteMarkerPurge()
+    {
+        // A large marker backlog must never delay (or fail) the staleness report: the purge is
+        // maintenance running alongside the scan, not part of it.
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        _kv.PurgeGate = () => release.Task;
+        await _store.SaveAsync("corr-live", new RecoveryState { CorrelationId = "corr-live" }, TimeSpan.FromMinutes(5));
+
+        using var guard = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        var states = new List<RecoveryState>();
+        await foreach (var state in _store.ScanAsync().WithCancellation(guard.Token))
+            states.Add(state);
+
+        Assert.Equal("corr-live", Assert.Single(states).CorrelationId);
+        release.TrySetResult();
+        await _kv.PurgeCompleted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+    }
+
+    [Fact]
     public async Task ScanAsync_ObservesCancellation()
     {
         await _store.SaveAsync("corr-a", new RecoveryState { CorrelationId = "corr-a" }, TimeSpan.FromMinutes(5));

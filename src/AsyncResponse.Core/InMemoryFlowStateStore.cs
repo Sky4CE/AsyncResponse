@@ -5,11 +5,10 @@ namespace AsyncResponse;
 /// <summary>Atomic process-local flow-state store for development, tests, and single-process apps.</summary>
 internal sealed class InMemoryFlowStateStore : IFlowStateStore
 {
-    // Saturating expiry stamp: the ttl parameter arrives from callers as well as options, and the
-    // external stores deliberately saturate the same arithmetic — a raw Add threw
-    // ArgumentOutOfRangeException on large ttls where every other store clamped.
-    private static DateTime Expiry(DateTime now, TimeSpan ttl)
-        => ttl >= DateTime.MaxValue - now ? DateTime.MaxValue : now.Add(ttl);
+    // Saturating expiry and lease stamps: the ttl and lease duration arrive from callers as well
+    // as options, and the external stores deliberately saturate the same arithmetic — a raw Add
+    // threw ArgumentOutOfRangeException on large values where every other store clamped.
+    private static DateTime Expiry(DateTime now, TimeSpan ttl) => FlowStateRetention.AddSaturating(now, ttl);
 
     /// <summary>
     /// How often <see cref="TryCreateAsync"/> sweeps expired entries whose ids are never touched
@@ -260,7 +259,7 @@ internal sealed class InMemoryFlowStateStore : IFlowStateStore
             var updated = current with
             {
                 LeaseId = leaseId,
-                LeaseExpiresAtUtc = now.Add(leaseDuration)
+                LeaseExpiresAtUtc = Expiry(now, leaseDuration)
             };
             if (_entries.TryUpdate(flowId, updated, current))
                 return Task.FromResult(true);

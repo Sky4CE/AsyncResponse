@@ -40,8 +40,9 @@ public sealed class OracleDurableFlowOptions : DurableFlowOptions
     public bool AutoCreateSchema { get; set; } = true;
 
     /// <summary>
-    /// How often <see cref="OracleFlowStateStore.TryCreateAsync"/> opportunistically deletes one bounded
-    /// batch (1000 rows) of expired rows (loads already treat expired state as absent; pruning
+    /// How often <see cref="OracleFlowStateStore.TryCreateAsync"/> opportunistically runs a
+    /// budgeted prune of expired rows: batches of 1000 until one comes back short or
+    /// <see cref="PruneBudget"/> lapses (loads already treat expired state as absent; pruning
     /// bounds table growth). Zero or negative prunes on every save. Default: 5 minutes.
     /// </summary>
     public TimeSpan PruneInterval { get; set; } = TimeSpan.FromMinutes(5);
@@ -147,7 +148,7 @@ public sealed class OracleFlowStateStore : IFlowStateStore
         var stateJson = DurableFlowStoreShared.SerializeBounded(flowId, state, _options.MaxStateBytes, "Oracle");
         await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
         if (DurableFlowStoreShared.ShouldPrune(ref _lastPruneTicks, _options.PruneInterval))
-            await DurableFlowStoreShared.PruneQuietlyAsync(() => PruneExpiredAsync(cancellationToken), _options.PruneBudget, "Oracle", _logger).ConfigureAwait(false);
+            await DurableFlowStoreShared.PruneQuietlyAsync(() => PruneExpiredAsync(cancellationToken), _options.PruneBudget, "Oracle", _logger, cancellationToken).ConfigureAwait(false);
 
         await using var connection = await OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         try
@@ -403,7 +404,9 @@ public sealed class OracleFlowStateStore : IFlowStateStore
     /// </description></item>
     /// </list>
     /// The expiry index is deliberately not verified: it is performance-only (loads and pruning
-    /// filter on expiry either way), the same standard the sibling stores apply to theirs.
+    /// filter on expiry either way), and no sibling fails startup over its own either — SQL
+    /// Server, MySQL and SQLite do not check theirs, and PostgreSQL verifies its index only when
+    /// present, warning when an operator-managed schema lacks it.
     /// </summary>
     private async Task<bool> VerifyFlowTableAsync(OracleConnection connection, CancellationToken cancellationToken)
     {

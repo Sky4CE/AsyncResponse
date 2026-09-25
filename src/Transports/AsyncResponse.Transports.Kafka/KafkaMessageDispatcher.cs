@@ -55,8 +55,15 @@ internal abstract class KafkaMessageDispatcher : IAsyncDisposable
 {
     private readonly Func<KafkaDelivery, CancellationToken, Task> _handler;
     private readonly KafkaSubscriberOptions _subscriberOptions;
-    private readonly IKafkaConsumerClient _consumer;
+
+    /// <summary>
+    /// The consumer settlements store offsets on. Fixed for a per-attempt dispatcher; a dispatcher
+    /// that outlives attempts (the queued one) is re-pointed at each attempt's consumer by
+    /// <see cref="AttachConsumer"/> — only ever from the poll thread's side of the loop.
+    /// </summary>
+    private volatile IKafkaConsumerClient? _consumer;
     private readonly IKafkaProducerClient _producer;
+    private int _messageMaxBytes;
     private readonly KafkaTransportTopicSchema _topics;
     private readonly string _topic;
     private readonly string _consumerGroup;
@@ -65,7 +72,7 @@ internal abstract class KafkaMessageDispatcher : IAsyncDisposable
     /// <summary>Runs the KafkaMessageDispatcher operation.</summary>
     protected KafkaMessageDispatcher(
         Func<KafkaDelivery, CancellationToken, Task> handler,
-        IKafkaConsumerClient consumer,
+        IKafkaConsumerClient? consumer,
         IKafkaProducerClient producer,
         KafkaAsyncResponseTransportOptions transportOptions,
         KafkaSubscriberOptions subscriberOptions,
@@ -88,14 +95,33 @@ internal abstract class KafkaMessageDispatcher : IAsyncDisposable
 
     protected KafkaAsyncResponseTransportOptions TransportOptions { get; }
     protected ILogger Logger { get; }
-    protected IKafkaConsumerClient Consumer => _consumer;
+    protected IKafkaConsumerClient Consumer
+        => _consumer ?? throw new InvalidOperationException("No Kafka consumer is attached to this dispatcher.");
 
     protected int MaxDeliveryAttempts => _subscriberOptions.MaxDeliveryAttempts;
+
+    /// <summary>
+    /// Points the dispatcher at the consumer of the subscriber attempt that is about to poll;
+    /// disposing the returned handle detaches it when that attempt ends. Only a dispatcher that
+    /// outlives attempts (the ACK-after-enqueue one: created once per hosted subscriber, drained
+    /// only at host stop) is created without a consumer.
+    /// </summary>
+    public IDisposable AttachConsumer(IKafkaConsumerClient consumer)
+    {
+        _consumer = consumer;
+        return new ConsumerAttachment(this, consumer);
+    }
+
+    private sealed class ConsumerAttachment(KafkaMessageDispatcher owner, IKafkaConsumerClient consumer) : IDisposable
+    {
+        public void Dispose()
+            => Interlocked.CompareExchange(ref owner._consumer, null, consumer);
+    }
 
     /// <summary>Creates the configured dispatcher.</summary>
     public static KafkaMessageDispatcher Create(
         Func<KafkaDelivery, CancellationToken, Task> handler,
-        IKafkaConsumerClient consumer,
+        IKafkaConsumerClient? consumer,
         IKafkaProducerClient producer,
         KafkaAsyncResponseTransportOptions transportOptions,
         KafkaSubscriberOptions subscriberOptions,
@@ -122,7 +148,8 @@ internal abstract class KafkaMessageDispatcher : IAsyncDisposable
 
         return new AwaitingKafkaMessageDispatcher(
             handler,
-            consumer,
+            // Per attempt: its detached handlers are bound to the consumer they were consumed on.
+            consumer ?? throw new ArgumentNullException(nameof(consumer), "The ack-after-handler dispatcher needs its attempt's consumer."),
             producer,
             transportOptions,
             subscriberOptions,
@@ -306,7 +333,12 @@ internal abstract class KafkaMessageDispatcher : IAsyncDisposable
         }
         catch (Exception ex)
         {
-            if (logFailures)
+            // A stop is not a handler failure: neither this subscriber's own cancellation nor the
+            // flow engine's host-stop hand-back belongs in an error log.
+            // Nor, for the same reason, an error span (RabbitMQ parity).
+            var stopped = ex is DurableFlowInterruptedException
+                || (ex is OperationCanceledException && cancellationToken.IsCancellationRequested);
+            if (logFailures && !stopped)
             {
                 Logger.LogError(
                     ex,
@@ -317,7 +349,8 @@ internal abstract class KafkaMessageDispatcher : IAsyncDisposable
                     attempt);
             }
 
-            AsyncResponseDiagnostics.SetError(activity, ex);
+            if (!stopped)
+                AsyncResponseDiagnostics.SetError(activity, ex);
             throw;
         }
     }
@@ -327,7 +360,7 @@ internal abstract class KafkaMessageDispatcher : IAsyncDisposable
     /// auto-committer flushes stored offsets on the configured interval.
     /// </summary>
     protected void StoreOffset(KafkaDelivery delivery)
-        => _consumer.StoreOffset(delivery.Topic, delivery.Partition, delivery.Offset);
+        => Consumer.StoreOffset(delivery.Topic, delivery.Partition, delivery.Offset);
 
     /// <summary>
     /// Stores the offset after the message is settled (handler success or dead-letter publish),
@@ -347,7 +380,19 @@ internal abstract class KafkaMessageDispatcher : IAsyncDisposable
     {
         try
         {
-            _consumer.StoreOffset(topic, partition, offset);
+            Consumer.StoreOffset(topic, partition, offset);
+        }
+        catch (KafkaPartitionNotAssignedException ex)
+        {
+            // Routine in a consumer group, not an error: a rebalance took the partition while the
+            // message was being settled, and its new owner re-consumes it from the group's
+            // committed offset (sibling precedent: the pause/resume of a revoked partition).
+            Logger.LogInformation(
+                ex,
+                "Did not store the offset of Kafka message {Topic}[{Partition}]@{Offset} after settlement: a rebalance revoked the partition, so its new owner redelivers it.",
+                topic,
+                partition,
+                offset);
         }
         catch (Exception ex)
         {
@@ -456,6 +501,87 @@ internal abstract class KafkaMessageDispatcher : IAsyncDisposable
     /// </summary>
     internal const int MaxDeadLetterHeaderLength = 4096;
 
+    /// <summary>The headers a dead-letter copy stamps (see <see cref="DeadLetterCoreAsync"/>).</summary>
+    internal static readonly IReadOnlySet<string> BurialHeaderKeys = new HashSet<string>(StringComparer.Ordinal)
+    {
+        "sourceTopic",
+        "sourcePartition",
+        "sourceOffset",
+        "consumerGroup",
+        "subscriberRole",
+        "attempts",
+        "reason",
+        "exceptionType",
+        "exceptionMessage",
+        "occurredAtUtc"
+    };
+
+    /// <summary>
+    /// Upper bounds on the record-format framing librdkafka adds when it checks a record against
+    /// <c>message.max.bytes</c> (length/offset/timestamp varints and attributes per record; the two
+    /// length varints per header). Over-estimated on purpose: they only shorten diagnostics.
+    /// </summary>
+    private const int RecordOverheadBytes = 64;
+    private const int HeaderOverheadBytes = 10;
+
+    /// <summary>The producer's <c>message.max.bytes</c>, resolved on first use (a burial is rare).</summary>
+    private int MessageMaxBytes
+    {
+        get
+        {
+            var resolved = Volatile.Read(ref _messageMaxBytes);
+            if (resolved == 0)
+            {
+                resolved = KafkaProducerClientAdapter.ResolveMessageMaxBytes(TransportOptions);
+                Volatile.Write(ref _messageMaxBytes, resolved);
+            }
+
+            return resolved;
+        }
+    }
+
+    private static bool HasHeader(IReadOnlyList<KafkaTransportHeader> headers, string key)
+    {
+        foreach (var header in headers)
+        {
+            if (string.Equals(header.Key, key, StringComparison.Ordinal))
+                return true;
+        }
+
+        return false;
+    }
+
+    private static long EstimateRecordSize(string? key, byte[] payload, IReadOnlyList<KafkaTransportHeader> headers)
+    {
+        long size = RecordOverheadBytes + payload.Length + (key is null ? 0 : Encoding.UTF8.GetByteCount(key));
+        foreach (var header in headers)
+            size += HeaderOverheadBytes + Encoding.UTF8.GetByteCount(header.Key) + (header.Value?.Length ?? 0);
+
+        return size;
+    }
+
+    /// <summary>The longest well-formed prefix of <paramref name="value"/> that encodes to at most <paramref name="maxBytes"/> UTF-8 bytes.</summary>
+    private static string TruncateToUtf8Bytes(string value, long maxBytes)
+    {
+        if (maxBytes <= 0)
+            return string.Empty;
+        if (Encoding.UTF8.GetByteCount(value) <= maxBytes)
+            return value;
+
+        // Every UTF-16 unit encodes to at least one byte, so the answer is at most maxBytes units.
+        int low = 0, high = (int)Math.Min(value.Length, maxBytes);
+        while (low < high)
+        {
+            var mid = low + ((high - low + 1) / 2);
+            if (Encoding.UTF8.GetByteCount(PortableText.TruncateWellFormed(value, mid)) <= maxBytes)
+                low = mid;
+            else
+                high = mid - 1;
+        }
+
+        return PortableText.TruncateWellFormed(value, low);
+    }
+
     private async Task DeadLetterCoreAsync(
         string sourceTopic,
         int partition,
@@ -471,8 +597,20 @@ internal abstract class KafkaMessageDispatcher : IAsyncDisposable
         if (!TransportOptions.DeadLetterEnabled)
             return;
 
-        var headers = new List<KafkaTransportHeader>(originalHeaders.Count + 10);
-        headers.AddRange(originalHeaders);
+        // A record replayed from a dead-letter topic already carries a burial set: replaced, not
+        // stacked — a second sourceTopic/reason/... behind the first left every first-match reader
+        // (tooling, a human with kcat) looking at the stale values, and each replay cycle grew the
+        // record toward the size limit. Only a record that carries one (sourceTopic AND
+        // sourceOffset) is stripped: the names are generic, and a user's own "reason" or
+        // "attempts" header on a record that was never buried is part of the message.
+        var replayedBurial = HasHeader(originalHeaders, "sourceTopic") && HasHeader(originalHeaders, "sourceOffset");
+        var headers = new List<KafkaTransportHeader>(originalHeaders.Count + BurialHeaderKeys.Count);
+        foreach (var header in originalHeaders)
+        {
+            if (!replayedBurial || !BurialHeaderKeys.Contains(header.Key))
+                headers.Add(header);
+        }
+
         headers.Add(KafkaTransportHeader.Utf8("sourceTopic", sourceTopic));
         headers.Add(KafkaTransportHeader.Utf8("sourcePartition", partition.ToString(CultureInfo.InvariantCulture)));
         headers.Add(KafkaTransportHeader.Utf8("sourceOffset", offset.ToString(CultureInfo.InvariantCulture)));
@@ -480,14 +618,29 @@ internal abstract class KafkaMessageDispatcher : IAsyncDisposable
         headers.Add(KafkaTransportHeader.Utf8("subscriberRole", _role.ToString()));
         headers.Add(KafkaTransportHeader.Utf8("attempts", attempts.ToString(CultureInfo.InvariantCulture)));
         headers.Add(KafkaTransportHeader.Utf8("reason", reason));
+        headers.Add(KafkaTransportHeader.Utf8("occurredAtUtc", DateTimeOffset.UtcNow.ToString("O")));
+
         // Capped: these two are the only dead-letter headers whose size the failing code decides
         // (an exception message can quote a whole payload; a closed generic's name nests without
         // bound), and an uncapped one pushed the dead-letter record past message.max.bytes — a
         // burial that then fails on every retry, for a message that was itself within the limit.
-        // Surrogate-aware cut (see PortableText.TruncateWellFormed).
-        headers.Add(KafkaTransportHeader.Utf8("exceptionType", PortableText.TruncateWellFormed(exception.GetType().FullName!, MaxDeadLetterHeaderLength)));
-        headers.Add(KafkaTransportHeader.Utf8("exceptionMessage", PortableText.TruncateWellFormed(exception.Message, MaxDeadLetterHeaderLength)));
-        headers.Add(KafkaTransportHeader.Utf8("occurredAtUtc", DateTimeOffset.UtcNow.ToString("O")));
+        // Surrogate-aware cut (see PortableText.TruncateWellFormed). The per-header cap alone did
+        // not close that: a record within ~24 KB of the producer's limit still could not be buried
+        // (and restarted the subscriber for ever, see KafkaDeadLetterPublishFailedException), so
+        // both are also cut to what the record's own size leaves — the message first.
+        var exceptionType = PortableText.TruncateWellFormed(exception.GetType().FullName!, MaxDeadLetterHeaderLength);
+        var exceptionMessage = PortableText.TruncateWellFormed(exception.Message, MaxDeadLetterHeaderLength);
+        var room = MessageMaxBytes - EstimateRecordSize(correlationId, payload, headers)
+            - (2 * HeaderOverheadBytes) - Encoding.UTF8.GetByteCount("exceptionType") - Encoding.UTF8.GetByteCount("exceptionMessage");
+        var typeBytes = Encoding.UTF8.GetByteCount(exceptionType);
+        if (typeBytes + Encoding.UTF8.GetByteCount(exceptionMessage) > room)
+        {
+            exceptionMessage = TruncateToUtf8Bytes(exceptionMessage, room - typeBytes);
+            exceptionType = TruncateToUtf8Bytes(exceptionType, room - Encoding.UTF8.GetByteCount(exceptionMessage));
+        }
+
+        headers.Add(KafkaTransportHeader.Utf8("exceptionType", exceptionType));
+        headers.Add(KafkaTransportHeader.Utf8("exceptionMessage", exceptionMessage));
 
         // The unprocessable-message discard blocks the poll thread on this (the awaiting
         // dispatcher's burial runs inside the detached handler task now, but keeps the same bound
@@ -577,6 +730,15 @@ internal sealed class AwaitingKafkaMessageDispatcher : KafkaMessageDispatcher
     // runs after it has exited. No lock.
     private readonly Dictionary<int, DetachedPartition> _detached = [];
 
+    /// <summary>
+    /// Partitions whose message was handed back by the flow engine because the host is stopping
+    /// (<see cref="DurableFlowInterruptedException"/>). Their offset is left unstored and the
+    /// partition stays paused: storing any LATER offset of the partition would commit past the
+    /// handed-back message (Kafka commits a position), so nothing more of it is settled until the
+    /// subscriber stops. Poll-thread-only, like <see cref="_detached"/>.
+    /// </summary>
+    private readonly HashSet<int> _handedBack = [];
+
     /// <summary>Runs the AwaitingKafkaMessageDispatcher operation.</summary>
     public AwaitingKafkaMessageDispatcher(
         Func<KafkaDelivery, CancellationToken, Task> handler,
@@ -610,32 +772,38 @@ internal sealed class AwaitingKafkaMessageDispatcher : KafkaMessageDispatcher
     /// <inheritdoc />
     public override void Accept(KafkaDelivery delivery, CancellationToken subscriberCancellationToken)
     {
-        if (_detached.TryGetValue(delivery.Partition, out var inFlight))
-        {
-            // A message for a partition whose handler is still running: a rebalance handed the
-            // partition back with its pause reset (librdkafka resets pause state on assignment),
-            // or the client delivered a message it had fetched before the pause. Hold it behind
-            // the running one — the partition's order is the contract — and re-assert the pause
-            // so nothing more arrives; the hold is therefore bounded by what was already in
-            // flight, never a queue that grows.
-            (inFlight.Held ??= new Queue<HeldMessage>()).Enqueue(HeldMessage.For(delivery));
-            PausePartition(delivery.Partition);
+        if (SkipHandedBackPartition(delivery.Partition, delivery.Offset))
             return;
-        }
+
+        if (TryHoldBehindDetached(delivery.Partition, HeldMessage.For(delivery)))
+            return;
 
         // Started on the pool, not inline: the inline wait below is a real bound on the poll
         // thread's gap even for a handler whose synchronous prefix is long.
         var settlement = Task.Run(() => SettleAsync(delivery, subscriberCancellationToken), CancellationToken.None);
         if (WaitInline(settlement))
         {
+            if (settlement.IsCanceled)
+            {
+                // A stop — this subscriber's own, or the flow engine's host-stop hand-back, which
+                // arrives while this subscriber's token may still be live. Not a failure to retry
+                // or bury, and never a skip: the offset stays unstored and the partition parked.
+                HandBack(delivery.Partition, delivery.Offset, held: null);
+                return;
+            }
+
             // The fast path, unchanged: settle in place and consume the next message.
             settlement.GetAwaiter().GetResult();
             StoreOffsetAfterSettlement(delivery);
             return;
         }
 
+        // Read only now, for a handler that detaches — the fast path above never needs it — and
+        // still the generation the message was consumed under: rebalance callbacks run only inside
+        // Consume, which the poll thread has not called since.
+        var generation = Consumer.GetAssignmentGeneration(delivery.Topic, delivery.Partition);
         PausePartition(delivery.Partition);
-        _detached[delivery.Partition] = new DetachedPartition(delivery, settlement, subscriberCancellationToken);
+        _detached[delivery.Partition] = new DetachedPartition(delivery, settlement, subscriberCancellationToken, generation);
         Logger.LogDebug(
             "Kafka handler for {Topic}[{Partition}]@{Offset} is still running after {DetachAfter}; detached it and paused the partition while polling continues.",
             delivery.Topic,
@@ -647,16 +815,17 @@ internal sealed class AwaitingKafkaMessageDispatcher : KafkaMessageDispatcher
     /// <inheritdoc />
     public override void AcceptUnprocessable(KafkaIncomingMessage message, Exception failure, CancellationToken subscriberCancellationToken)
     {
-        if (_detached.TryGetValue(message.Partition, out var inFlight))
+        if (SkipHandedBackPartition(message.Partition, message.Offset))
+            return;
+
+        // Same rule as a valid delivery for the partition: the message consumed before it is
+        // still being handled, so this one waits its turn. Settling it now would store — and
+        // let the auto-committer commit — an offset PAST the unfinished message; a crash
+        // after that commit skipped the unfinished message for good, and the dead-letter
+        // copy this discard produces is of the malformed record, not of the work that was
+        // lost. Held, it is buried and its offset stored in order, once the handler settles.
+        if (TryHoldBehindDetached(message.Partition, HeldMessage.Unprocessable(message, failure)))
         {
-            // Same rule as a valid delivery for the partition: the message consumed before it is
-            // still being handled, so this one waits its turn. Settling it now would store — and
-            // let the auto-committer commit — an offset PAST the unfinished message; a crash
-            // after that commit skipped the unfinished message for good, and the dead-letter
-            // copy this discard produces is of the malformed record, not of the work that was
-            // lost. Held, it is buried and its offset stored in order, once the handler settles.
-            (inFlight.Held ??= new Queue<HeldMessage>()).Enqueue(HeldMessage.Unprocessable(message, failure));
-            PausePartition(message.Partition);
             Logger.LogDebug(
                 "Kafka message {Topic}[{Partition}]@{Offset} could not be parsed into a delivery and is held behind the partition's detached handler; it is dead-lettered in order once that handler settles.",
                 message.Topic,
@@ -668,6 +837,94 @@ internal sealed class AwaitingKafkaMessageDispatcher : KafkaMessageDispatcher
         // Nothing earlier on the partition is unresolved (every earlier message settled inline
         // or would be in _detached), so the discard is safe to settle at once.
         base.AcceptUnprocessable(message, failure, subscriberCancellationToken);
+    }
+
+    /// <summary>
+    /// A message for a partition whose earlier message was handed back at host stop: dropped
+    /// unsettled (offset unstored, so it redelivers with the partition) and the pause re-asserted
+    /// — a rebalance hands a partition back with its pause state reset.
+    /// </summary>
+    private bool SkipHandedBackPartition(int partition, long offset)
+    {
+        if (!_handedBack.Contains(partition))
+            return false;
+
+        PausePartition(partition);
+        Logger.LogDebug(
+            "Kafka message {Topic}[{Partition}]@{Offset} is left unsettled: an earlier message of the partition was handed back because the host is stopping.",
+            _topic,
+            partition,
+            offset);
+        return true;
+    }
+
+    /// <summary>
+    /// Holds <paramref name="message"/> behind the partition's detached handler when that handler
+    /// still belongs to the partition's CURRENT assignment. A handler whose partition was revoked
+    /// since it detached is judged by this first message of the new assignment, which starts at
+    /// the group's committed offset: one PAST the handler's message means another member committed
+    /// past it, so the handler is orphaned — its offset can never be stored (that would rewind the
+    /// group), and the new message is settled normally while the orphan runs on unobserved by the
+    /// consumer, however long it still takes. One AT OR BEFORE it means nobody moved past it — an
+    /// eager rebalance revokes every partition and typically hands most straight back — so the
+    /// handler is re-adopted into the current assignment and the redelivered message waits behind
+    /// it, instead of a second copy of the same message running alongside the first.
+    /// </summary>
+    private bool TryHoldBehindDetached(int partition, HeldMessage message)
+    {
+        if (!_detached.TryGetValue(partition, out var inFlight))
+            return false;
+
+        var generation = Consumer.GetAssignmentGeneration(inFlight.Delivery.Topic, partition);
+        if (generation != inFlight.Generation)
+        {
+            if (message.Offset > inFlight.Delivery.Offset)
+            {
+                _detached.Remove(partition);
+                ObserveOrphaned(inFlight, committedPast: true);
+                return false;
+            }
+
+            inFlight.Generation = generation;
+            Logger.LogDebug(
+                "Kafka partition {Topic}[{Partition}] came back to this consumer at offset {Offset}, at or before its still-running detached handler @{RunningOffset}; the handler keeps the partition and the redelivered messages wait behind it.",
+                _topic,
+                partition,
+                message.Offset,
+                inFlight.Delivery.Offset);
+        }
+
+        // A message for a partition whose handler is still running: a rebalance handed the
+        // partition back with its pause reset (the consumer adapter lifts it on every revoke),
+        // or the client delivered a message it had fetched before the pause. Hold it behind
+        // the running one — the partition's order is the contract — and re-assert the pause
+        // so nothing more arrives; the hold is therefore bounded by what was already in
+        // flight, never a queue that grows.
+        (inFlight.Held ??= new Queue<HeldMessage>()).Enqueue(message);
+        PausePartition(partition);
+        return true;
+    }
+
+    /// <summary>Whether the partition was revoked (or lost) since <paramref name="work"/> detached.</summary>
+    private bool IsOrphaned(DetachedPartition work)
+        => Consumer.GetAssignmentGeneration(work.Delivery.Topic, work.Delivery.Partition) != work.Generation;
+
+    /// <summary>
+    /// Ends a settlement that was stopped rather than finished: the offset stays unstored, the
+    /// messages held behind it are dropped unstarted (their offsets unstored too), and the
+    /// partition stays paused and parked for the rest of this consumer's life — the host is
+    /// stopping, and storing any later offset of the partition would commit past this message.
+    /// </summary>
+    private void HandBack(int partition, long offset, Queue<HeldMessage>? held)
+    {
+        _handedBack.Add(partition);
+        PausePartition(partition);
+        Logger.LogInformation(
+            "Kafka message {Topic}[{Partition}]@{Offset} was handed back because the host is stopping; its offset is left unstored and the partition parked{Held}, so the message redelivers after the restart.",
+            _topic,
+            partition,
+            offset,
+            held is { Count: > 0 } ? $" ({held.Count} message(s) held behind it are left unsettled too)" : string.Empty);
     }
 
     /// <inheritdoc />
@@ -692,28 +949,59 @@ internal sealed class AwaitingKafkaMessageDispatcher : KafkaMessageDispatcher
             // Removed BEFORE it is observed: a settlement that throws faults the poll loop, and the
             // entry must not be settled a second time by disposal.
             _detached.Remove(partition);
+
+            if (IsOrphaned(work))
+            {
+                // Its partition moved away (and may have come back) while it ran, and no message of
+                // a new assignment re-adopted it: never store its offset, never start what was held
+                // behind it — the partition's current owner re-consumes all of it from the group's
+                // committed offset.
+                ObserveOrphaned(work);
+                continue;
+            }
+
+            if (work.Settlement.IsCanceled)
+            {
+                HandBack(partition, work.Delivery.Offset, work.Held);
+                continue;
+            }
+
             work.Settlement.GetAwaiter().GetResult();
             StoreOffsetAfterSettlement(work.Delivery);
-            ContinueHeld(partition, work.Held, work.SubscriberCancellationToken);
+            ContinueHeld(partition, work.Held, work.Delivery.Offset, work.SubscriberCancellationToken);
         }
     }
 
     /// <summary>
-    /// Works through the messages held behind a settled handler, in consumption order: an
+    /// Works through the messages held behind a settled handler, in consumption order: one at or
+    /// below the settled offset is a redelivery of work this consumer has already settled (a
+    /// re-adopting assignment re-fetched from the group's committed offset) and is dropped; an
     /// unprocessable one is dead-lettered and its offset stored right here (its turn has come —
     /// never ahead of the handler it was consumed behind); the first valid delivery is started
     /// detached with the rest still held behind it (the partition stays paused); an empty hold
     /// resumes the partition.
     /// </summary>
-    private void ContinueHeld(int partition, Queue<HeldMessage>? held, CancellationToken subscriberCancellationToken)
+    private void ContinueHeld(int partition, Queue<HeldMessage>? held, long settledOffset, CancellationToken subscriberCancellationToken)
     {
         while (held is { Count: > 0 })
         {
             var next = held.Dequeue();
+            if (next.Offset <= settledOffset)
+            {
+                Logger.LogDebug(
+                    "Kafka message {Topic}[{Partition}]@{Offset} is a redelivery of work this consumer already settled (up to @{SettledOffset}); dropped.",
+                    _topic,
+                    partition,
+                    next.Offset,
+                    settledOffset);
+                continue;
+            }
+
             if (next.Delivery is { } delivery)
             {
+                var generation = Consumer.GetAssignmentGeneration(delivery.Topic, delivery.Partition);
                 var settlement = Task.Run(() => SettleAsync(delivery, subscriberCancellationToken), CancellationToken.None);
-                _detached[partition] = new DetachedPartition(delivery, settlement, subscriberCancellationToken) { Held = held.Count > 0 ? held : null };
+                _detached[partition] = new DetachedPartition(delivery, settlement, subscriberCancellationToken, generation) { Held = held.Count > 0 ? held : null };
                 return;
             }
 
@@ -818,6 +1106,14 @@ internal sealed class AwaitingKafkaMessageDispatcher : KafkaMessageDispatcher
     /// </summary>
     private async Task SettleAfterLoopExitAsync(DetachedPartition work)
     {
+        if (IsOrphaned(work))
+        {
+            // Its partition was revoked while it ran: there is no offset of ours to store, so the
+            // stop does not wait for it either.
+            ObserveOrphaned(work);
+            return;
+        }
+
         try
         {
             await work.Settlement.ConfigureAwait(false);
@@ -843,42 +1139,91 @@ internal sealed class AwaitingKafkaMessageDispatcher : KafkaMessageDispatcher
     }
 
     /// <summary>
-    /// Logs the eventual outcome of a handler the fault teardown abandoned. It never touches the
-    /// consumer — the one it was consumed on is closed by then — so the outcome is informational:
-    /// the message has already been handed back to the group for redelivery.
+    /// Logs the eventual outcome of a handler whose partition was revoked while it ran. Like an
+    /// abandoned one it never touches the consumer: the message belongs to the partition's current
+    /// owner, which re-consumes it from the group's committed offset — storing this one's offset
+    /// would rewind that owner's commits. <paramref name="committedPast"/>: the new assignment
+    /// started past the message — the group has already committed past it, so nobody re-consumes it.
     /// </summary>
-    private void ObserveAbandoned(DetachedPartition work)
+    private void ObserveOrphaned(DetachedPartition work, bool committedPast = false)
+    {
+        if (committedPast)
+        {
+            Logger.LogInformation(
+                "Detached Kafka handler for {Topic}[{Partition}]@{Offset} outlived its partition's assignment (a rebalance revoked it) and the group has already committed past its message; its offset will not be stored and nothing is held behind it — the message is not redelivered.",
+                work.Delivery.Topic,
+                work.Delivery.Partition,
+                work.Delivery.Offset);
+        }
+        else
+        {
+            Logger.LogInformation(
+                "Detached Kafka handler for {Topic}[{Partition}]@{Offset} outlived its partition's assignment (a rebalance revoked it); its offset will not be stored and nothing is held behind it — the partition's current owner redelivers the message.",
+                work.Delivery.Topic,
+                work.Delivery.Partition,
+                work.Delivery.Offset);
+        }
+
+        ObserveAbandoned(work, revoked: true, committedPast);
+    }
+
+    /// <summary>
+    /// Logs the eventual outcome of a handler the fault teardown abandoned (or whose partition a
+    /// rebalance revoked, <paramref name="revoked"/>). It never touches the consumer — the one it
+    /// was consumed on is closed by then, or no longer holds its assignment — so the outcome is
+    /// informational: the message has already been handed back to the group for redelivery —
+    /// unless <paramref name="committedPast"/>, when the group has already committed past it.
+    /// </summary>
+    private void ObserveAbandoned(DetachedPartition work, bool revoked = false, bool committedPast = false)
         => _ = work.Settlement.ContinueWith(
             static (settlement, state) =>
             {
-                var (logger, delivery) = ((ILogger, KafkaDelivery))state!;
+                var (logger, delivery, revoked, committedPast) = ((ILogger, KafkaDelivery, bool, bool))state!;
+                var kind = revoked ? "Orphaned" : "Abandoned";
+                var where = revoked
+                    ? "after a rebalance revoked its partition"
+                    : "after the consumer it was consumed on was rebuilt";
+                var redelivery = committedPast
+                    ? "the group had already committed past the message, so it is not redelivered"
+                    : revoked
+                        ? "its offset was never stored, so the partition's current owner redelivers the message"
+                        : "its offset was never stored, so the message redelivers on the rebuilt consumer";
                 if (settlement.IsCanceled)
                 {
                     logger.LogInformation(
-                        "Abandoned Kafka handler for {Topic}[{Partition}]@{Offset} stopped on the session's cancellation; the message redelivers on the rebuilt consumer.",
+                        "{Kind} Kafka handler for {Topic}[{Partition}]@{Offset} stopped on cancellation {Where}; {Redelivery}.",
+                        kind,
                         delivery.Topic,
                         delivery.Partition,
-                        delivery.Offset);
+                        delivery.Offset,
+                        where,
+                        redelivery);
                 }
                 else if (settlement.IsFaulted)
                 {
                     logger.LogWarning(
                         settlement.Exception!.GetBaseException(),
-                        "Abandoned Kafka handler for {Topic}[{Partition}]@{Offset} failed after the consumer it was consumed on was rebuilt; the message redelivers there.",
+                        "{Kind} Kafka handler for {Topic}[{Partition}]@{Offset} failed {Where}; {Redelivery}.",
+                        kind,
                         delivery.Topic,
                         delivery.Partition,
-                        delivery.Offset);
+                        delivery.Offset,
+                        where,
+                        redelivery);
                 }
                 else
                 {
                     logger.LogInformation(
-                        "Abandoned Kafka handler for {Topic}[{Partition}]@{Offset} completed after the consumer it was consumed on was rebuilt; its offset was never stored, so the message redelivers there (handlers are at-least-once).",
+                        "{Kind} Kafka handler for {Topic}[{Partition}]@{Offset} completed {Where}; {Redelivery} (handlers are at-least-once).",
+                        kind,
                         delivery.Topic,
                         delivery.Partition,
-                        delivery.Offset);
+                        delivery.Offset,
+                        where,
+                        redelivery);
                 }
             },
-            (Logger, work.Delivery),
+            (Logger, work.Delivery, revoked, committedPast),
             CancellationToken.None,
             TaskContinuationOptions.ExecuteSynchronously,
             TaskScheduler.Default);
@@ -900,9 +1245,14 @@ internal sealed class AwaitingKafkaMessageDispatcher : KafkaMessageDispatcher
             {
                 await ExecuteHandlerAsync(delivery, attempt, subscriberCancellationToken).ConfigureAwait(false);
             }
-            catch (OperationCanceledException) when (subscriberCancellationToken.IsCancellationRequested)
+            catch (OperationCanceledException ex) when (subscriberCancellationToken.IsCancellationRequested || ex is DurableFlowInterruptedException)
             {
-                // Offset not stored: the message is redelivered after restart or rebalance.
+                // Offset not stored: the message is redelivered after restart or rebalance. The
+                // flow engine's host-stop hand-back is recognized by TYPE: the host fires
+                // ApplicationStopping before it stops any hosted service, so it arrives while this
+                // subscriber's own token is still live — and treated as a failure it ran the
+                // retry ladder against a stopping host and, past it, dead-lettered a flow's only
+                // wake-up and stored its offset.
                 throw;
             }
             catch (Exception ex)
@@ -1014,11 +1364,18 @@ internal sealed class AwaitingKafkaMessageDispatcher : KafkaMessageDispatcher
         }
     }
 
-    private sealed class DetachedPartition(KafkaDelivery delivery, Task settlement, CancellationToken subscriberCancellationToken)
+    private sealed class DetachedPartition(KafkaDelivery delivery, Task settlement, CancellationToken subscriberCancellationToken, long generation)
     {
         public KafkaDelivery Delivery { get; } = delivery;
         public Task Settlement { get; } = settlement;
         public CancellationToken SubscriberCancellationToken { get; } = subscriberCancellationToken;
+
+        /// <summary>
+        /// The partition's assignment generation when the message was consumed (see
+        /// <see cref="IKafkaConsumerClient.GetAssignmentGeneration"/>), or the later one that
+        /// re-adopted the handler (see <see cref="TryHoldBehindDetached"/>).
+        /// </summary>
+        public long Generation { get; set; } = generation;
 
         /// <summary>Messages consumed for the partition while its handler was detached, in order.</summary>
         public Queue<HeldMessage>? Held { get; set; }
@@ -1033,6 +1390,8 @@ internal sealed class AwaitingKafkaMessageDispatcher : KafkaMessageDispatcher
         public static HeldMessage For(KafkaDelivery delivery) => new(delivery, null, null);
 
         public static HeldMessage Unprocessable(KafkaIncomingMessage message, Exception failure) => new(null, message, failure);
+
+        public long Offset => Delivery?.Offset ?? Message!.Offset;
     }
 }
 
@@ -1051,7 +1410,7 @@ internal sealed class QueuedKafkaMessageDispatcher : KafkaMessageDispatcher
     /// <summary>Runs the QueuedKafkaMessageDispatcher operation.</summary>
     public QueuedKafkaMessageDispatcher(
         Func<KafkaDelivery, CancellationToken, Task> handler,
-        IKafkaConsumerClient consumer,
+        IKafkaConsumerClient? consumer,
         IKafkaProducerClient producer,
         KafkaAsyncResponseTransportOptions transportOptions,
         KafkaSubscriberOptions subscriberOptions,
@@ -1068,7 +1427,9 @@ internal sealed class QueuedKafkaMessageDispatcher : KafkaMessageDispatcher
         {
             AllowSynchronousContinuations = false,
             FullMode = BoundedChannelFullMode.Wait,
-            SingleReader = subscriberOptions.BackgroundWorkerCount == 1,
+            // Never single-reader: once the drain budget lapses, DisposeAsync reads the queue
+            // alongside the workers to route what is still queued.
+            SingleReader = false,
             SingleWriter = false
         });
 
@@ -1088,6 +1449,20 @@ internal sealed class QueuedKafkaMessageDispatcher : KafkaMessageDispatcher
     internal int RunningCount => Volatile.Read(ref _runningCount);
 
     public override bool CanAcceptMore => Volatile.Read(ref _pendingCount) < _capacity;
+
+    // The queue and its workers belong to the hosted service, not to one supervised attempt: the
+    // workers never touch the consumer (only the poll thread's enqueue stores an offset, through
+    // the attached one), so nothing in here is per attempt, and disposing it IS the stop-time
+    // drain — owned per attempt, every poll-loop fault on a healthy host paused the whole
+    // subscriber for the drain budget and then dead-lettered committed work unstarted as
+    // "drain budget lapsed" (or lost it, when the fault was the dead-letter topic itself).
+
+    /// <summary>
+    /// A poll-loop fault is not a stop: the queued work keeps running and the next attempt's
+    /// consumer is attached to this same instance, so there is nothing to tear down (the attempt's
+    /// consumer attachment is released by the subscriber).
+    /// </summary>
+    public override ValueTask TeardownAfterFaultAsync() => ValueTask.CompletedTask;
 
     /// <summary>Handles the delivered message.</summary>
     public override async Task HandleAsync(
@@ -1118,6 +1493,17 @@ internal sealed class QueuedKafkaMessageDispatcher : KafkaMessageDispatcher
         {
             StoreOffset(delivery);
         }
+        catch (KafkaPartitionNotAssignedException ex)
+        {
+            // Routine in a consumer group, as on the ack-after-handler settlement path: a
+            // rebalance took the partition, and its new owner re-consumes the message.
+            Logger.LogInformation(
+                ex,
+                "Did not store the offset of Kafka message {Topic}[{Partition}]@{Offset} after enqueue: a rebalance revoked the partition, so its new owner redelivers it while this copy is processed (at-least-once).",
+                delivery.Topic,
+                delivery.Partition,
+                delivery.Offset);
+        }
         catch (Exception ex)
         {
             Logger.LogError(
@@ -1142,9 +1528,19 @@ internal sealed class QueuedKafkaMessageDispatcher : KafkaMessageDispatcher
             RunningCount);
         _queue.Writer.TryComplete();
 
+        // BackgroundDrainTimeout is the whole spend the shutdown-budget validator sums for this
+        // dispatcher, so it is split rather than exceeded (DbTransportShared parity): most of it
+        // lets queued and running handlers finish, and a quarter is RESERVED for burying what is
+        // still queued once it lapses. That burial used to be left to the worker loop's lapse
+        // branch alone, which only runs when a busy worker frees up — with every worker still
+        // inside a long handler nothing ran it before this method returned, and the committed
+        // entries still queued raced the host disposing the shared producer and the process
+        // exiting: no dead-letter copy, no OnBackgroundFailure, no per-message log.
+        var routingReserve = TimeSpan.FromTicks(_drainTimeout.Ticks / 4);
+        var drainBudget = _drainTimeout - routingReserve;
         try
         {
-            await Task.WhenAll(_workers).WaitAsync(_drainTimeout).ConfigureAwait(false);
+            await Task.WhenAll(_workers).WaitAsync(drainBudget).ConfigureAwait(false);
             _drainCancellation.Dispose();
         }
         catch (TimeoutException ex)
@@ -1152,10 +1548,12 @@ internal sealed class QueuedKafkaMessageDispatcher : KafkaMessageDispatcher
             _drainCancellation.Cancel();
             Logger.LogWarning(
                 ex,
-                "Timed out while draining Kafka ACK-after-enqueue dispatcher for {Topic}. Pending={PendingCount}, Running={RunningCount}. Already committed work may be interrupted by host shutdown.",
+                "Timed out while draining Kafka ACK-after-enqueue dispatcher for {Topic}. Pending={PendingCount}, Running={RunningCount}. Dead-lettering the messages still queued; already committed work that is running may be interrupted by host shutdown.",
                 _topic,
                 PendingCount,
                 RunningCount);
+
+            await RouteUndrainedAsync(routingReserve).ConfigureAwait(false);
 
             _ = Task.WhenAll(_workers).ContinueWith(
                 _ => _drainCancellation.Dispose(),
@@ -1173,6 +1571,89 @@ internal sealed class QueuedKafkaMessageDispatcher : KafkaMessageDispatcher
         }
     }
 
+    /// <summary>
+    /// Runs inside <see cref="DisposeAsync"/> once the drain budget has lapsed, within the reserved
+    /// quarter of it and before the subscriber (and then the host) disposes the shared producer:
+    /// every message still queued is surfaced through
+    /// <see cref="KafkaSubscriberOptions.OnBackgroundFailure"/> and dead-lettered here, instead of
+    /// waiting for a worker that is still inside a long handler. Whatever the reserve cannot cover
+    /// is counted in one error; workers that free up later keep routing it through their own lapse
+    /// branch.
+    /// </summary>
+    private async Task RouteUndrainedAsync(TimeSpan reserve)
+    {
+        using var budget = new CancellationTokenSource(reserve);
+        while (!budget.IsCancellationRequested && _queue.Reader.TryRead(out var delivery))
+        {
+            Interlocked.Decrement(ref _pendingCount);
+            await RouteLapsedAsync(delivery, budget.Token).ConfigureAwait(false);
+        }
+
+        // A worker the cancellation cut short (mid-handler, or mid-retry-backoff) settles its own
+        // delivery on the way out; the rest of the reserve is theirs, so that copy lands before
+        // this method returns and the producer goes away.
+        try
+        {
+            await Task.WhenAll(_workers).WaitAsync(budget.Token).ConfigureAwait(false);
+        }
+        catch (Exception)
+        {
+            // The reserve lapsed with a worker still inside a handler that ignores the token (or a
+            // worker faulted outside its guard, which the caller's drain path already reports).
+        }
+
+        var remaining = _queue.Reader.Count;
+        if (remaining > 0)
+        {
+            Logger.LogError(
+                "{Remaining} already-committed Kafka messages on {Topic} were neither handled nor dead-lettered within the {Reserve} reserved after the drain budget lapsed; any still queued at process exit are lost (their offsets are committed).",
+                remaining,
+                _topic,
+                reserve);
+        }
+    }
+
+    /// <summary>
+    /// Settlement of an already-committed message that will never be handled because the drain
+    /// budget lapsed: surfaced through the callback and dead-lettered, since Kafka will not
+    /// redeliver it.
+    /// </summary>
+    private async Task RouteLapsedAsync(KafkaDelivery delivery, CancellationToken cancellationToken)
+    {
+        var lapsed = new OperationCanceledException(
+            "The ACK-after-enqueue drain budget lapsed before this already-committed message was handled.");
+        Logger.LogWarning(
+            "Kafka background handler for already-committed message {Topic}[{Partition}]@{Offset} was not started: the drain budget had lapsed. Dead-lettering and surfacing via OnBackgroundFailure.",
+            delivery.Topic,
+            delivery.Partition,
+            delivery.Offset);
+        await NotifyBackgroundFailureAsync(delivery, lapsed).ConfigureAwait(false);
+        await TryDeadLetterAfterCommitAsync(delivery, lapsed, "drain_budget_lapsed_after_commit", 0, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>Best-effort burial of an already-committed message: a failure is only logged (the offset is committed either way).</summary>
+    private async Task TryDeadLetterAfterCommitAsync(
+        KafkaDelivery delivery,
+        Exception exception,
+        string reason,
+        int attempts,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            await DeadLetterAsync(delivery, exception, reason, attempts, cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception deadLetterException)
+        {
+            Logger.LogError(
+                deadLetterException,
+                "Failed to dead-letter already-committed Kafka message {Topic}[{Partition}]@{Offset}.",
+                delivery.Topic,
+                delivery.Partition,
+                delivery.Offset);
+        }
+    }
+
     private async Task RunWorkerAsync(int workerIndex)
     {
         await foreach (var delivery in _queue.Reader.ReadAllAsync().ConfigureAwait(false))
@@ -1187,34 +1668,7 @@ internal sealed class QueuedKafkaMessageDispatcher : KafkaMessageDispatcher
             // no record (its offset was stored at enqueue, so Kafka never redelivers it).
             if (_drainCancellation.IsCancellationRequested)
             {
-                var lapsed = new OperationCanceledException(
-                    "The ACK-after-enqueue drain budget lapsed before this already-committed message was handled.");
-                Logger.LogWarning(
-                    "Kafka background handler for already-committed message {Topic}[{Partition}]@{Offset} was not started: the drain budget had lapsed. Dead-lettering and surfacing via OnBackgroundFailure.",
-                    delivery.Topic,
-                    delivery.Partition,
-                    delivery.Offset);
-                await NotifyBackgroundFailureAsync(delivery, lapsed).ConfigureAwait(false);
-
-                try
-                {
-                    await DeadLetterAsync(
-                        delivery,
-                        lapsed,
-                        "drain_budget_lapsed_after_commit",
-                        0,
-                        CancellationToken.None).ConfigureAwait(false);
-                }
-                catch (Exception deadLetterException)
-                {
-                    Logger.LogError(
-                        deadLetterException,
-                        "Failed to dead-letter already-committed Kafka message {Topic}[{Partition}]@{Offset}.",
-                        delivery.Topic,
-                        delivery.Partition,
-                        delivery.Offset);
-                }
-
+                await RouteLapsedAsync(delivery, CancellationToken.None).ConfigureAwait(false);
                 continue;
             }
 
@@ -1226,15 +1680,18 @@ internal sealed class QueuedKafkaMessageDispatcher : KafkaMessageDispatcher
             }
             catch (OperationCanceledException ex) when (_drainCancellation.IsCancellationRequested)
             {
-                // The drain budget lapsed with this already-committed message still unprocessed:
-                // Kafka will not redeliver it, so surface the drop through OnBackgroundFailure
-                // instead of losing it silently.
+                // The drain budget lapsed with this already-committed message still unsettled (its
+                // handler failed and the retry backoff was cut short): Kafka will not redeliver it,
+                // so surface the drop through OnBackgroundFailure AND bury it — an unstarted entry
+                // is dead-lettered on this same lapse, and one that already failed once has at
+                // least as much reason to leave a record.
                 Logger.LogWarning(
-                    "Kafka background handler for already-committed message {Topic}[{Partition}]@{Offset} was canceled during dispatcher shutdown; surfacing via OnBackgroundFailure.",
+                    "Kafka background handler for already-committed message {Topic}[{Partition}]@{Offset} was canceled during dispatcher shutdown; dead-lettering and surfacing via OnBackgroundFailure.",
                     delivery.Topic,
                     delivery.Partition,
                     delivery.Offset);
                 await NotifyBackgroundFailureAsync(delivery, ex).ConfigureAwait(false);
+                await TryDeadLetterAfterCommitAsync(delivery, ex, "drain_budget_lapsed_after_commit", 0, CancellationToken.None).ConfigureAwait(false);
             }
             finally
             {
@@ -1269,6 +1726,41 @@ internal sealed class QueuedKafkaMessageDispatcher : KafkaMessageDispatcher
                 // assignment paused, and the subscriber wedged with no dead-letter record and no
                 // OnBackgroundFailure, because both live inside this block. After an early ACK
                 // the sibling transports never retry at all, so 0 means a single attempt here.
+                //
+                // The flow engine's host-stop hand-back ends the ladder at once, too: the offset was
+                // committed at enqueue, so there is no delivery to hand back, and every retry would
+                // be interrupted by the same stopping host — only the record below is left to write.
+                if (ex is DurableFlowInterruptedException)
+                {
+                    // A hand-back, not a failure: a Warning (an Error alerted on every deploy that
+                    // stopped a host mid-flow), surfaced and dead-lettered under its own reason —
+                    // early ACK can never redeliver, and the flow's checkpoints make a replay of
+                    // the copy safe. With dead-lettering disabled no copy is written and the
+                    // wake-up is lost: that is an Error, and the log must not claim a copy.
+                    if (TransportOptions.DeadLetterEnabled)
+                    {
+                        Logger.LogWarning(
+                            ex,
+                            "Kafka background handler for already-committed message {Topic}[{Partition}]@{Offset} was handed back because the host is stopping; its offset is already committed, so Kafka will not redeliver it. Dead-lettering a copy (handed_back_after_commit) and surfacing via OnBackgroundFailure.",
+                            delivery.Topic,
+                            delivery.Partition,
+                            delivery.Offset);
+                    }
+                    else
+                    {
+                        Logger.LogError(
+                            ex,
+                            "Kafka background handler for already-committed message {Topic}[{Partition}]@{Offset} was handed back because the host is stopping; its offset is already committed and no dead-letter destination is configured, so the wake-up is lost unless OnBackgroundFailure records it (resume the flow explicitly).",
+                            delivery.Topic,
+                            delivery.Partition,
+                            delivery.Offset);
+                    }
+
+                    await NotifyBackgroundFailureAsync(delivery, ex).ConfigureAwait(false);
+                    await TryDeadLetterAfterCommitAsync(delivery, ex, "handed_back_after_commit", attempt, CancellationToken.None).ConfigureAwait(false);
+                    return;
+                }
+
                 if (MaxDeliveryAttempts <= 0 || ReachedDeliveryAttempts(attempt))
                 {
                     Logger.LogError(
@@ -1279,26 +1771,7 @@ internal sealed class QueuedKafkaMessageDispatcher : KafkaMessageDispatcher
                         delivery.Offset,
                         attempt);
                     await NotifyBackgroundFailureAsync(delivery, ex).ConfigureAwait(false);
-
-                    try
-                    {
-                        await DeadLetterAsync(
-                            delivery,
-                            ex,
-                            "background_handler_failed_after_commit",
-                            attempt,
-                            CancellationToken.None).ConfigureAwait(false);
-                    }
-                    catch (Exception deadLetterException)
-                    {
-                        Logger.LogError(
-                            deadLetterException,
-                            "Failed to dead-letter already-committed Kafka message {Topic}[{Partition}]@{Offset}.",
-                            delivery.Topic,
-                            delivery.Partition,
-                            delivery.Offset);
-                    }
-
+                    await TryDeadLetterAfterCommitAsync(delivery, ex, "background_handler_failed_after_commit", attempt, CancellationToken.None).ConfigureAwait(false);
                     return;
                 }
 

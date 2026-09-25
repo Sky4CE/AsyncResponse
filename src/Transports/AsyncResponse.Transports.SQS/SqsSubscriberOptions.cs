@@ -83,13 +83,17 @@ public sealed class SqsSubscriberOptions
     public TimeSpan? RedeliveryDelay { get; set; }
 
     /// <summary>
-    /// Heartbeat cadence for extending the visibility of received-but-unprocessed messages while a
-    /// <see cref="SqsAckMode.AckAfterHandlerCompletes"/> batch is worked through serially. Each beat
-    /// resets every unprocessed message's invisibility to <see cref="VisibilityTimeout"/> via
-    /// <c>ChangeMessageVisibility</c>, so a slow handler does not let later batch messages become
-    /// visible (and be processed twice) before their turn. Requires <see cref="VisibilityTimeout"/>
-    /// to be set and must be shorter than it. Renewal failures are logged and processing continues —
-    /// the message simply redelivers, preserving at-least-once semantics.
+    /// Heartbeat cadence for extending the visibility of a received message while its
+    /// <see cref="SqsAckMode.AckAfterHandlerCompletes"/> handler runs (the subscriber receives one
+    /// message at a time in that mode). Each beat resets the unsettled message's invisibility to
+    /// <see cref="VisibilityTimeout"/> via <c>ChangeMessageVisibility</c>, so a slow handler does not
+    /// let it become visible — and be processed twice — mid-run. SQS never keeps a message invisible
+    /// for more than 12 hours from its receive: the heartbeat clamps its last extension to that
+    /// ceiling, logs one warning and stops, and SQS then redelivers the message however alive its
+    /// handler is. The heartbeat is not ended by the host stop: it ends when the handler returns.
+    /// Requires <see cref="VisibilityTimeout"/> to be set and must be shorter than it. Renewal
+    /// failures are logged and processing continues — the message simply redelivers, preserving
+    /// at-least-once semantics.
     /// <c>null</c> (the default) disables renewal: it is off by default because extending visibility
     /// silently changes redrive timing operators tune on the queue, and on FIFO queues an extended
     /// message keeps its whole message group blocked if the consumer wedges, delaying failover.

@@ -1,0 +1,170 @@
+using Microsoft.Extensions.Logging;
+using System.Runtime.CompilerServices;
+using System.Text.Json;
+using System.Text.Json.Serialization.Metadata;
+
+namespace AsyncResponse.Channels;
+
+// Shared source for the database-backed channels' recovery-state stores (PostgreSQL, SQL Server,
+// MongoDB), compiled INTO each provider assembly via <Compile Include> exactly like
+// DbChannelShared.cs, and bound to the provider's store through the same DbChannelStore global
+// using alias. The three stores were line-for-line copies apart from type and provider names, and
+// every behavioural fix to them (validation, JsonSafety, the unreadable-row rules) had to land
+// three times in lockstep. Each provider keeps a thin sealed derivation, so DI registrations, the
+// ILogger<T> categories and the type names test projects reach through InternalsVisibleTo stay
+// exactly what they were.
+
+/// <summary>
+/// Provider-agnostic <see cref="IRecoveryStateStore"/> and <see cref="IRecoveryStateScanner"/> over
+/// a database channel store: argument validation, and materialization of the stored registrations
+/// with the unreadable-row rules.
+/// </summary>
+internal abstract class DbRecoveryStateStoreBase(
+    DbChannelStore store,
+    ILogger logger,
+    string providerName) : IRecoveryStateStore, IRecoveryStateScanner
+{
+    /// <inheritdoc />
+    public async Task SaveAsync(string correlationId, RecoveryState state, TimeSpan ttl, CancellationToken cancellationToken = default)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(correlationId);
+        ArgumentNullException.ThrowIfNull(state);
+        if (ttl <= TimeSpan.Zero)
+            throw new ArgumentOutOfRangeException(nameof(ttl), "TTL must be greater than zero.");
+        if (!string.Equals(state.CorrelationId, correlationId, StringComparison.Ordinal))
+            throw new ArgumentException("The recovery-state correlation id must match the store key.", nameof(state));
+        if (state.SchemaVersion != RecoveryStateSchema.Current)
+            throw new ArgumentException("The recovery state must use the current schema version.", nameof(state));
+
+        cancellationToken.ThrowIfCancellationRequested();
+        if (state.RegistrationId == Guid.Empty)
+            state.RegistrationId = Guid.NewGuid();
+
+        await store.SaveRecoveryStateAsync(correlationId, state, ttl, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <inheritdoc />
+    public async Task<IReadOnlyList<RecoveryState>> GetAllAsync(string correlationId, CancellationToken cancellationToken = default)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(correlationId);
+        cancellationToken.ThrowIfCancellationRequested();
+
+        var jsonStates = await store.LoadRecoveryStatesAsync(correlationId, cancellationToken).ConfigureAwait(false);
+        return DeserializeStates(jsonStates, correlationId);
+    }
+
+    /// <inheritdoc />
+    public Task<bool> TryDeleteAsync(string correlationId, Guid registrationId, CancellationToken cancellationToken = default)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(correlationId);
+        if (registrationId == Guid.Empty)
+            throw new ArgumentException("Registration id cannot be empty.", nameof(registrationId));
+        cancellationToken.ThrowIfCancellationRequested();
+        return store.DeleteRecoveryStateAsync(correlationId, registrationId, cancellationToken);
+    }
+
+    /// <inheritdoc />
+    public async IAsyncEnumerable<RecoveryState> ScanAsync([EnumeratorCancellation] CancellationToken cancellationToken = default)
+    {
+        await foreach (var json in store.ScanRecoveryStateJsonAsync(cancellationToken).ConfigureAwait(false))
+        {
+            var ignored = 0;
+            var state = DeserializeState(json, correlationId: null, ref ignored);
+            if (state is not null)
+                yield return state;
+        }
+    }
+
+    private IReadOnlyList<RecoveryState> DeserializeStates(IReadOnlyList<string> jsonStates, string correlationId)
+    {
+        if (jsonStates.Count == 0)
+            return [];
+
+        var states = new List<RecoveryState>(jsonStates.Count);
+        var unreadable = 0;
+        foreach (var json in jsonStates)
+        {
+            var state = DeserializeState(json, correlationId, ref unreadable);
+            if (state is not null)
+                states.Add(state);
+        }
+
+        // Rows existed and none of them survived materialization. Returning an empty list here told
+        // the dispatcher "no recovery callback was ever armed", which it answers by acknowledging
+        // the response — so a corrupt or newer-schema registration silently consumed a terminal
+        // response its callback never saw. Fail instead, and let redelivery reach a build that can
+        // read it. A PARTIALLY readable batch deliberately does not throw: see
+        // RecoveryStateUnreadableException.
+        // Only rows this build could not INTERPRET count. A row rejected for belonging to another
+        // correlation id is perfectly readable — it surfaced because a legacy case-insensitive
+        // collation matched the wrong key, and refusing it is the ordinal re-check doing its job.
+        // For the id actually asked about, that is absence, not corruption, and absence must stay
+        // an empty list.
+        if (states.Count == 0 && unreadable > 0)
+            throw new RecoveryStateUnreadableException(correlationId, unreadable);
+
+        return states;
+    }
+
+    /// <summary>The registration's metadata off the library's resolver — case-sensitive matching, as before.</summary>
+    private static readonly JsonTypeInfo<RecoveryState> _stateTypeInfo =
+        AsyncResponseJson.GetTypeInfo<RecoveryState>(AsyncResponseJson.Default);
+
+    // private protected, not private: the provider test suites reach it by reflection through the
+    // derived store types, and reflection over a derived type sees inherited non-private members only.
+    private protected RecoveryState? DeserializeState(string json, string? correlationId, ref int unreadable)
+    {
+        try
+        {
+            // Through JsonSafety, not the raw reader: the exception logged below is the body-free
+            // rebuild (size and position). The reader's own appends `Path: $.Context['<key>']`
+            // built from the stored registration's context keys — tenant and auth baggage — which
+            // the warning then carried into the application log.
+            var state = JsonSafety.SafeDeserialize(json, _stateTypeInfo);
+            if (state is null)
+            {
+                unreadable++;
+                return null;
+            }
+
+            if (state.RegistrationId == Guid.Empty || string.IsNullOrWhiteSpace(state.CorrelationId))
+            {
+                logger.LogWarning(
+                    "{Provider} recovery state for correlationId {CorrelationId} has an incomplete identity; rejecting it.",
+                    providerName,
+                    correlationId ?? state.CorrelationId);
+                unreadable++;
+                return null;
+            }
+
+            if (!RecoveryStateSchema.IsReadable(state.SchemaVersion))
+            {
+                logger.LogWarning(
+                    "{Provider} recovery state for correlationId {CorrelationId} has unsupported schema version {SchemaVersion} (current: {Current}); rejecting it instead of risking a misinterpreted recovery.",
+                    providerName,
+                    correlationId ?? state.CorrelationId,
+                    state.SchemaVersion,
+                    RecoveryStateSchema.Current);
+                unreadable++;
+                return null;
+            }
+
+            if (!string.IsNullOrWhiteSpace(correlationId)
+                && !string.Equals(state.CorrelationId, correlationId, StringComparison.Ordinal))
+            {
+                logger.LogWarning(
+                    "{Provider} recovery state has correlationId {StoredCorrelationId}, expected {CorrelationId}; rejecting it.",
+                    providerName, state.CorrelationId, correlationId);
+                return null;
+            }
+
+            return state;
+        }
+        catch (Exception ex) when (ex is JsonException or InvalidDataException)
+        {
+            logger.LogWarning(ex, "Unreadable {Provider} recovery state for correlationId {CorrelationId}; skipping.", providerName, correlationId);
+            unreadable++;
+            return null;
+        }
+    }
+}

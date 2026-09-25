@@ -23,14 +23,27 @@ public sealed class Round35RegressionTests
 
     public sealed record R35Input(string Name);
 
-    /// <summary>A flow that records having run, so a test can prove whether it did.</summary>
-    public sealed class R35MarkerFlow : IDurableFlow<R35Input>
+    /// <summary>
+    /// Counts <see cref="R35MarkerFlow"/> executions for ONE provider. Registered as a singleton per
+    /// test provider, never static: a process-wide counter was shared with
+    /// <see cref="Round35NewApiTests"/>, which runs in parallel, so a "ran exactly once more"
+    /// assertion here could see that class's execution too.
+    /// </summary>
+    public sealed class R35ExecutionCounter
     {
-        public static int Executions;
+        private int _executions;
 
+        public int Executions => Volatile.Read(ref _executions);
+
+        public void Increment() => Interlocked.Increment(ref _executions);
+    }
+
+    /// <summary>A flow that records having run, so a test can prove whether it did.</summary>
+    public sealed class R35MarkerFlow(R35ExecutionCounter counter) : IDurableFlow<R35Input>
+    {
         public Task ExecuteAsync(IDurableFlowContext flow, R35Input input)
         {
-            Interlocked.Increment(ref Executions);
+            counter.Increment();
             return Task.CompletedTask;
         }
     }
@@ -71,6 +84,7 @@ public sealed class Round35RegressionTests
             .WithInMemoryChannel()
             .WithInMemoryDurableFlows()
             .WithDurableFlow<R35MarkerFlow, R35Input>();
+        services.AddSingleton<R35ExecutionCounter>();
         services.AddSingleton<IWorkerTransport>(transport);
         return services.BuildServiceProvider();
     }
@@ -142,14 +156,15 @@ public sealed class Round35RegressionTests
         Assert.True(await store.TryDeleteAsync(id));
         Assert.Null(await store.LoadAsync(id));
 
-        var before = Volatile.Read(ref R35MarkerFlow.Executions);
+        var counter = provider.GetRequiredService<R35ExecutionCounter>();
+        var before = counter.Executions;
         await ingress.HandleWorkerMessageAsync(AsyncResponseJson.Serialize(job));
 
         var state = await store.LoadAsync(id);
         Assert.NotNull(state);
         Assert.Equal(FlowRunStatus.Succeeded, state!.Status);
         Assert.Equal(typeof(R35MarkerFlow).FullName, state.FlowTypeName);
-        Assert.Equal(before + 1, Volatile.Read(ref R35MarkerFlow.Executions));
+        Assert.Equal(before + 1, counter.Executions);
     }
 
     /// <summary>Pin (unchanged behavior): an identical explicit-id start re-enqueues, a conflicting one is rejected.</summary>
@@ -299,6 +314,64 @@ public sealed class Round35RegressionTests
         await Assert.ThrowsAsync<CallbackTargetUnresolvableException>(() => builder.EnqueueWorkerAsync<IOverloaded>(svc => svc.Run(1)));
 
         Assert.Empty(transport.Snapshot());
+    }
+
+    public static TheoryData<string> MalformedDescriptorShapes => ["null-service", "blank-method", "null-params", "null-entry"];
+
+    private static ReflectionCallDto MalformedDescriptor(string shape)
+    {
+        var descriptor = new ReflectionCallDto
+        {
+            ServiceInterfaceFullName = typeof(IOverloaded).FullName!,
+            MethodName = nameof(IOverloaded.Unique),
+            Params = [CallbackParam.ForValue(7)]
+        };
+        switch (shape)
+        {
+            case "null-service": descriptor.ServiceInterfaceFullName = null!; break;
+            case "blank-method": descriptor.MethodName = " "; break;
+            case "null-params": descriptor.Params = null!; break;
+            case "null-entry": descriptor.Params = [null!]; break;
+            default: throw new ArgumentOutOfRangeException(nameof(shape), shape, null);
+        }
+
+        return descriptor;
+    }
+
+    /// <summary>
+    /// Pre-fix failure: a descriptor with a null or blank name, a null Params, or a null entry
+    /// published cleanly (the size estimate tolerates null names; with no inbound budget nothing
+    /// dereferences Params) and the consumer's parse gate then drop-acknowledged it — the job
+    /// silently never ran while the producer saw success.
+    /// </summary>
+    [Theory]
+    [MemberData(nameof(MalformedDescriptorShapes))]
+    public async Task EnqueueWorker_WithAMalformedDescriptor_ThrowsInTheCallersStack_AndPublishesNothing(string shape)
+    {
+        var transport = new CapturingWorkerTransport();
+        var services = new ServiceCollection();
+        services.AddSingleton(typeof(ILogger<>), typeof(NullLogger<>));
+        services.AddAsyncResponse(options => options.MaxInboundMessageChars = null).WithInMemoryChannel();
+        services.AddSingleton<IWorkerTransport>(transport);
+        await using var provider = services.BuildServiceProvider();
+        var builder = provider.GetRequiredService<IAsyncResponseBuilder>();
+
+        await Assert.ThrowsAsync<ArgumentException>(() => builder.EnqueueWorkerAsync(MalformedDescriptor(shape)));
+
+        Assert.Empty(transport.Snapshot());
+    }
+
+    /// <summary>Pre-fix failure: the malformed descriptor was persisted and could never be invoked when the response arrived.</summary>
+    [Theory]
+    [MemberData(nameof(MalformedDescriptorShapes))]
+    public async Task RecoveryCallbackRegistration_WithAMalformedDescriptor_ThrowsAtRegistration(string shape)
+    {
+        var transport = new CapturingWorkerTransport();
+        await using var provider = BuildFlowProvider(transport);
+        var builder = provider.GetRequiredService<IRecoverableAsyncResponseBuilder>();
+
+        Assert.Throws<ArgumentException>(() => builder.For<OperationResult>().OnLostSubscriberResume(MalformedDescriptor(shape)));
+        Assert.Throws<ArgumentException>(() => builder.For<OperationResult>().OnLostSubscriberFailure(MalformedDescriptor(shape)));
     }
 
     /// <summary>Pre-fix failure: the registration succeeded and the recovery callback was unresolvable when it fired.</summary>

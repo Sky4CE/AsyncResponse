@@ -93,6 +93,23 @@ public sealed class CorrelationIdJsonPathsTests
                 """{"First":{"CorrelationId":"\ud800"},"Second":{"CorrelationId":"from-second-path"}}""",
                 ["First.CorrelationId", "Second.CorrelationId"]));
 
+    /// <summary>
+    /// Regression: only <see cref="JsonException"/> was caught around the parse, but a RAW lone
+    /// surrogate — which a SQL Server <c>nvarchar(max)</c> row holds unvalidated and SqlClient hands
+    /// back verbatim — cannot even be transcoded to the UTF-8 <c>JsonDocument.Parse(string)</c>
+    /// reads, and that throws <see cref="ArgumentException"/>. The unresolvable response became a
+    /// handler failure: redelivered up to the attempt cap with Error logs, then dead-lettered,
+    /// instead of the unroutable log + ACK every other unresolvable body gets. The ill-formed string
+    /// is built here, not in theory data (xUnit serialization mangles lone surrogates).
+    /// </summary>
+    [Theory]
+    [MemberData(nameof(TransportAssemblies))]
+    public void Extract_ReturnsNull_WhenTheBodyHoldsARawLoneSurrogate(Type marker)
+    {
+        var body = "{\"CorrelationId\":\"abc\",\"note\":\"" + '\ud800' + "\"}";
+        Assert.Null(Extract(marker, body, ["CorrelationId"]));
+    }
+
     private static string? Extract(Type marker, string json, string[] paths)
     {
         var method = marker.Assembly

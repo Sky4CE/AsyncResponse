@@ -48,8 +48,9 @@ public sealed class AsyncResponseTestHarnessOptions
     /// than the test claims. Default (<c>false</c>): the restart fails with
     /// <see cref="InvalidOperationException"/> naming the count. <c>true</c>: the executions are
     /// abandoned (their leases broken, their provider disposed) and the restart proceeds; the
-    /// test then owns the overlap. Engine-owned parks — an awaited step or an in-process timer
-    /// holding its worker slot on the virtual clock — are not user code and never trip this.
+    /// test then owns the overlap. Engine-owned waits — an awaited step or an in-process timer
+    /// holding its worker slot, a crashed attempt asleep in the redelivery backoff, all on the
+    /// virtual clock — and jobs still queued behind them are not user code and never trip this.
     /// </summary>
     public bool AbandonLingeringExecutionsOnRestart { get; set; }
 
@@ -201,9 +202,19 @@ public sealed class AsyncResponseTestHarness : IAsyncDisposable
     /// and scheduled (delayed) worker jobs — re-published into the new incarnation with their
     /// remaining virtual delay, as a broker would retain them. Everything process-bound dies: live
     /// waiters, subscriptions, in-flight executions (their execution leases are broken, as a real
-    /// crash's silence would let them expire, so the new incarnation takes their flows over
-    /// immediately). Queued immediate jobs are drained gracefully before the old incarnation
+    /// crash's silence would let them expire, so nothing blocks the new incarnation from taking
+    /// their flows over). Queued immediate jobs are drained gracefully before the old incarnation
     /// stops, bounded by the real-time guard.
+    /// <para>
+    /// Jobs still queued behind a park the stop could not wait for never started, so they are
+    /// carried over too and run in the new incarnation. The wake-up of an execution the stop
+    /// abandoned — one parked on an awaited step or an in-process timer, or one whose crashed
+    /// attempt was asleep in the transport's redelivery backoff — dies with the old incarnation,
+    /// and the new one does not redeliver it: resume those flows explicitly
+    /// (<see cref="IDurableFlows.ResumeAsync"/>, <c>FlowRunHandle.ResumeAsync</c>) after the
+    /// restart, or, for an awaited step, publish its response, which lost-subscriber recovery
+    /// routes into the run.
+    /// </para>
     /// </summary>
     /// <param name="whileDown">
     /// Runs between the old incarnation stopping and the new one starting — with no engine
@@ -221,23 +232,26 @@ public sealed class AsyncResponseTestHarness : IAsyncDisposable
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
 
-        // Retention, not a snapshot: the drain moves every pending delayed job into this list and
-        // also captures delayed publishes made BY draining jobs (a flow suspending mid-drain), so
-        // nothing falls between a pre-stop snapshot and the drain — a broker would keep all of it.
-        var pendingDelayed = Transport.BeginRetainingDelayedJobs();
+        // Retention, not a snapshot: the drain moves every pending delayed job into the transport's
+        // retention list and also captures delayed publishes made BY draining jobs (a flow
+        // suspending mid-drain), so nothing falls between a pre-stop snapshot and the drain — a
+        // broker would keep all of it.
+        var dyingTransport = Transport;
+        dyingTransport.BeginRetainingDelayedJobs();
         // Resolved BEFORE the provider goes away; abandoned after, once nothing can add to it.
         var dyingChannel = _provider.GetService<InMemoryAsyncResponseChannel>();
         await StopHostedServicesAsync().ConfigureAwait(false);
 
-        // Quiescence check BEFORE the provider is discarded. Jobs still outstanding after the
-        // bounded stop are executions the stop could not end. Engine-owned parks (an awaited step
-        // or an in-process timer holding its worker slot on the virtual clock) are expected —
-        // their leases are broken below and the new incarnation takes them over, as after a real
-        // crash. Anything beyond them is USER code still running: this restart cannot terminate
-        // it (there is no process to kill), so reporting a restart while it keeps executing —
-        // and performs side effects after the restart "completed" — would prove less than the
-        // test claims. Refuse unless the test opted into owning that overlap.
-        var lingering = Transport.OutstandingJobs + _quiesce.DirectRunsInFlight - _quiesce.ParkedCount;
+        // Quiescence check BEFORE the provider is discarded. Executions still running after the
+        // bounded stop are ones the stop could not end. Engine-owned waits (an awaited step or an
+        // in-process timer holding its worker slot, a crashed attempt asleep in the redelivery
+        // backoff — all on the virtual clock) are expected: their leases are broken below, as
+        // after a real crash. Anything beyond them is USER code still running: this restart
+        // cannot terminate it (there is no process to kill), so reporting a restart while it
+        // keeps executing — and performs side effects after the restart "completed" — would
+        // prove less than the test claims. Refuse unless the test opted into owning that overlap.
+        // A job still QUEUED behind a park never started, so it runs no user code at all.
+        var lingering = UserCodeRunning(dyingTransport);
         if (lingering > 0 && !_options.AbandonLingeringExecutionsOnRestart)
         {
             throw new InvalidOperationException(
@@ -250,6 +264,14 @@ public sealed class AsyncResponseTestHarness : IAsyncDisposable
                 $"{nameof(AsyncResponseTestHarnessOptions)}.{nameof(AsyncResponseTestHarnessOptions.AbandonLingeringExecutionsOnRestart)} " +
                 "to accept the overlap.");
         }
+
+        // Jobs still queued behind a park the stop was cut short on never started, so they are
+        // carried over like messages a broker still holds — a queued flow start has no ledger yet,
+        // and dropped here nothing could ever recover it. Taken out of the dead transport NOW,
+        // before anything below can end a park (disposing the provider, abandoning the waiters)
+        // and free one of its workers to pick them up: each job then runs exactly once, here or
+        // there.
+        var unstarted = dyingTransport.TakeUnstartedJobs();
 
         await _provider.DisposeAsync().ConfigureAwait(false);
 
@@ -274,31 +296,46 @@ public sealed class AsyncResponseTestHarness : IAsyncDisposable
         if (dyingChannel is not null)
             await dyingChannel.AbandonAllAsync().ConfigureAwait(false);
 
+        // Taken under the transport's retention gate, now that the stop is over: an execution the
+        // restart abandoned can still append to the live list.
+        var pendingDelayed = dyingTransport.TakeRetainedDelayedJobs();
+
+        // The step barriers see only what the new incarnation does from here on.
+        foreach (var observer in _observers)
+            (observer as FlowProbe)?.BeginIncarnation();
+
         whileDown?.Invoke();
 
         BuildProvider();
         await StartHostedServicesAsync().ConfigureAwait(false);
 
-        if (pendingDelayed.Count > 0)
+        // Immediate jobs are readmitted without waiting for queue room: the new workers may all
+        // park on waits only the test can end, and a publish waiting for room would then hang the
+        // restart with no guard.
+        var transport = Transport;
+        foreach (var queued in unstarted)
+            transport.Readmit(queued);
+
+        var now = Clock.GetUtcNow().UtcDateTime;
+        foreach (var job in pendingDelayed)
         {
-            var transport = (IDelayedWorkerTransport)Transport;
-            var now = Clock.GetUtcNow().UtcDateTime;
-            foreach (var job in pendingDelayed)
+            var remaining = job.NotBeforeUtc is { } notBefore && WorkerJobExecutor.AsUtc(notBefore) > now
+                ? WorkerJobExecutor.AsUtc(notBefore) - now
+                : TimeSpan.Zero;
+            if (remaining > TimeSpan.Zero)
             {
-                var remaining = job.NotBeforeUtc is { } notBefore && notBefore > now
-                    ? notBefore - now
-                    : TimeSpan.Zero;
-                if (remaining > TimeSpan.Zero)
-                {
-                    // Per-hop clamp, as every production publisher applies: NotBeforeUtc rides the
-                    // envelope, so the executor re-delays the remainder on delivery. Unclamped, a
-                    // legal 60-day sleep would throw here and silently lose the rest of the list.
-                    var hop = remaining <= transport.MaxPublishDelay ? remaining : transport.MaxPublishDelay;
-                    await transport.PublishAsync(job, hop).ConfigureAwait(false);
-                }
-                else
-                    await ((IWorkerTransport)transport).PublishAsync(job).ConfigureAwait(false);
+                // Per-hop clamp, as every production publisher applies: NotBeforeUtc rides the
+                // envelope, so the executor re-delays the remainder on delivery. Unclamped, a
+                // legal 60-day sleep would throw here and silently lose the rest of the list.
+                // Scheduled without waiting for a delayed slot: the drain frees every slot
+                // before it retains, so the retained set can exceed DelayedJobCapacity, and a
+                // slot only frees when a timer fires — on a clock that cannot move while the
+                // test is in here.
+                var hop = remaining <= transport.MaxPublishDelay ? remaining : transport.MaxPublishDelay;
+                transport.ScheduleRetained(job, hop);
             }
+            else
+                transport.Readmit(job);
         }
     }
 
@@ -319,25 +356,6 @@ public sealed class AsyncResponseTestHarness : IAsyncDisposable
 
         _options.ConfigureServices?.Invoke(services);
 
-        // The engine resolves the LAST TimeProvider registration, so a clock registered in
-        // ConfigureServices would silently displace the virtual one: no engine timer ever arms,
-        // AdvanceAsync advances a clock nothing reads, and every wait dies as an unexplained
-        // RealTimeGuard timeout. Fail construction instead, naming the fix.
-        var lastClock = services.LastOrDefault(d => !d.IsKeyedService && d.ServiceType == typeof(TimeProvider));
-        if (lastClock is null || !ReferenceEquals(lastClock.ImplementationInstance, Clock))
-        {
-            throw new InvalidOperationException(
-                $"{nameof(AsyncResponseTestHarness)} drives the whole engine on its own virtual clock; a TimeProvider " +
-                "registered via ConfigureServices would displace it and no timer, timeout, lease, or backoff would " +
-                "ever elapse. Use harness.Clock / AdvanceAsync instead of registering your own TimeProvider.");
-        }
-
-        // Fallback only, and only AFTER the user's registrations: AddLogging registers ILogger<>
-        // with TryAdd semantics, so a non-Try registration made before ConfigureServices would
-        // silently pin NullLogger and swallow the very diagnostics the harness's failure messages
-        // tell users to check.
-        services.TryAddSingleton(typeof(ILogger<>), typeof(NullLogger<>));
-
         var builder = services.AddAsyncResponse()
             .WithInMemoryChannel(channel =>
             {
@@ -354,12 +372,42 @@ public sealed class AsyncResponseTestHarness : IAsyncDisposable
 
         _options.ConfigureAsyncResponse?.Invoke(builder);
 
+        // Both checks run after EVERY user hook — ConfigureAsyncResponse included, whose builder
+        // exposes the same service collection: run before it, a clock or a logging registration
+        // made there slipped past them.
+        //
+        // The engine resolves the LAST TimeProvider registration, so a clock registered by the
+        // test would silently displace the virtual one: no engine timer ever arms, AdvanceAsync
+        // advances a clock nothing reads, and every wait dies as an unexplained RealTimeGuard
+        // timeout. Fail construction instead, naming the fix.
+        var lastClock = services.LastOrDefault(d => !d.IsKeyedService && d.ServiceType == typeof(TimeProvider));
+        if (lastClock is null || !ReferenceEquals(lastClock.ImplementationInstance, Clock))
+        {
+            throw new InvalidOperationException(
+                $"{nameof(AsyncResponseTestHarness)} drives the whole engine on its own virtual clock; a TimeProvider " +
+                "registered via ConfigureServices or ConfigureAsyncResponse would displace it and no timer, timeout, lease, " +
+                "or backoff would ever elapse. Use harness.Clock / AdvanceAsync instead of registering your own TimeProvider.");
+        }
+
+        // Fallback only, and only AFTER the user's registrations: AddLogging registers ILogger<>
+        // with TryAdd semantics, so a non-Try registration made before them would silently pin
+        // NullLogger and swallow the very diagnostics the harness's failure messages tell users
+        // to check.
+        services.TryAddSingleton(typeof(ILogger<>), typeof(NullLogger<>));
+
         _provider = services.BuildServiceProvider(new ServiceProviderOptions { ValidateScopes = true });
 
-        // The probe needs the engine clock and this incarnation's timer threshold to tell an
-        // in-process timer park (holds a worker slot) from a suspension (the job ends) — see
-        // QuiesceProbe.OnStepWaitingAsync.
-        _quiesce.Arm(Clock, _provider.GetRequiredService<DurableFlowOptions>().TimerInProcessThreshold);
+        // The probe needs the engine clock and this incarnation's timer settings to tell an
+        // in-process timer park (holds a worker slot) from a suspension (the job ends), and to
+        // know when a park's hop ends — see QuiesceProbe.OnStepWaitingAsync.
+        var flowOptions = _provider.GetRequiredService<DurableFlowOptions>();
+        _quiesce.Arm(Clock, flowOptions.TimerInProcessThreshold, flowOptions.MaxInProcessParkDuration);
+
+        // The flow probe makes the same in-process/suspended distinction: only an in-process
+        // park dies with its incarnation, so only its Waiting event is hidden from a barrier
+        // after a restart.
+        foreach (var observer in _observers)
+            (observer as FlowProbe)?.Arm(Clock, flowOptions.TimerInProcessThreshold);
     }
 
     private async Task StartHostedServicesAsync()
@@ -410,19 +458,30 @@ public sealed class AsyncResponseTestHarness : IAsyncDisposable
     }
 
     /// <summary>
-    /// Cancels <paramref name="cutoff"/> as soon as every execution still outstanding is an
-    /// engine-owned park. Deliberately does nothing while NOTHING is parked: a stop that can still
-    /// make progress is left to finish cleanly, and the real-time guard stays the backstop for
-    /// user code that is genuinely stuck.
+    /// Cancels <paramref name="cutoff"/> as soon as every execution still running is waiting on
+    /// the virtual clock or a reply — an engine-owned park, or a crashed attempt asleep in a
+    /// redelivery backoff the drain took — and no queued job can still get a worker. Deliberately
+    /// does nothing while NOTHING is waiting that way: a stop that can still make progress is left
+    /// to finish cleanly, and the real-time guard stays the backstop for user code that is
+    /// genuinely stuck. A backoff taken BEFORE the stop is no such wait: it is bound to the worker
+    /// host's stopping token, so the host's own stop ends it (dropping its job) and drains what is
+    /// queued behind it — this check runs before any hosted service has stopped, and counting it
+    /// cut that stop short at once.
     /// </summary>
     private async Task AbandonOnceOnlyParkedAsync(CancellationTokenSource cutoff, CancellationToken stopWatching)
     {
+        var transport = Transport;
         try
         {
             while (!stopWatching.IsCancellationRequested)
             {
-                var parked = _quiesce.ParkedCount;
-                if (parked > 0 && Transport.OutstandingJobs + _quiesce.DirectRunsInFlight <= parked)
+                // Queued jobs never started and run no user code, but while a worker is free they
+                // still make progress on their own; once every worker is held they wait on the
+                // same clock (or reply) as whatever holds it.
+                var executing = transport.ExecutingJobs;
+                var queuedCanRun = transport.OutstandingJobs > executing && executing < transport.Options.WorkerCount;
+                var waiting = _quiesce.ParkedCount + transport.DrainBackingOffJobs;
+                if (waiting > 0 && !queuedCanRun && UserCodeRunning(transport) <= 0)
                 {
                     await cutoff.CancelAsync().ConfigureAwait(false);
                     return;
@@ -441,6 +500,16 @@ public sealed class AsyncResponseTestHarness : IAsyncDisposable
 
     /// <summary>How often the stop checks whether a park is all that is left.</summary>
     private static readonly TimeSpan ParkedStopPollInterval = TimeSpan.FromMilliseconds(5);
+
+    /// <summary>
+    /// Executions of <paramref name="transport"/>'s incarnation still running user code: jobs a
+    /// worker has taken (queued ones never started) plus inline direct runs, minus the ones
+    /// waiting on the virtual clock or a reply — engine-owned parks and crashed attempts asleep in
+    /// a redelivery backoff the drain took. A backoff taken before the stop counts as running: the
+    /// worker host's stop ends it and the job then leaves (see <see cref="AbandonOnceOnlyParkedAsync"/>).
+    /// </summary>
+    private int UserCodeRunning(InMemoryWorkerTransport transport)
+        => transport.ExecutingJobs - transport.DrainBackingOffJobs + _quiesce.DirectRunsInFlight - _quiesce.ParkedCount;
 
     /// <inheritdoc/>
     public async ValueTask DisposeAsync()
@@ -472,11 +541,14 @@ public sealed class AsyncResponseTestHarness : IAsyncDisposable
     /// longer than this is the documented harness anti-pattern (use the injected TimeProvider).</item>
     /// </list>
     /// </summary>
-    /// <summary>Reports an inline executor attempt starting (see QuiesceProbe.DirectRunsInFlight).</summary>
-    internal void OnDirectRunStarted() => _quiesce.OnDirectRunStarted();
+    /// <summary>
+    /// Reports an inline executor attempt starting (see QuiesceProbe.DirectRunsInFlight); pass the
+    /// returned token to <see cref="OnDirectRunFinished"/>.
+    /// </summary>
+    internal int OnDirectRunStarted() => _quiesce.OnDirectRunStarted();
 
     /// <summary>Reports an inline executor attempt finished.</summary>
-    internal void OnDirectRunFinished() => _quiesce.OnDirectRunFinished();
+    internal void OnDirectRunFinished(int token) => _quiesce.OnDirectRunFinished(token);
 
     private async Task SettleAsync()
     {
@@ -492,9 +564,15 @@ public sealed class AsyncResponseTestHarness : IAsyncDisposable
         while (Transport.OutstandingJobs + _quiesce.DirectRunsInFlight > _quiesce.ParkedCount
                && TimeProvider.System.GetUtcNow() < budget)
         {
+            // A new earliest due time counts only when a timer was actually ARMED: disposing the
+            // earliest timer (a finished wait, a cancelled delay) moves NextTimerDueAt too, and
+            // ended the settle while the job that disposed it was still running code — the clock
+            // then advanced under it. (Any arm alone is not enough either: a job that just took a
+            // worker arms its lease-renew timer long before it reaches a wait of its own.)
+            var armed = Clock.ArmSequence;
             var next = Clock.NextTimerDueAt;
             await Task.Delay(TimeSpan.FromMilliseconds(1)).ConfigureAwait(false);
-            if (next != Clock.NextTimerDueAt)
+            if (armed != Clock.ArmSequence && next != Clock.NextTimerDueAt)
                 return; // A virtual wait just began — the advance loop re-evaluates immediately.
         }
     }
@@ -511,14 +589,32 @@ public sealed class AsyncResponseTestHarness : IAsyncDisposable
     /// </summary>
     private sealed class QuiesceProbe : IDurableFlowExecutionObserver
     {
-        private readonly HashSet<(string FlowId, string Step)> _parked = [];
+        /// <summary>
+        /// Parked steps, each with the instant its in-process wait ENDS: <c>null</c> for an awaited
+        /// step (it ends on a reply), the hop's end for a timer.
+        /// </summary>
+        private readonly Dictionary<(string FlowId, string Step), DateTime?> _parked = [];
+        private readonly object _directGate = new();
         private TimeProvider _clock = TimeProvider.System;
         private TimeSpan _timerInProcessThreshold;
+        private TimeSpan? _maxInProcessParkDuration;
         private int _directRunsInFlight;
+        private int _directGeneration;
 
+        /// <summary>
+        /// Steps parked right now. A timer entry stops counting once the clock reaches its hop's
+        /// end: the wait has fired and the job is running code again — completing the step, or
+        /// handing the timer over to a fresh delivery, which ends the job without any observer
+        /// event (a suspension notifies nothing), so the entry cannot be removed there.
+        /// </summary>
         public int ParkedCount
         {
-            get { lock (_parked) return _parked.Count; }
+            get
+            {
+                var now = _clock.GetUtcNow().UtcDateTime;
+                lock (_parked)
+                    return _parked.Values.Count(waitEnd => waitEnd is not { } end || end > now);
+            }
         }
 
         /// <summary>
@@ -527,23 +623,52 @@ public sealed class AsyncResponseTestHarness : IAsyncDisposable
         /// a step they park would otherwise make ParkedCount exceed the outstanding jobs and let
         /// the clock advance under a direct run still executing user code.
         /// </summary>
-        public int DirectRunsInFlight => Volatile.Read(ref _directRunsInFlight);
+        public int DirectRunsInFlight
+        {
+            get { lock (_directGate) return _directRunsInFlight; }
+        }
 
-        public void OnDirectRunStarted() => Interlocked.Increment(ref _directRunsInFlight);
+        /// <summary>Counts a direct run in; returns the generation its finish must match.</summary>
+        public int OnDirectRunStarted()
+        {
+            lock (_directGate)
+            {
+                _directRunsInFlight++;
+                return _directGeneration;
+            }
+        }
 
-        public void OnDirectRunFinished() => Interlocked.Decrement(ref _directRunsInFlight);
+        /// <summary>
+        /// Counts a direct run out — unless a restart reset the count since it started: a direct
+        /// run the restart abandoned (a parked one, which does not stop a restart) ends only after
+        /// the reset, and decrementing then drove the count to -1, so every later check
+        /// under-counted one busy direct run until the next restart.
+        /// </summary>
+        public void OnDirectRunFinished(int generation)
+        {
+            lock (_directGate)
+            {
+                if (generation == _directGeneration)
+                    _directRunsInFlight--;
+            }
+        }
 
-        /// <summary>Binds the engine clock and timer threshold of the current incarnation.</summary>
-        public void Arm(TimeProvider clock, TimeSpan timerInProcessThreshold)
+        /// <summary>Binds the engine clock and the in-process timer settings of the current incarnation.</summary>
+        public void Arm(TimeProvider clock, TimeSpan timerInProcessThreshold, TimeSpan? maxInProcessParkDuration)
         {
             _clock = clock;
             _timerInProcessThreshold = timerInProcessThreshold;
+            _maxInProcessParkDuration = maxInProcessParkDuration;
         }
 
         public void Reset()
         {
             lock (_parked) _parked.Clear();
-            Volatile.Write(ref _directRunsInFlight, 0);
+            lock (_directGate)
+            {
+                _directGeneration++;
+                _directRunsInFlight = 0;
+            }
         }
 
         public ValueTask OnStepWaitingAsync(DurableFlowStepEvent step)
@@ -551,17 +676,27 @@ public sealed class AsyncResponseTestHarness : IAsyncDisposable
             // Awaited steps always park in process holding their worker slot. Timer steps only
             // park when the remainder is at or below the in-process threshold — a longer wait
             // suspends (the engine mirrors this decision in DelayCoreAsync against the same
-            // clock), ending the worker job this entry would otherwise be offsetting.
-            var parksInProcess = step.Kind switch
+            // clock), ending the worker job this entry would otherwise be offsetting — and then
+            // only for one hop: at most MaxInProcessParkDuration (the harness transport advertises
+            // no in-flight ceiling, so that option is the whole in-process budget), after which
+            // the engine hands the rest over to a fresh delivery.
+            switch (step.Kind)
             {
-                DurableFlowStepKind.Awaited => true,
-                DurableFlowStepKind.Timer => step.WakeAtUtc is { } wakeAtUtc
-                    && wakeAtUtc - _clock.GetUtcNow().UtcDateTime <= _timerInProcessThreshold,
-                _ => false
-            };
+                case DurableFlowStepKind.Awaited:
+                    lock (_parked) _parked[(step.FlowId, step.StepName)] = null;
+                    break;
 
-            if (parksInProcess)
-                lock (_parked) _parked.Add((step.FlowId, step.StepName));
+                case DurableFlowStepKind.Timer when step.WakeAtUtc is { } wakeAtUtc:
+                    var now = _clock.GetUtcNow().UtcDateTime;
+                    var remaining = wakeAtUtc - now;
+                    if (remaining > _timerInProcessThreshold)
+                        break;
+
+                    var hopEnd = _maxInProcessParkDuration is { } budget && budget < remaining ? now + budget : wakeAtUtc;
+                    lock (_parked) _parked[(step.FlowId, step.StepName)] = hopEnd;
+                    break;
+            }
+
             return default;
         }
 
@@ -573,7 +708,7 @@ public sealed class AsyncResponseTestHarness : IAsyncDisposable
 
         public ValueTask OnRunFinishedAsync(DurableFlowRunEvent run)
         {
-            lock (_parked) _parked.RemoveWhere(entry => string.Equals(entry.FlowId, run.FlowId, StringComparison.Ordinal));
+            RemoveRun(run.FlowId);
             return default;
         }
 
@@ -583,8 +718,17 @@ public sealed class AsyncResponseTestHarness : IAsyncDisposable
             // timeout, a published failure the flow does not treat as terminal); the redelivery
             // re-parks whatever still applies. Left in place, the stale entry offset a genuinely
             // busy job in SettleAsync's guard for the rest of the incarnation.
-            lock (_parked) _parked.RemoveWhere(entry => string.Equals(entry.FlowId, run.FlowId, StringComparison.Ordinal));
+            RemoveRun(run.FlowId);
             return default;
+        }
+
+        private void RemoveRun(string flowId)
+        {
+            lock (_parked)
+            {
+                foreach (var entry in _parked.Keys.Where(entry => string.Equals(entry.FlowId, flowId, StringComparison.Ordinal)).ToArray())
+                    _parked.Remove(entry);
+            }
         }
     }
 }

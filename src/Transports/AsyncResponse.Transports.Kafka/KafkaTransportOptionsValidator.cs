@@ -24,6 +24,37 @@ internal static class KafkaTransportOptionsValidator
                 "(the librdkafka max.poll.interval.ms range; larger values fail consumer construction).");
     }
 
+    /// <summary>librdkafka's <c>session.timeout.ms</c> default (since 1.9, KIP-735).</summary>
+    internal const int DefaultSessionTimeoutMs = 45_000;
+
+    /// <summary>
+    /// Checks the consumer configuration the subscriber will build (package defaults, then
+    /// <see cref="KafkaAsyncResponseTransportOptions.ConfigureConsumer"/>) for a rule librdkafka
+    /// enforces only when the consumer is constructed: under the classic group protocol,
+    /// <c>max.poll.interval.ms</c> must be at least <c>session.timeout.ms</c>. Construction happens
+    /// inside the supervised subscriber loop, so a violation used to start the host cleanly and then
+    /// fail every attempt forever with nothing consumed.
+    /// </summary>
+    internal static void EnsureConsumerConfigAccepted(KafkaAsyncResponseTransportOptions options, KafkaSubscriberRole role)
+    {
+        var config = KafkaConsumerClientFactory.BuildConfig(options, role);
+        if (config.GroupProtocol is Confluent.Kafka.GroupProtocol.Consumer)
+            return; // KIP-848: the session timeout is broker-side, and librdkafka skips this check.
+
+        var sessionTimeoutMs = config.SessionTimeoutMs ?? DefaultSessionTimeoutMs;
+        if (config.MaxPollIntervalMs is { } maxPollIntervalMs && maxPollIntervalMs < sessionTimeoutMs)
+        {
+            var optionPath = role is KafkaSubscriberRole.Worker
+                ? $"{nameof(KafkaAsyncResponseTransportOptions)}.{nameof(KafkaAsyncResponseTransportOptions.WorkerSubscriber)}"
+                : $"{nameof(KafkaAsyncResponseTransportOptions)}.{nameof(KafkaAsyncResponseTransportOptions.ResponseSubscriber)}";
+            throw new InvalidOperationException(
+                $"{optionPath}.{nameof(KafkaSubscriberOptions.MaxPollInterval)} resolves to max.poll.interval.ms = {maxPollIntervalMs}, below " +
+                $"session.timeout.ms = {sessionTimeoutMs}{(config.SessionTimeoutMs is null ? " (the librdkafka default)" : string.Empty)}; librdkafka " +
+                "refuses to build such a consumer, so the subscriber could never start. Raise MaxPollInterval, or lower " +
+                $"SessionTimeoutMs through {nameof(KafkaAsyncResponseTransportOptions)}.{nameof(KafkaAsyncResponseTransportOptions.ConfigureConsumer)}.");
+        }
+    }
+
     /// <summary>
     /// The Kafka client passes timeouts to librdkafka as 32-bit millisecond values
     /// (<c>Flush(TimeSpan)</c>, <c>Consume(TimeSpan)</c>, admin request timeouts); anything above

@@ -1,3 +1,4 @@
+using AsyncResponse.Testing;
 using AsyncResponse.Transports.AzureServiceBus;
 using Azure.Messaging.ServiceBus;
 using Microsoft.Extensions.DependencyInjection;
@@ -742,6 +743,91 @@ public sealed class AzureServiceBusTransportTests
     }
 
     [Fact]
+    public async Task WorkerSubscriber_AckAfterEnqueue_ReceiveFault_DoesNotDrainOrRefuseAlreadyCompletedWork()
+    {
+        // Red-on-old (fixpoint r1, S8#1): the early-ACK dispatcher lived inside one supervised
+        // attempt, so a receive fault on a host that was NOT stopping disposed it: consumption
+        // paused for the stop-time drain, then the queued job — already COMPLETED at the broker,
+        // so Service Bus never redelivers it — was refused as "drain budget lapsed". The
+        // dispatcher now outlives attempts (SQS/Pub-Sub parity): the queued job runs, the rebuilt
+        // receiver feeds the same queue, and only host stop drains.
+        var receiver = new FakeReceiver { FailOnReceiveAttempt = 2 };
+        var client = new FakeServiceBusClient { Receiver = receiver };
+        var firstStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseFirst = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var secondHandled = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var thirdHandled = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var failureReported = new TaskCompletionSource<AzureServiceBusBackgroundFailureContext>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var handled = new System.Collections.Concurrent.ConcurrentQueue<string>();
+        var ingress = new Mock<IAsyncResponseIngress>();
+        ingress.Setup(i => i.HandleWorkerMessageAsync(It.IsAny<string>()))
+            .Returns<string>(async body =>
+            {
+                if (body == "first")
+                {
+                    firstStarted.TrySetResult();
+                    await releaseFirst.Task;
+                }
+
+                handled.Enqueue(body);
+                if (body == "second")
+                    secondHandled.TrySetResult();
+                if (body == "third")
+                    thirdHandled.TrySetResult();
+            });
+        var options = new AzureServiceBusAsyncResponseOptions
+        {
+            WorkerQueue = "workers",
+            ResponseQueue = "responses",
+            ReceiveWaitTime = TimeSpan.FromMilliseconds(10),
+            SubscriberRetryBaseDelay = TimeSpan.FromMilliseconds(1),
+            SubscriberRetryMaxDelay = TimeSpan.FromMilliseconds(1)
+        };
+        options.WorkerSubscriber.UseAckAfterEnqueue(backgroundWorkerCount: 1, backgroundQueueCapacity: 8, backgroundDrainTimeout: TimeSpan.FromMilliseconds(200));
+        options.WorkerSubscriber.OnBackgroundFailure = context =>
+        {
+            failureReported.TrySetResult(context);
+            return ValueTask.CompletedTask;
+        };
+        var firstCalls = new SettlementCalls();
+        var secondCalls = new SettlementCalls();
+        var thirdCalls = new SettlementCalls();
+        var subscriber = new AzureServiceBusWorkerSubscriber(
+            Options.Create(options),
+            client,
+            ingress.Object,
+            NullLogger<AzureServiceBusWorkerSubscriber>.Instance);
+
+        // One receive hands over both: "first" blocks in the only worker, "second" waits in the
+        // queue — both already completed at the broker. The next receive then faults.
+        receiver.Enqueue(Delivery(firstCalls, queue: "workers", messageId: "m1", body: "first"));
+        receiver.Enqueue(Delivery(secondCalls, queue: "workers", messageId: "m2", body: "second"));
+        await subscriber.StartAsync(CancellationToken.None);
+        await firstStarted.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        await secondCalls.Completed.Task.WaitAsync(TimeSpan.FromSeconds(2));
+
+        // The supervisor rebuilt the receiver: the attempt ended, the host did not.
+        await WaitUntilAsync(() => receiver.ReceiveAttempts >= 3);
+
+        releaseFirst.TrySetResult();
+        var outcome = await Task.WhenAny(secondHandled.Task, failureReported.Task).WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.True(
+            ReferenceEquals(outcome, secondHandled.Task),
+            "the already-completed queued job was refused after a receive fault instead of being handled");
+
+        // The rebuilt receiver feeds the very same queue.
+        receiver.Enqueue(Delivery(thirdCalls, queue: "workers", messageId: "m3", body: "third"));
+        await thirdHandled.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await subscriber.StopAsync(CancellationToken.None);
+
+        Assert.False(failureReported.Task.IsCompleted);
+        Assert.Equal(["first", "second", "third"], handled);
+        Assert.Equal(1, firstCalls.Complete);
+        Assert.Equal(1, secondCalls.Complete);
+        Assert.Equal(1, thirdCalls.Complete);
+    }
+
+    [Fact]
     public async Task Subscriber_RetryDelays_RouteThroughSharedJitteredBackoff()
     {
         // Red-on-old: the subscriber supervised its restarts through a private un-jittered
@@ -841,7 +927,9 @@ public sealed class AzureServiceBusTransportTests
     [Fact]
     public async Task WorkerSubscriber_SlowHandler_RenewsLocksOfUnsettledBatchMessages()
     {
-        var receiver = new FakeReceiver();
+        // ACK-after-handler now receives one message at a time; the receiver hands over the whole
+        // batch anyway so the renewal machinery the loop keeps for any batch is still pinned.
+        var receiver = new FakeReceiver { ReturnAllAvailable = true };
         var client = new FakeServiceBusClient { Receiver = receiver };
         var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var secondStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -1004,6 +1092,526 @@ public sealed class AzureServiceBusTransportTests
     }
 
     [Fact]
+    public async Task WorkerSubscriber_AckAfterHandlerCompletes_ReceivesOneMessageAtATime()
+    {
+        // Red-on-old (fixpoint r1, S8#6): ACK-after-handler received MaxMessagesPerReceive (16)
+        // messages and ran them serially. Service Bus locks — and, when a lock lapses, counts —
+        // every one of them, so a process-killing handler took its 15 batch-mates' DeliveryCount
+        // with it on every crash, and a long handler kept them locked while idle peers waited.
+        var receiver = new FakeReceiver();
+        var client = new FakeServiceBusClient { Receiver = receiver };
+        var ingress = new Mock<IAsyncResponseIngress>();
+        ingress.Setup(i => i.HandleWorkerMessageAsync(It.IsAny<string>())).Returns(Task.CompletedTask);
+        var firstCalls = new SettlementCalls();
+        var secondCalls = new SettlementCalls();
+        var subscriber = new AzureServiceBusWorkerSubscriber(
+            Options.Create(new AzureServiceBusAsyncResponseOptions
+            {
+                WorkerQueue = "workers",
+                ResponseQueue = "responses",
+                ReceiveWaitTime = TimeSpan.FromMilliseconds(10)
+            }),
+            client,
+            ingress.Object,
+            NullLogger<AzureServiceBusWorkerSubscriber>.Instance);
+
+        receiver.Enqueue(Delivery(firstCalls, queue: "workers", messageId: "m1"));
+        receiver.Enqueue(Delivery(secondCalls, queue: "workers", messageId: "m2"));
+        await subscriber.StartAsync(CancellationToken.None);
+        await secondCalls.Completed.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await subscriber.StopAsync(CancellationToken.None);
+
+        Assert.Equal(1, receiver.LastMaxMessages);
+        Assert.True(receiver.ReceiveAttempts >= 2);
+        Assert.Equal(1, firstCalls.Complete);
+        Assert.Equal(1, secondCalls.Complete);
+    }
+
+    [Fact]
+    public async Task WorkerSubscriber_StopMidBatch_KeepsRenewingTheLiveHandler_AndHandsBackTheUnstartedMessages()
+    {
+        // Red-on-old (fixpoint r1, S8#2): the renewal was linked to the stop token, so the lock of
+        // the handler still running at the stop lapsed under it (a peer re-ran the job and the late
+        // Complete failed with MessageLockLost), and the loop then STARTED the rest of the batch
+        // one after another, with no renewal, against the host's stop budget. The renewal now ends
+        // with the batch, nothing new starts once stopping, and the unstarted messages are
+        // abandoned so a peer takes them at once (SQS/NATS parity).
+        var receiver = new FakeReceiver { ReturnAllAvailable = true };
+        var client = new FakeServiceBusClient { Receiver = receiver };
+        var firstStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseFirst = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var ingress = new Mock<IAsyncResponseIngress>();
+        ingress.Setup(i => i.HandleWorkerMessageAsync(It.IsAny<string>())).Returns(Task.CompletedTask);
+        ingress.Setup(i => i.HandleWorkerMessageAsync("first"))
+            .Returns(async () =>
+            {
+                firstStarted.TrySetResult();
+                await releaseFirst.Task;
+            });
+        var options = new AzureServiceBusAsyncResponseOptions
+        {
+            WorkerQueue = "workers",
+            ResponseQueue = "responses",
+            ReceiveWaitTime = TimeSpan.FromMilliseconds(10)
+        };
+        options.WorkerSubscriber.LockRenewalInterval = TimeSpan.FromMilliseconds(50);
+        var firstCalls = new SettlementCalls();
+        var secondCalls = new SettlementCalls();
+        var thirdCalls = new SettlementCalls();
+        var subscriber = new AzureServiceBusWorkerSubscriber(
+            Options.Create(options),
+            client,
+            ingress.Object,
+            NullLogger<AzureServiceBusWorkerSubscriber>.Instance);
+
+        receiver.Enqueue(Delivery(firstCalls, queue: "workers", messageId: "m1", body: "first"));
+        receiver.Enqueue(Delivery(secondCalls, queue: "workers", messageId: "m2", body: "second"));
+        receiver.Enqueue(Delivery(thirdCalls, queue: "workers", messageId: "m3", body: "third"));
+        await subscriber.StartAsync(CancellationToken.None);
+        await firstStarted.Task.WaitAsync(TimeSpan.FromSeconds(2));
+
+        // The host stops while m1's handler is still running.
+        var stopping = subscriber.StopAsync(CancellationToken.None);
+
+        // m1's lock keeps being renewed after the stop signal: its handler is alive.
+        var renewalsAtStop = Volatile.Read(ref firstCalls.RenewLock);
+        await WaitUntilAsync(() => Volatile.Read(ref firstCalls.RenewLock) >= renewalsAtStop + 2);
+
+        releaseFirst.TrySetResult();
+        await stopping.WaitAsync(TimeSpan.FromSeconds(10));
+
+        Assert.Equal(1, firstCalls.Complete);
+        ingress.Verify(i => i.HandleWorkerMessageAsync("second"), Times.Never);
+        ingress.Verify(i => i.HandleWorkerMessageAsync("third"), Times.Never);
+        Assert.Equal(1, secondCalls.Abandon);
+        Assert.Equal(1, thirdCalls.Abandon);
+        Assert.Equal(0, secondCalls.Complete + thirdCalls.Complete);
+    }
+
+    [Fact]
+    public async Task WorkerSubscriber_RenewalOff_StopMidBatch_DoesNotStartTheRest_AndHandsItBack()
+    {
+        // Red-on-old (fixpoint r1, S8#2): the renewal-free loop had no stop check at all, so after
+        // the stop it kept starting the rest of the batch serially against the host's stop budget.
+        var receiver = new FakeReceiver { ReturnAllAvailable = true };
+        var client = new FakeServiceBusClient { Receiver = receiver };
+        var firstStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseFirst = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var ingress = new Mock<IAsyncResponseIngress>();
+        ingress.Setup(i => i.HandleWorkerMessageAsync(It.IsAny<string>())).Returns(Task.CompletedTask);
+        ingress.Setup(i => i.HandleWorkerMessageAsync("first"))
+            .Returns(async () =>
+            {
+                firstStarted.TrySetResult();
+                await releaseFirst.Task;
+            });
+        var options = new AzureServiceBusAsyncResponseOptions
+        {
+            WorkerQueue = "workers",
+            ResponseQueue = "responses",
+            ReceiveWaitTime = TimeSpan.FromMilliseconds(10)
+        };
+        options.WorkerSubscriber.LockRenewalInterval = null;
+        var firstCalls = new SettlementCalls();
+        var secondCalls = new SettlementCalls();
+        var subscriber = new AzureServiceBusWorkerSubscriber(
+            Options.Create(options),
+            client,
+            ingress.Object,
+            NullLogger<AzureServiceBusWorkerSubscriber>.Instance);
+
+        receiver.Enqueue(Delivery(firstCalls, queue: "workers", messageId: "m1", body: "first"));
+        receiver.Enqueue(Delivery(secondCalls, queue: "workers", messageId: "m2", body: "second"));
+        await subscriber.StartAsync(CancellationToken.None);
+        await firstStarted.Task.WaitAsync(TimeSpan.FromSeconds(2));
+
+        var stopping = subscriber.StopAsync(CancellationToken.None);
+        releaseFirst.TrySetResult();
+        await stopping.WaitAsync(TimeSpan.FromSeconds(10));
+
+        Assert.Equal(1, firstCalls.Complete);
+        ingress.Verify(i => i.HandleWorkerMessageAsync("second"), Times.Never);
+        Assert.Equal(1, secondCalls.Abandon);
+    }
+
+    [Fact]
+    public async Task WorkerSubscriber_HandlerCancelledByTheStop_HandsBackItsUnstartedBatchMates()
+    {
+        // Red-on-old (fixpoint r1, S8#2 — the ASB twin of S8#10): a handler that exits by throwing
+        // the stop's OperationCanceledException (a parked flow interrupted at shutdown) unwound
+        // past the loop's stop check, so its unstarted batch-mates stayed locked for the rest of
+        // their lock on every deploy. NATS rule: hand back from max(next, settled).
+        var receiver = new FakeReceiver { ReturnAllAvailable = true };
+        var client = new FakeServiceBusClient { Receiver = receiver };
+        var firstStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseFirst = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var ingress = new Mock<IAsyncResponseIngress>();
+        ingress.Setup(i => i.HandleWorkerMessageAsync(It.IsAny<string>())).Returns(Task.CompletedTask);
+        ingress.Setup(i => i.HandleWorkerMessageAsync("first"))
+            .Returns(async () =>
+            {
+                firstStarted.TrySetResult();
+                await releaseFirst.Task;
+                throw new OperationCanceledException("interrupted by the host stop");
+            });
+        var options = new AzureServiceBusAsyncResponseOptions
+        {
+            WorkerQueue = "workers",
+            ResponseQueue = "responses",
+            ReceiveWaitTime = TimeSpan.FromMilliseconds(10)
+        };
+        options.WorkerSubscriber.LockRenewalInterval = TimeSpan.FromMilliseconds(50);
+        var firstCalls = new SettlementCalls();
+        var secondCalls = new SettlementCalls();
+        var subscriber = new AzureServiceBusWorkerSubscriber(
+            Options.Create(options),
+            client,
+            ingress.Object,
+            NullLogger<AzureServiceBusWorkerSubscriber>.Instance);
+
+        receiver.Enqueue(Delivery(firstCalls, queue: "workers", messageId: "m1", body: "first"));
+        receiver.Enqueue(Delivery(secondCalls, queue: "workers", messageId: "m2", body: "second"));
+        await subscriber.StartAsync(CancellationToken.None);
+        await firstStarted.Task.WaitAsync(TimeSpan.FromSeconds(2));
+
+        var stopping = subscriber.StopAsync(CancellationToken.None);
+        releaseFirst.TrySetResult();
+        await stopping.WaitAsync(TimeSpan.FromSeconds(10));
+
+        // m1 was interrupted by the stop: left unsettled for its lock to lapse, not abandoned.
+        Assert.Equal(0, firstCalls.Complete + firstCalls.Abandon + firstCalls.DeadLetter);
+        ingress.Verify(i => i.HandleWorkerMessageAsync("second"), Times.Never);
+        Assert.Equal(1, secondCalls.Abandon);
+    }
+
+    [Fact]
+    public async Task RenewalSweep_StopsRenewingALostLock_AndWarnsOnce()
+    {
+        // Red-on-old (fixpoint r1, S8#17): after MessageLockLost the sweep kept renewing — and
+        // warning about — a lock token that can never be renewed again, one failing RPC ahead of
+        // the healthy messages per beat for as long as the handler ran.
+        var receiver = new FakeReceiver { ReturnAllAvailable = true };
+        var client = new FakeServiceBusClient { Receiver = receiver };
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var logger = new CollectingLogger();
+        var ingress = new Mock<IAsyncResponseIngress>();
+        ingress.Setup(i => i.HandleWorkerMessageAsync(It.IsAny<string>())).Returns(Task.CompletedTask);
+        ingress.Setup(i => i.HandleWorkerMessageAsync("first")).Returns(async () => await release.Task);
+        var options = new AzureServiceBusAsyncResponseOptions
+        {
+            WorkerQueue = "workers",
+            ResponseQueue = "responses",
+            ReceiveWaitTime = TimeSpan.FromMilliseconds(10)
+        };
+        options.WorkerSubscriber.LockRenewalInterval = TimeSpan.FromMilliseconds(50);
+        var firstCalls = new SettlementCalls
+        {
+            RenewLockException = new ServiceBusException("lock lost", ServiceBusFailureReason.MessageLockLost)
+        };
+        var secondCalls = new SettlementCalls();
+        var subscriber = new AzureServiceBusWorkerSubscriber(
+            Options.Create(options),
+            client,
+            ingress.Object,
+            logger.For<AzureServiceBusWorkerSubscriber>());
+
+        // m1 (lost lock) is renewed FIRST in every sweep pass; m2's renewals witness the beats.
+        receiver.Enqueue(Delivery(firstCalls, queue: "workers", messageId: "m1", body: "first"));
+        receiver.Enqueue(Delivery(secondCalls, queue: "workers", messageId: "m2", body: "second"));
+        await subscriber.StartAsync(CancellationToken.None);
+        await WaitUntilAsync(() => Volatile.Read(ref secondCalls.RenewLock) >= 3);
+
+        release.TrySetResult();
+        await secondCalls.Completed.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await subscriber.StopAsync(CancellationToken.None);
+
+        Assert.Equal(1, Volatile.Read(ref firstCalls.RenewLock));
+        Assert.Single(logger.Messages, message => message.Contains("is lost and can no longer be renewed", StringComparison.Ordinal));
+        Assert.DoesNotContain(logger.Messages, message => message.Contains("Failed to renew the lock", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task WorkerSubscriber_StopLandingMidHandler_ClosesTheReceiverWithinTheShutdownBudget()
+    {
+        // Red-on-old (fixpoint r1, S8#18): the budgeted CloseAsync ran only when the stop surfaced
+        // as an OperationCanceledException out of a receive. A stop landing while a handler ran
+        // left the loop through its condition, and `await using` disposed the receiver with no
+        // budget at all — ServiceBusReceiver.DisposeAsync closes with no token.
+        var receiver = new FakeReceiver { CloseIgnoresToken = true };
+        var client = new FakeServiceBusClient { Receiver = receiver };
+        var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var ingress = new Mock<IAsyncResponseIngress>();
+        ingress.Setup(i => i.HandleWorkerMessageAsync(It.IsAny<string>()))
+            .Returns(async () =>
+            {
+                started.TrySetResult();
+                await release.Task;
+            });
+        var calls = new SettlementCalls();
+        var subscriber = new AzureServiceBusWorkerSubscriber(
+            Options.Create(new AzureServiceBusAsyncResponseOptions
+            {
+                WorkerQueue = "workers",
+                ResponseQueue = "responses",
+                ReceiveWaitTime = TimeSpan.FromMilliseconds(10),
+                ShutdownTimeout = TimeSpan.FromMilliseconds(200)
+            }),
+            client,
+            ingress.Object,
+            NullLogger<AzureServiceBusWorkerSubscriber>.Instance);
+
+        receiver.Enqueue(Delivery(calls, queue: "workers"));
+        await subscriber.StartAsync(CancellationToken.None);
+        await started.Task.WaitAsync(TimeSpan.FromSeconds(2));
+
+        var stopping = subscriber.StopAsync(CancellationToken.None);
+        release.TrySetResult();
+
+        // The close hangs past its token (a stalled link detach); the stop still completes.
+        await stopping.WaitAsync(TimeSpan.FromSeconds(10));
+        Assert.Equal(1, calls.Complete);
+        Assert.Equal(1, receiver.CloseCalls);
+    }
+
+    [Fact]
+    public async Task WorkerSubscriber_RenewalOff_StopMidBatch_HandBackAndReceiverCloseShareOneShutdownTimeout()
+    {
+        // Red-on-old (fixpoint r1 pre-commit, I3): without lock renewal nothing overlaps the stop
+        // path's hand-back of unstarted messages, yet it and the receiver close after it each took
+        // a whole ShutdownTimeout while the validator sums one (plus BackgroundDrainTimeout in
+        // early ACK) — a stalling namespace overran the host budget by a ShutdownTimeout. The two
+        // now share one: a hand-back that spends all of it leaves the close nothing.
+        var clock = new VirtualTimeProvider();
+        var receiver = new FakeReceiver { ReturnAllAvailable = true, CloseIgnoresToken = true };
+        var client = new FakeServiceBusClient { Receiver = receiver };
+        var firstStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseFirst = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var ingress = new Mock<IAsyncResponseIngress>();
+        ingress.Setup(i => i.HandleWorkerMessageAsync(It.IsAny<string>())).Returns(Task.CompletedTask);
+        ingress.Setup(i => i.HandleWorkerMessageAsync("first"))
+            .Returns(async () =>
+            {
+                firstStarted.TrySetResult();
+                await releaseFirst.Task;
+            });
+        var options = new AzureServiceBusAsyncResponseOptions
+        {
+            WorkerQueue = "workers",
+            ResponseQueue = "responses",
+            ReceiveWaitTime = TimeSpan.FromMilliseconds(10),
+            ShutdownTimeout = TimeSpan.FromSeconds(5)
+        };
+        options.WorkerSubscriber.LockRenewalInterval = null;
+        var firstCalls = new SettlementCalls();
+        var secondCalls = new SettlementCalls { AbandonHangs = true };
+        var subscriber = new AzureServiceBusWorkerSubscriber(
+            Options.Create(options),
+            client,
+            ingress.Object,
+            NullLogger<AzureServiceBusWorkerSubscriber>.Instance)
+        {
+            Clock = clock
+        };
+
+        receiver.Enqueue(Delivery(firstCalls, queue: "workers", messageId: "m1", body: "first"));
+        receiver.Enqueue(Delivery(secondCalls, queue: "workers", messageId: "m2", body: "second"));
+        await subscriber.StartAsync(CancellationToken.None);
+        await firstStarted.Task.WaitAsync(TimeSpan.FromSeconds(2));
+
+        var stopping = subscriber.StopAsync(CancellationToken.None);
+        releaseFirst.TrySetResult();
+
+        // Handing m2 back stalls on the namespace for the whole ShutdownTimeout...
+        await secondCalls.Abandoned.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await WaitUntilAsync(() => clock.NextTimerDueAt is not null);
+        clock.Advance(TimeSpan.FromSeconds(5));
+
+        // ...so the receiver close gets what is left of the one budget: nothing.
+        await WaitUntilAsync(() => receiver.CloseCalls == 1);
+        Assert.True(receiver.CloseTokenWasCancelled, "the receiver close got a fresh ShutdownTimeout after the hand-back had spent the one the validator counts");
+        await stopping.WaitAsync(TimeSpan.FromSeconds(10));
+        Assert.Equal(1, firstCalls.Complete);
+        ingress.Verify(i => i.HandleWorkerMessageAsync("second"), Times.Never);
+    }
+
+    [Fact]
+    public async Task ResponseSubscriber_AckAfterHandlerCompletes_KeepsTheBatch()
+    {
+        // Red-on-old (fixpoint r1 pre-commit, I4): one message per receive was keyed on the ack
+        // mode alone, so the response ingress — ack-after-handler by default, running the
+        // library's own short handler — also paid a receive round trip per response. Only worker
+        // jobs carry the batch-mate risks that rule exists for.
+        var receiver = new FakeReceiver();
+        var client = new FakeServiceBusClient { Receiver = receiver };
+        var ingress = new Mock<IAsyncResponseIngress>();
+        ingress.Setup(i => i.HandleResponseMessageAsync(It.IsAny<string>(), It.IsAny<string?>())).Returns(Task.CompletedTask);
+        var calls = new SettlementCalls();
+        var subscriber = new AzureServiceBusResponseIngressSubscriber(
+            Options.Create(new AzureServiceBusAsyncResponseOptions
+            {
+                WorkerQueue = "workers",
+                ResponseQueue = "responses",
+                ReceiveWaitTime = TimeSpan.FromMilliseconds(10)
+            }),
+            client,
+            ingress.Object,
+            NullLogger<AzureServiceBusResponseIngressSubscriber>.Instance);
+
+        receiver.Enqueue(Delivery(calls, queue: "responses"));
+        await subscriber.StartAsync(CancellationToken.None);
+        await calls.Completed.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await subscriber.StopAsync(CancellationToken.None);
+
+        Assert.Equal(16, receiver.LastMaxMessages);
+    }
+
+    [Fact]
+    public async Task WorkerSubscriber_FlowHandBack_StopsReceivingUntilTheSubscriberStops()
+    {
+        // Red-on-old (fixpoint r1 pre-commit, R1): the flow engine hands a delivery back on
+        // ApplicationStopping, before this subscriber's own stop, and the receive loop kept
+        // receiving in between — so the wake-ups the engine hands over for a replica still running
+        // were taken by this stopping host, interrupted again and left locked for a whole
+        // LockDuration. The first hand-back now ends receiving for the rest of the attempt.
+        var receiver = new FakeReceiver();
+        var client = new FakeServiceBusClient { Receiver = receiver };
+        var logger = new CollectingLogger();
+        var ingress = new Mock<IAsyncResponseIngress>();
+        ingress.Setup(i => i.HandleWorkerMessageAsync("parked-flow")).ThrowsAsync(new DurableFlowInterruptedException("the host is stopping"));
+        ingress.Setup(i => i.HandleWorkerMessageAsync("wake-up")).Returns(Task.CompletedTask);
+        var parkedCalls = new SettlementCalls();
+        var wakeUpCalls = new SettlementCalls();
+        var subscriber = new AzureServiceBusWorkerSubscriber(
+            Options.Create(new AzureServiceBusAsyncResponseOptions
+            {
+                WorkerQueue = "workers",
+                ResponseQueue = "responses",
+                ReceiveWaitTime = TimeSpan.FromMilliseconds(10)
+            }),
+            client,
+            ingress.Object,
+            logger.For<AzureServiceBusWorkerSubscriber>());
+
+        receiver.Enqueue(Delivery(parkedCalls, queue: "workers", messageId: "m1", body: "parked-flow"));
+        receiver.Enqueue(Delivery(wakeUpCalls, queue: "workers", messageId: "m2", body: "wake-up"));
+        await subscriber.StartAsync(CancellationToken.None);
+        try
+        {
+            // The old loop received m2 straight after m1's hand-back; the fix parks it first.
+            await await Task.WhenAny(wakeUpCalls.Completed.Task, logger.WaitForAsync("stops receiving"));
+            Assert.False(wakeUpCalls.Completed.Task.IsCompleted, "the subscriber kept receiving after the flow engine handed a delivery back");
+            Assert.Equal(1, receiver.ReceiveAttempts);
+        }
+        finally
+        {
+            await subscriber.StopAsync(CancellationToken.None);
+        }
+
+        ingress.Verify(i => i.HandleWorkerMessageAsync("wake-up"), Times.Never);
+        Assert.Equal(0, parkedCalls.Complete + parkedCalls.Abandon + parkedCalls.DeadLetter); // left locked
+        Assert.Equal(0, wakeUpCalls.Complete + wakeUpCalls.Abandon);
+    }
+
+    [Fact]
+    public async Task WorkerSubscriber_PrefetchInAckAfterHandlerMode_WarnsAtStartup()
+    {
+        // Fixpoint r1 (S8#19): prefetched messages are locked while they sit in the client buffer,
+        // but the renewal heartbeat only covers messages a receive returned.
+        var logger = new CollectingLogger();
+        var options = new AzureServiceBusAsyncResponseOptions
+        {
+            WorkerQueue = "workers",
+            ResponseQueue = "responses",
+            ReceiveWaitTime = TimeSpan.FromMilliseconds(10)
+        };
+        options.WorkerSubscriber.PrefetchCount = 50;
+        var subscriber = new AzureServiceBusWorkerSubscriber(
+            Options.Create(options),
+            new FakeServiceBusClient(),
+            Mock.Of<IAsyncResponseIngress>(),
+            logger.For<AzureServiceBusWorkerSubscriber>());
+
+        await subscriber.StartAsync(CancellationToken.None);
+        await subscriber.StopAsync(CancellationToken.None);
+
+        Assert.Contains(logger.Messages, message => message.Contains("prefetches 50 message(s)", StringComparison.Ordinal));
+    }
+
+    [Theory]
+    [InlineData(AzureServiceBusAckMode.AckAfterHandlerCompletes, false, 5)]
+    [InlineData(AzureServiceBusAckMode.AckAfterHandlerCompletes, true, null)]
+    [InlineData(AzureServiceBusAckMode.AckAfterEnqueue, false, null)]
+    public void WorkerTransport_MaxInFlightDuration_IsTheLockDurationMaximumOnlyWithoutRenewal(
+        AzureServiceBusAckMode ackMode,
+        bool renewal,
+        int? expectedMinutes)
+    {
+        // Red-on-old (fixpoint r1, S8#15): with renewal off, a delivery held past the entity's
+        // LockDuration (at most 5 minutes) is redelivered however alive its handler is, but the
+        // transport advertised no ceiling, so the durable-flow engine never warned about an
+        // awaited step outliving it.
+        var options = new AzureServiceBusAsyncResponseOptions { WorkerQueue = "workers", ResponseQueue = "responses" };
+        options.WorkerSubscriber.AckMode = ackMode;
+        options.WorkerSubscriber.LockRenewalInterval = renewal ? TimeSpan.FromSeconds(10) : null;
+        var transport = new AzureServiceBusWorkerTransport(Options.Create(options), new FakeServiceBusClient());
+
+        var limit = Assert.IsAssignableFrom<IWorkerTransportInFlightLimit>(transport);
+        Assert.Equal(expectedMinutes is { } minutes ? TimeSpan.FromMinutes(minutes) : null, limit.MaxInFlightDuration);
+    }
+
+    [Fact]
+    public void ValidateSubscriber_LockRenewalIntervalAtTheLockDurationMaximum_Throws()
+    {
+        // Red-on-old (fixpoint r1, S8#16): only the timer bound applied, so an interval that can
+        // never beat any Service Bus lock (5 minutes is the LockDuration maximum) started cleanly.
+        var ex = Assert.Throws<InvalidOperationException>(() => AzureServiceBusMessageDispatcher.ValidateOptions(
+            new AzureServiceBusAsyncResponseOptions(),
+            new AzureServiceBusSubscriberOptions { LockRenewalInterval = TimeSpan.FromMinutes(5) },
+            AzureServiceBusSubscriberRole.Worker));
+        Assert.Contains(nameof(AzureServiceBusSubscriberOptions.LockRenewalInterval), ex.Message, StringComparison.Ordinal);
+
+        AzureServiceBusMessageDispatcher.ValidateOptions(
+            new AzureServiceBusAsyncResponseOptions(),
+            new AzureServiceBusSubscriberOptions { LockRenewalInterval = TimeSpan.FromMinutes(5) - TimeSpan.FromSeconds(1) },
+            AzureServiceBusSubscriberRole.Worker);
+    }
+
+    [Fact]
+    public void ValidateCommon_QueueNamesDifferingOnlyInCase_Throw()
+    {
+        // Red-on-old (fixpoint r1, S8#8): Service Bus entity names are case-insensitive, so
+        // "Jobs"/"jobs" are one entity and both subscribers would read it; the guard compared
+        // ordinally.
+        AssertInvalidCommon(options =>
+        {
+            options.WorkerQueue = "Jobs";
+            options.ResponseQueue = "jobs";
+        }, nameof(AzureServiceBusAsyncResponseOptions.ResponseQueue));
+    }
+
+    [Fact]
+    public async Task WorkerTransport_PublishAfterDispose_ThrowsTransportNamedDisposedException_EvenOnceTheSenderIsCached()
+    {
+        // Red-on-old (fixpoint r1, S8#22): the lock-free fast path returned the cached sender
+        // before the disposal check, so every publish after the first reached the SDK's disposed
+        // sender instead of the transport-named ObjectDisposedException.
+        var transport = new AzureServiceBusWorkerTransport(
+            Options.Create(new AzureServiceBusAsyncResponseOptions
+            {
+                WorkerQueue = "worker-q",
+                ResponseQueue = "response-q"
+            }),
+            new FakeServiceBusClient());
+
+        await transport.PublishAsync(WorkerJob("c-before"));
+        await transport.DisposeAsync();
+
+        var ex = await Assert.ThrowsAsync<ObjectDisposedException>(() => transport.PublishAsync(WorkerJob("c-after")));
+        Assert.Contains(nameof(AzureServiceBusWorkerTransport), ex.ObjectName, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void ValidateSubscriber_NonPositiveLockRenewalInterval_Throws()
     {
         var ex = Assert.Throws<InvalidOperationException>(() => AzureServiceBusMessageDispatcher.ValidateOptions(
@@ -1108,7 +1716,8 @@ public sealed class AzureServiceBusTransportTests
             {
                 calls.Abandon++;
                 calls.Abandoned.TrySetResult();
-                return ValueTask.CompletedTask;
+                // A hanging abandon behaves like a settlement stuck on a degraded namespace.
+                return calls.AbandonHangs ? new ValueTask(new TaskCompletionSource().Task) : ValueTask.CompletedTask;
             },
             (reason, description) =>
             {
@@ -1120,8 +1729,10 @@ public sealed class AzureServiceBusTransportTests
             },
             async cancellationToken =>
             {
-                calls.RenewLock++;
+                Interlocked.Increment(ref calls.RenewLock);
                 calls.RenewStarted.TrySetResult();
+                if (calls.RenewLockException is not null)
+                    throw calls.RenewLockException;
                 if (calls.RenewLockBlocksUntilCancelled)
                     // Behaves like ServiceBusReceiver.RenewMessageLockAsync stuck in the SDK retry
                     // pipeline on a degraded namespace: only the caller's token gets it back.
@@ -1136,6 +1747,8 @@ public sealed class AzureServiceBusTransportTests
         public int DeadLetter;
         public int RenewLock;
         public bool RenewLockBlocksUntilCancelled;
+        public bool AbandonHangs;
+        public Exception? RenewLockException;
         public string? DeadLetterReason;
         public string? DeadLetterDescription;
         public TaskCompletionSource Completed { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -1265,8 +1878,32 @@ public sealed class AzureServiceBusTransportTests
 
         public AzureServiceBusSubscriberOptions? LastSubscriberOptions { get; set; }
         public int FailuresBeforeReceive { get; set; }
-        public int ReceiveAttempts { get; private set; }
+
+        /// <summary>
+        /// Fails exactly the receive with this 1-based attempt number, like a ServiceBusException
+        /// that outlived the SDK's retries mid-run (FailuresBeforeReceive only fails the first ones).
+        /// </summary>
+        public int? FailOnReceiveAttempt { get; set; }
+
+        /// <summary>
+        /// Hands over everything queued regardless of the requested count. A real receiver never
+        /// returns more than asked; the flag lets a test drive the batch loop, which must handle
+        /// whatever batch a receive returns, although ACK-after-handler now asks for one message.
+        /// </summary>
+        public bool ReturnAllAvailable { get; set; }
+
+        /// <summary>Makes CloseAsync hang past its token, like a link detach the SDK runs with CancellationToken.None.</summary>
+        public bool CloseIgnoresToken { get; set; }
+
+        public int ReceiveAttempts => Volatile.Read(ref _receiveAttempts);
         public int LastMaxMessages { get; private set; }
+        public int CloseCalls => Volatile.Read(ref _closeCalls);
+
+        /// <summary>Whether the token the last CloseAsync received was already cancelled: the close had no budget left.</summary>
+        public bool CloseTokenWasCancelled { get; private set; }
+
+        private int _receiveAttempts;
+        private int _closeCalls;
 
         public void Enqueue(AzureServiceBusTransportDelivery delivery)
             => _deliveries.Writer.TryWrite(delivery);
@@ -1276,13 +1913,16 @@ public sealed class AzureServiceBusTransportTests
             TimeSpan maxWaitTime,
             CancellationToken cancellationToken = default)
         {
-            ReceiveAttempts++;
+            var attempt = Interlocked.Increment(ref _receiveAttempts);
             LastMaxMessages = maxMessages;
             if (FailuresBeforeReceive > 0)
             {
                 FailuresBeforeReceive--;
                 throw new InvalidOperationException("receive failed");
             }
+
+            if (attempt == FailOnReceiveAttempt)
+                throw new ServiceBusException(isTransient: true, "receive failed after the SDK retries");
 
             using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
             timeout.CancelAfter(maxWaitTime);
@@ -1297,12 +1937,18 @@ public sealed class AzureServiceBusTransportTests
             }
 
             var messages = new List<AzureServiceBusTransportDelivery>(maxMessages);
-            while (messages.Count < maxMessages && _deliveries.Reader.TryRead(out var delivery))
+            while ((ReturnAllAvailable || messages.Count < maxMessages) && _deliveries.Reader.TryRead(out var delivery))
                 messages.Add(delivery);
             return messages;
         }
 
-        public Task CloseAsync(CancellationToken cancellationToken = default) => Task.CompletedTask;
+        public Task CloseAsync(CancellationToken cancellationToken = default)
+        {
+            CloseTokenWasCancelled = cancellationToken.IsCancellationRequested;
+            Interlocked.Increment(ref _closeCalls);
+            return CloseIgnoresToken ? new TaskCompletionSource().Task : Task.CompletedTask;
+        }
+
         public ValueTask DisposeAsync() => ValueTask.CompletedTask;
     }
 

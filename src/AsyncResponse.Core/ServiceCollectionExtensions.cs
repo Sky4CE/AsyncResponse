@@ -51,6 +51,12 @@ public static class AsyncResponseCoreServiceCollectionExtensions
             // The producer-side mirror of the ingress's inbound size budget (WorkerJobTooLargeException).
             provider.GetService<IOptions<AsyncResponseOptions>>()));
 
+        // The package-version gate goes FIRST: the host constructs hosted services in registration
+        // order, and every provider subscriber (plus the validator's provider-built markers) is
+        // provider code bound to Core internals — a mixed install must fail on the named versions,
+        // not on whichever of those first hits a changed internal.
+        services.TryAddEnumerable(ServiceDescriptor.Singleton<Microsoft.Extensions.Hosting.IHostedService, AsyncResponsePackageVersionGate>());
+
         // Fail fast before background services do any real work if the required channel,
         // transport, and durable-flow store choices were not made explicitly. TryAddEnumerable
         // (keyed by implementation type) keeps a second AddAsyncResponse() call from registering a
@@ -109,7 +115,7 @@ public static class AsyncResponseCoreServiceCollectionExtensions
         // call with a different lifetime silently re-opens that hazard, so the marker carries the
         // snapshot and the startup validator re-checks it against the final collection.
         builder.Services.TryAddScoped<TFlowStateStore>();
-        var storeLifetime = builder.Services.Last(d => d.ServiceType == typeof(TFlowStateStore)).Lifetime;
+        var storeLifetime = builder.Services.Last(d => d.ServiceType == typeof(TFlowStateStore) && !d.IsKeyedService).Lifetime;
         builder.Services.Add(ServiceDescriptor.Describe(
             typeof(IFlowStateStore),
             static provider => provider.GetRequiredService<TFlowStateStore>(),
@@ -338,7 +344,12 @@ public static class AsyncResponseCoreServiceCollectionExtensions
 
         services.TryAddSingleton<InMemoryRecoveryStateStore>();
         services.TryAddSingleton<IRecoveryStateStore>(provider => provider.GetRequiredService<InMemoryRecoveryStateStore>());
-        services.TryAddSingleton<IRecoveryStateScanner>(provider => provider.GetRequiredService<InMemoryRecoveryStateStore>());
+        // The scanner is the capability of the store the channel actually WRITES to — which is
+        // whatever IRecoveryStateStore resolves, not necessarily the built-in one (an app may
+        // register its own store, before or after this call). Bound to the built-in instance, a
+        // custom store left the watchdog scanning an empty map and publishing a clean pass forever.
+        // A store without the capability yields no scanner, which idles the watchdog as documented.
+        services.TryAddSingleton<IRecoveryStateScanner>(provider => (provider.GetRequiredService<IRecoveryStateStore>() as IRecoveryStateScanner)!);
 
         services.TryAddSingleton<InMemoryAsyncResponseChannel>();
         services.TryAddSingleton<IAsyncResponsePublisher>(provider => provider.GetRequiredService<InMemoryAsyncResponseChannel>());

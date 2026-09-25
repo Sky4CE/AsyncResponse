@@ -307,6 +307,70 @@ public class GooglePubSubTransportTests
     }
 
     [Fact]
+    public void ReplyTargetProvider_NamesTheCorrelationAttributeForRemoteProducers()
+    {
+        // Red-on-old (fixpoint r1, GS5#12): the correlation attribute is configurable, and every
+        // other broker provider names its correlation key in the reply target; Pub/Sub did not, so
+        // a producer on another attribute name fell through to the body paths and, lacking the id
+        // there, the response was dropped as unroutable.
+        var provider = new GooglePubSubReplyTargetProvider(Options.Create(new GooglePubSubAsyncResponseOptions
+        {
+            ProjectId = "project-a",
+            ResponseTopicId = "responses",
+            CorrelationIdAttribute = "x-correlation"
+        }));
+
+        Assert.Equal("x-correlation", provider.GetReplyTarget().Properties["correlationIdAttribute"]);
+    }
+
+    [Fact]
+    public async Task WorkerTransport_CorrelationIdOverTheAttributeSizeLimit_TravelsWithoutTheAttribute()
+    {
+        // Red-on-old (fixpoint r1, S8#12): Pub/Sub rejects an attribute value over 1024 bytes —
+        // failing the whole publish — while a portable id may be 400 UTF-16 units: 350 CJK
+        // characters are 1050 UTF-8 bytes. The worker path reads the id from the body, so the
+        // diagnostic attribute is simply left off.
+        var correlationId = new string('中', 350);
+        var publisher = new FakePublisherClient();
+        var transport = new GooglePubSubWorkerTransport(
+            Options.Create(new GooglePubSubAsyncResponseOptions
+            {
+                ProjectId = "project-a",
+                WorkerTopicId = "jobs"
+            }),
+            _ => Task.FromResult<IGooglePubSubPublisherClient>(publisher));
+
+        await transport.PublishAsync(WorkerJob(correlationId));
+
+        var message = Assert.Single(publisher.Messages);
+        Assert.False(message.Attributes.ContainsKey("correlationId"));
+        Assert.Equal(correlationId, AsyncResponseJson.Deserialize<WorkerJobEnvelope>(message.Data.ToStringUtf8())!.CorrelationId);
+    }
+
+    [Fact]
+    public async Task WorkerTransport_PublishAfterDispose_ThrowsTransportNamedDisposedException_EvenOnceThePublisherIsCached()
+    {
+        // Red-on-old (fixpoint r1, S8#22): the lock-free fast path returned the cached publisher
+        // before the disposal check, so every publish after the first reached the shut-down
+        // PublisherClient instead of the transport-named ObjectDisposedException.
+        var publisher = new FakePublisherClient();
+        var transport = new GooglePubSubWorkerTransport(
+            Options.Create(new GooglePubSubAsyncResponseOptions
+            {
+                ProjectId = "project-a",
+                WorkerTopicId = "jobs"
+            }),
+            _ => Task.FromResult<IGooglePubSubPublisherClient>(publisher));
+
+        await transport.PublishAsync(WorkerJob("c-before"));
+        await transport.DisposeAsync();
+
+        var ex = await Assert.ThrowsAsync<ObjectDisposedException>(() => transport.PublishAsync(WorkerJob("c-after")));
+        Assert.Contains(nameof(GooglePubSubWorkerTransport), ex.ObjectName, StringComparison.Ordinal);
+        Assert.Single(publisher.Messages);
+    }
+
+    [Fact]
     public void ReplyTargetProvider_ResolvesNamedTargets()
     {
         var options = new GooglePubSubAsyncResponseOptions { ProjectId = "project-a" }

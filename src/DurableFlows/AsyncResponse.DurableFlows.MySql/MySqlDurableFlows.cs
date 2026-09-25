@@ -40,8 +40,9 @@ public sealed class MySqlDurableFlowOptions : DurableFlowOptions
     public bool AutoCreateSchema { get; set; } = true;
 
     /// <summary>
-    /// How often <see cref="MySqlFlowStateStore.TryCreateAsync"/> opportunistically deletes one bounded
-    /// batch (1000 rows) of expired rows (loads already treat expired state as absent; pruning
+    /// How often <see cref="MySqlFlowStateStore.TryCreateAsync"/> opportunistically runs a
+    /// budgeted prune of expired rows: batches of 1000 until one comes back short or
+    /// <see cref="PruneBudget"/> lapses (loads already treat expired state as absent; pruning
     /// bounds table growth). Zero or negative prunes on every save. Default: 5 minutes.
     /// </summary>
     public TimeSpan PruneInterval { get; set; } = TimeSpan.FromMinutes(5);
@@ -132,56 +133,110 @@ public sealed class MySqlFlowStateStore : IFlowStateStore
         var stateJson = DurableFlowStoreShared.SerializeBounded(flowId, state, _options.MaxStateBytes, "MySQL");
         await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
         if (DurableFlowStoreShared.ShouldPrune(ref _lastPruneTicks, _options.PruneInterval))
-            await DurableFlowStoreShared.PruneQuietlyAsync(() => PruneExpiredAsync(cancellationToken), _options.PruneBudget, "MySQL", _logger).ConfigureAwait(false);
+            await DurableFlowStoreShared.PruneQuietlyAsync(() => PruneExpiredAsync(cancellationToken), _options.PruneBudget, "MySQL", _logger, cancellationToken).ConfigureAwait(false);
 
         await using var connection = await OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         await using var command = connection.CreateCommand();
-        command.CommandText =
-            $"""
-            INSERT INTO {Table} (flow_id, state_json, expires_at_utc, updated_at_utc, revision)
-            VALUES (@flow_id, @state_json, {AddMilliseconds("@ttl_ms")}, UTC_TIMESTAMP(6), @revision);
-            """;
         command.Parameters.AddWithValue("@flow_id", flowId);
         command.Parameters.AddWithValue("@state_json", stateJson);
         command.Parameters.AddWithValue("@ttl_ms", DurableFlowStoreShared.ServerClockTtlMilliseconds(ttl));
         command.Parameters.AddWithValue("@revision", state.Revision);
-        try
-        {
-            await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
-            return true;
-        }
-        catch (MySqlException exception) when (exception.Number == 1062)
-        {
-            // 1062 says "some unique constraint rejected this row" — NOT "this flow id exists".
-            // The distinction is load-bearing on a table this build did not create: a legacy
-            // PREFIX key alongside the required one (UNIQUE (flow_id(100))) raises 1062 for a
-            // DIFFERENT id that happens to share a prefix, and reading that as "already exists"
-            // would report a successful start for a flow with no row and no run. Startup
-            // verification refuses such tables, but this store also runs against schemas it did not
-            // get to inspect first (AutoCreateSchema off, table created later), so confirm the row
-            // is actually there before believing the error.
-            if (!await ExistsAsync(connection, flowId, cancellationToken).ConfigureAwait(false))
-                throw;
 
-            // The id already exists. Only an expired row may be replaced below; do not use
-            // INSERT IGNORE here because it also suppresses truncation and other data errors.
-        }
+        return await CreateAsync(
+            insert: async () =>
+            {
+                command.CommandText =
+                    $"""
+                    INSERT INTO {Table} (flow_id, state_json, expires_at_utc, updated_at_utc, revision)
+                    VALUES (@flow_id, @state_json, {AddMilliseconds("@ttl_ms")}, UTC_TIMESTAMP(6), @revision);
+                    """;
+                try
+                {
+                    await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+                    return null;
+                }
+                catch (MySqlException exception) when (exception.Number == 1062)
+                {
+                    // Only an expired row may be replaced; do not use INSERT IGNORE here because
+                    // it also suppresses truncation and other data errors.
+                    return exception;
+                }
+            },
+            exists: () => ExistsAsync(connection, flowId, cancellationToken),
+            // Exactly one caller can replace an expired ledger: after its conditional update,
+            // every competing caller sees the new future expiry and matches nothing. This avoids
+            // relying on MySQL's configurable "changed rows" versus "matched rows" semantics.
+            replaceExpired: async () =>
+            {
+                command.CommandText =
+                    $"""
+                    UPDATE {Table}
+                    SET state_json = @state_json,
+                        revision = @revision,
+                        lease_id = NULL,
+                        lease_expires_at_utc = NULL,
+                        updated_at_utc = UTC_TIMESTAMP(6),
+                        expires_at_utc = {AddMilliseconds("@ttl_ms")}
+                    WHERE flow_id = @flow_id AND expires_at_utc <= UTC_TIMESTAMP(6);
+                    """;
+                return await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) > 0;
+            }).ConfigureAwait(false);
+    }
 
-        // Exactly one caller can replace an expired ledger: after its conditional update, every
-        // competing caller sees the new future expiry and returns false. This avoids relying on
-        // MySQL's configurable "changed rows" versus "matched rows" result semantics.
-        command.CommandText =
-            $"""
-            UPDATE {Table}
-            SET state_json = @state_json,
-                revision = @revision,
-                lease_id = NULL,
-                lease_expires_at_utc = NULL,
-                updated_at_utc = UTC_TIMESTAMP(6),
-                expires_at_utc = {AddMilliseconds("@ttl_ms")}
-            WHERE flow_id = @flow_id AND expires_at_utc <= UTC_TIMESTAMP(6);
-            """;
-        return await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) > 0;
+    /// <summary>
+    /// The create decision over its three statements, split out so the table is exercised without
+    /// a server (the relation verifiers' <c>Evaluate</c> precedent). Two tries:
+    /// <list type="bullet">
+    /// <item><description>
+    /// 1062 says "some unique constraint rejected this row" — NOT "this flow id exists". A legacy
+    /// PREFIX key alongside the required one (<c>UNIQUE (flow_id(100))</c>) raises 1062 for a
+    /// DIFFERENT id sharing the prefix, and reading that as "already exists" reported a successful
+    /// start for a flow with no row and no run. Startup verification refuses such tables, but this
+    /// store also runs against schemas it did not inspect first (AutoCreateSchema off, table
+    /// created later), so the row must actually be there before the error is believed.
+    /// </description></item>
+    /// <item><description>
+    /// No row under the id after a 1062 is either that foreign key or a peer's prune that deleted
+    /// the expired row the insert collided with (the autocommit insert already released its
+    /// locks). The second insert tells them apart: into the gap it succeeds, a prefix key refuses it
+    /// again and its 1062 is rethrown. Rethrowing on the first cost the job a delivery attempt and
+    /// an error log for a create that would now succeed.
+    /// </description></item>
+    /// <item><description>
+    /// A replace that matches nothing normally means a live owner holds the id — unless the prune
+    /// deleted the expired row between the existence check and the replace, and there is no row
+    /// at all. "Exists" there sent the executor to load an absent ledger and acknowledge the start
+    /// job: the run was never created. Insert into the gap instead.
+    /// </description></item>
+    /// </list>
+    /// </summary>
+    /// <param name="insert">Inserts the row; <c>null</c> on success, the 1062 on a duplicate key (anything else throws).</param>
+    /// <param name="exists">Whether a row with exactly this id exists, expired or not.</param>
+    /// <param name="replaceExpired">Replaces the row in place only while it is expired; whether it did.</param>
+    internal static async Task<bool> CreateAsync(Func<Task<Exception?>> insert, Func<Task<bool>> exists, Func<Task<bool>> replaceExpired)
+    {
+        const int maxAttempts = 2;
+        for (var attempt = 1; ; attempt++)
+        {
+            if (await insert().ConfigureAwait(false) is not { } duplicate)
+                return true;
+
+            if (!await exists().ConfigureAwait(false))
+            {
+                if (attempt < maxAttempts)
+                    continue;
+
+                System.Runtime.ExceptionServices.ExceptionDispatchInfo.Throw(duplicate);
+            }
+
+            if (await replaceExpired().ConfigureAwait(false))
+                return true;
+
+            if (attempt < maxAttempts && !await exists().ConfigureAwait(false))
+                continue;
+
+            return false;
+        }
     }
 
     /// <summary>

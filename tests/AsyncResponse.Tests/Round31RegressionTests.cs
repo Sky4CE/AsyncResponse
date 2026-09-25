@@ -122,6 +122,97 @@ public sealed class Round31RegressionTests
     }
 
     [Fact]
+    public async Task ReflectiveExecution_DoesNotConstructTheLedgersFlowType_BeforeTheContractCheck()
+    {
+        // Fixpoint r1 (S3#22): the input type was bounded (above), but the FLOW type was still
+        // resolved from DI first and checked afterwards — so a ledger naming any registered
+        // service ran that service's constructor (and, scoped, its disposal) on flow-store content
+        // before being rejected.
+        R31NonFlowCanary.Constructed = false;
+        var services = new ServiceCollection();
+        services.AddSingleton(typeof(ILogger<>), typeof(NullLogger<>));
+        services.AddScoped<R31NonFlowCanary>();
+        services.AddAsyncResponse().WithInMemoryChannel().WithInMemoryTransport().WithInMemoryDurableFlows();
+        await using var provider = services.BuildServiceProvider();
+
+        var store = provider.GetRequiredService<InMemoryFlowStateStore>();
+        var state = new FlowState
+        {
+            FlowId = "hostile-flow-type",
+            FlowTypeName = typeof(R31NonFlowCanary).FullName,
+            InputTypeName = typeof(string).FullName,
+            InputJson = "\"acme\"",
+            Status = FlowRunStatus.Running
+        };
+        Assert.True(await store.TryCreateAsync("hostile-flow-type", state, TimeSpan.FromDays(1)));
+
+        var executor = provider.GetRequiredService<IDurableFlowExecutor>();
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => executor.ExecuteAsync("hostile-flow-type"));
+
+        Assert.Contains("does not implement IDurableFlow", ex.Message, StringComparison.Ordinal);
+        Assert.False(R31NonFlowCanary.Constructed);
+    }
+
+    [Theory]
+    [InlineData("crlf")]
+    [InlineData("lone-surrogate")]
+    public void AFlowIdRejection_QuotesTheIdEscaped_NeverRaw(string shape)
+    {
+        // Built here, not passed as theory data: xUnit's data serialization mangles ill-formed strings.
+        var (flowId, escaped) = shape == "crlf"
+            ? ("tenant\r\nFORGED ENTRY", "\\u000d\\u000a")
+            : ("tenant\ud800lone", "\\ud800");
+
+        // Fixpoint r1 (S3#9): the rejection quoted the id truncated but raw. A start job's id is
+        // written by whoever can publish to the worker stream, and the rejection is logged at
+        // Error by the ingress — a CR/LF inside it wrote its own log line, and an unpaired
+        // surrogate reached the sink as U+FFFD. Round 42 escaped the correlation-id twins only.
+        var rejection = FlowStateConcurrency.FlowIdNotPortable(flowId);
+
+        Assert.NotNull(rejection);
+        Assert.Contains(escaped, rejection, StringComparison.Ordinal);
+        Assert.DoesNotContain('\r', rejection);
+        Assert.DoesNotContain('\n', rejection);
+        Assert.DoesNotContain('\ud800', rejection);
+    }
+
+    [Fact]
+    public async Task TheTypedPathsInputTypeMismatch_QuotesThePersistedNameEscaped()
+    {
+        // Fixpoint r1 (S3#10): the registered flow's input-type mismatch quoted the ledger's
+        // InputTypeName raw into an exception logged at Error on every redelivery — store data, so
+        // megabytes of text or line breaks that forge log entries. Its reflection-path sibling was
+        // escaped in round 42.
+        var services = new ServiceCollection();
+        services.AddSingleton(typeof(ILogger<>), typeof(NullLogger<>));
+        services.AddAsyncResponse()
+            .WithInMemoryChannel()
+            .WithInMemoryTransport()
+            .WithInMemoryDurableFlows()
+            .WithDurableFlow<R31MismatchedInputFlow, string>();
+        await using var provider = services.BuildServiceProvider();
+
+        var store = provider.GetRequiredService<InMemoryFlowStateStore>();
+        var state = new FlowState
+        {
+            FlowId = "forged-input-type",
+            FlowTypeName = typeof(R31MismatchedInputFlow).FullName,
+            InputTypeName = "Some.Type\r\n2030-01-01 FORGED ENTRY",
+            InputJson = "\"acme\"",
+            Status = FlowRunStatus.Running
+        };
+        Assert.True(await store.TryCreateAsync("forged-input-type", state, TimeSpan.FromDays(1)));
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => provider.GetRequiredService<IDurableFlowExecutor>().ExecuteAsync("forged-input-type"));
+
+        Assert.Contains("persisted run carries input type", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("\\u000d\\u000a", ex.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain('\r', ex.Message);
+        Assert.DoesNotContain('\n', ex.Message);
+    }
+
+    [Fact]
     public void Serialize_MetadataFailureRaisedMidGraph_CarriesTheRegistrationGuidance()
     {
         // Regression: when the serializer refuses a type while WALKING the graph (an object-typed
@@ -153,6 +244,14 @@ public sealed class R31ConstructionCanaryInput
     public R31ConstructionCanaryInput() => Constructed = true;
 
     public string? Name { get; set; }
+}
+
+/// <summary>A DI-registered service that is not a flow, recording whether anything constructed it.</summary>
+public sealed class R31NonFlowCanary
+{
+    public static volatile bool Constructed;
+
+    public R31NonFlowCanary() => Constructed = true;
 }
 
 /// <summary>A DI-resolvable flow whose input contract does NOT match the hostile ledger's.</summary>

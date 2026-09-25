@@ -44,9 +44,10 @@ public sealed class SqlServerDurableFlowOptions : DurableFlowOptions
     public bool AutoCreateSchema { get; set; } = true;
 
     /// <summary>
-    /// How often <see cref="SqlServerFlowStateStore.TryCreateAsync"/> opportunistically deletes one
-    /// bounded batch (1000 rows) of expired rows (loads already treat expired state as absent;
-    /// pruning bounds table growth). Zero or negative prunes on every save. Default: 5 minutes.
+    /// How often <see cref="SqlServerFlowStateStore.TryCreateAsync"/> opportunistically runs a
+    /// budgeted prune of expired rows: batches of 1000 until one comes back short or
+    /// <see cref="PruneBudget"/> lapses (loads already treat expired state as absent; pruning
+    /// bounds table growth). Zero or negative prunes on every save. Default: 5 minutes.
     /// </summary>
     public TimeSpan PruneInterval { get; set; } = TimeSpan.FromMinutes(5);
 
@@ -131,25 +132,11 @@ public sealed class SqlServerFlowStateStore : IFlowStateStore
         var stateJson = DurableFlowStoreShared.SerializeBounded(flowId, state, _options.MaxStateBytes, "SQL Server");
         await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
         if (DurableFlowStoreShared.ShouldPrune(ref _lastPruneTicks, _options.PruneInterval))
-            await DurableFlowStoreShared.PruneQuietlyAsync(() => PruneExpiredAsync(cancellationToken), _options.PruneBudget, "SQL Server", _logger).ConfigureAwait(false);
+            await DurableFlowStoreShared.PruneQuietlyAsync(() => PruneExpiredAsync(cancellationToken), _options.PruneBudget, "SQL Server", _logger, cancellationToken).ConfigureAwait(false);
 
         await using var connection = await OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         await using var command = connection.CreateCommand();
-        command.CommandText =
-            $"""
-            MERGE {Table} WITH (HOLDLOCK) AS target
-            USING (SELECT @flow_id AS flow_id) AS source ON target.flow_id = source.flow_id
-            WHEN MATCHED AND target.expires_at_utc <= SYSUTCDATETIME() THEN
-                UPDATE SET state_json = @state_json,
-                           expires_at_utc = {AddMilliseconds("@ttl_ms")},
-                           updated_at_utc = SYSUTCDATETIME(),
-                           revision = @revision,
-                           lease_id = NULL,
-                           lease_expires_at_utc = NULL
-            WHEN NOT MATCHED THEN
-                INSERT (flow_id, state_json, expires_at_utc, updated_at_utc, revision)
-                VALUES (@flow_id, @state_json, {AddMilliseconds("@ttl_ms")}, SYSUTCDATETIME(), @revision);
-            """;
+        command.CommandText = CreateSql;
         command.Parameters.AddWithValue("@flow_id", flowId);
         command.Parameters.AddWithValue("@state_json", stateJson);
         command.Parameters.AddWithValue("@ttl_ms", DurableFlowStoreShared.ServerClockTtlMilliseconds(ttl));
@@ -171,18 +158,7 @@ public sealed class SqlServerFlowStateStore : IFlowStateStore
 
         await using var connection = await OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         await using var command = connection.CreateCommand();
-        command.CommandText =
-            $"""
-            UPDATE {Table}
-            SET state_json = @state_json,
-                expires_at_utc = {AddMilliseconds("@ttl_ms")},
-                updated_at_utc = SYSUTCDATETIME(),
-                revision = @new_revision
-            WHERE flow_id = @flow_id
-              AND revision = @expected_revision
-              AND expires_at_utc > SYSUTCDATETIME()
-              AND (@lease_id IS NULL OR (lease_id = @lease_id AND lease_expires_at_utc > SYSUTCDATETIME()));
-            """;
+        command.CommandText = UpdateSql;
         command.Parameters.AddWithValue("@flow_id", flowId);
         command.Parameters.AddWithValue("@state_json", stateJson);
         command.Parameters.AddWithValue("@ttl_ms", DurableFlowStoreShared.ServerClockTtlMilliseconds(ttl));
@@ -243,7 +219,7 @@ public sealed class SqlServerFlowStateStore : IFlowStateStore
 
         await using var connection = await OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         await using var command = connection.CreateCommand();
-        command.CommandText = $"DELETE FROM {Table} WHERE flow_id = @flow_id;";
+        command.CommandText = DeleteSql;
         command.Parameters.AddWithValue("@flow_id", flowId);
         return await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) > 0;
     }
@@ -257,7 +233,7 @@ public sealed class SqlServerFlowStateStore : IFlowStateStore
         // expiry, so any backlog beyond the batch just waits for the next interval.
         await using var connection = await OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         await using var command = connection.CreateCommand();
-        command.CommandText = $"DELETE TOP ({DurableFlowStoreShared.PruneBatchSize}) FROM {Table} WHERE expires_at_utc <= SYSUTCDATETIME();";
+        command.CommandText = PruneSql;
         return await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
     }
 
@@ -352,10 +328,12 @@ public sealed class SqlServerFlowStateStore : IFlowStateStore
                 // component's table suppresses the guarded CREATE and the index that follows hits
                 // the wrong table, and a name held by a view fails outright with error 2714. Run
                 // the same catalog checks now, on a fresh connection (the objects in question are
-                // somebody else's and already committed), so the operator gets the precise reason.
+                // somebody else's and already committed) after rolling this transaction back, so
+                // the operator gets the precise reason.
                 await SqlServerRelationVerifier.ThrowDiagnosedCollisionAsync(
                     OpenConnectionAsync,
                     ex,
+                    transaction,
                     _options.SchemaName,
                     "durable-flow",
                     ExpectedObjects(),
@@ -420,17 +398,21 @@ public sealed class SqlServerFlowStateStore : IFlowStateStore
     /// post-DDL verification and the failed-batch diagnosis.</summary>
     /// <remarks>A bare <c>datetime2</c> declaration is <c>datetime2(7)</c>; the expected types
     /// state the scale, because a reduced-scale <c>lease_expires_at_utc</c> rounds the fence on
-    /// store — two nodes can then both read the lease as expired and run one flow at once.</remarks>
-    private SqlServerRelationVerifier.ExpectedObject[] ExpectedObjects() =>
+    /// store — two nodes can then both read the lease as expired and run one flow at once. That
+    /// scale stays exact (7 is already the maximum). The two <c>nvarchar</c> widths are minimums,
+    /// as in the MySQL and Oracle siblings: an operator-provisioned <c>flow_id nvarchar(450)</c> or
+    /// <c>lease_id nvarchar(100)</c> holds every value this store writes, and refusing it was a false
+    /// alarm; the ordinal (binary) collation is still required.</remarks>
+    internal SqlServerRelationVerifier.ExpectedObject[] ExpectedObjects() =>
             [
                 new(_options.TableName, SqlServerObjectKind.Table,
                 [
-                    new("flow_id", "nvarchar(400)", Nullable: false, RequiresBinaryCollation: true),
+                    new("flow_id", "nvarchar(400)", Nullable: false, RequiresBinaryCollation: true) { MinimumWidth = true },
                     new("state_json", "nvarchar(max)", Nullable: false),
                     new("expires_at_utc", "datetime2(7)", Nullable: false),
                     new("updated_at_utc", "datetime2(7)", Nullable: false),
                     new("revision", "bigint", Nullable: false),
-                    new("lease_id", "nvarchar(64)", Nullable: true),
+                    new("lease_id", "nvarchar(64)", Nullable: true) { MinimumWidth = true },
                     new("lease_expires_at_utc", "datetime2(7)", Nullable: true)
                 ],
                 PrimaryKey: ["flow_id"])
@@ -449,22 +431,73 @@ public sealed class SqlServerFlowStateStore : IFlowStateStore
         await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
         await using var connection = await OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         await using var command = connection.CreateCommand();
-        // Lease fencing runs entirely on the database clock: acquire steals only leases the
-        // database considers expired, and renew/extend stays relative to SYSUTCDATETIME(), so
-        // worker clock skew can never make two nodes hold the same lease.
-        command.CommandText =
-            $"""
-            UPDATE {Table}
-            SET lease_id = @lease_id, lease_expires_at_utc = {AddMilliseconds("@lease_ms")}
-            WHERE flow_id = @flow_id
-              AND expires_at_utc > SYSUTCDATETIME()
-              AND {(acquire ? "(lease_id IS NULL OR lease_expires_at_utc <= SYSUTCDATETIME() OR lease_id = @lease_id)" : "lease_id = @lease_id AND lease_expires_at_utc > SYSUTCDATETIME()")};
-            """;
+        command.CommandText = LeaseSql(acquire);
         command.Parameters.AddWithValue("@flow_id", flowId);
         command.Parameters.AddWithValue("@lease_id", leaseId);
         command.Parameters.AddWithValue("@lease_ms", DurableFlowStoreShared.ServerClockTtlMilliseconds(leaseDuration));
         return await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) > 0;
     }
+
+    /// <summary>
+    /// Opens every statement whose row count this store decides on. A server whose sessions start
+    /// with NOCOUNT on (<c>sp_configure 'user options', 512</c>, which <c>sp_reset_connection</c>
+    /// re-applies to every pooled connection) makes <c>ExecuteNonQuery</c> return -1: every create
+    /// then read as "exists", every checkpoint as a lost revision race, and every lease acquire as
+    /// contended although it took the lease — no flow ever ran. The MySQL sibling refuses its
+    /// equivalent setting (<c>UseAffectedRows</c>) for the same reason; here the statement simply
+    /// turns the count back on for itself, at no extra round trip.
+    /// </summary>
+    internal const string RowCountOn = "SET NOCOUNT OFF;\n";
+
+    internal string CreateSql =>
+        RowCountOn +
+        $"""
+        MERGE {Table} WITH (HOLDLOCK) AS target
+        USING (SELECT @flow_id AS flow_id) AS source ON target.flow_id = source.flow_id
+        WHEN MATCHED AND target.expires_at_utc <= SYSUTCDATETIME() THEN
+            UPDATE SET state_json = @state_json,
+                       expires_at_utc = {AddMilliseconds("@ttl_ms")},
+                       updated_at_utc = SYSUTCDATETIME(),
+                       revision = @revision,
+                       lease_id = NULL,
+                       lease_expires_at_utc = NULL
+        WHEN NOT MATCHED THEN
+            INSERT (flow_id, state_json, expires_at_utc, updated_at_utc, revision)
+            VALUES (@flow_id, @state_json, {AddMilliseconds("@ttl_ms")}, SYSUTCDATETIME(), @revision);
+        """;
+
+    internal string UpdateSql =>
+        RowCountOn +
+        $"""
+        UPDATE {Table}
+        SET state_json = @state_json,
+            expires_at_utc = {AddMilliseconds("@ttl_ms")},
+            updated_at_utc = SYSUTCDATETIME(),
+            revision = @new_revision
+        WHERE flow_id = @flow_id
+          AND revision = @expected_revision
+          AND expires_at_utc > SYSUTCDATETIME()
+          AND (@lease_id IS NULL OR (lease_id = @lease_id AND lease_expires_at_utc > SYSUTCDATETIME()));
+        """;
+
+    internal string DeleteSql => RowCountOn + $"DELETE FROM {Table} WHERE flow_id = @flow_id;";
+
+    // The prune's count only ends its batch loop, but a -1 there silently stopped every drain
+    // after one batch.
+    internal string PruneSql => RowCountOn + $"DELETE TOP ({DurableFlowStoreShared.PruneBatchSize}) FROM {Table} WHERE expires_at_utc <= SYSUTCDATETIME();";
+
+    // Lease fencing runs entirely on the database clock: acquire steals only leases the database
+    // considers expired, and renew/extend stays relative to SYSUTCDATETIME(), so worker clock skew
+    // can never make two nodes hold the same lease.
+    internal string LeaseSql(bool acquire) =>
+        RowCountOn +
+        $"""
+        UPDATE {Table}
+        SET lease_id = @lease_id, lease_expires_at_utc = {AddMilliseconds("@lease_ms")}
+        WHERE flow_id = @flow_id
+          AND expires_at_utc > SYSUTCDATETIME()
+          AND {(acquire ? "(lease_id IS NULL OR lease_expires_at_utc <= SYSUTCDATETIME() OR lease_id = @lease_id)" : "lease_id = @lease_id AND lease_expires_at_utc > SYSUTCDATETIME()")};
+        """;
 
     private Task<SqlConnection> OpenConnectionAsync(CancellationToken cancellationToken)
         => DurableFlowStoreShared.OpenConnectionAsync<SqlConnection>(_options.ConnectionString, cancellationToken);

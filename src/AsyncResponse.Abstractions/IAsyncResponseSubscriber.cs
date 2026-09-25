@@ -20,7 +20,10 @@ public interface IAsyncResponseSubscriber
     /// (intermediate/progress messages).
     /// </param>
     /// <param name="timeout">
-    /// Optional timeout after which the waiter faults with a <see cref="TimeoutException"/>.
+    /// Optional timeout after which the waiter faults with a <see cref="TimeoutException"/> — or
+    /// with <see cref="AsyncResponseIndeterminateDeliveryException"/> when a delivery is still in
+    /// flight (an <c>Until</c> predicate still running) and does not finish within the channel's
+    /// <c>DisposalDrainTimeout</c>, since that delivery may hold the response.
     /// When <c>null</c>, the response channel's default timeout applies — waits are never infinite.
     /// </param>
     Task<IAsyncResponseWaiter<T>> CreateResponseWaiter<T>(
@@ -57,7 +60,10 @@ public interface IRecoverableAsyncResponseSubscriber : IAsyncResponseSubscriber
     /// (intermediate/progress messages).
     /// </param>
     /// <param name="timeout">
-    /// Optional timeout after which the waiter faults with a <see cref="TimeoutException"/>.
+    /// Optional timeout after which the waiter faults with a <see cref="TimeoutException"/> — or
+    /// with <see cref="AsyncResponseIndeterminateDeliveryException"/> when a delivery is still in
+    /// flight (an <c>Until</c> predicate still running) and does not finish within the channel's
+    /// <c>DisposalDrainTimeout</c>, since that delivery may hold the response.
     /// When <c>null</c>, the response channel's default timeout applies — waits are never infinite.
     /// </param>
     Task<IAsyncResponseWaiter<T>> CreateRecoverableResponseWaiter<T>(

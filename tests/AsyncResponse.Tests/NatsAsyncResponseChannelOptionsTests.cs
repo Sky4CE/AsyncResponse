@@ -74,9 +74,17 @@ public class NatsAsyncResponseChannelOptionsTests
     public void Validate_Accepts_DashAndUnderscoreBucket()
         => new NatsAsyncResponseChannelOptions { RecoveryBucket = "ar-recovery_1" }.Validate();
 
+    [Theory]
+    [InlineData(0)]
+    [InlineData(6)]
+    public void Validate_Throws_ForReplicasOutsideTheJetStreamLimit(int replicas)
+        // Above 5 used to pass and then fail the bucket creation at the first waiter registration
+        // — every waiter's — instead of at startup.
+        => AssertInvalid(o => o.RecoveryBucketReplicas = replicas);
+
     [Fact]
-    public void Validate_Throws_ForNonPositiveReplicas()
-        => AssertInvalid(o => o.RecoveryBucketReplicas = 0);
+    public void Validate_Accepts_FiveReplicas()
+        => new NatsAsyncResponseChannelOptions { RecoveryBucketReplicas = 5 }.Validate();
 
     [Fact]
     public void Validate_Throws_ForNonPositiveTimers()

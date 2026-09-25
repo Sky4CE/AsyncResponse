@@ -34,15 +34,33 @@ internal static class FlowStateConcurrency
 
     /// <summary>
     /// Whether an existing ledger describes the same start as the requested one: same flow type,
-    /// same input type (both ordinal), and semantically identical input JSON. The one idempotency
-    /// test for flow ids, shared by the starter (which reports a mismatch to its caller as
+    /// same input type (both by type identity — <see cref="TypeNameIdentity"/> — so the assembly
+    /// versions inside a generic name do not count), and semantically identical input. The one idempotency test
+    /// for flow ids, shared by the starter (which reports a mismatch to its caller as
     /// <see cref="DurableFlowIdConflictException"/>) and the executor's start target (which drops
     /// the job on a mismatch) so the two can never disagree about what "the same run" means.
+    /// <para>
+    /// Input is compared by VALUE (<paramref name="inputEquivalent"/>:
+    /// <see cref="FlowStateJson.InputEquivalent{TInput}"/> on the starter; on the executor the
+    /// registration's round trip, or for a flow executed by reflection the same round trip through
+    /// the input type resolved from the ledger once it passed the flow-contract check), as child
+    /// starts already are: inputs are written with their nulls and defaults, so a member added to
+    /// the input type since the ledger was written made an idempotent re-start — the scheduler's
+    /// startup re-drive of a never-executed occurrence, a caller's retry across a deploy — differ in
+    /// shape, report a conflict, and drop the published start job with the run stuck behind it. The
+    /// JSON shape decides only when no delegate is passed, or the executor's reflection path cannot
+    /// resolve the input type or it fails that check.
+    /// </para>
     /// </summary>
-    internal static bool IsSameStart(FlowState existing, string? flowTypeName, string? inputTypeName, string? inputJson)
-        => string.Equals(existing.FlowTypeName, flowTypeName, StringComparison.Ordinal)
-            && string.Equals(existing.InputTypeName, inputTypeName, StringComparison.Ordinal)
-            && FlowStateJson.JsonEquivalent(existing.InputJson, inputJson ?? string.Empty);
+    internal static bool IsSameStart(
+        FlowState existing,
+        string? flowTypeName,
+        string? inputTypeName,
+        string? inputJson,
+        Func<string?, string, bool>? inputEquivalent = null)
+        => TypeNameIdentity.Same(existing.FlowTypeName, flowTypeName)
+            && TypeNameIdentity.Same(existing.InputTypeName, inputTypeName)
+            && (inputEquivalent ?? FlowStateJson.JsonEquivalent)(existing.InputJson, inputJson ?? string.Empty);
 
     /// <summary>
     /// Enforces the portable flow-id contract on every final id at creation — the single door all
@@ -119,7 +137,10 @@ internal static class FlowStateConcurrency
         "Budget root ids for growth: child flows append \":{stepName}\" to the parent id, and scheduled flows wrap the schedule " +
         "name as \"sched:{name}:{timestamp}\".";
 
-    private static string Excerpt(string flowId) => PortableText.Excerpt(flowId);
+    // Escaped, not merely truncated: the ids quoted here are rejected because they are malformed,
+    // and a start job's id is written by whoever can publish to the worker stream — quoted raw, a
+    // CR/LF inside it wrote its own log line (the correlation-id twins were switched in round 42).
+    private static string Excerpt(string flowId) => DiagnosticText.EscapedExcerpt(flowId);
 
     public static async Task<FlowExecutionLease?> TryAcquireExecutionLeaseAsync(
         IFlowStateStore store,
@@ -238,6 +259,10 @@ internal static class FlowStateConcurrency
         // Timer remainders at or under the threshold arm an in-process Task.Delay, so the knob is
         // timer-backed; zero legitimately means "always suspend".
         AsyncResponseChannelOptions.EnsureTimerBackedAllowZero(options.TimerInProcessThreshold, nameof(DurableFlowOptions), nameof(options.TimerInProcessThreshold));
+        // Here with the rest, not only in the lazily built starter: a worker-only host never
+        // resolves it, and zero (read as "always hand over", like TimerInProcessThreshold's zero)
+        // turned every in-process timer into a hot publish/acquire/save loop.
+        options.ValidateInProcessPark();
     }
 }
 
@@ -252,12 +277,18 @@ internal sealed class FlowExecutionLease : IAsyncDisposable
     private readonly TimeProvider _timeProvider;
     private readonly CancellationTokenSource _stop = new();
     private readonly CancellationTokenSource _lost = new();
-    private readonly Task _renewal;
     private readonly Task _deadline;
+    // Renewal alone can be paused (a park about to publish its wake-up) and restarted (that
+    // publish failed), so its loop and stop signal are replaceable; _stop still ends both loops.
+    private CancellationTokenSource _renewalStop;
+    private Task _renewal;
     // DateTime ticks so the renewal loop's writes and the execution path's reads tear-free on
     // 32-bit runtimes and order via Volatile.
     private long _validUntilUtcTicks;
     private int _disposed;
+    // 1 once the lease has been released — by a committed park, or by disposal. See EndForParkAsync.
+    private int _ended;
+    private Task<bool>? _end;
 
     /// <summary>
     /// Longest single wait the deadline watcher arms. ExecutionLeaseDuration is validated as a
@@ -316,7 +347,8 @@ internal sealed class FlowExecutionLease : IAsyncDisposable
         Volatile.Write(
             ref _validUntilUtcTicks,
             acquiredDeadlineUtcTicks ?? DeadlineFrom(_timeProvider, options.ExecutionLeaseDuration));
-        _renewal = RenewLoopAsync();
+        _renewalStop = CancellationTokenSource.CreateLinkedTokenSource(_stop.Token);
+        _renewal = RenewLoopAsync(_renewalStop.Token, options.ExecutionLeaseRenewInterval);
         _deadline = DeadlineLoopAsync();
     }
 
@@ -326,10 +358,7 @@ internal sealed class FlowExecutionLease : IAsyncDisposable
     /// is a legal configuration that must not throw here.
     /// </summary>
     internal static long DeadlineFrom(TimeProvider timeProvider, TimeSpan duration)
-    {
-        var now = timeProvider.GetUtcNow().UtcDateTime;
-        return duration > DateTime.MaxValue - now ? DateTime.MaxValue.Ticks : now.Add(duration).Ticks;
-    }
+        => FlowStateRetention.AddSaturating(timeProvider.GetUtcNow().UtcDateTime, duration).Ticks;
 
     public CancellationToken LostToken => _lost.Token;
 
@@ -338,6 +367,7 @@ internal sealed class FlowExecutionLease : IAsyncDisposable
     /// use it to choose the lease-less persistence path BEFORE surfacing the takeover signal.
     /// </summary>
     public bool IsLost => _lost.IsCancellationRequested
+        || Volatile.Read(ref _ended) != 0
         || _timeProvider.GetUtcNow().UtcDateTime.Ticks >= Volatile.Read(ref _validUntilUtcTicks);
 
     /// <summary>
@@ -354,6 +384,11 @@ internal sealed class FlowExecutionLease : IAsyncDisposable
     /// </summary>
     public void ThrowIfLost(Exception? cause = null)
     {
+        // Released on purpose (see EndForParkAsync), not lost: nothing is fenced by it any more,
+        // and the run's successor may already hold a lease of its own.
+        if (Volatile.Read(ref _ended) != 0)
+            throw new InvalidOperationException($"Durable flow '{_flowId}' has released its execution lease (the run parked, or the execution ended); this execution checkpoints nothing more.", cause);
+
         if (!_lost.IsCancellationRequested
             && _timeProvider.GetUtcNow().UtcDateTime.Ticks < Volatile.Read(ref _validUntilUtcTicks))
             return;
@@ -384,6 +419,16 @@ internal sealed class FlowExecutionLease : IAsyncDisposable
                     _leaseId,
                     cancellationToken).ConfigureAwait(false))
                 return;
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            // The CALLER cancelled the write — flow code's own token on a progress, value, park or
+            // breadcrumb save. That says nothing about the lease: marking it lost here turned every
+            // later context call into a misdiagnosed "lost its execution lease" and skipped the
+            // attempt's failure checkpoint. Should the write have committed after all, the next
+            // fenced save's compare-and-swap rejects and diagnoses it.
+            state.Revision = expectedRevision;
+            throw;
         }
         catch
         {
@@ -436,13 +481,29 @@ internal sealed class FlowExecutionLease : IAsyncDisposable
             cause);
     }
 
-    private async Task RenewLoopAsync()
+    /// <param name="stop">Ends the loop.</param>
+    /// <param name="firstWait">
+    /// How long before the first renewal: a full interval for a freshly acquired lease, zero for a
+    /// renewal restarted after a pause (see <see cref="ResumeRenewal"/>).
+    /// </param>
+    private async Task RenewLoopAsync(CancellationToken stop, TimeSpan firstWait)
     {
-        while (!_stop.IsCancellationRequested)
+        // A FAILED beat retries on a short backoff instead of waiting out another full interval
+        // (the database transports' lock renewal does the same): with the default 60 s lease and
+        // 20 s interval, two failed beats — a 25-second store blip — lost a healthy lease, and one
+        // renewal that took 20 s to time out lost it on its own. Floored at a millisecond: a zero
+        // wait would spin.
+        var interval = _options.ExecutionLeaseRenewInterval;
+        var retryInterval = TimeSpan.FromTicks(Math.Max(
+            TimeSpan.TicksPerMillisecond,
+            Math.Min(Math.Min(TimeSpan.TicksPerSecond, _options.ExecutionLeaseDuration.Ticks / 10), interval.Ticks)));
+        var wait = firstWait;
+        var failing = false;
+        while (!stop.IsCancellationRequested)
         {
             try
             {
-                await Task.Delay(_options.ExecutionLeaseRenewInterval, _timeProvider, _stop.Token).ConfigureAwait(false);
+                await Task.Delay(wait, _timeProvider, stop).ConfigureAwait(false);
 
                 // Same anchoring rule as acquisition: the renewed lease starts when the store runs
                 // the command, so the deadline is measured from before the call, not from whenever
@@ -454,26 +515,38 @@ internal sealed class FlowExecutionLease : IAsyncDisposable
                         _flowId,
                         _leaseId,
                         _options.ExecutionLeaseDuration,
-                        _stop.Token).ConfigureAwait(false))
+                        stop).ConfigureAwait(false))
                 {
                     MarkLost();
                     return;
                 }
 
                 Volatile.Write(ref _validUntilUtcTicks, renewedDeadline);
+                wait = interval;
+                failing = false;
             }
-            catch (OperationCanceledException) when (_stop.IsCancellationRequested)
+            catch (OperationCanceledException) when (stop.IsCancellationRequested)
             {
                 return;
             }
             catch (Exception ex)
             {
-                _logger.LogWarning(ex, "Failed to renew durable flow {FlowId} execution lease; retrying before expiry.", _flowId);
+                // Only the first failure of a streak is a warning: at the retry cadence a store
+                // outage would otherwise log one per second per running flow.
+                _logger.Log(
+                    failing ? LogLevel.Debug : LogLevel.Warning,
+                    ex,
+                    "Failed to renew durable flow {FlowId} execution lease; retrying every {RetryInterval} until it succeeds or the lease expires.",
+                    _flowId,
+                    retryInterval);
+                failing = true;
                 if (_timeProvider.GetUtcNow().UtcDateTime.Ticks >= Volatile.Read(ref _validUntilUtcTicks))
                 {
                     MarkLost();
                     return;
                 }
+
+                wait = retryInterval;
             }
         }
     }
@@ -533,11 +606,86 @@ internal sealed class FlowExecutionLease : IAsyncDisposable
         }
     }
 
+    /// <summary>
+    /// Stops renewing and waits for a renewal already in flight to land, so that from here on the
+    /// lease in the store never changes again on this execution's account. A park calls it after
+    /// its checkpoint and BEFORE it publishes the wake-up: that wake-up judges the lease it finds
+    /// by whether it changes (<see cref="FlowLeaseContention"/>), and a renewal landing after its
+    /// first look reads as a live holder executing a different job — proof enough to acknowledge
+    /// it as a duplicate, although it is the park's own continuation. The deadline watcher keeps
+    /// running. Bounded like disposal: past the budget the stuck renewal is left behind.
+    /// </summary>
+    internal async Task PauseRenewalAsync()
+    {
+        _renewalStop.Cancel();
+        try
+        {
+            await _renewal.WaitAsync(DisposeJoinLimit, _timeProvider).ConfigureAwait(false);
+        }
+        catch (TimeoutException)
+        {
+            _logger.LogWarning(
+                "Durable flow {FlowId} execution lease renewal did not stop within {DisposeJoinLimit} before the run parked; parking anyway.",
+                _flowId,
+                DisposeJoinLimit);
+        }
+    }
+
+    /// <summary>
+    /// Restarts the renewal <see cref="PauseRenewalAsync"/> stopped — the park's publish failed, so
+    /// the execution goes on (as the retriable failure it is) and still owns the run. The first
+    /// renewal is due at once, not a full interval later: the publish ran through the builder's
+    /// retry ladder with nothing renewing, so the lease may have little left — waiting another
+    /// interval let it lapse, and the attempt's failure checkpoint was refused with it.
+    /// </summary>
+    internal void ResumeRenewal()
+    {
+        if (Volatile.Read(ref _ended) != 0 || _stop.IsCancellationRequested || _lost.IsCancellationRequested || !_renewal.IsCompleted)
+            return;
+
+        _renewalStop.Dispose();
+        _renewalStop = CancellationTokenSource.CreateLinkedTokenSource(_stop.Token);
+        _renewal = RenewLoopAsync(_renewalStop.Token, TimeSpan.Zero);
+    }
+
+    /// <summary>
+    /// Releases the lease as soon as a park has committed (checkpoint written, wake-up published),
+    /// instead of when the executor disposes it — which happens only after the flow body has
+    /// unwound: every user <c>finally</c>, <c>await using</c> and <c>catch (OperationCanceledException)</c>
+    /// on the way out, since a park is a cancellation. Until then the store still showed a held
+    /// lease, and the wake-up the park had just published (a child finishing at once, a timer
+    /// hand-over) could only wait behind it; had it seen one more renewal it would have been
+    /// acknowledged as a duplicate of a live holder whose own job, far from being redelivered if
+    /// the holder died, was about to be acknowledged too. Released, the lease is free for the
+    /// wake-up on its next poll. Idempotent with disposal, which afterwards only frees resources.
+    /// Every later use of this lease to fence a write throws (see <see cref="ThrowIfLost"/>).
+    /// </summary>
+    internal Task EndForParkAsync() => EndAsync();
+
     public async ValueTask DisposeAsync()
     {
         if (Interlocked.Exchange(ref _disposed, 1) != 0)
             return;
 
+        if (!await EndAsync().ConfigureAwait(false))
+        {
+            // Loops abandoned: leave the cancellation sources undisposed for them.
+            return;
+        }
+
+        _stop.Dispose();
+        _renewalStop.Dispose();
+        _lost.Dispose();
+    }
+
+    // Called on the execution path only (a park, then disposal after the body returned), never
+    // concurrently: the first call does the work and every later one observes its outcome.
+    private Task<bool> EndAsync() => _end ??= EndCoreAsync();
+
+    /// <summary>Stops both loops and releases the lease; <c>false</c> when the loops had to be abandoned.</summary>
+    private async Task<bool> EndCoreAsync()
+    {
+        Volatile.Write(ref _ended, 1);
         _stop.Cancel();
         try
         {
@@ -555,7 +703,7 @@ internal sealed class FlowExecutionLease : IAsyncDisposable
                 "Durable flow {FlowId} execution lease loops did not stop within {DisposeJoinLimit}; abandoning them (the lease will expire server-side).",
                 _flowId,
                 DisposeJoinLimit);
-            return;
+            return false;
         }
 
         // Bounded release (see ReleaseLimit), with a token the store can honor. An unbounded,
@@ -589,8 +737,7 @@ internal sealed class FlowExecutionLease : IAsyncDisposable
             _logger.LogWarning(ex, "Failed to release durable flow {FlowId} execution lease; it will expire.", _flowId);
         }
 
-        _stop.Dispose();
-        _lost.Dispose();
+        return true;
     }
 
     /// <summary>

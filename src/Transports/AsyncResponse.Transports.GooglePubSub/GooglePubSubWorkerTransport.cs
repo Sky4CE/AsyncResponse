@@ -16,6 +16,9 @@ namespace AsyncResponse.Transports.GooglePubSub;
 /// </remarks>
 public sealed class GooglePubSubWorkerTransport : IWorkerTransportInFlightLimit, IAsyncDisposable
 {
+    /// <summary>The Pub/Sub attribute-value size limit, in UTF-8 bytes.</summary>
+    private const int MaxAttributeValueBytes = 1024;
+
     private readonly GooglePubSubAsyncResponseOptions _options;
     private readonly Func<CancellationToken, Task<IGooglePubSubPublisherClient>> _publisherFactory;
     private readonly SemaphoreSlim _publisherGate = new(1, 1);
@@ -64,6 +67,10 @@ public sealed class GooglePubSubWorkerTransport : IWorkerTransportInFlightLimit,
 
     private async Task<IGooglePubSubPublisherClient> GetPublisherAsync(CancellationToken cancellationToken)
     {
+        // The lock-free fast path checks disposal too: dispose leaves the cached publisher in
+        // place, so every publish after the first one reached the shut-down PublisherClient
+        // instead of the transport-named ObjectDisposedException the gated path throws.
+        ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed), this);
         var publisher = Volatile.Read(ref _publisher);
         if (publisher is not null)
             return publisher;
@@ -129,8 +136,15 @@ public sealed class GooglePubSubWorkerTransport : IWorkerTransportInFlightLimit,
                 Data = ByteString.CopyFromUtf8(AsyncResponseJson.Serialize(job))
             };
 
-            if (!string.IsNullOrWhiteSpace(job.CorrelationId))
+            // Pub/Sub rejects an attribute value over 1024 bytes — and with it the whole publish —
+            // while a portable correlation id may be 400 UTF-16 units, up to 1200 UTF-8 bytes of
+            // CJK text, so every publish for such an id failed. The worker path reads the id from
+            // the body, so an oversized id simply travels without the (diagnostic) attribute.
+            if (!string.IsNullOrWhiteSpace(job.CorrelationId)
+                && System.Text.Encoding.UTF8.GetByteCount(job.CorrelationId) <= MaxAttributeValueBytes)
+            {
                 message.Attributes[_options.CorrelationIdAttribute] = job.CorrelationId;
+            }
 
             var publisher = await GetPublisherAsync(cancellationToken).ConfigureAwait(false);
             var messageId = await publisher.PublishAsync(message, cancellationToken).ConfigureAwait(false);

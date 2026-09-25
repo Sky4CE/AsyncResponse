@@ -1,5 +1,6 @@
 using AsyncResponse.Internal;
 using Microsoft.Data.SqlClient;
+using Microsoft.Extensions.Logging;
 using System.Data;
 
 namespace AsyncResponse.Channels.SqlServer;
@@ -29,15 +30,19 @@ internal sealed class SqlServerChannelSql
 
     private readonly string _connectionString;
     private readonly SqlServerAsyncResponseChannelOptions _options;
+    private readonly ILogger<SqlServerChannelSql>? _logger;
     private readonly SemaphoreSlim _ensureGate = new(1, 1);
     private bool _created;
     private long _lastRecoveryPruneTicks;
     private long _lastMessagePruneTicks;
     private long _lastSubscriberPruneTicks;
 
-    public SqlServerChannelSql(Microsoft.Extensions.Options.IOptions<SqlServerAsyncResponseChannelOptions> options)
+    public SqlServerChannelSql(
+        Microsoft.Extensions.Options.IOptions<SqlServerAsyncResponseChannelOptions> options,
+        ILogger<SqlServerChannelSql>? logger = null)
     {
         _options = options.Value;
+        _logger = logger;
         _options.Validate();
         _connectionString = _options.ConnectionString!;
 
@@ -176,11 +181,13 @@ internal sealed class SqlServerChannelSql
                 // follow (an index over columns that table lacks, the acked_seq ALTER) hit the
                 // wrong table, and a name held by a view fails outright with error 2714. Run the
                 // very same catalog checks now — on a fresh connection, since the objects in
-                // question are somebody else's and already committed — so the operator gets the
-                // precise reason instead of a raw provider error.
+                // question are somebody else's and already committed, after rolling this
+                // transaction back so its own uncommitted objects hold no locks — so the operator
+                // gets the precise reason instead of a raw provider error.
                 await SqlServerRelationVerifier.ThrowDiagnosedCollisionAsync(
                     OpenConnectionAsync,
                     ex,
+                    transaction,
                     _options.SchemaName,
                     "channel",
                     ExpectedObjects(),
@@ -208,10 +215,12 @@ internal sealed class SqlServerChannelSql
 
 
     /// <summary>
-    /// Post-DDL catalog verification, inside the DDL transaction (and therefore under the shared
-    /// application lock). The existence guards above only ask "is there a user table with this
-    /// name": a name held by another AsyncResponse component's table makes them skip creation
-    /// silently, and a name held by a view or synonym makes the CREATE fail with raw error 2714.
+    /// Catalog verification of the relations this store reads and writes — after the DDL commit
+    /// (outside the transaction, the application lock already released: see the call site for
+    /// why), or on the manually managed path. The existence guards above only ask "is there a
+    /// user table with this name": a name held by another AsyncResponse component's table makes
+    /// them skip creation silently, and a name held by a view or synonym makes the CREATE fail
+    /// with raw error 2714.
     /// </summary>
     private Task VerifyRelationsAsync(SqlConnection connection, SqlTransaction? transaction, CancellationToken cancellationToken)
         => SqlServerRelationVerifier.VerifyAsync(
@@ -544,14 +553,43 @@ internal sealed class SqlServerChannelSql
 
         await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
         await using var connection = await OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
+
+        // One parameter per id: a joined literal list would put ids into SQL text, and SQL
+        // Server has no array parameter to bind instead. CHUNKED under the 2,100-parameter cap
+        // (the heartbeat batches the same way): the sweep hands over up to a whole page, and
+        // PendingMessageBatchSize is bounded only below, so a page of 2,100+ acknowledged rows
+        // failed with error 8003 — at the same row on every pass. Each chunk is a contiguous
+        // slice of the page-ordered id list, so the concatenated results keep page order.
+        if (ids.Count <= HydrationChunkSize)
+            return await LoadMessagesByIdChunkAsync(connection, correlationId, ids, 0, ids.Count, cancellationToken).ConfigureAwait(false);
+
+        var messages = new List<SqlServerChannelMessage>(ids.Count);
+        for (var offset = 0; offset < ids.Count; offset += HydrationChunkSize)
+        {
+            var count = Math.Min(HydrationChunkSize, ids.Count - offset);
+            messages.AddRange(await LoadMessagesByIdChunkAsync(connection, correlationId, ids, offset, count, cancellationToken).ConfigureAwait(false));
+        }
+
+        return messages;
+    }
+
+    /// <summary>Ids per hydration statement: one parameter each, plus the correlation id, under SQL Server's 2,100-parameter cap.</summary>
+    internal const int HydrationChunkSize = 1000;
+
+    private async Task<IReadOnlyList<SqlServerChannelMessage>> LoadMessagesByIdChunkAsync(
+        SqlConnection connection,
+        string correlationId,
+        IReadOnlyList<Guid> ids,
+        int offset,
+        int count,
+        CancellationToken cancellationToken)
+    {
         await using var command = connection.CreateCommand();
-        // One parameter per id (the sweep hands over at most a page): a joined literal list
-        // would put ids into SQL text, and SQL Server has no array parameter to bind instead.
-        var placeholders = new string[ids.Count];
-        for (var i = 0; i < ids.Count; i++)
+        var placeholders = new string[count];
+        for (var i = 0; i < count; i++)
         {
             placeholders[i] = $"@id{i}";
-            command.Parameters.Add(placeholders[i], SqlDbType.UniqueIdentifier).Value = ids[i];
+            command.Parameters.Add(placeholders[i], SqlDbType.UniqueIdentifier).Value = ids[offset + i];
         }
 
         command.CommandText =
@@ -564,7 +602,7 @@ internal sealed class SqlServerChannelSql
             ORDER BY created_at, id;
             """;
         command.Parameters.AddWithValue("@correlation_id", correlationId);
-        return await ReadMessagesAsync(command, ids.Count, cancellationToken).ConfigureAwait(false);
+        return await ReadMessagesAsync(command, count, cancellationToken).ConfigureAwait(false);
     }
 
     private static async Task<IReadOnlyList<SqlServerChannelMessage>> ReadMessagesAsync(SqlCommand command, int capacity, CancellationToken cancellationToken)
@@ -691,7 +729,7 @@ internal sealed class SqlServerChannelSql
     {
         await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
         if (ShouldPrune(ref _lastSubscriberPruneTicks))
-            await PruneExpiredSubscribersAsync(correlationId, cancellationToken).ConfigureAwait(false);
+            await PruneExpiredSubscribersAsync(cancellationToken).ConfigureAwait(false);
 
         await using var connection = await OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         await using var command = connection.CreateCommand();
@@ -778,7 +816,7 @@ internal sealed class SqlServerChannelSql
     {
         await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
         if (ShouldPrune(ref _lastSubscriberPruneTicks))
-            await PruneExpiredSubscribersAsync(correlationId, cancellationToken).ConfigureAwait(false);
+            await PruneExpiredSubscribersAsync(cancellationToken).ConfigureAwait(false);
 
         await using var connection = await OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         await using var command = connection.CreateCommand();
@@ -794,48 +832,72 @@ internal sealed class SqlServerChannelSql
     }
 
     /// <summary>
-    /// Bound on the table-wide prunes (durable-flow-store parity). They run inline on the publish
-    /// and probe paths, and an unbounded DELETE over a backlog past SQL Server's ~5,000-lock
-    /// escalation threshold takes a table lock that stalls concurrent delivery claims on the same
-    /// table — long enough for a live waiter's claim to lose to the recovery claim. A bounded
-    /// batch drains a backlog across successive calls instead.
+    /// The bounded table-wide prune statement for <paramref name="table"/> (durable-flow-store
+    /// parity). An unbounded DELETE over a backlog past SQL Server's ~5,000-lock escalation
+    /// threshold takes a table lock that stalls concurrent delivery claims on the same table —
+    /// long enough for a live waiter's claim to lose to the recovery claim. The count it returns
+    /// is what ends the drain, so the batch turns the row count back on for itself (transport
+    /// dead-letter prune parity): under a server-wide NOCOUNT (<c>sp_configure 'user options',
+    /// 512</c>) <c>ExecuteNonQuery</c> returned -1 and every drain stopped after its first batch.
     /// </summary>
-    private const int PruneBatchSize = 1000;
-
-    /// <summary>The bounded table-wide prune statement for <paramref name="table"/>.</summary>
     internal static string ExpiredPruneSql(string table)
-        => $"DELETE TOP ({PruneBatchSize}) FROM {table} WHERE expires_at <= SYSUTCDATETIME();";
+        => $"SET NOCOUNT OFF; DELETE TOP ({OpportunisticPrune.BatchSize}) FROM {table} WHERE expires_at <= SYSUTCDATETIME();";
 
-    private async Task PruneExpiredRecoveryAsync(string? correlationId, CancellationToken cancellationToken)
+    // Every prune below is opportunistic housekeeping riding on a publish, a waiter registration,
+    // a liveness probe, or a recovery load/scan, and goes through OpportunisticPrune: bounded
+    // batches DRAINED under a budget, and every failure logged and swallowed. One batch per
+    // PruneInterval was a hard ceiling — 1,000 expired messages per 30 s, ~33 rows/s per process —
+    // that any instance publishing faster outgrew forever; and awaited bare, a prune chosen as a
+    // 1205 deadlock victim failed the waiter registration or publish it rode on, after ShouldPrune
+    // had already consumed the interval. Reads filter on expires_at, so a skipped prune costs only
+    // disk until the next window. Each batch is its own autocommit statement, so draining stays
+    // under lock escalation.
+
+    private Task PruneExpiredRecoveryAsync(string? correlationId, CancellationToken cancellationToken)
+        => OpportunisticPrune.DrainQuietlyAsync(
+            token => PruneExpiredRecoveryBatchAsync(correlationId, token),
+            _logger,
+            "SQL Server channel recovery-state prune",
+            cancellationToken);
+
+    private async Task<int> PruneExpiredRecoveryBatchAsync(string? correlationId, CancellationToken cancellationToken)
     {
         await using var connection = await OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         await using var command = connection.CreateCommand();
         command.CommandText = correlationId is null
             ? ExpiredPruneSql(RecoveryTable)
-            : $"DELETE FROM {RecoveryTable} WHERE correlation_id = @correlation_id AND expires_at <= SYSUTCDATETIME();";
+            : $"SET NOCOUNT OFF; DELETE FROM {RecoveryTable} WHERE correlation_id = @correlation_id AND expires_at <= SYSUTCDATETIME();";
         if (correlationId is not null)
             command.Parameters.AddWithValue("@correlation_id", correlationId);
-        await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+        return await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
     }
 
-    private async Task PruneExpiredMessagesAsync(CancellationToken cancellationToken)
+    private Task PruneExpiredMessagesAsync(CancellationToken cancellationToken)
+        => OpportunisticPrune.DrainQuietlyAsync(
+            token => PruneExpiredBatchAsync(MessageTable, token),
+            _logger,
+            "SQL Server channel message prune",
+            cancellationToken);
+
+    /// <summary>
+    /// Table-wide, not scoped to the calling waiter's correlation id: a scoped prune never reached
+    /// the rows of a process that crashed with waiters in flight (correlation ids are rarely
+    /// reused), so those orphans stayed forever and the expires index built for this delete went
+    /// unused. Bounded, and throttled by <see cref="SqlServerAsyncResponseChannelOptions.PruneInterval"/>.
+    /// </summary>
+    private Task PruneExpiredSubscribersAsync(CancellationToken cancellationToken)
+        => OpportunisticPrune.DrainQuietlyAsync(
+            token => PruneExpiredBatchAsync(SubscriberTable, token),
+            _logger,
+            "SQL Server channel subscriber prune",
+            cancellationToken);
+
+    private async Task<int> PruneExpiredBatchAsync(string table, CancellationToken cancellationToken)
     {
         await using var connection = await OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         await using var command = connection.CreateCommand();
-        command.CommandText = ExpiredPruneSql(MessageTable);
-        await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
-    }
-
-    private async Task PruneExpiredSubscribersAsync(string? correlationId, CancellationToken cancellationToken)
-    {
-        await using var connection = await OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
-        await using var command = connection.CreateCommand();
-        command.CommandText = correlationId is null
-            ? ExpiredPruneSql(SubscriberTable)
-            : $"DELETE FROM {SubscriberTable} WHERE correlation_id = @correlation_id AND expires_at <= SYSUTCDATETIME();";
-        if (correlationId is not null)
-            command.Parameters.AddWithValue("@correlation_id", correlationId);
-        await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+        command.CommandText = ExpiredPruneSql(table);
+        return await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
     }
 
     private async Task<SqlConnection> OpenConnectionAsync(CancellationToken cancellationToken)
@@ -945,15 +1007,10 @@ internal sealed class SqlServerChannelSql
     /// <see cref="SqlServerAsyncResponseChannelOptions.PruneInterval"/> instead of on every operation.
     /// Read queries already filter on <c>expires_at</c>, so throttling pruning never affects correctness.
     /// </summary>
+    /// <remarks>
+    /// Monotonic (see <see cref="OpportunisticPrune.ShouldRun"/>): a backward wall-clock step no
+    /// longer suspends the housekeeping for the size of the step.
+    /// </remarks>
     private bool ShouldPrune(ref long lastTicks)
-    {
-        var interval = _options.PruneInterval;
-        if (interval <= TimeSpan.Zero)
-            return true;
-
-        var now = DateTime.UtcNow.Ticks;
-        var last = Interlocked.Read(ref lastTicks);
-        return now - last >= interval.Ticks
-            && Interlocked.CompareExchange(ref lastTicks, now, last) == last;
-    }
+        => OpportunisticPrune.ShouldRun(ref lastTicks, _options.PruneInterval);
 }

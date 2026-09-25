@@ -6,7 +6,5 @@ namespace AsyncResponse;
 /// </summary>
 internal interface IRawAsyncResponsePublisher
 {
-    Task SetRawResponse(object? response, string correlationId, CancellationToken cancellationToken = default);
-
     Task SetRawResponseJson(string responseJson, string correlationId, CancellationToken cancellationToken = default);
 }

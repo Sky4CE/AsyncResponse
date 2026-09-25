@@ -199,10 +199,42 @@ public class CallbackAuthorizationTests
 
         RestoreRecordingPropagator.Reset();
 
+        // Worker outcomes are process-wide; only measurements recorded on THIS test's async flow
+        // count, so parallel tests recording their own "rejected" cannot leak into the assertion.
+        var outcomes = new List<string?>();
+        var thisFlow = new AsyncLocal<bool> { Value = true };
+        using var listener = new MeterListener
+        {
+            InstrumentPublished = (instrument, l) =>
+            {
+                if (instrument.Meter.Name == AsyncResponseDiagnostics.MeterName && instrument.Name == "asyncresponse.worker.jobs")
+                    l.EnableMeasurementEvents(instrument);
+            }
+        };
+        listener.SetMeasurementEventCallback<long>((_, _, tags, _) =>
+        {
+            if (!thisFlow.Value)
+                return;
+            foreach (var tag in tags)
+            {
+                if (tag.Key == "outcome")
+                {
+                    lock (outcomes)
+                        outcomes.Add(tag.Value as string);
+                }
+            }
+        });
+        listener.Start();
+
+        // Still thrown, not acknowledged: the allowlist is per-deployment configuration another
+        // replica may accept, so the transport's redelivery/dead-letter policy decides.
         var ex = await Assert.ThrowsAnyAsync<InvalidOperationException>(() => ingress.HandleWorkerMessageAsync(json));
 
         Assert.Contains("not authorized", ex.Message, StringComparison.Ordinal);
         Assert.Equal(0, RestoreRecordingPropagator.RestoreCount);
+        // ...but counted: refused without dispatching is "rejected" (pre-fix: no outcome at all).
+        lock (outcomes)
+            Assert.Equal("rejected", Assert.Single(outcomes));
     }
 
     [Fact]
@@ -440,6 +472,56 @@ public class CallbackAuthorizationTests
 
         Assert.Equal(["via-interface", "via-class"], holder.Rotations);
         Assert.Equal(Round33KeyHolder.InitialKey, holder.ApiKey);
+    }
+
+    [Fact]
+    public async Task OutOfLimitOrNamelessTarget_IsRefusedBeforeTheAuthorizerSeesIt()
+    {
+        // The authorizer is user code, and nothing stops it (or an Allow predicate) from parsing
+        // the name — Type.GetType to check a namespace. Pre-fix it received the raw, unbounded
+        // stream-written name BEFORE the type-name shape limits applied, so a few hundred KB of
+        // A`1[[A`1[[… could overflow the stack inside it: an uncatchable crash on every
+        // redelivery. A name the resolver would refuse anyway never reaches the authorizer now.
+        var authorizer = new RecordingAuthorizer();
+        var services = new ServiceCollection();
+        services.AddSingleton(typeof(ILogger<>), typeof(NullLogger<>));
+        services.AddSingleton<IAsyncResponseCallbackAuthorizer>(authorizer);
+        services.AddAsyncResponse();
+        using var provider = services.BuildServiceProvider();
+
+        var hostile = await Assert.ThrowsAnyAsync<InvalidOperationException>(() => provider.InvokeAsync(new ReflectionInvocationDto
+        {
+            ServiceInterfaceFullName = string.Concat(Enumerable.Repeat("A`1[[", 2000)),
+            MethodName = "Run",
+            Params = []
+        }));
+        Assert.Contains("outside the persisted type-name limits", hostile.Message, StringComparison.Ordinal);
+
+        await Assert.ThrowsAnyAsync<InvalidOperationException>(() => provider.InvokeAsync(new ReflectionInvocationDto
+        {
+            ServiceInterfaceFullName = typeof(ICallbackTarget).FullName!,
+            MethodName = null!,
+            Params = []
+        }));
+
+        Assert.Empty(authorizer.Calls);
+    }
+
+    private sealed class RecordingAuthorizer : IAsyncResponseCallbackAuthorizer
+    {
+        private readonly List<string> _calls = [];
+
+        public IReadOnlyList<string> Calls
+        {
+            get { lock (_calls) return [.. _calls]; }
+        }
+
+        public bool IsAllowed(string serviceInterfaceFullName, string methodName)
+        {
+            lock (_calls)
+                _calls.Add(serviceInterfaceFullName);
+            return true;
+        }
     }
 
     private sealed class StaticAuthorizer(bool allowed) : IAsyncResponseCallbackAuthorizer

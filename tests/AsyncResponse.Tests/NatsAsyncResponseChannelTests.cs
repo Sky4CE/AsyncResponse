@@ -169,6 +169,87 @@ public class NatsAsyncResponseChannelTests
     }
 
     [Fact]
+    public async Task CreateResponseWaiter_SubscribeWaitingOnAReconnectingConnection_ThrowsOnceTheWaiterTimeoutLapses()
+    {
+        // While the NATS connection reconnects, subscribe waits for it to reopen — forever, as far
+        // as NATS.Net is concerned — and the waiter timeout was only armed after registration, so
+        // CreateResponseWaiter hung for the whole outage. The resolved timeout now bounds
+        // registration; the abandoned subscribe's lifetime token is cancelled so it can never
+        // install orphan interest after the reconnect.
+        var clock = new VirtualTimeProvider();
+        var subscribeEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        _client.SubscribeBehavior = async token =>
+        {
+            subscribeEntered.TrySetResult();
+            await Task.Delay(Timeout.Infinite, token);
+        };
+        var channel = CreateChannel(timeProvider: clock);
+
+        var waiterTask = channel.CreateResponseWaiter<OperationResult>("corr-reg-subscribe", timeout: TimeSpan.FromSeconds(30));
+        await subscribeEntered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        clock.Advance(TimeSpan.FromSeconds(31));
+
+        Assert.Same(waiterTask, await Task.WhenAny(waiterTask, Task.Delay(TimeSpan.FromSeconds(10))));
+        var timeout = await Assert.ThrowsAsync<TimeoutException>(() => waiterTask);
+        Assert.Contains("corr-reg-subscribe", timeout.Message, StringComparison.Ordinal);
+        Assert.True(_client.SubscriptionLifetime.IsCancellationRequested);
+        Assert.False(_client.HasSubscription);
+        _store.Verify(
+            s => s.SaveAsync(It.IsAny<string>(), It.IsAny<RecoveryState>(), It.IsAny<TimeSpan>(), It.IsAny<CancellationToken>()),
+            Times.Never);
+    }
+
+    [Fact]
+    public async Task CreateResponseWaiter_FlushWaitingOnAReconnectingConnection_ThrowsAndTearsTheSubscriptionDown()
+    {
+        var clock = new VirtualTimeProvider();
+        var flushEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        _client.FlushBehavior = async token =>
+        {
+            flushEntered.TrySetResult();
+            await Task.Delay(Timeout.Infinite, token);
+        };
+        var channel = CreateChannel(timeProvider: clock);
+
+        var waiterTask = channel.CreateResponseWaiter<OperationResult>("corr-reg-flush", timeout: TimeSpan.FromSeconds(30));
+        await flushEntered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        clock.Advance(TimeSpan.FromSeconds(31));
+
+        Assert.Same(waiterTask, await Task.WhenAny(waiterTask, Task.Delay(TimeSpan.FromSeconds(10))));
+        await Assert.ThrowsAsync<TimeoutException>(() => waiterTask);
+        _store.Verify(
+            s => s.SaveAsync(It.IsAny<string>(), It.IsAny<RecoveryState>(), It.IsAny<TimeSpan>(), It.IsAny<CancellationToken>()),
+            Times.Never);
+        await Eventually(() => _client.SubscriptionDisposeCount == 1);
+    }
+
+    [Fact]
+    public async Task CreateResponseWaiter_RecoverySaveWaitingOnAReconnectingConnection_ThrowsAndStillDeletesTheRegistration()
+    {
+        var clock = new VirtualTimeProvider();
+        var saveEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        _store
+            .Setup(s => s.SaveAsync(It.IsAny<string>(), It.IsAny<RecoveryState>(), It.IsAny<TimeSpan>(), It.IsAny<CancellationToken>()))
+            .Returns((string _, RecoveryState _, TimeSpan _, CancellationToken token) =>
+            {
+                saveEntered.TrySetResult();
+                return Task.Delay(Timeout.Infinite, token);
+            });
+        var channel = CreateChannel(timeProvider: clock);
+
+        var waiterTask = channel.CreateResponseWaiter<OperationResult>("corr-reg-save", timeout: TimeSpan.FromSeconds(30));
+        await saveEntered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        clock.Advance(TimeSpan.FromSeconds(31));
+
+        Assert.Same(waiterTask, await Task.WhenAny(waiterTask, Task.Delay(TimeSpan.FromSeconds(10))));
+        await Assert.ThrowsAsync<TimeoutException>(() => waiterTask);
+        // The save may have committed before the connection dropped; the background cleanup
+        // still deletes it and ends the subscription.
+        await Eventually(() => _store.Invocations.Any(i => i.Method.Name == nameof(IRecoveryStateStore.TryDeleteAsync)));
+        await Eventually(() => _client.SubscriptionDisposeCount == 1);
+    }
+
+    [Fact]
     public async Task CreateResponseWaiter_SaveFailureAfterTerminalSettledTheWait_ReturnsTheCompletedWaiter()
     {
         // A terminal delivery settles the wait while the recovery-state save is in flight, and
@@ -364,6 +445,35 @@ public class NatsAsyncResponseChannelTests
     }
 
     [Fact]
+    public async Task CreateResponseWaiter_RemoteFailureMessage_NeverReachesTheLogOrTheSpanRawOrUnbounded()
+    {
+        // The stack trace was capped on receive, but the remote's message went raw into a Warning
+        // on every delivery and into the span status — up to the whole inbound budget (8 Mi chars),
+        // with CR/LF that forge log lines. The DB channels never logged it at all.
+        using var activities = new AsyncResponseActivityCollector();
+        var logger = new CollectingLogger();
+        var channel = CreateChannel(logger: logger.For<NatsAsyncResponseChannel>());
+        var waiter = await channel.CreateResponseWaiter<OperationResult>("corr-hostile", timeout: TimeSpan.FromSeconds(5));
+        var hostile = "boom\r\nFORGED entry " + new string('x', 100_000);
+
+        _client.Push(JsonSerializer.Serialize(
+            new AsyncResponseEnvelope<OperationResult> { Success = false, ExceptionMessage = hostile },
+            AsyncResponseEnvelopeOptions<OperationResult>.Instance));
+
+        // The waiter itself still receives the message untouched.
+        var ex = await Assert.ThrowsAsync<Exception>(() => waiter.ResponseTask.WaitAsync(TimeSpan.FromSeconds(5)));
+        Assert.Equal(hostile, ex.Message);
+        await waiter.DisposeAsync();
+
+        Assert.Contains(logger.Messages, message => message.Contains("Received error response for correlationId corr-hostile", StringComparison.Ordinal));
+        Assert.All(logger.Messages, message => Assert.DoesNotContain("FORGED", message, StringComparison.Ordinal));
+        var status = activities.Single("asyncresponse.wait", "asyncresponse.channel", "nats").StatusDescription!;
+        Assert.DoesNotContain('\r', status);
+        Assert.DoesNotContain('\n', status);
+        Assert.True(status.Length < 2_000, $"span status carried {status.Length} characters");
+    }
+
+    [Fact]
     public async Task CreateResponseWaiter_RemoteFailureCarriesCappedStackTrace()
     {
         var channel = CreateChannel();
@@ -521,6 +631,79 @@ public class NatsAsyncResponseChannelTests
     }
 
     [Fact]
+    public async Task WaiterTimeout_DeletesTheRecoveryRegistrationWhileTheSubscriptionIsStillLive()
+    {
+        // The subscription was bound to the timeout source, and NATS.Net ends a subscription the
+        // moment that token is cancelled — so at CancelAfter the waiter lost its server-side
+        // interest, and the drain then unsubscribed before the recovery registration was deleted.
+        // A publish in that window saw "no responders, registration present" and fired the
+        // recovery callback while the waiter faulted with a timeout.
+        var clock = new VirtualTimeProvider();
+        (int Disposed, bool LifetimeCancelled)? atDelete = null;
+        _store.Setup(s => s.TryDeleteAsync(It.IsAny<string>(), It.IsAny<Guid>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(true)
+            .Callback(() => atDelete ??= (_client.SubscriptionDisposeCount, _client.SubscriptionLifetime.IsCancellationRequested));
+        var channel = CreateChannel(timeProvider: clock);
+        await using var waiter = await channel.CreateResponseWaiter<OperationResult>("corr-timeout-order", timeout: TimeSpan.FromMinutes(10));
+
+        clock.Advance(TimeSpan.FromMinutes(11));
+        await Assert.ThrowsAsync<TimeoutException>(() => waiter.ResponseTask.WaitAsync(TimeSpan.FromSeconds(5)));
+        await Eventually(() => atDelete is not null);
+
+        Assert.Equal<(int, bool)?>((0, false), atDelete);
+    }
+
+    [Fact]
+    public async Task WaiterDispose_DeletesTheRecoveryRegistrationBeforeUnsubscribing()
+    {
+        (int Disposed, bool LifetimeCancelled)? atDelete = null;
+        _store.Setup(s => s.TryDeleteAsync(It.IsAny<string>(), It.IsAny<Guid>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(true)
+            .Callback(() => atDelete ??= (_client.SubscriptionDisposeCount, _client.SubscriptionLifetime.IsCancellationRequested));
+        var channel = CreateChannel();
+        var waiter = await channel.CreateResponseWaiter<OperationResult>("corr-dispose-order", timeout: TimeSpan.FromMinutes(1));
+
+        await waiter.DisposeAsync();
+
+        Assert.Equal<(int, bool)?>((0, false), atDelete);
+        Assert.Equal(1, _client.SubscriptionDisposeCount);
+        // One delete: the drain's, the cleanup core does not repeat it.
+        _store.Verify(s => s.TryDeleteAsync("corr-dispose-order", It.IsAny<Guid>(), It.IsAny<CancellationToken>()), Times.Once);
+    }
+
+    [Fact]
+    public async Task WaiterTimeout_RegistrationDeleteWaitingOnAReconnectingConnection_StillSettlesWithinTheDrainBudget()
+    {
+        // Pre-commit review of fixpoint round 1: the timeout drain awaited the recovery-registration
+        // delete — a KV round trip with no token — before anything else, so during a NATS outage a
+        // timed-out waiter's ResponseTask stayed pending until the connection came back ("waits are
+        // never infinite"). The delete now runs inside the drain budget. Its lapse proves nothing
+        // about a delivery the live subscription may hold, so the waiter faults as indeterminate;
+        // the subscription stays up until the cleanup core's retried delete has landed.
+        var clock = new VirtualTimeProvider();
+        var reconnected = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        (int Disposed, bool LifetimeCancelled)? atReconnect = null;
+        _store.Setup(s => s.TryDeleteAsync(It.IsAny<string>(), It.IsAny<Guid>(), It.IsAny<CancellationToken>()))
+            .Returns(() => reconnected.Task);
+        var channel = CreateChannel(drainTimeout: TimeSpan.FromMilliseconds(200), timeProvider: clock);
+        var waiter = await channel.CreateResponseWaiter<OperationResult>("corr-timeout-outage", timeout: TimeSpan.FromMinutes(10));
+
+        clock.Advance(TimeSpan.FromMinutes(11));
+
+        var fault = await Assert.ThrowsAsync<AsyncResponseIndeterminateDeliveryException>(
+            () => waiter.ResponseTask.WaitAsync(TimeSpan.FromSeconds(10)));
+        Assert.Equal("corr-timeout-outage", fault.CorrelationId);
+        atReconnect = (_client.SubscriptionDisposeCount, _client.SubscriptionLifetime.IsCancellationRequested);
+
+        // The connection comes back: the retried delete lands, and only then does the stream end.
+        reconnected.TrySetResult(true);
+        await waiter.DisposeAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(10));
+
+        Assert.Equal<(int, bool)?>((0, false), atReconnect);
+        Assert.Equal(1, _client.SubscriptionDisposeCount);
+    }
+
+    [Fact]
     public async Task CreateRecoverableResponseWaiter_StampsRegisteredAtFromTheInjectedTimeProvider()
     {
         // Regression (round 29): the stamp came from DateTime.UtcNow, which no host can substitute.
@@ -659,19 +842,6 @@ public class NatsAsyncResponseChannelTests
 
         await Assert.ThrowsAsync<InvalidOperationException>(() =>
             raw.SetRawResponseJson("""{"Status":2}""", "corr-a"));
-    }
-
-    [Fact]
-    public async Task RawObjectResponse_DeliveredToWaiter()
-    {
-        var channel = CreateChannel();
-        var raw = (IRawAsyncResponsePublisher)channel;
-        await using var waiter = await channel.CreateResponseWaiter<OperationResult>("corr-a", timeout: TimeSpan.FromSeconds(5));
-
-        await raw.SetRawResponse(new OperationResult { Status = OperationStatus.Completed, Message = "typed-raw" }, "corr-a");
-
-        var result = await waiter.ResponseTask.WaitAsync(TimeSpan.FromSeconds(2));
-        Assert.Equal("typed-raw", result.Message);
     }
 
     [Fact]
@@ -910,7 +1080,7 @@ public class NatsAsyncResponseChannelTests
         releasePredicate.Release();
     }
 
-    private NatsAsyncResponseChannel CreateChannel(bool useRecoveryExpiry = false, TimeSpan? drainTimeout = null, TimeProvider? timeProvider = null) => new(
+    private NatsAsyncResponseChannel CreateChannel(bool useRecoveryExpiry = false, TimeSpan? drainTimeout = null, TimeProvider? timeProvider = null, ILogger<NatsAsyncResponseChannel>? logger = null) => new(
         _services.GetRequiredService<IServiceScopeFactory>(),
         _client,
         _store.Object,
@@ -921,7 +1091,7 @@ public class NatsAsyncResponseChannelTests
             DisposalDrainTimeout = drainTimeout ?? TimeSpan.FromSeconds(30)
         }),
         new AsyncResponseContextPropagation([]),
-        new TestLogger<NatsAsyncResponseChannel>(),
+        logger ?? new TestLogger<NatsAsyncResponseChannel>(),
         timeProvider);
 
     private static async Task Eventually(Func<bool> condition)

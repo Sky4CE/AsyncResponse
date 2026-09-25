@@ -39,7 +39,6 @@ internal abstract class RabbitMqSubscriberService : BackgroundService
     /// <summary>Handles the delivered message.</summary>
     protected abstract Task HandleMessageAsync(RabbitMqDelivery delivery, CancellationToken cancellationToken);
 
-    /// <summary>Runs this background operation until cancellation is requested.</summary>
     /// <summary>
     /// Validates subscriber options here rather than at the top of <c>ExecuteAsync</c>: since
     /// Microsoft.Extensions.Hosting.Abstractions 10.0.10, <c>BackgroundService.StartAsync</c> no
@@ -54,7 +53,7 @@ internal abstract class RabbitMqSubscriberService : BackgroundService
         return base.StartAsync(cancellationToken);
     }
 
-    protected override Task ExecuteAsync(CancellationToken stoppingToken)
+    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         var queue = QueueName;
 
@@ -74,8 +73,25 @@ internal abstract class RabbitMqSubscriberService : BackgroundService
                 SubscriberRole);
         }
 
-        return SubscriberSupervisor.RunAsync(
-            ct => RunSubscriberAsync(queue, ct),
+        // The dispatcher — and with it the ACK-after-enqueue queue and its workers — belongs to the
+        // hosted service, not to one supervised attempt (sibling parity: NATS, SQS, the database
+        // transports). Disposing it IS the stop-time drain, so owning it per attempt ran that drain
+        // on every channel fault of a host that was NOT stopping: a broker restart, a network blip
+        // or a channel-level protocol close paused consumption for the whole drain budget and then
+        // dead-lettered already-ACKed work as "drain budget lapsed" — or lost it, because the
+        // dead-letter copy rode the channel that had just died. Each attempt attaches its channel
+        // instead (AttachChannel), so background dead-letter copies ride the live one, and only the
+        // host stop drains.
+        await using var dispatcher = RabbitMqMessageDispatcher.Create(
+            HandleMessageAsync,
+            Options,
+            SubscriberOptions,
+            Logger,
+            queue,
+            SubscriberRole);
+
+        await SubscriberSupervisor.RunAsync(
+            ct => RunSubscriberAsync(dispatcher, queue, ct),
             stoppingToken,
             // Covers failed startup and a mid-run consumer/channel termination alike. Jittered
             // backoff, not NetworkRecoveryInterval (which paces the CLIENT's automatic recovery
@@ -87,31 +103,41 @@ internal abstract class RabbitMqSubscriberService : BackgroundService
                 "RabbitMQ subscriber failed for queue {Queue} ({Role}); retrying in {RetryDelay}.",
                 queue,
                 SubscriberRole,
-                retryDelay));
+                retryDelay),
+            healthyRunThreshold: Options.SubscriberRetryMaxDelay).ConfigureAwait(false);
     }
 
-    private async Task RunSubscriberAsync(string queue, CancellationToken stoppingToken)
+    /// <summary>
+    /// Whether this subscriber's channel ever publishes: the early-ACK dead-letter copy (to
+    /// <see cref="RabbitMqAsyncResponseOptions.DeadLetterExchange"/>, or parked) and the
+    /// ack-after-handler park at the cap (into <see cref="RabbitMqAsyncResponseOptions.ParkQueue"/>
+    /// or <see cref="RabbitMqAsyncResponseOptions.DeadLetterQueue"/> — reachable with no
+    /// dead-letter exchange configured here at all, when a broker policy supplies it).
+    /// </summary>
+    internal static bool PublishesFromSubscriberChannel(RabbitMqAsyncResponseOptions options)
+        => !string.IsNullOrWhiteSpace(options.DeadLetterExchange)
+            || !string.IsNullOrWhiteSpace(options.DeadLetterQueue)
+            || !string.IsNullOrWhiteSpace(options.ParkQueue);
+
+    private async Task RunSubscriberAsync(RabbitMqMessageDispatcher dispatcher, string queue, CancellationToken stoppingToken)
     {
         await using var connection = await _connectionFactory.CreateConnectionAsync(stoppingToken).ConfigureAwait(false);
-        // Publisher confirmations when a dead-letter exchange is configured: the already-ACKed
-        // dead-letter copy is published on THIS channel, and without confirmation tracking an
-        // unroutable (mandatory) return raises only an unobserved basic.return — the publish
-        // "succeeded" and a successful burial was logged for a message the broker discarded.
-        // With confirms the publish throws, and the existing catch logs the failure honestly.
-        // Acks/nacks are unaffected by confirm mode, so channels that never publish pay nothing.
+        // Publisher confirmations whenever this channel can publish (dead-letter copy or park):
+        // without confirmation tracking an unroutable (mandatory) return raises only an unobserved
+        // basic.return — the publish "succeeded", a successful burial (or park, followed by the
+        // ACK that ends the delivery) was logged for a message the broker discarded. With confirms
+        // the publish throws, and the existing catches log the failure honestly (a failed park is
+        // requeued). Acks/nacks are unaffected by confirm mode, so channels that never publish pay
+        // nothing.
         await using var channel = await connection.CreateChannelAsync(
-            publisherConfirmations: !string.IsNullOrWhiteSpace(Options.DeadLetterExchange),
+            publisherConfirmations: PublishesFromSubscriberChannel(Options),
             cancellationToken: stoppingToken).ConfigureAwait(false);
         await EnsureTopologyAsync(channel, stoppingToken).ConfigureAwait(false);
         await channel.BasicQosAsync(SubscriberOptions.PrefetchCount, stoppingToken).ConfigureAwait(false);
 
-        await using var dispatcher = RabbitMqMessageDispatcher.Create(
-            HandleMessageAsync,
-            Options,
-            SubscriberOptions,
-            Logger,
-            queue,
-            SubscriberRole);
+        // Bound before the first delivery can arrive, released when this attempt ends: background
+        // work that outlives the attempt publishes through the NEXT attempt's channel.
+        using var attached = dispatcher.AttachChannel(channel);
 
         Logger.LogInformation(
             "RabbitMQ subscriber started. Queue: {Queue}. Role: {Role}. AckMode: {AckMode}.",
@@ -138,6 +164,8 @@ internal abstract class RabbitMqSubscriberService : BackgroundService
             // UnregisteredAsync), so termination is a failure only while the host is still running.
             // Throwing hands control to the ExecuteAsync retry loop, which disposes this
             // connection/channel (via await using) and rebuilds both plus the consumer after backoff.
+            // The dispatcher is NOT drained on this path: it outlives the attempt, its queued
+            // already-ACKed work keeps running, and the next attempt's channel is attached to it.
             if (first == consumer.Terminated && !stoppingToken.IsCancellationRequested)
             {
                 var reason = await consumer.Terminated.ConfigureAwait(false);
@@ -147,14 +175,35 @@ internal abstract class RabbitMqSubscriberService : BackgroundService
         }
 
         using var shutdown = new CancellationTokenSource(Options.ShutdownTimeout);
-        await channel.BasicCancelAsync(consumer.ConsumerTag, shutdown.Token).ConfigureAwait(false);
+        try
+        {
+            await channel.BasicCancelAsync(consumer.ConsumerTag, shutdown.Token).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (stoppingToken.IsCancellationRequested)
+        {
+            // A cancel that fails or outlives ShutdownTimeout must not skip the drain below: thrown
+            // out of here, the channel and connection were disposed first and the drain ran later,
+            // from the service-level `await using` — dead-letter copies found no channel, and the
+            // in-flight wait ran after the close it exists to precede. A consumer still registered
+            // meanwhile is harmless: the awaiting dispatcher starts nothing once stoppingToken is
+            // cancelled, and the queued one leaves whatever arrives after its drain began un-ACKed
+            // until the channel close below requeues it.
+            Logger.LogWarning(
+                ex,
+                "RabbitMQ consumer cancel for queue {Queue} ({Role}) failed while stopping; draining and closing the channel anyway.",
+                queue,
+                SubscriberRole);
+        }
 
-        // Drain the ACK-after-enqueue background queue BEFORE closing the channel and connection
-        // (Kafka parity: "leaving the await-using scope drains ... before the consumer commits").
-        // The drain's dead-letter publishes ride this consumer channel, so closing it first made
-        // TryDeadLetterAlreadyAckedAsync find the channel closed on every graceful shutdown and
-        // each already-ACKed failure during the drain lost its DLX record. DisposeAsync is
-        // idempotent, so the `await using` unwind after the closes is a no-op.
+        // Host stop only (the termination path above threw): drain BEFORE closing the channel and
+        // connection (Kafka parity: "leaving the await-using scope drains ... before the consumer
+        // commits"). ACK-after-enqueue: the background queue, whose dead-letter publishes ride this
+        // consumer channel — closing it first made TryDeadLetterAlreadyAckedAsync find the channel
+        // closed on every graceful shutdown and each already-ACKed failure during the drain lost
+        // its DLX record. ACK-after-handler: the handler still running in a delivery callback, so
+        // its ACK lands before the close instead of the close requeueing a finished job for a peer
+        // to run again. DisposeAsync is idempotent, so the service-level `await using` unwind is a
+        // no-op.
         await dispatcher.DisposeAsync().ConfigureAwait(false);
 
         // A fresh budget for the closes (ASB/SQS parity: arm the source right before the call it
@@ -171,25 +220,78 @@ internal abstract class RabbitMqSubscriberService : BackgroundService
 internal sealed class RabbitMqWorkerSubscriber : RabbitMqSubscriberService
 {
     private readonly IAsyncResponseIngress _ingress;
+    private readonly bool _durableFlowsRegistered;
 
     /// <summary>Runs the RabbitMqWorkerSubscriber operation.</summary>
     public RabbitMqWorkerSubscriber(
         IOptions<RabbitMqAsyncResponseOptions> options,
         IAsyncResponseIngress ingress,
-        ILogger<RabbitMqWorkerSubscriber> logger)
+        ILogger<RabbitMqWorkerSubscriber> logger,
+        IEnumerable<DurableFlowOptions>? durableFlowOptions = null)
         : base(options, logger)
     {
         _ingress = ingress;
+        _durableFlowsRegistered = durableFlowOptions?.Any() == true;
     }
 
     internal RabbitMqWorkerSubscriber(
         IOptions<RabbitMqAsyncResponseOptions> options,
         IAsyncResponseIngress ingress,
         ILogger<RabbitMqWorkerSubscriber> logger,
-        IRabbitMqConnectionFactory connectionFactory)
+        IRabbitMqConnectionFactory connectionFactory,
+        IEnumerable<DurableFlowOptions>? durableFlowOptions = null)
         : base(options, logger, connectionFactory)
     {
         _ingress = ingress;
+        _durableFlowsRegistered = durableFlowOptions?.Any() == true;
+    }
+
+    /// <summary>
+    /// Validates like every subscriber, then warns about the worker configurations in which durable
+    /// flows run against RabbitMQ limits the engine cannot see (SQS parity).
+    /// </summary>
+    public override Task StartAsync(CancellationToken cancellationToken)
+    {
+        var start = base.StartAsync(cancellationToken);
+        if (_durableFlowsRegistered && SubscriberOptions.AckMode == RabbitMqAckMode.AckAfterHandlerCompletes)
+            WarnAboutDurableFlowLimits();
+        return start;
+    }
+
+    private void WarnAboutDurableFlowLimits()
+    {
+        if (SubscriberOptions.MaxDeliveryAttempts == 1)
+        {
+            // Every requeue the broker makes on its own comes back `redelivered`, which resolves to
+            // attempt 2 — past a cap of 1, so the pre-execution check rejects it unrun. A host-stop
+            // hand-back cannot avoid that: it leaves the delivery un-ACKed precisely so the broker
+            // redelivers it; a requeue NACK sets `redelivered` too, and an ACK-and-republish is what
+            // the flow engine's hand-over already tried — the hand-back is its fallback when that
+            // publish failed, or when the wake-up would only come straight back to this stopping host.
+            Logger.LogWarning(
+                "The RabbitMQ worker subscriber for {Queue} has {OptionName} = 1 and durable flows are registered: every delivery the broker requeues on its own — a flow handed back at host stop, a channel closed under a running handler (a stop that outlives its in-flight wait, a connection loss, consumer_timeout) — comes back redelivered, resolves to attempt 2 and is rejected before its handler runs (dead-lettered, or dropped without a dead-letter exchange). A durable flow's wake-up can be lost that way on a routine deploy. Set it to 2 or more, or 0 for unlimited.",
+                Options.WorkerQueue,
+                $"{nameof(RabbitMqAsyncResponseOptions.WorkerSubscriber)}.{nameof(RabbitMqSubscriberOptions.MaxDeliveryAttempts)}");
+        }
+
+        if (Options.BrokerConsumerTimeout is { } consumerTimeout
+            && SubscriberOptions.PrefetchCount > 0
+            && RabbitMqWorkerTransport.ResolveMaxInFlightDuration(Options) is { } ceiling
+            && consumerTimeout / SubscriberOptions.PrefetchCount < ceiling)
+        {
+            // The transport advertises the floor rather than a share that would hop timers every
+            // few seconds (or not at all); what the floor gives up is the guarantee that the last
+            // buffered delivery stays inside the timeout when most of the buffer is parked flows.
+            Logger.LogWarning(
+                "The RabbitMQ worker subscriber for {Queue} prefetches {PrefetchCount} deliveries, which leaves each {Share} of BrokerConsumerTimeout ({ConsumerTimeout}) — below the {InFlightCeiling} the transport advertises to the durable-flow engine as its in-flight ceiling instead (timers wait in process for at most half of it per delivery). When most prefetched deliveries are parked flows, the last one buffered can outlive the broker's consumer_timeout, which closes the channel and requeues every unacknowledged delivery. Lower {PrefetchOption} to {MaxPrefetch} or less, or raise the broker's consumer_timeout together with BrokerConsumerTimeout.",
+                Options.WorkerQueue,
+                SubscriberOptions.PrefetchCount,
+                consumerTimeout / SubscriberOptions.PrefetchCount,
+                consumerTimeout,
+                ceiling,
+                $"{nameof(RabbitMqAsyncResponseOptions.WorkerSubscriber)}.{nameof(RabbitMqSubscriberOptions.PrefetchCount)}",
+                Math.Max(1L, consumerTimeout.Ticks / ceiling.Ticks));
+        }
     }
 
     protected override string QueueName

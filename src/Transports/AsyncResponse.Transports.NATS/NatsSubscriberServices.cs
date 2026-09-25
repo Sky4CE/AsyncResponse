@@ -59,8 +59,9 @@ internal abstract class NatsSubscriberService : BackgroundService
         Logger = logger;
         Schema = new NatsTransportSubjectSchema(Options);
 
-        // Times the idle long poll and paces its fast-empty backoff. The system clock in
-        // production — what is measured is a real server's answer; the seam exists for tests.
+        // Times the idle long poll, paces its fast-empty backoff and the in-progress heartbeat.
+        // The system clock in production — what is measured is a real server's answer; the seam
+        // exists for tests.
         _timeProvider = timeProvider ?? TimeProvider.System;
     }
 
@@ -116,7 +117,8 @@ internal abstract class NatsSubscriberService : BackgroundService
             attemptToken => RunSubscriberAsync(dispatcher, attemptToken),
             stoppingToken,
             failures => AsyncResponseRetry.Backoff(failures, Options.SubscriberRetryBaseDelay, Options.SubscriberRetryMaxDelay),
-            (ex, retryDelay) => Logger.LogWarning(ex, "NATS subscriber failed for subject {Subject} ({Role}); retrying in {RetryDelay}.", Subject, Role, retryDelay)).ConfigureAwait(false);
+            (ex, retryDelay) => Logger.LogWarning(ex, "NATS subscriber failed for subject {Subject} ({Role}); retrying in {RetryDelay}.", Subject, Role, retryDelay),
+            healthyRunThreshold: Options.SubscriberRetryMaxDelay).ConfigureAwait(false);
     }
 
     private async Task RunSubscriberAsync(NatsMessageDispatcher dispatcher, CancellationToken stoppingToken)
@@ -128,7 +130,13 @@ internal abstract class NatsSubscriberService : BackgroundService
                 await _jetStream.EnsureDeadLetterStreamAsync(Schema.DeadLetterStream, Schema.DeadLetterSubject, Options.DeadLetterStreamMaxMessages, stoppingToken).ConfigureAwait(false);
         }
 
-        await _jetStream.EnsureConsumerAsync(Stream, Consumer, Options.AckWait, stoppingToken).ConfigureAwait(false);
+        var liveAckWait = await _jetStream.EnsureConsumerAsync(Stream, Consumer, Options.AckWait, SubscriberOptions.MaxDeliveryAttempts, stoppingToken).ConfigureAwait(false);
+
+        // The heartbeat must land inside the window the server actually enforces: the consumer is
+        // never modified, so after AckWait is raised (or on an operator-provisioned durable) the
+        // live consumer's ack wait can be the shorter one — renewing from the options alone let it
+        // lapse between renewals and redeliver messages under live handlers.
+        var renewalInterval = RenewalIntervalFor(liveAckWait < Options.AckWait ? liveAckWait : Options.AckWait);
 
         Logger.LogInformation(
             "NATS subscriber started. Subject: {Subject}. Stream: {Stream}. Consumer: {Consumer}. Role: {Role}. AckMode: {AckMode}.",
@@ -147,6 +155,18 @@ internal abstract class NatsSubscriberService : BackgroundService
         var fastEmptyPolls = 0;
         while (!stoppingToken.IsCancellationRequested)
         {
+            // The flow engine handed a delivery back: the host IS stopping — the engine reacts to
+            // ApplicationStopping, which fires before this subscriber's token — so fetch nothing
+            // more; wait for the stop. Ending only the delivery kept the loop fetching through the
+            // whole stop window, and every flow wake-up fetched there was handed back too: an
+            // attempt spent on a stopping host (a live peer would have taken it at once) — or, in
+            // early ACK, already ACKed, so each one became a dead-letter copy.
+            if (dispatcher.HandBackSignalled)
+            {
+                await Task.Delay(Timeout.InfiniteTimeSpan, stoppingToken).ConfigureAwait(false);
+                break;
+            }
+
             batch.Clear();
 
             // Drain whatever is already available, up to the fetch size. The batch is
@@ -176,7 +196,7 @@ internal abstract class NatsSubscriberService : BackgroundService
             }
 
             fastEmptyPolls = 0;
-            await DispatchBatchAsync(dispatcher, batch, stoppingToken).ConfigureAwait(false);
+            await DispatchBatchAsync(dispatcher, batch, renewalInterval, stoppingToken).ConfigureAwait(false);
         }
     }
 
@@ -220,6 +240,7 @@ internal abstract class NatsSubscriberService : BackgroundService
     private async Task DispatchBatchAsync(
         NatsMessageDispatcher dispatcher,
         List<NatsJobDelivery> batch,
+        TimeSpan renewalInterval,
         CancellationToken stoppingToken)
     {
         // The batch is dispatched serially, so a slow handler lets the server-side AckWait of the
@@ -231,15 +252,17 @@ internal abstract class NatsSubscriberService : BackgroundService
         // ends only when this loop has let go of every message.
         var progress = new BatchProgress();
         using var renewalCancellation = new CancellationTokenSource();
-        var renewalTask = RenewInProgressLoopAsync(batch, progress, renewalCancellation.Token);
+        var renewalTask = RenewInProgressLoopAsync(batch, progress, renewalInterval, renewalCancellation.Token);
         var next = 0;
         try
         {
             for (; next < batch.Count; next++)
             {
                 // Stopping: do not start what has not started. The rest of the batch used to run
-                // on, handler after handler, past the stop signal.
-                if (stoppingToken.IsCancellationRequested)
+                // on, handler after handler, past the stop signal. A hand-back from the flow
+                // engine (inline, or in an early-ACK worker) is the same signal, arriving before
+                // the token.
+                if (stoppingToken.IsCancellationRequested || dispatcher.HandBackSignalled)
                     break;
 
                 try
@@ -269,14 +292,14 @@ internal abstract class NatsSubscriberService : BackgroundService
                 // message in the batch had settled, so no further batch was fetched and a stop
                 // never completed, with nothing for the supervisor to restart. Past one heartbeat
                 // interval the loop is abandoned; the server's AckWait settles whatever it left.
-                await renewalTask.WaitAsync(RenewalInterval).ConfigureAwait(false);
+                await renewalTask.WaitAsync(renewalInterval, _timeProvider).ConfigureAwait(false);
             }
             catch (TimeoutException)
             {
                 Logger.LogWarning(
                     "NATS in-progress heartbeat for {Role} did not stop within {RenewalInterval} after its batch settled; abandoning it — unsettled deliveries fall back to the server-side AckWait.",
                     Role,
-                    RenewalInterval);
+                    renewalInterval);
                 _ = renewalTask.ContinueWith(
                     static (task, state) => ((ILogger)state!).LogWarning(task.Exception, "Abandoned NATS in-progress heartbeat faulted."),
                     Logger,
@@ -315,19 +338,19 @@ internal abstract class NatsSubscriberService : BackgroundService
     /// ~AckWait/3: two chances to land a renewal inside every AckWait window even when one sweep
     /// is delayed by a slow round trip. Also the bound on joining the renewal loop after a batch.
     /// </summary>
-    private TimeSpan RenewalInterval => TimeSpan.FromMilliseconds(Math.Max(1, Options.AckWait.TotalMilliseconds / 3));
+    private static TimeSpan RenewalIntervalFor(TimeSpan ackWait) => TimeSpan.FromMilliseconds(Math.Max(1, ackWait.TotalMilliseconds / 3));
 
     private async Task RenewInProgressLoopAsync(
         List<NatsJobDelivery> batch,
         BatchProgress progress,
+        TimeSpan interval,
         CancellationToken cancellationToken)
     {
-        var interval = RenewalInterval;
         try
         {
             while (true)
             {
-                await Task.Delay(interval, cancellationToken).ConfigureAwait(false);
+                await Task.Delay(interval, _timeProvider, cancellationToken).ConfigureAwait(false);
 
                 // Renew from the first unsettled message onward: that covers the message
                 // currently in the handler plus everything still waiting its turn. A settle
@@ -397,8 +420,9 @@ internal sealed class NatsWorkerSubscriber : NatsSubscriberService
         IOptions<NatsAsyncResponseTransportOptions> options,
         INatsJetStreamTransport jetStream,
         IAsyncResponseIngress ingress,
-        ILogger<NatsWorkerSubscriber> logger)
-        : base(options, jetStream, logger)
+        ILogger<NatsWorkerSubscriber> logger,
+        TimeProvider? timeProvider = null)
+        : base(options, jetStream, logger, timeProvider)
         => _ingress = ingress;
 
     protected override string Subject => Schema.WorkerSubject;
@@ -430,8 +454,9 @@ internal sealed class NatsResponseIngressSubscriber : NatsSubscriberService
         IOptions<NatsAsyncResponseTransportOptions> options,
         INatsJetStreamTransport jetStream,
         IAsyncResponseIngress ingress,
-        ILogger<NatsResponseIngressSubscriber> logger)
-        : base(options, jetStream, logger)
+        ILogger<NatsResponseIngressSubscriber> logger,
+        TimeProvider? timeProvider = null)
+        : base(options, jetStream, logger, timeProvider)
         => _ingress = ingress;
 
     protected override string Subject => Schema.ResponseSubject;

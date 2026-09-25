@@ -21,13 +21,17 @@ public sealed class SubscriberSupervisorTests
         .GetType("AsyncResponse.Transports.SubscriberSupervisor", throwOnError: true)!
         .GetMethod("RunAsync", BindingFlags.Public | BindingFlags.Static)!;
 
+    // A fact that does not exercise the healthy-run reset gets a threshold no run reaches.
     private static Task RunAsync(
         Func<CancellationToken, Task> run,
         CancellationToken stoppingToken,
         Func<int, TimeSpan> delayPolicy,
         Action<Exception, TimeSpan> logRetry,
-        TimeProvider? timeProvider = null)
-        => (Task)RunAsyncMethod.Invoke(null, [run, stoppingToken, delayPolicy, logRetry, timeProvider])!;
+        TimeProvider? timeProvider = null,
+        TimeSpan? healthyRunThreshold = null)
+        => (Task)RunAsyncMethod.Invoke(
+            null,
+            [run, stoppingToken, delayPolicy, logRetry, healthyRunThreshold ?? TimeSpan.MaxValue, timeProvider])!;
 
     [Fact]
     public async Task RunAsync_ReturnsWithoutRetrying_WhenRunSucceedsImmediately()
@@ -65,12 +69,6 @@ public sealed class SubscriberSupervisorTests
             CancellationToken.None,
             failures =>
             {
-                // int.MaxValue is the supervisor asking for the policy's longest delay (its
-                // healthy-run threshold), not a failure count; a day keeps these instant runs
-                // consecutive.
-                if (failures == int.MaxValue)
-                    return TimeSpan.FromDays(1);
-
                 observedFailureCounts.Add(failures);
                 return TimeSpan.FromMilliseconds(failures); // deterministic, distinguishable per call
             },
@@ -216,14 +214,12 @@ public sealed class SubscriberSupervisorTests
             CancellationToken.None,
             failures =>
             {
-                if (failures == int.MaxValue)
-                    return longestDelay;
-
                 observedFailureCounts.Add(failures);
                 return TimeSpan.Zero; // a zero wait completes inline on any clock
             },
             (_, _) => { },
-            clock);
+            clock,
+            healthyRunThreshold: longestDelay);
 
         // The old lifetime count fed 1, 2, 3, 4, 5 here: the blip an hour later already waited
         // like a fourth consecutive failure, and every one after it waited longer still.
@@ -256,16 +252,58 @@ public sealed class SubscriberSupervisorTests
             CancellationToken.None,
             failures =>
             {
+                observedFailureCounts.Add(failures);
+                return TimeSpan.Zero;
+            },
+            (_, _) => { },
+            clock,
+            healthyRunThreshold: longestDelay);
+
+        Assert.Equal(new List<int> { 1, 2, 3, 4 }, observedFailureCounts);
+    }
+
+    /// <summary>
+    /// Regression: the healthy-run threshold was drawn once from the delay policy, and every
+    /// transport's policy is the half-jittered <c>AsyncResponseRetry.Backoff</c> — so the threshold
+    /// was a random value in [max/2, max], not the configured maximum the reset is documented
+    /// against. With a low draw, runs that died well short of the maximum reset the streak each time
+    /// and reconnected at the base delay up to twice as often as designed. The threshold is now the
+    /// configured maximum, passed in.
+    /// </summary>
+    [Fact]
+    public async Task RunAsync_JudgesAHealthyRunAgainstTheConfiguredMaximum_NotAJitteredSampleOfThePolicy()
+    {
+        var clock = new VirtualTimeProvider();
+        var maxDelay = TimeSpan.FromSeconds(30);
+        var attempt = 0;
+        var observedFailureCounts = new List<int>();
+
+        await RunAsync(
+            _ =>
+            {
+                attempt++;
+                if (attempt > 3)
+                    return Task.CompletedTask;
+
+                // Died after 20 s: past the jitter's lowest draw of the ceiling (15 s), short of the
+                // configured maximum (30 s) — one streak.
+                clock.Advance(TimeSpan.FromSeconds(20));
+                throw new InvalidOperationException($"attempt {attempt} fails");
+            },
+            CancellationToken.None,
+            failures =>
+            {
                 if (failures == int.MaxValue)
-                    return longestDelay;
+                    return maxDelay / 2; // Backoff's half-jitter at its lowest draw
 
                 observedFailureCounts.Add(failures);
                 return TimeSpan.Zero;
             },
             (_, _) => { },
-            clock);
+            clock,
+            healthyRunThreshold: maxDelay);
 
-        Assert.Equal(new List<int> { 1, 2, 3, 4 }, observedFailureCounts);
+        Assert.Equal(new List<int> { 1, 2, 3 }, observedFailureCounts);
     }
 
     /// <summary>The retry wait runs on the supplied clock, so a virtual clock decides when it ends.</summary>

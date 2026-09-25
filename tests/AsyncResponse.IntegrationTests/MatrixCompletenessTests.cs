@@ -1,5 +1,6 @@
 using AsyncResponse.Conformance;
 using Microsoft.Extensions.DependencyInjection;
+using System.Collections;
 using System.Reflection;
 using Xunit;
 
@@ -74,14 +75,9 @@ public sealed class MatrixCompletenessTests
     [Fact]
     public void EveryShard_HasATestClassCarryingItsBatchTrait()
     {
-        var traitsInUse = typeof(MatrixCompletenessTests).Assembly
-            .GetTypes()
-            .Where(type => type is { IsAbstract: false, IsPublic: true })
-            .SelectMany(type => type.GetCustomAttributesData())
-            .Where(attribute => attribute.AttributeType.Name == nameof(TraitAttribute))
-            .Where(attribute => attribute.ConstructorArguments.Count == 2)
-            .Where(attribute => (string?)attribute.ConstructorArguments[0].Value == Batches.Trait)
-            .Select(attribute => (string?)attribute.ConstructorArguments[1].Value)
+        var traitsInUse = BatchAssignmentTests.TestClasses
+            .Select(BatchAssignmentTests.BatchTrait)
+            .OfType<string>()
             .ToHashSet(StringComparer.Ordinal);
 
         var missing = Enum.GetValues<MatrixShard>()
@@ -93,6 +89,89 @@ public sealed class MatrixCompletenessTests
             missing.Length == 0,
             "Every cross-product shard needs a test class tagged with its batch trait, or CI's matrix "
             + $"leg for it runs nothing. Missing: {string.Join(", ", missing)}");
+    }
+
+    /// <summary>
+    /// A shard class picks its cells by hand (<c>MatrixCells.For(MatrixShard.…)</c>) and its CI leg by
+    /// its trait, and nothing above ties the two: a class copied from another shard with only the
+    /// trait and collection updated runs the OTHER shard's cells — that shard twice, its own never —
+    /// while the shards still partition the product and every trait is still carried. This is the
+    /// tie: every class tagged with a <c>matrix-*</c> trait that runs theories must feed each of them
+    /// from a static <c>Cells</c> member holding exactly the cells of the shard that trait names. (The
+    /// transport contract classes share the shards' fleets but run facts, not cells.)
+    /// </summary>
+    [Fact]
+    public void EveryMatrixClass_RunsTheCellsOfTheShardItsTraitNames()
+    {
+        var shardByTrait = Enum.GetValues<MatrixShard>()
+            .ToDictionary(shard => $"matrix-{ProviderMatrix.TraitValueOf(shard)}", StringComparer.Ordinal);
+
+        var checkedClasses = 0;
+        var mismatches = new List<string>();
+        foreach (var type in BatchAssignmentTests.TestClasses)
+        {
+            if (BatchAssignmentTests.BatchTrait(type) is not { } trait
+                || !shardByTrait.TryGetValue(trait, out var shard)
+                || !type.GetMethods().Any(method => method.GetCustomAttributes<TheoryAttribute>().Any()))
+            {
+                continue;
+            }
+
+            checkedClasses++;
+            if (type.GetProperty("Cells", BindingFlags.Public | BindingFlags.Static)?.GetValue(null) is not IEnumerable cells)
+            {
+                mismatches.Add($"{type.Name} (batch={trait}) has no public static Cells member");
+                continue;
+            }
+
+            // The filter MatrixCells applies (ASYNCRESPONSE_MATRIX_FILTER) applies to both sides alike.
+            var actual = CellsIn(cells);
+            var expected = CellsIn(MatrixCells.For(shard));
+            if (!actual.SetEquals(expected))
+            {
+                mismatches.Add(
+                    $"{type.Name} (batch={trait}) runs {actual.Count} cell(s) that are not {shard}'s {expected.Count}: "
+                    + $"{actual.Except(expected).Count()} foreign, {expected.Except(actual).Count()} of its own missing");
+            }
+
+            var foreignSources = type.GetMethods()
+                .Where(method => method.GetCustomAttributes<TheoryAttribute>().Any())
+                .Where(method => !method.GetCustomAttributesData().Any(attribute =>
+                    attribute.AttributeType == typeof(MemberDataAttribute)
+                    && attribute.ConstructorArguments is [{ Value: "Cells" }, ..]
+                    && !attribute.NamedArguments.Any(named => named.MemberName == nameof(MemberDataAttribute.MemberType)
+                        && named.TypedValue.Value is Type memberType && memberType != type)))
+                .Select(method => method.Name);
+            foreach (var method in foreignSources)
+                mismatches.Add($"{type.Name}.{method} does not draw its cells from {type.Name}.Cells");
+        }
+
+        // A reflection guard that finds nothing passes for the wrong reason.
+        Assert.True(
+            checkedClasses >= shardByTrait.Count,
+            $"Only {checkedClasses} matrix-* classes running cells were found for {shardByTrait.Count} shards; the scan, not the suite, is broken.");
+        Assert.True(
+            mismatches.Count == 0,
+            "Every matrix shard class must run exactly the cells of the shard its batch trait selects, or CI "
+            + "runs one shard twice and another never while every other guard stays green. "
+            + string.Join("; ", mismatches));
+    }
+
+    private static HashSet<MatrixCell> CellsIn(IEnumerable theoryData)
+    {
+        var cells = new HashSet<MatrixCell>();
+        foreach (var row in theoryData)
+        {
+            var data = row switch
+            {
+                ITheoryDataRow theoryRow => theoryRow.GetData(),
+                object?[] values => values,
+                _ => throw new InvalidOperationException($"Unrecognized theory data row type {row?.GetType().FullName ?? "null"}."),
+            };
+            cells.Add(Assert.IsType<MatrixCell>(Assert.Single(data)));
+        }
+
+        return cells;
     }
 
     /// <summary>

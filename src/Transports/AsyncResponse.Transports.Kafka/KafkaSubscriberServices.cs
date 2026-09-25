@@ -45,7 +45,6 @@ internal abstract class KafkaSubscriberService : BackgroundService
     /// <summary>Handles the delivered message.</summary>
     protected abstract Task HandleMessageAsync(KafkaDelivery delivery, CancellationToken cancellationToken);
 
-    /// <summary>Runs this background operation until cancellation is requested.</summary>
     /// <summary>
     /// Validates subscriber options here rather than at the top of <c>ExecuteAsync</c>: since
     /// Microsoft.Extensions.Hosting.Abstractions 10.0.10, <c>BackgroundService.StartAsync</c> no
@@ -56,12 +55,23 @@ internal abstract class KafkaSubscriberService : BackgroundService
     public override Task StartAsync(CancellationToken cancellationToken)
     {
         KafkaMessageDispatcher.ValidateOptions(Options, SubscriberOptions, SubscriberRole);
+        KafkaTransportOptionsValidator.EnsureConsumerConfigAccepted(Options, SubscriberRole);
         return base.StartAsync(cancellationToken);
     }
 
-    protected override Task ExecuteAsync(CancellationToken stoppingToken)
-        => SubscriberSupervisor.RunAsync(
-            RunSubscriberAsync,
+    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
+    {
+        // The ACK-after-enqueue dispatcher — its queue and workers — belongs to the hosted
+        // service, not to one supervised attempt (sibling parity: NATS, SQS, the database
+        // transports): each attempt attaches its consumer, and only the host stop drains it. The
+        // ack-after-handler dispatcher stays per attempt: its detached handlers are bound to the
+        // consumer (and the partition assignment) they were consumed on.
+        await using var serviceDispatcher = SubscriberOptions.AckMode is KafkaAckMode.AckAfterEnqueue
+            ? CreateDispatcher(consumer: null)
+            : null;
+
+        await SubscriberSupervisor.RunAsync(
+            attemptToken => RunSubscriberAsync(serviceDispatcher, attemptToken),
             stoppingToken,
             failures => AsyncResponseRetry.Backoff(
                 failures,
@@ -72,9 +82,23 @@ internal abstract class KafkaSubscriberService : BackgroundService
                 "Kafka subscriber failed for topic {Topic} ({Role}); retrying in {RetryDelay}.",
                 Topic,
                 SubscriberRole,
-                retryDelay));
+                retryDelay),
+            healthyRunThreshold: Options.SubscriberRetryMaxDelay).ConfigureAwait(false);
+    }
 
-    private async Task RunSubscriberAsync(CancellationToken stoppingToken)
+    private KafkaMessageDispatcher CreateDispatcher(IKafkaConsumerClient? consumer)
+        => KafkaMessageDispatcher.Create(
+            HandleMessageAsync,
+            consumer,
+            _producer,
+            Options,
+            SubscriberOptions,
+            Logger,
+            Topic,
+            ConsumerGroup,
+            SubscriberRole);
+
+    private async Task RunSubscriberAsync(KafkaMessageDispatcher? serviceDispatcher, CancellationToken stoppingToken)
     {
         if (Options.CreateTopics)
             await EnsureTopicsAsync(stoppingToken).ConfigureAwait(false);
@@ -90,16 +114,11 @@ internal abstract class KafkaSubscriberService : BackgroundService
             // this session can no longer store, instead of running its whole retry ladder for a
             // consumer that is gone.
             using var session = CancellationTokenSource.CreateLinkedTokenSource(stoppingToken);
-            var dispatcher = KafkaMessageDispatcher.Create(
-                HandleMessageAsync,
-                consumer,
-                _producer,
-                Options,
-                SubscriberOptions,
-                Logger,
-                Topic,
-                ConsumerGroup,
-                SubscriberRole);
+            var dispatcher = serviceDispatcher ?? CreateDispatcher(consumer);
+
+            // The service-lifetime dispatcher stores offsets through THIS attempt's consumer until
+            // the attempt ends (released before the consumer closes).
+            using var attached = serviceDispatcher?.AttachConsumer(consumer);
 
             Logger.LogInformation(
                 "Kafka subscriber started. Topic: {Topic}. Group: {ConsumerGroup}. Role: {Role}. AckMode: {AckMode}.",
@@ -129,7 +148,9 @@ internal abstract class KafkaSubscriberService : BackgroundService
                 // durable-flow step awaiting a remote response — and the configured retry policy
                 // never ran. Handlers that settle within the budget get their offsets stored
                 // (the close below commits them); the rest are abandoned with their offsets
-                // unstored, so their messages redeliver on the rebuilt consumer.
+                // unstored, so their messages redeliver on the rebuilt consumer. The service-level
+                // ACK-after-enqueue dispatcher is not torn down at all: its queued work keeps
+                // running and the rebuilt consumer is attached to it.
                 faulted = true;
                 await dispatcher.TeardownAfterFaultAsync().ConfigureAwait(false);
                 session.Cancel();
@@ -140,7 +161,8 @@ internal abstract class KafkaSubscriberService : BackgroundService
                 // Graceful stop (or a fault racing one): the drain waits for the ACK-after-enqueue
                 // background queue — or ack-after-handler mode's detached handlers, storing their
                 // offsets — before the consumer commits its final stored offsets below. The host's
-                // shutdown budget bounds it.
+                // shutdown budget bounds it. DisposeAsync is idempotent, so the service-level
+                // `await using` of the ACK-after-enqueue dispatcher is a no-op after this.
                 if (!faulted)
                     await dispatcher.DisposeAsync().ConfigureAwait(false);
             }

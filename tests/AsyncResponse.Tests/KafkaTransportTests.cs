@@ -127,8 +127,17 @@ public class KafkaTransportTests
     [Theory]
     [InlineData(ErrorCode.Local_Transport, true)]
     [InlineData(ErrorCode.Local_TimedOut, true)]
+    [InlineData(ErrorCode.Local_QueueFull, true)]
     [InlineData(ErrorCode.UnknownTopicOrPart, true)]
     [InlineData(ErrorCode.Local_Fatal, false)]
+    // r1 GS5#5: raised only after librdkafka already retried for message.timeout.ms — a re-produce
+    // multiplies the latency and may land a second copy of a persisted record.
+    [InlineData(ErrorCode.Local_MsgTimedOut, false)]
+    // r1 GS5#5: a retry can only repeat these.
+    [InlineData(ErrorCode.MsgSizeTooLarge, false)]
+    [InlineData(ErrorCode.RecordListTooLarge, false)]
+    [InlineData(ErrorCode.TopicAuthorizationFailed, false)]
+    [InlineData(ErrorCode.ClusterAuthorizationFailed, false)]
     public void IsTransient_ClassifiesKafkaErrors(ErrorCode code, bool expected)
         => Assert.Equal(expected, KafkaTransportRetry.IsTransient(new KafkaException(new Error(code))));
 
@@ -204,6 +213,110 @@ public class KafkaTransportTests
         consumer.Verify(c => c.Resume(assignment));
         consumer.Verify(c => c.Close());
         consumer.Verify(c => c.Dispose());
+    }
+
+    [Fact]
+    public void ConsumerAdapter_MapsAStoreRefusedForAnUnassignedPartition_ToTheVendorFreeSignal()
+    {
+        // r1 S7#18: librdkafka refuses a store for a partition that is no longer assigned
+        // (RD_KAFKA_RESP_ERR__STATE); the adapter names that case so the vendor-free dispatcher
+        // can log it as routine. Every other store failure passes through unchanged.
+        var consumer = new Moq.Mock<IConsumer<string?, byte[]>>();
+        consumer.SetupSequence(c => c.StoreOffset(It.IsAny<TopicPartitionOffset>()))
+            .Throws(new KafkaException(new Error(ErrorCode.Local_State)))
+            .Throws(new KafkaException(new Error(ErrorCode.Local_Transport)));
+        var adapter = new KafkaConsumerClientAdapter(consumer.Object);
+
+        Assert.Throws<KafkaPartitionNotAssignedException>(() => adapter.StoreOffset("jobs", 2, 41));
+        Assert.Equal(ErrorCode.Local_Transport, Assert.Throws<KafkaException>(() => adapter.StoreOffset("jobs", 2, 42)).Error.Code);
+    }
+
+    [Fact]
+    public void ConsumerAdapter_AssignmentGeneration_AdvancesOnlyForTheRevokedPartitions()
+    {
+        // r1 S7#6: the generation the revoked/lost handlers advance is what tells a detached
+        // handler that its partition moved away while it ran.
+        var generations = new KafkaAssignmentGenerations();
+        var adapter = new KafkaConsumerClientAdapter(new Moq.Mock<IConsumer<string?, byte[]>>().Object, generations);
+
+        var before = adapter.GetAssignmentGeneration("jobs", 3);
+        generations.Advance([("jobs", 3)]);
+
+        Assert.NotEqual(before, adapter.GetAssignmentGeneration("jobs", 3));
+        Assert.Equal(0L, adapter.GetAssignmentGeneration("jobs", 4));
+        Assert.Equal(0L, adapter.GetAssignmentGeneration("other", 3));
+    }
+
+    [Fact]
+    public void ConsumerAdapter_ARevokedOrLostPartitionItPaused_IsResumed_SoThePauseDoesNotOutliveTheAssignment()
+    {
+        // Regression (r1 S7#6, real broker): librdkafka keeps an APPLICATION pause on a partition
+        // across a revoke and a later re-assignment (only its internal pause is reset on assign).
+        // A partition paused behind a detached handler therefore came back to this member still
+        // paused — nothing of the new assignment was fetched, and once the stale handler finished
+        // (an orphan, which never resumes) the partition stayed parked for the consumer's life. The
+        // rebalance callback now resumes the partitions this adapter paused, while they are still
+        // assigned — and only those.
+        var generations = new KafkaAssignmentGenerations();
+        var consumer = new Moq.Mock<IConsumer<string?, byte[]>>();
+        var resumed = new List<List<TopicPartition>>();
+        consumer.Setup(c => c.Resume(Moq.It.IsAny<IEnumerable<TopicPartition>>()))
+            .Callback<IEnumerable<TopicPartition>>(partitions => resumed.Add(partitions.ToList()));
+        var adapter = new KafkaConsumerClientAdapter(consumer.Object, generations);
+
+        adapter.PausePartition("jobs", 3); // behind a detached handler
+        adapter.PausePartition("jobs", 4);
+        adapter.ResumePartition("jobs", 4); // settled before the rebalance
+        resumed.Clear();
+
+        adapter.OnPartitionsRemoved(
+            [
+                new TopicPartitionOffset("jobs", new Partition(3), new Offset(10)),
+                new TopicPartitionOffset("jobs", new Partition(4), Offset.Unset),
+                new TopicPartitionOffset("jobs", new Partition(5), Offset.Unset)
+            ]);
+
+        Assert.Equal([new TopicPartition("jobs", new Partition(3))], Assert.Single(resumed));
+        Assert.Equal(1L, generations.Get("jobs", 3));
+        Assert.Equal(1L, generations.Get("jobs", 4));
+        Assert.Equal(1L, generations.Get("jobs", 5));
+
+        adapter.OnPartitionsRemoved([new TopicPartitionOffset("jobs", new Partition(3), Offset.Unset)]);
+        Assert.Single(resumed); // lifted once; the next assignment starts unpaused
+        Assert.Equal(2L, generations.Get("jobs", 3));
+    }
+
+    [Fact]
+    public void ConsumerAdapter_TheBackpressurePause_IsNotLiftedByARebalance()
+    {
+        // The assignment-wide pause is the early-ACK poll loop's: it re-asserts it on every
+        // saturated tick and lifts it itself once the queue has room, so a partition handed back
+        // during backpressure stays paused (librdkafka keeps it) instead of fetching into the full
+        // queue within the very Consume call that ran the rebalance.
+        var consumer = new Moq.Mock<IConsumer<string?, byte[]>>();
+        consumer.SetupGet(c => c.Assignment).Returns([new TopicPartition("jobs", new Partition(3))]);
+        var adapter = new KafkaConsumerClientAdapter(consumer.Object);
+
+        adapter.PauseAssignment();
+        adapter.OnPartitionsRemoved([new TopicPartitionOffset("jobs", new Partition(3), Offset.Unset)]);
+
+        consumer.Verify(c => c.Resume(Moq.It.IsAny<IEnumerable<TopicPartition>>()), Moq.Times.Never);
+        Assert.Equal(1L, adapter.GetAssignmentGeneration("jobs", 3));
+    }
+
+    [Fact]
+    public void ConsumerAdapter_AResumeThatThrowsInTheRebalanceCallback_DoesNotEscapeIt()
+    {
+        // A throw out of the rebalance callback would surface from Consume and fault the poll loop.
+        var consumer = new Moq.Mock<IConsumer<string?, byte[]>>();
+        consumer.Setup(c => c.Resume(Moq.It.IsAny<IEnumerable<TopicPartition>>()))
+            .Throws(new TopicPartitionException([new TopicPartitionError("jobs", new Partition(3), ErrorCode.UnknownTopicOrPart)]));
+        var adapter = new KafkaConsumerClientAdapter(consumer.Object);
+        adapter.PausePartition("jobs", 3);
+
+        adapter.OnPartitionsRemoved([new TopicPartitionOffset("jobs", new Partition(3), new Offset(10))]);
+
+        Assert.Equal(1L, adapter.GetAssignmentGeneration("jobs", 3));
     }
 
     [Fact]

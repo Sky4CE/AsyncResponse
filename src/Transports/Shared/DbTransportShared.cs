@@ -151,7 +151,14 @@ internal abstract class DbMessageDispatcherBase : IAsyncDisposable
             // already-armed beat — firing on a timer thread — renews under a blocked handler
             // thread. Teardown is exception-free (SuppressThrowing beat), so the always-armed
             // loop costs allocations per delivery, not a thrown TaskCanceledException.
-            using var renewalCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            //
+            // The source is NOT linked to the subscriber's stopping token (SQS/NATS parity): the
+            // handler takes no token and keeps running through the host's stop budget — longer if
+            // the operator raised HostOptions.ShutdownTimeout to let long jobs finish — so a beat
+            // that stopped with the subscriber let locked_until pass under a live handler, a peer
+            // (a new replica in a rolling deploy) claimed the row and ran it concurrently, and the
+            // original's fenced ack silently no-opped. The beat ends only when the handler does.
+            using var renewalCancellation = new CancellationTokenSource();
             var renewalTask = RenewLeaseLoopAsync(delivery, renewalCancellation.Token);
             try
             {
@@ -169,6 +176,26 @@ internal abstract class DbMessageDispatcherBase : IAsyncDisposable
             // would bury healthy work once the cap is reached. Leave the claim unsettled — the
             // lease lapses on its own and at-least-once redelivery applies after restart.
             throw;
+        }
+        catch (DurableFlowInterruptedException ex)
+        {
+            // The flow engine's "host is stopping, hand this delivery back" signal — the same
+            // shutdown as above, but it arrives BEFORE this subscriber's own token is cancelled:
+            // ApplicationStopping fires ahead of every hosted service's StopAsync, and the worker
+            // subscriber, registered first, is stopped last. Treated as a handler failure it logged
+            // "failed on attempt N", marked the receive span as an error, NAKed — and at the cap
+            // buried the flow's wake-up with a "Host is stopping" reason. Leave the claim unsettled
+            // exactly like the stop path (the heartbeat ends with the handler, so the lease lapses
+            // and the row is redelivered after the restart), and RETURN rather than rethrow: with
+            // a live token, a rethrow reads to the supervisor as a subscriber fault.
+            _logger.LogDebug(
+                ex,
+                "{Provider} message {MessageId} on queue {Queue} ({Role}) was handed back by a stopping host; leaving the claim unsettled for redelivery.",
+                _providerName,
+                delivery.Id,
+                delivery.Queue,
+                _role);
+            return;
         }
         catch (Exception ex)
         {
@@ -197,7 +224,12 @@ internal abstract class DbMessageDispatcherBase : IAsyncDisposable
         }
     }
 
-    private async Task RenewLeaseLoopAsync(DbTransportDelivery delivery, CancellationToken cancellationToken)
+    /// <param name="delivery">The claimed delivery whose lease is renewed.</param>
+    /// <param name="cancellationToken">Ends the loop (the handler finished, or the park ended).</param>
+    /// <param name="leaseLost">Cancelled when a renew reports the <c>lock_id</c> fence gone — positive
+    /// knowledge that a peer re-claimed (or finished) the row, since the renew is fenced on
+    /// <c>lock_id</c> alone.</param>
+    private async Task RenewLeaseLoopAsync(DbTransportDelivery delivery, CancellationToken cancellationToken, CancellationTokenSource? leaseLost = null)
     {
         // A third of the lease, and a FAILED beat retries on a short backoff instead of waiting out
         // another full beat. At LockTimeout/2 with the retry one more beat away, the retry landed
@@ -223,10 +255,19 @@ internal abstract class DbMessageDispatcherBase : IAsyncDisposable
                 if (cancellationToken.IsCancellationRequested)
                     return; // The handler finished or the subscriber is stopping.
 
+                // Every attempt is BOUNDED by the beat interval (the stores honor the token: connect,
+                // command, and SqlClient's CommandTimeout backstop). Unbounded, a renew hung on a
+                // black-holed pooled connection, a failover, or a lock wait inherited the provider's
+                // command timeout — 30 s on Npgsql/SqlClient, none on MongoDB — which outlasted the
+                // two thirds of the lease left after the beat, so the lease lapsed before the
+                // short-backoff retry below ever ran and a peer re-ran a healthy handler. A timed-out
+                // attempt is a failed beat: retried, on a fresh connection, inside the lease.
                 bool renewed;
                 try
                 {
-                    renewed = await delivery.RenewAsync().ConfigureAwait(false);
+                    using var attemptTimeout = new CancellationTokenSource(interval, _timeProvider);
+                    using var attempt = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, attemptTimeout.Token);
+                    renewed = await delivery.RenewAsync(attempt.Token).ConfigureAwait(false);
                 }
                 catch (Exception ex)
                 {
@@ -269,6 +310,15 @@ internal abstract class DbMessageDispatcherBase : IAsyncDisposable
                         delivery.Id,
                         delivery.Queue,
                         _role);
+                    try
+                    {
+                        leaseLost?.Cancel();
+                    }
+                    catch (ObjectDisposedException)
+                    {
+                        // The park already ended and disposed its source; nobody is listening.
+                    }
+
                     return;
                 }
 
@@ -304,8 +354,11 @@ internal abstract class DbMessageDispatcherBase : IAsyncDisposable
         {
             await _handler(delivery, cancellationToken).ConfigureAwait(false);
         }
-        catch (Exception ex)
+        catch (Exception ex) when (ex is not DurableFlowInterruptedException)
         {
+            // A stopping host's hand-back (DurableFlowInterruptedException) is not a handler error:
+            // HandleAsync leaves the claim unsettled for redelivery, so an error-status span only
+            // put a failure on every trace of a routine shutdown.
             AsyncResponseDiagnostics.SetError(activity, ex);
             throw;
         }
@@ -314,9 +367,9 @@ internal abstract class DbMessageDispatcherBase : IAsyncDisposable
     /// <summary>
     /// The cancelled lease-renewal heartbeat is NOT joined before settlement. Every settlement (ack,
     /// NAK, dead-letter) is fenced by <c>lock_id</c> in all three stores, so a beat still in flight
-    /// is a no-op against it — while the in-flight renew pins <see cref="CancellationToken.None"/>
-    /// for its connect and command, so a join held the ack behind a slow renew: a handler that had
-    /// already SUCCEEDED waited on a degraded database until the lease it was trying to extend had
+    /// is a no-op against it — and a join held the ack behind a slow renew (which then pinned
+    /// <see cref="CancellationToken.None"/> for its connect and command; each attempt is now bounded
+    /// by the beat interval): a handler that had already SUCCEEDED waited on a degraded database until the lease it was trying to extend had
     /// lapsed, and the row was claimed and run again before its ack went out. (While the subscriber
     /// is stopping the wait was also up to <c>LockTimeout</c> of the host's stop budget, a term no
     /// shutdown validator sums.) The loop swallows its own faults; observe defensively and let the
@@ -347,11 +400,30 @@ internal abstract class DbMessageDispatcherBase : IAsyncDisposable
             // the row, and this subscriber enqueue its own copy once the park completes: one job,
             // two concurrent executions, with the second ack's lock_id fence failing silently.
             // Arm the same fenced heartbeat as the inline path for exactly the park's duration.
+            //
+            // The park also listens for the heartbeat's "lease lost": a renew that no longer matches
+            // the lock_id fence means a peer re-claimed the row (the database was unreachable from
+            // here for most of a LockTimeout, a long GC or VM pause). Enqueueing it anyway once
+            // capacity freed ran a job a peer already owned — or had finished — a second time,
+            // with this ack's fence then failing silently. Drop it instead: not ours any more.
             using var renewalCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-            var renewalTask = RenewLeaseLoopAsync(delivery, renewalCancellation.Token);
+            using var leaseLost = new CancellationTokenSource();
+            using var parkCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, leaseLost.Token);
+            var renewalTask = RenewLeaseLoopAsync(delivery, renewalCancellation.Token, leaseLost);
             try
             {
-                await _backgroundQueue.Writer.WriteAsync(delivery, cancellationToken).ConfigureAwait(false);
+                await _backgroundQueue.Writer.WriteAsync(delivery, parkCancellation.Token).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (leaseLost.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
+            {
+                // No NAK either: the fence is gone, so it would no-op against the new owner's claim.
+                _logger.LogDebug(
+                    "{Provider} message {MessageId} on queue {Queue} ({Role}) lost its lease while parked on a full background queue; dropped without enqueueing it.",
+                    _providerName,
+                    delivery.Id,
+                    delivery.Queue,
+                    _role);
+                return;
             }
             catch (Exception ex) when (ex is OperationCanceledException or ChannelClosedException)
             {
@@ -448,6 +520,40 @@ internal abstract class DbMessageDispatcherBase : IAsyncDisposable
             {
                 await ExecuteHandlerAsync(delivery, cancellationToken).ConfigureAwait(false);
             }
+            catch (DurableFlowInterruptedException ex)
+            {
+                // The flow engine handed the job back because the host is stopping — not a handler
+                // failure — but the early ACK already deleted its queue row and nothing redelivers
+                // it. Dead-letter a copy under its own reason so the wake-up keeps a record
+                // (replaying it is safe: the run resumes from its last checkpoint) and surface it
+                // (Kafka/RabbitMQ/Redis/NATS parity). A Warning when the copy was written; an Error
+                // when it was not (dead-lettering disabled or the burial failed), since the wake-up
+                // is then lost unless OnBackgroundFailure records it.
+                var handedBack = new DurableFlowInterruptedException($"{HandedBackAfterCommitReason}: {ex.Message}", ex);
+                if (await DeadLetterSwallowingFailureAsync(delivery, handedBack, deleteOriginal: false).ConfigureAwait(false))
+                {
+                    _logger.LogWarning(
+                        ex,
+                        "{Provider} background handler for already-ACKed message {MessageId} on queue {Queue} ({Role}) was handed back by the flow engine because the host is stopping; the early ACK already removed its row. Dead-lettered a copy ({Reason}) and surfacing via OnBackgroundFailure.",
+                        _providerName,
+                        delivery.Id,
+                        delivery.Queue,
+                        _role,
+                        HandedBackAfterCommitReason);
+                }
+                else
+                {
+                    _logger.LogError(
+                        ex,
+                        "{Provider} background handler for already-ACKed message {MessageId} on queue {Queue} ({Role}) was handed back by the flow engine because the host is stopping, and no dead-letter copy could be written (dead-lettering disabled or the burial failed): the wake-up is lost unless OnBackgroundFailure records it — resume the flow explicitly.",
+                        _providerName,
+                        delivery.Id,
+                        delivery.Queue,
+                        _role);
+                }
+
+                await InvokeBackgroundFailureAsync(delivery, ex).ConfigureAwait(false);
+            }
             catch (Exception ex)
             {
                 _logger.LogError(ex, "{Provider} background handler failed for {Role} on queue {Queue} after early ACK.", _providerName, _role, delivery.Queue);
@@ -503,6 +609,9 @@ internal abstract class DbMessageDispatcherBase : IAsyncDisposable
             await NakSwallowingFailureAsync(delivery).ConfigureAwait(false);
         }
     }
+
+    /// <summary>The dead-letter reason prefix of an early-ACK job the flow engine handed back at host stop.</summary>
+    internal const string HandedBackAfterCommitReason = "handed_back_after_commit";
 
     // Burial with the same containment rule as NakSwallowingFailureAsync below: the delivery
     // contract says DeadLetterAsync returns false rather than throwing, but the stores'
@@ -659,6 +768,49 @@ internal static class DbCorrelationIdExtractor
 }
 
 /// <summary>
+/// The dead-letter retention prune every database transport runs after a publish: throttled to
+/// once per <see cref="Throttle"/> per store on the monotonic clock, drained in bounded batches
+/// under a budget, and guarded so it can never fail the publish it follows. The three stores had
+/// each carried their own copy, and the copies drifted twice: only SQL Server was bounded (one
+/// batch per window, a hard ceiling a poison storm outgrew), only PostgreSQL was guarded (the other
+/// two reported a COMMITTED publish as failed when the prune threw, and the caller's retry ran the
+/// job twice). Each store now supplies only its one-batch delete.
+/// </summary>
+internal static class DbDeadLetterPrune
+{
+    /// <summary>Minimum spacing between two prunes of one store, whatever the publish rate.</summary>
+    public static readonly TimeSpan Throttle = TimeSpan.FromMinutes(1);
+
+    /// <summary>
+    /// Runs the prune when <paramref name="retention"/> is set and the throttle window has elapsed;
+    /// never throws (see <see cref="AsyncResponse.Internal.OpportunisticPrune.DrainQuietlyAsync"/>).
+    /// </summary>
+    /// <param name="lastStamp">The store's throttle stamp (monotonic; 0 = never pruned).</param>
+    /// <param name="retention">The configured <c>DeadLetterRetention</c>; <c>null</c> keeps dead letters forever.</param>
+    /// <param name="pruneBatch">Deletes one bounded batch of over-retention dead letters and returns the count.</param>
+    /// <param name="logger">The store's logger, when DI supplied one.</param>
+    /// <param name="providerName">Provider display name for the log subject.</param>
+    /// <param name="cancellationToken">The publisher's token.</param>
+    public static Task RunIfDueAsync(
+        ref long lastStamp,
+        TimeSpan? retention,
+        Func<TimeSpan, CancellationToken, Task<int>> pruneBatch,
+        ILogger? logger,
+        string providerName,
+        CancellationToken cancellationToken)
+    {
+        if (retention is not { } keep || !AsyncResponse.Internal.OpportunisticPrune.ShouldRun(ref lastStamp, Throttle))
+            return Task.CompletedTask;
+
+        return AsyncResponse.Internal.OpportunisticPrune.DrainQuietlyAsync(
+            token => pruneBatch(keep, token),
+            logger,
+            $"{providerName} transport dead-letter prune",
+            cancellationToken);
+    }
+}
+
+/// <summary>
 /// Materializes a claimed queue item's <c>headers_json</c> without rejecting ANY content the
 /// column can legally hold. This runs after the claim already committed <c>attempts+1</c>/<c>lock_id</c>
 /// and before any delivery object exists, so a throw here (a wrong-typed value, a non-object root,
@@ -681,8 +833,11 @@ internal static class DbTransportHeaders
         {
             document = JsonDocument.Parse(json);
         }
-        catch (JsonException)
+        catch (Exception ex) when (ex is JsonException or ArgumentException)
         {
+            // ArgumentException: a RAW lone surrogate (legal in SQL Server's nvarchar(max), which
+            // stores UTF-16 code units unvalidated) cannot even be transcoded to the UTF-8 that
+            // Parse(string) reads, and that throws before any JSON is seen.
             return Empty;
         }
 

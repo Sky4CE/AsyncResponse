@@ -65,6 +65,79 @@ public class FluentRegistrationTests
     }
 
     [Fact]
+    public async Task StartupValidator_TwoAuthorizeCallbacksCalls_FailsInsteadOfDroppingTheFirstAllowlist()
+    {
+        // Regression: every consumer resolves ONE IAsyncResponseCallbackAuthorizer (the last
+        // registration), so a module's AuthorizeCallbacks followed by the application's silently
+        // discarded the module's allowlist — its recovery callbacks were dropped as permanent
+        // failures and its worker jobs dead-lettered. Startup now fails on the duplicate.
+        var provider = Build(builder => builder
+            .WithInMemoryChannel()
+            .WithInMemoryTransport()
+            .WithInMemoryDurableFlows()
+            .AuthorizeCallbacks(a => a.Allow("Module.IModuleService"))
+            .AuthorizeCallbacks(a => a.Allow("App.IAppService")));
+        var validator = StartupValidator(provider);
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => validator.StartAsync(CancellationToken.None));
+        Assert.Contains(nameof(IAsyncResponseCallbackAuthorizer), ex.Message, StringComparison.Ordinal);
+        Assert.Contains("one AuthorizeCallbacks call", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task StartupValidator_OneAuthorizer_OrOneInstanceRegisteredTwice_Starts()
+    {
+        var single = Build(builder => builder
+            .WithInMemoryChannel()
+            .WithInMemoryTransport()
+            .WithInMemoryDurableFlows()
+            .AuthorizeCallbacks(a => a.Allow("Module.IModuleService").Allow("App.IAppService")));
+        await StartupValidator(single).StartAsync(CancellationToken.None);
+
+        // The same instance twice drops nothing: last-wins resolves the identical authorizer.
+        var authorizer = single.GetRequiredService<IAsyncResponseCallbackAuthorizer>();
+        var sameTwice = Build(builder => builder
+            .WithInMemoryChannel()
+            .WithInMemoryTransport()
+            .WithInMemoryDurableFlows()
+            .AuthorizeCallbacks(authorizer)
+            .AuthorizeCallbacks(authorizer));
+        await StartupValidator(sameTwice).StartAsync(CancellationToken.None);
+    }
+
+    [Fact]
+    public async Task StartupValidator_KeyedScopedObserver_IsNotAuditedAsTheExecutorsObserver()
+    {
+        // Regression: the observer-lifetime audit matched keyed descriptors too, although the
+        // executor resolves GetServices<IDurableFlowExecutionObserver>(), which never returns a
+        // keyed registration — so a keyed scoped observer the engine never sees failed the host
+        // start (naming it "(factory registration)").
+        var provider = Build(builder =>
+        {
+            builder.WithInMemoryChannel().WithInMemoryTransport().WithInMemoryDurableFlows();
+            builder.Services.AddKeyedScoped<IDurableFlowExecutionObserver, NoOpObserver>("reporting");
+        });
+
+        await StartupValidator(provider).StartAsync(CancellationToken.None);
+    }
+
+    [Fact]
+    public async Task StartupValidator_NonKeyedScopedObserver_StillFailsTheAudit()
+    {
+        var provider = Build(builder =>
+        {
+            builder.WithInMemoryChannel().WithInMemoryTransport().WithInMemoryDurableFlows();
+            builder.Services.AddScoped<IDurableFlowExecutionObserver, NoOpObserver>();
+        });
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => StartupValidator(provider).StartAsync(CancellationToken.None));
+        Assert.Contains(nameof(NoOpObserver), ex.Message, StringComparison.Ordinal);
+        Assert.Contains("Scoped", ex.Message, StringComparison.Ordinal);
+    }
+
+    private sealed class NoOpObserver : IDurableFlowExecutionObserver;
+
+    [Fact]
     public void WithInMemoryTransport_WithConfigure_AppliesOptions()
     {
         using var provider = Build(builder => builder.WithInMemoryTransport(o => o.QueueCapacity = 999));

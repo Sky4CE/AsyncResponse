@@ -52,6 +52,39 @@ public sealed class TestingHarnessConfigurationTests
     }
 
     [Fact]
+    public async Task ConfigureAsyncResponse_RegisteringATimeProvider_FailsConstructionWithGuidance()
+    {
+        // Regression (fixpoint r1): the registration builder exposes the same service collection,
+        // and the clock guard ran BEFORE ConfigureAsyncResponse — so a clock registered there
+        // slipped past it, displaced the virtual one, and every wait died as an unexplained
+        // real-time-guard timeout: exactly what the guard exists to prevent.
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            AsyncResponseTestHarness.StartAsync(options =>
+                options.ConfigureAsyncResponse = builder => builder.Services.AddSingleton(TimeProvider.System)));
+
+        Assert.Contains("virtual clock", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("ConfigureAsyncResponse", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task ConfigureAsyncResponse_AddLogging_ReceivesEngineLoggerOutput()
+    {
+        // Regression (fixpoint r1): the NullLogger<> fallback was TryAdd-ed before
+        // ConfigureAsyncResponse ran, so AddLogging there (whose ILogger<> registration is a
+        // TryAdd too) lost to it and every engine diagnostic was swallowed.
+        var sink = new CollectingLoggerProvider();
+        await using var harness = await AsyncResponseTestHarness.StartAsync(options =>
+            options.ConfigureAsyncResponse = builder =>
+                builder.Services.AddLogging(logging => logging.AddProvider(sink).SetMinimumLevel(LogLevel.Debug)));
+
+        var logger = harness.Services.GetRequiredService<ILogger<TestingHarnessConfigurationTests>>();
+        Assert.IsNotType<NullLogger<TestingHarnessConfigurationTests>>(logger);
+
+        logger.LogInformation("builder-configured-logging-visible");
+        Assert.Contains(sink.Messages, message => message.Contains("builder-configured-logging-visible", StringComparison.Ordinal));
+    }
+
+    [Fact]
     public async Task NoUserLogging_StillFallsBackToNullLogger()
     {
         await using var harness = await AsyncResponseTestHarness.StartAsync();

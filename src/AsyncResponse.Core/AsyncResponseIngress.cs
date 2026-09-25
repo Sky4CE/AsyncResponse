@@ -110,13 +110,19 @@ internal sealed class AsyncResponseIngress(
             // dispatcher already ran its own ladder against the failure callback, and escalating
             // through SetException would only invoke that same failing callback again. It
             // propagates so the transport redelivers the still-unacknowledged terminal signal.
+            //
+            // A deterministic callback fault (a resume target that is unauthorized, unresolvable,
+            // malformed, or no longer binds) is excluded from the retry only: every attempt
+            // re-dispatched and failed identically, so it paid the ~1.75 s ladder on the consumer
+            // for nothing before escalating anyway. It escalates at once, like a parse failure.
             await AsyncResponseRetry.ExecuteAsync(
                 async _ =>
                 {
                     await _rawPublisher.SetRawResponseJson(messageJson, correlationId).ConfigureAwait(false);
                     return true;
                 },
-                isTransient: static ex => ex is not (System.Text.Json.JsonException or InvalidDataException or OperationCanceledException or RecoveryCallbackFailedException),
+                isTransient: static ex => ex is not (System.Text.Json.JsonException or InvalidDataException or OperationCanceledException or RecoveryCallbackFailedException)
+                                          && !LostSubscriberCallbackDispatcher.IsPermanentCallbackFailure(ex),
                 maxAttempts: 4,
                 baseDelay: TimeSpan.FromMilliseconds(250),
                 maxDelay: TimeSpan.FromSeconds(2),
@@ -174,15 +180,24 @@ internal sealed class AsyncResponseIngress(
                 throw new InvalidDataException("Worker envelope carries a null call description.");
 
             // Same mechanism one level down: ReflectionCallDto's members are `required` too, so an
-            // explicit "params": null (or a null element, or a null target name) parses yet can
-            // never resolve to a callback — it must take this drop-and-ack route, not escape as an
-            // ArgumentNullException the transport would redeliver forever.
-            if (job.Call.ServiceInterfaceFullName is null || job.Call.MethodName is null || job.Call.Params is null)
-                throw new InvalidDataException("Worker envelope carries a call description with a null member.");
-            foreach (var param in job.Call.Params)
+            // explicit "params": null (or a null element, or a null or blank target name) parses
+            // yet can never resolve to a callback — it must take this drop-and-ack route, not
+            // escape as an ArgumentNullException the transport would redeliver forever. The shape
+            // rule is shared with the producer and the recovery dispatcher (ReflectionCallDtoGuard).
+            if (ReflectionCallDtoGuard.FindDefect(job.Call) is { } defect)
+                throw new InvalidDataException($"Worker envelope carries a malformed call description: {defect}.");
+
+            // And beside the call: the reply target's members are `required` strings with the
+            // same presence-only guarantee, and the executor validates them the moment it pushes
+            // the job's context (whitespace-inclusive, exactly this rule) — outside this filter,
+            // so a null or blank member threw on every delivery and was redelivered forever. A
+            // null Properties map carries no data and is read as empty.
+            if (job.ReplyTarget is { } replyTarget
+                && (string.IsNullOrWhiteSpace(replyTarget.Name)
+                    || string.IsNullOrWhiteSpace(replyTarget.Transport)
+                    || string.IsNullOrWhiteSpace(replyTarget.Address)))
             {
-                if (param is null)
-                    throw new InvalidDataException("Worker envelope carries a call description with a null parameter entry.");
+                throw new InvalidDataException("Worker envelope carries a reply target with a null or blank member.");
             }
         }
         catch (Exception ex) when (ex is InvalidDataException or System.Text.Json.JsonException)
@@ -215,11 +230,20 @@ internal sealed class AsyncResponseIngress(
             AsyncResponseDiagnostics.SetCorrelationId(activity, job.CorrelationId);
             AsyncResponseDiagnostics.SetReplyTarget(activity, job.ReplyTarget);
             AsyncResponseDiagnostics.SetWorker(activity, job.Call);
-            _logger.LogDebug(
-                "Ingress worker job for {CorrelationId} targets {Service}.{Method}.",
-                job.CorrelationId,
-                job.Call.ServiceInterfaceFullName,
-                job.Call.MethodName);
+
+            // Stream-written text, logged before anything has validated or authorized it: the
+            // names go through the same bounded, escaped quoting as every other persisted name,
+            // and the correlation id through the escaped excerpt (it is checked against the
+            // portable-id contract only later, by the executor). An ordinary value reads exactly
+            // as before; CR/LF or megabytes of text can no longer forge or flood the log line.
+            if (_logger.IsEnabled(LogLevel.Debug))
+            {
+                _logger.LogDebug(
+                    "Ingress worker job for {CorrelationId} targets {Service}.{Method}.",
+                    job.CorrelationId is null ? null : DiagnosticText.EscapedExcerpt(job.CorrelationId, AsyncResponseChannelOptions.MaxCorrelationIdLength),
+                    AsyncResponseTypeResolution.DescribeForDiagnostics(job.Call.ServiceInterfaceFullName),
+                    DiagnosticText.EscapedExcerpt(job.Call.MethodName, 256));
+            }
 
             // Authorize the target while the envelope is still inert data — BEFORE its propagated
             // context is restored. Both halves of this envelope are attacker-controlled to anyone
@@ -228,15 +252,36 @@ internal sealed class AsyncResponseIngress(
             // authorizer that consults ambient tenant/principal state the message's own answer to
             // the question it was about to be asked. ReflectionExtensions.InvokeAsync re-checks
             // downstream; this is the ordering, not the only gate.
-            ReflectionExtensions.ThrowIfNotAuthorized(
-                _authorizer,
-                job.Call.ServiceInterfaceFullName ?? string.Empty,
-                job.Call.MethodName ?? string.Empty);
+            try
+            {
+                ReflectionExtensions.ThrowIfNotAuthorized(
+                    _authorizer,
+                    job.Call.ServiceInterfaceFullName ?? string.Empty,
+                    job.Call.MethodName ?? string.Empty);
+            }
+            catch (CallbackTargetUnresolvableException)
+            {
+                // Refused without dispatching: counted "rejected", like the executor's
+                // unsupported-schema refusal — and, like it, still thrown rather than
+                // acknowledged. The allowlist is per-deployment configuration another replica (or
+                // the next deploy) may accept, and an acknowledged job has no other copy; the
+                // transport's redelivery/dead-letter policy decides. Pre-fix the refusal recorded
+                // no worker outcome at all.
+                AsyncResponseDiagnostics.RecordWorkerOutcome("rejected");
+                throw;
+            }
 
             // The job crossed a serialization boundary (broker → ingress): restore any ambient
             // context its propagators captured before executing it.
             using (_propagation.Restore(job.Context))
                 await _workerJobExecutor.ExecuteAsync(job).ConfigureAwait(false);
+        }
+        catch (DurableFlowInterruptedException)
+        {
+            // A host-stop hand-back, not a failure: the executor records it as neither failed nor
+            // an error span, and the transport leaves the delivery unsettled for redelivery.
+            // Logging it at Error here raised an alert on every rolling deploy.
+            throw;
         }
         catch (Exception ex)
         {

@@ -190,9 +190,12 @@ it**. The
 notification that resumes a suspended parent follows the child's single `ParentFlowId`, so if a
 step awaits an id that belongs to another parent — or to a top-level run started via
 `IDurableFlows.StartAsync` — the parent would park forever. The library rejects that loudly
-instead: awaiting a foreign id throws `DurableFlowFailedException`. The persisted parent step,
-flow type, input type, and semantic JSON input value are validated both while waiting and when a
-completed checkpoint is replayed, so changed arguments can never silently adopt a stale child.
+instead: awaiting a foreign id throws `DurableFlowFailedException`. The persisted parent step is
+validated both while waiting and when a completed checkpoint is replayed; until the parent step has
+recorded the child's outcome, the child's flow type, input type, and semantic JSON input value are
+validated too — even when the child itself has already finished — so changed arguments can never be
+awaited under input the child never received. A parent step that recorded the child answers from its
+memo — see [editing a flow](#editing-a-flow).
 The default id, `{parentFlowId}:{stepName}`, is always safe; pass a custom nonblank `flowId` only
 when it is unique per parent step, and keep that id and input stable on every replay.
 
@@ -209,8 +212,10 @@ store and fail on another. Every final id — root, composed child, scheduled oc
   comparison (binary collations included) and MySQL's `utf8mb4_bin` is PAD SPACE, so `flow` and
   `flow ` are one key to those stores while the engine counts two flows.
 
-Ids are compared **ordinally** everywhere, and the relational stores pin a binary collation on the
-column so the database agrees — `flow-a` and `FLOW-A` are two different flows, not one. Budget
+Ids are compared **ordinally** everywhere, and the relational stores make the database agree —
+SQL Server and MySQL pin a binary collation on the column, and PostgreSQL, Oracle, and SQLite
+verify the comparison is ordinal (a deterministic collation, a binary `NLS_COMP`, no `NOCASE`) —
+so `flow-a` and `FLOW-A` are two different flows, not one. Budget
 root ids for growth: each child level appends `:{stepName}`, and `WithScheduledFlow` wraps its
 name as `sched:{name}:{timestamp}` (validated at registration). A non-portable root id is rejected
 at `StartAsync`; a non-portable composed child id fails the parent terminally with the budget in
@@ -284,10 +289,10 @@ property makes every failure mode collapse into "run it again":
 | The **terminal** response itself was the lost message | Its payload is already the step result. The resumed run skips that completed await and continues; it does not wait for a consumed correlation id or re-send the remote request |
 | The same flow job is delivered to two replicas | Atomic start preserves the first input, and the execution lease lets one worker run. The duplicate delivery is acknowledged without entering flow code **once the store shows the lease being renewed or taken over** — proof of a live holder; a lease that never changes belongs to a dead owner, so the delivery waits for its *persisted* expiry and resumes from the last compare-and-swap checkpoint. The wait follows the lease the owner actually wrote, so a deployment that shortens `ExecutionLeaseDuration` cannot acknowledge a wake-up behind a crashed owner's longer lease. See [lease contention](durable-flow-state-stores.md#lease-contention-and-deployments-that-change-the-lease-duration) |
 | The broker redelivers the job whose handler is **still running** | A live holder only makes a second delivery redundant when the holder's own job is a *different* one — that job is still unacknowledged at the broker and comes back if the holder dies. When a broker in-flight ceiling lapses under a running handler (Pub/Sub `MaxTotalAckExtension`, RabbitMQ `consumer_timeout`, the SQS 12-hour cap, a Kafka rebalance), the contending delivery **is** the holder's own job, and it is the last copy of the wake-up the broker has. The execution lease records the job that drives it (`WorkerJobEnvelope.JobId`), so such a delivery is recognised and never acknowledged as a duplicate: on a transport that can delay it is re-published as the same job just past the holder's lease, and otherwise it is handed back with `DurableFlowLeaseContendedException`. Counted on `asyncresponse.flow.own_job_redeliveries` and logged as a warning — it means a ceiling lapsed, so shorten the park (`DurableFlowOptions.MaxInProcessParkDuration`) or raise the ceiling |
-| The process **dies mid-`StartAsync`** | The publish of the start job is the start's commit point, and the job carries the initial ledger: `IDurableFlowExecutor.CreateAndExecuteAsync` creates the run (insert-if-absent) before executing it. A crash **before** the publish leaves nothing behind; a crash **after** it leaves a job whose execution creates and runs the flow. There is no window in which a committed `Running` ledger exists that nothing will ever execute (the pre-1.0 order — create, then publish — had exactly that window, and `IFlowStateStore` has no enumeration a reconciler could use to find such a run). The starter also writes the ledger after publishing; a transient failure of that write may leave `GetStateAsync` returning null until the worker creates it; losing that write to the executor (or to a concurrent identical start) is the expected shape, not an error |
+| The process **dies mid-`StartAsync`** | The publish of the start job is the start's commit point, and the job carries the initial ledger: `IDurableFlowExecutor.CreateAndExecuteAsync` creates the run (insert-if-absent) before executing it. A crash **before** the publish leaves nothing behind; a crash **after** it leaves a job whose execution creates and runs the flow. There is no window in which a committed `Running` ledger exists that nothing will ever execute (the pre-1.0 order — create, then publish — had exactly that window, and `IFlowStateStore` has no enumeration a reconciler could use to find such a run). The starter also writes the ledger after publishing; a transient failure of that write (or of the read that follows a lost create) may leave `GetStateAsync` returning null until the worker creates it, and `StartAsync` still returns the id — past the publish neither a store failure nor the caller's cancellation token turns a start that will run into an exception (what still throws there is a start the job will not run either: a `DurableFlowIdConflictException` found only by the create after the publish, or a `FlowStateTooLargeException`/`ArgumentException` rejection of the ledger that a store's preflight missed — any other store exception there is logged and the id returned); losing that write to the executor (or to a concurrent identical start) is the expected shape, not an error. A caller-chosen id already bound to different work is refused with `DurableFlowIdConflictException` before anything is published, whenever the existing ledger can be read |
 | `StartAsync`'s **publish fails** | After the start's own retry ladder, `StartAsync` throws **`DurableFlowNotDispatchedException`** and **nothing was persisted**. Its `FlowId` carries the id the start would have used — including a generated one — so the retry stays idempotent: if the publish had in fact landed (the ambiguous case is deliberately included), the same id dedupes against the run the job created; a retry with a fresh generated id would start a second, independent run. Supply deterministic ids wherever the caller may retry |
 | A child flow is running | The parent run is parked as `Running`; the child terminal state re-enqueues the parent, which reloads the child state and continues |
-| A **child run dead-letters** (a retriable failure exhausts the transport's delivery attempts) | The child stays `Running` and the parent stays suspended — **the child's DLQ entry is the alarm**. Replay the DLQ entry or call `ResumeAsync(childFlowId)`; re-enqueueing the parent (`ResumeAsync(parentFlowId)`) also works — it re-enqueues the child. The parent resumes automatically once the child reaches a terminal state |
+| A **child run dead-letters** (a retriable failure exhausts the transport's delivery attempts) | The child stays `Running` and the parent stays suspended — **the child's DLQ entry is the alarm**. Replay the DLQ entry (on RabbitMQ strip its `x-death` header first — see [troubleshooting](troubleshooting.md#rabbitmq-startup-warns-about-maxdeliveryattempts-or-a-poison-message-loops-forever)) or call `ResumeAsync(childFlowId)`; re-enqueueing the parent (`ResumeAsync(parentFlowId)`) also works — it re-enqueues the child. The parent resumes automatically once the child reaches a terminal state |
 | You want a dead-lettered run to **wait for you** | A `Running` run can be resurrected at any time by a late response or recovery — by design. To take manual control first, set the run's status to `FlowRunStatus.Suspended` in the flow store: wake-ups, resumes, and failure signals are ignored while suspended (a parent awaiting a suspended child keeps waiting). A recovered **terminal** response is not discarded: it is checkpointed into the suspended run's ledger *without waking it*, so un-parking replays from that preserved result; non-terminal checkpoints keep the recovery registration armed. When ready, set it back to `Running` and call `ResumeAsync(flowId)` to replay from checkpoints. **Park only runs that are not mid-execution**: the store write bumps the ledger revision, so a worker actively executing that flow fails its next checkpoint (logged as a lost execution lease) and everything after its last checkpoint replays on un-park — the normal at-least-once replay, but with side effects that already ran once |
 | The **child's ledger expired** while the parent was suspended | The parent step fails terminally with `DurableFlowFailedException` (`"has no state (expired or deleted)"`) instead of silently re-running the child's side effects — the child's outcome is unknowable. Size `DurableFlowOptions.StateExpiry` beyond the longest child idle time; the TTL refreshes on every checkpoint |
 | The **parent's ledger expired** while suspended | A descendant's long park (a timer sleep, or an awaited step whose wait window exceeds `StateExpiry`) extends every `Running` ancestor up to the root to cover it, so a parent suspended only because a child is parked no longer needs separate sizing for that case. The park stamps a **retention floor** — `FlowState.RetainUntilUtc` — on the run and on every ancestor, and every ledger write of a non-terminal run raises the TTL it stamps to reach that floor: a checkpoint, the executor's per-attempt save, or a recovery/operator mutation that knows nothing about the wait cannot shrink the retention under it. The extension is **part of the park**, not insurance around it: if an ancestor's ledger cannot be written (a store outage), the park fails with nothing published — the delivery is redelivered and replays the same step, which retries the chain — instead of the child parking "successfully" on a parent that would expire under it. A lost revision race is retried against the re-read ancestor (a competing write that already carries a floor reaching the park proves the retention); losing every attempt abandons the park the same way. The whole chain is walked with cycle detection; a chain that revisits an id, or is nested more than 256 child flows deep, fails the run terminally (`DurableFlowFailedException`) rather than being truncated in silence. This propagation fires on parking only: a child that keeps running and checkpointing without ever parking longer than its own `StateExpiry` does not extend the parent, so size `StateExpiry` above that child's total wall-clock duration too. Either way, an expired run cannot be resumed: the executor logs a warning and no-ops |
@@ -334,8 +339,11 @@ engine deriving the compensation sequence for you.
 **Do not compensate on an interruption.** A `catch (Exception)` around a step also catches this
 *attempt* being interrupted rather than the work failing: the run parking (a durable timer or a
 child flow suspended it — its wake-up is already published), or the host stopping while the run
-waited in process on a timer or an awaited response (the delivery is handed back and redelivered
-after the restart). Nothing went wrong, and the checkpoints are intact, so running the undo logic
+waited in process on a timer. At host stop an in-process timer wait is handed over like a hop —
+checkpoint, immediate wake-up, the delivery acknowledged — so a long sleep does not burn one
+broker delivery attempt per deploy; when that wake-up cannot be published, or the timer is
+reached on a host that is already stopping, the delivery is handed back and redelivered after
+the restart instead. Nothing went wrong, and the checkpoints are intact, so running the undo logic
 there compensates work that is about to be replayed. Both are raised as
 `DurableFlowInterruptedException`, which derives from `OperationCanceledException` — so the usual
 filter already excludes it, along with caller-token cancellations, which mean the same thing:
@@ -351,6 +359,19 @@ catch (Exception ex) when (ex is not OperationCanceledException)
     throw new DurableFlowFailedException("Charge failed; refunded.", ex);
 }
 ```
+
+Both are also sticky: flow code that swallows one anyway gets it again from its next context
+call, and a body that returns after swallowing it is not marked completed. Flow code that converts
+one into another exception — `DurableFlowFailedException` included — is logged as a warning and
+overruled: the run stays parked, or the delivery is still handed back, instead of the run failing
+terminally or the wake-up being retried as a fault.
+
+An awaited response is **not** interrupted by host stop. Ending that wait would dispose the step's
+waiter, and disposing a waiter deletes its lost-subscriber recovery registration — so a response
+arriving during the deploy's downtime would be dropped. The step keeps waiting until the channel
+itself shuts down, which cancels the wait but keeps the registration: a response that lands in the
+downtime is recovered into the checkpoint, and the redelivered execution re-attaches to the same
+correlation id either way.
 
 ## Cookbook: patterns from production flows
 
@@ -515,11 +536,15 @@ sizes serializes about N²/2 step-results over its lifetime (100 steps of 1 KiB:
 115 KB final ledger; 400 steps: ~92 MB for 458 KB). The store's `MaxStateBytes` (or the provider's
 item cap) is the hard limit; `DurableFlowOptions.LedgerSizeWarningBytes` (default 512 KiB, `null`
 disables) is the early signal — a warning naming the flow when its estimated size first crosses
-the threshold and again at each doubling. Keep step results small (persist large data yourself
-and pass references — the claim-check seam on the [roadmap](roadmap.md) will do this
+the threshold (for a run whose initial ledger — input and captured context — is already past it,
+as its first execution begins; for a crossing made between executions by a response checkpointed
+without the lease — a recovered one, or one won after the lease was lost — by that write) and again
+at each doubling. Keep step results small (persist
+large data yourself and pass references — the claim-check seam on the [roadmap](roadmap.md) will do this
 transparently), partition a long history into [child flows](#child-flows) (a parent memoizes
-only a compact snapshot of each child), and lower the threshold on DynamoDB, whose 350 KB item
-cap sits under the default.
+only a compact snapshot of each child), and lower the threshold on DynamoDB, whose store refuses a
+ledger past 350 KB by default (`MaxStateBytes`, headroom under the service's 400 KB item cap) —
+below the 512 KiB threshold.
 
 **Start acceptance and size errors.** `IFlowStateStore.ValidateCreate` checks deterministic
 creation constraints without I/O before the start job is published. Every bundled durable store
@@ -540,7 +565,7 @@ outside them the persistence cost arrives well before the size cap does:
 
 | Budget | Supported | What happens past it |
 |---|---|---|
-| Ledger size | ≤ `LedgerSizeWarningBytes` (512 KiB by default; ≤ 350 KB on DynamoDB) | The warning fires at the threshold and each doubling; `MaxStateBytes` fails the run. |
+| Ledger size | ≤ `LedgerSizeWarningBytes` (512 KiB by default; ≤ 350 KB on DynamoDB) | The warning fires at the threshold and each doubling. A checkpoint over `MaxStateBytes` is refused with `FlowStateTooLargeException`: the attempt fails and is retried until the transport dead-letters the wake-up (the run stays `Running`, and a step body whose checkpoint was refused runs again on each redelivery) — the dead-letter queue is the alarm. |
 | Retained steps per run | 256 by default (`MaxRetainedSteps`) | A new step fails before side effects. Explicitly raising the budget increases serialization and write amplification. |
 | Size of one step result | a few KiB | One large result is paid again on every later checkpoint of the run. |
 | Flow input | Must fit both the worker-envelope budget and the selected store's `MaxStateBytes`, including provider document overhead | Built-in stores reject oversized initial state with `FlowStateTooLargeException` before publication; oversized envelopes throw `WorkerJobTooLargeException`. Nothing is persisted. |
@@ -673,7 +698,9 @@ The API encodes the *checkpointed-flow pattern*, extracted from years of product
   single commit point (see the failure table above). Resume, redelivery, and operator kicks all
   re-enqueue the lighter `ExecuteAsync(flowId)` job. The cost is the input travelling twice —
   once in the job, once in the ledger — so mind the transport's payload ceiling for large inputs
-  (SQS and Azure Service Bus cap a message at 256 KiB). `StartAsync` with a caller-supplied
+  (Azure Service Bus standard tier caps a message at 256 KB, SQS at 1 MiB — or the queue's lower
+  `MaximumMessageSize` — and NATS at the server's `max_payload`, 1 MiB by default). `StartAsync`
+  with a caller-supplied
   `flowId` is atomically idempotent for the same flow type and semantically identical input; the
   starter reports a conflicting reuse as `DurableFlowIdConflictException` and the executor drops
   the job it already published on the same test, so an existing run is never replaced silently. A

@@ -64,19 +64,38 @@ awaited step, with the same crash story (broker redelivery of the executing job 
 remainder). Such a wait holds its broker delivery unsettled, and some brokers cap how long ONE
 delivery may stay in flight however alive its handler is: Google Pub/Sub stops extending at
 `MaxTotalAckExtension` (60 minutes by default), RabbitMQ closes a channel whose delivery outlives
-`consumer_timeout` (30 minutes by default), and SQS never keeps a message invisible beyond 12
+`consumer_timeout` (30 minutes by default; mirror your broker's value in
+[`BrokerConsumerTimeout`](configuration.md#transport-options) — and since that clock starts when the
+broker sends a delivery, prefetched deliveries age while they wait, so RabbitMQ advertises
+`BrokerConsumerTimeout / WorkerSubscriber.PrefetchCount`, never less than one minute nor more than
+the timeout itself — with durable flows in ack-after-handler mode a startup warning says when the share falls below that floor; set
+`PrefetchCount = 1` for longer in-process hops), and SQS never keeps a message invisible beyond 12
 hours. Past the ceiling the broker hands the **same job** to another consumer while the first
 handler is still sleeping. A transport that knows its ceiling advertises it
 (`IWorkerTransportInFlightLimit`), and the engine then waits a long sleep in **hops**: it parks for
-at most half the ceiling (or `DurableFlowOptions.MaxInProcessParkDuration`, whichever is shorter),
+at most half the ceiling — never longer than what the delivery has left of it after the steps
+that ran before the timer, less a tenth of the ceiling as headroom (with nothing left it hands over
+at once) — or `DurableFlowOptions.MaxInProcessParkDuration`, whichever is shorter; then it
 checkpoints, publishes an immediate wake-up for the run and ends the delivery; the replay resumes
 the same timer — its due time is checkpointed — under a fresh delivery whose in-flight clock starts
 again. A wake-up that arrives anyway while its own handler is still running is recognised and never
-acknowledged as a duplicate (see [durable-flows.md](durable-flows.md#one-run-at-a-time)).
+acknowledged as a duplicate (see [durable-flows.md](durable-flows.md#what-happens-when-things-die)).
+
+Host stop ends an in-process timer wait the same way: the run checkpoints, publishes an immediate
+wake-up and acknowledges its delivery, so a sleep that spans many deploys never accumulates broker
+delivery attempts — brokers count an unsettled redelivery like a failed one, and a transport's
+attempt cap would eventually dead-letter the run's only wake-up without running it. A timer reached
+on a host that is already stopping, or whose hand-over cannot be published, hands the delivery back
+to the transport instead (`DurableFlowInterruptedException`), to be redelivered after the restart.
+That redelivery does count: on RabbitMQ it arrives `redelivered`, so a worker `MaxDeliveryAttempts`
+of 1 rejects it unrun (the worker subscriber warns about that at startup) — keep it at 2 or more.
 
 Awaited-response steps are **not** hopped: a step re-attaches to a correlation id, so handing its
 delivery back would need the wait to be re-established from the ledger on every hop. A step whose
-timeout exceeds the transport's ceiling logs a warning naming both, once per park. The ledger's TTL is automatically extended to cover the sleep on both paths, so a
+timeout exceeds half the transport's ceiling logs a warning naming both, once per park
+(`MaxInProcessParkDuration` plays no part in it: it shortens timer hops only). A transport with
+neither delayed delivery nor a ceiling waits a sleep longer than the ~49.7-day .NET timer ceiling
+in hops of that length. The ledger's TTL is automatically extended to cover the sleep on both paths, so a
 run can never out-sleep its own state. That contract also bounds a single sleep: at most the
 3650-day persistence ceiling **minus** `DurableFlowOptions.StateExpiry` (default 14 days →
 3636 days), so the extended TTL always outlives the due instant by the full idle margin; a longer
@@ -103,10 +122,10 @@ flow, prefer `flow.DelayAsync(...)` followed by a normal enqueue — that works 
 |---|---|---|---|
 | In-memory | `TimeProvider` timer wheel | none | Delayed jobs share the process lifetime; dropped (loudly) at shutdown. Bounded by `DelayedJobCapacity` (default 4096): an external publisher waits for a slot, a flow parking from inside a job is rejected and redelivered. Virtual-clock aware in tests. |
 | Azure Service Bus | scheduled messages (`ScheduledEnqueueTime`) | none | The broker holds the message; survives restarts. |
-| AWS SQS | `DelaySeconds` | 15 min (chunked) | Standard queues only — SQS rejects per-message delays on FIFO queues, so a FIFO worker queue advertises **no** delay capability (`MaxPublishDelay` = zero): flow timers fall back to the in-process path, and a bare delayed enqueue fails fast at the publish call site. |
+| AWS SQS | `DelaySeconds` | 15 min (chunked) | Standard queues only — SQS rejects per-message delays on FIFO queues, so a FIFO worker queue advertises **no** delay capability (`MaxPublishDelay` = zero): flow timers fall back to the in-process path, and a bare delayed enqueue fails fast at the publish call site. On FIFO, flow jobs without a correlation id also share one message group, so a flow parked in process holds every other flow's jobs — prefer a standard worker queue for durable flows. |
 | PostgreSQL | `available_at` gate on the claim query | none | Due time computed on the **database** clock (`now() + delay`); precision bounded by the subscriber's `EmptyPollDelay`. |
 | SQL Server | `available_at` gate on the claim query | none | Due time on the database clock (`SYSUTCDATETIME`); precision as PostgreSQL. |
-| MongoDB | `available_at` gate on the claim filter | none | Insert stamps a client-computed due time in one atomic write; early delivery from clock skew is corrected by the `NotBeforeUtc` guard, which detects a non-shrinking remainder (persistent skew) and executes rather than re-publishing forever. |
+| MongoDB | `available_at` gate on the claim filter | none | Insert stamps the due time on the **database** clock (`$$NOW + delay`) in one atomic write; early delivery from skew between this host's clock (which stamps `NotBeforeUtc`) and the server's is corrected by the `NotBeforeUtc` guard, which detects a non-shrinking remainder (persistent skew) and executes rather than re-publishing forever. |
 | Kafka, RabbitMQ, Google Pub/Sub, Redis Streams, NATS | — | — | No native delay; flow timers use the in-process path, bare delayed enqueue throws. |
 
 ## Cron-scheduled flows
@@ -127,9 +146,13 @@ services.AddAsyncResponse()
 
 Every replica runs the scheduler; every replica computes the same occurrence and the same
 deterministic run id (`sched:nightly-report:20300101T060000Z`); the flow store's atomic create
-accepts exactly one, and the losers' duplicate wake-ups are absorbed by the execution lease. The
-registration also routes the flow statically (like `WithDurableFlow`), so scheduled flows are
-trim/AOT-safe.
+accepts exactly one, and the losers re-enqueue the same run. The execution lease keeps those
+duplicate wake-ups from executing the run concurrently, but it does not deduplicate them: one that
+arrives after the run has parked (a first child flow, a durable timer on a delayed-capable
+transport) replays it — completed steps skip — and re-parks it, publishing its own wake-up. A run
+that parks early can therefore carry one wake-up chain per replica for its lifetime: extra
+executions, ledger writes and observer events, never a repeated step. The registration also routes
+the flow statically (like `WithDurableFlow`), so scheduled flows are trim/AOT-safe.
 
 The `input` factory receives the occurrence's scheduled UTC instant and **must be deterministic
 across replicas** (every replica must produce the same value for the same occurrence — don't put
@@ -155,8 +178,10 @@ costs startup nothing)
 at startup and re-drives any occurrence whose ledger *exists*, is Running, and has zero attempts —
 a run whose wake-up was published and then lost in transit (an early-ACK worker subscriber, a
 broker that dropped the job) and that nothing else would find. A run that is merely queued behind
-a busy worker looks the same and is re-driven too, harmlessly: the duplicate wake-up is absorbed by
-the execution lease. Every re-drive is logged; a queue that exceeds 256 undispatched occurrences
+a busy worker looks the same and is re-driven too, harmlessly: the execution lease keeps the two
+wake-ups from running the flow at once and completed steps replay from their checkpoints (a run
+that has parked by then gains a second wake-up chain, as above). Every re-drive is logged; a queue
+that exceeds 256 undispatched occurrences
 drops the oldest with an error naming its id, which stays startable by hand with the same
 occurrence id.
 
@@ -193,7 +218,8 @@ are rejected.
   so editing the code mid-run cannot double- or under-sleep an in-flight run.
 - **Schedules are at-most-once.** Occurrences that pass while *no* replica is up are skipped on
   restart, by design — the run history shows the gap. A late timer fire (seconds) still starts
-  its own occurrence. An occurrence the loop did reach but could not publish is re-driven in
+  its own occurrence; a loop that wakes so late that several occurrences are due (a paused VM, a
+  clock jump) starts only the latest of them. An occurrence the loop did reach but could not publish is re-driven in
   process until it is (see above); one whose publish was still failing when the process died is
   skipped like any other missed occurrence, because nothing was persisted for it. A published
   start whose job was then lost in transit is found by the startup probe.

@@ -12,7 +12,10 @@ namespace AsyncResponse;
 /// log entry and starts a forged one in every line-oriented sink, and an unpaired surrogate is
 /// replaced with U+FFFD by the sink's UTF-8 encoder, so the persisted line no longer says what
 /// was received. The excerpt therefore carries such code units as visible backslash-u escapes,
-/// never raw.
+/// never raw — and the backslash itself too, so the encoding is unambiguous: a received six-unit
+/// literal <c>\u000a</c> no longer reads exactly like an escaped line feed. Bidirectional
+/// formatting controls are escaped as well: they forge no line, but a right-to-left override
+/// visually reorders the rest of the line in bidi-aware viewers.
 /// </para>
 /// </summary>
 internal static class DiagnosticText
@@ -23,8 +26,9 @@ internal static class DiagnosticText
     /// <summary>
     /// The first <paramref name="maxLength"/> UTF-16 code units of <paramref name="value"/> (cut
     /// through <see cref="PortableText.TruncateWellFormed"/>, so a whole surrogate pair is never
-    /// split), with every control character, line/paragraph separator, and unpaired surrogate
-    /// written as a backslash-u escape, and an ellipsis appended when anything was cut. The budget
+    /// split), with every control character, line/paragraph separator, bidirectional formatting
+    /// control, unpaired surrogate, and backslash written as a backslash-u escape, and an ellipsis
+    /// appended when anything was cut. The budget
     /// applies to the INPUT: an escape widens one unit to six, so the result is at most six times
     /// the budget.
     /// </summary>
@@ -83,7 +87,20 @@ internal static class DiagnosticText
 
     // Reached only for a unit that is NOT part of a well-formed pair, so any surrogate seen here
     // is unpaired. The line and paragraph separators are not control characters to char.IsControl,
-    // but they are line breaks to the viewers and parsers that matter for log forging.
+    // but they are line breaks to the viewers and parsers that matter for log forging. The
+    // backslash is escaped so every backslash-u in the output is one of ours. The bidi controls
+    // are an explicit list, NOT all of Unicode's format category: that also holds the zero-width
+    // joiner, which composed emoji — a valid id shape — are made of.
     private static bool IsUnsafe(char unit)
-        => char.IsControl(unit) || char.IsSurrogate(unit) || unit is LineSeparator or ParagraphSeparator;
+        => char.IsControl(unit)
+           || char.IsSurrogate(unit)
+           || unit is LineSeparator or ParagraphSeparator or '\\'
+           || IsBidiControl(unit);
+
+    // U+061C ARABIC LETTER MARK, U+200E/U+200F LRM/RLM, U+202A-U+202E the embeddings and
+    // overrides, U+2066-U+2069 the isolates.
+    private static bool IsBidiControl(char unit)
+        => unit is (char)0x061C or (char)0x200E or (char)0x200F
+           or >= (char)0x202A and <= (char)0x202E
+           or >= (char)0x2066 and <= (char)0x2069;
 }

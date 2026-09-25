@@ -135,6 +135,7 @@ internal sealed class AsyncResponseEnvelopeConverter<T> : JsonConverter<AsyncRes
         int schemaVersion = default;
         bool hasSchemaVersion = false;
         bool success = false;
+        bool hasSuccess = false;
         bool hasPayload = false;
         bool payloadIsNull = false;
         T? payload = default;
@@ -168,6 +169,7 @@ internal sealed class AsyncResponseEnvelopeConverter<T> : JsonConverter<AsyncRes
                     if (reader.TokenType is not (JsonTokenType.True or JsonTokenType.False))
                         throw JsonSafety.WireContractFailure("Success must be a boolean.");
                     success = reader.GetBoolean();
+                    hasSuccess = true;
                 }
                 else if (property == EnvelopeProperty.Payload)
                 {
@@ -208,6 +210,13 @@ internal sealed class AsyncResponseEnvelopeConverter<T> : JsonConverter<AsyncRes
 
         if (!hasSchemaVersion)
             throw JsonSafety.WireContractFailure("SchemaVersion is required.");
+
+        // Required like SchemaVersion: defaulted to false, {"SchemaVersion":1,"Payload":{...}}
+        // from a foreign producer read as a failure with no message — the waiter faulted with
+        // "Unknown error" and the delivered payload was thrown away — instead of naming the
+        // violation. Every library writer has always emitted it.
+        if (!hasSuccess)
+            throw JsonSafety.WireContractFailure("Success is required.");
 
         // Every publisher serializes the non-null payload it was handed, so Success=true with a
         // null Payload only arises from a producer-side contract violation — typically a raw

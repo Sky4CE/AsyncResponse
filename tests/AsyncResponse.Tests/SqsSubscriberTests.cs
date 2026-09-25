@@ -1,5 +1,6 @@
 using Amazon.SQS;
 using Amazon.SQS.Model;
+using AsyncResponse.Testing;
 using AsyncResponse.Transports.SQS;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -115,6 +116,10 @@ public sealed class SqsSubscriberTests
             MaxMessagesPerReceive = 7,
             ReceiveWaitTime = TimeSpan.FromMilliseconds(10)
         };
+        // MaxMessagesPerReceive applies to early ACK only (fixpoint r1, S8#6): ACK-after-handler
+        // receives one message at a time — pinned by
+        // WorkerSubscriber_AckAfterHandlerCompletes_ReceivesOneMessageAtATime.
+        options.WorkerSubscriber.UseAckAfterEnqueue(backgroundWorkerCount: 1, backgroundQueueCapacity: 8);
         options.WorkerSubscriber.VisibilityTimeout = TimeSpan.FromSeconds(45);
         var calls = new SettlementCalls();
         var subscriber = new SqsWorkerSubscriber(
@@ -217,7 +222,9 @@ public sealed class SqsSubscriberTests
     [Fact]
     public async Task WorkerSubscriber_SlowHandler_RenewsVisibilityOfUnprocessedBatchMessages()
     {
-        var client = new FakeSqsClient();
+        // ACK-after-handler now receives one message at a time; the client hands over the whole
+        // batch anyway so the renewal machinery the loop keeps for any batch is still pinned.
+        var client = new FakeSqsClient { ReturnAllAvailable = true };
         var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var firstStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var first = true;
@@ -279,7 +286,7 @@ public sealed class SqsSubscriberTests
         // keeps running, and cancelling its renewal at that moment let its visibility lapse under
         // it — a competing consumer re-ran the same job on every rolling deploy. It ends when the
         // batch loop does, which is also what bounds StopAsync.
-        var client = new FakeSqsClient();
+        var client = new FakeSqsClient { ReturnAllAvailable = true }; // one receive, whole batch
         var releaseFirstHandler = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var sweepBlocked = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var releaseSweep = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -358,7 +365,7 @@ public sealed class SqsSubscriberTests
         // the caller's token untouched. That escaped to the outer catch — whose body is just a
         // comment — silently ending renewal for the whole remaining batch. Messages 3..N then went
         // visible mid-processing and a peer re-ran them: systematic duplicate execution, no log.
-        var client = new FakeSqsClient();
+        var client = new FakeSqsClient { ReturnAllAvailable = true }; // one receive, whole batch
         var logger = new CollectingLogger<SqsWorkerSubscriber>();
         var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var ingress = new Mock<IAsyncResponseIngress>();
@@ -490,7 +497,7 @@ public sealed class SqsSubscriberTests
     [Fact]
     public async Task WorkerSubscriber_FailedMessageRedeliveryDelay_IsNotOverwrittenByRenewalHeartbeat()
     {
-        var client = new FakeSqsClient();
+        var client = new FakeSqsClient { ReturnAllAvailable = true }; // one receive, whole batch
         var releaseFirstHandler = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var sweepBlocked = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var releaseSweep = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -608,6 +615,391 @@ public sealed class SqsSubscriberTests
             release.TrySetResult();
             await subscriber.StopAsync(default);
         }
+    }
+
+    [Fact]
+    public async Task WorkerSubscriber_AckAfterHandlerCompletes_ReceivesOneMessageAtATime()
+    {
+        // Red-on-old (fixpoint r1, S8#6 — also closes S8#5 and S8#14): ACK-after-handler received
+        // MaxMessagesPerReceive (10) messages and ran them serially. SQS counts — and starts the
+        // visibility clock of — every message a receive hands over, so a process-killing handler
+        // took its 9 batch-mates' receive counts with it on every crash, later batch positions
+        // spent their visibility (or the 12-hour ceiling) waiting, and on FIFO a failed message's
+        // same-group batch-mates ran ahead of its redelivery.
+        var client = new FakeSqsClient();
+        var ingress = new Mock<IAsyncResponseIngress>();
+        ingress.Setup(i => i.HandleWorkerMessageAsync(It.IsAny<string>())).Returns(Task.CompletedTask);
+        var firstCalls = new SettlementCalls();
+        var secondCalls = new SettlementCalls();
+        var subscriber = new SqsWorkerSubscriber(
+            Options.Create(new SqsAsyncResponseOptions
+            {
+                WorkerQueue = "workers",
+                ResponseQueue = "responses",
+                ReceiveWaitTime = TimeSpan.FromMilliseconds(10)
+            }),
+            client,
+            ingress.Object,
+            NullLogger<SqsWorkerSubscriber>.Instance);
+
+        client.Enqueue(Delivery(firstCalls, messageId: "m1"));
+        client.Enqueue(Delivery(secondCalls, messageId: "m2"));
+        await subscriber.StartAsync(CancellationToken.None);
+        await secondCalls.Deleted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await subscriber.StopAsync(CancellationToken.None);
+
+        Assert.Equal(1, client.LastReceiveRequest!.MaxMessages);
+        Assert.True(client.ReceiveAttempts >= 2);
+        Assert.Equal(1, firstCalls.Delete);
+        Assert.Equal(1, secondCalls.Delete);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task WorkerSubscriber_HandlerCancelledByTheStop_HandsBackItsUnstartedBatchMates(bool renewal)
+    {
+        // Red-on-old (fixpoint r1, S8#10): a handler that exits by throwing the stop's
+        // OperationCanceledException (a parked flow interrupted at shutdown) unwound past both
+        // batch loops — the stop check only ran between messages — so the unstarted batch-mates
+        // stayed invisible for their full visibility on every deploy. NATS rule: hand back from
+        // max(next, settled).
+        var client = new FakeSqsClient { ReturnAllAvailable = true };
+        var firstStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseFirst = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var ingress = new Mock<IAsyncResponseIngress>();
+        ingress.Setup(i => i.HandleWorkerMessageAsync(It.IsAny<string>())).Returns(Task.CompletedTask);
+        ingress.Setup(i => i.HandleWorkerMessageAsync("m1-body")).Returns(async () =>
+        {
+            firstStarted.TrySetResult();
+            await releaseFirst.Task;
+            throw new OperationCanceledException("interrupted by the host stop");
+        });
+        var options = new SqsAsyncResponseOptions
+        {
+            WorkerQueue = "workers",
+            ResponseQueue = "responses",
+            ReceiveWaitTime = TimeSpan.FromMilliseconds(10)
+        };
+        if (renewal)
+        {
+            options.WorkerSubscriber.VisibilityTimeout = TimeSpan.FromSeconds(45);
+            options.WorkerSubscriber.VisibilityRenewalInterval = TimeSpan.FromMilliseconds(50);
+        }
+
+        var firstCalls = new SettlementCalls();
+        var secondCalls = new SettlementCalls();
+        var subscriber = new SqsWorkerSubscriber(Options.Create(options), client, ingress.Object, NullLogger<SqsWorkerSubscriber>.Instance);
+
+        client.Enqueue(Delivery(firstCalls, body: "m1-body", messageId: "m1"));
+        client.Enqueue(Delivery(secondCalls, body: "m2-body", messageId: "m2"));
+        await subscriber.StartAsync(CancellationToken.None);
+        await firstStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        var stopping = subscriber.StopAsync(CancellationToken.None);
+        releaseFirst.TrySetResult();
+        await stopping.WaitAsync(TimeSpan.FromSeconds(10));
+
+        ingress.Verify(i => i.HandleWorkerMessageAsync("m2-body"), Times.Never);
+        Assert.NotEmpty(secondCalls.VisibilityChanges);
+        Assert.Equal(TimeSpan.Zero, secondCalls.VisibilityChanges[^1]);
+        // m1 was interrupted by the stop: untouched, never handed back as if it had not run.
+        Assert.DoesNotContain(TimeSpan.Zero, firstCalls.VisibilityChanges);
+        Assert.Equal(0, firstCalls.Delete);
+    }
+
+    [Fact]
+    public async Task WorkerSubscriber_RenewalOff_StopMidBatch_HandsBackTheUnstartedMessages()
+    {
+        // Fixpoint r1 (S8#23): the round-42 renewal-free stop hand-back shipped unpinned.
+        var client = new FakeSqsClient { ReturnAllAvailable = true };
+        var firstStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseFirst = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var ingress = new Mock<IAsyncResponseIngress>();
+        ingress.Setup(i => i.HandleWorkerMessageAsync(It.IsAny<string>())).Returns(Task.CompletedTask);
+        ingress.Setup(i => i.HandleWorkerMessageAsync("m1-body")).Returns(async () =>
+        {
+            firstStarted.TrySetResult();
+            await releaseFirst.Task;
+        });
+        var firstCalls = new SettlementCalls();
+        var secondCalls = new SettlementCalls();
+        var subscriber = new SqsWorkerSubscriber(
+            Options.Create(new SqsAsyncResponseOptions
+            {
+                WorkerQueue = "workers",
+                ResponseQueue = "responses",
+                ReceiveWaitTime = TimeSpan.FromMilliseconds(10)
+            }),
+            client,
+            ingress.Object,
+            NullLogger<SqsWorkerSubscriber>.Instance);
+
+        client.Enqueue(Delivery(firstCalls, body: "m1-body", messageId: "m1"));
+        client.Enqueue(Delivery(secondCalls, body: "m2-body", messageId: "m2"));
+        await subscriber.StartAsync(CancellationToken.None);
+        await firstStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        var stopping = subscriber.StopAsync(CancellationToken.None);
+        releaseFirst.TrySetResult();
+        await stopping.WaitAsync(TimeSpan.FromSeconds(10));
+
+        Assert.Equal(1, firstCalls.Delete);
+        ingress.Verify(i => i.HandleWorkerMessageAsync("m2-body"), Times.Never);
+        Assert.Equal([TimeSpan.Zero], secondCalls.VisibilityChanges);
+    }
+
+    [Fact]
+    public async Task WorkerSubscriber_HandlerFailingAfterTheStop_StillAppliesTheRedeliveryDelay()
+    {
+        // Red-on-old (fixpoint r1, S8#9): the renewal path's visibility wrapper waited on its gate
+        // with the stop token. SemaphoreSlim.WaitAsync throws at once for an already-cancelled
+        // token, even with the gate free, so a handler that failed after the stop (it keeps
+        // running past it since round 42) silently skipped RedeliveryDelay and sat out the full
+        // visibility timeout.
+        var client = new FakeSqsClient();
+        var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var ingress = new Mock<IAsyncResponseIngress>();
+        ingress.Setup(i => i.HandleWorkerMessageAsync(It.IsAny<string>())).Returns(async () =>
+        {
+            started.TrySetResult();
+            await release.Task;
+            throw new InvalidOperationException("dependency torn down during shutdown");
+        });
+        var options = new SqsAsyncResponseOptions
+        {
+            WorkerQueue = "workers",
+            ResponseQueue = "responses",
+            ReceiveWaitTime = TimeSpan.FromMilliseconds(10)
+        };
+        options.WorkerSubscriber.VisibilityTimeout = TimeSpan.FromSeconds(45);
+        options.WorkerSubscriber.VisibilityRenewalInterval = TimeSpan.FromMilliseconds(50);
+        options.WorkerSubscriber.RedeliveryDelay = TimeSpan.FromSeconds(3);
+        var calls = new SettlementCalls();
+        var subscriber = new SqsWorkerSubscriber(Options.Create(options), client, ingress.Object, NullLogger<SqsWorkerSubscriber>.Instance);
+
+        client.Enqueue(Delivery(calls, messageId: "m1"));
+        await subscriber.StartAsync(CancellationToken.None);
+        await started.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        var stopping = subscriber.StopAsync(CancellationToken.None);
+        release.TrySetResult();
+        await stopping.WaitAsync(TimeSpan.FromSeconds(10));
+
+        Assert.NotEmpty(calls.VisibilityChanges);
+        Assert.Equal(TimeSpan.FromSeconds(3), calls.VisibilityChanges[^1]);
+        Assert.Equal(0, calls.Delete);
+    }
+
+    [Fact]
+    public async Task WorkerSubscriber_AckAfterEnqueue_ReceiveFault_DoesNotDrainOrRefuseAlreadyDeletedWork()
+    {
+        // Fixpoint r1 (S8#23): round 42 moved the early-ACK dispatcher out of the supervised
+        // attempt — a receive fault on a healthy host used to run the stop-time drain and refuse
+        // the queued, already-DELETED work as "drain budget lapsed" — but shipped no pin.
+        var client = new FakeSqsClient { FailOnReceiveAttempt = 2 };
+        var firstStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseFirst = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var secondHandled = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var failureReported = new TaskCompletionSource<SqsBackgroundFailureContext>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var ingress = new Mock<IAsyncResponseIngress>();
+        ingress.Setup(i => i.HandleWorkerMessageAsync(It.IsAny<string>())).Returns<string>(async body =>
+        {
+            if (body == "first")
+            {
+                firstStarted.TrySetResult();
+                await releaseFirst.Task;
+            }
+
+            if (body == "second")
+                secondHandled.TrySetResult();
+        });
+        var options = new SqsAsyncResponseOptions
+        {
+            WorkerQueue = "workers",
+            ResponseQueue = "responses",
+            ReceiveWaitTime = TimeSpan.FromMilliseconds(10),
+            SubscriberRetryBaseDelay = TimeSpan.FromMilliseconds(1),
+            SubscriberRetryMaxDelay = TimeSpan.FromMilliseconds(1)
+        };
+        options.WorkerSubscriber.UseAckAfterEnqueue(backgroundWorkerCount: 1, backgroundQueueCapacity: 8, backgroundDrainTimeout: TimeSpan.FromMilliseconds(200));
+        options.WorkerSubscriber.OnBackgroundFailure = context =>
+        {
+            failureReported.TrySetResult(context);
+            return ValueTask.CompletedTask;
+        };
+        var firstCalls = new SettlementCalls();
+        var secondCalls = new SettlementCalls();
+        var subscriber = new SqsWorkerSubscriber(Options.Create(options), client, ingress.Object, NullLogger<SqsWorkerSubscriber>.Instance);
+
+        client.Enqueue(Delivery(firstCalls, body: "first", messageId: "m1"));
+        client.Enqueue(Delivery(secondCalls, body: "second", messageId: "m2"));
+        await subscriber.StartAsync(CancellationToken.None);
+        await firstStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await secondCalls.Deleted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        // The supervisor rebuilt the attempt after the faulted receive: the host did not stop.
+        await WaitUntilAsync(() => client.ReceiveAttempts >= 3);
+
+        releaseFirst.TrySetResult();
+        var outcome = await Task.WhenAny(secondHandled.Task, failureReported.Task).WaitAsync(TimeSpan.FromSeconds(5));
+        await subscriber.StopAsync(CancellationToken.None);
+
+        Assert.True(
+            ReferenceEquals(outcome, secondHandled.Task),
+            "the already-deleted queued job was refused after a receive fault instead of being handled");
+        Assert.False(failureReported.Task.IsCompleted);
+    }
+
+    [Fact]
+    public async Task RenewalHeartbeat_ClampsTheLastExtensionToTheTwelveHourCeiling_ThenStopsWithOneWarning()
+    {
+        // Fixpoint r1 (S8#23): the round-42 12-hour clamp and its Clock seam shipped unpinned. SQS
+        // rejects — it does not truncate — a ChangeMessageVisibility crossing 12 hours from the
+        // receive, so the heartbeat must shorten its last extension and then stop asking.
+        var clock = new VirtualTimeProvider();
+        var client = new FakeSqsClient();
+        var logger = new CollectingLogger<SqsWorkerSubscriber>();
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var ingress = new Mock<IAsyncResponseIngress>();
+        ingress.Setup(i => i.HandleWorkerMessageAsync(It.IsAny<string>())).Returns(async () => await release.Task);
+        var options = new SqsAsyncResponseOptions
+        {
+            WorkerQueue = "workers",
+            ResponseQueue = "responses",
+            ReceiveWaitTime = TimeSpan.FromMilliseconds(10)
+        };
+        options.WorkerSubscriber.VisibilityTimeout = TimeSpan.FromSeconds(45);
+        options.WorkerSubscriber.VisibilityRenewalInterval = TimeSpan.FromMilliseconds(50);
+        var calls = new SettlementCalls();
+        var subscriber = new SqsWorkerSubscriber(Options.Create(options), client, ingress.Object, logger) { Clock = clock };
+
+        client.Enqueue(Delivery(calls, messageId: "m1"));
+        await subscriber.StartAsync(CancellationToken.None);
+        await WaitUntilAsync(() => calls.VisibilityChanges.Count >= 1);
+        Assert.All(calls.VisibilityChanges, change => Assert.Equal(TimeSpan.FromSeconds(45), change));
+
+        // 30 s before the ceiling: the next beat may only ask for what is left, then stops.
+        clock.Advance(TimeSpan.FromHours(12) - TimeSpan.FromSeconds(30));
+        await WaitUntilAsync(() => calls.VisibilityChanges.Contains(TimeSpan.FromSeconds(30)));
+        var afterCeiling = calls.VisibilityChanges.Count;
+        clock.Advance(TimeSpan.FromMinutes(1));
+        await WaitUntilAsync(() => logger.Snapshot().Any(entry => entry.Message.Contains("12-hour SQS in-flight ceiling", StringComparison.Ordinal)));
+
+        release.TrySetResult();
+        await calls.Deleted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await subscriber.StopAsync(CancellationToken.None);
+
+        Assert.Equal(afterCeiling, calls.VisibilityChanges.Count);
+        Assert.Equal(TimeSpan.FromSeconds(30), calls.VisibilityChanges[^1]);
+        Assert.Single(logger.Snapshot(), entry => entry.Message.Contains("12-hour SQS in-flight ceiling", StringComparison.Ordinal));
+    }
+
+    [Theory]
+    [InlineData(0, 45.0)]                   // fresh: the full visibility timeout
+    [InlineData(43_170, 30.0)]              // 12 h − 30 s: only what is left
+    [InlineData(43_169.5, 30.0)]            // rounded DOWN to whole seconds (the adapter rounds up)
+    [InlineData(43_200, null)]              // at the ceiling: nothing left
+    [InlineData(46_800, null)]              // past it
+    public void ClampRenewalToInFlightCeiling_NeverRequestsPastTwelveHoursFromTheReceive(double inFlightSeconds, double? expectedSeconds)
+    {
+        // Fixpoint r1 (S8#23): pins the round-42 clamp directly.
+        var clamped = SqsSubscriberService.ClampRenewalToInFlightCeiling(TimeSpan.FromSeconds(45), TimeSpan.FromSeconds(inFlightSeconds));
+
+        Assert.Equal(expectedSeconds is { } seconds ? TimeSpan.FromSeconds(seconds) : null, clamped);
+    }
+
+    [Fact]
+    public async Task WorkerSubscriber_ShortPolling_BacksOffBetweenEmptyReceives()
+    {
+        // Red-on-old (fixpoint r1, S8#20): with ReceiveWaitTime = 0 (short polling) an empty
+        // receive returns at once, and the loop re-polled without pause — billed ReceiveMessage
+        // calls once per round trip, per subscriber and replica, around the clock.
+        var clock = new VirtualTimeProvider();
+        var client = new FakeSqsClient();
+        var subscriber = new SqsWorkerSubscriber(
+            Options.Create(new SqsAsyncResponseOptions
+            {
+                WorkerQueue = "workers",
+                ResponseQueue = "responses",
+                ReceiveWaitTime = TimeSpan.Zero
+            }),
+            client,
+            Mock.Of<IAsyncResponseIngress>(),
+            NullLogger<SqsWorkerSubscriber>.Instance) { Clock = clock };
+
+        await subscriber.StartAsync(CancellationToken.None);
+        try
+        {
+            await WaitUntilAsync(() => client.ReceiveAttempts >= 1);
+
+            // Virtual time stands still, so the backoff after the first empty receive never ends
+            // on its own: on the old code no timer was armed and a receive went out per round
+            // trip. Advancing only once the backoff is armed keeps the step deterministic — an
+            // advance before it would leave a timer due after the advanced clock, never firing.
+            await WaitUntilAsync(() => clock.NextTimerDueAt is not null);
+            Assert.Equal(1, client.ReceiveAttempts);
+
+            // Past the backoff the next receive goes out.
+            clock.Advance(TimeSpan.FromSeconds(10));
+            await WaitUntilAsync(() => client.ReceiveAttempts >= 2);
+        }
+        finally
+        {
+            await subscriber.StopAsync(CancellationToken.None);
+        }
+    }
+
+    [Theory]
+    [InlineData(true, false)]  // FIFO worker queue: every uncorrelated flow job shares one group
+    [InlineData(false, true)]  // 12-hour ceiling advertised while the real one is the queue's visibility timeout
+    public async Task WorkerSubscriber_WithDurableFlows_WarnsAboutTheLimitsTheEngineCannotSee(bool fifo, bool visibilityUnset)
+    {
+        // Fixpoint r1 (S8#3 / S8#4 interim; the root fixes are maintainer decisions).
+        var logger = new CollectingLogger<SqsWorkerSubscriber>();
+        var options = new SqsAsyncResponseOptions
+        {
+            WorkerQueue = fifo ? "workers.fifo" : "workers",
+            ResponseQueue = "responses",
+            ReceiveWaitTime = TimeSpan.FromMilliseconds(10)
+        };
+        if (!visibilityUnset)
+            options.WorkerSubscriber.VisibilityTimeout = TimeSpan.FromMinutes(5);
+        var subscriber = new SqsWorkerSubscriber(
+            Options.Create(options),
+            new FakeSqsClient(),
+            Mock.Of<IAsyncResponseIngress>(),
+            logger,
+            [new DurableFlowOptions()]);
+
+        await subscriber.StartAsync(CancellationToken.None);
+        await subscriber.StopAsync(CancellationToken.None);
+
+        var warnings = logger.Snapshot().Where(entry => entry.Level == LogLevel.Warning).Select(entry => entry.Message).ToArray();
+        Assert.Equal(fifo, warnings.Any(message => message.Contains("is a FIFO queue and durable flows are registered", StringComparison.Ordinal)));
+        Assert.Equal(visibilityUnset, warnings.Any(message => message.Contains("advertises the 12-hour SQS maximum", StringComparison.Ordinal)));
+    }
+
+    [Fact]
+    public async Task WorkerSubscriber_WithoutDurableFlows_DoesNotWarn()
+    {
+        var logger = new CollectingLogger<SqsWorkerSubscriber>();
+        var subscriber = new SqsWorkerSubscriber(
+            Options.Create(new SqsAsyncResponseOptions
+            {
+                WorkerQueue = "workers.fifo",
+                ResponseQueue = "responses",
+                ReceiveWaitTime = TimeSpan.FromMilliseconds(10)
+            }),
+            new FakeSqsClient(),
+            Mock.Of<IAsyncResponseIngress>(),
+            logger);
+
+        await subscriber.StartAsync(CancellationToken.None);
+        await subscriber.StopAsync(CancellationToken.None);
+
+        Assert.DoesNotContain(logger.Snapshot(), entry => entry.Message.Contains("durable", StringComparison.OrdinalIgnoreCase));
     }
 
     private static async Task WaitUntilAsync(Func<bool> condition)
@@ -873,6 +1265,168 @@ public sealed class SqsSubscriberTests
         await service.StartAsync(CancellationToken.None);
 
         Assert.Equal(4, client.CreatedQueues.Count);
+    }
+
+    [Fact]
+    public async Task ProvisioningService_DeterministicRejection_FailsStartupWithoutBurningTheRetryBudget()
+    {
+        // Red-on-old (fixpoint r1, S8#21): the provisioning retry caught EVERY exception, so a
+        // deterministic 400 (AccessDenied, InvalidAttributeValue, an invalid name) burned all 40
+        // attempts — minutes of backoff inside host startup — before failing it anyway.
+        var rejection = new AmazonSQSException(
+            "Access to the resource is denied.",
+            Amazon.Runtime.ErrorType.Sender,
+            "AccessDenied",
+            "request-id",
+            System.Net.HttpStatusCode.Forbidden);
+        var client = new FakeSqsClient { CreateQueueFailuresBeforeSuccess = int.MaxValue, CreateQueueFailure = () => rejection };
+        var service = new SqsQueueProvisioningService(
+            Options.Create(new SqsAsyncResponseOptions
+            {
+                WorkerQueue = "workers",
+                ResponseQueue = "responses",
+                CreateQueues = true,
+                SubscriberRetryBaseDelay = TimeSpan.FromMilliseconds(1),
+                SubscriberRetryMaxDelay = TimeSpan.FromMilliseconds(1)
+            }),
+            client,
+            NullLogger<SqsQueueProvisioningService>.Instance);
+
+        var thrown = await Assert.ThrowsAsync<AmazonSQSException>(() => service.StartAsync(CancellationToken.None));
+
+        Assert.Same(rejection, thrown);
+        Assert.Equal(1, client.CreateQueueAttempts);
+    }
+
+    [Fact]
+    public void ProvisioningService_ClassifiesOnlyWhatCanStillSucceedAsTransient()
+    {
+        Assert.True(SqsQueueProvisioningService.IsTransientProvisioningFailure(SqsTransportTests.TransientSqsException("5xx")));
+        Assert.True(SqsQueueProvisioningService.IsTransientProvisioningFailure(new HttpRequestException("connection refused", new System.Net.Sockets.SocketException())));
+        Assert.True(SqsQueueProvisioningService.IsTransientProvisioningFailure(new QueueDoesNotExistException("not yet visible")));
+        Assert.False(SqsQueueProvisioningService.IsTransientProvisioningFailure(new InvalidOperationException("bug")));
+        Assert.False(SqsQueueProvisioningService.IsTransientProvisioningFailure(new AmazonSQSException(
+            "bad attribute", Amazon.Runtime.ErrorType.Sender, "InvalidAttributeValue", "request-id", System.Net.HttpStatusCode.BadRequest)));
+    }
+
+    [Fact]
+    public void ProvisioningService_ClientSideFailuresAtPodStart_AreTransient()
+    {
+        // Red-on-old (fixpoint r1 pre-commit, I6): the transient-only filter failed startup at
+        // once on two failures that resolve by themselves — the SDK's client-side exception while
+        // credentials or the instance-metadata endpoint are not ready yet at pod start, and its own
+        // HTTP timeout, which surfaces as TaskCanceledException with our token untouched.
+        Assert.True(SqsQueueProvisioningService.IsTransientProvisioningFailure(
+            new Amazon.Runtime.AmazonClientException("Failed to retrieve credentials from EC2 Instance Metadata Service.")));
+        Assert.True(SqsQueueProvisioningService.IsTransientProvisioningFailure(
+            new TaskCanceledException("The request was canceled due to the configured HttpClient.Timeout.")));
+    }
+
+    [Fact]
+    public async Task ProvisioningService_CredentialsNotReadyYet_RetriesInsteadOfFailingStartup()
+    {
+        // Red-on-old (fixpoint r1 pre-commit, I6): end to end — the first CreateQueue fails
+        // client-side (no service answer at all), and provisioning retries instead of failing
+        // host startup on the first attempt.
+        var client = new FakeSqsClient
+        {
+            CreateQueueFailuresBeforeSuccess = 1,
+            CreateQueueFailure = () => new Amazon.Runtime.AmazonClientException("Unable to get IAM security credentials from EC2 Instance Metadata Service.")
+        };
+        var service = new SqsQueueProvisioningService(
+            Options.Create(new SqsAsyncResponseOptions
+            {
+                WorkerQueue = "workers",
+                ResponseQueue = "responses",
+                CreateQueues = true,
+                SubscriberRetryBaseDelay = TimeSpan.FromMilliseconds(1),
+                SubscriberRetryMaxDelay = TimeSpan.FromMilliseconds(1)
+            }),
+            client,
+            NullLogger<SqsQueueProvisioningService>.Instance);
+
+        await service.StartAsync(CancellationToken.None);
+
+        Assert.Equal(
+            ["workers-dlq", "workers", "responses-dlq", "responses"],
+            client.CreatedQueues.Select(created => created.QueueName));
+    }
+
+    [Fact]
+    public async Task ResponseSubscriber_AckAfterHandlerCompletes_KeepsTheBatch()
+    {
+        // Red-on-old (fixpoint r1 pre-commit, I4): one message per receive was keyed on the ack
+        // mode alone, so the response ingress — ack-after-handler by default, running the
+        // library's own short handler — also paid a billed ReceiveMessage per response. Only worker
+        // jobs carry the batch-mate risks that rule exists for.
+        var client = new FakeSqsClient();
+        var ingress = new Mock<IAsyncResponseIngress>();
+        ingress.Setup(i => i.HandleResponseMessageAsync(It.IsAny<string>(), It.IsAny<string?>())).Returns(Task.CompletedTask);
+        var calls = new SettlementCalls();
+        var subscriber = new SqsResponseIngressSubscriber(
+            Options.Create(new SqsAsyncResponseOptions
+            {
+                WorkerQueue = "workers",
+                ResponseQueue = "responses",
+                ReceiveWaitTime = TimeSpan.FromMilliseconds(10)
+            }),
+            client,
+            ingress.Object,
+            NullLogger<SqsResponseIngressSubscriber>.Instance);
+
+        client.Enqueue(Delivery(calls, body: "response-json"));
+        await subscriber.StartAsync(CancellationToken.None);
+        await calls.Deleted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await subscriber.StopAsync(CancellationToken.None);
+
+        Assert.Equal(10, client.LastReceiveRequest!.MaxMessages);
+    }
+
+    [Fact]
+    public async Task WorkerSubscriber_FlowHandBack_StopsReceivingUntilTheSubscriberStops()
+    {
+        // Red-on-old (fixpoint r1 pre-commit, R1): the flow engine hands a delivery back on
+        // ApplicationStopping, before this subscriber's own stop, and the receive loop kept
+        // receiving in between — so the wake-ups the engine hands over for a replica still running
+        // were taken by this stopping host, interrupted again and left invisible for a whole
+        // visibility timeout. The first hand-back now ends receiving for the rest of the attempt.
+        var client = new FakeSqsClient();
+        var logger = new CollectingLogger();
+        var ingress = new Mock<IAsyncResponseIngress>();
+        ingress.Setup(i => i.HandleWorkerMessageAsync("parked-flow")).ThrowsAsync(new DurableFlowInterruptedException("the host is stopping"));
+        ingress.Setup(i => i.HandleWorkerMessageAsync("wake-up")).Returns(Task.CompletedTask);
+        var parkedCalls = new SettlementCalls();
+        var wakeUpCalls = new SettlementCalls();
+        var subscriber = new SqsWorkerSubscriber(
+            Options.Create(new SqsAsyncResponseOptions
+            {
+                WorkerQueue = "workers",
+                ResponseQueue = "responses",
+                ReceiveWaitTime = TimeSpan.FromMilliseconds(10)
+            }),
+            client,
+            ingress.Object,
+            logger.For<SqsWorkerSubscriber>());
+
+        client.Enqueue(Delivery(parkedCalls, body: "parked-flow", messageId: "m1"));
+        client.Enqueue(Delivery(wakeUpCalls, body: "wake-up", messageId: "m2"));
+        await subscriber.StartAsync(CancellationToken.None);
+        try
+        {
+            // The old loop received m2 straight after m1's hand-back; the fix parks it first.
+            await await Task.WhenAny(wakeUpCalls.Deleted.Task, logger.WaitForAsync("stops receiving"));
+            Assert.False(wakeUpCalls.Deleted.Task.IsCompleted, "the subscriber kept receiving after the flow engine handed a delivery back");
+            Assert.Equal(1, client.ReceiveAttempts);
+        }
+        finally
+        {
+            await subscriber.StopAsync(CancellationToken.None);
+        }
+
+        ingress.Verify(i => i.HandleWorkerMessageAsync("wake-up"), Times.Never);
+        Assert.Equal(0, parkedCalls.Delete);
+        Assert.Empty(parkedCalls.VisibilityChanges); // left invisible, not released into this loop
+        Assert.Equal(0, wakeUpCalls.Delete);
     }
 
     [Fact]

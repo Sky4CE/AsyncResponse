@@ -5,7 +5,9 @@ using AsyncResponse.Internal;
 using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Options;
 using MongoDB.Bson;
+using MongoDB.Bson.Serialization;
 using MongoDB.Bson.Serialization.Attributes;
+using MongoDB.Bson.Serialization.Serializers;
 using MongoDB.Driver;
 
 namespace Microsoft.Extensions.DependencyInjection
@@ -165,9 +167,12 @@ public sealed class MongoDbFlowStateStore : IFlowStateStore, IDisposable
         // concern stays inherited on purpose: primary reads already see every write this store
         // had acknowledged (read-your-writes needs nothing more), and a majority snapshot could
         // only hide a competitor's newer write, which the revision/lease filters reject anyway.
+        // Majority with a BOUND (see MongoWriteConcerns): a bare WMajority carried no wtimeout, so
+        // on a primary-secondary-arbiter set with its secondary down every checkpoint blocked
+        // indefinitely — and it discarded the operator's own wtimeoutMS/journal besides.
         _collection = database.GetCollection<MongoFlowStateDocument>(_options.CollectionName)
             .WithReadPreference(ReadPreference.Primary)
-            .WithWriteConcern(WriteConcern.WMajority);
+            .WithWriteConcern(MongoWriteConcerns.BoundedMajority(database));
         _ownedClient = ownedClient;
     }
 
@@ -181,7 +186,19 @@ public sealed class MongoDbFlowStateStore : IFlowStateStore, IDisposable
         // live one. All lease fencing below uses the same authority.
         var document = await _collection.Find(BuildLiveFilter(flowId)).FirstOrDefaultAsync(cancellationToken).ConfigureAwait(false);
         if (document is null)
+        {
+            // A document whose expiry is missing or not a BSON date also misses the live filter —
+            // by BSON type order a string, a number or a missing field compares below any date —
+            // and the TTL monitor never reaps it, so "absent" would acknowledge the only wake-up
+            // of a ledger that sits in the collection forever. Only a well-formed, elapsed expiry
+            // reads as absent (DynamoDB refuses the same shape). One id-only probe, on this path only.
+            // Neither the reaper nor a create (BuildExpiredReplaceFilter) ever removes such a
+            // document, so the id stays blocked until an operator does: the reason carries the cleanup.
+            if (await _collection.CountDocumentsAsync(BuildMalformedExpiryFilter(flowId), new CountOptions { Limit = 1 }, cancellationToken).ConfigureAwait(false) > 0)
+                throw new FlowStateUnreadableException(flowId, MalformedExpiryReason(_options.CollectionName));
+
             return null;
+        }
 
         // BuildLiveFilter already excluded expired documents server-side, so reaching here with a
         // document means the ledger is present and live. A missing required field is therefore an
@@ -248,7 +265,16 @@ public sealed class MongoDbFlowStateStore : IFlowStateStore, IDisposable
         }
         catch (MongoWriteException ex) when (ex.WriteError?.Category == ServerErrorCategory.DuplicateKey)
         {
-            return false;
+            // The document that holds the id may have expired during the `hello` round trip
+            // between step 1 and this insert. Answering "exists" for it sends the executor to load
+            // a ledger that reads as absent, and the start job is acknowledged with no run
+            // created — so replace it once more before conceding the id to a live owner.
+            var retried = await _collection.UpdateOneAsync(
+                BuildExpiredReplaceFilter(flowId),
+                BuildStateUpdate(stateJson, state.Revision, ttl, resetLease: true),
+                options: null,
+                cancellationToken).ConfigureAwait(false);
+            return retried.ModifiedCount > 0;
         }
     }
 
@@ -373,8 +399,22 @@ public sealed class MongoDbFlowStateStore : IFlowStateStore, IDisposable
                 Builders<MongoFlowStateDocument>.IndexKeys.Ascending(item => item.ExpiresAtUtc),
                 new CreateIndexOptions { Name = indexName, ExpireAfter = TimeSpan.Zero });
             // Do not drop or rewrite a conflicting application-owned index. MongoDB reports the
-            // mismatch and startup fails, leaving the operator to correct schema intentionally.
-            await _collection.Indexes.CreateOneAsync(model, cancellationToken: cancellationToken).ConfigureAwait(false);
+            // mismatch and startup fails, leaving the operator to correct schema intentionally —
+            // unless what conflicts is the reaper this store needs under another name: the index
+            // the docs and the AutoCreateIndexes = false error prescribe,
+            // createIndex({ expires_at_utc: 1 }, { expireAfterSeconds: 0 }), is named
+            // "expires_at_utc_1", and MongoDB refuses the same key and options under a second name
+            // (85 IndexOptionsConflict; 86 IndexKeySpecsConflict for a same-named different key).
+            try
+            {
+                await _collection.Indexes.CreateOneAsync(model, cancellationToken: cancellationToken).ConfigureAwait(false);
+            }
+            catch (MongoCommandException ex) when (ex.Code is 85 or 86)
+            {
+                if (!await HasTtlIndexAsync(cancellationToken).ConfigureAwait(false))
+                    throw;
+            }
+
             _created = true;
         }
         finally
@@ -390,25 +430,30 @@ public sealed class MongoDbFlowStateStore : IFlowStateStore, IDisposable
     /// </summary>
     private async Task VerifyTtlIndexAsync(CancellationToken cancellationToken)
     {
-        using var cursor = await _collection.Indexes.ListAsync(cancellationToken).ConfigureAwait(false);
-        var indexes = await cursor.ToListAsync(cancellationToken).ConfigureAwait(false);
-        foreach (var index in indexes)
-        {
-            if (index.Contains("expireAfterSeconds")
-                && index.TryGetValue("key", out var key)
-                && key is BsonDocument keyDocument
-                && keyDocument.ElementCount == 1
-                && keyDocument.Contains("expires_at_utc"))
-            {
-                return;
-            }
-        }
+        if (await HasTtlIndexAsync(cancellationToken).ConfigureAwait(false))
+            return;
 
         throw new InvalidOperationException(
             $"The MongoDB durable-flow collection '{_options.CollectionName}' has no TTL index on 'expires_at_utc' and " +
             $"{nameof(MongoDbDurableFlowOptions)}.{nameof(MongoDbDurableFlowOptions.AutoCreateIndexes)} is disabled. The TTL index is " +
             "the store's only cleanup mechanism; without it expired flow ledgers accumulate forever. Create it " +
             "(createIndex({ expires_at_utc: 1 }, { expireAfterSeconds: 0 })) or enable AutoCreateIndexes.");
+    }
+
+    /// <summary>
+    /// Whether the collection carries a TTL reaper on the expiry timestamp, whatever it is named:
+    /// a single-field index on <c>expires_at_utc</c> with <c>expireAfterSeconds</c> set.
+    /// </summary>
+    private async Task<bool> HasTtlIndexAsync(CancellationToken cancellationToken)
+    {
+        using var cursor = await _collection.Indexes.ListAsync(cancellationToken).ConfigureAwait(false);
+        var indexes = await cursor.ToListAsync(cancellationToken).ConfigureAwait(false);
+        return indexes.Exists(index =>
+            index.Contains("expireAfterSeconds")
+            && index.TryGetValue("key", out var key)
+            && key is BsonDocument keyDocument
+            && keyDocument.ElementCount == 1
+            && keyDocument.Contains("expires_at_utc"));
     }
 
     /// <summary>
@@ -461,10 +506,33 @@ public sealed class MongoDbFlowStateStore : IFlowStateStore, IDisposable
         => Builders<MongoFlowStateDocument>.Filter.Eq(item => item.FlowId, flowId)
            & ServerClockExpr(new BsonDocument("$gt", new BsonArray { "$expires_at_utc", "$$NOW" }));
 
-    /// <summary>Expired-ledger filter used by create to replace a dead ledger in place.</summary>
+    /// <summary>
+    /// Expired-ledger filter used by create to replace a dead ledger in place. Only a BSON date
+    /// can be elapsed: a missing or non-date expiry also compares <c>$lte</c> <c>$$NOW</c> by BSON
+    /// type order, and replacing that corrupt, still-present ledger would silently discard it
+    /// (DynamoDB's condition refuses the same create).
+    /// </summary>
     internal static FilterDefinition<MongoFlowStateDocument> BuildExpiredReplaceFilter(string flowId)
         => Builders<MongoFlowStateDocument>.Filter.Eq(item => item.FlowId, flowId)
+           & Builders<MongoFlowStateDocument>.Filter.Type(item => item.ExpiresAtUtc, BsonType.DateTime)
            & ServerClockExpr(new BsonDocument("$lte", new BsonArray { "$expires_at_utc", "$$NOW" }));
+
+    /// <summary>
+    /// Operator-facing reason for a malformed expiry, with the cleanup that frees the id: the TTL
+    /// monitor never reaps a non-date and no create replaces one, so nothing else ever will.
+    /// </summary>
+    internal static string MalformedExpiryReason(string collectionName)
+        => "its stored document's expires_at_utc is missing or not a date, so the TTL index never reaps it and no create " +
+           "replaces it. Earlier AsyncResponse releases wrote such expiries when the host had registered a non-date " +
+           "DateTime serializer globally; once no run needs them, remove them with " +
+           $"db.getCollection(\"{collectionName}\").deleteMany({{ expires_at_utc: {{ $not: {{ $type: \"date\" }} }} }}) " +
+           "(add an _id condition to clear one flow)";
+
+    /// <summary>The id with an expiry that is missing or not a BSON date — a corrupt ledger, not an absent one.</summary>
+    internal static FilterDefinition<MongoFlowStateDocument> BuildMalformedExpiryFilter(string flowId)
+        => Builders<MongoFlowStateDocument>.Filter.Eq(item => item.FlowId, flowId)
+           & Builders<MongoFlowStateDocument>.Filter.Not(
+               Builders<MongoFlowStateDocument>.Filter.Type(item => item.ExpiresAtUtc, BsonType.DateTime));
 
     /// <summary>
     /// Checkpoint filter: revision fence plus server-clock expiry (and, when fenced by a lease,
@@ -575,6 +643,14 @@ public sealed class MongoDbFlowStateStore : IFlowStateStore, IDisposable
 /// column a newer build added would make every older replica in a rolling deploy fail to read a
 /// live flow's ledger — and an unreadable ledger is the one outcome the store contract refuses to
 /// report as "absent".
+/// <para>
+/// The instants are pinned to BSON dates (<see cref="UtcBsonDateSerializer"/>), whatever
+/// <see cref="DateTime"/> serializer the host registered globally: every expiry and lease filter
+/// compares them with <c>$$NOW</c>, and the TTL monitor reaps only dates. Under a host-wide
+/// String or Document representation the insert path wrote a string, which by BSON type order
+/// never compares above <c>$$NOW</c> — every new ledger read as absent (its start or child job was
+/// acknowledged "nothing to execute") and was never reaped.
+/// </para>
 /// </remarks>
 [BsonIgnoreExtraElements]
 internal sealed class MongoFlowStateDocument
@@ -587,9 +663,11 @@ internal sealed class MongoFlowStateDocument
     public string StateJson { get; set; } = "";
 
     [BsonElement("expires_at_utc")]
+    [BsonSerializer(typeof(UtcBsonDateSerializer))]
     public DateTime ExpiresAtUtc { get; set; }
 
     [BsonElement("updated_at_utc")]
+    [BsonSerializer(typeof(UtcBsonDateSerializer))]
     public DateTime UpdatedAtUtc { get; set; }
 
     [BsonElement("revision")]
@@ -601,6 +679,39 @@ internal sealed class MongoFlowStateDocument
 
     [BsonElement("lease_expires_at_utc")]
     [BsonIgnoreIfNull]
+    [BsonSerializer(typeof(NullableUtcBsonDateSerializer))]
     public DateTime? LeaseExpiresAtUtc { get; set; }
+}
+
+/// <summary>
+/// A ledger instant as a UTC BSON date, set on the member itself so the global serializer registry
+/// is never consulted. <c>[BsonDateTimeOptions]</c> would not do: it RECONFIGURES whatever
+/// serializer the registry returns for <see cref="DateTime"/>, and for a host that registered its
+/// own <c>IBsonSerializer&lt;DateTime&gt;</c> (anything but the driver's
+/// <see cref="DateTimeSerializer"/>) freezing this class map throws
+/// <see cref="NotSupportedException"/>, failing every flow-store operation. The driver's
+/// serializers are sealed, so this delegates to a privately held one instead of deriving from it.
+/// </summary>
+internal sealed class UtcBsonDateSerializer : SerializerBase<DateTime>
+{
+    internal static readonly DateTimeSerializer Pinned = new(DateTimeKind.Utc, BsonType.DateTime);
+
+    public override DateTime Deserialize(BsonDeserializationContext context, BsonDeserializationArgs args)
+        => Pinned.Deserialize(context, args);
+
+    public override void Serialize(BsonSerializationContext context, BsonSerializationArgs args, DateTime value)
+        => Pinned.Serialize(context, args, value);
+}
+
+/// <summary>The nullable twin of <see cref="UtcBsonDateSerializer"/>, for the lease expiry.</summary>
+internal sealed class NullableUtcBsonDateSerializer : SerializerBase<DateTime?>
+{
+    private static readonly NullableSerializer<DateTime> Pinned = new(UtcBsonDateSerializer.Pinned);
+
+    public override DateTime? Deserialize(BsonDeserializationContext context, BsonDeserializationArgs args)
+        => Pinned.Deserialize(context, args);
+
+    public override void Serialize(BsonSerializationContext context, BsonSerializationArgs args, DateTime? value)
+        => Pinned.Serialize(context, args, value);
 }
 }

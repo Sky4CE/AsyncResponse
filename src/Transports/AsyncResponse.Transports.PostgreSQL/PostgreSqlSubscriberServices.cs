@@ -74,7 +74,8 @@ internal abstract class PostgreSqlSubscriberService : BackgroundService
             attemptToken => RunSubscriberAsync(dispatcher, attemptToken),
             stoppingToken,
             failures => AsyncResponseRetry.Backoff(failures, Options.SubscriberRetryBaseDelay, Options.SubscriberRetryMaxDelay),
-            (ex, delay) => Logger.LogWarning(ex, "PostgreSQL subscriber failed for queue {Queue} ({Role}); retrying in {RetryDelay}.", Queue, Role, delay)).ConfigureAwait(false);
+            (ex, delay) => Logger.LogWarning(ex, "PostgreSQL subscriber failed for queue {Queue} ({Role}); retrying in {RetryDelay}.", Queue, Role, delay),
+            healthyRunThreshold: Options.SubscriberRetryMaxDelay).ConfigureAwait(false);
     }
 
     private async Task RunSubscriberAsync(PostgreSqlMessageDispatcher dispatcher, CancellationToken stoppingToken)
@@ -138,11 +139,15 @@ internal abstract class PostgreSqlSubscriberService : BackgroundService
         {
             try
             {
+                // Queue-scoped: every logical queue of every process shares the one notification
+                // channel, so an unscoped listener was woken by every publish to ANY queue (each
+                // response publish woke every worker subscriber fleet-wide, and vice versa, as did
+                // other apps sharing the channel) into a claim that found nothing.
                 await _store.ExecuteListenAsync(() =>
                 {
                     _signals.Writer.TryWrite(true);
                     return Task.CompletedTask;
-                }, cancellationToken).ConfigureAwait(false);
+                }, cancellationToken, Queue).ConfigureAwait(false);
                 failures = 0;
             }
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)

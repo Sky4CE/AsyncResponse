@@ -155,8 +155,9 @@ public sealed class Round39RegressionTests
     public async Task DispatchLostExceptions_ATransientSiblingFailure_PreservesRedelivery_WhateverTheOrder(string order)
     {
         var correlationId = $"round39-exception-{order}";
+        var time = new VirtualTimeProvider();
         var spy = new OrderedSpy();
-        await using var provider = BuildProvider(spy);
+        await using var provider = BuildProvider(spy, time);
         var store = provider.GetRequiredService<IRecoveryStateStore>();
 
         var successId = Guid.NewGuid();
@@ -179,12 +180,26 @@ public sealed class Round39RegressionTests
         }
 
         var publisher = provider.GetRequiredService<IAsyncResponsePublisher>();
-        var ex = await Assert.ThrowsAsync<RecoveryCallbackFailedException>(
-            () => publisher.SetException(new InvalidOperationException("remote boom"), correlationId));
+        var dispatching = publisher.SetException(new InvalidOperationException("remote boom"), correlationId);
+
+        // The exception route shares the response route's failure-callback ladder (round-1 fix
+        // pass): it backs off on the virtual clock; walk it.
+        // Advance only to a timer the ladder has actually armed (a blind advance that lands before
+        // the next backoff is armed strands it on the virtual clock), and bound the final await so a
+        // stall fails instead of hanging.
+        var deadline = DateTime.UtcNow.AddSeconds(30);
+        while (!dispatching.IsCompleted && DateTime.UtcNow < deadline)
+        {
+            if (time.NextTimerDueAt is { } due)
+                time.AdvanceTo(due);
+            await Task.Delay(10);
+        }
+
+        var ex = await Assert.ThrowsAsync<RecoveryCallbackFailedException>(() => dispatching.WaitAsync(TimeSpan.FromSeconds(10)));
 
         Assert.Equal(correlationId, ex.CorrelationId);
         Assert.Equal(1, spy.Ok);
-        Assert.Equal(1, spy.Boom);
+        Assert.Equal(LostSubscriberCallbackDispatcher.FailureCallbackAttempts, spy.Boom);
 
         var remaining = await store.GetAllAsync(correlationId);
         Assert.Equal(2, remaining.Count);
@@ -232,14 +247,15 @@ public sealed class Round39RegressionTests
             correlationId);
 
         // The failure-callback ladder backs off on the virtual clock; walk it.
-        var deadline = DateTime.UtcNow.AddSeconds(10);
+        var deadline = DateTime.UtcNow.AddSeconds(30);
         while (!dispatching.IsCompleted && DateTime.UtcNow < deadline)
         {
-            time.Advance(TimeSpan.FromSeconds(3));
+            if (time.NextTimerDueAt is { } due)
+                time.AdvanceTo(due);
             await Task.Delay(10);
         }
 
-        var ex = await Assert.ThrowsAsync<RecoveryCallbackFailedException>(() => dispatching);
+        var ex = await Assert.ThrowsAsync<RecoveryCallbackFailedException>(() => dispatching.WaitAsync(TimeSpan.FromSeconds(10)));
         Assert.Equal(correlationId, ex.CorrelationId);
         Assert.Equal(4, spy.Boom);
         Assert.Equal(2, (await store.GetAllAsync(correlationId)).Count);

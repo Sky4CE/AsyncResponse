@@ -8,13 +8,22 @@ namespace AsyncResponse.Transports.GooglePubSub;
 
 internal abstract class GooglePubSubSubscriberService : BackgroundService
 {
-    private readonly Func<SubscriptionName, GooglePubSubSubscriberOptions, Task<IGooglePubSubSubscriberClient>> _subscriberFactory;
+    /// <summary>Marks <see cref="_hostStoppingAt"/> as not yet stamped.</summary>
+    private const long HostStopNotSeen = long.MinValue;
+
+    private readonly Func<SubscriptionName, GooglePubSubSubscriberOptions, CancellationToken, Task<IGooglePubSubSubscriberClient>> _subscriberFactory;
+    private readonly IHostApplicationLifetime? _hostLifetime;
+    private CancellationTokenRegistration _hostStoppingRegistration;
+
+    /// <summary><see cref="Clock"/> timestamp of <c>ApplicationStopping</c>, when the host stop began.</summary>
+    private long _hostStoppingAt = HostStopNotSeen;
 
     /// <summary>Runs the GooglePubSubSubscriberService operation.</summary>
     protected GooglePubSubSubscriberService(
         IOptions<GooglePubSubAsyncResponseOptions> options,
-        ILogger logger)
-        : this(options, logger, CreateSubscriberAsync)
+        ILogger logger,
+        IHostApplicationLifetime? hostLifetime)
+        : this(options, logger, CreateSubscriberAsync, hostLifetime)
     {
     }
 
@@ -22,15 +31,66 @@ internal abstract class GooglePubSubSubscriberService : BackgroundService
     protected GooglePubSubSubscriberService(
         IOptions<GooglePubSubAsyncResponseOptions> options,
         ILogger logger,
-        Func<SubscriptionName, GooglePubSubSubscriberOptions, Task<IGooglePubSubSubscriberClient>> subscriberFactory)
+        Func<SubscriptionName, GooglePubSubSubscriberOptions, CancellationToken, Task<IGooglePubSubSubscriberClient>> subscriberFactory,
+        IHostApplicationLifetime? hostLifetime)
     {
         Options = options.Value;
         Logger = logger;
         _subscriberFactory = subscriberFactory;
+        _hostLifetime = hostLifetime;
     }
 
     protected GooglePubSubAsyncResponseOptions Options { get; }
     protected ILogger Logger { get; }
+
+    /// <summary>Clocks the host stop and the in-flight drain; replaced by tests to drive them virtually.</summary>
+    internal TimeProvider Clock { get; set; } = TimeProvider.System;
+
+    /// <summary>The Generic Host's default stop budget, assumed when HostShutdownTimeout is validated externally.</summary>
+    private static readonly TimeSpan DefaultHostShutdownTimeout = TimeSpan.FromSeconds(30);
+
+    /// <summary>
+    /// How long the stop waits for the handlers already running before it stops the client — the
+    /// RabbitMQ in-flight wait's rule: <see cref="GooglePubSubSubscriberOptions.BackgroundDrainTimeout"/>,
+    /// shortened to what the host budget still leaves after the client stop
+    /// (<c>HostShutdownTimeout − time since the host stop began − ShutdownTimeout</c>). Clamped,
+    /// never validated: a wait that does not fit only costs a redelivery.
+    /// </summary>
+    /// <remarks>
+    /// Bounded by its own option, not by the whole host budget: a handler parked on an awaited
+    /// durable-flow response cannot return until the channel shuts down at provider disposal —
+    /// after the host stop — so a wait sized to the host budget spent all of it on every deploy
+    /// with such a flow. Measured from <c>ApplicationStopping</c>, not assumed whole: hosted
+    /// services stop one after another, so the response subscriber (stopped first) may already
+    /// have spent its own drain, and the worker's then overran the host budget — the process
+    /// exited before the client stop handed the leased messages back. A hosted service always runs
+    /// inside a host that registers <see cref="IHostApplicationLifetime"/>; without one (direct
+    /// construction) the host stop counts as just begun.
+    /// </remarks>
+    internal static TimeSpan ResolveInFlightDrainBudget(
+        GooglePubSubAsyncResponseOptions options,
+        GooglePubSubSubscriberOptions subscriberOptions,
+        TimeSpan sinceHostStopBegan)
+    {
+        var wait = subscriberOptions.BackgroundDrainTimeout;
+        var left = (options.HostShutdownTimeout ?? DefaultHostShutdownTimeout) - sinceHostStopBegan - options.ShutdownTimeout;
+        if (left < wait)
+            wait = left;
+
+        if (wait <= TimeSpan.Zero)
+            return TimeSpan.Zero;
+
+        return wait > AsyncResponseChannelOptions.MaxTimerBackedTimeout
+            ? AsyncResponseChannelOptions.MaxTimerBackedTimeout
+            : wait;
+    }
+
+    private TimeSpan InFlightDrainBudget()
+    {
+        var stoppingAt = Interlocked.Read(ref _hostStoppingAt);
+        var sinceHostStopBegan = stoppingAt == HostStopNotSeen ? TimeSpan.Zero : Clock.GetElapsedTime(stoppingAt);
+        return ResolveInFlightDrainBudget(Options, SubscriberOptions, sinceHostStopBegan);
+    }
 
     protected abstract string SubscriptionId { get; }
     protected abstract GooglePubSubSubscriberOptions SubscriberOptions { get; }
@@ -41,9 +101,12 @@ internal abstract class GooglePubSubSubscriberService : BackgroundService
     [System.Diagnostics.CodeAnalysis.ExcludeFromCodeCoverage]
     private static async Task<IGooglePubSubSubscriberClient> CreateSubscriberAsync(
         SubscriptionName subscriptionName,
-        GooglePubSubSubscriberOptions subscriberOptions)
+        GooglePubSubSubscriberOptions subscriberOptions,
+        CancellationToken cancellationToken)
     {
-        var subscriber = await CreateSubscriberBuilder(subscriptionName, subscriberOptions).BuildAsync().ConfigureAwait(false);
+        // The token reaches the build itself (publisher parity): a stalled credential/metadata
+        // lookup during a supervised rebuild otherwise ignored the host stop.
+        var subscriber = await CreateSubscriberBuilder(subscriptionName, subscriberOptions).BuildAsync(cancellationToken).ConfigureAwait(false);
         return new GooglePubSubSubscriberClientAdapter(subscriber);
     }
 
@@ -96,7 +159,25 @@ internal abstract class GooglePubSubSubscriberService : BackgroundService
         _ = GooglePubSubOptionsValidator.Required(Options.ProjectId, nameof(Options.ProjectId));
         _ = SubscriptionId; // Resolving the id enforces its Required check at startup too.
         GooglePubSubMessageDispatcher.ValidateOptions(Options, SubscriberOptions, SubscriberRole);
+        if (_hostLifetime is not null)
+        {
+            _hostStoppingRegistration = _hostLifetime.ApplicationStopping.Register(
+                static state =>
+                {
+                    var service = (GooglePubSubSubscriberService)state!;
+                    Interlocked.CompareExchange(ref service._hostStoppingAt, service.Clock.GetTimestamp(), HostStopNotSeen);
+                },
+                this);
+        }
+
         return base.StartAsync(cancellationToken);
+    }
+
+    /// <summary>Releases the host-stop registration, then the service.</summary>
+    public override void Dispose()
+    {
+        _hostStoppingRegistration.Dispose();
+        base.Dispose();
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -147,7 +228,8 @@ internal abstract class GooglePubSubSubscriberService : BackgroundService
                 "Pub/Sub subscriber failed for subscription {Subscription} ({Role}); retrying in {RetryDelay}.",
                 subscriptionName.ToString(),
                 SubscriberRole,
-                retryDelay)).ConfigureAwait(false);
+                retryDelay),
+            healthyRunThreshold: Options.SubscriberRetryMaxDelay).ConfigureAwait(false);
     }
 
     private async Task RunSubscriberAsync(
@@ -155,7 +237,7 @@ internal abstract class GooglePubSubSubscriberService : BackgroundService
         GooglePubSubMessageDispatcher dispatcher,
         CancellationToken stoppingToken)
     {
-        var subscriber = await _subscriberFactory(subscriptionName, SubscriberOptions).ConfigureAwait(false);
+        var subscriber = await _subscriberFactory(subscriptionName, SubscriberOptions, stoppingToken).ConfigureAwait(false);
         try
         {
             Logger.LogInformation(
@@ -172,9 +254,26 @@ internal abstract class GooglePubSubSubscriberService : BackgroundService
             }
             catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
             {
+                // ACK-after-handler: let the handlers already running finish — keeping their lease
+                // extension and their Ack — before the client stop hands every message still in
+                // leasing back, for at most BackgroundDrainTimeout and never past what the host
+                // budget leaves for the stop itself. Deliveries arriving meanwhile are held, and
+                // handed back only now, immediately before the client stop.
+                try
+                {
+                    await dispatcher.DrainInFlightAsync(InFlightDrainBudget(), Clock).ConfigureAwait(false);
+                }
+                finally
+                {
+                    dispatcher.ReleaseHeldDeliveries();
+                }
+
                 await subscriber.StopAsync(
                     new SubscriberClient.ShutdownOptions
                     {
+                        // Explicit: the SDK already nacks at once for any timeout under its
+                        // 30-second hard-stop window; nothing handled is left to wait for.
+                        Mode = SubscriberClient.ShutdownMode.NackImmediately,
                         Timeout = Options.ShutdownTimeout
                     },
                     CancellationToken.None).ConfigureAwait(false);
@@ -227,8 +326,9 @@ internal sealed class GooglePubSubWorkerSubscriber : GooglePubSubSubscriberServi
     public GooglePubSubWorkerSubscriber(
         IOptions<GooglePubSubAsyncResponseOptions> options,
         IAsyncResponseIngress ingress,
-        ILogger<GooglePubSubWorkerSubscriber> logger)
-        : base(options, logger)
+        ILogger<GooglePubSubWorkerSubscriber> logger,
+        IHostApplicationLifetime? hostLifetime = null)
+        : base(options, logger, hostLifetime)
     {
         _ingress = ingress;
     }
@@ -237,8 +337,9 @@ internal sealed class GooglePubSubWorkerSubscriber : GooglePubSubSubscriberServi
         IOptions<GooglePubSubAsyncResponseOptions> options,
         IAsyncResponseIngress ingress,
         ILogger<GooglePubSubWorkerSubscriber> logger,
-        Func<SubscriptionName, GooglePubSubSubscriberOptions, Task<IGooglePubSubSubscriberClient>> subscriberFactory)
-        : base(options, logger, subscriberFactory)
+        Func<SubscriptionName, GooglePubSubSubscriberOptions, CancellationToken, Task<IGooglePubSubSubscriberClient>> subscriberFactory,
+        IHostApplicationLifetime? hostLifetime = null)
+        : base(options, logger, subscriberFactory, hostLifetime)
     {
         _ingress = ingress;
     }
@@ -262,8 +363,9 @@ internal sealed class GooglePubSubResponseIngressSubscriber : GooglePubSubSubscr
     public GooglePubSubResponseIngressSubscriber(
         IOptions<GooglePubSubAsyncResponseOptions> options,
         IAsyncResponseIngress ingress,
-        ILogger<GooglePubSubResponseIngressSubscriber> logger)
-        : base(options, logger)
+        ILogger<GooglePubSubResponseIngressSubscriber> logger,
+        IHostApplicationLifetime? hostLifetime = null)
+        : base(options, logger, hostLifetime)
     {
         _ingress = ingress;
     }
@@ -272,8 +374,9 @@ internal sealed class GooglePubSubResponseIngressSubscriber : GooglePubSubSubscr
         IOptions<GooglePubSubAsyncResponseOptions> options,
         IAsyncResponseIngress ingress,
         ILogger<GooglePubSubResponseIngressSubscriber> logger,
-        Func<SubscriptionName, GooglePubSubSubscriberOptions, Task<IGooglePubSubSubscriberClient>> subscriberFactory)
-        : base(options, logger, subscriberFactory)
+        Func<SubscriptionName, GooglePubSubSubscriberOptions, CancellationToken, Task<IGooglePubSubSubscriberClient>> subscriberFactory,
+        IHostApplicationLifetime? hostLifetime = null)
+        : base(options, logger, subscriberFactory, hostLifetime)
     {
         _ingress = ingress;
     }

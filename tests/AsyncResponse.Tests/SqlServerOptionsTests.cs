@@ -528,8 +528,23 @@ public sealed class SqlServerOptionsTests
         Assert.NotNull(pruneSql);
         var sql = (string)pruneSql!.Invoke(null, ["[dbo].[ar_messages]"])!;
 
-        Assert.StartsWith("DELETE TOP (1000) FROM [dbo].[ar_messages]", sql, StringComparison.Ordinal);
+        Assert.Contains("DELETE TOP (1000) FROM [dbo].[ar_messages]", sql, StringComparison.Ordinal);
         Assert.Contains("expires_at <= SYSUTCDATETIME()", sql, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Pre-commit fix (fixpoint r1 G 6.4): the prune batch's row count — what ends the
+    /// OpportunisticPrune drain — came from <c>ExecuteNonQuery</c>, which is -1 under a server-wide
+    /// NOCOUNT (<c>sp_configure 'user options', 512</c>), so every channel prune drain stopped after
+    /// its first batch (the transport's dead-letter prune and the flow store already turn the count
+    /// back on). Red on the round's code: the batch began with the DELETE.
+    /// </summary>
+    [Fact]
+    public void ChannelPrunes_TurnTheRowCountBackOn_SoNocountCannotEndTheDrain()
+    {
+        var sql = AsyncResponse.Channels.SqlServer.SqlServerChannelSql.ExpiredPruneSql("[dbo].[ar_messages]");
+
+        Assert.StartsWith("SET NOCOUNT OFF; DELETE TOP (1000) FROM [dbo].[ar_messages]", sql, StringComparison.Ordinal);
     }
 
     [Fact]

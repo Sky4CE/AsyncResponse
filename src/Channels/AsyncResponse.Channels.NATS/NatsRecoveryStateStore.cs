@@ -224,9 +224,19 @@ internal sealed class NatsRecoveryStateStore : IRecoveryStateStore, IRecoverySta
         return false;
     }
 
+    /// <summary>
+    /// How long a KV delete marker is kept before the maintenance pass purges it: far longer than
+    /// any read-then-conditional-write window of this store, and the NATS.Net default.
+    /// </summary>
+    internal static readonly TimeSpan DeleteMarkerRetention = TimeSpan.FromMinutes(30);
+
+    private int _markerPurgeRunning;
+
     /// <inheritdoc />
     public async IAsyncEnumerable<RecoveryState> ScanAsync([EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
+        StartDeleteMarkerPurge(cancellationToken);
+
         await foreach (var key in _store.GetKeysAsync(cancellationToken).ConfigureAwait(false))
         {
             cancellationToken.ThrowIfCancellationRequested();
@@ -260,6 +270,42 @@ internal sealed class NatsRecoveryStateStore : IRecoveryStateStore, IRecoverySta
                 yield return state!;
             }
         }
+    }
+
+    /// <summary>
+    /// Starts the delete-marker maintenance pass alongside the watchdog scan (one pass in flight
+    /// per store). Every waiter that completes leaves a KV delete marker the bucket keeps for its
+    /// whole MaxAge, so without this pass storage, server subject state and the cost of every scan
+    /// grew with throughput × RecoveryStateExpiry. Off the scan's path, so a large backlog never
+    /// delays the staleness report; maintenance, not inspection, so a failure is logged and retried
+    /// by the next scan instead of failing this one.
+    /// </summary>
+    private void StartDeleteMarkerPurge(CancellationToken cancellationToken)
+    {
+        if (Interlocked.CompareExchange(ref _markerPurgeRunning, 1, 0) != 0)
+            return;
+
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                var purged = await _store.PurgeDeleteMarkersAsync(DeleteMarkerRetention, cancellationToken).ConfigureAwait(false);
+                if (purged > 0)
+                    _logger.LogDebug("Purged {Purged} delete marker(s) older than {Retention} from the NATS recovery bucket.", purged, DeleteMarkerRetention);
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                // Host shutdown; the next scan resumes the maintenance.
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Purging delete markers from the NATS recovery bucket failed; the next watchdog scan retries.");
+            }
+            finally
+            {
+                Volatile.Write(ref _markerPurgeRunning, 0);
+            }
+        }, CancellationToken.None);
     }
 
     private const int MaxCasAttempts = 4;

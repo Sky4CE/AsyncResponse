@@ -501,6 +501,186 @@ public sealed class OracleCosmosStoreContractTests(OracleCosmosBatchFixture fixt
         }
     }
 
+    [Fact]
+    public async Task CosmosPackageStore_AfterItsServerTtlLapses_NeverReadsAsLive_AndTheIdIsReusable()
+    {
+        // FlowStoreContract only reaches "visible but logically expired" (a 1 ms logical expiry
+        // under a 1 s server TTL, read 30 ms later). Past the SERVER ttl, reads answer 404 while the
+        // write path (the store's never-matching conditional patch) still sees the physical item
+        // and answers 412 — the emulator keeps doing so after it already accepts a new create of
+        // the id. Under Session or Strong consistency each 412 makes the re-read current, so the
+        // store reads the lapsed ledger as absent (unit-tested: CosmosDurableFlowStateStoreTests);
+        // this emulator's account default is Eventual, where "present for writes, absent for
+        // reads" cannot prove absence, so there the store may refuse with
+        // FlowStateUnreadableException instead — but it must never report the run as live, and the
+        // id must become reusable.
+        var connectionString = Environment.GetEnvironmentVariable("ASYNCRESPONSE_ITEST_COSMOS_CONNECTION_STRING");
+        if (string.IsNullOrWhiteSpace(connectionString))
+            Assert.Skip("Set ASYNCRESPONSE_ITEST_COSMOS_CONNECTION_STRING to run the Cosmos DB durable-flow store contract test.");
+
+        var databaseName = NewIdentifier("df_cosmos_ttl", 63);
+        using var client = new CosmosClient(connectionString, GetCosmosClientOptions(connectionString));
+        await WaitForCosmosAsync(client);
+        try
+        {
+            IFlowStateStore store = new CosmosFlowStateStore(
+                client,
+                Options.Create(new CosmosDurableFlowOptions { DatabaseName = databaseName, ContainerName = "flow_state" }));
+            Assert.True(await store.TryCreateAsync("ttl-lapsed", CreateState("ttl-lapsed"), TimeSpan.FromSeconds(1)));
+
+            // Wait for the SERVER ttl to hide the item from reads — not merely for the logical expiry.
+            var container = client.GetContainer(databaseName, "flow_state");
+            var hidden = await PollAsync(
+                async () =>
+                {
+                    using var read = await container.ReadItemStreamAsync("ttl-lapsed", new PartitionKey("ttl-lapsed"));
+                    return read.StatusCode == System.Net.HttpStatusCode.NotFound;
+                },
+                done => done,
+                TimeSpan.FromSeconds(60));
+            Assert.True(hidden, "the emulator never hid the item after its 1 s ttl");
+
+            var account = await client.ReadAccountAsync();
+            var sessionConsistent = account.Consistency.DefaultConsistencyLevel is ConsistencyLevel.Session or ConsistencyLevel.Strong;
+            foreach (var load in new Func<Task<FlowState?>>[] { () => store.LoadAsync("ttl-lapsed"), () => store.LoadCurrentAsync("ttl-lapsed") })
+            {
+                if (sessionConsistent)
+                {
+                    Assert.Null(await load());
+                }
+                else
+                {
+                    try
+                    {
+                        Assert.Null(await load());
+                    }
+                    catch (FlowStateUnreadableException)
+                    {
+                        // Eventual/Consistent Prefix: the store refuses to prove absence — never "live".
+                    }
+                }
+            }
+
+            Assert.Same(FlowLeaseObservation.Unheld, await store.ObserveLeaseAsync("ttl-lapsed"));
+            var reused = await PollAsync(
+                () => store.TryCreateAsync("ttl-lapsed", CreateState("ttl-lapsed"), TimeSpan.FromMinutes(5)),
+                created => created,
+                TimeSpan.FromSeconds(60));
+            Assert.True(reused, "the id never became reusable after its ttl lapsed");
+            Assert.NotNull(await store.LoadAsync("ttl-lapsed"));
+        }
+        finally
+        {
+            await DeleteCosmosDatabaseAsync(client, databaseName);
+        }
+    }
+
+    [Fact]
+    public async Task CosmosPackageStore_ServesLeasesFromAContainerWithoutIndexing()
+    {
+        // The lease paths read through a projection query filtered on `id`, which only the
+        // Consistent indexing mode indexes. A container provisioned as a pure key-value store
+        // (IndexingMode.None) refuses such a query unless scans are allowed — every acquire,
+        // renewal, release and observation failed while point reads kept working.
+        var connectionString = Environment.GetEnvironmentVariable("ASYNCRESPONSE_ITEST_COSMOS_CONNECTION_STRING");
+        if (string.IsNullOrWhiteSpace(connectionString))
+            Assert.Skip("Set ASYNCRESPONSE_ITEST_COSMOS_CONNECTION_STRING to run the Cosmos DB durable-flow store contract test.");
+
+        var databaseName = NewIdentifier("df_cosmos_kv", 63);
+        using var client = new CosmosClient(connectionString, GetCosmosClientOptions(connectionString));
+        await WaitForCosmosAsync(client);
+        try
+        {
+            var database = (await client.CreateDatabaseIfNotExistsAsync(databaseName)).Database;
+            try
+            {
+                await database.CreateContainerAsync(new ContainerProperties("flow_state_kv", "/flowId")
+                {
+                    DefaultTimeToLive = -1,
+                    IndexingPolicy = new IndexingPolicy { IndexingMode = IndexingMode.None, Automatic = false }
+                });
+            }
+            catch (CosmosException ex) when (ex.StatusCode == System.Net.HttpStatusCode.BadRequest)
+            {
+                Assert.Skip($"This Cosmos endpoint refuses an unindexed container with TTL enabled ({ex.Message}); the store requires TTL, so the case cannot arise here.");
+            }
+
+            IFlowStateStore store = new CosmosFlowStateStore(
+                client,
+                Options.Create(new CosmosDurableFlowOptions
+                {
+                    DatabaseName = databaseName,
+                    ContainerName = "flow_state_kv",
+                    AutoCreateContainer = false
+                }));
+
+            Assert.True(await store.TryCreateAsync("kv-flow", CreateState("kv-flow"), TimeSpan.FromMinutes(5)));
+            Assert.True(await store.TryAcquireLeaseAsync("kv-flow", "owner", TimeSpan.FromMinutes(1)));
+            Assert.True(await store.TryRenewLeaseAsync("kv-flow", "owner", TimeSpan.FromMinutes(1)));
+            Assert.Equal("owner", (await store.ObserveLeaseAsync("kv-flow"))!.LeaseId);
+            await store.ReleaseLeaseAsync("kv-flow", "owner");
+            Assert.Same(FlowLeaseObservation.Unheld, await store.ObserveLeaseAsync("kv-flow"));
+        }
+        finally
+        {
+            await DeleteCosmosDatabaseAsync(client, databaseName);
+        }
+    }
+
+    [Fact]
+    public async Task CosmosPackageStore_RefusesADocumentWithoutItsExpiry_InsteadOfReadingItAsAbsent()
+    {
+        // A missing expiresAtUtc used to deserialize to DateTime.MinValue — "long expired" — so a
+        // present, corrupt ledger read as absent and its only wake-up was acknowledged.
+        var connectionString = Environment.GetEnvironmentVariable("ASYNCRESPONSE_ITEST_COSMOS_CONNECTION_STRING");
+        if (string.IsNullOrWhiteSpace(connectionString))
+            Assert.Skip("Set ASYNCRESPONSE_ITEST_COSMOS_CONNECTION_STRING to run the Cosmos DB durable-flow store contract test.");
+
+        var databaseName = NewIdentifier("df_cosmos_noexp", 63);
+        using var client = new CosmosClient(connectionString, GetCosmosClientOptions(connectionString));
+        await WaitForCosmosAsync(client);
+        try
+        {
+            IFlowStateStore store = new CosmosFlowStateStore(
+                client,
+                Options.Create(new CosmosDurableFlowOptions { DatabaseName = databaseName, ContainerName = "flow_state" }));
+            Assert.Null(await store.LoadAsync("provisioning")); // creates the database and container
+
+            var json = System.Text.Json.JsonSerializer.Serialize(new
+            {
+                id = "no-expiry",
+                flowId = "no-expiry",
+                stateJson = System.Text.Json.JsonSerializer.Serialize(CreateState("no-expiry")),
+                revision = 0
+            });
+            using (var seed = await client.GetContainer(databaseName, "flow_state").CreateItemStreamAsync(
+                       new MemoryStream(System.Text.Encoding.UTF8.GetBytes(json)),
+                       new PartitionKey("no-expiry")))
+            {
+                Assert.True(seed.IsSuccessStatusCode, seed.ErrorMessage);
+            }
+
+            await Assert.ThrowsAsync<FlowStateUnreadableException>(() => store.LoadAsync("no-expiry"));
+            Assert.False(await store.TryCreateAsync("no-expiry", CreateState("no-expiry"), TimeSpan.FromMinutes(5)));
+            Assert.False(await store.TryAcquireLeaseAsync("no-expiry", "owner", TimeSpan.FromMinutes(1)));
+        }
+        finally
+        {
+            await DeleteCosmosDatabaseAsync(client, databaseName);
+        }
+    }
+
+    private static async Task DeleteCosmosDatabaseAsync(CosmosClient client, string databaseName)
+    {
+        try
+        {
+            await client.GetDatabase(databaseName).DeleteAsync();
+        }
+        catch (CosmosException ex) when (ex.StatusCode == System.Net.HttpStatusCode.NotFound)
+        {
+        }
+    }
+
     private static async Task WaitForOracleAsync(string connectionString)
         // Oracle creates its database on first boot and needs far longer than the 30s default.
         => await EventuallyAsync(async () =>

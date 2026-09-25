@@ -219,8 +219,11 @@ public abstract class TransportConformanceSuite
             elapsed >= delay - TimeSpan.FromSeconds(1),
             $"{Transport}: the delayed job executed after {elapsed}, before its {delay} delay elapsed.");
 
-        // Exactly once, asserted the same way as the immediate contract (no settling sleep): the
-        // re-publish chain must not leave a duplicate behind once the job finally runs.
+        // Exactly once, asserted the same way as the immediate contract — after the same settling
+        // window: the re-publish chain must not leave a duplicate behind once the job finally
+        // runs, and such a duplicate runs AFTER the first call, so a count taken the moment the
+        // first call lands cannot see it.
+        await Task.Delay(TimeSpan.FromSeconds(2));
         Assert.Equal(1, probe.CallCount);
     }
 

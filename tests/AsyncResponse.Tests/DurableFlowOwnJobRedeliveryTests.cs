@@ -199,6 +199,76 @@ public sealed class DurableFlowOwnJobRedeliveryTests
     }
 
     // ---------------------------------------------------------------------------------------
+    // A park's own follow-up wake-up.
+    // ---------------------------------------------------------------------------------------
+
+    [Fact]
+    public async Task AParksOwnFollowUpWakeUp_IsNotAckedAsADuplicate_WhileTheParkedBodyIsStillUnwinding()
+    {
+        // The holder parks on a child and then lingers in a finally block: user cleanup, an
+        // `await using` resource, a catch-and-rethrow — a park is a cancellation, so all of them
+        // run on every park. The child finishes at once and wakes the parent. That wake-up is the
+        // park's OWN continuation, not a duplicate of the holder's job: the holder's job is
+        // acknowledged the moment the body finishes unwinding. Judged against a holder that was
+        // still renewing its lease, it used to be acknowledged as a duplicate — and the run stayed
+        // Running with nothing queued and nothing dead-lettered.
+        var store = new InMemoryFlowStateStore();
+        var parent = new ParkThenLingerFlow();
+        var transport = new RecordingTransport();
+        await using var holder = new Deployment(store, new ParkedFlow(), HolderLease, transport, extraFlows: [parent, new ChildNoopFlow()]);
+        await using var contender = new Deployment(store, new ParkedFlow(), ContenderLease, transport, extraFlows: [parent, new ChildNoopFlow()]);
+        await store.TryCreateAsync("park-successor", RunningState("park-successor", typeof(ParkThenLingerFlow)), TimeSpan.FromMinutes(5));
+
+        var firstDelivery = holder.DeliverAsync(Wire(ExecuteJob("park-successor", "job-first")));
+        await parent.Lingering.Task.WaitAsync(TimeSpan.FromSeconds(15));
+
+        // The park published the child's start; the child runs, finishes, and wakes the parent.
+        var childJob = Assert.Single(transport.Immediate);
+        await holder.DeliverAsync(childJob).WaitAsync(TimeSpan.FromSeconds(15));
+        Assert.Equal(2, transport.Immediate.Count);
+        var wakeUp = transport.Immediate.Last();
+
+        await contender.DeliverAsync(wakeUp).WaitAsync(TimeSpan.FromSeconds(30));
+
+        Assert.False(firstDelivery.IsCompleted, "The holder must still be unwinding its parked body.");
+        Assert.Equal(2, parent.Executions);
+        Assert.Equal(FlowRunStatus.Succeeded, (await store.LoadAsync("park-successor"))!.Status);
+
+        // The unwound holder writes nothing over the run its successor already finished.
+        parent.Linger.SetResult();
+        await firstDelivery.WaitAsync(TimeSpan.FromSeconds(15));
+        Assert.Equal(FlowRunStatus.Succeeded, (await store.LoadAsync("park-successor"))!.Status);
+    }
+
+    [Fact]
+    public async Task HostStop_WhileAWakeUpWaitsOutADeadHoldersLease_HandsItBackAsAnInterruption_NotAPlainCancellation()
+    {
+        // ApplicationStopping fires before any hosted service stops, so the worker subscriber's own
+        // token is usually still live when the poll gives up: only the exception's TYPE tells the
+        // dispatcher "hand this back, it is not a failure". A plain OperationCanceledException read
+        // as a handler failure — a NAK, a retry ladder, a dead-lettered wake-up.
+        var store = new InMemoryFlowStateStore();
+        var flow = new ParkedFlow();
+        flow.Release.SetResult();
+        using var host = new DurableFlowContextTestSupport.StoppingHost();
+        await using var contender = new Deployment(
+            store,
+            flow,
+            new DurableFlowOptions { ExecutionLeaseDuration = TimeSpan.FromSeconds(10), ExecutionLeaseRenewInterval = TimeSpan.FromMilliseconds(40) },
+            new RecordingTransport(),
+            hostLifetime: host);
+        await store.TryCreateAsync("host-stop-poll", RunningState("host-stop-poll"), TimeSpan.FromMinutes(5));
+        Assert.True(await store.TryAcquireLeaseAsync("host-stop-poll", FlowLeaseContention.NewLeaseId(null), TimeSpan.FromMinutes(5)));
+
+        var delivery = contender.DeliverAsync(Wire(ExecuteJob("host-stop-poll", "job-poll")));
+        host.StopApplication();
+
+        var interrupted = await Assert.ThrowsAsync<DurableFlowInterruptedException>(() => delivery.WaitAsync(TimeSpan.FromSeconds(30)));
+        Assert.Contains("Host is stopping", interrupted.Message, StringComparison.Ordinal);
+        Assert.Equal(0, flow.Executions);
+    }
+
+    // ---------------------------------------------------------------------------------------
     // The cases that must NOT change.
     // ---------------------------------------------------------------------------------------
 
@@ -255,6 +325,38 @@ public sealed class DurableFlowOwnJobRedeliveryTests
         Assert.Empty(transport.Delayed);
         Assert.Equal(1, flow.Executions);
         Assert.Equal(FlowRunStatus.Succeeded, (await store.LoadAsync("own-job-dead-holder"))!.Status);
+    }
+
+    [Fact]
+    public async Task WaitingOutADeadHoldersLease_RereadsTheLedgerOccasionally_NotOnEveryPoll()
+    {
+        // A crashed holder's lease is waited out to its persisted expiry, polling every 2 s. Each
+        // poll used to load the WHOLE ledger to read its status — about thirty loads for this
+        // one-minute lease, seventy with the default window, per parked wake-up of every run the
+        // dead holder had. The ledger is now re-read when the lease changes and otherwise every
+        // ~30 s, so a run turned terminal by a lease-less writer is still noticed.
+        var time = new VirtualTimeProvider();
+        var inner = new InMemoryFlowStateStore(time);
+        var store = new LoadCountingStore(inner);
+        var flow = new ParkedFlow();
+        flow.Release.SetResult();
+        await using var contender = new Deployment(store, flow, new DurableFlowOptions(), new RecordingTransport(), time);
+        await inner.TryCreateAsync("dead-holder-loads", RunningState("dead-holder-loads"), TimeSpan.FromDays(1));
+        Assert.True(await inner.TryAcquireLeaseAsync("dead-holder-loads", FlowLeaseContention.NewLeaseId(null), TimeSpan.FromMinutes(1)));
+
+        var delivery = contender.DeliverAsync(Wire(ExecuteJob("dead-holder-loads", "job-after-crash")));
+        for (var step = 0; step < 600 && !delivery.IsCompleted; step++)
+        {
+            await WaitForArmedTimerOrCompletionAsync(time, delivery);
+            if (!delivery.IsCompleted)
+                time.Advance(TimeSpan.FromSeconds(1));
+        }
+
+        await delivery.WaitAsync(TimeSpan.FromSeconds(30));
+        Assert.Equal(1, flow.Executions);
+        Assert.Equal(FlowRunStatus.Succeeded, (await inner.LoadAsync("dead-holder-loads"))!.Status);
+        // The minute's wait, plus the execution's own load and checkpoint diagnosis headroom.
+        Assert.InRange(store.Loads, 2, 8);
     }
 
     // ---------------------------------------------------------------------------------------
@@ -369,10 +471,10 @@ public sealed class DurableFlowOwnJobRedeliveryTests
     // Harness.
     // ---------------------------------------------------------------------------------------
 
-    private static FlowState RunningState(string flowId) => new()
+    private static FlowState RunningState(string flowId, Type? flowType = null) => new()
     {
         FlowId = flowId,
-        FlowTypeName = typeof(ParkedFlow).FullName,
+        FlowTypeName = (flowType ?? typeof(ParkedFlow)).FullName,
         InputTypeName = typeof(TestFlowInput).FullName,
         InputJson = JsonSerializer.Serialize(new TestFlowInput(1)),
         Status = FlowRunStatus.Running,
@@ -413,7 +515,14 @@ public sealed class DurableFlowOwnJobRedeliveryTests
         private readonly IWorkerTransport _transport;
         private readonly AsyncResponseBuilder _builder;
 
-        public Deployment(IFlowStateStore store, ParkedFlow flow, DurableFlowOptions options, IWorkerTransport transport, TimeProvider? clock = null)
+        public Deployment(
+            IFlowStateStore store,
+            ParkedFlow flow,
+            DurableFlowOptions options,
+            IWorkerTransport transport,
+            TimeProvider? clock = null,
+            object[]? extraFlows = null,
+            Microsoft.Extensions.Hosting.IHostApplicationLifetime? hostLifetime = null)
         {
             _transport = transport;
             _builder = new AsyncResponseBuilder(
@@ -424,6 +533,8 @@ public sealed class DurableFlowOwnJobRedeliveryTests
             var services = new ServiceCollection();
             services.AddSingleton(store);
             services.AddSingleton(flow);
+            foreach (var extra in extraFlows ?? [])
+                services.AddSingleton(extra.GetType(), extra);
             services.AddSingleton<IDurableFlowExecutor>(provider => new DurableFlowExecutor(
                 provider.GetRequiredService<IServiceScopeFactory>(),
                 _builder,
@@ -432,6 +543,7 @@ public sealed class DurableFlowOwnJobRedeliveryTests
                 new AsyncResponseContextPropagation([]),
                 options,
                 Log,
+                hostLifetime: hostLifetime,
                 timeProvider: clock,
                 workerTransport: transport));
             _provider = services.BuildServiceProvider();
@@ -490,6 +602,40 @@ public sealed class DurableFlowOwnJobRedeliveryTests
         }
     }
 
+    /// <summary>Parks on a child, then — on its FIRST execution only — lingers in a finally block until released.</summary>
+    public sealed class ParkThenLingerFlow : IDurableFlow<TestFlowInput>
+    {
+        private int _executions;
+
+        public int Executions => Volatile.Read(ref _executions);
+
+        public TaskCompletionSource Lingering { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public TaskCompletionSource Linger { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public async Task ExecuteAsync(IDurableFlowContext context, TestFlowInput input)
+        {
+            var execution = Interlocked.Increment(ref _executions);
+            try
+            {
+                await context.AwaitChildFlowAsync<ChildNoopFlow, TestFlowInput>("child", input);
+            }
+            finally
+            {
+                if (execution == 1)
+                {
+                    Lingering.TrySetResult();
+                    await Linger.Task;
+                }
+            }
+        }
+    }
+
+    public sealed class ChildNoopFlow : IDurableFlow<TestFlowInput>
+    {
+        public Task ExecuteAsync(IDurableFlowContext context, TestFlowInput input) => Task.CompletedTask;
+    }
+
     private sealed class WorkerJobScopeProbe : IWorkerJobScopeProbe
     {
         public WorkerJobEnvelope? Seen { get; private set; }
@@ -542,6 +688,41 @@ public sealed class DurableFlowOwnJobRedeliveryTests
             Delayed.Enqueue((Wire(job), delay));
             return Task.CompletedTask;
         }
+    }
+
+    /// <summary>The in-memory store, counting ledger loads.</summary>
+    private sealed class LoadCountingStore(InMemoryFlowStateStore inner) : IFlowStateStore
+    {
+        private int _loads;
+
+        public int Loads => Volatile.Read(ref _loads);
+
+        public Task<FlowState?> LoadAsync(string flowId, CancellationToken cancellationToken = default)
+        {
+            Interlocked.Increment(ref _loads);
+            return inner.LoadAsync(flowId, cancellationToken);
+        }
+
+        public Task<FlowLeaseObservation?> ObserveLeaseAsync(string flowId, CancellationToken cancellationToken = default)
+            => inner.ObserveLeaseAsync(flowId, cancellationToken);
+
+        public Task<bool> TryAcquireLeaseAsync(string flowId, string leaseId, TimeSpan leaseDuration, CancellationToken cancellationToken = default)
+            => inner.TryAcquireLeaseAsync(flowId, leaseId, leaseDuration, cancellationToken);
+
+        public Task<bool> TryCreateAsync(string flowId, FlowState state, TimeSpan ttl, CancellationToken cancellationToken = default)
+            => inner.TryCreateAsync(flowId, state, ttl, cancellationToken);
+
+        public Task<bool> TryUpdateAsync(string flowId, FlowState state, long expectedRevision, TimeSpan ttl, string? leaseId = null, CancellationToken cancellationToken = default)
+            => inner.TryUpdateAsync(flowId, state, expectedRevision, ttl, leaseId, cancellationToken);
+
+        public Task<bool> TryRenewLeaseAsync(string flowId, string leaseId, TimeSpan leaseDuration, CancellationToken cancellationToken = default)
+            => inner.TryRenewLeaseAsync(flowId, leaseId, leaseDuration, cancellationToken);
+
+        public Task ReleaseLeaseAsync(string flowId, string leaseId, CancellationToken cancellationToken = default)
+            => inner.ReleaseLeaseAsync(flowId, leaseId, cancellationToken);
+
+        public Task<bool> TryDeleteAsync(string flowId, CancellationToken cancellationToken = default)
+            => inner.TryDeleteAsync(flowId, cancellationToken);
     }
 
     /// <summary>A Running ledger whose lease this delivery can never win, held by a holder that renews on every look.</summary>

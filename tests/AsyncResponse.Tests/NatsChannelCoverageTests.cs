@@ -337,6 +337,29 @@ public sealed class NatsChannelCoverageTests
         Round36RegressionTests.AssertNoMarker(ex, logger);
     }
 
+    [Fact]
+    public void Construction_WithANonDefaultPrefixButTheDefaultRecoveryBucket_WarnsThatRegistrationsAreShared()
+    {
+        // The prefix XML promised isolation, but recovery keys carry no prefix: two deployments on
+        // the default bucket share one keyspace. Until keys are scoped, startup says so.
+        NatsAsyncResponseChannel Create(NatsAsyncResponseChannelOptions options, ILogger<NatsAsyncResponseChannel> logger) => new(
+            _services.GetRequiredService<IServiceScopeFactory>(),
+            _client,
+            _store.Object,
+            Options.Create(options),
+            new AsyncResponseContextPropagation([]),
+            logger);
+
+        var shared = new RecordingThrowingLogger<NatsAsyncResponseChannel>();
+        Create(new NatsAsyncResponseChannelOptions { SubjectPrefix = "staging" }, shared);
+        Assert.True(shared.HasEntry(LogLevel.Warning, "RecoveryBucket is still the default 'asyncresponse-recovery'"));
+
+        var isolated = new RecordingThrowingLogger<NatsAsyncResponseChannel>();
+        Create(new NatsAsyncResponseChannelOptions { SubjectPrefix = "staging", RecoveryBucket = "staging-recovery" }, isolated);
+        Create(new NatsAsyncResponseChannelOptions(), isolated);
+        Assert.False(isolated.HasEntry(LogLevel.Warning, "RecoveryBucket is still the default"));
+    }
+
     private NatsAsyncResponseChannel CreateChannel(
         FakeNatsResponseChannelClient client,
         ILogger<NatsAsyncResponseChannel> logger,

@@ -166,10 +166,11 @@ internal static class PayloadRecoveryClassifier
         if (resolved is not null)
         {
             // Collectible (plugin) payload types stay resolve-per-call: a strong process-wide
-            // cache entry would pin the plugin's AssemblyLoadContext after unload. Indexer, not
-            // TryAdd, so a stale-stamped survivor of a raced unregister is replaced.
-            if (!resolved.Assembly.IsCollectible)
-                PayloadTypes[payloadTypeFullName] = (resolved, resolvedGenerationBeforeScan);
+            // cache entry would pin the plugin's AssemblyLoadContext after unload. The insert
+            // policy (count-bounded, clear-when-full, stale stamps replaced) is shared with the
+            // callback service cache — this name is cached BEFORE the marker gate in Classify
+            // runs, so without the bound every novel spelling a recovery row carried stayed.
+            ReflectionExtensions.CacheResolvedType(PayloadTypes, payloadTypeFullName, resolved, resolvedGenerationBeforeScan);
         }
         else
         {

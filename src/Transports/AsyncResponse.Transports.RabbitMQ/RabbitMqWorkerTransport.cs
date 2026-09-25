@@ -56,17 +56,49 @@ public sealed class RabbitMqWorkerTransport : IWorkerTransport, IWorkerTransport
     }
 
     /// <summary>
+    /// The least <see cref="MaxInFlightDuration"/> ever advertises however many prefetched deliveries
+    /// share the consumer timeout — or the whole timeout, when that is shorter. The flow engine hops
+    /// an in-process timer at half the advertised ceiling, so an unfloored share turned a large
+    /// <see cref="RabbitMqSubscriberOptions.PrefetchCount"/> into a republish storm (1,000 → a 0.9 s
+    /// hop; a few thousand → a zero hop, handed over on every delivery until the timer was due). One
+    /// minute keeps every hop at 30 s or more (at most two hand-overs a minute per sleeping flow) and
+    /// leaves the default share (30 min / 16 ≈ 112 s) alone; the worker subscriber warns at startup
+    /// when the share falls below it, since the last buffered delivery can then outlive the timeout.
+    /// </summary>
+    internal static readonly TimeSpan MinInFlightDuration = TimeSpan.FromMinutes(1);
+
+    /// <summary>
     /// The broker's <c>consumer_timeout</c> as mirrored by
-    /// <see cref="RabbitMqAsyncResponseOptions.BrokerConsumerTimeout"/>: past it RabbitMQ closes the
-    /// consumer's channel and requeues the still-unacknowledged delivery while its handler runs.
+    /// <see cref="RabbitMqAsyncResponseOptions.BrokerConsumerTimeout"/>, divided by the worker
+    /// subscriber's <see cref="RabbitMqSubscriberOptions.PrefetchCount"/>: past the timeout RabbitMQ
+    /// closes the consumer's channel and requeues every still-unacknowledged delivery. The broker
+    /// starts that clock when it SENDS a delivery, not when its handler starts, and the subscriber
+    /// runs its prefetched deliveries one at a time — so up to <c>PrefetchCount</c> handlers age
+    /// against one timeout, and a per-handler ceiling of timeout / prefetch is what keeps the last
+    /// buffered one inside it. Never less than one minute (<see cref="MinInFlightDuration"/>), nor
+    /// more than the undivided timeout; a <c>PrefetchCount</c> of 0 (AMQP's "unlimited", which the
+    /// worker subscriber rejects at startup) advertises that floor. Lower <c>PrefetchCount</c> (1
+    /// gives the full timeout) for workers whose durable-flow timers should wait in process for longer.
     /// <c>null</c> when that option is <c>null</c>, and when the worker subscriber uses
     /// <see cref="RabbitMqAckMode.AckAfterEnqueue"/> — the delivery is acknowledged before its handler
     /// starts, so no handler run is ever in flight at the broker.
     /// </summary>
-    public TimeSpan? MaxInFlightDuration
-        => _options.WorkerSubscriber.AckMode == RabbitMqAckMode.AckAfterEnqueue
-            ? null
-            : _options.BrokerConsumerTimeout;
+    public TimeSpan? MaxInFlightDuration => ResolveMaxInFlightDuration(_options);
+
+    /// <summary>The value <see cref="MaxInFlightDuration"/> advertises for <paramref name="options"/>.</summary>
+    internal static TimeSpan? ResolveMaxInFlightDuration(RabbitMqAsyncResponseOptions options)
+    {
+        if (options.WorkerSubscriber.AckMode == RabbitMqAckMode.AckAfterEnqueue || options.BrokerConsumerTimeout is not { } consumerTimeout)
+            return null;
+
+        var floor = consumerTimeout < MinInFlightDuration ? consumerTimeout : MinInFlightDuration;
+        var prefetch = options.WorkerSubscriber.PrefetchCount;
+        if (prefetch == 0)
+            return floor;
+
+        var share = consumerTimeout / prefetch;
+        return share < floor ? floor : share;
+    }
 
     private async Task<IRabbitMqChannel> GetChannelAsync(CancellationToken cancellationToken)
     {

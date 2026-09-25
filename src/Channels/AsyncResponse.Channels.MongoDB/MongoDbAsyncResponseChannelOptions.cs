@@ -96,10 +96,13 @@ public sealed class MongoDbAsyncResponseChannelOptions : DurableAsyncResponseCha
     /// tick with W in-flight waiters. While change streams carry normal delivery the sweep only
     /// covers wakes lost in failure windows, so this bounds idle database load without touching
     /// normal delivery latency — it stretches only the worst-case recovery of a LOST wake. It is
-    /// ignored (the sweep runs on every <see cref="ListenerPollInterval"/> tick) whenever change
-    /// streams are not carrying delivery: <see cref="UseChangeStreams"/> off, or a server that
-    /// reports them unsupported — there the sweep is the only cross-process wake, and a throttle
-    /// equal to <see cref="DeliveryConfirmationTimeout"/> routed live waiters into recovery.
+    /// ignored (the sweep runs on every <see cref="ListenerPollInterval"/> tick) when the channel
+    /// polls for good: <see cref="UseChangeStreams"/> off, or a server that reports change streams
+    /// unsupported. While a stream is down until it re-opens the sweep runs every
+    /// <c>min(FullSweepInterval, DeliveryConfirmationTimeout / 4)</c> (1.25 s on defaults), and
+    /// each open triggers one immediate full sweep. Either way the sweep is then the only
+    /// cross-process wake, and a throttle equal to <see cref="DeliveryConfirmationTimeout"/>
+    /// routed live waiters into recovery.
     /// Default: 5 seconds (an unbounded null swept every waiter on every 250 ms tick — W
     /// sequential queries per tick of pure idle load). Set null to sweep on every poll tick.
     /// </summary>

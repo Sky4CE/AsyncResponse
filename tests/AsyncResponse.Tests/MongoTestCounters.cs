@@ -32,6 +32,38 @@ internal static class MongoTestCounters
     }
 
     /// <summary>
+    /// Stubs the UNTYPED handle the MongoDB transport store claims through (it reads the stamped
+    /// document as raw BSON and maps it itself, so an unreadable document is buried instead of
+    /// throwing inside findOneAndUpdate). Register AFTER <see cref="WithTestNamespace"/>: this
+    /// name-specific setup must override its BsonDocument catch-all.
+    /// </summary>
+    public static Mock<IMongoCollection<BsonDocument>> WithRawTransportMessages(
+        this Mock<IMongoDatabase> database,
+        string collectionName = "asyncresponse_transport_messages")
+    {
+        var raw = new Mock<IMongoCollection<BsonDocument>>(MockBehavior.Loose).SelfPinning();
+        database
+            .Setup(d => d.GetCollection<BsonDocument>(collectionName, It.IsAny<MongoCollectionSettings>()))
+            .Returns(raw.Object);
+        return raw;
+    }
+
+    /// <summary>Answers successive transport claims with <paramref name="documents"/> (<c>null</c> = queue empty).</summary>
+    public static Mock<IMongoCollection<BsonDocument>> ClaimsInOrder(
+        this Mock<IMongoCollection<BsonDocument>> raw,
+        params BsonDocument?[] documents)
+    {
+        var sequence = raw.SetupSequence(c => c.FindOneAndUpdateAsync(
+            It.IsAny<FilterDefinition<BsonDocument>>(),
+            It.IsAny<UpdateDefinition<BsonDocument>>(),
+            It.IsAny<FindOneAndUpdateOptions<BsonDocument, BsonDocument>>(),
+            It.IsAny<CancellationToken>()));
+        foreach (var document in documents)
+            sequence = sequence.ReturnsAsync(document!);
+        return raw;
+    }
+
+    /// <summary>
     /// Stubs <c>GetCollection&lt;T&gt;</c> with a fresh self-pinning loose mock and returns that
     /// mock, for collections the store constructor touches but the test never exercises.
     /// </summary>

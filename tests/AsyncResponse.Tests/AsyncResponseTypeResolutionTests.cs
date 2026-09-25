@@ -43,6 +43,37 @@ public class AsyncResponseTypeResolutionTests : IDisposable
     }
 
     [Fact]
+    public void PositiveCaches_StayBounded_UnderEndlessSpellingsOfOneResolvableType()
+    {
+        // The positive caches are keyed by the persisted SPELLING, and every Version variant of a
+        // loaded assembly's name resolves to the same type. Pre-fix each novel spelling a store or
+        // stream writer chose became a new permanent entry — before the payload or flow gate even
+        // looked at the type — so memory grew with every hostile row. Both caches are bounded now.
+        var assemblyName = typeof(OperationResult).Assembly.GetName().Name;
+        var capacity = ReflectionExtensions.ResolvedTypeCacheCapacity;
+        for (var i = 0; i < capacity + 100; i++)
+        {
+            var spelling = $"{typeof(OperationResult).FullName}, {assemblyName}, Version=7.{i / 1000}.{i % 1000}.0";
+            Assert.Equal(typeof(OperationResult), PayloadRecoveryClassifier.ResolvePayloadType(spelling));
+            Assert.Equal(typeof(OperationResult), ReflectionExtensions.ResolveServiceType(spelling));
+        }
+
+        // A small slack only for a parallel test resolving its own names at the exact instant the
+        // count crosses the bound; unbounded, both counts sit past capacity + 100.
+        Assert.InRange(CacheCount(typeof(PayloadRecoveryClassifier), "PayloadTypes"), 0, capacity + 8);
+        Assert.InRange(CacheCount(typeof(ReflectionExtensions), "ServiceTypes"), 0, capacity + 8);
+
+        // Names in real use keep resolving (and re-enter the cache after a clear).
+        Assert.Equal(typeof(OperationResult), PayloadRecoveryClassifier.ResolvePayloadType(typeof(OperationResult).FullName!));
+        Assert.Equal(typeof(OperationResult), ReflectionExtensions.ResolveServiceType(typeof(OperationResult).FullName!));
+    }
+
+    private static int CacheCount(Type owner, string field)
+        => ((System.Collections.ICollection)owner
+            .GetField(field, BindingFlags.Static | BindingFlags.NonPublic)!
+            .GetValue(null)!).Count;
+
+    [Fact]
     public void ResolveServiceType_CachesUnresolvableNames_ConsultsResolversOnce()
     {
         // Without the negative cache, every attempt on an unresolvable name (a poisoned recovery
@@ -481,22 +512,24 @@ public class AsyncResponseTypeResolutionTests : IDisposable
         // Assembly.GetType, and an application resolver is as likely to call Type.GetType itself.
         // Reaching it at all is the defect, so the probe records and the assertion is that it
         // never ran — and that the name never became a cache key either.
-        var consulted = 0;
-        AsyncResponseTypeResolution.RegisterResolver(_ =>
+        var hostile = HostileNames();
+        var reasonable = $"N.Reasonable{Guid.NewGuid():N}";
+        var consulted = RegisterAnsweringResolver([.. hostile, reasonable]);
+
+        foreach (var name in hostile)
         {
-            Interlocked.Increment(ref consulted);
-            return typeof(OperationResult);
-        });
+            Assert.Null(AsyncResponseTypeResolution.Resolve(name));
+            Assert.Null(ReflectionExtensions.ResolveServiceType(name));
+            // ResolveServiceType's own guard, not only Resolve's backstop: the name is not a
+            // negative-cache key either.
+            Assert.False(UnresolvableTypeNames.IsKnownMiss(name));
+        }
 
-        var hostile = "N.T" + new string('x', AsyncResponseTypeResolution.MaxTypeNameLength);
-
-        Assert.Null(AsyncResponseTypeResolution.Resolve(hostile));
-        Assert.Null(ReflectionExtensions.ResolveServiceType(hostile));
-        Assert.Equal(0, consulted);
+        Assert.Equal(0, consulted.Count);
 
         // A name within the limits still resolves through the very same resolver.
-        Assert.Same(typeof(OperationResult), AsyncResponseTypeResolution.Resolve("N.Reasonable"));
-        Assert.Equal(1, consulted);
+        Assert.Same(typeof(OperationResult), AsyncResponseTypeResolution.Resolve(reasonable));
+        Assert.Equal(1, consulted.Count);
     }
 
     [Fact]
@@ -504,12 +537,65 @@ public class AsyncResponseTypeResolutionTests : IDisposable
     {
         // The recovery path resolves the persisted payload type name BEFORE any callback is
         // chosen or authorized, so no authorizer configuration stands in front of it: the bound
-        // has to be here.
-        var hostile = "N.T" + new string('x', AsyncResponseTypeResolution.MaxTypeNameLength);
+        // has to be here. Regression for the pin itself: with no resolver registered, a long
+        // simple name simply failed to resolve, so the test passed without any guard at all. The
+        // answer-everything resolver makes an unguarded path MATERIALIZE the payload, and the
+        // negative-cache assertion pins ResolvePayloadType's own guard — the backstops in
+        // ResolveLoaded and Resolve would otherwise still answer null after the hostile name had
+        // become a cache key.
+        var hostile = HostileNames();
+        var reasonable = $"N.Reasonable{Guid.NewGuid():N}";
+        var consulted = RegisterAnsweringResolver([.. hostile, reasonable]);
 
-        var classification = PayloadRecoveryClassifier.Classify("""{"Status":2}""", hostile);
+        foreach (var name in hostile)
+        {
+            Assert.Null(PayloadRecoveryClassifier.Classify("""{"Status":2}""", name).MaterializedPayload);
+            Assert.False(UnresolvableTypeNames.IsKnownMiss(name));
+        }
 
-        Assert.Null(classification.MaterializedPayload);
+        Assert.Equal(0, consulted.Count);
+
+        // The same resolver does answer a name within the limits: the refusal above is the guard's.
+        Assert.NotNull(PayloadRecoveryClassifier.Classify("""{"Status":2}""", reasonable).MaterializedPayload);
+        Assert.Equal(1, consulted.Count);
+    }
+
+    /// <summary>
+    /// Several distinct over-long names. The negative-cache assertion on each is what pins a
+    /// guard in front of the caches, and a single name could hide a missing guard: an assembly
+    /// the lookup itself lazily loads invalidates the miss it just recorded, so the first name in
+    /// a fresh process may read "not cached" even when the guard is gone. The later ones cannot.
+    /// </summary>
+    private static string[] HostileNames()
+        => [.. Enumerable.Range(0, 3).Select(i => $"N.T{i}" + new string('x', AsyncResponseTypeResolution.MaxTypeNameLength))];
+
+    /// <summary>
+    /// Registers a resolver that answers <see cref="OperationResult"/> for exactly the given names
+    /// and counts those lookups. Name-scoped, not answer-everything: the registry is process-wide,
+    /// so tests in other classes running in parallel consult it too, and an answer-everything
+    /// resolver would both inflate the count and hand their lookups a type they never asked for.
+    /// </summary>
+    private static ConsultationCount RegisterAnsweringResolver(params string[] names)
+    {
+        var count = new ConsultationCount();
+        AsyncResponseTypeResolution.RegisterResolver(name =>
+        {
+            if (Array.IndexOf(names, name) < 0)
+                return null;
+
+            count.Increment();
+            return typeof(OperationResult);
+        });
+        return count;
+    }
+
+    private sealed class ConsultationCount
+    {
+        private int _count;
+
+        public int Count => Volatile.Read(ref _count);
+
+        public void Increment() => Interlocked.Increment(ref _count);
     }
 
     [Fact]

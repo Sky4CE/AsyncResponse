@@ -2,6 +2,7 @@ using AsyncResponse.Transports.Redis;
 using Moq;
 using StackExchange.Redis;
 using System.Reflection;
+using System.Runtime.CompilerServices;
 using Xunit;
 
 namespace AsyncResponse.Tests;
@@ -161,6 +162,101 @@ public class RedisStreamDatabaseAdapterTests
         // publish/subscriber retry paths classify it as transient rather than as an intentional cancel.
         await Assert.ThrowsAsync<TimeoutException>(() =>
             adapter.StreamAddAsync("stream", [new NameValueEntry("payload", "{}")], null, true, CancellationToken.None));
+    }
+
+    /// <summary>
+    /// Fixpoint r1 (S6a#14): the consumer retirement is one atomic script on the stream's key —
+    /// delete only while the consumer has no pending entries — and reports whether it deleted.
+    /// </summary>
+    [Theory]
+    [InlineData(0L, true)]
+    [InlineData(-1L, false)]
+    public async Task TryDeleteIdleConsumer_RunsTheAtomicScriptOnTheStreamKey(long scriptResult, bool deleted)
+    {
+        var database = new Mock<IDatabase>(MockBehavior.Strict);
+        database
+            .Setup(db => db.ScriptEvaluateAsync(
+                RedisStreamDatabaseAdapter.DeleteIdleConsumerScript,
+                It.Is<RedisKey[]>(keys => keys.Length == 1 && keys[0] == "stream"),
+                It.Is<RedisValue[]>(values => values.Length == 2 && values[0] == "group" && values[1] == "consumer-a"),
+                CommandFlags.None))
+            .ReturnsAsync(RedisResult.Create((RedisValue)scriptResult));
+        var adapter = new RedisStreamDatabaseAdapter(database.Object, TimeSpan.FromSeconds(5));
+
+        Assert.Equal(deleted, await adapter.TryDeleteIdleConsumerAsync("stream", "group", "consumer-a", CancellationToken.None));
+        Assert.Contains("XPENDING", RedisStreamDatabaseAdapter.DeleteIdleConsumerScript, StringComparison.Ordinal);
+        Assert.Contains("DELCONSUMER", RedisStreamDatabaseAdapter.DeleteIdleConsumerScript, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Fixpoint r1 (S6a#22). A command the adapter gives up on (caller cancellation, or the
+    /// operation timeout) keeps running in the multiplexer, and nothing observed it: a fault it
+    /// raised later surfaced only as a <see cref="TaskScheduler.UnobservedTaskException"/>. The
+    /// abandoned command is now observed. Filtered to this test's own exception, so unrelated
+    /// unobserved tasks from other tests cannot leak in.
+    /// </summary>
+    [Fact]
+    public void AbandonedCommand_ThatFaultsLater_IsObserved()
+    {
+        var marker = $"late redis fault {Guid.NewGuid():N}";
+        var unobserved = 0;
+        void OnUnobserved(object? sender, UnobservedTaskExceptionEventArgs args)
+        {
+            if (args.Exception.Flatten().InnerExceptions.Any(inner => inner.Message == marker))
+                Interlocked.Increment(ref unobserved);
+        }
+
+        TaskScheduler.UnobservedTaskException += OnUnobserved;
+        try
+        {
+            var command = AbandonThenFault(marker);
+            for (var pass = 0; pass < 3 && command.IsAlive; pass++)
+            {
+                GC.Collect();
+                GC.WaitForPendingFinalizers();
+            }
+
+            GC.Collect();
+            GC.WaitForPendingFinalizers();
+
+            // Not collected (an instrumented or debug run can extend lifetimes): no finalizer ran,
+            // so the check below would prove nothing either way.
+            if (command.IsAlive)
+                Assert.Skip("The abandoned command was not collected, so its unobserved-exception check cannot run.");
+        }
+        finally
+        {
+            TaskScheduler.UnobservedTaskException -= OnUnobserved;
+        }
+
+        Assert.Equal(0, Volatile.Read(ref unobserved));
+    }
+
+    /// <summary>
+    /// Starts an acknowledge, abandons it by cancelling the caller token, then faults the command —
+    /// keeping nothing that references it but a weak handle.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static WeakReference AbandonThenFault(string marker)
+    {
+        var command = new TaskCompletionSource<long>();
+        var database = new Mock<IDatabase>();
+        database
+            .Setup(db => db.StreamAcknowledgeAsync(It.IsAny<RedisKey>(), It.IsAny<RedisValue>(), It.IsAny<RedisValue>(), It.IsAny<CommandFlags>()))
+            .Returns(command.Task);
+        var adapter = new RedisStreamDatabaseAdapter(database.Object, TimeSpan.FromMinutes(1));
+
+        using (var cancellation = new CancellationTokenSource())
+        {
+            var acknowledge = adapter.StreamAcknowledgeAsync("stream", "group", "1-0", cancellation.Token);
+            cancellation.Cancel();
+            Assert.ThrowsAny<OperationCanceledException>(() => acknowledge.GetAwaiter().GetResult());
+        }
+
+        command.SetException(new InvalidOperationException(marker));
+        database.Reset();
+        database.Invocations.Clear();
+        return new WeakReference(command.Task);
     }
 
     private static StreamPendingMessageInfo Pending(

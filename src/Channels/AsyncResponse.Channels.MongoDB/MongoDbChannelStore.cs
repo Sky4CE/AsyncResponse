@@ -78,18 +78,25 @@ internal sealed class MongoDbChannelStore : IDisposable
         // load to a lagging secondary, so a publisher racing a fresh registration saw 0 subscribers
         // AND 0 recovery states and dropped the response while reporting success. It also keeps
         // reads on the same authority whose $$NOW the expiry filters evaluate against (same
-        // reasoning as the MongoDB durable-flow store's pin).
+        // reasoning as the MongoDB durable-flow store's pin). Writes are bounded-majority on every
+        // handle for the same parity (see MongoWriteConcerns): under an inherited w=1 a failover
+        // rolled back an acknowledged response, recovery registration, or ack-sequence draw.
+        var writeConcern = MongoWriteConcerns.BoundedMajority(database);
         _recovery = database.GetCollection<MongoRecoveryStateDocument>(_options.RecoveryStateCollection)
-            .WithReadPreference(ReadPreference.Primary);
+            .WithReadPreference(ReadPreference.Primary)
+            .WithWriteConcern(writeConcern);
         _messages = database.GetCollection<MongoChannelMessageDocument>(_options.MessageCollection)
-            .WithReadPreference(ReadPreference.Primary);
+            .WithReadPreference(ReadPreference.Primary)
+            .WithWriteConcern(writeConcern);
         _subscribers = database.GetCollection<MongoChannelSubscriberDocument>(_options.SubscriberCollection)
-            .WithReadPreference(ReadPreference.Primary);
+            .WithReadPreference(ReadPreference.Primary)
+            .WithWriteConcern(writeConcern);
         // The monotonic ack sequence: delivery claims and subscription registrations draw from
         // this ONE counter, giving acked_seq and a subscription's start position a total order no
         // pair of same-tick timestamps has. Created on first upsert; no index needed (_id only).
         _counters = database.GetCollection<BsonDocument>(CountersCollectionName(_options.MessageCollection))
-            .WithReadPreference(ReadPreference.Primary);
+            .WithReadPreference(ReadPreference.Primary)
+            .WithWriteConcern(writeConcern);
         _ownedClient = ownedClient;
     }
 
@@ -305,9 +312,9 @@ internal sealed class MongoDbChannelStore : IDisposable
         {
             new BsonDocument("$set", new BsonDocument
             {
-                ["correlation_id"] = correlationId,
+                ["correlation_id"] = Literal(correlationId),
                 ["registration_id"] = new BsonBinaryData(state.RegistrationId, GuidRepresentation.Standard),
-                ["state_json"] = AsyncResponseJson.Serialize(state),
+                ["state_json"] = Literal(AsyncResponseJson.Serialize(state)),
                 ["expires_at"] = new BsonDocument("$add", new BsonArray { "$$NOW", ttl.TotalMilliseconds }),
                 ["registered_at"] = "$$NOW"
             })
@@ -359,7 +366,7 @@ internal sealed class MongoDbChannelStore : IDisposable
     public Task<MongoDbChannelMessage> InsertMessageAsync(Guid id, string correlationId, string envelopeJson, TimeSpan retention, CancellationToken cancellationToken)
         => AsyncResponseRetry.ExecuteAsync(
             token => InsertMessageOnceAsync(id, correlationId, envelopeJson, retention, token),
-            MongoTransientFaults.IsTransient,
+            IsTransient,
             _options.PublishMaxAttempts,
             _options.PublishRetryBaseDelay,
             _options.PublishRetryMaxDelay,
@@ -380,7 +387,9 @@ internal sealed class MongoDbChannelStore : IDisposable
             new FindOneAndUpdateOptions<MongoChannelMessageDocument>
             {
                 IsUpsert = true,
-                ReturnDocument = ReturnDocument.After
+                ReturnDocument = ReturnDocument.After,
+                // The caller already holds the envelope: only the stamps travel back.
+                Projection = WithoutEnvelopeProjection
             },
             cancellationToken).ConfigureAwait(false);
 
@@ -400,6 +409,14 @@ internal sealed class MongoDbChannelStore : IDisposable
                 document.AckedSeq);
     }
 
+    /// <summary>Every field but the envelope — what the insert needs back.</summary>
+    internal static readonly ProjectionDefinition<MongoChannelMessageDocument, MongoChannelMessageDocument> WithoutEnvelopeProjection =
+        new BsonDocumentProjectionDefinition<MongoChannelMessageDocument, MongoChannelMessageDocument>(new BsonDocument("envelope_json", 0));
+
+    /// <summary>The id alone — all a claim's caller inspects is whether a document came back.</summary>
+    internal static readonly ProjectionDefinition<MongoChannelMessageDocument, MongoChannelMessageDocument> IdOnlyProjection =
+        new BsonDocumentProjectionDefinition<MongoChannelMessageDocument, MongoChannelMessageDocument>(new BsonDocument("_id", 1));
+
     /// <summary>
     /// Upsert pipeline for a response envelope: <c>$ifNull</c> keeps the original server-stamped
     /// timestamps and claim flags when a publish retry finds the document already present.
@@ -412,8 +429,8 @@ internal sealed class MongoDbChannelStore : IDisposable
         {
             new BsonDocument("$set", new BsonDocument
             {
-                ["correlation_id"] = correlationId,
-                ["envelope_json"] = envelopeJson,
+                ["correlation_id"] = Literal(correlationId),
+                ["envelope_json"] = Literal(envelopeJson),
                 ["created_at"] = new BsonDocument("$ifNull", new BsonArray { "$created_at", "$$NOW" }),
                 ["expires_at"] = new BsonDocument("$ifNull", new BsonArray
                 {
@@ -465,6 +482,8 @@ internal sealed class MongoDbChannelStore : IDisposable
     /// subscription's cost grow with its whole retained history. The shared sweep fetches the
     /// envelope by id for the rare acknowledged document a live subscription has not seen.
     /// <c>$ifNull</c> folds a missing <c>acked_at</c> (a pre-settlement document) into null.
+    /// An aggregation expression inside a <c>find</c> projection needs MongoDB 4.4+, which makes
+    /// 4.4 the channel's documented server floor (4.2 rejects the projection on every sweep).
     /// </summary>
     internal static readonly ProjectionDefinition<MongoChannelMessageDocument, MongoChannelMessageDocument> SweepProjection =
         new BsonDocumentProjectionDefinition<MongoChannelMessageDocument, MongoChannelMessageDocument>(new BsonDocument
@@ -547,7 +566,7 @@ internal sealed class MongoDbChannelStore : IDisposable
         var claimed = await _messages.FindOneAndUpdateAsync(
             BuildDeliveryClaimFilter(messageId),
             BuildDeliveryClaimUpdate(ackSeq),
-            new FindOneAndUpdateOptions<MongoChannelMessageDocument> { ReturnDocument = ReturnDocument.After },
+            new FindOneAndUpdateOptions<MongoChannelMessageDocument> { ReturnDocument = ReturnDocument.After, Projection = IdOnlyProjection },
             cancellationToken).ConfigureAwait(false);
         return claimed is not null;
     }
@@ -601,7 +620,7 @@ internal sealed class MongoDbChannelStore : IDisposable
         var claimed = await _messages.FindOneAndUpdateAsync(
             BuildRecoveryClaimFilter(messageId),
             Builders<MongoChannelMessageDocument>.Update.Set(item => item.RecoveryClaimed, true),
-            new FindOneAndUpdateOptions<MongoChannelMessageDocument> { ReturnDocument = ReturnDocument.After },
+            new FindOneAndUpdateOptions<MongoChannelMessageDocument> { ReturnDocument = ReturnDocument.After, Projection = IdOnlyProjection },
             cancellationToken).ConfigureAwait(false);
         return claimed is not null;
     }
@@ -710,9 +729,9 @@ internal sealed class MongoDbChannelStore : IDisposable
         {
             new BsonDocument("$set", new BsonDocument
             {
-                ["correlation_id"] = correlationId,
+                ["correlation_id"] = Literal(correlationId),
                 ["registration_id"] = new BsonBinaryData(registrationId, GuidRepresentation.Standard),
-                ["instance_id"] = instanceId,
+                ["instance_id"] = Literal(instanceId),
                 ["expires_at"] = new BsonDocument("$add", new BsonArray { "$$NOW", ttl.TotalMilliseconds })
             })
         });
@@ -762,8 +781,16 @@ internal sealed class MongoDbChannelStore : IDisposable
         await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
         var filter = Builders<MongoChannelSubscriberDocument>.Filter.Eq(item => item.CorrelationId, correlationId)
                      & NotExpiredOnServerClock<MongoChannelSubscriberDocument>();
-        return await _subscribers.CountDocumentsAsync(filter, cancellationToken: cancellationToken).ConfigureAwait(false);
+        // Simple (binary) collation pinned, as the Mongo transport pins it: under an operator-
+        // provisioned case- or accent-folding default collation, a count for "ABC" counted "abc"'s
+        // live waiter, so a publish to "ABC" took the live route and sat out the whole
+        // confirmation budget before recovery, and the watchdog never saw "ABC" as stale. A count
+        // has no rows for the dispatch loop's ordinal re-check to screen. (A folding collection
+        // loses index use for this query — the transport's documented trade-off.)
+        return await _subscribers.CountDocumentsAsync(filter, SimpleCollationCount, cancellationToken).ConfigureAwait(false);
     }
+
+    private static readonly CountOptions SimpleCollationCount = new() { Collation = Collation.Simple };
 
     /// <summary>
     /// Server-clock expiry filter (<c>$expr: expires_at &gt; $$NOW</c>): message, liveness, and
@@ -777,15 +804,17 @@ internal sealed class MongoDbChannelStore : IDisposable
     /// Watches the message collection with a change stream and invokes
     /// <paramref name="onNotification"/> with the correlation id of every inserted response. One
     /// stream serves every local waiter — the caller routes the id to the right subscription — so
-    /// waiter count never multiplies server-side cursors. Runs until cancellation or a stream error.
+    /// waiter count never multiplies server-side cursors. Runs until cancellation or a stream error;
+    /// <paramref name="onOpened"/> runs once the stream is open.
     /// </summary>
-    public async Task WatchMessagesAsync(Func<string?, Task> onNotification, CancellationToken cancellationToken)
+    public async Task WatchMessagesAsync(Func<string?, Task> onNotification, CancellationToken cancellationToken, Action? onOpened = null)
     {
         await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
         using var cursor = await _messages.WatchAsync(
             BuildMessageWatchPipeline(),
             new ChangeStreamOptions { FullDocument = ChangeStreamFullDocumentOption.UpdateLookup },
             cancellationToken).ConfigureAwait(false);
+        onOpened?.Invoke();
         while (await cursor.MoveNextAsync(cancellationToken).ConfigureAwait(false))
         {
             foreach (var change in cursor.Current)
@@ -796,11 +825,23 @@ internal sealed class MongoDbChannelStore : IDisposable
     /// <summary>
     /// Change-stream pipeline for response wakes: a <c>$match</c> on insert events. The correlation
     /// id travels in the event's full document, letting the dispatcher scan only the signaled
-    /// correlation id — the targeted-wake contract.
+    /// correlation id — the targeted-wake contract. The <c>$project</c> keeps only that id (plus
+    /// the event's <c>_id</c> resume token, which an inclusion projection keeps implicitly, and its
+    /// operation type): every process watches every insert, and shipping each full envelope to
+    /// every watcher just to read one field cost payload × watchers on every publish.
     /// </summary>
     internal static PipelineDefinition<ChangeStreamDocument<MongoChannelMessageDocument>, ChangeStreamDocument<MongoChannelMessageDocument>> BuildMessageWatchPipeline()
         => new EmptyPipelineDefinition<ChangeStreamDocument<MongoChannelMessageDocument>>()
-            .Match(change => change.OperationType == ChangeStreamOperationType.Insert);
+            .Match(change => change.OperationType == ChangeStreamOperationType.Insert)
+            .Project(new BsonDocumentProjectionDefinition<ChangeStreamDocument<MongoChannelMessageDocument>, ChangeStreamDocument<MongoChannelMessageDocument>>(
+                new BsonDocument
+                {
+                    ["operationType"] = 1,
+                    ["fullDocument.correlation_id"] = 1
+                }));
+
+    /// <summary>The fault classification the shared channel base retries its post-insert store calls on.</summary>
+    internal static bool IsTransient(Exception exception) => MongoTransientFaults.IsTransient(exception);
 
     /// <summary>Returns <c>true</c> when the server rejected the change stream itself (not a transient cursor error).</summary>
     internal static bool IsChangeStreamUnsupported(Exception exception)
@@ -810,6 +851,16 @@ internal sealed class MongoDbChannelStore : IDisposable
 
     internal static string RegistrationKey(string correlationId, Guid registrationId)
         => $"{correlationId}:{registrationId:N}";
+
+    /// <summary>
+    /// A caller-supplied string as a pipeline-update VALUE. The upserts are aggregation pipelines,
+    /// where a plain string beginning with <c>$</c> is read as a field path (<c>$$</c>: a variable)
+    /// — so a correlation id like <c>"$order-17"</c> resolved to a missing field and was never
+    /// stored: the subscriber and recovery documents lost their <c>correlation_id</c>, every
+    /// lookup for the id matched nothing, and each response for it was silently dropped. The
+    /// transport and flow stores wrap their user strings the same way.
+    /// </summary>
+    private static BsonDocument Literal(string value) => new("$literal", value);
 
     /// <summary>
     /// Name of the derived ack-counter collection. Part of the effective collection-name plan:
@@ -841,6 +892,14 @@ internal sealed class MongoDbChannelStore : IDisposable
     }
 }
 
+/// <remarks>
+/// <c>[BsonIgnoreExtraElements]</c> is load-bearing, as on the transport's and flow store's
+/// documents: the driver's default is to THROW for any element outside this class map, so the
+/// next element a newer build adds would break older hosts mid rolling deploy — a claim that
+/// committed <c>acked_at</c> and then failed to deserialize its reply, a hydration read, a
+/// change-stream event. Unknown elements are ignored instead.
+/// </remarks>
+[BsonIgnoreExtraElements]
 internal sealed class MongoRecoveryStateDocument
 {
     [BsonId]
@@ -864,6 +923,14 @@ internal sealed class MongoRecoveryStateDocument
     public DateTime RegisteredAtUtc { get; set; }
 }
 
+/// <remarks>
+/// <c>[BsonIgnoreExtraElements]</c> is load-bearing, as on the transport's and flow store's
+/// documents: the driver's default is to THROW for any element outside this class map, so the
+/// next element a newer build adds would break older hosts mid rolling deploy — a claim that
+/// committed <c>acked_at</c> and then failed to deserialize its reply, a hydration read, a
+/// change-stream event. Unknown elements are ignored instead.
+/// </remarks>
+[BsonIgnoreExtraElements]
 internal sealed class MongoChannelMessageDocument
 {
     [BsonId]
@@ -894,6 +961,14 @@ internal sealed class MongoChannelMessageDocument
     public bool RecoveryClaimed { get; set; }
 }
 
+/// <remarks>
+/// <c>[BsonIgnoreExtraElements]</c> is load-bearing, as on the transport's and flow store's
+/// documents: the driver's default is to THROW for any element outside this class map, so the
+/// next element a newer build adds would break older hosts mid rolling deploy — a claim that
+/// committed <c>acked_at</c> and then failed to deserialize its reply, a hydration read, a
+/// change-stream event. Unknown elements are ignored instead.
+/// </remarks>
+[BsonIgnoreExtraElements]
 internal sealed class MongoChannelSubscriberDocument
 {
     [BsonId]

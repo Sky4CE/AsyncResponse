@@ -281,6 +281,11 @@ public sealed class CoreCoverageTests
         // the "now + ttl" stamp, and the in-memory one used to overflow instead.
         Assert.True(await store.TryCreateAsync("huge-ttl", State("huge-ttl"), TimeSpan.MaxValue));
         Assert.NotNull(await store.LoadAsync("huge-ttl"));
+        // ...and the lease stamp the same way (fixpoint r1, S10#7): acquire and renew still added
+        // the duration raw and threw where every provider store clamps.
+        Assert.True(await store.TryAcquireLeaseAsync("huge-ttl", "lease-huge", TimeSpan.MaxValue));
+        Assert.True(await store.TryRenewLeaseAsync("huge-ttl", "lease-huge", TimeSpan.MaxValue));
+        Assert.Equal("lease-huge", (await store.ObserveLeaseAsync("huge-ttl"))!.LeaseId);
 
         var expiring = State("expiring");
         Assert.True(await store.TryCreateAsync("expiring", expiring, TimeSpan.FromMilliseconds(5)));

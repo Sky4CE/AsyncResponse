@@ -127,6 +127,32 @@ public sealed class SixtyDaySettleFlow : IDurableFlow<LongSettleInput>
         => await flow.DelayAsync("sixty-day-settle", TimeSpan.FromDays(60));
 }
 
+public sealed record HandOverInput(long Id);
+
+/// <summary>
+/// An in-process timer longer than the park budget: parked for one hop, then handed over to a fresh
+/// delivery. The replay (the flow's second entry) can be held at a gate before it re-parks.
+/// </summary>
+public sealed class HandOverTimerFlow : IDurableFlow<HandOverInput>
+{
+    public static int Entries;
+    public static TaskCompletionSource ReplayEntered = NewSource();
+    public static TaskCompletionSource ReleaseReplay = NewSource();
+
+    public static TaskCompletionSource NewSource() => new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+    public async Task ExecuteAsync(IDurableFlowContext flow, HandOverInput input)
+    {
+        if (Interlocked.Increment(ref Entries) == 2)
+        {
+            ReplayEntered.TrySetResult();
+            await ReleaseReplay.Task.ConfigureAwait(false);
+        }
+
+        await flow.DelayAsync("hop-nap", TimeSpan.FromSeconds(5));
+    }
+}
+
 public class FlowTestHarnessShowcaseTests
 {
     private static async Task<(FlowTestHarness Harness, RecordingProvisioningClient Client, StepRecorder Recorder)> StartAsync()
@@ -299,12 +325,144 @@ public class FlowTestHarnessShowcaseTests
         Assert.Contains("already armed", ex.Message);
     }
 
-    private static int ParkedCount(FlowTestHarness harness)
+    private static int ParkedCount(FlowTestHarness harness) => QuiesceCount(harness, "ParkedCount");
+
+    private static int DirectRunsInFlight(FlowTestHarness harness) => QuiesceCount(harness, "DirectRunsInFlight");
+
+    private static int QuiesceCount(FlowTestHarness harness, string property)
     {
         var quiesce = typeof(AsyncResponseTestHarness)
             .GetField("_quiesce", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!
             .GetValue(harness.Engine)!;
-        return (int)quiesce.GetType().GetProperty("ParkedCount")!.GetValue(quiesce)!;
+        return (int)quiesce.GetType().GetProperty(property)!.GetValue(quiesce)!;
+    }
+
+    [Fact]
+    public async Task TimerHandOver_LeavesNoStaleParkedEntry_WhileTheWakeUpRunsCode()
+    {
+        // Regression (fixpoint r1): the quiesce probe counted an in-process timer as parked for
+        // the whole remainder, but a remainder longer than MaxInProcessParkDuration is parked for
+        // one hop and then handed over to a fresh delivery — a suspension, which notifies no
+        // observer. The stale entry then offset the hand-over's wake-up while it ran replay code:
+        // SettleAsync let the clock advance under it, and a restart's stop could end early with
+        // user code still running.
+        HandOverTimerFlow.Entries = 0;
+        HandOverTimerFlow.ReplayEntered = HandOverTimerFlow.NewSource();
+        HandOverTimerFlow.ReleaseReplay = HandOverTimerFlow.NewSource();
+        var harness = await FlowTestHarness.StartAsync(options =>
+        {
+            options.DurableFlows = flows => flows.MaxInProcessParkDuration = TimeSpan.FromSeconds(2);
+            options.ConfigureAsyncResponse = builder => builder.WithDurableFlow<HandOverTimerFlow, HandOverInput>();
+        });
+        await using var _ = harness;
+
+        var run = await harness.StartFlowAsync<HandOverTimerFlow, HandOverInput>(new HandOverInput(1));
+        await run.WaitForTimerStepAsync("hop-nap");
+        var guard = TimeProvider.System.GetUtcNow() + TimeSpan.FromSeconds(10);
+        while (ParkedCount(harness) != 1)
+        {
+            Assert.True(TimeProvider.System.GetUtcNow() < guard, "the in-process timer never registered as parked");
+            await Task.Delay(TimeSpan.FromMilliseconds(5));
+        }
+
+        // The first hop ends at 2 s: the timer is handed over and its wake-up replays the flow,
+        // held at the gate before it can park again.
+        var advance = harness.AdvanceAsync(TimeSpan.FromSeconds(2));
+        await HandOverTimerFlow.ReplayEntered.Task.WaitAsync(TimeSpan.FromSeconds(10));
+
+        Assert.Equal(0, ParkedCount(harness));
+
+        HandOverTimerFlow.ReleaseReplay.TrySetResult();
+        await advance;
+        await harness.AdvanceAsync(TimeSpan.FromSeconds(4));
+        Assert.Equal(FlowRunStatus.Succeeded, await run.WaitForFinishedAsync());
+    }
+
+    [Fact]
+    public async Task RestartAbandoningADirectRun_KeepsTheDirectRunCountAtZero()
+    {
+        // Regression (fixpoint r1): a restart reset the direct-run count to zero while a parked
+        // direct run (a park does not stop a restart) was still in flight. When the abandoned run
+        // ended afterwards, its finish decremented the count to -1, and from then on every settle
+        // and stop check under-counted one busy direct run until the next restart.
+        var harness = await FlowTestHarness.StartAsync(options =>
+            options.ConfigureAsyncResponse = builder => builder.WithDurableFlow<ParkedOnReplyFlow, ParkedRestartInput>());
+        await using var _ = harness;
+
+        // A run with a ledger that nothing on the worker queue is executing: start it, let it
+        // park, and restart once (the parked worker execution is abandoned; no redelivery).
+        var run = await harness.StartFlowAsync<ParkedOnReplyFlow, ParkedRestartInput>(new ParkedRestartInput("direct"));
+        await run.WaitForAwaitingStepAsync("remote");
+        await harness.Engine.SimulateRestartAsync();
+
+        // Drive it inline instead: the direct run re-attaches and parks on the awaited step.
+        var attempt = run.ExecuteDirectAsync();
+        await run.WaitForAwaitingStepAsync("remote");
+        Assert.Equal(1, DirectRunsInFlight(harness));
+
+        // The restart abandons the parked direct run; its attempt ends after the count was reset.
+        await harness.Engine.SimulateRestartAsync();
+        try
+        {
+            await attempt.WaitAsync(TimeSpan.FromSeconds(10));
+        }
+        catch (Exception ex) when (ex is not TimeoutException)
+        {
+            // However the abandoned wait ends its attempt, it has ended.
+        }
+
+        Assert.Equal(0, DirectRunsInFlight(harness));
+    }
+
+    [Fact]
+    public async Task SimulateRestart_RetainedWakeUpsBeyondTheDelayedCapacity_AreAllCarriedOver()
+    {
+        // Regression (fixpoint r1): the drain frees every delayed slot before it retains, so a flow
+        // suspending mid-drain is retained ON TOP of the wake-ups that already held the slots. The
+        // restart re-published through the external path, which waits for a free slot — freed
+        // only when a timer fires, on a virtual clock that cannot move while the test is inside
+        // the restart: SimulateRestartAsync hung forever, with no guard.
+        DrainSuspendFlow.EnteredExecution = DrainSuspendFlow.NewSource();
+        DrainSuspendFlow.ReleaseToSuspend = DrainSuspendFlow.NewSource();
+        DrainSuspendFlow.ReleaseToSuspend.TrySetResult(); // the first run suspends at once
+        var harness = await FlowTestHarness.StartAsync(options =>
+        {
+            options.Transport = transport => transport.DelayedJobCapacity = 1;
+            options.ConfigureAsyncResponse = builder => builder.WithDurableFlow<DrainSuspendFlow, DrainSuspendInput>();
+        });
+        await using var _ = harness;
+
+        // Run A sleeps two days on the only delayed slot.
+        var sleeping = await harness.StartFlowAsync<DrainSuspendFlow, DrainSuspendInput>(new DrainSuspendInput(1));
+        await sleeping.WaitForTimerStepAsync("two-day-settle");
+        await harness.Engine.WaitForWorkerIdleAsync();
+
+        // Run B is mid-execution when the restart begins, and suspends only once the drain runs.
+        DrainSuspendFlow.EnteredExecution = DrainSuspendFlow.NewSource();
+        DrainSuspendFlow.ReleaseToSuspend = DrainSuspendFlow.NewSource();
+        var suspending = await harness.StartFlowAsync<DrainSuspendFlow, DrainSuspendInput>(new DrainSuspendInput(2));
+        await DrainSuspendFlow.EnteredExecution.Task.WaitAsync(TimeSpan.FromSeconds(10));
+
+        var dying = harness.Engine.Services.GetRequiredService<InMemoryWorkerTransport>();
+        var draining = typeof(InMemoryWorkerTransport).GetField("_draining", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!;
+        var restart = harness.Engine.SimulateRestartAsync();
+        var guard = TimeProvider.System.GetUtcNow() + TimeSpan.FromSeconds(10);
+        while (!(bool)draining.GetValue(dying)!)
+        {
+            Assert.True(TimeProvider.System.GetUtcNow() < guard, "the old incarnation never began draining");
+            await Task.Delay(TimeSpan.FromMilliseconds(1));
+        }
+
+        DrainSuspendFlow.ReleaseToSuspend.TrySetResult();
+        await restart.WaitAsync(TimeSpan.FromSeconds(10));
+
+        // Both wake-ups made it into the new incarnation — two, on a one-slot transport.
+        var transport = harness.Engine.Services.GetRequiredService<InMemoryWorkerTransport>();
+        Assert.Equal(2, transport.SnapshotDelayedJobs().Count);
+
+        await harness.AdvanceAsync(TimeSpan.FromDays(2) + TimeSpan.FromMinutes(1));
+        Assert.Equal(FlowRunStatus.Succeeded, await sleeping.WaitForFinishedAsync());
+        Assert.Equal(FlowRunStatus.Succeeded, await suspending.WaitForFinishedAsync());
     }
 
     [Fact]

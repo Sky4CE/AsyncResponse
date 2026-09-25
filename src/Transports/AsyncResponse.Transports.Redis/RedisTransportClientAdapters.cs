@@ -84,6 +84,20 @@ internal interface IRedisStreamDatabase
         bool useApproximateMaxLength,
         CancellationToken cancellationToken)
         => StreamAddAsync(stream, values, maxLength, useApproximateMaxLength, cancellationToken);
+
+    /// <summary>
+    /// Deletes <paramref name="consumerName"/> from the group only while it has no pending
+    /// entries, atomically (XGROUP DELCONSUMER discards the consumer's pending entries, so a
+    /// delete that raced a read or claim into that name would lose them). Returns whether it was
+    /// deleted. Carries a delete-nothing default implementation so out-of-package fakes keep
+    /// compiling.
+    /// </summary>
+    Task<bool> TryDeleteIdleConsumerAsync(
+        RedisKey stream,
+        RedisValue groupName,
+        RedisValue consumerName,
+        CancellationToken cancellationToken)
+        => Task.FromResult(false);
 }
 
 internal sealed class RedisStreamDatabaseAdapter(IDatabase _database, TimeSpan _operationTimeout) : IRedisStreamDatabase
@@ -111,6 +125,16 @@ internal sealed class RedisStreamDatabaseAdapter(IDatabase _database, TimeSpan _
         return id
         """;
 
+    // The pending check and the delete in one server-side step: a consumer that still owns
+    // pending entries is never deleted (that would drop them), and nothing can read or claim into
+    // the name between the two. XPENDING's range-and-consumer form runs on Redis 5+.
+    internal const string DeleteIdleConsumerScript = """
+        if #redis.call('XPENDING', KEYS[1], ARGV[1], '-', '+', 1, ARGV[2]) == 0 then
+            return redis.call('XGROUP', 'DELCONSUMER', KEYS[1], ARGV[1], ARGV[2])
+        end
+        return -1
+        """;
+
     /// <summary>Runs the StreamAddAsync operation.</summary>
     public Task<RedisValue> StreamAddAsync(
         RedisKey stream,
@@ -121,10 +145,14 @@ internal sealed class RedisStreamDatabaseAdapter(IDatabase _database, TimeSpan _
         // Call the classic overload (int? maxLength, no trim-mode parameter) so publishing emits plain
         // `XADD … MAXLEN ~ N` with no Redis 8 KEEPREF/DELREF/ACKED token. That keeps the transport
         // portable across Redis 8+, Valkey, and Dragonfly by construction — independent of whether the
-        // StackExchange.Redis version would otherwise fold KEEPREF into the wire form. On Redis 8+ the
-        // server default is KEEPREF, so an entry trimmed while still pending becomes a tombstone on claim
-        // and the subscriber dead-letters it via DiscardUnprocessableAsync rather than wedging; the older
-        // trim behavior on pre-8 servers is equivalent for that path.
+        // StackExchange.Redis version would otherwise fold KEEPREF into the wire form. (This path
+        // writes the dead-letter stream; worker publishes go through the append script below, with
+        // the same MAXLEN semantics.) MAXLEN trims by length alone, whatever the consumer group has
+        // read: an entry trimmed before any consumer read it vanishes without a trace, and one trimmed
+        // while still pending is lost too — Redis 6.2 answers its XCLAIM with a nil tombstone, which
+        // the claim loop ACKs by its pending id with a Warning, and 7+ drops it from the pending list
+        // silently. Neither path dead-letters it: the cap must sit above the deepest backlog the
+        // stream can build up (see RedisAsyncResponseTransportOptions.StreamMaxLength).
         => WithCancellation(
             _database.StreamAddAsync(
                 stream,
@@ -164,6 +192,19 @@ internal sealed class RedisStreamDatabaseAdapter(IDatabase _database, TimeSpan _
         return (RedisValue)await WithCancellation(
             _database.ScriptEvaluateAsync(AppendOnceScript, [stream, dedupKey], args),
             cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>Runs the TryDeleteIdleConsumerAsync operation.</summary>
+    public async Task<bool> TryDeleteIdleConsumerAsync(
+        RedisKey stream,
+        RedisValue groupName,
+        RedisValue consumerName,
+        CancellationToken cancellationToken)
+    {
+        var result = await WithCancellation(
+            _database.ScriptEvaluateAsync(DeleteIdleConsumerScript, [stream], [groupName, consumerName]),
+            cancellationToken).ConfigureAwait(false);
+        return (long)result >= 0;
     }
 
     /// <summary>Runs the StreamCreateConsumerGroupAsync operation.</summary>
@@ -272,9 +313,21 @@ internal sealed class RedisStreamDatabaseAdapter(IDatabase _database, TimeSpan _
         {
             return await command.WaitAsync(linked.Token).ConfigureAwait(false);
         }
-        catch (OperationCanceledException) when (timeout.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
+        catch (OperationCanceledException)
         {
-            throw new TimeoutException($"The Redis command did not complete within {_operationTimeout}.");
+            // Abandoned, not stopped: a fault the command raises later (the multiplexer disposed
+            // under it, a late server error) would otherwise surface only as a
+            // TaskScheduler.UnobservedTaskException nobody logs. Observe it here.
+            _ = command.ContinueWith(
+                static abandoned => _ = abandoned.Exception,
+                CancellationToken.None,
+                TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously,
+                TaskScheduler.Default);
+
+            if (timeout.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
+                throw new TimeoutException($"The Redis command did not complete within {_operationTimeout}.");
+
+            throw;
         }
     }
 }
@@ -290,9 +343,25 @@ internal static class RedisTransportRetry
         CancellationToken cancellationToken)
         => AsyncResponseRetry.ExecuteAsync(action, IsTransient, maxAttempts, baseDelay, maxDelay, cancellationToken);
 
-    /// <summary>Runs the IsTransient operation.</summary>
+    /// <summary>
+    /// Whether a failed publish is worth retrying. Besides lost connections and timeouts, that is
+    /// the server errors a cluster in transition answers with — TRYAGAIN (the idempotent append is
+    /// a two-key script, refused while its slot migrates with only one key moved), CLUSTERDOWN,
+    /// LOADING, MASTERDOWN and READONLY (a failover in progress): the server raises them BEFORE
+    /// running anything, and the append is keyed by its dedup marker, so a retry cannot apply it
+    /// twice. Read as permanent, every publish in a migration or failover window failed at once.
+    /// Any other server error (WRONGTYPE, NOSCRIPT, OOM …) stays permanent.
+    /// </summary>
     public static bool IsTransient(Exception exception)
         => exception is RedisConnectionException
             or RedisTimeoutException
-            or TimeoutException;
+            or TimeoutException
+            or RedisServerException
+            {
+                Kind: RedisErrorKind.TryAgain
+                    or RedisErrorKind.ClusterDown
+                    or RedisErrorKind.Loading
+                    or RedisErrorKind.MasterDown
+                    or RedisErrorKind.ReadOnly
+            };
 }

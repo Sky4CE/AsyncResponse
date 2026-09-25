@@ -409,6 +409,247 @@ public sealed class EFCoreDurableFlowStateStoreTests
         Assert.Equal("replaced", loaded!.LastMessage);
     }
 
+    [Fact]
+    public void LedgerEntity_CanBeProxied_SoALazyLoadingProxiesContextCanMapIt()
+    {
+        // Regression: DurableFlowStateRecord was sealed, and EF Core's proxies convention rejects
+        // every sealed entity type at model finalisation ("UseLazyLoadingProxies requires all
+        // entity types to be public, unsealed…") — an application context that uses proxies
+        // could not host the ledger, the store's only supported setup. EF Core Proxies builds its
+        // proxies with Castle DynamicProxy, which is what this asks directly.
+        var proxy = new Castle.DynamicProxy.ProxyGenerator().CreateClassProxy<DurableFlowStateRecord>();
+
+        Assert.IsAssignableFrom<DurableFlowStateRecord>(proxy);
+        Assert.NotEqual(typeof(DurableFlowStateRecord), proxy.GetType());
+    }
+
+    [Fact]
+    public async Task Prune_OnSqlite_ReChecksExpiryOnTheRowItDeletes_InExpiryOrder()
+    {
+        // Regression: `Where(expired).OrderBy(FlowId).Take(n).ExecuteDelete()` is not a valid
+        // single-table delete for the relational providers (an ordering or a limit sends them to
+        // the `DELETE … WHERE <pk> IN/EXISTS (SELECT … WHERE expired ORDER BY … LIMIT n)` fallback),
+        // so the expiry predicate lived only inside the subquery. A TryCreate that replaced the
+        // expired row in place between the subquery's read and the delete reaching the row lost its
+        // fresh ledger to the prune: under PostgreSQL READ COMMITTED (and SQL Server RCSI) the outer
+        // DELETE re-checks only its own predicate, and it had none. The expiry predicate must sit on
+        // the DELETE's own WHERE — and the batch is taken in expiry order, which the expires index
+        // serves, not flow-id order, which made every batch sort or walk the whole backlog.
+        await using var database = new TempSqliteDatabase();
+        await database.EnsureSchemaAsync();
+        var capture = new CapturingCommandInterceptor();
+        var services = new ServiceCollection();
+        services.AddDbContextFactory<TestFlowDbContext>(options => options
+            .UseSqlite(database.ConnectionString)
+            .AddInterceptors(capture));
+        await using var provider = services.BuildServiceProvider(new ServiceProviderOptions { ValidateScopes = true });
+        var store = CreateStore(provider, pruneInterval: TimeSpan.Zero);
+
+        Assert.True(await store.TryCreateAsync("expired-flow", CreateState("expired-flow"), TimeSpan.FromMinutes(5)));
+        await database.ExpireAsync("expired-flow");
+        Assert.True(await store.TryCreateAsync("live-flow", CreateState("live-flow"), TimeSpan.FromMinutes(5)));
+
+        AssertPruneDeleteReChecksExpiry(capture.Commands.First(c => c.StartsWith("DELETE", StringComparison.OrdinalIgnoreCase)));
+        // And the reshaped statement still does its job on a real database.
+        Assert.Equal(0, await database.CountRowsAsync("expired-flow"));
+        Assert.NotNull(await store.LoadAsync("live-flow"));
+    }
+
+    [Fact]
+    public async Task Prune_OnSqlServer_ReChecksExpiryOnTheRowItDeletes_InExpiryOrder()
+    {
+        // The same pin against the SQL Server provider's own rendering — the provider on which the
+        // lost run was reported (RCSI, the Azure SQL default). No server is contacted: the connection
+        // open and every command are intercepted, so only the SQL EF Core renders is observed.
+        var capture = new CapturingCommandInterceptor { SuppressWith = sql => sql.StartsWith("DELETE", StringComparison.OrdinalIgnoreCase) ? 0 : 1 };
+        var services = new ServiceCollection();
+        services.AddDbContextFactory<CollatedFlowDbContext>(options => options
+            .UseSqlServer("Server=unused;Database=unused;")
+            .AddInterceptors(capture, new SuppressOpenInterceptor()));
+        await using var provider = services.BuildServiceProvider(new ServiceProviderOptions { ValidateScopes = true });
+        var store = new EFCoreFlowStateStore<CollatedFlowDbContext>(
+            provider.GetRequiredService<IServiceScopeFactory>(),
+            Options.Create(new EFCoreDurableFlowOptions { PruneInterval = TimeSpan.Zero }));
+
+        Assert.True(await store.TryCreateAsync("flow-a", CreateState("flow-a"), TimeSpan.FromMinutes(5)));
+
+        AssertPruneDeleteReChecksExpiry(Assert.Single(capture.Commands, c => c.StartsWith("DELETE", StringComparison.OrdinalIgnoreCase)));
+    }
+
+    private static void AssertPruneDeleteReChecksExpiry(string sql)
+    {
+        // Everything before the first SELECT is the DELETE's own predicate on the row it deletes.
+        var subquery = sql.IndexOf("SELECT", StringComparison.OrdinalIgnoreCase);
+        Assert.True(subquery > 0, sql);
+        Assert.Contains("expires_at_utc", sql[..subquery], StringComparison.Ordinal);
+        Assert.Matches(@"ORDER BY\s+\S*expires_at_utc", sql);
+        Assert.DoesNotMatch(@"ORDER BY\s+\S*flow_id", sql);
+    }
+
+    [Fact]
+    public async Task RowCountWrites_RefuseAnUnavailableRowCount_InsteadOfReportingALostWrite()
+    {
+        // Regression: a SQL Server with NOCOUNT on by default (`sp_configure 'user options', 512`)
+        // makes every ExecuteUpdate/ExecuteDelete report -1. The store compared `> 0`, so every
+        // acquire, renew, checkpoint and delete read as lost although the row was written — flows
+        // churned through lease contention into the dead-letter queue with no hint at the cause. A
+        // negative count is not "0 rows": it is "the database did not say", and the store says so.
+        await using var database = new TempSqliteDatabase();
+        await database.EnsureSchemaAsync();
+        var capture = new CapturingCommandInterceptor();
+        var services = new ServiceCollection();
+        services.AddDbContextFactory<TestFlowDbContext>(options => options
+            .UseSqlite(database.ConnectionString)
+            .AddInterceptors(capture));
+        await using var provider = services.BuildServiceProvider(new ServiceProviderOptions { ValidateScopes = true });
+        IFlowStateStore store = CreateStore(provider);
+
+        var state = CreateState("nocount-flow");
+        Assert.True(await store.TryCreateAsync(state.FlowId!, state, TimeSpan.FromMinutes(5)));
+        capture.ReportRowCount = -1;
+
+        var acquire = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => store.TryAcquireLeaseAsync(state.FlowId!, "owner-a", TimeSpan.FromMinutes(1)));
+        Assert.Contains("NOCOUNT", acquire.Message, StringComparison.Ordinal);
+        state.Revision = 1;
+        await Assert.ThrowsAsync<InvalidOperationException>(
+            () => store.TryUpdateAsync(state.FlowId!, state, 0, TimeSpan.FromMinutes(5)));
+        await Assert.ThrowsAsync<InvalidOperationException>(() => store.TryDeleteAsync(state.FlowId!));
+        await Assert.ThrowsAsync<InvalidOperationException>(
+            () => store.TryCreateAsync("other-flow", CreateState("other-flow"), TimeSpan.FromMinutes(5)));
+    }
+
+    [Fact]
+    public async Task TryCreate_WhenTheInsertCollidesWithARowThatHasSinceExpired_ReplacesItInsteadOfReportingExists()
+    {
+        // Regression (store half of the lost-start window): the in-place replace judged expiry with
+        // a `now` taken before the prune (up to PruneBudget earlier), and the duplicate-key fallback
+        // asked "does ANY row carry this id" — so a row that expired between the replace and the
+        // insert made TryCreate answer "exists". The executor then loaded the ledger, found it
+        // expired, and acknowledged the start job: the new run was never created. Here the first
+        // replace is made to miss exactly as a stale `now` makes it miss; the fallback must see the
+        // row is expired and replace it.
+        await using var database = new TempSqliteDatabase();
+        await database.EnsureSchemaAsync();
+        var capture = new CapturingCommandInterceptor();
+        var services = new ServiceCollection();
+        services.AddDbContextFactory<TestFlowDbContext>(options => options
+            .UseSqlite(database.ConnectionString)
+            .AddInterceptors(capture));
+        await using var provider = services.BuildServiceProvider(new ServiceProviderOptions { ValidateScopes = true });
+        var store = CreateStore(provider, pruneInterval: TimeSpan.FromHours(1));
+
+        // Arms the prune throttle (the first create always prunes) and leaves an expired row behind.
+        Assert.True(await store.TryCreateAsync("reused-flow", CreateState("reused-flow"), TimeSpan.FromMinutes(5)));
+        await database.ExpireAsync("reused-flow");
+        capture.MissNextReplace = true;
+
+        var replacement = CreateState("reused-flow");
+        replacement.LastMessage = "second run";
+        Assert.True(await store.TryCreateAsync("reused-flow", replacement, TimeSpan.FromMinutes(5)));
+        Assert.Equal("second run", (await store.LoadAsync("reused-flow"))!.LastMessage);
+    }
+
+    [Fact]
+    public async Task TryCreate_WhenAPeerPrunesTheCollidingRowBeforeTheExistenceCheck_InsertsInsteadOfThrowing()
+    {
+        // Regression: the insert collided with an expired row, a peer's prune deleted that row, and
+        // the existence check then found nothing — so the store rethrew the raw duplicate-key
+        // exception for a create that would now succeed, costing the job a delivery attempt and an
+        // error log. Neither a live owner nor a failure: try again.
+        await using var database = new TempSqliteDatabase();
+        await database.EnsureSchemaAsync();
+        var capture = new CapturingCommandInterceptor();
+        var services = new ServiceCollection();
+        services.AddDbContextFactory<TestFlowDbContext>(options => options
+            .UseSqlite(database.ConnectionString)
+            .AddInterceptors(capture));
+        await using var provider = services.BuildServiceProvider(new ServiceProviderOptions { ValidateScopes = true });
+        var store = CreateStore(provider, pruneInterval: TimeSpan.FromHours(1));
+
+        Assert.True(await store.TryCreateAsync("pruned-flow", CreateState("pruned-flow"), TimeSpan.FromMinutes(5)));
+        await database.ExpireAsync("pruned-flow");
+        capture.MissNextReplace = true;
+        capture.BeforeNextExistenceCheck = () => database.ExecuteSqlAsync("DELETE FROM asyncresponse_flow_state WHERE flow_id = 'pruned-flow';");
+
+        var replacement = CreateState("pruned-flow");
+        replacement.LastMessage = "second run";
+        Assert.True(await store.TryCreateAsync("pruned-flow", replacement, TimeSpan.FromMinutes(5)));
+        Assert.Equal("second run", (await store.LoadAsync("pruned-flow"))!.LastMessage);
+    }
+
+    /// <summary>
+    /// Records every command EF Core sends and, when armed, bends the answers the way a racing
+    /// database would: suppress commands (with a scripted row count), report an unavailable row
+    /// count, make the in-place replace miss once, or run a peer's write just before the insert's
+    /// duplicate-key fallback asks whether the row exists.
+    /// </summary>
+    private sealed class CapturingCommandInterceptor : DbCommandInterceptor
+    {
+        public System.Collections.Concurrent.ConcurrentQueue<string> Commands { get; } = new();
+
+        public Func<string, int>? SuppressWith { get; init; }
+
+        public int? ReportRowCount { get; set; }
+
+        public bool MissNextReplace { get; set; }
+
+        public Func<Task>? BeforeNextExistenceCheck { get; set; }
+
+        public override ValueTask<InterceptionResult<int>> NonQueryExecutingAsync(
+            System.Data.Common.DbCommand command,
+            CommandEventData eventData,
+            InterceptionResult<int> result,
+            CancellationToken cancellationToken = default)
+        {
+            Commands.Enqueue(command.CommandText);
+            if (SuppressWith is { } suppress)
+                return ValueTask.FromResult(InterceptionResult<int>.SuppressWithResult(suppress(command.CommandText)));
+            if (MissNextReplace && command.CommandText.StartsWith("UPDATE", StringComparison.OrdinalIgnoreCase)
+                && command.CommandText.Contains("state_json", StringComparison.Ordinal))
+            {
+                MissNextReplace = false;
+                return ValueTask.FromResult(InterceptionResult<int>.SuppressWithResult(0));
+            }
+
+            return base.NonQueryExecutingAsync(command, eventData, result, cancellationToken);
+        }
+
+        public override ValueTask<int> NonQueryExecutedAsync(
+            System.Data.Common.DbCommand command,
+            CommandExecutedEventData eventData,
+            int result,
+            CancellationToken cancellationToken = default)
+            => ValueTask.FromResult(ReportRowCount ?? result);
+
+        public override async ValueTask<InterceptionResult<System.Data.Common.DbDataReader>> ReaderExecutingAsync(
+            System.Data.Common.DbCommand command,
+            CommandEventData eventData,
+            InterceptionResult<System.Data.Common.DbDataReader> result,
+            CancellationToken cancellationToken = default)
+        {
+            Commands.Enqueue(command.CommandText);
+            if (BeforeNextExistenceCheck is { } peer && command.CommandText.Contains("EXISTS", StringComparison.OrdinalIgnoreCase))
+            {
+                BeforeNextExistenceCheck = null;
+                await peer();
+            }
+
+            return result;
+        }
+    }
+
+    /// <summary>Lets a provider render and "execute" commands without a server to connect to.</summary>
+    private sealed class SuppressOpenInterceptor : DbConnectionInterceptor
+    {
+        public override ValueTask<InterceptionResult> ConnectionOpeningAsync(
+            System.Data.Common.DbConnection connection,
+            ConnectionEventData eventData,
+            InterceptionResult result,
+            CancellationToken cancellationToken = default)
+            => ValueTask.FromResult(InterceptionResult.Suppress());
+    }
+
     private sealed class ArmedThrowingSaveChangesInterceptor : SaveChangesInterceptor
     {
         public bool Armed { get; set; }
@@ -536,6 +777,19 @@ public sealed class EFCoreDurableFlowStateStoreTests
         {
             await using var context = CreateContext();
             await context.Database.ExecuteSqlRawAsync(sql);
+        }
+
+        /// <summary>
+        /// Backdates a ledger's expiry far into the past: an expired row without waiting out a
+        /// short TTL on the real clock, which a clock step or a slow runner makes timing-dependent.
+        /// </summary>
+        public async Task ExpireAsync(string flowId)
+        {
+            await using var context = CreateContext();
+            var longExpired = new DateTime(2000, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+            Assert.Equal(1, await context.Set<DurableFlowStateRecord>()
+                .Where(r => r.FlowId == flowId)
+                .ExecuteUpdateAsync(setters => setters.SetProperty(r => r.ExpiresAtUtc, longExpired)));
         }
 
         private TestFlowDbContext CreateContext()

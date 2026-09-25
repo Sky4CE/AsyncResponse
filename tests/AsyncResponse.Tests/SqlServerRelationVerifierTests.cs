@@ -3,6 +3,7 @@ using System.Reflection;
 using AsyncResponse.Channels.SqlServer;
 using AsyncResponse.DurableFlows.SqlServer;
 using AsyncResponse.Transports.SqlServer;
+using Microsoft.Data.SqlClient;
 using Microsoft.Extensions.Options;
 using Xunit;
 
@@ -210,6 +211,65 @@ public sealed class SqlServerRelationVerifierTests
         Assert.Contains("missing the column 'queue';", missing.Message, StringComparison.Ordinal);
     }
 
+    [Theory]
+    [MemberData(nameof(AnchorTypes))]
+    public void EvaluateTableColumns_WidthIsExact_UnlessTheColumnOptsIntoAMinimum(Type anchor)
+    {
+        var verifier = new Verifier(anchor);
+        var exact = verifier.Tables(verifier.Table("jobs", verifier.Column("id", "nvarchar(400)", nullable: false)));
+        var minimum = verifier.Tables(verifier.Table("jobs", verifier.Column("id", "nvarchar(400)", nullable: false, minimumWidth: true)));
+        object Row(string type) => verifier.ColumnRow(type, nullable: false);
+
+        // Unflagged columns (every channel and transport column) keep the exact comparison.
+        Assert.NotNull(verifier.Evaluate(exact, [(("jobs", "id"), Row("nvarchar(450)"))]));
+
+        // Flagged: wider or (max) of the SAME base type passes; narrower, another base type, or a
+        // fixed-width type does not.
+        Assert.Null(verifier.Evaluate(minimum, [(("jobs", "id"), Row("nvarchar(400)"))]));
+        Assert.Null(verifier.Evaluate(minimum, [(("jobs", "id"), Row("nvarchar(450)"))]));
+        Assert.Null(verifier.Evaluate(minimum, [(("jobs", "id"), Row("nvarchar(max)"))]));
+        Assert.NotNull(verifier.Evaluate(minimum, [(("jobs", "id"), Row("nvarchar(399)"))]));
+        Assert.NotNull(verifier.Evaluate(minimum, [(("jobs", "id"), Row("varchar(4000)"))]));
+        Assert.NotNull(verifier.Evaluate(minimum, [(("jobs", "id"), Row("nchar(450)"))]));
+    }
+
+    [Fact]
+    public void DurableFlowStore_AcceptsAMoreGenerousOperatorSchema_ButStillRefusesANarrowerOne()
+    {
+        // Regression: the flow store compared nvarchar widths exactly, so an operator-provisioned
+        // `flow_id nvarchar(450)` (the classic 900-byte key) or `lease_id nvarchar(100)` failed
+        // startup as a "collision", where the MySQL and Oracle siblings treat widths as minimums.
+        // The binary collation and the datetime2(7) scale stay required.
+        var options = new SqlServerDurableFlowOptions { ConnectionString = ConnectionString };
+        var store = new SqlServerFlowStateStore(Options.Create(options));
+        var verifier = new Verifier(typeof(SqlServerDurableFlowOptions));
+        var tables = (Array)typeof(SqlServerFlowStateStore)
+            .GetMethod("ExpectedObjects", BindingFlags.Instance | BindingFlags.NonPublic)!
+            .Invoke(store, null)!;
+        var table = options.TableName;
+        InvalidOperationException? Check(string flowId, string leaseId, string leaseExpires = "datetime2(7)")
+            => verifier.Evaluate(tables,
+            [
+                ((table, "flow_id"), verifier.ColumnRow(flowId, nullable: false, collation: "Latin1_General_100_BIN2")),
+                ((table, "state_json"), verifier.ColumnRow("nvarchar(max)", nullable: false)),
+                ((table, "expires_at_utc"), verifier.ColumnRow("datetime2(7)", nullable: false)),
+                ((table, "updated_at_utc"), verifier.ColumnRow("datetime2(7)", nullable: false)),
+                ((table, "revision"), verifier.ColumnRow("bigint", nullable: false)),
+                ((table, "lease_id"), verifier.ColumnRow(leaseId, nullable: true)),
+                ((table, "lease_expires_at_utc"), verifier.ColumnRow(leaseExpires, nullable: true)),
+            ]);
+
+        Assert.Null(Check("nvarchar(400)", "nvarchar(64)"));
+        Assert.Null(Check("nvarchar(450)", "nvarchar(100)"));
+        Assert.Null(Check("nvarchar(400)", "nvarchar(max)"));
+
+        var narrow = Check("nvarchar(100)", "nvarchar(64)");
+        Assert.NotNull(narrow);
+        Assert.Contains("'flow_id'", narrow.Message, StringComparison.Ordinal);
+        Assert.NotNull(Check("nvarchar(400)", "nvarchar(32)"));
+        Assert.NotNull(Check("nvarchar(400)", "nvarchar(64)", leaseExpires: "datetime2(3)"));
+    }
+
     private static IEnumerable<(string Label, object Store)> Stores()
     {
         yield return ("channel", new SqlServerChannelSql(Options.Create(new SqlServerAsyncResponseChannelOptions { ConnectionString = ConnectionString })));
@@ -288,6 +348,51 @@ public sealed class SqlServerRelationVerifierTests
         Assert.Contains("NO MAXVALUE", capped.Message, StringComparison.Ordinal);
     }
 
+    /// <summary>
+    /// Regression: the failed-batch diagnosis caught only <see cref="SqlException"/> around opening
+    /// its connection and treated EVERY <see cref="InvalidOperationException"/> from the checks as
+    /// its own finding — so SqlClient's pool-timeout InvalidOperationException on open, or a provider
+    /// error from a catalog query, escaped the diagnosis and replaced the original DDL error with an
+    /// unrelated one. Only the verifier's own diagnosis may replace it now; anything else returns so
+    /// the caller's <c>throw;</c> surfaces the real failure.
+    /// </summary>
+    [Theory]
+    [MemberData(nameof(AnchorTypes))]
+    public async Task DiagnoseFailedBatch_LetsTheOriginalErrorStand_WhenTheDiagnosisItselfFails(Type anchor)
+    {
+        var verifier = new Verifier(anchor);
+        var failure = RelationalSharedHelperTests.SqlExceptionWith(262);
+        var expected = verifier.Tables(verifier.Table("jobs", verifier.Column("id", "uniqueidentifier", nullable: false)));
+
+        // Opening the diagnosis connection fails with SqlClient's pool-timeout exception type.
+        await verifier.DiagnoseAsync(
+            _ => throw new InvalidOperationException("Timeout expired. The timeout period elapsed prior to obtaining a connection from the pool."),
+            failure,
+            expected);
+
+        // A catalog query fails with a provider InvalidOperationException (here: the connection
+        // handed back was never opened).
+        await verifier.DiagnoseAsync(_ => Task.FromResult(new SqlConnection(ConnectionString)), failure, expected);
+    }
+
+    /// <summary>
+    /// A same-name decimal/numeric sequence (default MAXVALUE 10^38-1) used to hit arithmetic
+    /// overflow 8115 inside <c>CAST(sq.maximum_value AS bigint)</c> before the type check ran; the
+    /// catalog now reads increment/maximum only for bigint (NULL otherwise), and the decision reports
+    /// the wrong TYPE actionably.
+    /// </summary>
+    [Theory]
+    [MemberData(nameof(AnchorTypes))]
+    public void EvaluateSequence_ReportsANonBigintSequenceByItsType(Type anchor)
+    {
+        var verifier = new Verifier(anchor);
+
+        var wrongType = verifier.EvaluateSequenceRow("decimal", increment: null, cycles: false, maximum: null);
+
+        Assert.NotNull(wrongType);
+        Assert.Contains("found decimal NO CYCLE", wrongType.Message, StringComparison.Ordinal);
+    }
+
     private sealed class Verifier
     {
         private readonly Type _expectedObject;
@@ -302,6 +407,7 @@ public sealed class SqlServerRelationVerifierTests
         private readonly MethodInfo _evaluateIndexes;
         private readonly MethodInfo _evaluatePrimaryKeys;
         private readonly MethodInfo _evaluateSequence;
+        private readonly MethodInfo _diagnose;
 
         public Verifier(Type anchor)
         {
@@ -321,6 +427,7 @@ public sealed class SqlServerRelationVerifierTests
             _evaluateIndexes = type.GetMethod("EvaluateIndexes", BindingFlags.NonPublic | BindingFlags.Static)!;
             _evaluatePrimaryKeys = type.GetMethod("EvaluatePrimaryKeys", BindingFlags.NonPublic | BindingFlags.Static)!;
             _evaluateSequence = type.GetMethod("EvaluateSequence", BindingFlags.NonPublic | BindingFlags.Static)!;
+            _diagnose = type.GetMethod("ThrowDiagnosedCollisionAsync", BindingFlags.Public | BindingFlags.Static)!;
         }
 
         /// <summary>A table expectation that declares only its primary key.</summary>
@@ -348,7 +455,7 @@ public sealed class SqlServerRelationVerifierTests
         }
 
         /// <summary>Runs the pure sequence decision over one fabricated sys.sequences row; null means "accepted".</summary>
-        public InvalidOperationException? EvaluateSequenceRow(string type, long increment, bool cycles, long maximum)
+        public InvalidOperationException? EvaluateSequenceRow(string type, long? increment, bool cycles, long? maximum)
         {
             try
             {
@@ -361,11 +468,20 @@ public sealed class SqlServerRelationVerifierTests
             }
         }
 
+        /// <summary>Runs the failed-batch diagnosis; completing normally means "let the original error stand".</summary>
+        public Task DiagnoseAsync(Func<CancellationToken, Task<SqlConnection>> openConnectionAsync, SqlException failure, Array expected)
+            => (Task)_diagnose.Invoke(null, [openConnectionAsync, failure, null, "catalog_test", "channel", expected, CancellationToken.None])!;
+
         public string RenderType(string typeName, short maxLength, byte scale)
             => (string)_renderType.Invoke(null, [typeName, maxLength, scale])!;
 
-        public object Column(string name, string? type, bool nullable, bool requiresBinaryCollation = false, string? defaultExpression = null)
-            => Activator.CreateInstance(_expectedColumn, name, type, nullable, requiresBinaryCollation, defaultExpression)!;
+        public object Column(string name, string? type, bool nullable, bool requiresBinaryCollation = false, string? defaultExpression = null, bool minimumWidth = false)
+        {
+            var column = Activator.CreateInstance(_expectedColumn, name, type, nullable, requiresBinaryCollation, defaultExpression)!;
+            if (minimumWidth)
+                _expectedColumn.GetProperty("MinimumWidth")!.SetValue(column, true);
+            return column;
+        }
 
         public object Table(string name, params object[] columns)
             // Positional args must cover the whole ctor: ExpectedObject also carries the index

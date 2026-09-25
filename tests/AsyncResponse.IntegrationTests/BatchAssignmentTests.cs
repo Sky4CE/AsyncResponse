@@ -30,9 +30,14 @@ public sealed class BatchAssignmentTests
         [MatrixCloudCosmosCollection.Name] = typeof(MatrixCloudCosmosFixture),
     };
 
-    private static IEnumerable<Type> TestClasses => typeof(BatchAssignmentTests).Assembly
+    /// <summary>
+    /// Every class xUnit can run. Nested public classes included: xUnit discovers them like any other,
+    /// and a filter on <see cref="Type.IsPublic"/> alone (false for every nested type) hid them from
+    /// all of these guards — an untagged nested class ran locally and in no CI leg.
+    /// </summary>
+    internal static IEnumerable<Type> TestClasses => typeof(BatchAssignmentTests).Assembly
         .GetTypes()
-        .Where(type => type is { IsAbstract: false, IsPublic: true })
+        .Where(type => !type.IsAbstract && (type.IsPublic || type.IsNestedPublic))
         .Where(type => type.GetMethods()
             .Any(method => method.GetCustomAttributes<FactAttribute>().Any()
                 || method.GetCustomAttributes<TheoryAttribute>().Any()));
@@ -134,7 +139,7 @@ public sealed class BatchAssignmentTests
     /// Read through <see cref="CustomAttributeData"/> rather than xUnit's trait API, which has moved
     /// between versions; the constructor arguments have not.
     /// </summary>
-    private static string? BatchTrait(Type type) => type.GetCustomAttributesData()
+    internal static string? BatchTrait(Type type) => type.GetCustomAttributesData()
         .Where(attribute => attribute.AttributeType.Name == nameof(TraitAttribute))
         .Where(attribute => attribute.ConstructorArguments.Count == 2)
         .Where(attribute => (string?)attribute.ConstructorArguments[0].Value == Batches.Trait)

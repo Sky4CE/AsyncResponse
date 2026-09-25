@@ -30,6 +30,7 @@
     <Compile Include="..\..\Shared\SqlServerRelationVerifier.cs" Link="SqlServerRelationVerifier.cs" />
     <Compile Include="..\..\Shared\SqlServerTransientFaults.cs" Link="SqlServerTransientFaults.cs" />
     <Compile Include="..\..\Shared\RelationalNamePlan.cs" Link="RelationalNamePlan.cs" />
+    <Compile Include="..\..\Shared\OpportunisticPrune.cs" Link="OpportunisticPrune.cs" />
   </ItemGroup>
 
   <ItemGroup>

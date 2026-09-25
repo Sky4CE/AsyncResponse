@@ -45,8 +45,8 @@ public sealed record AsyncResponseStaleRecoveryEntry(
 /// <item><description><b>Degraded</b> — stale entries exist, the last scan failed, the last scan
 /// was truncated at the buffer cap (its verdict covers a subset only), waiter liveness could not
 /// be probed for some entries (their staleness is unknown), or the watchdog stopped publishing
-/// (snapshot older than twice the scan interval, or no first snapshot after the startup delay
-/// plus twice the interval).</description></item>
+/// (snapshot older than twice the scan interval plus the interval jitter, or no first snapshot
+/// after the startup delay plus twice the interval).</description></item>
 /// </list>
 /// </summary>
 public sealed class AsyncResponseRecoveryHealthCheck(AsyncResponseWatchdogState _state, TimeProvider? _timeProvider = null) : IHealthCheck
@@ -66,11 +66,16 @@ public sealed class AsyncResponseRecoveryHealthCheck(AsyncResponseWatchdogState 
         if (snapshot is null)
             return EvaluateBeforeFirstScan(activation, utcNow);
 
+        // A healthy next snapshot lands up to Interval + jitter + scan duration after the last
+        // one (the loop waits a jittered interval, then scans, then stamps). A bare 2 x Interval
+        // budget left only Interval - jitter for the scan itself — none at the maximum legal
+        // jitter — so a healthy watchdog read "stopped reporting" for up to one scan duration.
+        var jitter = activation?.IntervalJitter ?? TimeSpan.Zero;
         var snapshotAge = utcNow - snapshot.ScanCompletedUtc;
-        if (snapshotAge > snapshot.ScanInterval * 2)
+        if (snapshotAge > snapshot.ScanInterval * 2 + jitter)
         {
             return HealthCheckResult.Degraded(
-                $"Async-response watchdog stopped reporting: last scan {snapshot.ScanCompletedUtc:u} is older than twice the scan interval ({snapshot.ScanInterval}).",
+                $"Async-response watchdog stopped reporting: last scan {snapshot.ScanCompletedUtc:u} is older than twice the scan interval ({snapshot.ScanInterval}) plus its jitter ({jitter}).",
                 data: BuildData(snapshot));
         }
 

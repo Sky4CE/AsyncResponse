@@ -115,6 +115,49 @@ public sealed class MongoDbTransportCoverageTests
     }
 
     /// <summary>
+    /// Regression: the dead-letter prune runs AFTER the publish's upsert committed, and it was
+    /// awaited bare (only PostgreSQL had been guarded) — so a prune that threw (a connection error,
+    /// the caller's token firing mid-delete) reported a FAILED publish for a job that was already
+    /// claimable, and the caller's retry ran it twice. The prune now swallows its own failure.
+    /// </summary>
+    [Fact]
+    public async Task Publish_ThatCommitted_IsNotFailedByAThrowingDeadLetterPrune()
+    {
+        var upserts = 0;
+        var collection = new Mock<IMongoCollection<MongoTransportMessageDocument>>(MockBehavior.Loose).SelfPinning();
+        collection
+            .Setup(c => c.UpdateOneAsync(
+                It.IsAny<FilterDefinition<MongoTransportMessageDocument>>(),
+                It.IsAny<UpdateDefinition<MongoTransportMessageDocument>>(),
+                It.IsAny<UpdateOptions>(),
+                It.IsAny<CancellationToken>()))
+            .Callback(() => upserts++)
+            .ReturnsAsync(new UpdateResult.Acknowledged(0, 0, BsonNull.Value));
+        collection
+            .Setup(c => c.DeleteManyAsync(
+                It.IsAny<FilterDefinition<MongoTransportMessageDocument>>(),
+                It.IsAny<DeleteOptions>(),
+                It.IsAny<CancellationToken>()))
+            .ThrowsAsync(new TimeoutException("prune lost its connection"));
+        var logger = new CollectingLogger();
+        var options = Options.Create(new MongoDbAsyncResponseTransportOptions
+        {
+            AutoCreateIndexes = false,
+            UseOwnershipLedger = false,
+            DeadLetterRetention = TimeSpan.FromMinutes(30)
+        });
+        using var store = new MongoDbTransportStore(Database(collection.Object).Object, options, logger: logger.For<MongoDbTransportStore>());
+
+        await store.PublishAsync(Guid.NewGuid(), "worker", "{}", headers: null, CancellationToken.None);
+
+        Assert.Equal(1, upserts);
+        collection.Verify(
+            c => c.DeleteManyAsync(It.IsAny<FilterDefinition<MongoTransportMessageDocument>>(), It.IsAny<DeleteOptions>(), It.IsAny<CancellationToken>()),
+            Times.Once);
+        Assert.Contains(logger.Entries, entry => entry.Exception is TimeoutException);
+    }
+
+    /// <summary>
     /// Regression (round 33): the claim's FindOneAndUpdateOptions carried no collation. The three
     /// logical queues share one collection and are told apart by nothing but the queue field, so
     /// on an operator-created collection with a case- or accent-folding default collation the
@@ -125,22 +168,24 @@ public sealed class MongoDbTransportCoverageTests
     [Fact]
     public async Task Claim_PinsTheBinaryCollation_SoAFoldingCollectionCannotCrossRouteQueues()
     {
-        FindOneAndUpdateOptions<MongoTransportMessageDocument, MongoTransportMessageDocument>? claimOptions = null;
+        FindOneAndUpdateOptions<BsonDocument, BsonDocument>? claimOptions = null;
         var collection = new Mock<IMongoCollection<MongoTransportMessageDocument>>(MockBehavior.Loose).SelfPinning();
-        collection
+        var database = Database(collection.Object);
+        var raw = database.WithRawTransportMessages();
+        raw
             .Setup(c => c.FindOneAndUpdateAsync(
-                It.IsAny<FilterDefinition<MongoTransportMessageDocument>>(),
-                It.IsAny<UpdateDefinition<MongoTransportMessageDocument>>(),
-                It.IsAny<FindOneAndUpdateOptions<MongoTransportMessageDocument, MongoTransportMessageDocument>>(),
+                It.IsAny<FilterDefinition<BsonDocument>>(),
+                It.IsAny<UpdateDefinition<BsonDocument>>(),
+                It.IsAny<FindOneAndUpdateOptions<BsonDocument, BsonDocument>>(),
                 It.IsAny<CancellationToken>()))
             .Callback((
-                FilterDefinition<MongoTransportMessageDocument> _,
-                UpdateDefinition<MongoTransportMessageDocument> _,
-                FindOneAndUpdateOptions<MongoTransportMessageDocument, MongoTransportMessageDocument> options,
+                FilterDefinition<BsonDocument> _,
+                UpdateDefinition<BsonDocument> _,
+                FindOneAndUpdateOptions<BsonDocument, BsonDocument> options,
                 CancellationToken _) => claimOptions = options)
-            .ReturnsAsync((MongoTransportMessageDocument)null!);
+            .ReturnsAsync((BsonDocument)null!);
         var options = Options.Create(new MongoDbAsyncResponseTransportOptions { AutoCreateIndexes = false });
-        using var store = CreateStore(collection.Object, options);
+        using var store = new MongoDbTransportStore(database.Object, options);
 
         Assert.Null(await store.TryClaimAsync("worker", TimeSpan.FromSeconds(1), CancellationToken.None));
 
@@ -173,13 +218,14 @@ public sealed class MongoDbTransportCoverageTests
             Headers = new Dictionary<string, string>()
         };
         var collection = new Mock<IMongoCollection<MongoTransportMessageDocument>>(MockBehavior.Loose).SelfPinning();
-        collection
+        var claims = new Mock<IMongoCollection<BsonDocument>>(MockBehavior.Loose).SelfPinning();
+        claims
             .Setup(c => c.FindOneAndUpdateAsync(
-                It.IsAny<FilterDefinition<MongoTransportMessageDocument>>(),
-                It.IsAny<UpdateDefinition<MongoTransportMessageDocument>>(),
-                It.IsAny<FindOneAndUpdateOptions<MongoTransportMessageDocument, MongoTransportMessageDocument>>(),
+                It.IsAny<FilterDefinition<BsonDocument>>(),
+                It.IsAny<UpdateDefinition<BsonDocument>>(),
+                It.IsAny<FindOneAndUpdateOptions<BsonDocument, BsonDocument>>(),
                 It.IsAny<CancellationToken>()))
-            .ReturnsAsync(message);
+            .ReturnsAsync(() => message.ToBsonDocument());
         collection
             .Setup(c => c.DeleteOneAsync(It.IsAny<FilterDefinition<MongoTransportMessageDocument>>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync(new DeleteResult.Acknowledged(1));
@@ -189,7 +235,7 @@ public sealed class MongoDbTransportCoverageTests
             AutoCreateIndexes = false,
             DeadLetterEnabled = false
         });
-        using (var disabledStore = CreateStore(collection.Object, disabledOptions))
+        using (var disabledStore = CreateStore(collection.Object, disabledOptions, claims.Object))
         {
             var delivery = Assert.IsType<MongoDbTransportDelivery>(
                 await disabledStore.TryClaimAsync("worker", TimeSpan.FromSeconds(1), CancellationToken.None));
@@ -207,7 +253,7 @@ public sealed class MongoDbTransportCoverageTests
                 It.IsAny<CancellationToken>()))
             .ThrowsAsync(new InvalidOperationException("dlq unavailable"));
         var enabledOptions = Options.Create(new MongoDbAsyncResponseTransportOptions { AutoCreateIndexes = false });
-        using var enabledStore = CreateStore(collection.Object, enabledOptions);
+        using var enabledStore = CreateStore(collection.Object, enabledOptions, claims.Object);
         var enabledDelivery = Assert.IsType<MongoDbTransportDelivery>(
             await enabledStore.TryClaimAsync("worker", TimeSpan.FromSeconds(1), CancellationToken.None));
 
@@ -236,13 +282,14 @@ public sealed class MongoDbTransportCoverageTests
         };
         var deletes = new List<BsonDocument>();
         var collection = new Mock<IMongoCollection<MongoTransportMessageDocument>>(MockBehavior.Loose).SelfPinning();
-        collection
+        var claims = new Mock<IMongoCollection<BsonDocument>>(MockBehavior.Loose).SelfPinning();
+        claims
             .Setup(c => c.FindOneAndUpdateAsync(
-                It.IsAny<FilterDefinition<MongoTransportMessageDocument>>(),
-                It.IsAny<UpdateDefinition<MongoTransportMessageDocument>>(),
-                It.IsAny<FindOneAndUpdateOptions<MongoTransportMessageDocument, MongoTransportMessageDocument>>(),
+                It.IsAny<FilterDefinition<BsonDocument>>(),
+                It.IsAny<UpdateDefinition<BsonDocument>>(),
+                It.IsAny<FindOneAndUpdateOptions<BsonDocument, BsonDocument>>(),
                 It.IsAny<CancellationToken>()))
-            .ReturnsAsync(message);
+            .ReturnsAsync(() => message.ToBsonDocument());
         collection
             .Setup(c => c.UpdateOneAsync(
                 It.IsAny<FilterDefinition<MongoTransportMessageDocument>>(),
@@ -258,7 +305,7 @@ public sealed class MongoDbTransportCoverageTests
             .ReturnsAsync(new DeleteResult.Acknowledged(0));
 
         var options = Options.Create(new MongoDbAsyncResponseTransportOptions { AutoCreateIndexes = false });
-        using var store = CreateStore(collection.Object, options);
+        using var store = CreateStore(collection.Object, options, claims.Object);
         var delivery = Assert.IsType<MongoDbTransportDelivery>(
             await store.TryClaimAsync("worker", TimeSpan.FromSeconds(1), CancellationToken.None));
 
@@ -396,12 +443,23 @@ public sealed class MongoDbTransportCoverageTests
         () => ValueTask.CompletedTask,
         _ => ValueTask.CompletedTask,
         (_, _, _) => ValueTask.FromResult(true),
-        () => ValueTask.FromResult(true));
+        _ => ValueTask.FromResult(true));
 
     private static MongoDbTransportStore CreateStore(
         IMongoCollection<MongoTransportMessageDocument> collection,
-        IOptions<MongoDbAsyncResponseTransportOptions> options)
-        => new(Database(collection).Object, options);
+        IOptions<MongoDbAsyncResponseTransportOptions> options,
+        IMongoCollection<BsonDocument>? claims = null)
+    {
+        var database = Database(collection);
+        if (claims is not null)
+        {
+            database
+                .Setup(d => d.GetCollection<BsonDocument>(options.Value.MessageCollection, It.IsAny<MongoCollectionSettings>()))
+                .Returns(claims);
+        }
+
+        return new(database.Object, options);
+    }
 
     private static Mock<IMongoDatabase> Database(IMongoCollection<MongoTransportMessageDocument> collection)
     {

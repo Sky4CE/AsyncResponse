@@ -72,7 +72,14 @@ public sealed class RabbitMqSubscriberOptions
     public RabbitMqAckMode AckMode { get; set; } = RabbitMqAckMode.AckAfterHandlerCompletes;
 
     /// <summary>
-    /// Prefetch count set through <c>basic.qos</c>. Default: <c>16</c>.
+    /// Prefetch count set through <c>basic.qos</c>. Default: <c>16</c>. On the worker subscriber in
+    /// <see cref="RabbitMqAckMode.AckAfterHandlerCompletes"/> mode the transport's advertised in-flight
+    /// ceiling is <see cref="RabbitMqAsyncResponseOptions.BrokerConsumerTimeout"/> divided by this value
+    /// (prefetched deliveries age against the broker's <c>consumer_timeout</c> while they wait their turn),
+    /// but never less than one minute (nor more than the timeout itself), so durable-flow timers wait in
+    /// process for at most half of that per delivery; set it to <c>1</c> for workers whose timers should
+    /// use the whole timeout. When the share falls below that one-minute floor (above 30 at the default
+    /// 30-minute timeout) the worker subscriber logs a startup warning. Must be positive.
     /// </summary>
     public ushort PrefetchCount { get; set; } = 16;
 
@@ -86,8 +93,13 @@ public sealed class RabbitMqSubscriberOptions
     /// not increment <c>x-death</c>, the resolved attempt never exceeds 2 on its own, so values above 2 only take
     /// effect when the dead-letter path forms a TTL-retry cycle that re-delivers the message (each dead-letter
     /// hop increments <c>x-death</c>). A value above 2 without such a cycle behaves like 2 and logs a startup
-    /// warning. Ignored for <see cref="RabbitMqAckMode.AckAfterEnqueue"/>, which acknowledges before handling
-    /// and never redelivers.
+    /// warning. Negative values fail startup. On RabbitMQ 4.x quorum queues the broker applies its own
+    /// <c>delivery-limit</c> (20 by default) regardless of this setting, so "unlimited" is bounded there: past
+    /// the limit the broker dead-letters the message, or drops it when no dead-letter exchange is set —
+    /// configure a dead-letter exchange, or raise/disable <c>delivery-limit</c> by policy. Ignored for
+    /// <see cref="RabbitMqAckMode.AckAfterEnqueue"/>, which acknowledges before handling, so the broker never
+    /// redelivers a failed handler's message; its dead-letter copy, if it comes back through the dead-letter
+    /// exchange (a TTL-retry cycle) and fails again, is parked instead of copied into that cycle a second time.
     /// </summary>
     public int MaxDeliveryAttempts { get; set; }
 
@@ -105,7 +117,12 @@ public sealed class RabbitMqSubscriberOptions
     public int BackgroundQueueCapacity { get; set; }
 
     /// <summary>
-    /// Maximum time to wait for queued/running background handlers while the hosted subscriber stops.
+    /// Maximum time to wait for queued/running background handlers while the hosted subscriber stops
+    /// (<see cref="RabbitMqAckMode.AckAfterEnqueue"/>; a quarter of it is reserved for dead-lettering
+    /// whatever is still queued once the rest lapses). In <see cref="RabbitMqAckMode.AckAfterHandlerCompletes"/>
+    /// mode it bounds the wait for the handler still running when the subscriber stops, so its ACK lands
+    /// before the channel closes — shortened to what <see cref="RabbitMqAsyncResponseOptions.HostShutdownTimeout"/>
+    /// leaves after the two <see cref="RabbitMqAsyncResponseOptions.ShutdownTimeout"/> spends. Default: <c>20s</c>.
     /// </summary>
     public TimeSpan BackgroundDrainTimeout { get; set; } = TimeSpan.FromSeconds(20);
 

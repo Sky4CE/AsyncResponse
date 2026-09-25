@@ -7,8 +7,9 @@ namespace AsyncResponse;
 /// Nothing was published.
 /// <para>
 /// Without this producer-side check the job left the process: the transport accepted it (every
-/// database transport and most brokers take far more than the engine's default 8 Mi
-/// characters), the ingress then acknowledged it <em>without executing it</em> — an oversized
+/// database transport and several brokers take more than the engine's default 8 Mi characters;
+/// SQS, Service Bus standard tier, Kafka and NATS reject far less at their own defaults), the
+/// ingress then acknowledged it <em>without executing it</em> — an oversized
 /// message never gets smaller, so redelivering it would hot-loop — and the caller held a flow id
 /// for a run recorded as <c>Running</c> that nothing would ever execute. Failing here, in the
 /// caller's stack, is the only place the mistake can still be corrected.

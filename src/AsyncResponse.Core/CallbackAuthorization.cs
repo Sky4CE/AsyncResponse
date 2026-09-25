@@ -58,7 +58,14 @@ public sealed class AsyncResponseCallbackAllowList
         if (AllowDurableFlowExecutor && typeof(IDurableFlowExecutor).FullName is { } executorName)
             _allowedTypes.Add(executorName);
 
-        return new AllowListAuthorizer(_allowedTypes, _predicates);
+        // Compared by type identity (TypeNameIdentity), as resolution matches them: an allowlisted
+        // closed generic persisted by a build whose argument assembly had another version — a
+        // recovery row written before the deploy that bumped it — used to be refused.
+        var allowed = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var name in _allowedTypes)
+            allowed.Add(TypeNameIdentity.Normalize(name)!);
+
+        return new AllowListAuthorizer(allowed, _predicates);
     }
 
     private sealed class AllowListAuthorizer(HashSet<string> allowedTypes, List<Func<string, string, bool>> predicates)
@@ -67,7 +74,9 @@ public sealed class AsyncResponseCallbackAllowList
         /// <summary>Runs the IsAllowed operation.</summary>
         public bool IsAllowed(string serviceInterfaceFullName, string methodName)
         {
-            if (allowedTypes.Contains(serviceInterfaceFullName))
+            // Normalized like the allowlist (Build); a name outside the persisted type-name limits
+            // is left untouched and must match verbatim.
+            if (allowedTypes.Contains(TypeNameIdentity.Normalize(serviceInterfaceFullName)!))
                 return true;
 
             foreach (var predicate in predicates)

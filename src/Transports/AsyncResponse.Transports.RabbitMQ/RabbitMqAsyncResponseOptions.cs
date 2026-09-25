@@ -164,9 +164,12 @@ public sealed class RabbitMqAsyncResponseOptions
     /// closes a channel whose delivery stays unacknowledged longer than that (<c>PRECONDITION_FAILED</c>)
     /// and requeues the delivery, so a worker handler still running past it — in
     /// <see cref="RabbitMqAckMode.AckAfterHandlerCompletes"/> the delivery stays unacknowledged for the
-    /// handler's whole run — has its job redelivered to another consumer mid-run. The value is advertised
-    /// through <see cref="IWorkerTransportInFlightLimit.MaxInFlightDuration"/> so durable-flow timers that
-    /// wait in process plan their waits inside it; nothing in this package enforces it. Default:
+    /// handler's whole run — has its job redelivered to another consumer mid-run. The broker starts that
+    /// clock when it sends the delivery, so prefetched deliveries age while they wait their turn: the value
+    /// divided by <see cref="RabbitMqSubscriberOptions.PrefetchCount"/> of <see cref="WorkerSubscriber"/> (never
+    /// less than one minute, nor more than the value itself) is
+    /// advertised through <see cref="IWorkerTransportInFlightLimit.MaxInFlightDuration"/>, so durable-flow
+    /// timers that wait in process plan their waits inside it; nothing in this package enforces it. Default:
     /// <c>30 minutes</c>, the broker's default. Keep it equal to (or below) the broker's setting; set
     /// <c>null</c> only when the broker's <c>consumer_timeout</c> is disabled. Must be positive.
     /// </summary>

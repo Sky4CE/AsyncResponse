@@ -534,11 +534,11 @@ public sealed class AzureServiceBusDispatcherTests
     [Fact]
     public void LockRenewalInterval_DefaultBeatsAzureDefaultLockDuration()
     {
-        // Regression (r24): the default was 30 s — exactly Azure Service Bus's own default
-        // LockDuration — and the renewal loop sleeps a FULL interval before its first renew, so
-        // at defaults the heartbeat could never beat lock expiry: later batch messages were
-        // redelivered to a competing consumer and handled twice. The default must stay
-        // comfortably below the 30-second lock.
+        // Regression (r24): the default was 30 s — a LockDuration entities are commonly configured
+        // with (Azure's own default is 60 s) — and the renewal loop sleeps a FULL interval before
+        // its first renew, so against such a lock the heartbeat could never beat lock expiry: later
+        // batch messages were redelivered to a competing consumer and handled twice. The default
+        // must stay comfortably below a 30-second lock.
         var options = new AzureServiceBusSubscriberOptions();
 
         Assert.Equal(TimeSpan.FromSeconds(10), options.LockRenewalInterval);
@@ -592,6 +592,41 @@ public sealed class AzureServiceBusDispatcherTests
 
         releaseHandler.TrySetResult();
         await handlerCompleted.Task.WaitAsync(TimeSpan.FromSeconds(2));
+    }
+
+    [Fact]
+    public async Task AckAfterEnqueue_FlowHandBack_WarnsAndSurfacesIt_WithoutAnErrorLog()
+    {
+        // Fixpoint r1 pre-commit (H6): an early-ACK job the flow engine hands back at host stop
+        // cannot be redelivered (it was completed at enqueue) and a completed message cannot be
+        // dead-lettered, so it is surfaced through OnBackgroundFailure — at Warning, not as a
+        // handler failure at Error.
+        var calls = new SettlementCalls();
+        var failure = new TaskCompletionSource<AzureServiceBusBackgroundFailureContext>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var logger = new CapturingLogger<AzureServiceBusDispatcherTests>();
+        await using var dispatcher = AzureServiceBusMessageDispatcher.Create(
+            (_, _) => throw new DurableFlowInterruptedException("the host is stopping"),
+            new AzureServiceBusAsyncResponseOptions(),
+            new AzureServiceBusSubscriberOptions
+            {
+                OnBackgroundFailure = context =>
+                {
+                    failure.TrySetResult(context);
+                    return ValueTask.CompletedTask;
+                }
+            }.UseAckAfterEnqueue(1, 8, TimeSpan.FromSeconds(5)),
+            logger,
+            "workers",
+            AzureServiceBusSubscriberRole.Worker);
+
+        await dispatcher.HandleAsync(Delivery(calls), CancellationToken.None);
+
+        var surfaced = await failure.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.IsType<DurableFlowInterruptedException>(surfaced.Exception);
+        Assert.Equal(1, calls.Complete);
+        Assert.Contains(logger.Entries, entry => entry.Level == Microsoft.Extensions.Logging.LogLevel.Warning
+            && entry.Message.Contains("handed back by the flow engine", StringComparison.Ordinal));
+        Assert.DoesNotContain(logger.Entries, entry => entry.Level >= Microsoft.Extensions.Logging.LogLevel.Error);
     }
 
     [Fact]
@@ -768,6 +803,86 @@ public sealed class AzureServiceBusDispatcherTests
         Assert.Equal(0, calls.Complete);
         Assert.Equal(0, calls.Abandon);
         Assert.Equal(0, calls.DeadLetter);
+    }
+
+    [Theory]
+    [InlineData(1)] // below the cap: the failure path abandoned it, and the live receiver pulled it straight back
+    [InlineData(5)] // at the cap: the failure path dead-lettered the flow's only wake-up
+    public async Task HostStopInterruption_WhileTheSubscriberTokenIsLive_LeavesTheMessageUnsettled(int deliveryCount)
+    {
+        // Red-on-old (fixpoint r1, GS5#1): the flow engine throws DurableFlowInterruptedException
+        // on ApplicationStopping, which fires BEFORE the hosted subscriber's own token. Keyed on
+        // that token alone, the dispatcher treated the interruption as a handler failure — an
+        // Error log, then Abandon (re-received at once by the still-running loop) until the
+        // delivery-count cap dead-lettered the wake-up and stranded the run.
+        var calls = new SettlementCalls();
+        var logger = new CollectingLogger();
+        await using var dispatcher = AzureServiceBusMessageDispatcher.Create(
+            (_, _) => throw new DurableFlowInterruptedException("the host is stopping"),
+            new AzureServiceBusAsyncResponseOptions(),
+            new AzureServiceBusSubscriberOptions { MaxDeliveryAttempts = 5 },
+            logger,
+            "workers",
+            AzureServiceBusSubscriberRole.Worker);
+
+        // Returns normally: the receive loop is live and must not enter the supervisor's failure path.
+        await dispatcher.HandleAsync(Delivery(calls, deliveryCount: deliveryCount), CancellationToken.None);
+
+        Assert.Equal(0, calls.Complete);
+        Assert.Equal(0, calls.Abandon);
+        Assert.Equal(0, calls.DeadLetter);
+        Assert.DoesNotContain(logger.Messages, message => message.Contains("handling failed", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task AckAfterEnqueue_DrainLapse_SurfacesEveryStillQueuedEntryBeforeDisposeReturns()
+    {
+        // Red-on-old (fixpoint r1, GS5#4): past the drain budget only a worker that freed up
+        // surfaced a queued entry — and with every worker still inside a handler that ignores the
+        // token, none did before DisposeAsync returned and the process exited, so already-completed
+        // work vanished with no OnBackgroundFailure call. The dispose now surfaces the rest itself
+        // within the last quarter of the budget and logs the loss with its count.
+        var failures = new List<string>();
+        var logger = new CollectingLogger();
+        var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var dispatcher = AzureServiceBusMessageDispatcher.Create(
+            async (_, _) =>
+            {
+                started.TrySetResult();
+                await release.Task.ConfigureAwait(false);
+            },
+            new AzureServiceBusAsyncResponseOptions(),
+            new AzureServiceBusSubscriberOptions
+            {
+                OnBackgroundFailure = context =>
+                {
+                    lock (failures)
+                        failures.Add(context.MessageId);
+                    return ValueTask.CompletedTask;
+                }
+            }.UseAckAfterEnqueue(1, 8, TimeSpan.FromMilliseconds(400)),
+            logger,
+            "workers",
+            AzureServiceBusSubscriberRole.Worker);
+
+        try
+        {
+            await dispatcher.HandleAsync(Delivery(new SettlementCalls(), messageId: "m1"), CancellationToken.None);
+            await started.Task.WaitAsync(TimeSpan.FromSeconds(2));
+            await dispatcher.HandleAsync(Delivery(new SettlementCalls(), messageId: "m2"), CancellationToken.None);
+            await dispatcher.HandleAsync(Delivery(new SettlementCalls(), messageId: "m3"), CancellationToken.None);
+
+            await dispatcher.DisposeAsync(); // the only worker is still blocked in m1's handler
+
+            lock (failures)
+                Assert.Equal(["m2", "m3"], failures);
+            Assert.Contains(logger.Messages, message => message.Contains("lapsed with 2 already-completed message(s)", StringComparison.Ordinal));
+        }
+        finally
+        {
+            release.TrySetResult();
+        }
     }
 
     [Fact]

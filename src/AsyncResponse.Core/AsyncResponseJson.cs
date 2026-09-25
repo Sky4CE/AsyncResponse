@@ -138,15 +138,32 @@ internal static class AsyncResponseJson
         catch (NotSupportedException ex)
         {
             var guidance = new NotSupportedException(
-                $"No JSON metadata is available for '{type}'. This app runs without reflection-based " +
-                "System.Text.Json (trimmed/Native AOT), so payload types must be registered at startup: " +
-                $"declare [JsonSerializable(typeof({type.Name}))] on a JsonSerializerContext and call " +
-                $"{nameof(AsyncResponseJsonSerialization)}.{nameof(AsyncResponseJsonSerialization.RegisterResolver)}(YourContext.Default).",
+                _reflectionResolver is null
+                    ? $"No JSON metadata is available for '{type}'. This app runs without reflection-based " +
+                      "System.Text.Json (trimmed/Native AOT), so payload types must be registered at startup: " +
+                      $"declare [JsonSerializable(typeof({type.Name}))] on a JsonSerializerContext and call " +
+                      $"{RegisterResolverCall}(YourContext.Default)."
+                    : $"No JSON metadata is available for '{type}' — the inner exception says why. {ReflectionEnabledAdvice}",
                 ex);
             guidance.Data[RegistrationGuidanceMarker] = true;
             throw guidance;
         }
     }
+
+    private const string RegisterResolverCall =
+        $"{nameof(AsyncResponseJsonSerialization)}.{nameof(AsyncResponseJsonSerialization.RegisterResolver)}";
+
+    /// <summary>
+    /// The JIT half of the guidance. Reflection-based metadata is enabled, and it backs every
+    /// option set the library owns, so the failure is not a missing startup registration — telling
+    /// the app it runs trimmed/Native AOT, and that registering a context will help, sent the
+    /// reader after a fix that cannot work for a type the serializer refuses in every mode.
+    /// </summary>
+    private const string ReflectionEnabledAdvice =
+        "Reflection-based System.Text.Json is enabled in this app, so this is not a missing startup registration: " +
+        "System.Text.Json does not support the type (System.Type, delegates and pointers never serialize), or the " +
+        "JsonSerializerOptions in use carry their own resolver without it. Registering types through " +
+        $"{RegisterResolverCall} is required only in trimmed/Native AOT apps.";
 
     /// <summary>Marks the guidance-carrying NotSupportedException so wrappers never re-wrap it.</summary>
     private const string RegistrationGuidanceMarker = "asyncresponse.registration_guidance";
@@ -155,17 +172,37 @@ internal static class AsyncResponseJson
         => ex.Data.Contains(RegistrationGuidanceMarker);
 
     /// <summary>
+    /// The register-your-type guidance carried by <paramref name="exception"/> or anything in its
+    /// inner-exception chain, or <c>null</c>. The serializer re-wraps a converter's
+    /// <see cref="NotSupportedException"/> with the reader's path appended, so guidance raised
+    /// while resolving metadata mid-read arrives as an inner exception.
+    /// </summary>
+    internal static NotSupportedException? FindRegistrationGuidance(Exception exception)
+    {
+        for (Exception? current = exception; current is not null; current = current.InnerException)
+        {
+            if (current is NotSupportedException notSupported && IsRegistrationGuidance(notSupported))
+                return notSupported;
+        }
+
+        return null;
+    }
+
+    /// <summary>
     /// Guidance for a metadata failure raised mid-serialization by a member's RUNTIME type (the
     /// root type itself resolved fine); the inner exception names the exact path.
     /// </summary>
     private static NotSupportedException MemberRegistrationGuidance(Type rootType, NotSupportedException inner)
     {
         var guidance = new NotSupportedException(
-            $"A value reached through '{rootType}' has a runtime type with no JSON metadata — the inner exception names the " +
-            "path (typically an object-typed member such as a worker-call argument whose runtime type is an enum or other " +
-            "unregistered type). This app runs without reflection-based System.Text.Json (trimmed/Native AOT), so that type " +
-            "must be registered at startup: declare [JsonSerializable(typeof(...))] on a JsonSerializerContext and call " +
-            $"{nameof(AsyncResponseJsonSerialization)}.{nameof(AsyncResponseJsonSerialization.RegisterResolver)}(YourContext.Default).",
+            _reflectionResolver is null
+                ? $"A value reached through '{rootType}' has a runtime type with no JSON metadata — the inner exception names the " +
+                  "path (typically an object-typed member such as a worker-call argument whose runtime type is an enum or other " +
+                  "unregistered type). This app runs without reflection-based System.Text.Json (trimmed/Native AOT), so that type " +
+                  "must be registered at startup: declare [JsonSerializable(typeof(...))] on a JsonSerializerContext and call " +
+                  $"{RegisterResolverCall}(YourContext.Default)."
+                : $"A value reached through '{rootType}' cannot be serialized — the inner exception names the path (typically an " +
+                  $"object-typed member such as a worker-call argument). {ReflectionEnabledAdvice}",
             inner);
         guidance.Data[RegistrationGuidanceMarker] = true;
         return guidance;

@@ -53,8 +53,13 @@ internal interface INatsJetStreamTransport
     /// </summary>
     Task EnsureDeadLetterStreamAsync(string stream, string subject, long? maxMessages, CancellationToken cancellationToken);
 
-    /// <summary>Idempotently creates or updates a durable explicit-ack consumer on <paramref name="stream"/>.</summary>
-    Task EnsureConsumerAsync(string stream, string durable, TimeSpan ackWait, CancellationToken cancellationToken);
+    /// <summary>
+    /// Creates the durable explicit-ack pull consumer on <paramref name="stream"/> when it does not
+    /// exist. An existing consumer is verified, never rewritten. Returns the ack wait the live
+    /// consumer actually runs with — <paramref name="ackWait"/> for one this call created, the
+    /// consumer's own for an existing one — which is what the in-progress heartbeat must beat.
+    /// </summary>
+    Task<TimeSpan> EnsureConsumerAsync(string stream, string durable, TimeSpan ackWait, int maxDeliveryAttempts, CancellationToken cancellationToken);
 
     /// <summary>Publishes <paramref name="payload"/> to <paramref name="subject"/> via JetStream and returns the assigned sequence.</summary>
     Task<string> PublishAsync(string subject, string payload, IReadOnlyDictionary<string, string>? headers, CancellationToken cancellationToken);
@@ -243,19 +248,128 @@ internal sealed class NatsJetStreamTransportAdapter(INatsJSContext _jetStream, I
         return capturedTokens.Length == subjectTokens.Length;
     }
 
-    /// <summary>Ensures the required resource exists.</summary>
-    public async Task EnsureConsumerAsync(string stream, string durable, TimeSpan ackWait, CancellationToken cancellationToken)
+    /// <summary>
+    /// Creates the consumer when it is missing and otherwise leaves it exactly as it is. This ran
+    /// as a create-or-UPDATE with the minimal config below on every subscriber attempt (every
+    /// fast-empty rebuild included), even with CreateStreams off, and a JetStream update replaces
+    /// the whole configuration: an operator's MaxAckPending, BackOff or metadata reverted on every
+    /// start, and an operator-provisioned durable differing in an immutable field failed every
+    /// start forever. An existing consumer is only checked for what this transport cannot work
+    /// without (the streams follow the same rule), and its own ack wait is returned so the
+    /// heartbeat follows the consumer rather than the options.
+    /// </summary>
+    public async Task<TimeSpan> EnsureConsumerAsync(string stream, string durable, TimeSpan ackWait, int maxDeliveryAttempts, CancellationToken cancellationToken)
     {
-        var config = new ConsumerConfig(durable)
+        var existing = await TryGetConsumerConfigAsync(stream, durable, cancellationToken).ConfigureAwait(false);
+        if (existing is null)
         {
-            DurableName = durable,
-            AckPolicy = ConsumerConfigAckPolicy.Explicit,
-            AckWait = ackWait,
-            // Redelivery attempts are bounded by the dispatcher (via NumDelivered + Terminate), so the
-            // consumer itself is left unlimited rather than silently swallowing the last attempt.
-            MaxDeliver = -1
-        };
-        await _jetStream.CreateOrUpdateConsumerAsync(stream, config, cancellationToken).ConfigureAwait(false);
+            var config = new ConsumerConfig(durable)
+            {
+                DurableName = durable,
+                AckPolicy = ConsumerConfigAckPolicy.Explicit,
+                AckWait = ackWait,
+                // Redelivery attempts are bounded by the dispatcher (via NumDelivered + Terminate), so the
+                // consumer itself is left unlimited rather than silently swallowing the last attempt.
+                MaxDeliver = -1
+            };
+
+            try
+            {
+                // Create-only: creating with a configuration identical to the live one is a
+                // JetStream no-op, so replicas of one deployment racing here all succeed.
+                await _jetStream.CreateConsumerAsync(stream, config, cancellationToken).ConfigureAwait(false);
+                return ackWait;
+            }
+            catch (NatsJSApiException)
+            {
+                // A peer configured differently won the creation race: from here on it is an
+                // existing consumer like any other. Anything else is still missing, so rethrow.
+                existing = await TryGetConsumerConfigAsync(stream, durable, cancellationToken).ConfigureAwait(false);
+                if (existing is null)
+                    throw;
+            }
+        }
+
+        VerifyExistingConsumer(stream, durable, existing, maxDeliveryAttempts);
+
+        // The server reports its resolved ack wait (30 s when none was set); a non-positive value
+        // would only come from a non-conforming server, and then the options are all there is.
+        var liveAckWait = existing.AckWait > TimeSpan.Zero ? existing.AckWait : ackWait;
+        if (liveAckWait != ackWait)
+            ReportAckWaitDrift(stream, durable, liveAckWait, ackWait);
+
+        return liveAckWait;
+    }
+
+    // Consumers whose ack-wait drift has been reported, with the live value reported: this runs on
+    // every subscriber attempt (fast-empty rebuilds included), and one warning per drift is enough.
+    private readonly ConcurrentDictionary<(string Stream, string Durable), TimeSpan> _reportedAckWaitDrift = new();
+
+    /// <summary>
+    /// A live ack wait that differs from <see cref="NatsAsyncResponseTransportOptions.AckWait"/> is
+    /// not an error: the heartbeat renews at a third of the SHORTER of the two, so it always lands
+    /// inside the consumer's real window. This was a throw when the live value sat at or below a
+    /// third of the configured one — so raising AckWait (30 s to 2 min, for long handlers) failed
+    /// every subscriber attempt inside the supervisor, which retried it at Warning forever while
+    /// nothing consumed; and just above that line the heartbeat ran from the configured value
+    /// against the shorter live window, one stall away from redelivering under live handlers.
+    /// </summary>
+    private void ReportAckWaitDrift(string stream, string durable, TimeSpan liveAckWait, TimeSpan ackWait)
+    {
+        var key = (stream, durable);
+        if (_reportedAckWaitDrift.TryGetValue(key, out var reported) && reported == liveAckWait)
+            return;
+
+        _reportedAckWaitDrift[key] = liveAckWait;
+        _logger?.LogWarning(
+            "NATS consumer {Consumer} on stream {Stream} already exists with ack wait {AckWait}; this host is configured for {DesiredAckWait}. " +
+            "The in-progress heartbeat follows the shorter of the two. An existing consumer is never modified by this transport — apply the change to the consumer yourself, or align AckWait with it.",
+            durable,
+            stream,
+            liveAckWait,
+            ackWait);
+    }
+
+    private async Task<ConsumerConfig?> TryGetConsumerConfigAsync(string stream, string durable, CancellationToken cancellationToken)
+    {
+        try
+        {
+            var consumer = await _jetStream.GetConsumerAsync(stream, durable, cancellationToken).ConfigureAwait(false);
+            return consumer.Info.Config;
+        }
+        catch (NatsJSApiException ex) when (ex.Error.Code == 404)
+        {
+            return null; // "consumer (or stream) not found" — the only answer that means it may be created
+        }
+    }
+
+    private static void VerifyExistingConsumer(string stream, string durable, ConsumerConfig existing, int maxDeliveryAttempts)
+    {
+        const string NeverModified = "An existing consumer is never modified by this transport: fix it, or delete it so this host recreates it, or configure a different consumer name.";
+
+        // Every fetch here is a pull request, and every settlement an explicit ack/nak/term.
+        if (!string.IsNullOrEmpty(existing.DeliverSubject))
+        {
+            throw new InvalidOperationException(
+                $"NATS consumer '{durable}' on stream '{stream}' already exists as a push consumer (deliver subject '{existing.DeliverSubject}'); this transport needs a pull consumer. {NeverModified}");
+        }
+
+        if (existing.AckPolicy != ConsumerConfigAckPolicy.Explicit)
+        {
+            throw new InvalidOperationException(
+                $"NATS consumer '{durable}' on stream '{stream}' already exists with ack policy {existing.AckPolicy}; this transport settles every message explicitly and needs ack policy {ConsumerConfigAckPolicy.Explicit}. {NeverModified}");
+        }
+
+        // The dispatcher bounds attempts itself: it dead-letters a delivery arriving past
+        // MaxDeliveryAttempts before running it. A server-side MaxDeliver at or below that cap
+        // stops redelivering first, so a message whose attempts all died with the process sits
+        // unacknowledged on the stream forever, never dead-lettered.
+        if (existing.MaxDeliver > 0 && (maxDeliveryAttempts <= 0 || existing.MaxDeliver <= maxDeliveryAttempts))
+        {
+            throw new InvalidOperationException(
+                $"NATS consumer '{durable}' on stream '{stream}' already exists with max deliver {existing.MaxDeliver}, which stops redelivery before MaxDeliveryAttempts " +
+                $"({(maxDeliveryAttempts <= 0 ? "unlimited" : maxDeliveryAttempts)}) can dead-letter the message; it needs unlimited (-1) or more than MaxDeliveryAttempts. {NeverModified}");
+        }
     }
 
     /// <summary>Publishes the supplied message.</summary>
@@ -403,6 +517,11 @@ internal static class NatsTransportRetry
         // responders, no API response, connection loss — is the transient case.
         if (exception is NatsJSApiException api)
             return api.Error.Code >= 500;
+
+        // The client refuses a message above the server's max_payload before sending it, on every
+        // attempt alike: a decision, not a blip, even though it is a NatsException too.
+        if (exception is NatsPayloadTooLargeException)
+            return false;
 
         return exception is NatsException or TimeoutException && exception is not OperationCanceledException;
     }

@@ -86,6 +86,43 @@ public sealed class RedisTransportTests(BrokersBatchFixture fixture) : Integrati
         }
     }
 
+    /// <summary>
+    /// Fixpoint r1 (S6a#14), against a real server: the stop-time consumer retirement deletes a
+    /// consumer only while it owns no pending entries (XGROUP DELCONSUMER would discard them), in
+    /// one atomic script.
+    /// </summary>
+    [Fact]
+    public async Task ConsumerRetirement_DeletesOnlyAConsumerWithoutPendingEntries()
+    {
+        using var connection = await ConnectionMultiplexer.ConnectAsync(Fixture.RedisConnectionString);
+        var db = connection.GetDatabase();
+        var stream = "review-consumers:" + Guid.NewGuid().ToString("N");
+        var adapter = new RedisStreamDatabaseAdapter(db, TimeSpan.FromSeconds(5));
+        try
+        {
+            await db.StreamCreateConsumerGroupAsync(stream, "group", StreamPosition.Beginning, createStream: true);
+            await db.StreamAddAsync(stream, "payload", "held");
+            await db.StreamAddAsync(stream, "payload", "done");
+
+            // "holder" keeps one entry pending; "idle" read one and ACKed it.
+            Assert.Single(await db.StreamReadGroupAsync(stream, "group", "holder", StreamPosition.NewMessages, count: 1));
+            var done = Assert.Single(await db.StreamReadGroupAsync(stream, "group", "idle", StreamPosition.NewMessages, count: 1));
+            await db.StreamAcknowledgeAsync(stream, "group", done.Id);
+
+            Assert.False(await adapter.TryDeleteIdleConsumerAsync(stream, "group", "holder", default));
+            Assert.True(await adapter.TryDeleteIdleConsumerAsync(stream, "group", "idle", default));
+
+            var consumers = await db.StreamConsumerInfoAsync(stream, "group");
+            var holder = Assert.Single(consumers);
+            Assert.Equal("holder", holder.Name.ToString());
+            Assert.Equal(1, holder.PendingMessageCount);
+        }
+        finally
+        {
+            await db.KeyDeleteAsync(stream);
+        }
+    }
+
     [Fact]
     public async Task Config_ReportsDefaultAndEarlyAckRedisModes()
     {

@@ -121,6 +121,7 @@ public sealed class CosmosFlowStateStore : IFlowStateStore, IDisposable
     private readonly SemaphoreSlim _ensureGate = new(1, 1);
     private readonly bool _ownsClient;
     private volatile bool _created;
+    private int _sessionConsistentReads; // 0 = not yet known, 1 = yes, 2 = no
 
     public CosmosFlowStateStore(CosmosClient client, IOptions<CosmosDurableFlowOptions> options, bool ownsClient = false)
     {
@@ -130,15 +131,34 @@ public sealed class CosmosFlowStateStore : IFlowStateStore, IDisposable
         _ownsClient = ownsClient;
     }
 
-    public async Task<FlowState?> LoadAsync(string flowId, CancellationToken cancellationToken = default)
+    public Task<FlowState?> LoadAsync(string flowId, CancellationToken cancellationToken = default)
+        => LoadCoreAsync(flowId, current: false, cancellationToken);
+
+    /// <inheritdoc />
+    /// <remarks>
+    /// A session read from a process that never received the writer's session token can be served
+    /// by a replica still holding an OLDER copy of a present ledger — one without the breadcrumb a
+    /// recovered response matches, or still Suspended after an operator set it back to Running.
+    /// <see cref="LoadAsync"/> confirms only absence and expiry on the write path (a load that finds
+    /// a live document costs nothing extra); this asks the write path FIRST, so the read that follows
+    /// is current under Session or Strong consistency. One extra bodiless request, on the engine's
+    /// no-write decision paths only.
+    /// </remarks>
+    public Task<FlowState?> LoadCurrentAsync(string flowId, CancellationToken cancellationToken = default)
+        => LoadCoreAsync(flowId, current: true, cancellationToken);
+
+    private async Task<FlowState?> LoadCoreAsync(string flowId, bool current, CancellationToken cancellationToken)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(flowId);
         var container = await GetContainerAsync(cancellationToken).ConfigureAwait(false);
 
+        if (current && !await ExistsOnWritePathAsync(container, flowId, cancellationToken).ConfigureAwait(false))
+            return null;
+
         // Point reads have no predicate, so the expiry check happens client-side on the app
         // clock — see the time-authority note on this class.
         var document = await ReadDocumentAsync(container, flowId, cancellationToken).ConfigureAwait(false);
-        if (document is null || document.ExpiresAtUtc <= DateTime.UtcNow)
+        if (document is null || (!current && document.ExpiresAtUtc <= DateTime.UtcNow))
         {
             // Callers acknowledge the wake-up on null, so "absent" must not come from a read
             // alone. Session consistency is read-your-writes for the client that WROTE: a
@@ -159,25 +179,37 @@ public sealed class CosmosFlowStateStore : IFlowStateStore, IDisposable
                     break;
 
                 // Present for writes and absent for reads, repeatedly: a delete can win that race
-                // once, not every time. This client's reads are not session-consistent with its
-                // writes (an Eventual or Consistent Prefix account or client), so nothing it
-                // reads can prove the run is gone.
+                // once, not every time. Under Session or Strong consistency each 412 made the
+                // re-read current, so the item is physically present but hidden by its SERVER ttl
+                // and not yet purged (the physical ttl is counted from the last write and never
+                // ends before the logical expiry): absent. Otherwise this client's reads are not
+                // session-consistent with its writes (an Eventual or Consistent Prefix account or
+                // client), so nothing it reads can prove the run is gone.
                 if (attempt == MaxAbsenceConfirmations - 1)
                 {
+                    if (await ReadsAreSessionConsistentAsync(cancellationToken).ConfigureAwait(false))
+                        return null;
+
                     throw new FlowStateUnreadableException(
                         flowId,
                         "the container's write path reports its document present while reads keep answering 404; the " +
-                        "CosmosClient's reads are not session-consistent with its writes (the store needs Session consistency or stronger)");
+                        "CosmosClient's reads are not session-consistent with its writes (the store needs Session or Strong consistency)");
                 }
             }
 
-            if (document.ExpiresAtUtc <= DateTime.UtcNow)
-                return null;
         }
 
         // The document exists, so a missing required field is an unreadable ledger, not an
         // absent one. Reporting it as absent let the executor ack the only wake-up of a run that
-        // is still sitting in the container.
+        // is still sitting in the container — which is what a document without its expiry did:
+        // the field read back as DateTime.MinValue, and MinValue is "long expired". Only a
+        // well-formed, elapsed expiry reads as absent.
+        if (document.ExpiresAtUtc is not { } expiresAtUtc)
+            throw new FlowStateUnreadableException(flowId, "its stored document has no expiry");
+
+        if (expiresAtUtc <= DateTime.UtcNow)
+            return null;
+
         if (document.Revision is not { } revision)
             throw new FlowStateUnreadableException(flowId, "its stored document has no revision");
 
@@ -185,6 +217,30 @@ public sealed class CosmosFlowStateStore : IFlowStateStore, IDisposable
             throw new FlowStateUnreadableException(flowId, "its stored document has no state JSON");
 
         return DurableFlowStoreShared.ReadState(flowId, document.StateJson, revision);
+    }
+
+    /// <summary>
+    /// Whether a read that follows a write-path round trip is current: the client's own consistency
+    /// override, else the account default, is Session or Strong. Asked once, and only on the rare
+    /// "present for writes, absent for reads" path.
+    /// </summary>
+    private async Task<bool> ReadsAreSessionConsistentAsync(CancellationToken cancellationToken)
+    {
+        var known = Volatile.Read(ref _sessionConsistentReads);
+        if (known != 0)
+            return known == 1;
+
+        var level = _client.ClientOptions?.ConsistencyLevel;
+        if (level is null)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var account = await _client.ReadAccountAsync().ConfigureAwait(false);
+            level = account?.Consistency?.DefaultConsistencyLevel;
+        }
+
+        var consistent = level is ConsistencyLevel.Session or ConsistencyLevel.Strong;
+        Volatile.Write(ref _sessionConsistentReads, consistent ? 1 : 2);
+        return consistent;
     }
 
     private static async Task<CosmosFlowStateDocument?> ReadDocumentAsync(Container container, string flowId, CancellationToken cancellationToken)
@@ -195,7 +251,7 @@ public sealed class CosmosFlowStateStore : IFlowStateStore, IDisposable
                 flowId,
                 new PartitionKey(flowId),
                 cancellationToken: cancellationToken).ConfigureAwait(false);
-            return response.Resource;
+            return AsUtc(response.Resource);
         }
         catch (CosmosException ex) when (ex.StatusCode == HttpStatusCode.NotFound && ex.SubStatusCode == 0)
         {
@@ -210,6 +266,23 @@ public sealed class CosmosFlowStateStore : IFlowStateStore, IDisposable
             // primary reads; Cosmos cannot strengthen a read per request.)
             return null;
         }
+    }
+
+    /// <summary>
+    /// Normalizes the document's instants to <see cref="DateTimeKind.Utc"/> once, as it is read,
+    /// so every comparison below is against the same instant <see cref="DateTime.UtcNow"/> names.
+    /// <see cref="DateTime"/> comparison ignores <see cref="DateTime.Kind"/>: a host serializer set
+    /// to local time zone handling (Newtonsoft <c>DateTimeZoneHandling.Local</c>) hands back
+    /// <see cref="DateTimeKind.Local"/> values carrying LOCAL ticks, and on a UTC−5 host a live
+    /// 60-second lease compared as five hours expired — a second worker acquired it and ran the
+    /// same flow while its holder's renewals kept failing.
+    /// </summary>
+    private static CosmosFlowStateDocument AsUtc(CosmosFlowStateDocument document)
+    {
+        document.ExpiresAtUtc = DurableFlowStoreShared.AsUtc(document.ExpiresAtUtc);
+        document.UpdatedAtUtc = DurableFlowStoreShared.AsUtc(document.UpdatedAtUtc);
+        document.LeaseExpiresAtUtc = DurableFlowStoreShared.AsUtc(document.LeaseExpiresAtUtc);
+        return document;
     }
 
     /// <inheritdoc />
@@ -255,7 +328,10 @@ public sealed class CosmosFlowStateStore : IFlowStateStore, IDisposable
                         flowId,
                         new PartitionKey(flowId),
                         cancellationToken: cancellationToken).ConfigureAwait(false);
-                    if (current.Resource.ExpiresAtUtc > now)
+                    // Replaced only when its expiry is well-formed and elapsed: a document without
+                    // one is a corrupt ledger that is still present, not a free slot (DynamoDB's
+                    // condition refuses the same create).
+                    if (AsUtc(current.Resource).ExpiresAtUtc is not { } currentExpiry || currentExpiry > now)
                         return false;
 
                     await container.ReplaceItemAsync(
@@ -305,8 +381,9 @@ public sealed class CosmosFlowStateStore : IFlowStateStore, IDisposable
                     flowId,
                     new PartitionKey(flowId),
                     cancellationToken: cancellationToken).ConfigureAwait(false);
-                var document = current.Resource;
-                if (document.ExpiresAtUtc <= now || document.Revision != expectedRevision)
+                var document = AsUtc(current.Resource);
+                // Positive form, so a document without an expiry is not live either.
+                if (!(document.ExpiresAtUtc > now) || document.Revision != expectedRevision)
                     return false;
                 // Positive form (SQL-sibling parity: `lease_id = @lease_id AND lease_expires_at_utc > now()`
                 // is false for NULL). The negated `LeaseExpiresAtUtc <= now` was ALSO false for a
@@ -371,15 +448,25 @@ public sealed class CosmosFlowStateStore : IFlowStateStore, IDisposable
                 // countdown and decouple it from the logical ExpiresAtUtc. Rewrite it from the
                 // remaining logical window instead. (Checkpoints recompute both together in
                 // TryUpdateAsync; only the lease paths write without moving ExpiresAtUtc.)
+                // A document without an expiry keeps its ttl untouched: there is no logical window
+                // to realign to, and collapsing it would have the purge destroy a corrupt ledger an
+                // operator still has to inspect.
                 await PatchLeaseAsync(
                     container,
                     flowId,
                     current.ETag,
-                    [
-                        PatchOperation.Set<string?>(LeaseIdPath, null),
-                        PatchOperation.Set<DateTime?>(LeaseExpiresAtPath, null),
-                        PatchOperation.Set(TtlPath, CosmosTtlSeconds(current.ExpiresAtUtc, DateTime.UtcNow))
-                    ],
+                    current.ExpiresAtUtc is { } expiresAtUtc
+                        ?
+                        [
+                            PatchOperation.Set<string?>(LeaseIdPath, null),
+                            PatchOperation.Set<DateTime?>(LeaseExpiresAtPath, null),
+                            PatchOperation.Set(TtlPath, CosmosTtlSeconds(expiresAtUtc, DateTime.UtcNow))
+                        ]
+                        :
+                        [
+                            PatchOperation.Set<string?>(LeaseIdPath, null),
+                            PatchOperation.Set<DateTime?>(LeaseExpiresAtPath, null)
+                        ],
                     cancellationToken).ConfigureAwait(false);
                 return;
             }
@@ -462,8 +549,9 @@ public sealed class CosmosFlowStateStore : IFlowStateStore, IDisposable
     /// answer is authoritative there and the following read can still lag. An account with
     /// multiple WRITE regions has no single authoritative write path (it already lets two regions
     /// win the same ETag-fenced lease write and resolves them last-writer-wins), so none of this
-    /// holds on one. The cost is one extra bodiless request, on the two decision paths only —
-    /// never on a load that found its document.
+    /// holds on one. The cost is one extra bodiless request, on the three decision paths only
+    /// (absence or expiry in <see cref="LoadAsync"/>, every <see cref="ObserveLeaseAsync"/>, every
+    /// <see cref="LoadCurrentAsync"/>) — never on a plain load that found a live document.
     /// </para>
     /// </summary>
     private static async Task<bool> ExistsOnWritePathAsync(Container container, string flowId, CancellationToken cancellationToken)
@@ -519,7 +607,12 @@ public sealed class CosmosFlowStateStore : IFlowStateStore, IDisposable
     {
         using var iterator = container.GetItemQueryIterator<CosmosLeaseProjection>(
             new QueryDefinition(LeaseProjectionSql).WithParameter("@id", flowId),
-            requestOptions: new QueryRequestOptions { PartitionKey = new PartitionKey(flowId), MaxItemCount = 1 });
+            // EnableScanInQuery: the filter is on `id`, which is only auto-indexed under the
+            // Consistent indexing mode. A container provisioned as a pure key-value store
+            // (IndexingMode.None) refuses the filtered query with a 400 unless scans are allowed,
+            // and every acquire, renewal, release and observation then failed while point reads
+            // kept working. The scan covers one document in one partition.
+            requestOptions: new QueryRequestOptions { PartitionKey = new PartitionKey(flowId), MaxItemCount = 1, EnableScanInQuery = true });
         while (iterator.HasMoreResults)
         {
             var page = await iterator.ReadNextAsync(cancellationToken).ConfigureAwait(false);
@@ -534,6 +627,8 @@ public sealed class CosmosFlowStateStore : IFlowStateStore, IDisposable
                         $"The Cosmos DB durable-flow store's lease query for '{flowId}' returned no _etag; the registered serializer does not surface system properties, so lease writes cannot be fenced.");
                 }
 
+                projection.ExpiresAtUtc = DurableFlowStoreShared.AsUtc(projection.ExpiresAtUtc);
+                projection.LeaseExpiresAtUtc = DurableFlowStoreShared.AsUtc(projection.LeaseExpiresAtUtc);
                 return projection;
             }
         }
@@ -695,7 +790,8 @@ public sealed class CosmosFlowStateStore : IFlowStateStore, IDisposable
             try
             {
                 var document = await ReadLeaseAsync(container, flowId, cancellationToken).ConfigureAwait(false);
-                if (document is null || document.ExpiresAtUtc <= now || document.Revision is null)
+                // Positive form, so a document without an expiry is not live either.
+                if (document is null || document.ExpiresAtUtc is not { } expiresAtUtc || expiresAtUtc <= now || document.Revision is null)
                     return false;
                 if (acquire)
                 {
@@ -718,7 +814,7 @@ public sealed class CosmosFlowStateStore : IFlowStateStore, IDisposable
                     [
                         PatchOperation.Set(LeaseIdPath, leaseId),
                         PatchOperation.Set(LeaseExpiresAtPath, DurableFlowStoreShared.AddSaturating(now, leaseDuration)),
-                        PatchOperation.Set(TtlPath, CosmosTtlSeconds(document.ExpiresAtUtc, now))
+                        PatchOperation.Set(TtlPath, CosmosTtlSeconds(expiresAtUtc, now))
                     ],
                     cancellationToken).ConfigureAwait(false);
                 return true;
@@ -874,9 +970,14 @@ internal sealed class CosmosFlowStateDocument
     [System.Text.Json.Serialization.JsonPropertyName("stateJson")]
     public string StateJson { get; set; } = "";
 
+    /// <summary>
+    /// Nullable so a document WITHOUT the field reads as what it is — corrupt — instead of
+    /// deserializing to <see cref="DateTime.MinValue"/>, which every check read as long expired.
+    /// The store always writes it.
+    /// </summary>
     [JsonProperty("expiresAtUtc")]
     [System.Text.Json.Serialization.JsonPropertyName("expiresAtUtc")]
-    public DateTime ExpiresAtUtc { get; set; }
+    public DateTime? ExpiresAtUtc { get; set; }
 
     [JsonProperty("updatedAtUtc")]
     [System.Text.Json.Serialization.JsonPropertyName("updatedAtUtc")]
@@ -920,9 +1021,14 @@ internal sealed class CosmosLeaseProjection
     [System.Text.Json.Serialization.JsonPropertyName("_etag")]
     public string ETag { get; set; } = "";
 
+    /// <summary>
+    /// Nullable so a document WITHOUT the field reads as what it is — corrupt — instead of
+    /// deserializing to <see cref="DateTime.MinValue"/>, which every check read as long expired.
+    /// The store always writes it.
+    /// </summary>
     [JsonProperty("expiresAtUtc")]
     [System.Text.Json.Serialization.JsonPropertyName("expiresAtUtc")]
-    public DateTime ExpiresAtUtc { get; set; }
+    public DateTime? ExpiresAtUtc { get; set; }
 
     [JsonProperty("revision")]
     [System.Text.Json.Serialization.JsonPropertyName("revision")]

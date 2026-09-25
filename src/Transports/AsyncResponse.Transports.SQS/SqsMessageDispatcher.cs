@@ -10,6 +10,19 @@ internal enum SqsSubscriberRole
     ResponseIngress
 }
 
+internal enum SqsDispatchOutcome
+{
+    /// <summary>The delivery was settled, or accepted into the early-ACK queue.</summary>
+    Processed,
+
+    /// <summary>
+    /// The flow engine handed the delivery back because the host is stopping
+    /// (<see cref="DurableFlowInterruptedException"/>) while this subscriber's token was still
+    /// live: its visibility was left untouched — and the receive loop must stop taking work.
+    /// </summary>
+    HandedBack
+}
+
 internal abstract class SqsMessageDispatcher : IAsyncDisposable
 {
     private readonly Func<SqsTransportDelivery, CancellationToken, Task> _handler;
@@ -73,7 +86,7 @@ internal abstract class SqsMessageDispatcher : IAsyncDisposable
         => SqsOptionsValidator.ValidateSubscriber(transportOptions, subscriberOptions, role);
 
     /// <summary>Handles the delivered message.</summary>
-    public abstract Task HandleAsync(
+    public abstract Task<SqsDispatchOutcome> HandleAsync(
         SqsTransportDelivery delivery,
         CancellationToken subscriberCancellationToken);
 
@@ -123,6 +136,14 @@ internal abstract class SqsMessageDispatcher : IAsyncDisposable
         {
             await _handler(delivery, cancellationToken).ConfigureAwait(false);
         }
+        catch (Exception ex) when (ex is DurableFlowInterruptedException || (logFailures && IsHostStop(ex, cancellationToken)))
+        {
+            // The inline (ACK-after-handler) path hands the delivery back on a host stop, and the
+            // flow engine's hand-back is not a failure on the early-ACK path either (its caller
+            // warns and surfaces it): nothing failed, so no error log and no error span on every
+            // rolling deploy.
+            throw;
+        }
         catch (Exception ex)
         {
             if (logFailures)
@@ -131,6 +152,19 @@ internal abstract class SqsMessageDispatcher : IAsyncDisposable
             throw;
         }
     }
+
+    /// <summary>
+    /// Whether <paramref name="exception"/> is the host stopping rather than a handler failure: a
+    /// cancellation once the subscriber's own token has fired, or the durable-flow engine's
+    /// <see cref="DurableFlowInterruptedException"/>. The engine throws the latter on
+    /// <c>ApplicationStopping</c>, which fires BEFORE any hosted service stops — so the worker
+    /// subscriber's token is usually still live when it arrives, and keying on the token alone
+    /// sent the flow's wake-up down the failure path (RedeliveryDelay, then the redrive policy's
+    /// maxReceiveCount toward the dead-letter queue).
+    /// </summary>
+    protected static bool IsHostStop(Exception exception, CancellationToken subscriberCancellationToken)
+        => exception is OperationCanceledException
+            && (subscriberCancellationToken.IsCancellationRequested || exception is DurableFlowInterruptedException);
 
     /// <summary>
     /// Best-effort <c>ChangeMessageVisibility</c>: the receipt handle may already be expired or the
@@ -202,7 +236,7 @@ internal sealed class AwaitingSqsMessageDispatcher(
     : SqsMessageDispatcher(handler, transportOptions, subscriberOptions, logger, queue, role)
 {
     /// <summary>Handles the delivered message.</summary>
-    public override async Task HandleAsync(
+    public override async Task<SqsDispatchOutcome> HandleAsync(
         SqsTransportDelivery delivery,
         CancellationToken subscriberCancellationToken)
     {
@@ -210,14 +244,26 @@ internal sealed class AwaitingSqsMessageDispatcher(
         {
             await ExecuteHandlerAsync(delivery, subscriberCancellationToken).ConfigureAwait(false);
         }
-        catch (OperationCanceledException) when (subscriberCancellationToken.IsCancellationRequested)
+        catch (Exception ex) when (IsHostStop(ex, subscriberCancellationToken))
         {
             // Host shutdown, not a handler failure: shortening visibility would hasten a
             // redelivery of work that never ran as if it had failed. Leave the message
             // untouched — its visibility timeout lapses on its own and at-least-once
             // redelivery applies after restart (parity with the RabbitMQ/Redis/Kafka/DB
             // dispatchers).
-            throw;
+            if (subscriberCancellationToken.IsCancellationRequested)
+                throw;
+
+            // The flow engine saw the host stop before this subscriber did. Its receive loop is
+            // still running, so a released (or shortened) visibility would hand the wake-up
+            // straight back to it; untouched, the message reappears once its visibility lapses —
+            // by then to a peer or to this host after its restart. Returning (not rethrowing)
+            // keeps the live receive loop out of the supervisor's failure path; the outcome tells
+            // it to stop receiving.
+            Logger.LogInformation(
+                "SQS message {MessageId} was interrupted by the host stopping; leaving it for redelivery after its visibility timeout.",
+                delivery.MessageId);
+            return SqsDispatchOutcome.HandedBack;
         }
         catch (Exception)
         {
@@ -226,7 +272,7 @@ internal sealed class AwaitingSqsMessageDispatcher(
             // the queue's redrive policy dead-letters it after maxReceiveCount receives.
             if (RedeliveryDelay is { } redeliveryDelay)
                 await TryChangeVisibilityAsync(delivery, redeliveryDelay).ConfigureAwait(false);
-            return;
+            return SqsDispatchOutcome.Processed;
         }
 
         // The delete sits outside the handler's try/catch: a transient DeleteMessage failure after
@@ -245,6 +291,8 @@ internal sealed class AwaitingSqsMessageDispatcher(
                 "Failed to delete SQS message {MessageId} after a successful handler; it may be redelivered after its visibility timeout.",
                 delivery.MessageId);
         }
+
+        return SqsDispatchOutcome.Processed;
     }
 }
 
@@ -314,7 +362,7 @@ internal sealed class QueuedSqsMessageDispatcher : SqsMessageDispatcher
     }
 
     /// <summary>Handles the delivered message.</summary>
-    public override async Task HandleAsync(
+    public override async Task<SqsDispatchOutcome> HandleAsync(
         SqsTransportDelivery delivery,
         CancellationToken subscriberCancellationToken)
     {
@@ -335,7 +383,7 @@ internal sealed class QueuedSqsMessageDispatcher : SqsMessageDispatcher
             // so redelivery lands after capacity has had time to free.
             if (RedeliveryDelay is { } redeliveryDelay)
                 await TryChangeVisibilityAsync(delivery, redeliveryDelay).ConfigureAwait(false);
-            return;
+            return SqsDispatchOutcome.Processed;
         }
 
         // The delivery now belongs to a background worker, which decrements _pendingCount when it
@@ -354,6 +402,8 @@ internal sealed class QueuedSqsMessageDispatcher : SqsMessageDispatcher
                 delivery.MessageId,
                 _queueName);
         }
+
+        return SqsDispatchOutcome.Processed;
     }
 
     /// <summary>Releases resources held by this instance.</summary>
@@ -369,9 +419,14 @@ internal sealed class QueuedSqsMessageDispatcher : SqsMessageDispatcher
             RunningCount);
         _queue.Writer.TryComplete();
 
+        // BackgroundDrainTimeout is the whole spend the shutdown-budget validator sums for this
+        // dispatcher, so it is split rather than exceeded (database-transport parity): most of it
+        // lets queued and running handlers finish, and the last quarter is RESERVED for surfacing
+        // whatever is still queued once that lapses.
+        var surfacingReserve = TimeSpan.FromTicks(_drainTimeout.Ticks / 4);
         try
         {
-            await Task.WhenAll(_workers).WaitAsync(_drainTimeout).ConfigureAwait(false);
+            await Task.WhenAll(_workers).WaitAsync(_drainTimeout - surfacingReserve).ConfigureAwait(false);
             _drainCancellation.Dispose();
         }
         catch (TimeoutException ex)
@@ -383,6 +438,12 @@ internal sealed class QueuedSqsMessageDispatcher : SqsMessageDispatcher
                 _queueName,
                 PendingCount,
                 RunningCount);
+
+            // The workers surface a lapsed entry only once one of them frees up — and with every
+            // worker still inside a handler that ignores the token, none does before this returns,
+            // the host finishes stopping and the process exits: the entries still queued vanished
+            // with no OnBackgroundFailure call at all. So the dispose surfaces them itself.
+            await SurfaceUndrainedAsync(surfacingReserve).ConfigureAwait(false);
 
             _ = Task.WhenAll(_workers).ContinueWith(
                 _ => _drainCancellation.Dispose(),
@@ -400,6 +461,58 @@ internal sealed class QueuedSqsMessageDispatcher : SqsMessageDispatcher
         }
     }
 
+    /// <summary>
+    /// Surfaces every entry still queued after the drain budget lapsed through
+    /// <c>OnBackgroundFailure</c>, within <paramref name="reserve"/>, and logs the loss at Error
+    /// with its count. Runs inline on the stop path, so a callback that is slow asynchronously is
+    /// cut off at the reserve; entries left then are counted as lost.
+    /// </summary>
+    private async Task SurfaceUndrainedAsync(TimeSpan reserve)
+    {
+        var started = Stopwatch.GetTimestamp();
+        var surfaced = 0;
+        while (true)
+        {
+            var remaining = reserve - Stopwatch.GetElapsedTime(started);
+            if (remaining <= TimeSpan.Zero || !_queue.Reader.TryRead(out var delivery))
+                break;
+
+            Interlocked.Decrement(ref _pendingCount);
+            surfaced++;
+            try
+            {
+                await SurfaceLapsedAsync(delivery).AsTask().WaitAsync(remaining).ConfigureAwait(false);
+            }
+            catch (TimeoutException)
+            {
+                break;
+            }
+        }
+
+        var lost = _queue.Reader.Count;
+        if (surfaced == 0 && lost == 0)
+            return;
+
+        Logger.LogError(
+            "The SQS ACK-after-enqueue drain budget for {Queue} lapsed with {Count} already-deleted message(s) never handled — SQS cannot redeliver them. Surfaced {Surfaced} via OnBackgroundFailure within the reserved {Reserve}; {Lost} could not be surfaced before shutdown.",
+            _queueName,
+            surfaced + lost,
+            surfaced,
+            reserve,
+            lost);
+    }
+
+    private ValueTask SurfaceLapsedAsync(SqsTransportDelivery delivery)
+    {
+        var lapsed = new OperationCanceledException(
+            "The ACK-after-enqueue drain budget lapsed before this already-deleted message was handled.");
+        Logger.LogWarning(
+            "SQS background handler for already-deleted message {MessageId} on {Queue} was not started: the drain budget had lapsed. Surfacing via OnBackgroundFailure.",
+            delivery.MessageId,
+            _queueName);
+        return NotifyBackgroundFailureAsync(delivery, lapsed, _queueName, _role);
+    }
+
     private async Task RunWorkerAsync(int workerIndex)
     {
         await foreach (var delivery in _queue.Reader.ReadAllAsync().ConfigureAwait(false))
@@ -415,13 +528,7 @@ internal sealed class QueuedSqsMessageDispatcher : SqsMessageDispatcher
             // write is possible for a deleted message; OnBackgroundFailure is the record.
             if (_drainCancellation.IsCancellationRequested)
             {
-                var lapsed = new OperationCanceledException(
-                    "The ACK-after-enqueue drain budget lapsed before this already-deleted message was handled.");
-                Logger.LogWarning(
-                    "SQS background handler for already-deleted message {MessageId} on {Queue} was not started: the drain budget had lapsed. Surfacing via OnBackgroundFailure.",
-                    delivery.MessageId,
-                    _queueName);
-                await NotifyBackgroundFailureAsync(delivery, lapsed, _queueName, _role).ConfigureAwait(false);
+                await SurfaceLapsedAsync(delivery).ConfigureAwait(false);
                 continue;
             }
 
@@ -440,6 +547,21 @@ internal sealed class QueuedSqsMessageDispatcher : SqsMessageDispatcher
                     delivery,
                     _drainCancellation.Token,
                     logFailures: false).ConfigureAwait(false);
+            }
+            catch (DurableFlowInterruptedException ex)
+            {
+                // The flow engine handed the job back because the host is stopping (Redis/NATS
+                // parity): not a handler failure, so no Error — but the message was deleted at
+                // enqueue and SQS cannot redeliver it, so surface the hand-back.
+                Logger.LogWarning(
+                    "SQS background handler for already-deleted message {MessageId} on {Queue} was handed back by the flow engine because the host is stopping; SQS will not redeliver it. Surfacing via OnBackgroundFailure.",
+                    delivery.MessageId,
+                    _queueName);
+                await NotifyBackgroundFailureAsync(
+                    delivery,
+                    ex,
+                    _queueName,
+                    _role).ConfigureAwait(false);
             }
             catch (Exception ex)
             {

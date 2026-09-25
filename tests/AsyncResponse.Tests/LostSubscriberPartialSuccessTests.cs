@@ -1,3 +1,4 @@
+using AsyncResponse.Testing;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -224,9 +225,11 @@ public sealed class LostSubscriberPartialSuccessTests
     public async Task DispatchLostExceptions_TransientSiblingFailureAfterASuccessfulCallback_PropagatesForRedelivery()
     {
         const string correlationId = "partial-failure-correlation-id";
+        var time = new VirtualTimeProvider();
         var spy = new PartialFailSpy();
         var services = new ServiceCollection();
         services.AddSingleton(typeof(ILogger<>), typeof(NullLogger<>));
+        services.AddSingleton<TimeProvider>(time);
         services.AddSingleton<IPartialFailSpy>(spy);
         services.AddAsyncResponse().WithInMemoryChannel();
         await using var provider = services.BuildServiceProvider();
@@ -239,12 +242,25 @@ public sealed class LostSubscriberPartialSuccessTests
 
         var publisher = provider.GetRequiredService<IAsyncResponsePublisher>();
 
-        var ex = await Assert.ThrowsAsync<RecoveryCallbackFailedException>(
-            () => publisher.SetException(new InvalidOperationException("remote boom"), correlationId));
+        // The failed sibling's failure callback runs the shared in-process ladder (round-1 fix
+        // pass: the exception route no longer makes a single attempt); walk its backoff.
+        var dispatching = publisher.SetException(new InvalidOperationException("remote boom"), correlationId);
+        // Advance only to a timer the ladder has actually armed (a blind advance that lands before
+        // the next backoff is armed strands it on the virtual clock), and bound the final await so a
+        // stall fails instead of hanging.
+        var deadline = DateTime.UtcNow.AddSeconds(30);
+        while (!dispatching.IsCompleted && DateTime.UtcNow < deadline)
+        {
+            if (time.NextTimerDueAt is { } due)
+                time.AdvanceTo(due);
+            await Task.Delay(10);
+        }
+
+        var ex = await Assert.ThrowsAsync<RecoveryCallbackFailedException>(() => dispatching.WaitAsync(TimeSpan.FromSeconds(10)));
 
         Assert.Equal(correlationId, ex.CorrelationId);
         Assert.Equal(1, spy.Ok);
-        Assert.Equal(1, spy.Boom);
+        Assert.Equal(LostSubscriberCallbackDispatcher.FailureCallbackAttempts, spy.Boom);
 
         // The successful registration was consumed; the failed one stays armed for the redelivery.
         var remaining = await recoveryStateStore.GetAllAsync(correlationId);

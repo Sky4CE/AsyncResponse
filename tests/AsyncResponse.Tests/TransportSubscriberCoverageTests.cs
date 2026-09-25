@@ -48,7 +48,7 @@ public sealed class TransportSubscriberCoverageTests
             }),
             ingress.Object,
             NullLogger<GooglePubSubWorkerSubscriber>.Instance,
-            (_, _) => Task.FromResult<IGooglePubSubSubscriberClient>(client));
+            (_, _, _) => Task.FromResult<IGooglePubSubSubscriberClient>(client));
 
         var startTask = subscriber.StartAsync(CancellationToken.None);
 
@@ -71,7 +71,7 @@ public sealed class TransportSubscriberCoverageTests
             }),
             ingress.Object,
             NullLogger<GooglePubSubWorkerSubscriber>.Instance,
-            (_, _) => {
+            (_, _, _) => {
                 cts.Cancel();
                 throw new OperationCanceledException(cts.Token);
             });

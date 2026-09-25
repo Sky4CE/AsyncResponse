@@ -85,7 +85,14 @@ public sealed class GooglePubSubSubscriberOptions
     public int BackgroundQueueCapacity { get; set; }
 
     /// <summary>
-    /// Maximum time to wait for queued/running background handlers while the hosted subscriber stops.
+    /// Maximum time to wait for queued/running background handlers while the hosted subscriber stops
+    /// (<see cref="GooglePubSubAckMode.AckAfterEnqueue"/>; a quarter of it is reserved for surfacing
+    /// whatever is still queued once the rest lapses). In
+    /// <see cref="GooglePubSubAckMode.AckAfterHandlerCompletes"/> mode it bounds the wait for the
+    /// handlers still running before the subscriber client is stopped, so their Acks land first —
+    /// shortened to what <see cref="GooglePubSubAsyncResponseOptions.HostShutdownTimeout"/> still
+    /// leaves after <see cref="GooglePubSubAsyncResponseOptions.ShutdownTimeout"/>, never validated
+    /// (a stop that cannot wait only costs a redelivery). Default: <c>20s</c>.
     /// </summary>
     public TimeSpan BackgroundDrainTimeout { get; set; } = TimeSpan.FromSeconds(20);
 

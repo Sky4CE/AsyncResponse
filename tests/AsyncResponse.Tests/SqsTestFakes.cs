@@ -28,12 +28,28 @@ internal sealed class FakeSqsClient : ISqsClient
     public Exception? SendException { get; set; }
 
     public SqsReceiveRequest? LastReceiveRequest { get; private set; }
-    public int ReceiveAttempts { get; private set; }
+    public int ReceiveAttempts => Volatile.Read(ref _receiveAttempts);
     public int FailuresBeforeReceive { get; set; }
+
+    /// <summary>Fails exactly the receive with this 1-based attempt number (a throttling blip mid-run).</summary>
+    public int? FailOnReceiveAttempt { get; set; }
+
+    /// <summary>
+    /// Hands over everything queued regardless of the requested count. Real SQS never returns more
+    /// than asked; the flag lets a test drive the batch loop, which must handle whatever batch a
+    /// receive returns, although ACK-after-handler now asks for one message.
+    /// </summary>
+    public bool ReturnAllAvailable { get; set; }
 
     public List<(string QueueName, IReadOnlyDictionary<string, string> Attributes)> CreatedQueues { get; } = [];
     public HashSet<string> ExistingQueues { get; } = new(StringComparer.Ordinal);
     public int CreateQueueFailuresBeforeSuccess { get; set; }
+
+    /// <summary>What a failing CreateQueue throws; a retryable 5xx unless a test says otherwise.</summary>
+    public Func<Exception> CreateQueueFailure { get; set; } = () => SqsTransportTests.TransientSqsException("create queue failed");
+
+    public int CreateQueueAttempts { get; private set; }
+    private int _receiveAttempts;
     public List<string> ArnRequests { get; } = [];
     public List<(string QueueUrl, IReadOnlyDictionary<string, string> Attributes)> AttributeUpdates { get; } = [];
 
@@ -60,10 +76,11 @@ internal sealed class FakeSqsClient : ISqsClient
         IReadOnlyDictionary<string, string> attributes,
         CancellationToken cancellationToken = default)
     {
+        CreateQueueAttempts++;
         if (CreateQueueFailuresBeforeSuccess > 0)
         {
             CreateQueueFailuresBeforeSuccess--;
-            throw new InvalidOperationException("create queue failed");
+            throw CreateQueueFailure();
         }
 
         if (ExistingQueues.Contains(queueName))
@@ -108,13 +125,16 @@ internal sealed class FakeSqsClient : ISqsClient
         SqsReceiveRequest request,
         CancellationToken cancellationToken = default)
     {
-        ReceiveAttempts++;
+        var attempt = Interlocked.Increment(ref _receiveAttempts);
         LastReceiveRequest = request;
         if (FailuresBeforeReceive > 0)
         {
             FailuresBeforeReceive--;
             throw new InvalidOperationException("receive failed");
         }
+
+        if (attempt == FailOnReceiveAttempt)
+            throw SqsTransportTests.TransientSqsException("receive failed after the SDK retries");
 
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         timeout.CancelAfter(request.WaitTime);
@@ -129,7 +149,7 @@ internal sealed class FakeSqsClient : ISqsClient
         }
 
         var messages = new List<SqsTransportDelivery>(request.MaxMessages);
-        while (messages.Count < request.MaxMessages && _deliveries.Reader.TryRead(out var delivery))
+        while ((ReturnAllAvailable || messages.Count < request.MaxMessages) && _deliveries.Reader.TryRead(out var delivery))
             messages.Add(delivery);
         return messages;
     }

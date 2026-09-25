@@ -36,10 +36,15 @@ internal sealed class GooglePubSubReplyTargetProvider(
                 $"{nameof(GooglePubSubAsyncResponseOptions.WorkerTopicId)}; its responses would be consumed as worker jobs.");
         }
 
+        // The correlation key a remote producer must set is configurable, so name it (sibling
+        // parity: every other broker provider hands out its correlationId* key). Without it a
+        // producer on another attribute name fell through to the body paths and, lacking the id
+        // there, the response was dropped as unroutable.
         var properties = new Dictionary<string, string>(target.Properties, StringComparer.Ordinal)
         {
             ["projectId"] = projectId,
-            ["topicId"] = topicId
+            ["topicId"] = topicId,
+            ["correlationIdAttribute"] = options.CorrelationIdAttribute
         };
 
         return new AsyncResponseReplyTarget

@@ -1,4 +1,5 @@
 using AsyncResponse.Transports.Redis;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using StackExchange.Redis;
 using System.Diagnostics;
@@ -299,6 +300,121 @@ public class RedisDispatcherTests
         Assert.Equal("dead", dead.Stream);
         Assert.Equal("handler_failed_max_attempts", RedisTransportTests.Field(dead.Values, "reason"));
         Assert.Equal("payload-json", RedisTransportTests.Field(dead.Values, "payload"));
+    }
+
+    /// <summary>
+    /// Fixpoint r1 (host-stop hand-back). The flow engine signals "the host is stopping, hand this
+    /// delivery back" with <see cref="DurableFlowInterruptedException"/>, and it arrives while the
+    /// subscriber's own token is still live (ApplicationStopping fires before hosted services
+    /// stop). The dispatcher recognised its own token only, so the hand-back was logged as a
+    /// handler failure and — at MaxDeliveryAttempts — dead-lettered and ACKed: a flow's only
+    /// wake-up buried because of a deploy. It is now left pending, unsettled, with no failure log.
+    /// </summary>
+    [Fact]
+    public async Task Awaiting_HostStopHandBack_WithALiveToken_LeavesTheEntryPendingEvenAtTheCap()
+    {
+        var database = new RedisTransportTests.FakeRedisStreamDatabase();
+        var logger = new RecordingThrowingLogger<RedisDispatcherTests>();
+        await using var dispatcher = RedisMessageDispatcher.Create(
+            (_, _) => throw new DurableFlowInterruptedException("Host is stopping; durable flow 'flow-1' left its in-process wait and the delivery is abandoned for redelivery."),
+            database,
+            new RedisAsyncResponseTransportOptions { DeadLetterStream = "dead" },
+            new RedisSubscriberOptions { MaxDeliveryAttempts = 1 },
+            logger,
+            "worker-stream",
+            "worker-group",
+            RedisSubscriberRole.Worker);
+
+        var outcome = await dispatcher.HandleAsync(Delivery("1-0", attempt: 1), CancellationToken.None);
+
+        Assert.Equal(RedisDispatchOutcome.HandedBack, outcome);
+        Assert.Empty(database.Adds);
+        Assert.Empty(database.Acks);
+        Assert.False(logger.HasEntry(LogLevel.Error, string.Empty));
+        Assert.False(logger.HasEntry(LogLevel.Warning, string.Empty));
+        Assert.True(dispatcher.HandBackSignalled); // the subscriber stops reading and claiming on it
+    }
+
+    /// <summary>
+    /// Fixpoint r1 (host-stop hand-back), the early-ACK half: the entry was ACKed at enqueue, so
+    /// it cannot be handed back to Redis. It is not a handler failure (no Error log), but — per
+    /// the early-ACK hand-back rule of the pre-commit review of fixpoint round 1 — Redis will never
+    /// redeliver it, so besides the OnBackgroundFailure report it gets a dead-letter copy under its
+    /// own reason, its only durable record (a replay resumes the run from its last checkpoint).
+    /// </summary>
+    [Fact]
+    public async Task Queued_HostStopHandBack_IsSurfacedAndDeadLetteredAsHandedBackAfterCommit_WithoutAnErrorLog()
+    {
+        var database = new RedisTransportTests.FakeRedisStreamDatabase();
+        var logger = new RecordingThrowingLogger<RedisDispatcherTests>();
+        var failureReported = new TaskCompletionSource<RedisBackgroundFailureContext>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var options = new RedisSubscriberOptions().UseAckAfterEnqueue(1, 8, TimeSpan.FromSeconds(5));
+        options.OnBackgroundFailure = context =>
+        {
+            failureReported.TrySetResult(context);
+            return ValueTask.CompletedTask;
+        };
+        var dispatcher = RedisMessageDispatcher.Create(
+            (_, _) => throw new DurableFlowInterruptedException("Host is stopping; durable flow 'flow-1' wake-up is abandoned for redelivery."),
+            database,
+            new RedisAsyncResponseTransportOptions { DeadLetterStream = "dead" },
+            options,
+            logger,
+            "worker-stream",
+            "worker-group",
+            RedisSubscriberRole.Worker);
+
+        await dispatcher.HandleAsync(Delivery("1-0", attempt: 1), CancellationToken.None);
+        var failure = await failureReported.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await dispatcher.DisposeAsync(); // joins the worker, so nothing more can be written
+
+        Assert.IsType<DurableFlowInterruptedException>(failure.Exception);
+        var dead = Assert.Single(database.Adds);
+        Assert.Equal("dead", dead.Stream);
+        Assert.Equal("handed_back_after_commit", RedisTransportTests.Field(dead.Values, "reason"));
+        Assert.Equal("payload-json", RedisTransportTests.Field(dead.Values, "payload"));
+        Assert.True(logger.HasEntry(LogLevel.Warning, "handed back by the flow engine"));
+        Assert.False(logger.HasEntry(LogLevel.Error, string.Empty));
+        Assert.True(dispatcher.HandBackSignalled);
+    }
+
+    /// <summary>
+    /// Pass 2 of the pre-commit review of fixpoint round 1: with dead-lettering disabled no copy
+    /// is written, yet the hand-back still logged a Warning claiming one — a wake-up Redis will
+    /// never redeliver was lost at Warning under a false "Dead-lettering a copy". Without a
+    /// destination the loss is now logged at Error and says so.
+    /// </summary>
+    [Fact]
+    public async Task Queued_HostStopHandBack_WithDeadLetteringDisabled_LogsTheLossAtError()
+    {
+        var database = new RedisTransportTests.FakeRedisStreamDatabase();
+        var logger = new RecordingThrowingLogger<RedisDispatcherTests>();
+        var failureReported = new TaskCompletionSource<RedisBackgroundFailureContext>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var options = new RedisSubscriberOptions().UseAckAfterEnqueue(1, 8, TimeSpan.FromSeconds(5));
+        options.OnBackgroundFailure = context =>
+        {
+            failureReported.TrySetResult(context);
+            return ValueTask.CompletedTask;
+        };
+        var dispatcher = RedisMessageDispatcher.Create(
+            (_, _) => throw new DurableFlowInterruptedException("Host is stopping; durable flow 'flow-1' wake-up is abandoned for redelivery."),
+            database,
+            new RedisAsyncResponseTransportOptions { DeadLetterStream = "dead", DeadLetterEnabled = false },
+            options,
+            logger,
+            "worker-stream",
+            "worker-group",
+            RedisSubscriberRole.Worker);
+
+        await dispatcher.HandleAsync(Delivery("1-0", attempt: 1), CancellationToken.None);
+        var failure = await failureReported.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await dispatcher.DisposeAsync(); // joins the worker, so nothing more can be logged
+
+        Assert.IsType<DurableFlowInterruptedException>(failure.Exception);
+        Assert.Empty(database.Adds);
+        Assert.True(logger.HasEntry(LogLevel.Error, "no dead-letter destination is configured"));
+        Assert.False(logger.HasEntry(LogLevel.Warning, "Dead-lettering a copy"));
+        Assert.True(dispatcher.HandBackSignalled);
     }
 
     [Fact]

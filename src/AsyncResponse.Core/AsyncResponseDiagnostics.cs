@@ -44,11 +44,11 @@ public static class AsyncResponseDiagnostics
 
     private static readonly Counter<long> WorkerJobsCounter =
         Meter.CreateCounter<long>("asyncresponse.worker.jobs", unit: "{job}",
-            description: "Worker jobs processed, tagged by outcome (executed/failed/rejected).");
+            description: "Worker jobs processed, tagged by outcome (executed/failed/rejected/dropped/redelayed).");
 
     private static readonly Counter<long> TypeResolutionFailures =
         Meter.CreateCounter<long>("asyncresponse.type_resolution.unresolved", unit: "{failure}",
-            description: "Persisted service/payload type names that could not be resolved; the callback may silently fail to route.");
+            description: "Persisted service/payload type names that could not be resolved (kind = service|payload; the callback may silently fail to route), plus registered type resolvers that threw (kind = resolver, one per throw).");
 
     private static readonly Counter<long> UnroutableResponsesCounter =
         Meter.CreateCounter<long>("asyncresponse.ingress.unroutable_responses", unit: "{message}",
@@ -202,14 +202,27 @@ public static class AsyncResponseDiagnostics
         activity?.SetTag("asyncresponse.reply_target.transport", replyTarget.Transport);
     }
 
+    /// <summary>
+    /// Tags the worker target. On the consuming side these names come off the worker stream,
+    /// written by whoever can publish to it, and are tagged before authorization: bounded and
+    /// escaped like every other quoted persisted name, never megabytes of raw text or its line
+    /// breaks copied into a trace backend. An ordinary name is tagged unchanged.
+    /// </summary>
     internal static void SetWorker(Activity? activity, ReflectionCallDto? call)
     {
-        if (call is null)
+        if (activity is null || call is null)
             return;
 
-        activity?.SetTag("asyncresponse.worker.service", call.ServiceInterfaceFullName);
-        activity?.SetTag("asyncresponse.worker.method", call.MethodName);
+        activity.SetTag("asyncresponse.worker.service", call.ServiceInterfaceFullName is { } service
+            ? AsyncResponseTypeResolution.DescribeForDiagnostics(service)
+            : null);
+        activity.SetTag("asyncresponse.worker.method", call.MethodName is { } method
+            ? DiagnosticText.EscapedExcerpt(method, MaxTaggedMethodNameLength)
+            : null);
     }
+
+    /// <summary>Longest method name tagged whole — the excerpt budget the callback resolver quotes method names with.</summary>
+    private const int MaxTaggedMethodNameLength = 256;
 
     internal static void SetLostSubscriberRoute(Activity? activity, RecoveryAction? action, bool mixed = false)
         => activity?.SetTag("asyncresponse.lost_subscriber_route", LostSubscriberRouteName(action, mixed));
@@ -268,7 +281,12 @@ public static class AsyncResponseDiagnostics
             WaiterTimeoutsCounter.Add(1, new KeyValuePair<string, object?>("channel", channel));
     }
 
-    /// <summary>Records one worker-job outcome (executed/failed/rejected).</summary>
+    /// <summary>
+    /// Records one worker-job outcome: <c>executed</c>, <c>failed</c> (one per attempt),
+    /// <c>rejected</c> (refused without dispatching), <c>dropped</c> (the in-memory transport's
+    /// terminal give-up; broker transports dead-letter instead), or <c>redelayed</c> (a delayed
+    /// job delivered early and re-published for the remainder — one per hop).
+    /// </summary>
     internal static void RecordWorkerOutcome(string outcome)
     {
         if (WorkerJobsCounter.Enabled)
@@ -277,7 +295,9 @@ public static class AsyncResponseDiagnostics
 
     /// <summary>
     /// Records that a persisted type name (kind = "service" or "payload") could not be resolved, so
-    /// operators can correlate a silently-failing recovery callback with a missing/ALC-loaded type.
+    /// operators can correlate a silently-failing recovery callback with a missing/ALC-loaded type
+    /// — or (kind = "resolver") that a registered type resolver threw, counted per throw whether or
+    /// not a later resolver then answered.
     /// </summary>
     internal static void RecordTypeResolutionFailure(string kind)
     {

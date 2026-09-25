@@ -41,7 +41,7 @@ public sealed class RelationalTransportCoverageTests
             () => ValueTask.CompletedTask,
             _ => ValueTask.CompletedTask,
             (_, _, _) => new ValueTask<bool>(true),
-            () => new ValueTask<bool>(true));
+            _ => new ValueTask<bool>(true));
         var worker = new SqlServerWorkerSubscriber(
             configured,
             store,

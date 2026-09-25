@@ -1,6 +1,7 @@
 using AsyncResponse;
 using AsyncResponse.Channels.NATS;
 using Microsoft.Extensions.DependencyInjection.Extensions;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using NATS.Client.Core;
 using NATS.Net;
@@ -42,7 +43,8 @@ public static class NatsAsyncResponseChannelServiceCollectionExtensions
         // NATS JetStream Key-Value client adapter (lazily creates the recovery bucket on first use).
         services.TryAddSingleton<INatsKvStore>(provider => new NatsKvStoreAdapter(
             provider.GetRequiredService<INatsConnection>().CreateKeyValueStoreContext(),
-            provider.GetRequiredService<IOptions<NatsAsyncResponseChannelOptions>>().Value));
+            provider.GetRequiredService<IOptions<NatsAsyncResponseChannelOptions>>().Value,
+            provider.GetService<ILogger<NatsKvStoreAdapter>>()));
 
         // Durable recovery store; also the watchdog's recovery-state scanner.
         services.TryAddSingleton<NatsRecoveryStateStore>();

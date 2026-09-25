@@ -376,4 +376,75 @@ public class SerialExecutorRegistryTests
         registry.OnSubscriptionRetired("cid");
         await registry.RemoveAsync("cid");
     }
+
+    [Fact]
+    public async Task RetireIfUnreferenced_WithASiblingStillRegistered_LeavesTheSharedExecutorAdmitting()
+    {
+        // Fan-out: the first waiter's cleanup must not retire the executor its sibling still
+        // uses. Pre-fix the per-waiter cleanup retired it unconditionally, and while that
+        // retirement drained the sibling's in-flight item every non-blocking TryEnqueue for the
+        // sibling read "Full" — which the Redis channel answers by faulting the wait as overloaded.
+        var registry = new SerialExecutorRegistry(NullLogger.Instance);
+        registry.OnSubscriptionRegistered("cid");
+        registry.OnSubscriptionRegistered("cid");
+        var siblingStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseSibling = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        Assert.Equal(SerialExecutorRegistry.TryEnqueueOutcome.Accepted, registry.TryEnqueue("cid", async () =>
+        {
+            siblingStarted.TrySetResult();
+            await releaseSibling.Task;
+        }));
+        await siblingStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        registry.OnSubscriptionRetired("cid");
+        var firstCleanup = registry.RetireIfUnreferencedAsync("cid").AsTask();
+
+        // Nothing to wait for: the sibling keeps the executor, so no retirement (and no drain) began.
+        Assert.True(firstCleanup.IsCompletedSuccessfully);
+        var ran = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        Assert.Equal(SerialExecutorRegistry.TryEnqueueOutcome.Accepted, registry.TryEnqueue("cid", () =>
+        {
+            ran.TrySetResult();
+            return Task.CompletedTask;
+        }));
+
+        releaseSibling.TrySetResult();
+        await ran.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        // The last cleanup out retires it, which lays the tombstone for stragglers.
+        registry.OnSubscriptionRetired("cid");
+        await registry.RetireIfUnreferencedAsync("cid").AsTask().WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal(SerialExecutorRegistry.TryEnqueueOutcome.Suppressed, registry.TryEnqueue("cid", () => Task.CompletedTask));
+    }
+
+    [Fact]
+    public async Task Tombstone_OutlivesAForwardWallClockStep()
+    {
+        // A tombstone bounds how long an in-flight enqueue may still arrive — elapsed time. Pre-fix
+        // its deadline was a wall-clock instant, so a forward clock step (NTP, a resumed VM) expired
+        // it early and the straggler it exists to drop recreated an executor nothing would retire.
+        var clock = new SteppedWallClock();
+        var registry = new SerialExecutorRegistry(NullLogger.Instance, timeProvider: clock);
+        registry.OnSubscriptionRegistered("cid");
+        Assert.True(await registry.EnqueueAsync("cid", () => Task.CompletedTask));
+        registry.OnSubscriptionRetired("cid");
+        await registry.RemoveAsync("cid");
+
+        clock.Wall += TimeSpan.FromHours(1);
+
+        // No monotonic time elapsed: the straggler is still suppressed.
+        Assert.False(await registry.EnqueueAsync("cid", () => Task.CompletedTask));
+    }
+
+    /// <summary>A clock whose wall time can jump while its monotonic timestamp stands still.</summary>
+    private sealed class SteppedWallClock : TimeProvider
+    {
+        private readonly long _timestamp = global::System.Diagnostics.Stopwatch.GetTimestamp();
+
+        public DateTimeOffset Wall { get; set; } = DateTimeOffset.UtcNow;
+
+        public override DateTimeOffset GetUtcNow() => Wall;
+
+        public override long GetTimestamp() => _timestamp;
+    }
 }

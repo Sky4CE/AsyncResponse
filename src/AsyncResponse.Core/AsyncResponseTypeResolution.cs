@@ -5,15 +5,18 @@ namespace AsyncResponse;
 
 /// <summary>
 /// Opt-in extensibility for resolving the service and payload types named in persisted callbacks and
-/// recovery state. By default AsyncResponse resolves a type name against the assemblies loaded into
-/// the default <see cref="System.Runtime.Loader.AssemblyLoadContext"/>
-/// (<c>AppDomain.CurrentDomain.GetAssemblies()</c>). Apps that load callback targets or payload types
-/// into a <em>separate</em> <c>AssemblyLoadContext</c> — plugin hosts, dynamic-load scenarios — can
-/// register an extra resolver (or assembly) here so those types resolve too, instead of the recovery
-/// callback silently failing because the type was invisible to the default context.
+/// recovery state. By default AsyncResponse resolves a type name against every assembly already
+/// loaded into the process (<c>AppDomain.CurrentDomain.GetAssemblies()</c>), in ANY
+/// <see cref="System.Runtime.Loader.AssemblyLoadContext"/> — a plugin's types are found once its
+/// context has loaded them. A name defined in several loaded assemblies (the same plugin loaded
+/// into two contexts) resolves to the first match in load order. Apps whose callback targets or
+/// payload types are not loaded yet when a persisted name arrives — plugin hosts, dynamic-load
+/// scenarios — can register an extra resolver (or assembly) here so those types resolve too,
+/// instead of the recovery callback silently failing to route.
 /// <para>
 /// This is process-wide and additive: registered resolvers are consulted only when the default scan
-/// does not find the type. Registering nothing preserves the default behavior exactly.
+/// does not find the type, so a resolver cannot choose between copies the scan already sees.
+/// Registering nothing preserves the default behavior exactly.
 /// </para>
 /// <para>
 /// <b>Unloadable (collectible) contexts:</b> the library's resolution caches skip types from
@@ -227,8 +230,13 @@ public static class AsyncResponseTypeResolution
     /// the framework: asking <c>netstandard</c> for <c>System.Net.Mail.SmtpClient</c> makes the
     /// runtime load <c>System.Net.Mail</c> and answer with a type from it. That load cannot be
     /// prevented from here — it is limited to the framework's own assemblies, never a file the
-    /// name's author supplies — but its result can be refused, so a persisted name still only
-    /// ever resolves to a type from an assembly the process had already loaded for itself.
+    /// name's author supplies — but its result is refused: an assembly-qualified component must
+    /// come from a snapshotted assembly, and an unqualified one only ever from the candidate that
+    /// defines it (never through another candidate's forwarder). The refusal holds for the
+    /// resolution that caused the load, not beyond it: the loaded assembly is part of the process
+    /// from then on, so the next snapshot contains it and a later resolution of the same name (a
+    /// redelivery) answers with its type. Such a type still has to pass the caller's own gate —
+    /// the payload marker interface, a DI registration, the flow contract — before anything uses it.
     /// </para>
     /// </summary>
     [RequiresUnreferencedCode("Resolves a persisted type name by string; a trimmed app may have removed the type.")]
@@ -254,9 +262,11 @@ public static class AsyncResponseTypeResolution
 
                 foreach (var candidate in loaded)
                 {
-                    // A forwarded hit from outside the snapshot is skipped, not final: a later
-                    // candidate may define the same name itself.
-                    if (candidate.GetType(typeName, throwOnError: false, ignoreCase) is { } type && IsDefinedIn(loaded, type))
+                    // Only a candidate's OWN type: a forwarded hit is skipped, not final. The
+                    // defining assembly, when it is loaded, is itself a candidate and answers for
+                    // itself — so requiring the definer loses nothing, and a facade can never
+                    // answer ahead of it in load order.
+                    if (candidate.GetType(typeName, throwOnError: false, ignoreCase) is { } type && type.Assembly == candidate)
                         return type;
                 }
 
@@ -290,7 +300,9 @@ public static class AsyncResponseTypeResolution
                 // next. Counted, though: swallowed without a trace, a resolver that throws on every
                 // call looked identical to one that simply had no answer, and the recovery
                 // callbacks it should have resolved just kept failing to route with nothing to
-                // explain why.
+                // explain why. Counted per THROW, under its own kind — a later resolver may still
+                // answer, and a name that stays unresolved is counted again by its caller under
+                // "service" or "payload".
                 AsyncResponseDiagnostics.RecordTypeResolutionFailure("resolver");
             }
         }

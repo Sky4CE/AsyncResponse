@@ -315,6 +315,95 @@ public sealed class Round27RegressionTests
         lease.ThrowIfLost();
     }
 
+    [Fact]
+    public async Task FailedRenewals_RetryOnAShortBackoff_SoAStoreBlipDoesNotLoseAHealthyLease()
+    {
+        // Fixpoint r1 (S1#16): a failed beat waited out another full renew interval. Defaults: a
+        // 60 s lease renewed every 20 s — the beats at t=20 and t=40 fail (a ~25 s store blip) and
+        // the next one, at t=60, is already past the deadline: the lease was lost although the
+        // store came back at t=41. Now a failed beat retries every second.
+        var clock = new VirtualTimeProvider();
+        var store = new FlakyRenewalStore(new InMemoryFlowStateStore(clock), failures: 2);
+        var options = new DurableFlowOptions();
+
+        Assert.True(await store.TryCreateAsync("flow-blip", RunningState("flow-blip"), TimeSpan.FromDays(1)));
+        Assert.True(await store.TryAcquireLeaseAsync("flow-blip", "lease-1", options.ExecutionLeaseDuration));
+
+        await using var lease = new FlowExecutionLease(store, "flow-blip", "lease-1", options, NullLogger.Instance, clock);
+
+        // Past the original 60 s deadline.
+        clock.Advance(TimeSpan.FromSeconds(65));
+
+        Assert.False(lease.LostToken.IsCancellationRequested);
+        lease.ThrowIfLost();
+        // t=20 and t=21 fail; t=22, t=42 and t=62 renew.
+        Assert.Equal(5, store.RenewAttempts);
+    }
+
+    [Fact]
+    public async Task RenewalResumedAfterAFailedParkPublish_RenewsAtOnce_SoTheLeaseDoesNotLapseBeforeTheNextBeat()
+    {
+        // Precommit review (residual): a park pauses renewal before it publishes its wake-up; when
+        // the publish fails the execution carries on and renewal resumes. It resumed with a full
+        // interval before its first beat — after a publish that spent most of the lease in the
+        // builder's retry ladder, the deadline passed first and the attempt's failure checkpoint was
+        // refused. Defaults: 60 s lease, 20 s interval; paused at t=19, resumed at t=50.
+        var clock = new VirtualTimeProvider();
+        var store = new InMemoryFlowStateStore(clock);
+        var options = new DurableFlowOptions();
+
+        Assert.True(await store.TryCreateAsync("flow-resumed", RunningState("flow-resumed"), TimeSpan.FromDays(1)));
+        Assert.True(await store.TryAcquireLeaseAsync("flow-resumed", "lease-1", options.ExecutionLeaseDuration));
+
+        await using var lease = new FlowExecutionLease(store, "flow-resumed", "lease-1", options, NullLogger.Instance, clock);
+
+        clock.Advance(TimeSpan.FromSeconds(19));
+        await lease.PauseRenewalAsync();
+        clock.Advance(TimeSpan.FromSeconds(31));
+        Assert.False(lease.IsLost);
+
+        lease.ResumeRenewal();
+
+        // Past the lease the acquire granted (t=60), short of the interval a full first wait would
+        // have ended at (t=70).
+        clock.Advance(TimeSpan.FromSeconds(15));
+
+        Assert.False(lease.LostToken.IsCancellationRequested);
+        lease.ThrowIfLost();
+        Assert.True((await store.ObserveLeaseAsync("flow-resumed"))!.ExpiresAtUtc > clock.GetUtcNow().UtcDateTime);
+    }
+
+    /// <summary>The in-memory store, whose first <c>failures</c> renewals throw like a store that is briefly unreachable.</summary>
+    private sealed class FlakyRenewalStore(InMemoryFlowStateStore inner, int failures) : IFlowStateStore
+    {
+        private int _renewAttempts;
+
+        public int RenewAttempts => Volatile.Read(ref _renewAttempts);
+
+        public Task<bool> TryRenewLeaseAsync(string flowId, string leaseId, TimeSpan leaseDuration, CancellationToken cancellationToken = default)
+            => Interlocked.Increment(ref _renewAttempts) <= failures
+                ? Task.FromException<bool>(new TimeoutException("store briefly unreachable"))
+                : inner.TryRenewLeaseAsync(flowId, leaseId, leaseDuration, cancellationToken);
+
+        public Task<bool> TryCreateAsync(string flowId, FlowState state, TimeSpan ttl, CancellationToken cancellationToken = default)
+            => inner.TryCreateAsync(flowId, state, ttl, cancellationToken);
+
+        public Task<FlowState?> LoadAsync(string flowId, CancellationToken cancellationToken = default)
+            => inner.LoadAsync(flowId, cancellationToken);
+
+        public Task<bool> TryUpdateAsync(string flowId, FlowState state, long expectedRevision, TimeSpan ttl, string? leaseId = null, CancellationToken cancellationToken = default)
+            => inner.TryUpdateAsync(flowId, state, expectedRevision, ttl, leaseId, cancellationToken);
+
+        public Task<bool> TryAcquireLeaseAsync(string flowId, string leaseId, TimeSpan leaseDuration, CancellationToken cancellationToken = default)
+            => inner.TryAcquireLeaseAsync(flowId, leaseId, leaseDuration, cancellationToken);
+
+        public Task ReleaseLeaseAsync(string flowId, string leaseId, CancellationToken cancellationToken = default)
+            => inner.ReleaseLeaseAsync(flowId, leaseId, cancellationToken);
+
+        public Task<bool> TryDeleteAsync(string flowId, CancellationToken cancellationToken = default)
+            => inner.TryDeleteAsync(flowId, cancellationToken);
+    }
+
     // -----------------------------------------------------------------------------------------
     // Finding — a resolver registration was process-static with no way to remove it, so
     // RegisterAssembly pinned a collectible AssemblyLoadContext for the life of the process,

@@ -14,10 +14,13 @@ namespace AsyncResponse.Transports.SQS;
 /// <c>GetQueueUrl</c> once) and cached for the lifetime of the transport; a transient resolution
 /// failure on the first publish is not cached, so the next publish retries. When the worker queue
 /// is a FIFO queue (name or URL ending in <c>.fifo</c>), the correlation id becomes the
-/// <c>MessageGroupId</c> so one flow's jobs stay ordered (an id SQS would reject there — longer
-/// than 128 characters, or anything outside ASCII letters, digits and punctuation — is replaced by
-/// a stable hash of itself), and every message carries a unique
-/// <c>MessageDeduplicationId</c> so distinct jobs of the same flow are never deduplicated away.
+/// <c>MessageGroupId</c>, so jobs sharing a correlation id are delivered in order (an id SQS would
+/// reject there — longer than 128 characters, or anything outside ASCII letters, digits and
+/// punctuation — is replaced by a stable hash of itself), and every message carries a unique
+/// <c>MessageDeduplicationId</c> so distinct jobs are never deduplicated away. Jobs without a
+/// correlation id — durable-flow start, resume and wake-up jobs among them, unless the flow was
+/// started inside a request scope — all share <see cref="SqsAsyncResponseOptions.FifoMessageGroupIdFallback"/>:
+/// one group SQS delivers strictly one at a time across every consumer, not one group per flow.
 /// </remarks>
 public sealed class SqsWorkerTransport : IWorkerTransport, IDelayedWorkerTransport, IWorkerTransportInFlightLimit, IAsyncDisposable
 {
@@ -74,6 +77,10 @@ public sealed class SqsWorkerTransport : IWorkerTransport, IDelayedWorkerTranspo
 
     private async Task<string> GetQueueUrlAsync(CancellationToken cancellationToken)
     {
+        // The lock-free fast path checks disposal too: dispose leaves the cached URL in place, so
+        // every publish after the first one skipped the gated check below — and with a shared,
+        // DI-owned SQS client it even went through, after the transport was disposed.
+        ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed), this);
         var queueUrl = Volatile.Read(ref _queueUrl);
         if (queueUrl is not null)
             return queueUrl;
@@ -122,7 +129,8 @@ public sealed class SqsWorkerTransport : IWorkerTransport, IDelayedWorkerTranspo
     /// extend past. Without renewal an explicit <see cref="SqsSubscriberOptions.VisibilityTimeout"/>
     /// is itself the ceiling and is reported as such; when that is unset too, the queue's own
     /// visibility timeout governs — a value this transport never reads — so only the 12-hour
-    /// upper bound can be reported: set <c>VisibilityTimeout</c> to advertise the real one.
+    /// upper bound can be reported: set <c>VisibilityTimeout</c> to advertise the real one (the
+    /// worker subscriber warns at startup while durable flows run in that configuration).
     /// <c>null</c> in <see cref="SqsAckMode.AckAfterEnqueue"/>, where the message is deleted before
     /// its handler runs and nothing stays in flight at the broker.
     /// </remarks>
@@ -170,7 +178,7 @@ public sealed class SqsWorkerTransport : IWorkerTransport, IDelayedWorkerTranspo
         try
         {
             var messageAttributes = new Dictionary<string, string>(StringComparer.Ordinal);
-            if (!string.IsNullOrWhiteSpace(job.CorrelationId))
+            if (!string.IsNullOrWhiteSpace(job.CorrelationId) && IsValidAttributeValue(job.CorrelationId))
                 messageAttributes[_options.CorrelationIdAttribute] = job.CorrelationId;
 
             var queueUrl = await GetQueueUrlAsync(cancellationToken).ConfigureAwait(false);
@@ -210,6 +218,28 @@ public sealed class SqsWorkerTransport : IWorkerTransport, IDelayedWorkerTranspo
             ? correlationId
             // Uppercase hex: ToHexStringLower is .NET 9+, and this package still targets net8.0.
             : HashedMessageGroupIdPrefix + Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(correlationId)));
+
+    /// <summary>
+    /// Whether SQS accepts the value in a <c>String</c> message attribute. SQS restricts message
+    /// text to the XML character set (#x9, #xA, #xD, #x20–#xD7FF, #xE000–#xFFFD, #x10000+), and a
+    /// portable correlation id — which rules out control characters and unpaired surrogates, but
+    /// not U+FFFE/U+FFFF — can still fall outside it; SQS then rejected the whole
+    /// <c>SendMessage</c>, so every publish for that id failed. The worker path reads the id from
+    /// the body, so such an id simply travels without the (diagnostic) attribute.
+    /// </summary>
+    internal static bool IsValidAttributeValue(string value)
+    {
+        foreach (var character in value)
+        {
+            if (character is '￾' or '￿'
+                || (character < ' ' && character is not ('\t' or '\n' or '\r')))
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
 
     /// <summary>Whether SQS accepts the value as a <c>MessageGroupId</c> (or <c>MessageDeduplicationId</c>).</summary>
     internal static bool IsValidMessageGroupId(string value)

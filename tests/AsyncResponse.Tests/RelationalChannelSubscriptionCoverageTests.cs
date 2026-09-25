@@ -100,7 +100,7 @@ public sealed class RelationalChannelSubscriptionCoverageTests
         Assert.True(Invoke<bool>(success.Instance, "MarkSeen", seenId));
         Assert.True(Invoke<bool>(success.Instance, "HasSeen", seenId));
         Assert.False(Invoke<bool>(success.Instance, "MarkSeen", seenId));
-        Invoke(success.Instance, "PruneSeen", DateTimeOffset.UtcNow.AddMinutes(1));
+        Invoke(success.Instance, "PruneSeen", TimeSpan.Zero); // Evicts every entry: none is younger than a zero age.
         Assert.False(Invoke<bool>(success.Instance, "HasSeen", seenId));
         await ProcessAsync(success.Instance, message(SuccessEnvelope(OperationStatus.Running, "progress")));
         Assert.False(success.Completion.Task.IsCompleted);
@@ -320,14 +320,23 @@ public sealed class RelationalChannelSubscriptionCoverageTests
         await Assert.ThrowsAnyAsync<Exception>(() => sql.CountActiveSubscribersAsync("corr", CancellationToken.None));
         await Assert.ThrowsAnyAsync<Exception>(() => sql.SaveRecoveryStateAsync("corr", new RecoveryState { RegistrationId = Guid.NewGuid(), CorrelationId = "corr" }, TimeSpan.FromMinutes(1), CancellationToken.None));
 
+        // The batch statements themselves still fail against the unreachable server...
+        var recoveryBatch = typeof(SqlServerChannelSql).GetMethod("PruneExpiredRecoveryBatchAsync", BindingFlags.Instance | BindingFlags.NonPublic)!;
+        await Assert.ThrowsAnyAsync<Exception>(() => (Task)recoveryBatch.Invoke(sql, [null, CancellationToken.None])!);
+
+        var tableBatch = typeof(SqlServerChannelSql).GetMethod("PruneExpiredBatchAsync", BindingFlags.Instance | BindingFlags.NonPublic)!;
+        await Assert.ThrowsAnyAsync<Exception>(() => (Task)tableBatch.Invoke(sql, [sql.MessageTable, CancellationToken.None])!);
+
+        // ...but the opportunistic prunes that wrap them swallow the failure (see the prune facts in
+        // OpportunisticPruneTests): they ride on publishes, registrations, and probes.
         var pruneRecovery = typeof(SqlServerChannelSql).GetMethod("PruneExpiredRecoveryAsync", BindingFlags.Instance | BindingFlags.NonPublic)!;
-        await Assert.ThrowsAnyAsync<Exception>(() => (Task)pruneRecovery.Invoke(sql, [null, CancellationToken.None])!);
+        await (Task)pruneRecovery.Invoke(sql, [null, CancellationToken.None])!;
 
         var pruneMessages = typeof(SqlServerChannelSql).GetMethod("PruneExpiredMessagesAsync", BindingFlags.Instance | BindingFlags.NonPublic)!;
-        await Assert.ThrowsAnyAsync<Exception>(() => (Task)pruneMessages.Invoke(sql, [CancellationToken.None])!);
+        await (Task)pruneMessages.Invoke(sql, [CancellationToken.None])!;
 
         var pruneSubscribers = typeof(SqlServerChannelSql).GetMethod("PruneExpiredSubscribersAsync", BindingFlags.Instance | BindingFlags.NonPublic)!;
-        await Assert.ThrowsAnyAsync<Exception>(() => (Task)pruneSubscribers.Invoke(sql, [null, CancellationToken.None])!);
+        await (Task)pruneSubscribers.Invoke(sql, [CancellationToken.None])!;
     }
 
     [Fact]
@@ -352,8 +361,12 @@ public sealed class RelationalChannelSubscriptionCoverageTests
         await Assert.ThrowsAnyAsync<Exception>(() => sql.HeartbeatSubscribersAsync("instance", [("corr", Guid.NewGuid())], TimeSpan.FromMinutes(1), CancellationToken.None));
         await Assert.ThrowsAnyAsync<Exception>(() => sql.CountActiveSubscribersAsync("corr", CancellationToken.None));
 
+        var pgTableBatch = typeof(PostgreSqlChannelSql).GetMethod("PruneExpiredBatchAsync", BindingFlags.Instance | BindingFlags.NonPublic)!;
+        await Assert.ThrowsAnyAsync<Exception>(() => (Task)pgTableBatch.Invoke(sql, [sql.SubscriberTable, CancellationToken.None])!);
+
+        // The opportunistic wrapper swallows the same failure.
         var pgPruneSubscribers = typeof(PostgreSqlChannelSql).GetMethod("PruneExpiredSubscribersAsync", BindingFlags.Instance | BindingFlags.NonPublic)!;
-        await Assert.ThrowsAnyAsync<Exception>(() => (Task)pgPruneSubscribers.Invoke(sql, [null, CancellationToken.None])!);
+        await (Task)pgPruneSubscribers.Invoke(sql, [CancellationToken.None])!;
 
         var cts = new CancellationTokenSource();
         await cts.CancelAsync();

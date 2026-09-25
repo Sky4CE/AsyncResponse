@@ -4,10 +4,12 @@ namespace AsyncResponse;
 /// Carries ambient async-response metadata that flows with the async call stack via
 /// <see cref="AsyncLocal{T}"/>, so it is unique per logical operation.
 /// <para>
-/// Publishers fall back to this ambient value when <c>SetResponse</c>/<c>SetException</c> are
-/// called without an explicit correlation id, and worker jobs restore it before executing so
-/// downstream publishes correlate automatically. Reply targets are available to outbound
-/// integration code that needs to tell a remote system where to publish its response.
+/// Worker jobs restore it before executing, and the builder reads it when a job enqueues further
+/// work, so the ambient id travels with the call chain. Publishers never fall back to it:
+/// <c>SetResponse</c>/<c>SetException</c> require an explicit correlation id and drop a publish
+/// without one, so pass <see cref="CorrelationId"/> explicitly when publishing from a job. Reply
+/// targets are available to outbound integration code that needs to tell a remote system where
+/// to publish its response.
 /// Prefer passing values explicitly where practical; the ambient context exists for integration
 /// points that cannot.
 /// </para>

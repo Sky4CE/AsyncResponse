@@ -13,6 +13,13 @@ public sealed class RedisAsyncResponseOptions : DurableAsyncResponseChannelOptio
     /// applications or environments sharing one Redis. Treat as a deployment-wide contract:
     /// publishers and subscribers must agree on it, and changing it orphans existing
     /// recovery state.
+    /// <para>
+    /// On Redis Cluster, do not hash-tag it (<c>{app}</c>): the channel needs no co-location —
+    /// its recovery-state transactions touch one key and its pub/sub channels are key-routed per
+    /// correlation id — so a tag only pins every response channel and recovery key to one slot,
+    /// putting all of the channel's traffic on one node. (The Redis transport's own prefix is the
+    /// opposite case and should be hash-tagged.)
+    /// </para>
     /// </summary>
     public string KeyPrefix { get; set; } = "asyncresponse";
 

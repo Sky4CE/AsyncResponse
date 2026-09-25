@@ -44,9 +44,12 @@ internal sealed class RecordingThrowingLogger<T> : ILogger<T>
     }
 
     public bool HasEntry(LogLevel level, string messageFragment)
+        => CountEntries(level, messageFragment) > 0;
+
+    public int CountEntries(LogLevel level, string messageFragment)
     {
         lock (_gate)
-            return _entries.Any(entry => entry.Level == level && entry.Message.Contains(messageFragment, StringComparison.Ordinal));
+            return _entries.Count(entry => entry.Level == level && entry.Message.Contains(messageFragment, StringComparison.Ordinal));
     }
 }
 
@@ -70,6 +73,23 @@ internal sealed class FakeNatsKvStore : INatsKvStore
     private ulong _revisionCounter;
 
     public readonly Dictionary<string, string> Entries = new(StringComparer.Ordinal);
+
+    /// <summary>
+    /// The KV delete marker each removal leaves behind, with the time it was written — NATS KV
+    /// keeps it (History = 1) until the bucket's MaxAge, unless the maintenance pass purges it. A
+    /// value written to the key afterwards supersedes it. Seeded directly by tests as needed.
+    /// </summary>
+    public readonly Dictionary<string, DateTimeOffset> DeleteMarkers = new(StringComparer.Ordinal);
+
+    /// <summary>The <c>olderThan</c> of every <see cref="PurgeDeleteMarkersAsync"/> call, in order.</summary>
+    public readonly List<TimeSpan> PurgeRequests = new();
+
+    /// <summary>Completed when a delete-marker purge pass has finished.</summary>
+    public TaskCompletionSource PurgeCompleted { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+    /// <summary>Awaited inside <see cref="PurgeDeleteMarkersAsync"/> before it purges, to hold a pass open.</summary>
+    public Func<Task>? PurgeGate { get; set; }
+
     public int PutCount, DeleteCount;
     public int ForcedCreateConflicts { get; set; }
     public int ForcedUpdateConflicts { get; set; }
@@ -82,18 +102,6 @@ internal sealed class FakeNatsKvStore : INatsKvStore
     /// write deterministically. Cleared before it runs so a re-entrant store call cannot recurse.
     /// </summary>
     public Func<string, Task>? AfterGet;
-
-    public Task PutAsync(string key, string value, CancellationToken cancellationToken)
-    {
-        lock (_gate)
-        {
-            PutCount++;
-            Entries[key] = value;
-            _revisions[key] = ++_revisionCounter;
-        }
-
-        return Task.CompletedTask;
-    }
 
     public Task<bool> TryCreateAsync(string key, string value, CancellationToken cancellationToken)
     {
@@ -110,6 +118,7 @@ internal sealed class FakeNatsKvStore : INatsKvStore
 
             PutCount++;
             Entries[key] = value;
+            DeleteMarkers.Remove(key);
             _revisions[key] = ++_revisionCounter;
             return Task.FromResult(true);
         }
@@ -167,21 +176,11 @@ internal sealed class FakeNatsKvStore : INatsKvStore
         return result;
     }
 
-    public Task<bool> DeleteAsync(string key, CancellationToken cancellationToken)
+    public Task<bool> TryDeleteAsync(string key, ulong expectedRevision, CancellationToken cancellationToken)
     {
         if (DeleteException is not null)
             throw DeleteException;
 
-        lock (_gate)
-        {
-            DeleteCount++;
-            _revisions.Remove(key);
-            return Task.FromResult(Entries.Remove(key));
-        }
-    }
-
-    public Task<bool> TryDeleteAsync(string key, ulong expectedRevision, CancellationToken cancellationToken)
-    {
         lock (_gate)
         {
             if (ForcedDeleteConflicts > 0)
@@ -195,7 +194,36 @@ internal sealed class FakeNatsKvStore : INatsKvStore
 
             DeleteCount++;
             _revisions.Remove(key);
-            return Task.FromResult(Entries.Remove(key));
+            if (Entries.Remove(key))
+            {
+                DeleteMarkers[key] = DateTimeOffset.UtcNow;
+                return Task.FromResult(true);
+            }
+
+            return Task.FromResult(false);
+        }
+    }
+
+    public async Task<long> PurgeDeleteMarkersAsync(TimeSpan olderThan, CancellationToken cancellationToken)
+    {
+        try
+        {
+            if (PurgeGate is { } gate)
+                await gate();
+
+            lock (_gate)
+            {
+                PurgeRequests.Add(olderThan);
+                var cutoff = DateTimeOffset.UtcNow - olderThan;
+                var stale = DeleteMarkers.Where(marker => marker.Value <= cutoff).Select(marker => marker.Key).ToList();
+                foreach (var key in stale)
+                    DeleteMarkers.Remove(key);
+                return stale.Count;
+            }
+        }
+        finally
+        {
+            PurgeCompleted.TrySetResult();
         }
     }
 
@@ -250,6 +278,16 @@ internal sealed class FakeNatsResponseChannelClient : INatsResponseChannelClient
     /// <summary>The lifetime token the channel handed to the live subscription.</summary>
     public CancellationToken SubscriptionLifetime { get; private set; }
 
+    /// <summary>
+    /// Awaited inside <see cref="SubscribeAsync"/> with the token the channel handed it, before the
+    /// subscription exists — e.g. a connection that is reconnecting (NATS.Net waits on that token
+    /// for the connection to reopen).
+    /// </summary>
+    public Func<CancellationToken, Task>? SubscribeBehavior { get; set; }
+
+    /// <summary>Awaited inside <see cref="FlushAsync"/> with the token the channel handed it.</summary>
+    public Func<CancellationToken, Task>? FlushBehavior { get; set; }
+
     public Task<NatsDeliveryOutcome> RequestAsync(string subject, string? payload, bool probe, TimeSpan timeout, CancellationToken cancellationToken)
     {
         if (RequestException is not null)
@@ -268,18 +306,22 @@ internal sealed class FakeNatsResponseChannelClient : INatsResponseChannelClient
         return Task.FromResult(outcome);
     }
 
-    public Task<INatsChannelSubscription> SubscribeAsync(string subject, CancellationToken cancellationToken)
+    public async Task<INatsChannelSubscription> SubscribeAsync(string subject, CancellationToken cancellationToken)
     {
         SubscribedSubjects.Add(subject);
         SubscriptionLifetime = cancellationToken;
+        if (SubscribeBehavior is { } behavior)
+            await behavior(cancellationToken);
+
         _subscription = new FakeSubscription(this, cancellationToken);
-        return Task.FromResult<INatsChannelSubscription>(_subscription);
+        return _subscription;
     }
 
-    public Task FlushAsync(CancellationToken cancellationToken)
+    public async Task FlushAsync(CancellationToken cancellationToken)
     {
         FlushCount++;
-        return Task.CompletedTask;
+        if (FlushBehavior is { } behavior)
+            await behavior(cancellationToken);
     }
 
     /// <summary>Pushes a raw message (e.g. malformed JSON or a probe) into the live subscription.</summary>
@@ -435,7 +477,13 @@ internal sealed class FakeNatsJetStreamTransport : INatsJetStreamTransport
     public Task EnsureDeadLetterStreamAsync(string stream, string subject, long? maxMessages, CancellationToken cancellationToken)
         => EnsureStreamAsync(stream, subject, maxMessages, cancellationToken);
 
-    public Task EnsureConsumerAsync(string stream, string durable, TimeSpan ackWait, CancellationToken cancellationToken)
+    /// <summary>
+    /// The ack wait the "live" consumer reports back from <see cref="EnsureConsumerAsync"/>; null
+    /// answers with the configured one, as for a consumer the call created.
+    /// </summary>
+    public TimeSpan? LiveAckWait { get; set; }
+
+    public Task<TimeSpan> EnsureConsumerAsync(string stream, string durable, TimeSpan ackWait, int maxDeliveryAttempts, CancellationToken cancellationToken)
     {
         _ensureConsumerAttempts++;
         var failure = EnsureConsumerFailureForAttempt?.Invoke(_ensureConsumerAttempts);
@@ -443,7 +491,7 @@ internal sealed class FakeNatsJetStreamTransport : INatsJetStreamTransport
             throw failure;
 
         EnsuredConsumers.Add((stream, durable));
-        return Task.CompletedTask;
+        return Task.FromResult(LiveAckWait ?? ackWait);
     }
 
     public Task<string> PublishAsync(string subject, string payload, IReadOnlyDictionary<string, string>? headers, CancellationToken cancellationToken)

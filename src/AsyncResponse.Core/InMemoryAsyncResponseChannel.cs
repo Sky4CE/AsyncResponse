@@ -30,6 +30,9 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
     private readonly TimeProvider _timeProvider;
     private readonly ILogger<InMemoryAsyncResponseChannel> _logger;
 
+    /// <summary>How much of a remote failure message the wait activity's status quotes.</summary>
+    private const int RemoteFailureStatusLength = 256;
+
     /// <summary>Creates a process-local async-response channel.</summary>
     public InMemoryAsyncResponseChannel(
         IServiceScopeFactory scopeFactory,
@@ -178,16 +181,35 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
             // path, so nothing is leaked; a save that still committed is compensated above or
             // expires via TTL. The filter demands an actual settlement (result or fault): a
             // canceled task means NO response was delivered — e.g. a future channel-wide teardown
-            // canceling in-flight registrations — and takes the rethrow path below.
-            _logger.LogWarning(ex,
-                "Registration step failed after a delivery settled correlationId {CorrelationId}; returning the completed waiter.",
-                correlationId);
+            // canceling in-flight registrations — and takes the rethrow path below. The log is
+            // guarded for the same reason: a throwing logging provider must not turn the
+            // delivered response into a create failure after all.
+            try
+            {
+                _logger.LogWarning(ex,
+                    "Registration step failed after a delivery settled correlationId {CorrelationId}; returning the completed waiter.",
+                    correlationId);
+            }
+            catch
+            {
+                // The logger is what is failing; the completed waiter is returned regardless.
+            }
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Failed to create in-memory waiter for correlationId {CorrelationId}.", correlationId);
+            // Clean up first, report second: the log call is the part that can throw, and logging
+            // first left a zombie subscription behind a throwing logger — no timer armed, read as
+            // a live waiter by the probe forever, silently consuming the next response for the id.
             AsyncResponseDiagnostics.SetError(activity, ex);
             await subscription.DisposeCleanupAsync().ConfigureAwait(false);
+            try
+            {
+                _logger.LogError(ex, "Failed to create in-memory waiter for correlationId {CorrelationId}.", correlationId);
+            }
+            catch
+            {
+                // The logger is what is failing; the registration failure below is what the caller needs.
+            }
 
             // Rethrow instead of returning a pre-faulted waiter: the builder's contract is that
             // the trigger runs only once the subscription AND recovery state exist. A returned
@@ -202,9 +224,6 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
 
     /// <inheritdoc />
     public Task SetResponse<T>(T response, string correlationId, CancellationToken cancellationToken = default) where T : IAsyncResponsePayload
-        => SetResponseCore(response, correlationId, cancellationToken);
-
-    Task IRawAsyncResponsePublisher.SetRawResponse(object? response, string correlationId, CancellationToken cancellationToken)
         => SetResponseCore(response, correlationId, cancellationToken);
 
     Task IRawAsyncResponsePublisher.SetRawResponseJson(string responseJson, string correlationId, CancellationToken cancellationToken)
@@ -225,6 +244,21 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
 
         try
         {
+            // One serialization per publish, shared by every waiter's materialization. Wire parity
+            // is deliberate for SAME-type waiters too: handing the publisher's live instance
+            // through shared one mutable reference across the fan-out and leaked [JsonIgnore]
+            // state no broker-backed channel can deliver — each waiter gets its own declared-T
+            // materialization, byte-equivalent to what Redis/NATS/DB waiters receive. The wire
+            // form is UTF-8 bytes end to end (the earlier string round-trip paid a UTF-16
+            // transcode both ways). Serialized BEFORE anything is routed, as every broker channel
+            // serializes its envelope before publishing: a payload with no wire form (a cycle,
+            // missing AOT metadata) throws at the publisher with the registrations intact, rather
+            // than reaching the lost-subscriber route as an unclassifiable instance and failing
+            // the flow — a divergence no durable channel can produce.
+            var wireBytes = response is null
+                ? null
+                : DeclaredWireSerializer<T>.Instance(response);
+
             var subscribers = SnapshotSubscribers(correlationId);
             activity?.SetTag("asyncresponse.subscribers", subscribers.Count);
             for (var attempt = 0; subscribers.Count == 0; attempt++)
@@ -273,18 +307,6 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
                 }
             }
 
-            // One serialization per publish, shared by every waiter's materialization. Wire parity
-            // is deliberate for SAME-type waiters too: handing the publisher's live instance
-            // through shared one mutable reference across the fan-out and leaked [JsonIgnore]
-            // state no broker-backed channel can deliver — each waiter gets its own declared-T
-            // materialization, byte-equivalent to what Redis/NATS/DB waiters receive. The wire
-            // form is UTF-8 bytes end to end (the earlier string round-trip paid a UTF-16
-            // transcode both ways), serialized eagerly here: every waiter of a typed instance
-            // needs it, and JsonElement/string/null payloads — which materialize through the
-            // conversion path instead — skip it entirely.
-            var wireBytes = response is System.Text.Json.JsonElement or string or null
-                ? null
-                : DeclaredWireSerializer<T>.Instance(response);
             await DispatchResponsesAsync(subscribers, response, wireBytes).ConfigureAwait(false);
 
             if (_logger.IsEnabled(LogLevel.Debug))
@@ -789,8 +811,8 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
         /// Dispatches a typed or materializable response to this subscription.
         /// <paramref name="wireBytes"/> is the publisher's single DECLARED-type wire
         /// serialization (UTF-8 JSON) — what a broker envelope would carry — from which each
-        /// waiter materializes its own instance; <c>null</c> when the response is a
-        /// JsonElement/string/null payload that materializes through the conversion path.
+        /// waiter materializes its own instance; <c>null</c> for a published null, which
+        /// materializes through the conversion path (and faults the waiter).
         /// </summary>
         public abstract Task DispatchResponseAsync(object? response, byte[]? wireBytes);
 
@@ -811,15 +833,17 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
             if (!TryBeginTerminal())
                 return Task.CompletedTask;
 
-            AsyncResponseDiagnostics.SetError(_activity, exception);
-
             // Wire parity: every durable channel transmits only the message (plus, optionally, the
             // capped stack trace in Data["RemoteStackTrace"]) and faults the waiter with a plain
             // Exception — the concrete type never crosses the wire. Handing the publisher's live
             // instance through let a typed `catch` pass against this channel that can never match
             // in production, the same divergence DeclaredWireSerializer exists to prevent for
-            // payloads.
+            // payloads. The wait activity gets the wire channels' tag too: error.type is
+            // "remote_failure", never the publisher's concrete exception type.
             var remoteFailure = new Exception(exception.Message);
+            // The status gets only a capped, escaped excerpt (wire-channel parity): the waiter's
+            // exception carries the whole message, but a span status is a line-oriented sink.
+            AsyncResponseDiagnostics.SetError(_activity, "remote_failure", DiagnosticText.EscapedExcerpt(remoteFailure.Message, RemoteFailureStatusLength));
             var remoteStackTrace = RemoteStackTrace.ForWire(
                 exception.StackTrace,
                 _owner._options.IncludeRemoteStackTrace,
@@ -957,13 +981,29 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
                 }
                 catch (TimeoutException)
                 {
-                    _owner._logger.LogWarning(
-                        "Disposal drain for correlationId {CorrelationId} did not finish within {DrainTimeout}; faulting the waiter as indeterminate.",
-                        CorrelationId, drainTimeout);
-                    AsyncResponseDiagnostics.SetError(_activity, "indeterminate_delivery", "Disposal drain timed out with a delivery in flight.");
-                    // A TrySetResult from the late-finishing dispatch loses against this and is
-                    // dropped; its cleanup call is a no-op behind the latch.
-                    TrySetException(new AsyncResponseIndeterminateDeliveryException(CorrelationId, drainTimeout));
+                    // Settle first, report second, exactly as TimeoutAsync does: the log call is
+                    // the part that can throw, and logging first left ResponseTask pending behind
+                    // the wedged delivery with the cleanup skipped. A TrySetResult from the
+                    // late-finishing dispatch loses against this and is dropped; its cleanup call
+                    // is a no-op behind the latch. Tagged and logged only when the fault WON — a
+                    // delivery that settled the task first (and holds the gate through its own
+                    // cleanup) was not indeterminate.
+                    if (TrySetException(new AsyncResponseIndeterminateDeliveryException(CorrelationId, drainTimeout)))
+                    {
+                        AsyncResponseDiagnostics.SetError(_activity, "indeterminate_delivery", "Disposal drain timed out with a delivery in flight.");
+                        try
+                        {
+                            _owner._logger.LogWarning(
+                                "Disposal drain for correlationId {CorrelationId} did not finish within {DrainTimeout}; faulting the waiter as indeterminate.",
+                                CorrelationId, drainTimeout);
+                        }
+                        finally
+                        {
+                            await CleanupOnceAsync().ConfigureAwait(false);
+                        }
+
+                        return;
+                    }
                 }
             }
 
@@ -1019,7 +1059,6 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
         protected bool TryBeginTerminal()
             => Interlocked.Exchange(ref _terminal, 1) == 0;
 
-        /// <summary>Stores the timeout exception on the concrete waiter task.</summary>
         /// <summary>
         /// Disarms this waiter as if its process had died: the timeout timer is disposed so it can
         /// never fire on a shared clock, the task is cancelled for callers holding it, and the
@@ -1046,10 +1085,11 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
             _activity?.Dispose();
         }
 
+        /// <summary>Stores the timeout exception on the concrete waiter task.</summary>
         protected abstract void SetTimeoutException(Exception exception);
 
-        /// <summary>Attempts to fault the concrete waiter task.</summary>
-        public abstract void TrySetException(Exception exception);
+        /// <summary>Attempts to fault the concrete waiter task; <c>true</c> when this fault settled it.</summary>
+        public abstract bool TrySetException(Exception exception);
 
         /// <summary>Attempts to cancel the concrete waiter task (dispose before any terminal signal).</summary>
         public abstract void TrySetCanceled();
@@ -1094,14 +1134,20 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
                     // Settle first, report second: the log call is the part that can throw. The
                     // abandoned timeout marker no-ops behind CleanupStarted whenever the wedged
                     // dispatch finally releases the gate, and a late TrySetResult from it loses
-                    // against this fault.
-                    TrySetException(new AsyncResponseIndeterminateDeliveryException(CorrelationId, drainTimeout));
-                    AsyncResponseDiagnostics.SetError(_activity, "indeterminate_delivery", "Waiter timeout lapsed with a delivery in flight.");
+                    // against this fault. Tagged and logged only when the fault WON: a delivery
+                    // that already completed the task holds the gate through its own cleanup, and
+                    // a slow cleanup delete is not an indeterminate delivery.
+                    var faulted = TrySetException(new AsyncResponseIndeterminateDeliveryException(CorrelationId, drainTimeout));
+                    if (faulted)
+                        AsyncResponseDiagnostics.SetError(_activity, "indeterminate_delivery", "Waiter timeout lapsed with a delivery in flight.");
                     try
                     {
-                        _owner._logger.LogWarning(
-                            "The waiter timeout for correlationId {CorrelationId} could not run within {DrainTimeout} because a delivery is still in flight; faulting the waiter as indeterminate.",
-                            CorrelationId, drainTimeout);
+                        if (faulted)
+                        {
+                            _owner._logger.LogWarning(
+                                "The waiter timeout for correlationId {CorrelationId} could not run within {DrainTimeout} because a delivery is still in flight; faulting the waiter as indeterminate.",
+                                CorrelationId, drainTimeout);
+                        }
                     }
                     finally
                     {
@@ -1277,8 +1323,8 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
         // object across all same-type waiters and exposed in-process-only state no broker-backed
         // channel can deliver. The publish serializes once (UTF-8 bytes); each waiter
         // deserializes its own instance case-insensitively — the same property matching the
-        // string conversion path and every broker ingress apply. JsonElement/string/null payloads
-        // keep the existing conversion path.
+        // string conversion path and every broker ingress apply. A published null keeps the
+        // conversion path, which faults the waiter below.
         //
         // Through JsonSafety, like every other reader of a body the waiter did not write: a
         // publisher's payload that does not fit the waiter's type (a string-valued dictionary
@@ -1330,7 +1376,7 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
             => _tcs.TrySetException(exception);
 
         /// <inheritdoc />
-        public override void TrySetException(Exception exception)
+        public override bool TrySetException(Exception exception)
             => _tcs.TrySetException(exception);
 
         /// <inheritdoc />

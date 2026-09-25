@@ -69,6 +69,24 @@ internal static class SqlServerTransportOptionsValidator
             $"{nameof(SqlServerAsyncResponseTransportOptions)}.{nameof(transportOptions.HostShutdownTimeout)}",
             transportOptions.HostShutdownTimeout,
             ($"{nameof(SqlServerSubscriberOptions)}.{nameof(subscriber.BackgroundDrainTimeout)} ({role})", subscriber.BackgroundDrainTimeout));
+
+        // Both roles early-ACK: the host stops its hosted services ONE AFTER ANOTHER (the .NET
+        // default HostOptions.ServicesStopConcurrently = false, in reverse registration order), so
+        // the response subscriber's whole stop spend runs to completion before the worker's stop
+        // even begins — the worker keeps claiming and early-ACKing meanwhile — and the two spends
+        // ADD UP. Checked per role, each passed alone (20 + 5 <= 30 with stock defaults) while the
+        // worker's drain got only what the response side left, and the already-ACKed rows the host
+        // abandoned mid-drain (deleted from the table) vanished with no dead-letter record.
+        if (transportOptions.WorkerSubscriber.AckMode is SqlServerAckMode.AckAfterEnqueue
+            && transportOptions.ResponseSubscriber.AckMode is SqlServerAckMode.AckAfterEnqueue)
+        {
+            ShutdownBudgetValidator.Validate(
+                "SQL Server",
+                $"{nameof(SqlServerAsyncResponseTransportOptions)}.{nameof(transportOptions.HostShutdownTimeout)}",
+                transportOptions.HostShutdownTimeout,
+                ($"{nameof(SqlServerSubscriberOptions)}.{nameof(subscriber.BackgroundDrainTimeout)} (Worker)", transportOptions.WorkerSubscriber.BackgroundDrainTimeout),
+                ($"{nameof(SqlServerSubscriberOptions)}.{nameof(subscriber.BackgroundDrainTimeout)} (ResponseIngress)", transportOptions.ResponseSubscriber.BackgroundDrainTimeout));
+        }
     }
 
     public static void ValidateSubscriber(SqlServerSubscriberOptions subscriber, string role)

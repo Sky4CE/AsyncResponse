@@ -5,6 +5,7 @@ using StackExchange.Redis;
 using System.Buffers;
 using System.Collections.Concurrent;
 using System.Diagnostics;
+using System.Net;
 using System.Text;
 using System.Text.Json;
 
@@ -294,6 +295,12 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
     }
 
     /// <summary>
+    /// How much of a remote failure's message (UTF-16 code units, before escaping) the wait's
+    /// activity status quotes.
+    /// </summary>
+    private const int RemoteFailureStatusLength = 256;
+
+    /// <summary>
     /// Per-waiter subscription state and lifecycle. A concrete class rather than closures over the
     /// creating method: the message handler and timeout callback live for the whole wait — days
     /// for a durable-flow await — and must retain only these fields, not a display class holding
@@ -531,10 +538,14 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
                         remoteFailure.Data["RemoteStackTrace"] = RemoteStackTrace.Cap(envelope.ExceptionStackTrace, _owner._options.MaxRemoteStackTraceLength);
                     }
 
-                    _owner._logger.LogWarning("Received error response for correlationId {CorrelationId}: {ErrorMessage}", _correlationId, envelope.ExceptionMessage);
-                    AsyncResponseDiagnostics.SetError(_activity, "remote_failure", remoteFailure.Message);
+                    // The remote's message stays out of the log (DB-channel parity) and goes into the
+                    // activity status only as a capped, escaped excerpt: whoever produced the envelope
+                    // chose it — megabytes of it, CR/LF forging log lines — and only the stack trace
+                    // was bounded. The waiter still receives it whole, on the exception.
+                    _owner._logger.LogWarning("Received error response for correlationId {CorrelationId}.", _correlationId);
+                    AsyncResponseDiagnostics.SetError(_activity, "remote_failure", DiagnosticText.EscapedExcerpt(remoteFailure.Message, RemoteFailureStatusLength));
                     if (!_tcs.TrySetException(remoteFailure))
-                        _owner._logger.LogWarning(remoteFailure, "TaskCompletionSource already completed for correlationId {CorrelationId}.", _correlationId);
+                        _owner._logger.LogWarning("TaskCompletionSource already completed for correlationId {CorrelationId}; the error response was dropped.", _correlationId);
                 }
                 else
                 {
@@ -704,12 +715,14 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
 
                 // Schedule the disposal on the thread pool; do not await directly to prevent
                 // deadlocks with work currently running on the executor. Tracked so the channel's
-                // DisposeAsync can join it at host shutdown.
+                // DisposeAsync can join it at host shutdown. Only once no sibling waiter on this
+                // correlation id is still registered: the executor is shared, and a retiring one
+                // reads as full to HandleMessageAsync, which faults the survivor as overloaded.
                 _owner.TrackRetirement(Task.Run(async () =>
                 {
                     try
                     {
-                        await _owner._executors.RemoveAsync(ChannelName).ConfigureAwait(false);
+                        await _owner._executors.RetireIfUnreferencedAsync(ChannelName).ConfigureAwait(false);
                     }
                     catch (Exception ex)
                     {
@@ -749,9 +762,6 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
     public Task SetResponse<T>(T response, string correlationId, CancellationToken cancellationToken = default) where T : IAsyncResponsePayload
         => SetResponseCore(response, correlationId, cancellationToken);
 
-    Task IRawAsyncResponsePublisher.SetRawResponse(object? response, string correlationId, CancellationToken cancellationToken)
-        => SetResponseCore(response, correlationId, cancellationToken);
-
     Task IRawAsyncResponsePublisher.SetRawResponseJson(string responseJson, string correlationId, CancellationToken cancellationToken)
         => SetRawResponseJsonCore(responseJson, correlationId, cancellationToken);
 
@@ -764,13 +774,17 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
     /// and that retirement can be draining a work item wedged in a user <c>Until</c> predicate —
     /// so an unbounded join here stalled the ingress consumer thread per late/duplicate response
     /// for the registry's 30 s + 30 s defaults, with no configured budget applying. The
-    /// retirement itself continues in the background once the wait lapses.
+    /// retirement itself continues in the background once the wait lapses. Only when no waiter
+    /// in this process is registered on the channel, like the per-waiter cleanups: the recovery
+    /// route (up to its four-attempt callback ladder) leaves ample time for a waiter to
+    /// re-attach and receive, and an unconditional retirement marked that waiter's executor
+    /// retiring — its next delivery read as a full queue and faulted it as overloaded.
     /// </summary>
     private async ValueTask RetireExecutorBoundedAsync(string channel)
     {
         try
         {
-            await _executors.RemoveAsync(channel).AsTask().WaitAsync(_options.DisposalDrainTimeout).ConfigureAwait(false);
+            await _executors.RetireIfUnreferencedAsync(channel).AsTask().WaitAsync(_options.DisposalDrainTimeout).ConfigureAwait(false);
         }
         catch (TimeoutException)
         {
@@ -787,7 +801,6 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
         activity?.SetTag("asyncresponse.channel", "redis");
         AsyncResponseDiagnostics.SetPayloadType(activity, typeof(T));
 
-        // When no correlation id is provided, fall back to the ambient context.
         AsyncResponseDiagnostics.SetCorrelationId(activity, correlationId);
 
         if (CorrelationIdGuard.IsUnpublishable(correlationId, _logger, activity, "the response"))
@@ -1072,55 +1085,116 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
     // ---------------------------------------------------------------------------------------
     // IActiveSubscriberProbe
 
+    /// <summary>
+    /// How long an endpoint must have been seen disconnected before the liveness probe excuses it
+    /// — outside a cluster as the old primary of a failover, in a cluster through the node table. A just-disconnected node IS the failover window: this process already
+    /// routes to the promoted node while the waiter's multiplexer, in another process, has not
+    /// moved its subscription there yet, so the promoted node's zero says nothing about the
+    /// waiter — and excusing the old node at once consumed a live waiter's recovery registration
+    /// (a double resume once the waiter re-subscribed a moment later). StackExchange.Redis
+    /// re-issues a subscription on the new owner only once it learns the new topology: on a
+    /// reconnect attempt after the failover has completed, or at the latest on its periodic
+    /// configuration check (<c>ConfigCheckSeconds</c>, 60 s by default) — and the failover itself
+    /// completes only after the node has been unreachable for the cluster node timeout (15 s by
+    /// default; Sentinel's <c>down-after-milliseconds</c>, 30 s). 90 s covers both, counted from
+    /// the moment a probe in this process first saw the node down. The record is cleared when a
+    /// probe sees the node connected again, but a reconnection no probe observed, or one observed
+    /// while an older probe was still in flight, goes unnoticed, so an earlier outage can shorten a
+    /// later failover's grace. Inside the grace a zero is unknown:
+    /// the lost-subscriber publish throws and is redelivered, and the watchdog leaves the
+    /// registration alone.
+    /// </summary>
+    internal static readonly TimeSpan DisconnectedEndPointGrace = TimeSpan.FromSeconds(90);
+
+    // When a probe first saw each endpoint disconnected (a timestamp on the injected clock); a
+    // probe that sees the endpoint connected again clears it, but a reconnection no probe saw
+    // does not.
+    private readonly ConcurrentDictionary<EndPoint, long> _disconnectedSince = new();
+
     /// <inheritdoc/>
     /// <remarks>
     /// Returns the live subscriber count, or a negative value when liveness could not be
-    /// established. Zero is reported only when every node that could hold the subscription
-    /// answered: the channels are key-routed, so the subscription lives on the single slot owner,
-    /// and a zero collected while that node was unreachable says nothing about the waiter.
+    /// established. A primary that answered with a failure keeps a zero unknown, and so does one
+    /// that has been disconnected for less than <see cref="DisconnectedEndPointGrace"/>. Past the
+    /// grace the recovery scan's completeness rules decide: outside a cluster one answering
+    /// primary is the whole answer (a failed-over deployment lists the old primary, disconnected,
+    /// until it rejoins); in a cluster — where the channels are key-routed and the subscription
+    /// lives on the channel's slot owner — the node table is read, and the disconnected
+    /// primary-flagged endpoints are excused only when every slot owner it lists answered. The
+    /// table is consulted only for disconnected endpoints flagged as primaries: a disconnected or
+    /// failing endpoint still flagged as a replica (a promotion this process has not seen yet) is
+    /// not treated as a possible owner.
     /// </remarks>
     public async ValueTask<long> CountActiveSubscribersAsync(string correlationId, CancellationToken cancellationToken = default)
     {
         if (string.IsNullOrWhiteSpace(correlationId))
             return 0L;
 
+        cancellationToken.ThrowIfCancellationRequested();
         var channel = _keys.Channel(correlationId);
 
         // Subscriptions live on whichever node the client subscribed through, so the live count is
-        // the maximum reported across all connected endpoints. The async server call keeps large
-        // watchdog probe sweeps off blocking thread-pool waits, and the per-endpoint token check
-        // lets a shutdown abort the sweep between probes.
-        long subscribers = 0;
-        var answeredEveryPrimary = true;
-        var primaryAnswered = false;
-        foreach (var endPoint in _multiplexer.GetEndPoints())
+        // the maximum reported across the endpoints. They are asked CONCURRENTLY: one after
+        // another, every hung-but-connected node added its whole command timeout to every probe —
+        // twice per lost-subscriber publish, and again on every ingress retry. The async server
+        // call keeps large watchdog probe sweeps off blocking thread-pool waits.
+        var endPoints = _multiplexer.GetEndPoints();
+        var servers = new IServer[endPoints.Length];
+        var counts = new Task<long?>?[endPoints.Length];
+        var now = _timeProvider.GetTimestamp();
+        for (var i = 0; i < endPoints.Length; i++)
         {
-            cancellationToken.ThrowIfCancellationRequested();
+            servers[i] = _multiplexer.GetServer(endPoints[i]);
+            if (servers[i].IsConnected)
+            {
+                counts[i] = ReadSubscriberCountAsync(servers[i], channel);
+                _disconnectedSince.TryRemove(endPoints[i], out _);
+            }
+        }
 
-            var server = _multiplexer.GetServer(endPoint);
+        if (_disconnectedSince.Count > endPoints.Length)
+            ForgetEndPointsNoLongerListed(endPoints);
 
-            // PUBSUB NUMSUB is node-local and the response channels are key-routed, so the
-            // subscription sits on the ONE node that owns the channel key's slot — a primary. A
-            // node that has never connected reports the default (not a replica), which counts it
-            // as a primary here: the conservative direction, since the unknown node may be the
-            // very owner. Replicas are asked too (a positive answer is proof wherever it comes
-            // from) but never decide a zero.
+        await Task.WhenAll(counts.OfType<Task<long?>>()).WaitAsync(cancellationToken).ConfigureAwait(false);
+
+        long subscribers = 0;
+        var primaryAnswered = false;
+        var primaryFailed = false;
+        var clusterAnswered = false;
+        EndPoint? withinGrace = null;
+        List<IServer>? answered = null;
+        List<IServer>? disconnectedPrimaries = null;
+        for (var i = 0; i < servers.Length; i++)
+        {
+            var server = servers[i];
+
+            // A node that has never connected reports the default — not a replica — so it counts
+            // as a primary here: the conservative direction, since the unknown node may be the very
+            // owner. Replicas are asked too (a positive answer is proof wherever it comes from) but
+            // never decide a zero.
             var isPrimary = !server.IsReplica;
-            if (!server.IsConnected)
+            if (counts[i] is null)
             {
-                answeredEveryPrimary &= !isPrimary;
-                continue;
+                if (isPrimary)
+                {
+                    (disconnectedPrimaries ??= []).Add(server);
+                    var since = _disconnectedSince.GetOrAdd(endPoints[i], now);
+                    if (_timeProvider.GetElapsedTime(since, now) < DisconnectedEndPointGrace)
+                        withinGrace ??= endPoints[i];
+                }
             }
-
-            try
+            else if (counts[i]!.Result is { } count)
             {
-                subscribers = Math.Max(subscribers, await server.SubscriptionSubscriberCountAsync(channel).ConfigureAwait(false));
+                subscribers = Math.Max(subscribers, count);
+                (answered ??= []).Add(server);
                 primaryAnswered |= isPrimary;
+                clusterAnswered |= server.ServerType == ServerType.Cluster;
             }
-            catch (Exception ex) when (ex is not OperationCanceledException)
+            else
             {
-                answeredEveryPrimary &= !isPrimary;
-                _logger.LogDebug(ex, "Failed to read subscriber count for channel {Channel}.", channel.ToString()!);
+                // A live node that was asked and failed to answer is never excused (the scan fails
+                // on it the same way): it may be the slot owner.
+                primaryFailed |= isPrimary;
             }
         }
 
@@ -1133,7 +1207,71 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
         if (subscribers > 0)
             return subscribers;
 
-        return primaryAnswered && answeredEveryPrimary ? 0L : -1L;
+        if (!primaryAnswered || primaryFailed)
+            return -1L;
+
+        // A primary that went down moments ago may be the old owner of a failover the waiter has
+        // not followed yet (see DisconnectedEndPointGrace): nothing below may excuse it until it
+        // has stayed down for the grace.
+        if (withinGrace is not null)
+        {
+            _logger.LogDebug(
+                "Redis subscriber liveness probe for channel {Channel}: {EndPoint} has been disconnected for less than {Grace}; a waiter may still be moving its subscription, so the zero stays unknown.",
+                channel.ToString()!,
+                withinGrace,
+                DisconnectedEndPointGrace);
+            return -1L;
+        }
+
+        // Every "primary" answered, or — outside a cluster — the unanswered ones are the
+        // disconnected leftovers of a failover, which the multiplexer keeps listing (as it does
+        // for the scan): one answering primary is the whole answer. Treating them as possible
+        // owners made every lost-subscriber publish throw, and the watchdog report every
+        // registration as unknown, until the old primary rejoined or the process restarted.
+        if (disconnectedPrimaries is null || !clusterAnswered)
+            return 0L;
+
+        // In a cluster the node table decides, with the scan's rule: once every slot owner it
+        // lists has answered, a disconnected endpoint is a replica that never connected (still
+        // flagged as a primary), a node without slots, or one the cluster no longer lists, and
+        // cannot hold the subscription. A table that cannot be read keeps the zero unknown.
+        var nodes = await RedisClusterNodeTable.TryReadFromAnyAsync(answered!, _logger).ConfigureAwait(false);
+        if (nodes is null)
+            return -1L;
+
+        var uncovered = RedisClusterNodeTable.UncoveredSlotOwners(
+            nodes,
+            answered!.ConvertAll(static server => server.EndPoint),
+            disconnectedPrimaries.ConvertAll(static server => server.EndPoint),
+            _logger,
+            "Redis subscriber liveness probe");
+        return uncovered.Count == 0 ? 0L : -1L;
+    }
+
+    private void ForgetEndPointsNoLongerListed(EndPoint[] endPoints)
+    {
+        foreach (var tracked in _disconnectedSince.Keys)
+        {
+            if (Array.IndexOf(endPoints, tracked) < 0)
+                _disconnectedSince.TryRemove(tracked, out _);
+        }
+    }
+
+    /// <summary>
+    /// One node's PUBSUB NUMSUB answer, or <c>null</c> when it did not give one. Never faults, so
+    /// the concurrent probe can be abandoned on cancellation without leaving an unobserved task.
+    /// </summary>
+    private async Task<long?> ReadSubscriberCountAsync(IServer server, RedisChannel channel)
+    {
+        try
+        {
+            return await server.SubscriptionSubscriberCountAsync(channel).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "Failed to read subscriber count for channel {Channel} from {EndPoint}.", channel.ToString()!, server.EndPoint);
+            return null;
+        }
     }
 
     /// <summary>
@@ -1149,7 +1287,9 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
         if (subscribers < 0)
         {
             throw new InvalidOperationException(
-                $"Redis subscriber liveness for correlationId '{correlationId}' could not be probed on any connected endpoint.");
+                $"Redis subscriber liveness for correlationId '{correlationId}' could not be probed: a node that may hold the waiter's " +
+                "subscription is unreachable or did not answer PUBSUB NUMSUB, so the zero from the nodes that did answer is not proof " +
+                "that no waiter is live. Recovery registrations were left intact; retry the publish.");
         }
 
         return subscribers > 0;

@@ -54,7 +54,15 @@ public sealed class AzureServiceBusAsyncResponseOptions
         "DagJsonParameters.CorrelationId"
     ];
 
-    /// <summary>Maximum messages requested from Service Bus in one receive call.</summary>
+    /// <summary>
+    /// Maximum messages requested from Service Bus in one receive call (in
+    /// <see cref="AzureServiceBusAckMode.AckAfterEnqueue"/> still capped by the background queue's
+    /// free capacity). The worker subscriber in
+    /// <see cref="AzureServiceBusAckMode.AckAfterHandlerCompletes"/> receives one message at a time:
+    /// it runs handlers serially, and every message a receive hands over is locked — and counted
+    /// when its lock lapses — whether or not its handler ever starts. The response subscriber keeps
+    /// the batch in both modes (its handler is the library's own). Default: <c>16</c>.
+    /// </summary>
     public int MaxMessagesPerReceive { get; set; } = 16;
 
     /// <summary>Maximum time a subscriber receive call waits for messages before polling again.</summary>
@@ -77,8 +85,10 @@ public sealed class AzureServiceBusAsyncResponseOptions
 
     /// <summary>
     /// Bounds receiver/sender close and the lock-renewal task join while a hosted subscriber
-    /// stops. These complete in milliseconds when healthy; when they do not, the work is abandoned
-    /// anyway, so keep this short — it counts against the host's shutdown budget. Default: <c>5s</c>.
+    /// stops; without renewal, handing a batch's unstarted messages back and the receiver close
+    /// after it share one. These complete in milliseconds when healthy; when they do not, the work
+    /// is abandoned anyway, so keep this short — it counts against the host's shutdown budget.
+    /// Default: <c>5s</c>.
     /// </summary>
     public TimeSpan ShutdownTimeout { get; set; } = TimeSpan.FromSeconds(5);
 
@@ -179,21 +189,33 @@ public sealed class AzureServiceBusSubscriberOptions
     /// </summary>
     public int MaxDeliveryAttempts { get; set; } = 5;
 
-    /// <summary>Number of messages the receiver prefetches locally. Default: <c>0</c>.</summary>
+    /// <summary>
+    /// Number of messages the receiver prefetches locally. Default: <c>0</c>.
+    /// Service Bus locks a prefetched message from the moment it is buffered, but the lock-renewal
+    /// heartbeat covers only messages a receive has returned: a buffered message's lock ticks away
+    /// in the client and is never renewed. In <see cref="AzureServiceBusAckMode.AckAfterHandlerCompletes"/>
+    /// handlers run one at a time, so a buffered message waits behind every handler ahead of it —
+    /// keep <c>PrefetchCount × handler latency</c> well under the queue's <c>LockDuration</c>, or
+    /// leave this at <c>0</c>; otherwise buffered messages are handed out after their locks
+    /// expired, run a second time on a peer, and inflate <c>DeliveryCount</c> toward
+    /// <see cref="MaxDeliveryAttempts"/>. Startup logs a warning when it is positive in that mode.
+    /// </summary>
     public int PrefetchCount { get; set; }
 
     /// <summary>
-    /// Heartbeat cadence for renewing the peek locks of received-but-unsettled messages while a
-    /// <see cref="AzureServiceBusAckMode.AckAfterHandlerCompletes"/> batch is worked through
-    /// serially. Each beat calls <c>RenewMessageLockAsync</c> for every message that has not been
-    /// settled yet (including the one currently in the handler), so a slow handler does not let the
-    /// locks of later batch messages expire and cause systematic duplicate processing. Renewal
-    /// failures are logged and processing continues — the message simply redelivers, preserving
-    /// at-least-once semantics. Set to <c>null</c> to disable renewal. Ignored in
+    /// Heartbeat cadence for renewing the peek lock of a received message while its
+    /// <see cref="AzureServiceBusAckMode.AckAfterHandlerCompletes"/> handler runs (the worker
+    /// subscriber receives one message at a time in that mode). Each beat calls <c>RenewMessageLockAsync</c>
+    /// for every received message not settled yet, so a slow handler does not let its lock expire
+    /// and cause duplicate processing. The heartbeat is not ended by the host stop: it ends when the
+    /// handler returns. Renewal failures are logged and processing continues — the message simply
+    /// redelivers, preserving at-least-once semantics; a lock reported lost is not renewed again.
+    /// Set to <c>null</c> to disable renewal. Ignored in
     /// <see cref="AzureServiceBusAckMode.AckAfterEnqueue"/> (messages are already completed).
-    /// Keep this comfortably below the queue's <c>LockDuration</c> (Azure's default is 30 seconds):
-    /// the first renewal only fires after one full interval, so an interval at or above the lock
-    /// duration can never beat lock expiry. Default: <c>10 seconds</c>.
+    /// Keep this comfortably below the queue's <c>LockDuration</c> (Azure's default is 60 seconds,
+    /// its maximum 5 minutes): the first renewal only fires after one full interval, so an interval
+    /// at or above the lock duration can never beat lock expiry — startup rejects 5 minutes or more.
+    /// Default: <c>10 seconds</c>.
     /// </summary>
     public TimeSpan? LockRenewalInterval { get; set; } = TimeSpan.FromSeconds(10);
 

@@ -233,6 +233,123 @@ public class DelayedWorkerTransportTests
         Assert.Equal(2, run.StepExecutions("nap"));
     }
 
+    /// <summary>Records every delayed hop; optionally fails each one (delayed capacity exhausted, host draining).</summary>
+    private sealed class RecordingDelayedTransport : IDelayedWorkerTransport
+    {
+        private readonly List<(WorkerJobEnvelope Job, TimeSpan Delay)> _hops = [];
+
+        public bool FailHops { get; init; }
+
+        public TimeSpan MaxPublishDelay { get; init; } = TimeSpan.FromMinutes(15);
+
+        public IReadOnlyList<(WorkerJobEnvelope Job, TimeSpan Delay)> Hops
+        {
+            get { lock (_hops) return [.. _hops]; }
+        }
+
+        public Task PublishAsync(WorkerJobEnvelope job, CancellationToken cancellationToken = default) => Task.CompletedTask;
+
+        public Task PublishAsync(WorkerJobEnvelope job, TimeSpan delay, CancellationToken cancellationToken = default)
+        {
+            lock (_hops) _hops.Add((job, delay));
+            return FailHops
+                ? Task.FromException(new InvalidOperationException("delayed publish rejected (capacity exhausted)"))
+                : Task.CompletedTask;
+        }
+    }
+
+    [Fact]
+    public async Task FailedRedelayHop_RetriedOnTheSameEnvelope_NeverReadsAsAStall()
+    {
+        // Regression (fixpoint r1): the executor stamped the next hop's stall counters on the
+        // DELIVERED envelope before publishing it. The in-memory transport retries that very
+        // instance when the in-job publish throws (delayed capacity exhausted, host draining), so
+        // each retry 100 ms later saw its own stamped remainder barely shrunk — "no progress" —
+        // and the second retry "proved" clock skew and ran the job early: a durable timer would
+        // spend the forced-early marker on it and fail terminally with more than the timer
+        // ceiling left. The hop is now a copy; the delivered envelope is never modified.
+        var audit = new RecordingDeferredWorkAudit();
+        await using var provider = new ServiceCollection().AddSingleton<IDeferredWorkAudit>(audit).BuildServiceProvider();
+        var clock = new VirtualTimeProvider();
+        var transport = new RecordingDelayedTransport { FailHops = true };
+        var executor = new WorkerJobExecutor(
+            provider.GetRequiredService<IServiceScopeFactory>(),
+            NullLogger<WorkerJobExecutor>.Instance,
+            transport,
+            clock);
+
+        var delivered = new WorkerJobEnvelope
+        {
+            Call = Work(),
+            JobId = "job-1",
+            NotBeforeUtc = clock.GetUtcNow().UtcDateTime.AddDays(60)
+        };
+
+        for (var attempt = 0; attempt < 4; attempt++)
+        {
+            await Assert.ThrowsAsync<InvalidOperationException>(() => executor.ExecuteAsync(delivered));
+            clock.Advance(TimeSpan.FromMilliseconds(100)); // the in-memory ladder's retry backoff
+        }
+
+        // Never executed early, and the transport's envelope carries no stall evidence of its own.
+        Assert.Empty(audit.Ran);
+        Assert.Null(delivered.LastRedelayRemaining);
+        Assert.Equal(0, delivered.RedelayStallCount);
+
+        // Every attempt published a fresh copy of the same job with a first hop's counters.
+        Assert.Equal(4, transport.Hops.Count);
+        Assert.All(transport.Hops, hop =>
+        {
+            Assert.NotSame(delivered, hop.Job);
+            Assert.Equal("job-1", hop.Job.JobId);
+            Assert.Equal(delivered.NotBeforeUtc, hop.Job.NotBeforeUtc);
+            Assert.NotNull(hop.Job.LastRedelayRemaining);
+            Assert.Equal(0, hop.Job.RedelayStallCount);
+            Assert.Equal(transport.MaxPublishDelay, hop.Delay);
+        });
+    }
+
+    [Fact]
+    public async Task OffsetStampedDueTime_IsComparedAsAUtcInstant()
+    {
+        // Regression (fixpoint r1): NotBeforeUtc is wire data, and System.Text.Json reads a
+        // timestamp carrying an offset ("+00:00", what most non-.NET producers write) as LOCAL
+        // time, while DateTime subtraction ignores Kind — so on any host whose zone is not UTC the
+        // due time moved by the host's offset (re-delayed hours too long east of Greenwich, run
+        // early west of it). The delay assertion discriminates only on a non-UTC host (CI runners
+        // are UTC); the Kind assertion on every host.
+        var audit = new RecordingDeferredWorkAudit();
+        await using var provider = new ServiceCollection().AddSingleton<IDeferredWorkAudit>(audit).BuildServiceProvider();
+        var clock = new VirtualTimeProvider();
+        var transport = new RecordingDelayedTransport { MaxPublishDelay = TimeSpan.FromDays(1) };
+        var executor = new WorkerJobExecutor(
+            provider.GetRequiredService<IServiceScopeFactory>(),
+            NullLogger<WorkerJobExecutor>.Instance,
+            transport,
+            clock);
+
+        var dueUtc = clock.GetUtcNow().UtcDateTime.AddHours(2);
+        // Invariant, with literal separators: a culture-formatted timestamp is not ISO 8601 (':'
+        // is the culture's time separator — '.' in fi-FI — and th-TH counts Buddhist-era years).
+        var dueText = dueUtc.ToString("yyyy'-'MM'-'dd'T'HH':'mm':'ss", System.Globalization.CultureInfo.InvariantCulture);
+        var json = $$"""
+            {
+              "SchemaVersion": {{WorkerJobEnvelopeSchema.Current}},
+              "Call": {{AsyncResponseJson.Serialize(Work())}},
+              "NotBeforeUtc": "{{dueText}}+00:00"
+            }
+            """;
+        var job = AsyncResponseJson.DeserializeCaseInsensitive<WorkerJobEnvelope>(System.Text.Encoding.UTF8.GetBytes(json))!;
+
+        await executor.ExecuteAsync(job);
+
+        Assert.Empty(audit.Ran);
+        var hop = Assert.Single(transport.Hops);
+        Assert.Equal(TimeSpan.FromHours(2), hop.Delay);
+        Assert.Equal(dueUtc, hop.Job.NotBeforeUtc);
+        Assert.Equal(DateTimeKind.Utc, hop.Job.NotBeforeUtc!.Value.Kind);
+    }
+
     [Fact]
     public async Task DelayBeyondThePersistenceCeiling_IsRejected()
     {

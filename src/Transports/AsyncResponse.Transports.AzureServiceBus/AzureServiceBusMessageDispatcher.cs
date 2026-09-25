@@ -10,6 +10,19 @@ internal enum AzureServiceBusSubscriberRole
     ResponseIngress
 }
 
+internal enum AzureServiceBusDispatchOutcome
+{
+    /// <summary>The delivery was settled, or accepted into the early-ACK queue.</summary>
+    Processed,
+
+    /// <summary>
+    /// The flow engine handed the delivery back because the host is stopping
+    /// (<see cref="DurableFlowInterruptedException"/>) while this subscriber's token was still
+    /// live: it was left locked, unsettled — and the receive loop must stop taking work.
+    /// </summary>
+    HandedBack
+}
+
 internal abstract class AzureServiceBusMessageDispatcher : IAsyncDisposable
 {
     private readonly Func<AzureServiceBusTransportDelivery, CancellationToken, Task> _handler;
@@ -90,7 +103,7 @@ internal abstract class AzureServiceBusMessageDispatcher : IAsyncDisposable
         => AzureServiceBusOptionsValidator.ValidateSubscriber(transportOptions, subscriberOptions, role);
 
     /// <summary>Handles the delivered message.</summary>
-    public abstract Task HandleAsync(
+    public abstract Task<AzureServiceBusDispatchOutcome> HandleAsync(
         AzureServiceBusTransportDelivery delivery,
         CancellationToken subscriberCancellationToken);
 
@@ -140,6 +153,14 @@ internal abstract class AzureServiceBusMessageDispatcher : IAsyncDisposable
         {
             await _handler(delivery, cancellationToken).ConfigureAwait(false);
         }
+        catch (Exception ex) when (ex is DurableFlowInterruptedException || (logFailures && IsHostStop(ex, cancellationToken)))
+        {
+            // The inline (ACK-after-handler) path hands the delivery back on a host stop, and the
+            // flow engine's hand-back is not a failure on the early-ACK path either (its caller
+            // warns and surfaces it): nothing failed, so no error log and no error span on every
+            // rolling deploy.
+            throw;
+        }
         catch (Exception ex)
         {
             if (logFailures)
@@ -148,6 +169,19 @@ internal abstract class AzureServiceBusMessageDispatcher : IAsyncDisposable
             throw;
         }
     }
+
+    /// <summary>
+    /// Whether <paramref name="exception"/> is the host stopping rather than a handler failure: a
+    /// cancellation once the subscriber's own token has fired, or the durable-flow engine's
+    /// <see cref="DurableFlowInterruptedException"/>. The engine throws the latter on
+    /// <c>ApplicationStopping</c>, which fires BEFORE any hosted service stops — so the worker
+    /// subscriber's token is usually still live when it arrives, and keying on the token alone
+    /// abandoned the flow's only wake-up, which this still-running receiver then pulled straight
+    /// back, until the delivery-count cap dead-lettered it and stranded the run.
+    /// </summary>
+    protected static bool IsHostStop(Exception exception, CancellationToken subscriberCancellationToken)
+        => exception is OperationCanceledException
+            && (subscriberCancellationToken.IsCancellationRequested || exception is DurableFlowInterruptedException);
 
     protected async ValueTask NotifyBackgroundFailureAsync(
         AzureServiceBusTransportDelivery delivery,
@@ -202,7 +236,7 @@ internal sealed class AwaitingAzureServiceBusMessageDispatcher(
     : AzureServiceBusMessageDispatcher(handler, transportOptions, subscriberOptions, logger, queue, role)
 {
     /// <summary>Handles the delivered message.</summary>
-    public override async Task HandleAsync(
+    public override async Task<AzureServiceBusDispatchOutcome> HandleAsync(
         AzureServiceBusTransportDelivery delivery,
         CancellationToken subscriberCancellationToken)
     {
@@ -210,14 +244,25 @@ internal sealed class AwaitingAzureServiceBusMessageDispatcher(
         {
             await ExecuteHandlerAsync(delivery, subscriberCancellationToken).ConfigureAwait(false);
         }
-        catch (OperationCanceledException) when (subscriberCancellationToken.IsCancellationRequested)
+        catch (Exception ex) when (IsHostStop(ex, subscriberCancellationToken))
         {
             // Host shutdown, not a handler failure: abandoning would burn a delivery count on
             // work that never ran, and at the cap the branch below would dead-letter healthy
             // work. Leave the delivery unsettled — the peek lock lapses on its own and
             // at-least-once redelivery applies after restart (parity with the
             // RabbitMQ/Redis/Kafka/DB dispatchers).
-            throw;
+            if (subscriberCancellationToken.IsCancellationRequested)
+                throw;
+
+            // The flow engine saw the host stop before this subscriber did. Its receive loop is
+            // still running, so an abandon would hand the wake-up straight back to it; left
+            // locked, the delivery redelivers once the lock lapses — by then to a peer or to
+            // this host after its restart. Returning (not rethrowing) keeps the live receive loop
+            // out of the supervisor's failure path; the outcome tells it to stop receiving.
+            Logger.LogInformation(
+                "Azure Service Bus message {MessageId} was interrupted by the host stopping; leaving it unsettled for redelivery after its lock lapses.",
+                delivery.MessageId);
+            return AzureServiceBusDispatchOutcome.HandedBack;
         }
         catch (Exception ex)
         {
@@ -242,7 +287,7 @@ internal sealed class AwaitingAzureServiceBusMessageDispatcher(
                         delivery.MessageId);
                 }
 
-                return;
+                return AzureServiceBusDispatchOutcome.Processed;
             }
 
             try
@@ -257,7 +302,7 @@ internal sealed class AwaitingAzureServiceBusMessageDispatcher(
                     delivery.MessageId);
             }
 
-            return;
+            return AzureServiceBusDispatchOutcome.Processed;
         }
 
         // The Complete sits outside the handler's try/catch: a transient settlement failure after
@@ -276,6 +321,8 @@ internal sealed class AwaitingAzureServiceBusMessageDispatcher(
                 "Failed to complete Azure Service Bus message {MessageId} after a successful handler; the lock will lapse and the message may be redelivered.",
                 delivery.MessageId);
         }
+
+        return AzureServiceBusDispatchOutcome.Processed;
     }
 }
 
@@ -345,7 +392,7 @@ internal sealed class QueuedAzureServiceBusMessageDispatcher : AzureServiceBusMe
     }
 
     /// <summary>Handles the delivered message.</summary>
-    public override async Task HandleAsync(
+    public override async Task<AzureServiceBusDispatchOutcome> HandleAsync(
         AzureServiceBusTransportDelivery delivery,
         CancellationToken subscriberCancellationToken)
     {
@@ -378,7 +425,7 @@ internal sealed class QueuedAzureServiceBusMessageDispatcher : AzureServiceBusMe
                     _queueName);
             }
 
-            return;
+            return AzureServiceBusDispatchOutcome.Processed;
         }
 
         // The delivery now belongs to a background worker, which decrements _pendingCount when it dequeues.
@@ -396,6 +443,8 @@ internal sealed class QueuedAzureServiceBusMessageDispatcher : AzureServiceBusMe
                 delivery.MessageId,
                 _queueName);
         }
+
+        return AzureServiceBusDispatchOutcome.Processed;
     }
 
     /// <summary>Releases resources held by this instance.</summary>
@@ -411,9 +460,14 @@ internal sealed class QueuedAzureServiceBusMessageDispatcher : AzureServiceBusMe
             RunningCount);
         _queue.Writer.TryComplete();
 
+        // BackgroundDrainTimeout is the whole spend the shutdown-budget validator sums for this
+        // dispatcher, so it is split rather than exceeded (database-transport parity): most of it
+        // lets queued and running handlers finish, and the last quarter is RESERVED for surfacing
+        // whatever is still queued once that lapses.
+        var surfacingReserve = TimeSpan.FromTicks(_drainTimeout.Ticks / 4);
         try
         {
-            await Task.WhenAll(_workers).WaitAsync(_drainTimeout).ConfigureAwait(false);
+            await Task.WhenAll(_workers).WaitAsync(_drainTimeout - surfacingReserve).ConfigureAwait(false);
             _drainCancellation.Dispose();
         }
         catch (TimeoutException ex)
@@ -425,6 +479,12 @@ internal sealed class QueuedAzureServiceBusMessageDispatcher : AzureServiceBusMe
                 _queueName,
                 PendingCount,
                 RunningCount);
+
+            // The workers surface a lapsed entry only once one of them frees up — and with every
+            // worker still inside a handler that ignores the token, none does before this returns,
+            // the host finishes stopping and the process exits: the entries still queued vanished
+            // with no OnBackgroundFailure call at all. So the dispose surfaces them itself.
+            await SurfaceUndrainedAsync(surfacingReserve).ConfigureAwait(false);
 
             _ = Task.WhenAll(_workers).ContinueWith(
                 _ => _drainCancellation.Dispose(),
@@ -442,6 +502,58 @@ internal sealed class QueuedAzureServiceBusMessageDispatcher : AzureServiceBusMe
         }
     }
 
+    /// <summary>
+    /// Surfaces every entry still queued after the drain budget lapsed through
+    /// <c>OnBackgroundFailure</c>, within <paramref name="reserve"/>, and logs the loss at Error
+    /// with its count. Runs inline on the stop path, so a callback that is slow asynchronously is
+    /// cut off at the reserve; entries left then are counted as lost.
+    /// </summary>
+    private async Task SurfaceUndrainedAsync(TimeSpan reserve)
+    {
+        var started = Stopwatch.GetTimestamp();
+        var surfaced = 0;
+        while (true)
+        {
+            var remaining = reserve - Stopwatch.GetElapsedTime(started);
+            if (remaining <= TimeSpan.Zero || !_queue.Reader.TryRead(out var delivery))
+                break;
+
+            Interlocked.Decrement(ref _pendingCount);
+            surfaced++;
+            try
+            {
+                await SurfaceLapsedAsync(delivery).AsTask().WaitAsync(remaining).ConfigureAwait(false);
+            }
+            catch (TimeoutException)
+            {
+                break;
+            }
+        }
+
+        var lost = _queue.Reader.Count;
+        if (surfaced == 0 && lost == 0)
+            return;
+
+        Logger.LogError(
+            "The Azure Service Bus ACK-after-enqueue drain budget for {Queue} lapsed with {Count} already-completed message(s) never handled — Service Bus cannot redeliver them. Surfaced {Surfaced} via OnBackgroundFailure within the reserved {Reserve}; {Lost} could not be surfaced before shutdown.",
+            _queueName,
+            surfaced + lost,
+            surfaced,
+            reserve,
+            lost);
+    }
+
+    private ValueTask SurfaceLapsedAsync(AzureServiceBusTransportDelivery delivery)
+    {
+        var lapsed = new OperationCanceledException(
+            "The ACK-after-enqueue drain budget lapsed before this already-completed message was handled.");
+        Logger.LogWarning(
+            "Azure Service Bus background handler for already-completed message {MessageId} on {Queue} was not started: the drain budget had lapsed. Surfacing via OnBackgroundFailure.",
+            delivery.MessageId,
+            _queueName);
+        return NotifyBackgroundFailureAsync(delivery, lapsed, _queueName, _role);
+    }
+
     private async Task RunWorkerAsync(int workerIndex)
     {
         await foreach (var delivery in _queue.Reader.ReadAllAsync().ConfigureAwait(false))
@@ -457,13 +569,7 @@ internal sealed class QueuedAzureServiceBusMessageDispatcher : AzureServiceBusMe
             // lock rules out a DLQ write; OnBackgroundFailure is the record.
             if (_drainCancellation.IsCancellationRequested)
             {
-                var lapsed = new OperationCanceledException(
-                    "The ACK-after-enqueue drain budget lapsed before this already-completed message was handled.");
-                Logger.LogWarning(
-                    "Azure Service Bus background handler for already-completed message {MessageId} on {Queue} was not started: the drain budget had lapsed. Surfacing via OnBackgroundFailure.",
-                    delivery.MessageId,
-                    _queueName);
-                await NotifyBackgroundFailureAsync(delivery, lapsed, _queueName, _role).ConfigureAwait(false);
+                await SurfaceLapsedAsync(delivery).ConfigureAwait(false);
                 continue;
             }
 
@@ -482,6 +588,21 @@ internal sealed class QueuedAzureServiceBusMessageDispatcher : AzureServiceBusMe
                     delivery,
                     _drainCancellation.Token,
                     logFailures: false).ConfigureAwait(false);
+            }
+            catch (DurableFlowInterruptedException ex)
+            {
+                // The flow engine handed the job back because the host is stopping (Redis/NATS
+                // parity): not a handler failure, so no Error — but the message was completed at
+                // enqueue and Service Bus cannot redeliver it, so surface the hand-back.
+                Logger.LogWarning(
+                    "Azure Service Bus background handler for already-completed message {MessageId} on {Queue} was handed back by the flow engine because the host is stopping; Service Bus will not redeliver it. Surfacing via OnBackgroundFailure.",
+                    delivery.MessageId,
+                    _queueName);
+                await NotifyBackgroundFailureAsync(
+                    delivery,
+                    ex,
+                    _queueName,
+                    _role).ConfigureAwait(false);
             }
             catch (Exception ex)
             {

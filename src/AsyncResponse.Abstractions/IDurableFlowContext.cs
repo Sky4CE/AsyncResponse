@@ -88,7 +88,10 @@ public interface IDurableFlowContext
     /// The default child id is <c>{FlowId}:{name}</c>. Pass a nonblank <paramref name="flowId"/> when
     /// the child needs a domain-owned idempotency key. A child id is permanently bound to one parent
     /// step, flow type, input type, and semantically identical input value; conflicting reuse fails
-    /// fast. On success the child <see cref="FlowState"/> snapshot is memoized as this step's result.
+    /// fast while the child runs. Once the step has completed, only the parent step binding is
+    /// enforced: like any completed step it answers from its memo, so a child class renamed or an
+    /// input edited since logs a warning instead of failing the parent.
+    /// On success the child <see cref="FlowState"/> snapshot is memoized as this step's result.
     /// On failure the step is also memoized, then
     /// <see cref="DurableFlowFailedException"/> is thrown unless
     /// <paramref name="failOnChildFailure"/> is <c>false</c>.
@@ -142,7 +145,8 @@ public interface IDurableFlowContext
     /// Updates the operator-facing progress message on the flow state
     /// (<see cref="FlowState.LastMessage"/>). Rapid reports may be coalesced according to
     /// <c>DurableFlowOptions.ProgressPersistenceInterval</c>; the latest value is included in the
-    /// next checkpoint or flow outcome. Safe to call from <c>until</c> predicates.
+    /// next checkpoint (a run's outcome records its own final message). Safe to call from
+    /// <c>until</c> predicates.
     /// </summary>
     Task ReportProgressAsync(string message, CancellationToken cancellationToken = default);
 

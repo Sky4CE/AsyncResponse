@@ -633,6 +633,197 @@ public sealed class SqsTransportTests
         Assert.Contains(nameof(SqsWorkerTransport), ex.ObjectName, StringComparison.Ordinal);
     }
 
+    [Fact]
+    public async Task WorkerTransport_PublishAfterDispose_ThrowsTransportNamedDisposedException_EvenOnceTheUrlIsCached()
+    {
+        // Red-on-old (fixpoint r1, S8#22): the lock-free fast path returned the cached queue URL
+        // before the disposal check, so every publish after the first went through — with a
+        // shared DI-owned client it even SUCCEEDED — after the transport was disposed.
+        var client = new FakeSqsClient();
+        var transport = new SqsWorkerTransport(
+            Options.Create(new SqsAsyncResponseOptions { WorkerQueue = "worker-q" }),
+            client);
+
+        await transport.PublishAsync(WorkerJob("c-before"));
+        await transport.DisposeAsync();
+
+        var ex = await Assert.ThrowsAsync<ObjectDisposedException>(() => transport.PublishAsync(WorkerJob("c-after")));
+        Assert.Contains(nameof(SqsWorkerTransport), ex.ObjectName, StringComparison.Ordinal);
+        Assert.Single(client.SentMessages);
+    }
+
+    [Theory]
+    [InlineData("ok-￾")]
+    [InlineData("￿final")]
+    public async Task WorkerTransport_CorrelationIdOutsideTheSqsCharacterSet_TravelsWithoutTheAttribute(string correlationId)
+    {
+        // Red-on-old (fixpoint r1, S8#12): a portable correlation id may contain U+FFFE/U+FFFF,
+        // which SQS rejects in message text — the whole SendMessage failed, for every publish of
+        // that id. The worker path reads the id from the body, so the diagnostic attribute is
+        // simply left off.
+        var client = new FakeSqsClient();
+        var transport = new SqsWorkerTransport(
+            Options.Create(new SqsAsyncResponseOptions { WorkerQueue = "worker-q" }),
+            client);
+
+        await transport.PublishAsync(WorkerJob(correlationId));
+
+        var message = Assert.Single(client.SentMessages);
+        Assert.False(message.MessageAttributes.ContainsKey("correlationId"));
+        Assert.Equal(correlationId, AsyncResponseJson.Deserialize<WorkerJobEnvelope>(message.Body)!.CorrelationId);
+    }
+
+    [Theory]
+    [InlineData("has space")]
+    [InlineData("café")]
+    [InlineData(null)] // 129 characters, built below
+    public async Task WorkerTransport_FifoQueue_CorrelationIdSqsWouldReject_BecomesAStableHashedGroup(string? correlationId)
+    {
+        // Fixpoint r1 (S8#23): the round-42 MessageGroupId mapping shipped unpinned. An id SQS
+        // rejects as a MessageGroupId maps to a stable "sha256-" hash, so one id still lands in
+        // one group; conforming ids pass through (WorkerTransport_FifoQueue_SetsMessageGroupIdToCorrelationId).
+        correlationId ??= new string('a', 129);
+        var client = new FakeSqsClient();
+        var transport = new SqsWorkerTransport(
+            Options.Create(new SqsAsyncResponseOptions { WorkerQueue = "worker-q.fifo" }),
+            client);
+
+        await transport.PublishAsync(WorkerJob(correlationId));
+        await transport.PublishAsync(WorkerJob(correlationId));
+
+        Assert.Equal(2, client.SentMessages.Count);
+        var group = client.SentMessages[0].MessageGroupId!;
+        Assert.StartsWith("sha256-", group, StringComparison.Ordinal);
+        Assert.True(SqsWorkerTransport.IsValidMessageGroupId(group));
+        Assert.Equal(group, client.SentMessages[1].MessageGroupId);
+    }
+
+    [Theory]
+    [InlineData(SqsAckMode.AckAfterHandlerCompletes, 45, 10, 43_200)] // renewal on: the 12-hour SQS maximum
+    [InlineData(SqsAckMode.AckAfterHandlerCompletes, 45, null, 45)]   // renewal off: the explicit visibility timeout
+    [InlineData(SqsAckMode.AckAfterHandlerCompletes, null, null, 43_200)] // queue default: only the upper bound is known
+    [InlineData(SqsAckMode.AckAfterEnqueue, 45, null, null)]          // deleted before the handler runs
+    public void WorkerTransport_MaxInFlightDuration_FollowsTheWorkerSubscriberConfiguration(
+        SqsAckMode ackMode,
+        int? visibilitySeconds,
+        int? renewalSeconds,
+        int? expectedSeconds)
+    {
+        // Fixpoint r1 (S8#23): the round-42 in-flight ceiling shipped unpinned.
+        var options = new SqsAsyncResponseOptions { WorkerQueue = "workers" };
+        options.WorkerSubscriber.AckMode = ackMode;
+        options.WorkerSubscriber.VisibilityTimeout = visibilitySeconds is { } visibility ? TimeSpan.FromSeconds(visibility) : null;
+        options.WorkerSubscriber.VisibilityRenewalInterval = renewalSeconds is { } renewal ? TimeSpan.FromSeconds(renewal) : null;
+        var transport = new SqsWorkerTransport(Options.Create(options), new FakeSqsClient());
+
+        Assert.Equal(expectedSeconds is { } seconds ? TimeSpan.FromSeconds(seconds) : null, transport.MaxInFlightDuration);
+    }
+
+    [Theory]
+    [InlineData("my app")]
+    [InlineData("groupe-é")]
+    [InlineData(null)] // 129 characters, built below
+    public void WorkerTransport_FifoFallbackGroupSqsWouldReject_FailsAtStartup(string? fallback)
+    {
+        // Red-on-old (fixpoint r1, S8#13): only blankness was checked, so a fallback SQS rejects
+        // passed startup and then every uncorrelated FIFO publish — every durable-flow job among
+        // them — failed with a non-retryable 400.
+        fallback ??= new string('g', 129);
+        AssertInvalidCommon(
+            options =>
+            {
+                options.WorkerQueue = "workers.fifo";
+                options.FifoMessageGroupIdFallback = fallback;
+            },
+            nameof(SqsAsyncResponseOptions.FifoMessageGroupIdFallback));
+    }
+
+    [Theory]
+    [InlineData("-dlq", 77)]  // 77 + "-dlq" = 81 characters
+    [InlineData(".dlq", 10)]  // '.' is outside the SQS name character set
+    public void WorkerTransport_CreateQueues_DerivedDeadLetterNameSqsWouldReject_FailsAtStartup(string suffix, int workerNameLength)
+    {
+        // Red-on-old (fixpoint r1, S8#21): the derived dead-letter names were never checked
+        // against the SQS name rule, so provisioning spent its whole retry budget on a
+        // deterministic 400 minutes into host startup.
+        AssertInvalidCommon(
+            options =>
+            {
+                options.CreateQueues = true;
+                options.WorkerQueue = new string('w', workerNameLength);
+                options.DeadLetterQueueSuffix = suffix;
+            },
+            nameof(SqsAsyncResponseOptions.DeadLetterQueueSuffix));
+    }
+
+    [Fact]
+    public void WorkerTransport_WorkerAndResponseQueueNamingOneQueueAsTwoUrls_FailsAtStartup()
+    {
+        // Red-on-old (fixpoint r1, GS5#9): queues accept a name or a URL, and the guard compared
+        // the raw strings — two spellings of one queue URL passed, and both subscribers consumed
+        // one queue.
+        AssertInvalidCommon(
+            options =>
+            {
+                options.WorkerQueue = "https://sqs.us-east-1.amazonaws.com/000000000000/jobs";
+                options.ResponseQueue = "HTTPS://SQS.us-east-1.amazonaws.com/000000000000/jobs/";
+            },
+            nameof(SqsAsyncResponseOptions.ResponseQueue));
+    }
+
+    [Theory]
+    [InlineData("https://sqs.us-east-1.amazonaws.com/999999999999/jobs", "jobs")]
+    [InlineData("jobs", "https://sqs.us-east-1.amazonaws.com/999999999999/jobs")]
+    public async Task WorkerTransport_QueueNameAndAUrlSharingIt_StartsWithAWarning(string workerQueue, string responseQueue)
+    {
+        // Red-on-old (fixpoint r1 pre-commit, I5): a name and a URL were compared by queue name
+        // alone, so another account's ".../999999999999/jobs" beside the local "jobs" — two queues —
+        // failed startup. The transport cannot tell without a GetQueueUrl call, so it warns.
+        var options = new SqsAsyncResponseOptions
+        {
+            WorkerQueue = workerQueue,
+            ResponseQueue = responseQueue,
+            ReceiveWaitTime = TimeSpan.FromMilliseconds(10)
+        };
+        await using var transport = new SqsWorkerTransport(Options.Create(options), new FakeSqsClient());
+        var logger = new CollectingLogger();
+        var subscriber = new SqsWorkerSubscriber(
+            Options.Create(options),
+            new FakeSqsClient(),
+            Moq.Mock.Of<IAsyncResponseIngress>(),
+            logger.For<SqsWorkerSubscriber>());
+
+        await subscriber.StartAsync(CancellationToken.None);
+        await subscriber.StopAsync(CancellationToken.None);
+
+        Assert.Single(logger.Messages, message => message.Contains("may be one queue", StringComparison.Ordinal)
+            && message.Contains(nameof(SqsAsyncResponseOptions.ResponseQueue), StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void QueueAddress_SameQueue_IsExactForTwoNamesOrTwoUrls_AndNeverCertainForANameAndAUrl()
+    {
+        Assert.True(SqsQueueAddress.SameQueue("jobs", "jobs"));
+        Assert.False(SqsQueueAddress.SameQueue("jobs", "Jobs")); // SQS names are case-sensitive
+        Assert.True(SqsQueueAddress.SameQueue(
+            "https://sqs.eu-west-1.amazonaws.com:443/111111111111/jobs",
+            "https://SQS.EU-WEST-1.amazonaws.com/111111111111/jobs/"));
+        // A cross-account pair that shares a name stays expressible as two URLs.
+        Assert.False(SqsQueueAddress.SameQueue(
+            "https://sqs.eu-west-1.amazonaws.com/111111111111/jobs",
+            "https://sqs.eu-west-1.amazonaws.com/222222222222/jobs"));
+
+        // A name resolves in the client's own account: the same queue only if the URL is there too.
+        Assert.False(SqsQueueAddress.SameQueue("jobs", "https://sqs.eu-west-1.amazonaws.com/111111111111/jobs"));
+        Assert.True(SqsQueueAddress.MayBeSameQueue("jobs", "https://sqs.eu-west-1.amazonaws.com/111111111111/jobs"));
+        Assert.True(SqsQueueAddress.MayBeSameQueue("https://sqs.eu-west-1.amazonaws.com/111111111111/jobs", "jobs"));
+        Assert.False(SqsQueueAddress.MayBeSameQueue("jobs", "https://sqs.eu-west-1.amazonaws.com/111111111111/other"));
+        Assert.False(SqsQueueAddress.MayBeSameQueue("jobs", "jobs"));
+        Assert.False(SqsQueueAddress.MayBeSameQueue(
+            "https://sqs.eu-west-1.amazonaws.com/111111111111/jobs",
+            "https://sqs.eu-west-1.amazonaws.com/222222222222/jobs"));
+    }
+
     private static WorkerJobEnvelope WorkerJob(string correlationId)
         => new()
         {

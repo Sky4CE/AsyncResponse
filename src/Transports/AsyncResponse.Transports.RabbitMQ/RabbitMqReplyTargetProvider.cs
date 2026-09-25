@@ -31,8 +31,18 @@ internal sealed class RabbitMqReplyTargetProvider(
         // queue does the same one hop later — while the waiter times out.
         var routesToWorker = StringComparer.Ordinal.Equals(exchange, options.WorkerExchange)
             && StringComparer.Ordinal.Equals(routingKey, options.WorkerRoutingKey);
+        // The subscriber validator's own rule for what the dead-letter exchange routes: with a
+        // DeadLetterRoutingKey, dead-lettered traffic (and the dead-letter queue's binding) uses
+        // exactly that key, so only (DLX, DeadLetterRoutingKey) mixes into it — a distinct key on a
+        // SHARED exchange is a legitimate topology the validator lets start, and rejecting the
+        // exchange as a whole made the default target throw on every WithReplyTarget() call.
+        // Without one, dead-lettered messages keep whatever routing key they arrived with, so any
+        // key on the dead-letter exchange may land in buried traffic (the validator already
+        // requires that exchange to be dedicated then).
         var routesToDeadLetter = !string.IsNullOrWhiteSpace(options.DeadLetterExchange)
-            && StringComparer.Ordinal.Equals(exchange, options.DeadLetterExchange);
+            && StringComparer.Ordinal.Equals(exchange, options.DeadLetterExchange)
+            && (string.IsNullOrWhiteSpace(options.DeadLetterRoutingKey)
+                || StringComparer.Ordinal.Equals(routingKey, options.DeadLetterRoutingKey));
         var queueCollides = !string.IsNullOrWhiteSpace(queue)
             && (StringComparer.Ordinal.Equals(queue, options.WorkerQueue)
                 || (!string.IsNullOrWhiteSpace(options.DeadLetterQueue) && StringComparer.Ordinal.Equals(queue, options.DeadLetterQueue)));
@@ -52,6 +62,11 @@ internal sealed class RabbitMqReplyTargetProvider(
 
         if (!string.IsNullOrWhiteSpace(queue))
             properties["queue"] = queue;
+
+        // Tells an outside producer which header the response ingress reads the id from (parity
+        // with the other providers' correlationId* property); a blank header name is never read.
+        if (!string.IsNullOrWhiteSpace(options.CorrelationIdHeader))
+            properties["correlationIdHeader"] = options.CorrelationIdHeader;
 
         return new AsyncResponseReplyTarget
         {

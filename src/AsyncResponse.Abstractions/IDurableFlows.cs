@@ -20,7 +20,22 @@ public interface IDurableFlows
     /// <para>
     /// Pass a non-empty <paramref name="flowId"/> to make the start idempotent: starting an id that
     /// already exists with the same flow type and semantically identical input re-enqueues the
-    /// existing run (which skips completed steps). Reusing the id for different work is rejected.
+    /// existing run (which skips completed steps). Reusing the id for different work is rejected —
+    /// before anything is published when the existing ledger can be read up front.
+    /// </para>
+    /// <para>
+    /// The publish of the start job is the start's commit point. Once it succeeded, a cancelled
+    /// <paramref name="cancellationToken"/> no longer interrupts the method, and a store failure
+    /// while creating or reading the ledger is logged, not thrown — the job creates and runs the
+    /// flow when it is picked up — so the id is returned. Two outcomes still throw after the
+    /// publish, because the published job will not run the flow either: a
+    /// <see cref="DurableFlowIdConflictException"/> when the id turns out to be bound to different
+    /// work only at the create that follows the publish (a concurrent start with other input won
+    /// the race, or the up-front read failed; the job is dropped on the same test when it runs),
+    /// and a deterministic rejection of the initial ledger by a store whose
+    /// <see cref="IFlowStateStore.ValidateCreate"/> did not catch it before the publish
+    /// (<see cref="FlowStateTooLargeException"/>, <see cref="ArgumentException"/>; the job fails
+    /// the same way and is dead-lettered by the worker transport).
     /// </para>
     /// </summary>
     /// <typeparam name="TFlow">The flow class; must be registered in DI and resolvable by its persisted type name.</typeparam>

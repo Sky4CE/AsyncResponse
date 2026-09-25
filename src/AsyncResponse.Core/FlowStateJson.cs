@@ -116,7 +116,10 @@ internal static class FlowStateJson
     /// <c>{"TenantId":7,"Region":null}</c> serialized today are the same input. The persisted JSON
     /// is therefore read as <typeparamref name="TInput"/> and written back by today's serializer
     /// before it is compared. A genuinely different value still differs after the round trip, and
-    /// a persisted input today's type cannot read is a mismatch, never an exception.
+    /// a persisted input today's type cannot read is a mismatch, never an exception — whatever
+    /// throws: the type's own constructor or setters reject old JSON too (a member added with an
+    /// <c>ArgumentNullException.ThrowIfNull</c> guard), and an escaped exception failed every
+    /// replay of a parent whose child step had long completed.
     /// </summary>
     public static bool InputEquivalent<TInput>(string? persisted, string requested)
     {
@@ -129,7 +132,7 @@ internal static class FlowStateJson
         {
             return JsonEquivalent(AsyncResponseJson.Serialize(JsonSafety.SafeDeserialize<TInput>(persisted)), requested);
         }
-        catch (Exception ex) when (ex is JsonException or InvalidDataException or NotSupportedException)
+        catch (Exception ex) when (ex is not OperationCanceledException)
         {
             return false;
         }

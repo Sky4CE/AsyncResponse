@@ -371,6 +371,126 @@ public class ScheduledFlowTests
     }
 
     [Fact]
+    public async Task ALoopThatWakesHoursLate_StartsTheLatestDueOccurrence_NotTheOldestMissedOne()
+    {
+        // The loop sleeps toward 01:00 and wakes at 04:30 (a paused VM, a clock jump): four
+        // occurrences are due at once. The skip policy keeps the one whose successor is not yet
+        // due — 04:00 — instead of starting the three-and-a-half-hour-stale 01:00 with input built
+        // for it and skipping every newer one.
+        var clock = new SteppedClock(new DateTimeOffset(2030, 1, 1, 0, 30, 0, TimeSpan.Zero));
+        var started = new List<(string FlowId, DateTimeOffset Occurrence)>();
+        var firstStart = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var registration = new ScheduledFlowRegistration
+        {
+            Name = "hourly",
+            CronExpression = "0 * * * *",
+            Options = new ScheduledFlowOptions { StartupRedriveWindow = TimeSpan.Zero },
+            StartOccurrenceAsync = (_, flowId, occurrence, _) =>
+            {
+                lock (started)
+                    started.Add((flowId, occurrence));
+                firstStart.TrySetResult();
+                return Task.CompletedTask;
+            }
+        };
+
+        using var scheduler = new ScheduledFlowService(Moq.Mock.Of<IDurableFlows>(), [registration], NullLogger<ScheduledFlowService>.Instance, clock);
+        await scheduler.StartAsync(CancellationToken.None);
+        try
+        {
+            var sleep = await clock.NextTimerAsync();
+            Assert.Equal(TimeSpan.FromMinutes(30), sleep.DueTime);
+
+            clock.Now = new DateTimeOffset(2030, 1, 1, 4, 30, 0, TimeSpan.Zero);
+            sleep.Fire();
+            await firstStart.Task.WaitAsync(TimeSpan.FromSeconds(30));
+
+            var (flowId, occurrence) = Assert.Single(started);
+            Assert.Equal("sched:hourly:20300101T040000Z", flowId);
+            Assert.Equal(new DateTimeOffset(2030, 1, 1, 4, 0, 0, TimeSpan.Zero), occurrence);
+
+            // ...and the loop then sleeps toward 05:00, not toward 02:00.
+            var next = await clock.NextTimerAsync();
+            Assert.Equal(TimeSpan.FromMinutes(30), next.DueTime);
+            Assert.Single(started);
+        }
+        finally
+        {
+            await scheduler.StopAsync(CancellationToken.None);
+        }
+    }
+
+    /// <summary>
+    /// A clock that moves only when the test sets it, and whose timers fire only when the test
+    /// fires them — so a loop can be made to wake at an instant long after its timer was due.
+    /// </summary>
+    private sealed class SteppedClock(DateTimeOffset start) : TimeProvider
+    {
+        private readonly object _gate = new();
+        private readonly Queue<SteppedTimer> _created = new();
+        private TaskCompletionSource _timerCreated = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private DateTimeOffset _now = start;
+
+        public DateTimeOffset Now
+        {
+            get { lock (_gate) return _now; }
+            set { lock (_gate) _now = value; }
+        }
+
+        public override DateTimeOffset GetUtcNow() => Now;
+
+        public override ITimer CreateTimer(TimerCallback callback, object? state, TimeSpan dueTime, TimeSpan period)
+        {
+            var timer = new SteppedTimer(callback, state, dueTime);
+            lock (_gate)
+            {
+                _created.Enqueue(timer);
+                _timerCreated.TrySetResult();
+            }
+
+            return timer;
+        }
+
+        /// <summary>The next timer the code under test arms (waiting for it, bounded).</summary>
+        public async Task<SteppedTimer> NextTimerAsync()
+        {
+            var deadline = DateTime.UtcNow.AddSeconds(30);
+            while (true)
+            {
+                Task created;
+                lock (_gate)
+                {
+                    if (_created.TryDequeue(out var timer))
+                        return timer;
+                    if (_timerCreated.Task.IsCompleted)
+                        _timerCreated = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                    created = _timerCreated.Task;
+                }
+
+                var remaining = deadline - DateTime.UtcNow;
+                if (remaining <= TimeSpan.Zero)
+                    throw new TimeoutException("The scheduler armed no timer.");
+                await created.WaitAsync(remaining);
+            }
+        }
+    }
+
+    private sealed class SteppedTimer(TimerCallback callback, object? state, TimeSpan dueTime) : ITimer
+    {
+        public TimeSpan DueTime { get; } = dueTime;
+
+        public void Fire() => callback(state);
+
+        public bool Change(TimeSpan dueTime, TimeSpan period) => true;
+
+        public void Dispose()
+        {
+        }
+
+        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+    }
+
+    [Fact]
     public void OccurrenceFlowId_IsCultureInvariant()
     {
         // The deterministic occurrence id is the cross-replica exactly-once key: a culture whose

@@ -362,7 +362,7 @@ execution leases. They are independent axes — combine any one of each.
 | RabbitMQ | publisher confirms + mandatory routing, dead-letter exchange |
 | Azure Service Bus | peek-lock ACKs; reuses your own `ServiceBusClient` (e.g. Azure Identity) if registered |
 | Google Pub/Sub | streaming pull; redelivery bounds via the subscription's DeadLetterPolicy |
-| AWS SQS | long-poll `ReceiveMessage` (up to 10/batch), visibility-timeout redelivery, native dead-letter via redrive policies (provisionable with `CreateQueues`), opt-in FIFO ordering per flow; reuses your own `IAmazonSQS` if registered |
+| AWS SQS | long-poll `ReceiveMessage` (up to 10/batch in early ACK, one at a time otherwise), visibility-timeout redelivery, native dead-letter via redrive policies (provisionable with `CreateQueues`), opt-in FIFO ordering per correlation id; reuses your own `IAmazonSQS` if registered |
 | Kafka | classic consumer groups, manual offset management, in-process bounded retry, `{topic}.deadletter` topics; a handler that outlives `DetachHandlerAfter` runs detached with its partition paused, so long flow steps never overrun `max.poll.interval.ms`; also covers Redpanda / Amazon MSK / WarpStream / Aiven / Confluent Cloud |
 | NATS | JetStream explicit ACKs, NAK-with-delay redelivery, dead-lettering |
 | PostgreSQL | queue table claimed with `FOR UPDATE SKIP LOCKED`, idempotent publish, dead-lettering |
@@ -563,7 +563,9 @@ builder.Services.AddAsyncResponse()
 ```
 
 SQS owns visibility-timeout redelivery and redrive-policy dead letters. Name both queues with a
-`.fifo` suffix to keep each correlation id ordered as one message group. A registered `IAmazonSQS`
+`.fifo` suffix to keep each correlation id ordered as one message group — but every job without a
+correlation id, durable-flow jobs among them, then shares one group that SQS delivers strictly one
+at a time, so prefer standard queues when durable flows run on SQS. A registered `IAmazonSQS`
 is reused automatically; otherwise the AWS SDK credential and region chain is used.
 
 ### More deployment combinations
@@ -573,7 +575,7 @@ is reused automatically; otherwise the AWS SDK credential and region chain is us
 | Kafka / Redpanda / MSK / Confluent | durable channel + `.WithKafkaTransport(...)` + one flow store | Correlation id is the partition key; partition count bounds consumer parallelism and a retry delays that partition — only that partition: long handlers are detached from the poll thread. |
 | PostgreSQL | `.WithPostgreSqlChannel()` + `.WithPostgreSqlTransport(...)` + `.WithPostgreSqlDurableFlows(...)` | `LISTEN/NOTIFY` wakes response readers; workers claim queue rows with `FOR UPDATE SKIP LOCKED`. |
 | SQL Server | `.WithSqlServerChannel(...)` + `.WithSqlServerTransport(...)` + `.WithSqlServerDurableFlows(...)` | Adaptive response polling; workers claim rows with `UPDLOCK, ROWLOCK, READPAST`. |
-| AWS | Redis/PostgreSQL channel + `.WithSqsTransport(...)` + `.WithDynamoDbDurableFlows(...)` | Native visibility-timeout redelivery and redrive-policy dead letters; FIFO queues order by correlation id. |
+| AWS | Redis/PostgreSQL channel + `.WithSqsTransport(...)` + `.WithDynamoDbDurableFlows(...)` | Native visibility-timeout redelivery and redrive-policy dead letters; FIFO queues order by correlation id (uncorrelated jobs, durable-flow jobs among them, share one serial group). |
 | NATS | `.WithNatsChannel(...)` + `.WithNatsTransport(...)` + one flow store | Core request/reply for responses and JetStream explicit ACKs for worker jobs. |
 
 See [configuration](docs/configuration.md) for every registration and option,
@@ -692,8 +694,8 @@ runs instead of 660:
 
 | Contract | Facts | Providers | Cases |
 | --- | ---: | ---: | ---: |
-| Channel conformance | 27 | 6 channels | 162 |
-| Transport conformance | 10 | 11 transports | 110 |
+| Channel conformance | 34 | 6 channels | 222 |
+| Transport conformance | 13 | 11 transports | 143 |
 | Durable-flow store contract | one composed contract | 10 stores | 10 |
 
 The channel contract pins live delivery, `Until` predicates, timeouts, correlation-id isolation and
@@ -706,12 +708,13 @@ expiry and steal after a worker dies, large state, and rejection of a newer sche
 
 Transports differ in *where* a guarantee comes from, and the suite records that rather than letting
 the difference become an untested gap. Every transport bounds redelivery — via a subscriber knob on
-six of them, the in-process retry budget on the in-memory queue, the queue's redrive policy on SQS,
+eight of them, the in-process retry budget on the in-memory queue, the queue's redrive policy on SQS,
 and the subscription's `DeadLetterPolicy` on Google Pub/Sub. Two constrain the bound itself: RabbitMQ
 cannot count past two without an application-owned TTL-retry cycle (a plain `basic.nack` requeue does
 not increment `x-death`), and a Pub/Sub dead-letter policy rejects anything under five. Payload
-ceilings differ by two orders of magnitude — SQS and Service Bus standard tier both reject messages
-over 256 KiB — so the payload fact is sized per transport. Where a capability is genuinely absent, a
+ceilings differ by two orders of magnitude — Service Bus standard tier rejects messages over 256 KB,
+and SQS over 1 MiB (since August 2025; a queue's `MaximumMessageSize` may be set lower, and LocalStack
+and older queues still apply 256 KiB) — so the payload fact is sized per transport. Where a capability is genuinely absent, a
 dedicated fact asserts the absence — every transport is pinned for or against native delayed
 delivery, so gaining or losing `IDelayedWorkerTransport` later fails the test — while the
 delayed-delivery *timing* facts skip, capability-gated, on the five transports that lack it (there,

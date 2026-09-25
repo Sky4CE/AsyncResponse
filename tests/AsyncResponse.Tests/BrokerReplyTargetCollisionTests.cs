@@ -88,10 +88,50 @@ public sealed class BrokerReplyTargetCollisionTests
     [Fact]
     public void RabbitMq_NamedTargetAimedAtTheDeadLetterExchange_IsRejected()
     {
-        // DeadLetterRoutingKey defaults to the delivery's own routing key, so ANY routing key on
-        // the dead-letter exchange lands in buried traffic.
+        // With no DeadLetterRoutingKey, dead-lettered messages keep their own routing key, so ANY
+        // routing key on the dead-letter exchange may land in buried traffic.
         var options = new RabbitMqAsyncResponseOptions { DeadLetterExchange = "dlx" }
             .AddReplyTarget("billing", "dlx", "some.route");
+        var provider = new RabbitMqReplyTargetProvider(Options.Create(options));
+
+        var exception = Assert.Throws<InvalidOperationException>(() => provider.GetReplyTarget("billing"));
+        Assert.Contains("billing", exception.Message);
+    }
+
+    [Fact]
+    public void RabbitMq_DefaultTargetOnAnExchangeSharedWithTheDeadLetterExchange_ResolvesWhenTheDeadLetterRoutingKeyIsDistinct()
+    {
+        // Regression (r1 GS5#2): one exchange for worker, response and dead letters, told apart by
+        // routing key, is a topology the subscriber validator deliberately lets start (a distinct
+        // DeadLetterRoutingKey on a shared exchange). The reply-target guard compared the exchange
+        // alone, so the DEFAULT target threw on every WithReplyTarget() call after a clean start.
+        var options = new RabbitMqAsyncResponseOptions
+        {
+            WorkerExchange = "app",
+            ResponseExchange = "app",
+            DeadLetterExchange = "app",
+            WorkerRoutingKey = "worker",
+            ResponseRoutingKey = "response",
+            DeadLetterRoutingKey = "dead"
+        };
+        RabbitMqMessageDispatcher.ValidateOptions(options, options.WorkerSubscriber, RabbitMqSubscriberRole.Worker);
+        var provider = new RabbitMqReplyTargetProvider(Options.Create(options));
+
+        Assert.Equal("app:response", provider.GetReplyTarget().Address);
+    }
+
+    [Fact]
+    public void RabbitMq_NamedTargetOnTheDeadLetterAddress_IsStillRejectedWhenTheDeadLetterRoutingKeyIsSet()
+    {
+        var options = new RabbitMqAsyncResponseOptions
+        {
+            WorkerExchange = "app",
+            ResponseExchange = "app",
+            DeadLetterExchange = "app",
+            WorkerRoutingKey = "worker",
+            ResponseRoutingKey = "response",
+            DeadLetterRoutingKey = "dead"
+        }.AddReplyTarget("billing", "app", "dead");
         var provider = new RabbitMqReplyTargetProvider(Options.Create(options));
 
         var exception = Assert.Throws<InvalidOperationException>(() => provider.GetReplyTarget("billing"));
@@ -109,6 +149,18 @@ public sealed class BrokerReplyTargetCollisionTests
         Assert.Contains("asyncresponse-worker", exception.Message);
     }
 
+    [Fact]
+    public void AzureServiceBus_NamedTargetNamingTheWorkerQueueInAnotherCase_IsRejected()
+    {
+        // Red-on-old (fixpoint r1, S8#8): Service Bus entity names are case-insensitive, so
+        // "ASYNCRESPONSE-WORKER" IS the worker queue; the guard compared ordinally.
+        var options = new AzureServiceBusAsyncResponseOptions().AddReplyTarget("billing", "ASYNCRESPONSE-WORKER");
+        var provider = new AzureServiceBusReplyTargetProvider(Options.Create(options));
+
+        var exception = Assert.Throws<InvalidOperationException>(() => provider.GetReplyTarget("billing"));
+        Assert.Contains("billing", exception.Message);
+    }
+
     [Theory]
     [InlineData("asyncresponse-worker")]
     [InlineData("asyncresponse-worker-dlq")]
@@ -121,6 +173,39 @@ public sealed class BrokerReplyTargetCollisionTests
         var exception = Assert.Throws<InvalidOperationException>(() => provider.GetReplyTarget("billing"));
         Assert.Contains("billing", exception.Message);
         Assert.Contains(queue, exception.Message);
+    }
+
+    [Theory]
+    [InlineData("HTTPS://SQS.us-east-1.amazonaws.com:443/000000000000/asyncresponse-worker/")]
+    [InlineData("https://sqs.us-east-1.amazonaws.com/000000000000/asyncresponse-worker-dlq")]
+    public void Sqs_NamedTargetGivenAsAnotherSpellingOfTheWorkerOrDerivedDeadLetterQueueUrl_IsRejected(string queueUrl)
+    {
+        // Red-on-old (fixpoint r1, GS5#9): queues accept a name or a URL, and the guard compared
+        // the raw strings, so another spelling of the worker queue's URL slipped past it.
+        var options = new SqsAsyncResponseOptions
+        {
+            WorkerQueue = "https://sqs.us-east-1.amazonaws.com/000000000000/asyncresponse-worker"
+        }.AddReplyTarget("billing", queueUrl);
+        var provider = new SqsReplyTargetProvider(Options.Create(options));
+
+        var exception = Assert.Throws<InvalidOperationException>(() => provider.GetReplyTarget("billing"));
+        Assert.Contains("billing", exception.Message);
+    }
+
+    [Theory]
+    [InlineData("https://sqs.us-east-1.amazonaws.com/999999999999/asyncresponse-worker")]
+    [InlineData("https://sqs.us-east-1.amazonaws.com/999999999999/asyncresponse-worker-dlq")]
+    public void Sqs_NamedTargetGivenAsAUrlSharingTheWorkerOrDeadLetterQueueName_IsNotRejected(string queueUrl)
+    {
+        // Red-on-old (fixpoint r1 pre-commit, I5): a URL was compared with the worker queue's NAME
+        // by queue name alone, so another account's queue that happens to share the name threw from
+        // GetReplyTarget on every enqueue. It may be a different queue; the worker subscriber warns
+        // about the pair at startup instead.
+        var options = new SqsAsyncResponseOptions().AddReplyTarget("billing", queueUrl);
+        var provider = new SqsReplyTargetProvider(Options.Create(options));
+
+        Assert.Equal(queueUrl, provider.GetReplyTarget("billing").Address);
+        Assert.Contains(SqsOptionsValidator.PossibleQueueCollisions(options), collision => collision.Contains("billing", StringComparison.Ordinal));
     }
 
     [Fact]

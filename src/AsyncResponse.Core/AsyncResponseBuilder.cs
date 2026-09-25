@@ -31,13 +31,27 @@ internal abstract class AsyncResponseBuilderBase(
     private const int ScalarOverhead = 64;
 
     /// <summary>
+    /// How much longer a delayed envelope can get on its way to the handler. The worker-job
+    /// executor re-publishes an early delivery (a hop capped by the transport's
+    /// <see cref="IDelayedWorkerTransport.MaxPublishDelay"/>, or broker imprecision) after
+    /// stamping the remaining delay into <see cref="WorkerJobEnvelope.LastRedelayRemaining"/>:
+    /// the <c>null</c> measured here becomes a quoted TimeSpan, at widest
+    /// <c>"-10675199.02:48:05.4775808"</c> — 28 characters for 4. The stall counter beside it
+    /// stays one digit (clamped by the executor).
+    /// </summary>
+    internal const int MaxRedelayHopGrowth = 24;
+
+    /// <summary>
     /// Refuses an envelope the consuming ingress would acknowledge without executing. The ingress
     /// compares the delivered JSON's UTF-16 length against <see cref="AsyncResponseOptions.MaxInboundMessageChars"/>
     /// and drops what exceeds it (an oversized message never gets smaller, so redelivery would
     /// hot-loop); without this check the publish succeeded, the caller kept a flow id or a
     /// fire-and-forget "success", and the work silently never ran. Measured exactly — the same
     /// serialization the transports perform — but only when a cheap upper bound says it might
-    /// matter, so the hot path of small jobs pays no extra serialization.
+    /// matter, so the hot path of small jobs pays no extra serialization. A delayed envelope is
+    /// measured as its largest re-published hop (<see cref="MaxRedelayHopGrowth"/>): measured as
+    /// published, one within a few characters of the limit passed here and was then dropped by
+    /// the ingress on the hop that stamped its remaining delay.
     /// </summary>
     /// <exception cref="WorkerJobTooLargeException">The serialized envelope exceeds the budget.</exception>
     protected void ThrowIfOverInboundBudget(WorkerJobEnvelope envelope)
@@ -45,12 +59,13 @@ internal abstract class AsyncResponseBuilderBase(
         if (_options?.Value.MaxInboundMessageChars is not { } limit)
             return;
 
-        if (TryEstimateUpperBound(envelope, out var upperBound) && upperBound <= limit)
+        var hopGrowth = envelope.NotBeforeUtc is null ? 0 : MaxRedelayHopGrowth;
+        if (TryEstimateUpperBound(envelope, out var upperBound) && upperBound + hopGrowth <= limit)
             return;
 
         var serialized = AsyncResponseJson.Serialize(envelope);
-        if (serialized.Length > limit)
-            throw new WorkerJobTooLargeException(serialized.Length, limit);
+        if (serialized.Length + hopGrowth > limit)
+            throw new WorkerJobTooLargeException(serialized.Length + hopGrowth, limit);
     }
 
     /// <summary>
@@ -68,8 +83,14 @@ internal abstract class AsyncResponseBuilderBase(
         if (envelope.ReplyTarget is { } target)
         {
             total += Escaped(target.Name) + Escaped(target.Transport) + Escaped(target.Address);
-            foreach (var (key, value) in target.Properties)
-                total += Escaped(key) + Escaped(value) + PerEntryOverhead;
+            // Null-tolerant: an inbound job's "Properties":null overwrites the initializer, and the
+            // worker executor pushes that target ambiently — every enqueue the handler made (a
+            // flow's own wake-up included) threw NullReferenceException here, on every delivery.
+            if (target.Properties is { } properties)
+            {
+                foreach (var (key, value) in properties)
+                    total += Escaped(key) + Escaped(value) + PerEntryOverhead;
+            }
         }
 
         if (envelope.Context is { } context)
@@ -130,7 +151,10 @@ internal abstract class AsyncResponseBuilderBase(
     // DynamicallyAccessedMembers) and the RequiresUnreferencedCode DTO overloads above.
     private async Task EnqueueWorkerCoreAsync(ReflectionCallDto work, TimeSpan delay, CancellationToken cancellationToken)
     {
-        ArgumentNullException.ThrowIfNull(work);
+        // A null or blank target name, a null Params, or a null entry publishes cleanly and is then
+        // drop-acknowledged by the consumer's parse gate: the job silently never ran and the
+        // producer saw success. Refuse it here, in the caller's stack.
+        ReflectionCallDtoGuard.ThrowIfMalformed(work, nameof(work));
         cancellationToken.ThrowIfCancellationRequested();
 
         using var activity = AsyncResponseDiagnostics.StartActivity(
@@ -209,7 +233,8 @@ internal abstract class AsyncResponseBuilderBase(
             // by the worker-job executor for the remainder, so the due time holds end to end.
             envelope.NotBeforeUtc = (_timeProvider ?? TimeProvider.System).GetUtcNow().UtcDateTime.Add(delay);
             var hop = delay <= delayedTransport.MaxPublishDelay ? delay : delayedTransport.MaxPublishDelay;
-            // After the due-time stamp: the check measures the envelope exactly as it is published.
+            // After the due-time stamp: the check measures the envelope as it is published, plus
+            // what a re-published hop adds.
             ThrowIfOverInboundBudget(envelope);
             await delayedTransport.PublishAsync(envelope, hop, cancellationToken).ConfigureAwait(false);
         }
@@ -419,8 +444,11 @@ internal class AsyncResponseBuilder<T> : IAsyncResponseAttachedBuilder<T>, IAsyn
                 "call For<T>() again so every wait gets its own correlation id and registration.");
         }
 
-        await using var waiter = await CreateWaiterAsync().ConfigureAwait(false);
+        // Before the waiter: resolution needs nothing from it, and a missing provider or a bad
+        // target name used to subscribe and persist a recovery row only to throw and tear both
+        // down again — durable writes on every failed call.
         var replyTarget = ResolveReplyTarget();
+        await using var waiter = await CreateWaiterAsync().ConfigureAwait(false);
         var requestContext = new AsyncResponseRequestContext(_correlationId, replyTarget);
 
         // Subscribe-before-send by construction: the trigger runs only once the subscription and
@@ -531,11 +559,19 @@ internal sealed class RecoverableAsyncResponseBuilder<T> :
             _completionPredicate,
             _timeout);
 
+    // Validated at registration, like the expression overloads' binding check: a malformed
+    // descriptor persisted into the recovery row can never be invoked when the response arrives.
     private void SetResumeCallback(ReflectionCallDto callback)
-        => _resumeCallback = callback ?? throw new ArgumentNullException(nameof(callback));
+    {
+        ReflectionCallDtoGuard.ThrowIfMalformed(callback, nameof(callback));
+        _resumeCallback = callback;
+    }
 
     private void SetFailureCallback(ReflectionCallDto callback)
-        => _failureCallback = callback ?? throw new ArgumentNullException(nameof(callback));
+    {
+        ReflectionCallDtoGuard.ThrowIfMalformed(callback, nameof(callback));
+        _failureCallback = callback;
+    }
 
     [RequiresUnreferencedCode("The callback names its target service and method as strings, resolved by reflection when it fires after a " +
                               "subscriber loss; trimming may have removed them. Use the expression-based overload, which roots the service's " +

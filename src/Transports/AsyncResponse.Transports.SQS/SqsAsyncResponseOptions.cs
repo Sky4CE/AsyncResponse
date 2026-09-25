@@ -32,7 +32,9 @@ public sealed class SqsAsyncResponseOptions
     /// SQS queue used by <see cref="SqsWorkerTransport"/> to publish worker jobs. Accepts a queue
     /// name (resolved once via <c>GetQueueUrl</c>) or a full queue URL. A name or URL ending in
     /// <c>.fifo</c> opts the worker path into FIFO publishing: the correlation id becomes the
-    /// <c>MessageGroupId</c> so one flow's jobs stay ordered.
+    /// <c>MessageGroupId</c>, so jobs sharing a correlation id stay ordered, while every job without
+    /// one — durable-flow jobs among them — shares <see cref="FifoMessageGroupIdFallback"/>, a single
+    /// group SQS delivers strictly one at a time. Prefer a standard queue for durable flows.
     /// </summary>
     public string WorkerQueue { get; set; } = "asyncresponse-worker";
 
@@ -79,14 +81,21 @@ public sealed class SqsAsyncResponseOptions
     ];
 
     /// <summary>
-    /// Maximum messages requested from SQS in one <c>ReceiveMessage</c> call. SQS allows 1–10;
-    /// default: <c>10</c>.
+    /// Maximum messages requested from SQS in one <c>ReceiveMessage</c> call (in
+    /// <see cref="SqsAckMode.AckAfterEnqueue"/> still capped by the background queue's free
+    /// capacity). SQS allows 1–10; default: <c>10</c>. The worker subscriber in
+    /// <see cref="SqsAckMode.AckAfterHandlerCompletes"/> receives one message at a time: it runs
+    /// handlers serially, and SQS counts every received message toward the redrive policy — and
+    /// starts its visibility clock — whether or not its handler ever starts. The response
+    /// subscriber keeps the batch in both modes (its handler is the library's own).
     /// </summary>
     public int MaxMessagesPerReceive { get; set; } = 10;
 
     /// <summary>
     /// Long-poll wait time per <c>ReceiveMessage</c> call. SQS allows 0–20 seconds; the default of
-    /// 20 seconds minimizes empty-receive billing and wake-up latency.
+    /// 20 seconds minimizes empty-receive billing and wake-up latency. <c>0</c> is short polling:
+    /// an empty receive returns at once, so the subscriber backs off on the subscriber retry
+    /// schedule between empty receives instead of re-polling once per round trip.
     /// </summary>
     public TimeSpan ReceiveWaitTime { get; set; } = TimeSpan.FromSeconds(20);
 
@@ -113,7 +122,12 @@ public sealed class SqsAsyncResponseOptions
 
     /// <summary>
     /// <c>MessageGroupId</c> used when publishing to a FIFO worker queue and the job carries no
-    /// correlation id. Default: <c>asyncresponse</c>.
+    /// correlation id. Every such job — durable-flow start, resume and wake-up jobs among them,
+    /// unless the flow was started inside a request scope — lands in this ONE group, which SQS
+    /// delivers strictly one at a time across every consumer; FIFO also keeps flow timers in
+    /// process, so one parked flow holds the group for all others (the worker subscriber warns at
+    /// startup). Must be a valid <c>MessageGroupId</c>: 1–128 ASCII letters, digits and
+    /// punctuation. Default: <c>asyncresponse</c>.
     /// </summary>
     public string FifoMessageGroupIdFallback { get; set; } = "asyncresponse";
 

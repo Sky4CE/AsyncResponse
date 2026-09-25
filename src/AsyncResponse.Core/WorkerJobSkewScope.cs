@@ -49,6 +49,24 @@ internal static class WorkerJobSkewScope
     }
 
     /// <summary>
+    /// Clears any marker the calling flow carries until the returned scope is disposed: entered at
+    /// the start of EVERY job, so a job the in-memory transport runs under its enqueuer's captured
+    /// execution context never inherits a marker the publishing job still held (the same reason
+    /// <c>WorkerJobScope</c> is entered for every job). Allocation-free in the common case, a flow
+    /// that carries no marker: there is nothing to clear or restore, and a scope object per job on
+    /// the executor every transport shares would be pure overhead.
+    /// </summary>
+    public static IDisposable EnterUnmarked()
+    {
+        var previous = _forcedEarly.Value;
+        if (previous is null)
+            return NoMarkerScope.Instance;
+
+        _forcedEarly.Value = null;
+        return new Scope(previous);
+    }
+
+    /// <summary>
     /// Heap cell shared by every continuation of the job: an <see cref="AsyncLocal{T}"/> VALUE
     /// written inside an async callee never flows back to its caller, so consumption mutates the
     /// referenced marker instead of the ambient slot.
@@ -56,6 +74,16 @@ internal static class WorkerJobSkewScope
     private sealed class Marker
     {
         public bool Consumed;
+    }
+
+    /// <summary><see cref="EnterUnmarked"/> on a flow without a marker: nothing to restore.</summary>
+    private sealed class NoMarkerScope : IDisposable
+    {
+        public static readonly NoMarkerScope Instance = new();
+
+        public void Dispose()
+        {
+        }
     }
 
     private sealed class Scope(Marker? _previous) : IDisposable
