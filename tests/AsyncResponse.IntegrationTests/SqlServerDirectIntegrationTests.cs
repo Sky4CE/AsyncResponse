@@ -513,6 +513,24 @@ public sealed class SqlServerDirectIntegrationTests(DataBatchFixture fixture) : 
         return (int)(await command.ExecuteScalarAsync())!;
     }
 
+    /// <summary>
+    /// A catalog poll that runs beside DDL the test itself provoked (an index build waiting on, or
+    /// holding, schema locks): it volunteers as the deadlock victim and reports a lost deadlock as
+    /// "not yet" (null), so the poll retries instead of failing the fact on SQL Server's choice of
+    /// victim (error 1205, seen on a loaded CI runner).
+    /// </summary>
+    private async Task<int?> PollScalarIntAsync(string sql)
+    {
+        try
+        {
+            return await ScalarIntAsync("SET DEADLOCK_PRIORITY LOW;\n" + sql);
+        }
+        catch (SqlException ex) when (ex.Number == 1205)
+        {
+            return null;
+        }
+    }
+
     [Fact]
     public async Task ASpacePaddedQueueRow_IsNeverClaimed_AndDoesNotStarveTheRowsBehindIt()
     {
@@ -2009,17 +2027,17 @@ public sealed class SqlServerDirectIntegrationTests(DataBatchFixture fixture) : 
                 }
 
                 var publish = store.PublishAsync(Guid.NewGuid(), options.WorkerQueue, EmptyJson, null, caller.Token);
-                await EventuallyAsync(async () => await ScalarIntAsync($"""
+                await EventuallyAsync(async () => await PollScalarIntAsync($"""
                     SELECT COUNT(*) FROM sys.dm_tran_locks
                     WHERE request_status = 'WAIT' AND resource_type = 'OBJECT' AND resource_associated_entity_id = OBJECT_ID(N'[{schema}].[{options.MessageTable}]');
-                    """) > 0);
+                    """) is > 0);
                 await caller.CancelAsync();
                 await Assert.ThrowsAnyAsync<OperationCanceledException>(() => publish);
                 await transaction.RollbackAsync();
             }
 
-            await EventuallyAsync(async () => await ScalarIntAsync(
-                $"SELECT COUNT(*) FROM sys.indexes WHERE object_id = OBJECT_ID(N'[{schema}].[{options.MessageTable}]') AND name = N'{readyIndex}';") == 1);
+            await EventuallyAsync(async () => await PollScalarIntAsync(
+                $"SELECT COUNT(*) FROM sys.indexes WHERE object_id = OBJECT_ID(N'[{schema}].[{options.MessageTable}]') AND name = N'{readyIndex}';") is 1);
         });
     }
 
