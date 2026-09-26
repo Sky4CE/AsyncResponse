@@ -1215,6 +1215,64 @@ public class DurableFlowInProcessParkTests
         Assert.Equal(wakeAt, Assert.Single(transport.Jobs).NotBeforeUtc);
     }
 
+    [Fact]
+    public async Task InProcessTimer_FirstArm_WaitsTheRemainderMeasuredAfterTheCheckpointSave_NotBeforeIt()
+    {
+        // Same class of bug as ASuspendedTimersWakeUp_IsDueAtTheCheckpointedInstant, for the
+        // in-process wait instead of the suspend/hand-over path: the remainder was measured BEFORE
+        // the first-arm checkpoint save, so the in-process timer was armed late by however long
+        // that save took (here five seconds).
+        var clock = new VirtualTimeProvider();
+        var transport = new RecordingTransport();
+        await using var provider = BuildProvider(transport, clock);
+        var store = new SlowUpdateStore(new InMemoryFlowStateStore(clock), clock, TimeSpan.FromSeconds(5));
+        var options = Options();
+        var state = State("park-inprocess-due-at-the-checkpoint");
+        Assert.True(await store.TryCreateAsync(state.FlowId!, state, options.StateExpiry));
+        var dueAt = clock.GetUtcNow().UtcDateTime + SixHours;
+
+        await using var lease = await AcquireAsync(store, state.FlowId!, options, clock);
+        var context = CreateContext(provider, state, store, lease, options, clock, transport);
+        var sleeping = context.DelayAsync("nap", SixHours);
+        await WaitForArmedTimerAsync(clock, SixHours);
+
+        // Armed for the due time itself, not the due time plus the checkpoint save's own cost.
+        Assert.Equal(dueAt, clock.NextTimerDueAt);
+
+        clock.AdvanceTo(dueAt);
+        await sleeping;
+    }
+
+    [Fact]
+    public async Task InProcessTimer_Replay_ReExtensionSaveCrossesTheDueTime_FloorsTheRemainderAtZero_InsteadOfThrowing()
+    {
+        // A replayed execution (checkpoint.WakeAtUtc already persisted, so this is NOT the first
+        // arm) resumes an in-process sleep close to due. The re-extension save that renews the
+        // ledger's TTL takes long enough (virtual clock) to cross wakeAtUtc itself, so the
+        // remainder re-measured right after it is negative. Without the floor at zero, that
+        // negative remainder reaches the in-process wait as-is (ArgumentOutOfRangeException, or an
+        // infinite wait at exactly -1 ms) instead of completing the step at once.
+        var clock = new VirtualTimeProvider();
+        var transport = new RecordingTransport();
+        await using var provider = BuildProvider(transport, clock);
+        var store = new SlowUpdateStore(new InMemoryFlowStateStore(clock), clock, TimeSpan.FromSeconds(10));
+        var options = Options();
+        var state = State("park-inprocess-replay-crosses-due-time");
+        var dueAt = clock.GetUtcNow().UtcDateTime + TimeSpan.FromSeconds(5);
+        state.Steps = new Dictionary<string, FlowStepState>(StringComparer.Ordinal)
+        {
+            ["nap"] = new FlowStepState { WakeAtUtc = dueAt, Message = $"Sleeping until {dueAt:O}." }
+        };
+        Assert.True(await store.TryCreateAsync(state.FlowId!, state, options.StateExpiry));
+
+        await using var lease = await AcquireAsync(store, state.FlowId!, options, clock);
+        var context = CreateContext(provider, state, store, lease, options, clock, transport);
+
+        // The re-extension save (SlowUpdateStore) advances the clock by ten seconds — past the
+        // five-second-out due time — before the remainder is re-measured.
+        await context.DelayUntilAsync("nap", dueAt).WaitAsync(TimeSpan.FromSeconds(30));
+    }
+
     /// <summary><see cref="SleepyFlow"/>, waiting on the host's own stopping token.</summary>
     internal sealed class HostTokenSleepyFlow(Microsoft.Extensions.Hosting.IHostApplicationLifetime lifetime) : IDurableFlow<ParkInput>
     {

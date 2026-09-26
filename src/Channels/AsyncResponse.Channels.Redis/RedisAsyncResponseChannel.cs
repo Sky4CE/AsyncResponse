@@ -506,9 +506,13 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
             {
                 try
                 {
-                    _owner._logger.LogWarning("Timed out waiting for response for correlationId {CorrelationId}.", _correlationId);
-                    AsyncResponseDiagnostics.SetError(_activity, "timeout", $"Timed out waiting for response for correlationId {_correlationId}.");
-                    AsyncResponseDiagnostics.RecordWaiterTimeout("redis");
+                    // Logged/tagged through SafeLog: a throwing logger or metrics listener must not
+                    // skip DrainThenCleanupAsync below — the in-memory channel settles first for the
+                    // same reason, and a throw here would otherwise leave ResponseTask pending with
+                    // the SUBSCRIBE, executor and recovery registration leaked until disposal.
+                    SafeLog.Try(() => _owner._logger.LogWarning("Timed out waiting for response for correlationId {CorrelationId}.", _correlationId));
+                    SafeLog.Try(() => AsyncResponseDiagnostics.SetError(_activity, "timeout", $"Timed out waiting for response for correlationId {_correlationId}."));
+                    SafeLog.Try(() => AsyncResponseDiagnostics.RecordWaiterTimeout("redis"));
                     await DrainThenCleanupAsync(
                         new TimeoutException($"Timed out waiting for response for correlationId {_correlationId}."))
                         .ConfigureAwait(false);
@@ -568,12 +572,17 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
                 return;
             }
 
-            _owner._logger.LogError(
+            // Logged/tagged through SafeLog: a throwing logger or metrics listener must not skip
+            // CleanupOnceAsync below — that teardown is what stops the flood; a throw here would
+            // otherwise leave the subscription, executor registration and recovery row until the
+            // caller disposes, and that dispose would then park on the still-full executor for a
+            // whole DisposalDrainTimeout.
+            SafeLog.Try(() => _owner._logger.LogError(
                 "Wait for correlationId {CorrelationId} is overloaded: {Buffered} responses are queued behind its serial processing and the next could not be admitted. Faulting it as indeterminate and unsubscribing; the queued responses are discarded with it.",
                 _correlationId,
-                ChannelSerialExecutor.DefaultCapacity);
-            AsyncResponseDiagnostics.SetError(_activity, "overloaded", "The wait's bounded response buffer overflowed.");
-            AsyncResponseDiagnostics.RecordWaiterOverload("redis");
+                ChannelSerialExecutor.DefaultCapacity));
+            SafeLog.Try(() => AsyncResponseDiagnostics.SetError(_activity, "overloaded", "The wait's bounded response buffer overflowed."));
+            SafeLog.Try(() => AsyncResponseDiagnostics.RecordWaiterOverload("redis"));
             await CleanupOnceAsync().ConfigureAwait(false);
         }
 
@@ -757,13 +766,25 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
                     // with the explicit indeterminate contract instead. A TrySetResult from the
                     // late-finishing dispatch loses against this and is dropped; its cleanup
                     // call is a no-op behind the latch.
-                    _owner._logger.LogWarning(
-                        "Disposal drain for correlationId {CorrelationId} did not prove settlement within {DrainTimeout}; faulting the waiter as indeterminate.",
-                        _correlationId, drainTimeout);
-                    AsyncResponseDiagnostics.SetError(_activity, "indeterminate_delivery", "Disposal drain did not prove settlement.");
-                    if (drainEx is not OperationCanceledException)
-                        _owner._logger.LogDebug(drainEx, "Dispatch drain failed for channel {Channel}.", ChannelName);
-                    _tcs.TrySetException(new AsyncResponseIndeterminateDeliveryException(_correlationId, drainTimeout));
+                    //
+                    // Faulted BEFORE the logs, and logged/tagged only when the fault actually won
+                    // (mirrors OnOverloadedAsync above): a delivery that already settled the wait
+                    // through some other path makes this TrySetException a no-op, and reporting an
+                    // "indeterminate" warning/tag for a wait that in fact carries a real result
+                    // would be a false diagnostic — exactly the outcome the cleanup's plain cancel
+                    // below already avoids for the truthful case.
+                    if (_tcs.TrySetException(new AsyncResponseIndeterminateDeliveryException(_correlationId, drainTimeout)))
+                    {
+                        // Logged through SafeLog: a throwing logger must not skip CleanupOnceAsync
+                        // below — a throw here would otherwise leave the subscription/registration
+                        // until the caller's DisposeAsync/timeout.
+                        SafeLog.Try(() => _owner._logger.LogWarning(
+                            "Disposal drain for correlationId {CorrelationId} did not prove settlement within {DrainTimeout}; faulting the waiter as indeterminate.",
+                            _correlationId, drainTimeout));
+                        SafeLog.Try(() => AsyncResponseDiagnostics.SetError(_activity, "indeterminate_delivery", "Disposal drain did not prove settlement."));
+                        if (drainEx is not OperationCanceledException)
+                            SafeLog.Try(() => _owner._logger.LogDebug(drainEx, "Dispatch drain failed for channel {Channel}.", ChannelName));
+                    }
                 }
             }
 
@@ -803,8 +824,10 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
                 catch (Exception ex)
                 {
                     // Best-effort: the state expires on its own, and a transient store failure must
-                    // not skip the unsubscribe and executor teardown below.
-                    _owner._logger.LogError(ex, "Failed to delete recovery state for correlationId {CorrelationId}.", _correlationId);
+                    // not skip the unsubscribe and executor teardown below. Logged through SafeLog:
+                    // a throwing logger provider must not escape this catch either, or it skips the
+                    // pub/sub release right below the same way an unguarded store failure would.
+                    SafeLog.Try(() => _owner._logger.LogError(ex, "Failed to delete recovery state for correlationId {CorrelationId}.", _correlationId));
                 }
 
                 try
@@ -1029,6 +1052,13 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
                     _logger.LogDebug("Published response for correlationId {CorrelationId} on channel {Channel}. PayloadType: {PayloadType}. Subscribers: {SubscriberCount}.", correlationId, channel.ToString()!, typeof(T), numSubscribers);
             }
         }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            // Cancellation is not a failure: the caller's own token fired while this awaited the
+            // publish or a lost-subscriber probe. Rethrow without the Error log/failed-activity
+            // that a real publish failure gets.
+            throw;
+        }
         catch (Exception ex)
         {
             _logger.LogError(ex, "Failed to publish response for correlationId {CorrelationId} on channel {Channel}.", correlationId, channel.ToString()!);
@@ -1120,6 +1150,11 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
                 if (_logger.IsEnabled(LogLevel.Debug))
                     _logger.LogDebug("Published raw response for correlationId {CorrelationId} on channel {Channel}. Subscribers: {SubscriberCount}.", correlationId, channel.ToString()!, numSubscribers);
             }
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            // Cancellation is not a failure: see SetResponseCore's twin catch.
+            throw;
         }
         catch (Exception ex)
         {
@@ -1218,6 +1253,11 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
             {
                 _logger.LogDebug("Published exception response for correlationId {CorrelationId} on channel {Channel}. Subscribers: {SubscriberCount}.", correlationId, channel.ToString()!, numSubscribers);
             }
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            // Cancellation is not a failure: see SetResponseCore's twin catch.
+            throw;
         }
         catch (Exception ex)
         {

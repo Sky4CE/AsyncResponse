@@ -187,6 +187,12 @@ internal abstract class RabbitMqMessageDispatcher : IAsyncDisposable
     internal const string HandedBackAfterCommitReason = "handed_back_after_commit";
 
     /// <summary>
+    /// Leads the <c>AR-DeadLetter-Reason</c> of an already-ACKed delivery whose background handler
+    /// was cut short by the drain budget lapsing while it was still running (Kafka parity).
+    /// </summary>
+    internal const string DrainLapsedAfterCommitReason = "drain_budget_lapsed_after_commit";
+
+    /// <summary>
     /// Builds the properties for a dead-letter copy of <paramref name="delivery"/>: the original
     /// headers plus the <c>AR-DeadLetter-*</c> forensic headers. A <paramref name="reasonCode"/>
     /// leads the reason header (<c>code: message</c>).
@@ -1585,6 +1591,45 @@ internal sealed class QueuedRabbitMqMessageDispatcher : RabbitMqMessageDispatche
     }
 
     /// <summary>
+    /// A background handler cut short by the drain budget lapsing while it was still running (not a
+    /// hand-back, and not thrown from the handler's own work): not a failure of the job, so no
+    /// Error-level "handler failed" log or park-cycle routing — it goes through the same
+    /// not-a-failure dead-letter path as a hand-back or a lapse before the handler even started
+    /// (Kafka's drain_budget_lapsed_after_commit; <see cref="BuryLapsedAsync"/> for the
+    /// never-started case). The copy is written first, then the outcome logged, then
+    /// OnBackgroundFailure notified.
+    /// </summary>
+    private async Task SettleLapsedMidHandlerAsync(RabbitMqDelivery delivery, OperationCanceledException lapsed)
+    {
+        if (await TryDeadLetterAlreadyAckedAsync(delivery, lapsed, handlerFailure: false, reasonCode: DrainLapsedAfterCommitReason).ConfigureAwait(false))
+        {
+            SafeLog.Try(() => Logger.LogWarning(
+                lapsed,
+                "RabbitMQ background handler for already-ACKed delivery {DeliveryTag} on {Queue} was canceled because the drain budget lapsed while it was still running; the broker will not redeliver it. Dead-lettered a copy (drain_budget_lapsed_after_commit); surfacing via OnBackgroundFailure.",
+                delivery.DeliveryTag,
+                _queueName));
+        }
+        else if (string.IsNullOrWhiteSpace(TransportOptions.DeadLetterExchange))
+        {
+            SafeLog.Try(() => Logger.LogError(
+                lapsed,
+                "RabbitMQ background handler for already-ACKed delivery {DeliveryTag} on {Queue} was canceled because the drain budget lapsed while it was still running; the broker will not redeliver it and no dead-letter destination is configured, so the message is lost unless OnBackgroundFailure records it.",
+                delivery.DeliveryTag,
+                _queueName));
+        }
+        else
+        {
+            SafeLog.Try(() => Logger.LogError(
+                lapsed,
+                "RabbitMQ background handler for already-ACKed delivery {DeliveryTag} on {Queue} was canceled because the drain budget lapsed while it was still running; the broker will not redeliver it and its dead-letter copy could not be written, so the message is lost unless OnBackgroundFailure records it.",
+                delivery.DeliveryTag,
+                _queueName));
+        }
+
+        await NotifyBackgroundFailureAsync(delivery, lapsed, _queueName, _role).ConfigureAwait(false);
+    }
+
+    /// <summary>
     /// A background handler that failed after the early ACK: logged, dead-lettered (the copy's own
     /// outcome is logged by the burial), and only then surfaced through OnBackgroundFailure.
     /// </summary>
@@ -1633,6 +1678,14 @@ internal sealed class QueuedRabbitMqMessageDispatcher : RabbitMqMessageDispatche
             catch (DurableFlowInterruptedException ex)
             {
                 await SettleHandedBackAsync(delivery, ex).ConfigureAwait(false);
+            }
+            // The drain budget lapsed while this handler was still running (Kafka parity): not a
+            // failure of the job, so it must not take the "handler failed" Error/park-cycle path
+            // below. DurableFlowInterruptedException IS an OperationCanceledException and is
+            // already handled above as a hand-back, not a lapse.
+            catch (OperationCanceledException ex) when (_drainCancellation.IsCancellationRequested && ex is not DurableFlowInterruptedException)
+            {
+                await SettleLapsedMidHandlerAsync(delivery, ex).ConfigureAwait(false);
             }
             catch (Exception ex)
             {

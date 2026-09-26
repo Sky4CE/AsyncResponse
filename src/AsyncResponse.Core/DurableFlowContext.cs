@@ -287,6 +287,11 @@ internal sealed class DurableFlowContext : IDurableFlowContext
             checkpoint.Faulted = false;
             checkpoint.Message = remaining > TimeSpan.Zero ? $"Sleeping until {wakeAtUtc:O}." : null;
             await SaveForSleepAsync(wakeAtUtc, cancellationToken).ConfigureAwait(false);
+
+            // Re-measured after the checkpoint write: a remainder measured before it made the
+            // in-process wait late by however long the save took (mirrors SuspendForTimerAsync,
+            // which measures its delay after the park's checkpoints for the same reason).
+            remaining = wakeAtUtc - UtcNow;
         }
 
         if (remaining > TimeSpan.Zero)
@@ -318,6 +323,26 @@ internal sealed class DurableFlowContext : IDurableFlowContext
                 throw new InvalidOperationException("Unreachable.");
             }
 
+            if (!firstPass)
+            {
+                // Replayed execution about to resume the sleep in process: the executor's
+                // unconditional per-attempt save reset the ledger TTL to StateExpiry, and every
+                // store recomputes expiry from "now" — a resumed sleep longer than StateExpiry
+                // would out-sleep its own ledger and be silently dropped mid-wait. Re-extend to
+                // cover the remainder (the suspend path re-extends every pass in SuspendForTimerAsync).
+                await SaveForSleepAsync(wakeAtUtc, cancellationToken).ConfigureAwait(false);
+
+                // Re-measured after the re-extension write, for the same reason as the first-pass
+                // save above: a remainder measured before it made the wait late by the save's cost.
+                // Floored at zero: a save slower than a near-due remainder would otherwise hand
+                // Task.Delay a negative span (ArgumentOutOfRange, or an infinite wait at exactly -1 ms).
+                remaining = wakeAtUtc - UtcNow;
+                if (remaining < TimeSpan.Zero)
+                {
+                    remaining = TimeSpan.Zero;
+                }
+            }
+
             // One delivery is never held past the in-process budget: a longer remainder is waited
             // in hops, each under a fresh delivery (see HandOverTimerAsync). Without a budget the
             // hop is the BCL timer ceiling the wait arms (~49.7 days): a longer sleep on a
@@ -334,16 +359,6 @@ internal sealed class DurableFlowContext : IDurableFlowContext
                     $"{AsyncResponseChannelOptions.MaxTimerBackedTimeout.TotalDays:0.#}-day .NET timer ceiling, and " +
                     "this wake-up was released early because the transport's delay gate and the publishing clock disagree, so " +
                     "re-suspending would loop instead of sleeping. Fix the clock skew between the application and the broker/database.");
-            }
-
-            if (!firstPass)
-            {
-                // Replayed execution about to resume the sleep in process: the executor's
-                // unconditional per-attempt save reset the ledger TTL to StateExpiry, and every
-                // store recomputes expiry from "now" — a resumed sleep longer than StateExpiry
-                // would out-sleep its own ledger and be silently dropped mid-wait. Re-extend to
-                // cover the remainder (the suspend path re-extends every pass in SuspendForTimerAsync).
-                await SaveForSleepAsync(wakeAtUtc, cancellationToken).ConfigureAwait(false);
             }
 
             await WaitInProcessAsync(name, wakeAtUtc, wait, cancellationToken).ConfigureAwait(false);

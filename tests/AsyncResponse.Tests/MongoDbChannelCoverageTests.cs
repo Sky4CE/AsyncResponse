@@ -54,6 +54,40 @@ public sealed class MongoDbChannelCoverageTests
     }
 
     [Fact]
+    public async Task Publishers_ACallerCancellation_PropagatesWithoutLoggingItAsAFailure()
+    {
+        // Regression (fixpoint r1 R1-09): SetResponseCore / SetRawResponseJsonCore / SetException
+        // caught every exception, including an OperationCanceledException from the caller's own
+        // token (host stop, ingress token), and logged it at Error as "Failed to publish" plus
+        // marked the activity errored — cancellation is not a failure.
+        var logger = new CollectingLogger();
+        var fixture = new ChannelFixture(logger: logger.For<MongoDbAsyncResponseChannel>());
+        var channel = fixture.Channel;
+        var raw = (IRawAsyncResponsePublisher)channel;
+
+        using var cts = new CancellationTokenSource();
+        cts.Cancel();
+
+        fixture.Subscribers
+            .Setup(c => c.CountDocumentsAsync(
+                It.IsAny<FilterDefinition<MongoChannelSubscriberDocument>>(),
+                It.IsAny<CountOptions>(),
+                cts.Token))
+            .ThrowsAsync(new OperationCanceledException(cts.Token));
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            () => channel.SetResponse(new OperationResult(), "cancelled-response", cts.Token));
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            () => raw.SetRawResponseJson("{}", "cancelled-raw", cts.Token));
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            () => channel.SetException(new InvalidOperationException("boom"), "cancelled-exception", cts.Token));
+
+        Assert.DoesNotContain(logger.Messages, message => message.Contains("Failed to publish", StringComparison.Ordinal));
+
+        await channel.DisposeAsync();
+    }
+
+    [Fact]
     public async Task WaiterTimeout_IsArmedOnlyAfterTheSubscriptionIsDiscoverable()
     {
         // Regression (r24): the waiter timeout was armed BEFORE AddSubscription published the
@@ -156,6 +190,50 @@ public sealed class MongoDbChannelCoverageTests
         await fixture.Channel.DisposeAsync();
         await Assert.ThrowsAsync<ObjectDisposedException>(
             () => fixture.Channel.CreateResponseWaiter<OperationResult>("disposed"));
+    }
+
+    [Fact]
+    public async Task WaiterRegistration_ADisposeThatRacesAddSubscription_DrainsAndCleansUpInsteadOfLeaking()
+    {
+        // Regression (fixpoint r1 R1-04): CreateResponseWaiterCore checked _disposed only before
+        // its store round trips (GetSubscriptionStartAsync / UpsertSubscriberAsync / SaveAsync). A
+        // DisposeAsync racing those awaits takes its _subscriptions snapshot before AddSubscription
+        // runs, drains/cleans up nothing for this waiter, and returns — leaving the waiter's TCS
+        // pending on a channel whose dispatch/heartbeat loops are already stopped forever (or until
+        // its own timeout). Pre-fix: CreateResponseWaiter returned a "live" waiter on a disposed
+        // channel instead of throwing, and it was never removed from _subscriptions.
+        var fixture = new ChannelFixture();
+        var upsertStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseUpsert = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        fixture.Subscribers
+            .Setup(c => c.UpdateOneAsync(
+                It.IsAny<FilterDefinition<MongoChannelSubscriberDocument>>(),
+                It.IsAny<UpdateDefinition<MongoChannelSubscriberDocument>>(),
+                It.IsAny<UpdateOptions>(),
+                It.IsAny<CancellationToken>()))
+            .Returns(async () =>
+            {
+                upsertStarted.TrySetResult();
+                await releaseUpsert.Task.ConfigureAwait(false);
+                return (UpdateResult)null!;
+            });
+
+        var waiterTask = fixture.Channel.CreateResponseWaiter<OperationResult>("race", timeout: TimeSpan.FromSeconds(30));
+        await upsertStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        // Runs to completion while the registration above is still parked inside its store round
+        // trip: _subscriptions is still empty, since AddSubscription has not run yet, so this
+        // finds nothing of this waiter's to drain.
+        await fixture.Channel.DisposeAsync();
+
+        // Only now does the registration's UpsertSubscriberAsync (and then SaveAsync and
+        // AddSubscription) proceed — after disposal has already returned.
+        releaseUpsert.TrySetResult();
+
+        await Assert.ThrowsAsync<ObjectDisposedException>(() => waiterTask);
+        Assert.Empty((System.Collections.IDictionary)typeof(MongoDbAsyncResponseChannel)
+            .BaseType!.GetField("_subscriptions", BindingFlags.Instance | BindingFlags.NonPublic)!
+            .GetValue(fixture.Channel)!);
     }
 
     [Fact]

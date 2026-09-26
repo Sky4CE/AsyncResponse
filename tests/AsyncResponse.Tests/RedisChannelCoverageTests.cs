@@ -1,5 +1,6 @@
 using AsyncResponse.Channels.Redis;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
 using Moq;
@@ -298,12 +299,12 @@ public sealed class RedisChannelCoverageTests
         Exception
     }
 
-    private static Task PublishAsync(RedisAsyncResponseChannel channel, PublishKind kind, string correlationId)
+    private static Task PublishAsync(RedisAsyncResponseChannel channel, PublishKind kind, string correlationId, CancellationToken cancellationToken = default)
         => kind switch
         {
-            PublishKind.Response => channel.SetResponse(new OperationResult { Status = OperationStatus.Completed }, correlationId),
-            PublishKind.RawJson => ((IRawAsyncResponsePublisher)channel).SetRawResponseJson("""{"Status":2}""", correlationId),
-            _ => channel.SetException(new InvalidOperationException("boom"), correlationId)
+            PublishKind.Response => channel.SetResponse(new OperationResult { Status = OperationStatus.Completed }, correlationId, cancellationToken),
+            PublishKind.RawJson => ((IRawAsyncResponsePublisher)channel).SetRawResponseJson("""{"Status":2}""", correlationId, cancellationToken),
+            _ => channel.SetException(new InvalidOperationException("boom"), correlationId, cancellationToken)
         };
 
     [Theory]
@@ -333,7 +334,30 @@ public sealed class RedisChannelCoverageTests
         await PublishAsync(channel, kind, "corr-wedged").WaitAsync(TimeSpan.FromSeconds(5));
     }
 
-    private RedisAsyncResponseChannel CreateChannel(TimeSpan? disposalDrainTimeout = null)
+    [Theory]
+    [InlineData(PublishKind.Response)]
+    [InlineData(PublishKind.RawJson)]
+    [InlineData(PublishKind.Exception)]
+    public async Task Publish_WhenTheCallerTokenIsAlreadyCanceled_RethrowsWithoutLoggingAFailure(PublishKind kind)
+    {
+        // Regression: the publish catches logged every exception, cancellation included, as an
+        // "Failed to publish" Error and marked the activity errored — against the "cancellation !=
+        // failure" convention. A caller's own token firing (host stop, ingress token) while the
+        // publish awaited Redis is not a publish failure.
+        _subscriber
+            .Setup(instance => instance.PublishAsync(It.IsAny<RedisChannel>(), It.IsAny<RedisValue>(), It.IsAny<CommandFlags>()))
+            .ThrowsAsync(new OperationCanceledException());
+        var logger = new RecordingThrowingLogger<RedisAsyncResponseChannel>();
+        var channel = CreateChannel(logger: logger);
+        using var cts = new CancellationTokenSource();
+        cts.Cancel();
+
+        await Assert.ThrowsAsync<OperationCanceledException>(() => PublishAsync(channel, kind, "corr-canceled", cts.Token));
+
+        Assert.False(logger.HasEntry(LogLevel.Error, "Failed to publish"));
+    }
+
+    private RedisAsyncResponseChannel CreateChannel(TimeSpan? disposalDrainTimeout = null, ILogger<RedisAsyncResponseChannel>? logger = null)
     {
         var options = new RedisAsyncResponseOptions
         {
@@ -349,7 +373,7 @@ public sealed class RedisChannelCoverageTests
             _store.Object,
             Options.Create(options),
             new AsyncResponseContextPropagation([]),
-            NullLogger<RedisAsyncResponseChannel>.Instance,
+            logger ?? NullLogger<RedisAsyncResponseChannel>.Instance,
             new NoopChannelSubscriber());
     }
 

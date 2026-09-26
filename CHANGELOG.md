@@ -13,6 +13,28 @@ work that has landed on `main` but not yet shipped. Security reporters credited 
 
 ### Changed
 
+- **Round-46 review (2026-09-26, fixpoint-light round 1 of `4ee3ad8`): a throwing logger or metrics
+  listener can no longer leave a Redis waiter unsettled, caller cancellation is no longer logged as a
+  publish failure, a DB-channel waiter created during disposal no longer leaves its subscription behind, a RabbitMQ handler cut
+  short by the drain lapse is no longer a handler failure, and in-process durable-flow timers no longer
+  oversleep by the checkpoint save.**
+  - *Redis channel.* The waiter-timeout, lapsed-drain, recovery-delete and overload paths logged,
+    tagged and recorded metrics before settling, faulting or cleaning up, so an exception from a
+    logger or metrics listener skipped the settlement. Those calls now go through `SafeLog`, and
+    settlement always runs. The three publish paths rethrow the caller's cancellation instead of
+    logging it at Error as "Failed to publish".
+  - *DB channels (PostgreSQL, SQL Server, MongoDB).* A `DisposeAsync` that ran
+    during a waiter's registration round trips left a live subscription behind; the registration now
+    re-checks disposal after subscribing, drains and cleans up, and throws `ObjectDisposedException`.
+    `SetResponse`, `SetRawResponseJson` and `SetException` let the caller's cancellation propagate
+    instead of logging it as a failure.
+  - *RabbitMQ transport.* A background handler cancelled by the drain lapse after its commit is
+    settled with a Warning and the drain-lapse reason (as Kafka does), not recorded as a handler
+    failure.
+  - *Durable flows.* The in-process timer now measures the remaining wait after its checkpoint save
+    rather than before it, so a slow save no longer lengthens the sleep (and a save that outlasts a
+    near-due remainder completes the timer instead of handing `Task.Delay` a negative span).
+
 - **Round-45 review (2026-09-26, external review of `7142832`): a stale MongoDB read can no longer
   consume a recovered response, Redis recovery writes that Redis rejects no longer report success,
   unreadable recovery registrations degrade the health check, and the NATS recovery scan reads in

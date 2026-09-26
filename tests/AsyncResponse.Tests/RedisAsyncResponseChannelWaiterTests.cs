@@ -572,11 +572,14 @@ public class RedisAsyncResponseChannelWaiterTests
     }
 
     [Fact]
-    public async Task WaiterTimeout_WhenTimeoutHandlingThrows_LogsInsteadOfLeavingAnUnobservedFault()
+    public async Task WaiterTimeout_WhenTheTimeoutLogThrows_StillSettlesTheWaiter()
     {
-        // The timeout body runs on a fire-and-forget Task.Run; an exception escaping it (here a
-        // logger provider that throws on the timeout warning) must be caught and logged through
-        // the error path, not die as an unobserved task fault.
+        // Regression: the timeout body logged/tagged/recorded BEFORE calling DrainThenCleanupAsync,
+        // so a throwing logger (or metrics listener) skipped the settle-and-cleanup entirely —
+        // ResponseTask stayed pending forever with the SUBSCRIBE/executor/recovery registration
+        // leaked, only surfaced as an unrelated "Error handling waiter timeout" log. Now that the
+        // timeout body's own logging goes through SafeLog, a throwing logger provider on that log
+        // line no longer prevents the settle-and-cleanup below it.
         var logger = new RecordingThrowingLogger<RedisAsyncResponseChannel> { ThrowOnMessageContaining = "Timed out waiting" };
         var channel = CreateChannel(new RedisAsyncResponseOptions
         {
@@ -585,10 +588,11 @@ public class RedisAsyncResponseChannelWaiterTests
         }, logger);
 
         await using var waiter = await channel.CreateResponseWaiter<OperationResult>(
-            "corr-timeout-throws",
+            "corr-timeout-throws-settle",
             timeout: TimeSpan.FromMilliseconds(5));
 
-        await Eventually(() => logger.HasEntry(LogLevel.Error, "Error handling waiter timeout"));
+        var ex = await Assert.ThrowsAsync<TimeoutException>(() => waiter.ResponseTask.WaitAsync(TimeSpan.FromSeconds(5)));
+        Assert.Contains("corr-timeout-throws-settle", ex.Message);
     }
 
     [Fact]
@@ -614,6 +618,103 @@ public class RedisAsyncResponseChannelWaiterTests
 
         var result = await waiter.ResponseTask.WaitAsync(TimeSpan.FromSeconds(2));
         Assert.Equal(message, result.Message);
+    }
+
+    [Fact]
+    public async Task DrainThenCleanup_WhenTheLapsedDrainLogThrows_StillFaultsTheWaiterAsIndeterminate()
+    {
+        // Regression: the lapsed-drain catch logged and tagged BEFORE the TrySetException below it,
+        // so a throwing logger skipped the indeterminate fault entirely — the waiter's
+        // DisposeAsync/timeout then threw with ResponseTask unsettled and the subscription/
+        // registration leaked, instead of the explicit indeterminate contract other callers rely on.
+        var logger = new RecordingThrowingLogger<RedisAsyncResponseChannel> { ThrowOnMessageContaining = "did not prove settlement" };
+        var channel = CreateChannel(new RedisAsyncResponseOptions
+        {
+            DefaultTimeout = TimeSpan.FromSeconds(5),
+            RecoveryStateExpiry = TimeSpan.FromMinutes(5),
+            DisposalDrainTimeout = TimeSpan.FromMilliseconds(100)
+        }, logger);
+
+        var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var wedged = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var waiter = await channel.CreateResponseWaiter<OperationResult>(
+            "corr-drain-lapse-throwing-logger",
+            completionPredicate: async _ =>
+            {
+                started.TrySetResult();
+                await wedged.Task;
+                return true;
+            },
+            timeout: TimeSpan.FromSeconds(30));
+
+        await PublishSuccess(new OperationResult { Status = OperationStatus.Completed, Message = "wedged" });
+        // Wait for the predicate to actually be admitted onto the executor (not a fixed real
+        // delay) before disposal starts the drain.
+        await started.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        await waiter.DisposeAsync();
+
+        var ex = await Assert.ThrowsAsync<AsyncResponseIndeterminateDeliveryException>(
+            () => waiter.ResponseTask.WaitAsync(TimeSpan.FromSeconds(5)));
+        Assert.Contains("corr-drain-lapse-throwing-logger", ex.Message);
+
+        wedged.TrySetResult();
+    }
+
+    [Fact]
+    public async Task DrainThenCleanup_WhenADeliveryAlreadySettledTheWait_TheLapsedDrainLogsNoIndeterminateWarning()
+    {
+        // Regression (fixpoint-light r1 C4): the lapsed-drain catch tagged the activity and logged
+        // the indeterminate warning BEFORE calling _tcs.TrySetException(...), and unconditionally —
+        // even when a delivery had already won the race and TrySetException lost. Fixed to mirror
+        // the overload path (OnOverloadedAsync): fault first, log/tag only when TrySetException
+        // actually won. Here the wait is settled directly (standing in for a delivery that won
+        // through some other path) while the wedged predicate keeps the executor busy, so the
+        // disposal drain still lapses despite the wait already carrying a real result.
+        var logger = new RecordingThrowingLogger<RedisAsyncResponseChannel>();
+        var channel = CreateChannel(new RedisAsyncResponseOptions
+        {
+            DefaultTimeout = TimeSpan.FromSeconds(5),
+            RecoveryStateExpiry = TimeSpan.FromMinutes(5),
+            DisposalDrainTimeout = TimeSpan.FromMilliseconds(100)
+        }, logger);
+
+        var wedged = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var waiter = await channel.CreateResponseWaiter<OperationResult>(
+            "corr-drain-lapse-already-won",
+            completionPredicate: async _ =>
+            {
+                await wedged.Task;
+                return true;
+            },
+            timeout: TimeSpan.FromSeconds(30));
+
+        await PublishSuccess(new OperationResult { Status = OperationStatus.Completed, Message = "wedged" });
+
+        // Reach into the subscription behind the waiter and settle its response task directly —
+        // the wedged predicate above still occupies the executor, so the marker-based drain below
+        // still lapses even though the wait is already won.
+        var cleanupField = waiter.GetType()
+            .GetFields(BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public)
+            .First(f => typeof(Delegate).IsAssignableFrom(f.FieldType));
+        var cleanupAsync = (Delegate)cleanupField.GetValue(waiter)!;
+        var subscription = cleanupAsync.Target!;
+        var subscriptionField = subscription.GetType()
+            .GetFields(BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public)
+            .First(f => f.FieldType.Name.StartsWith("RedisSubscription", StringComparison.Ordinal));
+        var subscriptionInstance = subscriptionField.GetValue(subscription)!;
+        var tcs = (TaskCompletionSource<OperationResult>)subscriptionInstance.GetType()
+            .GetField("_tcs", BindingFlags.Instance | BindingFlags.NonPublic)!
+            .GetValue(subscriptionInstance)!;
+        Assert.True(tcs.TrySetResult(new OperationResult { Status = OperationStatus.Completed, Message = "already-won" }));
+
+        await waiter.DisposeAsync();
+
+        var result = await waiter.ResponseTask.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal("already-won", result.Message);
+        Assert.False(logger.HasEntry(LogLevel.Warning, "did not prove settlement"));
+
+        wedged.TrySetResult();
     }
 
     [Fact]
@@ -1005,6 +1106,33 @@ public class RedisAsyncResponseChannelWaiterTests
         Assert.False(HasExecutorRegistration(registry, _channelSubscriber.SubscribedChannel.ToString()!));
     }
 
+    [Fact]
+    public async Task RedisWaiter_CleanupStillReleasesPubSub_WhenRecoveryDeleteThrowsAndLoggerAlsoThrows()
+    {
+        // Regression: the recovery-delete catch logged the store failure unguarded. A throwing
+        // logger provider escaped that inner catch and skipped the pub/sub release right below it
+        // (the comment there says a store failure must never skip that release) — the SUBSCRIBE
+        // then outlived the waiter.
+        _store
+            .Setup(s => s.TryDeleteAsync(It.IsAny<string>(), It.IsAny<Guid>(), It.IsAny<CancellationToken>()))
+            .ThrowsAsync(new InvalidOperationException("recovery store down"));
+        var logger = new RecordingThrowingLogger<RedisAsyncResponseChannel> { ThrowOnMessageContaining = "Failed to delete recovery state" };
+        var channel = CreateChannel(new RedisAsyncResponseOptions
+        {
+            DefaultTimeout = TimeSpan.FromSeconds(5),
+            RecoveryStateExpiry = TimeSpan.FromMinutes(5)
+        }, logger);
+
+        var waiter = await channel.CreateResponseWaiter<OperationResult>(
+            "corr-store-down-throwing-logger",
+            timeout: TimeSpan.FromSeconds(5));
+        await waiter.DisposeAsync();
+
+        Assert.Equal(1, _channelSubscriber.UnsubscribeCount);
+        var registry = GetExecutorRegistry(channel);
+        Assert.False(HasExecutorRegistration(registry, _channelSubscriber.SubscribedChannel.ToString()!));
+    }
+
     /// <summary>
     /// Regression (round 33): the channel implemented no <see cref="IAsyncDisposable"/> at all, so
     /// container disposal at host shutdown had nothing to join — an executor retirement scheduled
@@ -1179,6 +1307,62 @@ public class RedisAsyncResponseChannelWaiterTests
         Assert.Equal("second", result.Message);
         await publish.WaitAsync(TimeSpan.FromSeconds(10));
     }
+
+    [Fact]
+    public async Task OnOverloaded_WhenTheOverloadLogThrows_StillTearsDownTheSubscription()
+    {
+        // Regression: the overload path faulted the task, then logged/tagged/recorded the overload
+        // BEFORE calling CleanupOnceAsync — a throwing logger or metrics listener skipped that
+        // teardown, so the subscription, executor registration and recovery row stayed until the
+        // caller disposed, and that dispose would then park on the still-full executor for a whole
+        // DisposalDrainTimeout.
+        var logger = new RecordingThrowingLogger<RedisAsyncResponseChannel> { ThrowOnMessageContaining = "is overloaded" };
+        var channel = CreateChannel(new RedisAsyncResponseOptions
+        {
+            DefaultTimeout = TimeSpan.FromSeconds(30),
+            RecoveryStateExpiry = TimeSpan.FromMinutes(5)
+        }, logger);
+
+        var wedged = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        await using var waiter = await channel.CreateResponseWaiter<OperationResult>(
+            "corr-overload-throwing-logger",
+            completionPredicate: async _ =>
+            {
+                started.TrySetResult();
+                await wedged.Task;
+                return true;
+            },
+            timeout: TimeSpan.FromSeconds(30));
+
+        // Admitted onto the executor and starts running the wedged predicate.
+        await PublishSuccess(new OperationResult { Status = OperationStatus.Completed, Message = "running" });
+        await started.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        // Fill the remainder of the bounded queue directly so the next delivery finds it full,
+        // without needing to run 1024 real predicates.
+        var registry = (SerialExecutorRegistry)GetExecutorRegistry(channel);
+        var channelName = _channelSubscriber.SubscribedChannel.ToString()!;
+        for (var i = 0; i < ChannelSerialExecutorCapacity; i++)
+        {
+            var outcome = registry.TryEnqueue(channelName, () => Task.CompletedTask);
+            Assert.Equal(SerialExecutorRegistry.TryEnqueueOutcome.Accepted, outcome);
+        }
+
+        // The next delivery finds the queue full: faults the wait as indeterminate (overloaded)
+        // and, despite the throwing logger, must still unsubscribe below.
+        await PublishSuccess(new OperationResult { Status = OperationStatus.Completed, Message = "overflow" });
+
+        var ex = await Assert.ThrowsAsync<AsyncResponseIndeterminateDeliveryException>(
+            () => waiter.ResponseTask.WaitAsync(TimeSpan.FromSeconds(5)));
+        Assert.Contains("corr-overload-throwing-logger", ex.Message);
+
+        await Eventually(() => _channelSubscriber.UnsubscribeCount == 1);
+
+        wedged.TrySetResult();
+    }
+
+    private const int ChannelSerialExecutorCapacity = 1024;
 
     private static string Envelope(OperationResult payload)
         => JsonSerializer.Serialize(

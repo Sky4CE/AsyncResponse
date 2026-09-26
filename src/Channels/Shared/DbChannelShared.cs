@@ -329,6 +329,22 @@ internal abstract class DbAsyncResponseChannelBase :
         // then signal a scan targeted at this correlation id so any already-stored response is
         // delivered promptly without a full sweep.
         AddSubscription(correlationId, subscription);
+
+        // Re-check AFTER publishing into the map: DisposeAsync snapshots _subscriptions once
+        // (outside any lock) and drains exactly what it finds there. A DisposeAsync that raced
+        // this call and already took its snapshot before AddSubscription ran above would never
+        // see — and never drain or clean up — this subscription, leaving its TCS pending on a
+        // channel whose dispatch/heartbeat loops are already stopped. If disposal has happened
+        // (or is happening) by now, this waiter drains and cleans itself up instead of relying on
+        // a teardown snapshot that may already be behind it; DrainThenCleanupAsync is idempotent,
+        // so this is safe even if DisposeAsync's own loop reaches the same subscription too.
+        if (_disposed)
+        {
+            AsyncResponseDiagnostics.SetError(activity, "subscribe_failure", "Channel disposed.");
+            await subscription.DrainThenCleanupAsync(deleteRecoveryState: true).ConfigureAwait(false);
+            throw new ObjectDisposedException(_channelTypeName);
+        }
+
         SignalDispatcher(correlationId);
 
         // Arm the waiter timeout only AFTER the subscription is discoverable (Redis/NATS parity):
@@ -376,7 +392,10 @@ internal abstract class DbAsyncResponseChannelBase :
                 rawResponseJson: null,
                 cancellationToken).ConfigureAwait(false);
         }
-        catch (Exception ex)
+        // Cancellation is not a failure: a caller-token cancellation (host stop, ingress token)
+        // during the store round trips above must propagate untouched, not get logged at Error
+        // and marked as an errored span alongside genuine publish failures.
+        catch (Exception ex) when (ex is not OperationCanceledException || !cancellationToken.IsCancellationRequested)
         {
             // SafeLog: a throwing logging provider must not replace the exception the caller
             // (the ingress's retry classification among them) is about to receive.
@@ -407,7 +426,8 @@ internal abstract class DbAsyncResponseChannelBase :
                 rawResponseJson: responseJson,
                 cancellationToken).ConfigureAwait(false);
         }
-        catch (Exception ex)
+        // Cancellation is not a failure: see SetResponseCore's identical guard above.
+        catch (Exception ex) when (ex is not OperationCanceledException || !cancellationToken.IsCancellationRequested)
         {
             SafeLog.Try(
                 (Logger: _logger, Error: ex, Provider: _providerName, CorrelationId: correlationId),
@@ -555,7 +575,8 @@ internal abstract class DbAsyncResponseChannelBase :
                 AsyncResponseDiagnostics.RecordLostSubscriber("exception", action: RecoveryAction.Fail, dispatchResult.CallbackInvoked);
             }
         }
-        catch (Exception ex)
+        // Cancellation is not a failure: see SetResponseCore's identical guard above.
+        catch (Exception ex) when (ex is not OperationCanceledException || !cancellationToken.IsCancellationRequested)
         {
             SafeLog.Try(
                 (Logger: _logger, Error: ex, Provider: _providerName, CorrelationId: correlationId),

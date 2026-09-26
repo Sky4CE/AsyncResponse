@@ -2259,6 +2259,60 @@ public class RabbitMqDispatcherTests
         }
     }
 
+    [Fact]
+    public async Task Queued_AHandlerCutShortByTheDrainLapse_IsAWarning_NotAHandlerFailure()
+    {
+        // Regression (fixpoint r1 R1-01): a handler that honours the drain token and is cut short
+        // once the drain budget lapses is a lapse, not a handler failure (Kafka parity: OCE tied to
+        // _drainCancellation is caught before the generic "handler failed" arm). Pre-fix this fell
+        // through to `catch (Exception ex)` -> SettleFailedAsync, which logged Error("handler
+        // failed") and — for a delivery that already carries this queue's dead-letter marker —
+        // routed it through the park cycle instead of the DLX copy a lapse gets everywhere else.
+        var channel = new FakeDispatcherChannel();
+        var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var logger = new ListLogger();
+        var notified = new TaskCompletionSource<RabbitMqBackgroundFailureContext>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var subscriber = EnqueueSubscriber(workers: 1, capacity: 8, drain: TimeSpan.FromMilliseconds(400)); // ~300ms budget, ~100ms reserve
+        subscriber.OnBackgroundFailure = context =>
+        {
+            notified.TrySetResult(context);
+            return ValueTask.CompletedTask;
+        };
+        var dispatcher = RabbitMqMessageDispatcher.Create(
+            async (delivery, ct) =>
+            {
+                started.TrySetResult();
+                await Task.Delay(Timeout.Infinite, ct).ConfigureAwait(false); // honours the drain token
+            },
+            new RabbitMqAsyncResponseOptions { DeadLetterExchange = "dlx" },
+            subscriber,
+            logger,
+            "worker.q",
+            RabbitMqSubscriberRole.Worker);
+
+        try
+        {
+            await dispatcher.HandleAsync(Delivery("m1", deliveryTag: 1), channel, CancellationToken.None);
+            await started.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+            await dispatcher.DisposeAsync();
+
+            var context = await notified.Task.WaitAsync(TimeSpan.FromSeconds(10));
+            await WaitForPublishesAsync(channel, 1);
+
+            Assert.DoesNotContain(logger.Entries, entry => entry.Level >= LogLevel.Error);
+            var warning = Assert.Single(logger.Entries, entry => entry.Level == LogLevel.Warning && entry.Exception is OperationCanceledException);
+            Assert.Contains("Dead-lettered a copy (drain_budget_lapsed_after_commit)", warning.Message, StringComparison.Ordinal);
+            Assert.IsAssignableFrom<OperationCanceledException>(context.Exception);
+            var buried = Assert.Single(channel.Publishes);
+            Assert.Equal("dlx", buried.Exchange);
+        }
+        finally
+        {
+            await dispatcher.DisposeAsync();
+        }
+    }
+
     [Theory]
     [InlineData(true)]
     [InlineData(false)]
