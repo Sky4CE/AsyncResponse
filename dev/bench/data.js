@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1790431240305,
+  "lastUpdate": 1790431265427,
   "repoUrl": "https://github.com/Sky4CE/AsyncResponse",
   "entries": {
     "AsyncResponse Microbenchmarks": [
@@ -114804,6 +114804,140 @@ window.BENCHMARK_DATA = {
           {
             "name": "durable-flow-storm throughput",
             "value": 1268.9212656687666,
+            "unit": "flows/s"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "tyunisov@gmail.com",
+            "name": "Sky4CE",
+            "username": "Sky4CE"
+          },
+          "committer": {
+            "email": "tyunisov@gmail.com",
+            "name": "Sky4CE",
+            "username": "Sky4CE"
+          },
+          "distinct": true,
+          "id": "714283202c3d9791063e8bda01ed2183c90e673b",
+          "message": "fix: apply round-44 review — worker intake stops at host stop, MongoDB wtimeout read-backs, log safety\n\nA whole-repository review (fixpoint round 2, repo round 44) found 177 candidates: 150 were real and\nare fixed here, 11 need a maintainer decision and 16 were refuted (both kinds recorded as standing\ndecisions). Round 43's own code was reviewed first, and several of its fixes needed finishing.\n\nEvery broker and database worker subscriber now takes no new delivery from ApplicationStopping on\n(response subscribers are never gated; Google Pub/Sub in ack-after-handler mode is the documented\nexception). A delivery received but not yet started is handed back without running, and a stopping\nhost's wake-ups are left to a live replica. The cost is documented: on a single replica, or when the\nwhole fleet stops at once, queued worker jobs wait for the next start.\n\nMongoDB: a write whose bounded-majority wtimeout lapsed was applied on the primary, so the channel\nnow reads it back by id at local read concern instead of failing. Before, the ingress re-published\nunder new ids, and claims stayed acknowledged but undelivered. Kafka: a rebalance during early-ACK\nbackpressure no longer leaves the returned partitions paused for good. Early-ACK stops on Redis,\nNATS, RabbitMQ and Kafka dead-letter every queued entry before any OnBackgroundFailure callback\nruns. Relational startup DDL runs through one shared guard with table-scoped locks and a retry-after\nlatch that only real, persistent failures set. Durable flows: a host-stop hand-back skips the\nexecutor's failure path, failed lease renewals back off, and a cancelled StartAsync carries its flow\nid. Across Core, the channels, the transports and the stores, a throwing logging provider can no\nlonger change an outcome: the decision comes first, and the log line runs after it, through a guard.\n\nEvery behavioural fix ships a regression test that fails on the old code. The pre-commit review ran\ntwo critic passes over the fix diff. Pass 1 raised 67: 62 were fixed and 5 are documented residuals.\nPass 2 raised 1, which is fixed with its own red-on-old test. Items under .github/ and the CI retry\nclassifier are left for the maintainer. Operator-visible changes lead the CHANGELOG's Round-44\nsection: the intake gate and its cost, the PostgreSQL LISTEN self-probe (it needs a session-pooled\nor direct data source), MongoDB's linearizable LoadCurrentAsync, and new SQS, Pub/Sub, Kafka and\nRabbitMQ startup or publish checks.",
+          "timestamp": "2026-09-26T15:46:23+02:00",
+          "tree_id": "643630a905c89e80f1e97177ac8590e7077c2520",
+          "url": "https://github.com/Sky4CE/AsyncResponse/commit/714283202c3d9791063e8bda01ed2183c90e673b"
+        },
+        "date": 1790431264409,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "waiter-storm throughput",
+            "value": 101028.67395824283,
+            "unit": "ops/s"
+          },
+          {
+            "name": "progress-storm throughput",
+            "value": 70099.87830661127,
+            "unit": "ops/s"
+          },
+          {
+            "name": "worker-storm throughput",
+            "value": 53048.04519014435,
+            "unit": "jobs/s"
+          },
+          {
+            "name": "google-pubsub-ack-after-enqueue-dispatch-storm throughput",
+            "value": 204126.62382729255,
+            "unit": "ops/s"
+          },
+          {
+            "name": "rabbitmq-ack-after-enqueue-dispatch-storm throughput",
+            "value": 344860.8831197495,
+            "unit": "ops/s"
+          },
+          {
+            "name": "redis-ack-after-enqueue-dispatch-storm throughput",
+            "value": 237135.40431586438,
+            "unit": "ops/s"
+          },
+          {
+            "name": "nats-ack-after-receive-dispatch-storm throughput",
+            "value": 259794.24295957602,
+            "unit": "ops/s"
+          },
+          {
+            "name": "postgresql-ack-after-receive-dispatch-storm throughput",
+            "value": 203510.14294552442,
+            "unit": "ops/s"
+          },
+          {
+            "name": "sqlserver-ack-after-enqueue-dispatch-storm throughput",
+            "value": 224239.3800229621,
+            "unit": "ops/s"
+          },
+          {
+            "name": "mongodb-ack-after-enqueue-dispatch-storm throughput",
+            "value": 244702.19742573288,
+            "unit": "ops/s"
+          },
+          {
+            "name": "azure-servicebus-ack-after-receive-dispatch-storm throughput",
+            "value": 236572.1639728983,
+            "unit": "ops/s"
+          },
+          {
+            "name": "sqs-ack-after-enqueue-dispatch-storm throughput",
+            "value": 272366.7581818974,
+            "unit": "ops/s"
+          },
+          {
+            "name": "kafka-ack-after-enqueue-dispatch-storm throughput",
+            "value": 286605.2185078186,
+            "unit": "ops/s"
+          },
+          {
+            "name": "race-burst throughput",
+            "value": 144797.09293772452,
+            "unit": "ops/s"
+          },
+          {
+            "name": "raw-ingress-storm throughput",
+            "value": 148828.9247229252,
+            "unit": "ops/s"
+          },
+          {
+            "name": "shared-response-fanout throughput",
+            "value": 54709.43164341005,
+            "unit": "ops/s"
+          },
+          {
+            "name": "exception-fanout throughput",
+            "value": 26808.409519258734,
+            "unit": "ops/s"
+          },
+          {
+            "name": "timeout-storm throughput",
+            "value": 4826.841874590926,
+            "unit": "ops/s"
+          },
+          {
+            "name": "dispose-cleanup-storm throughput",
+            "value": 320139.32463408075,
+            "unit": "ops/s"
+          },
+          {
+            "name": "context-isolation-storm throughput",
+            "value": 125520.2815670956,
+            "unit": "ops/s"
+          },
+          {
+            "name": "watchdog-scan-storm throughput",
+            "value": 2198768.689533861,
+            "unit": "entries/s"
+          },
+          {
+            "name": "durable-flow-storm throughput",
+            "value": 2050.464725527252,
             "unit": "flows/s"
           }
         ]
