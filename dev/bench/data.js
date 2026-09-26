@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1790070034762,
+  "lastUpdate": 1790381027020,
   "repoUrl": "https://github.com/Sky4CE/AsyncResponse",
   "entries": {
     "AsyncResponse Microbenchmarks": [
@@ -195732,6 +195732,330 @@ window.BENCHMARK_DATA = {
           "url": "https://github.com/Sky4CE/AsyncResponse/commit/eb3a317acf6e83d50ad1b004527db682f3c20737"
         },
         "date": 1790070017904,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "request_response_success_redis throughput",
+            "value": 3,
+            "unit": "req/s"
+          },
+          {
+            "name": "request_response_domain_failure_redis throughput",
+            "value": 3,
+            "unit": "req/s"
+          },
+          {
+            "name": "attach_redis throughput",
+            "value": 3,
+            "unit": "req/s"
+          },
+          {
+            "name": "worker_pubsub_observed throughput",
+            "value": 3,
+            "unit": "req/s"
+          },
+          {
+            "name": "multi_step_success_redis throughput",
+            "value": 3,
+            "unit": "req/s"
+          },
+          {
+            "name": "multi_step_domain_failure_redis throughput",
+            "value": 3,
+            "unit": "req/s"
+          },
+          {
+            "name": "ambient_exception_redis throughput",
+            "value": 3,
+            "unit": "req/s"
+          },
+          {
+            "name": "shared_exception_fanout_redis throughput",
+            "value": 3,
+            "unit": "req/s"
+          },
+          {
+            "name": "reply_target_pubsub throughput",
+            "value": 3,
+            "unit": "req/s"
+          },
+          {
+            "name": "rabbitmq_worker_default_ack_observed throughput",
+            "value": 3,
+            "unit": "req/s"
+          },
+          {
+            "name": "rabbitmq_response_ingress_header throughput",
+            "value": 3,
+            "unit": "req/s"
+          },
+          {
+            "name": "rabbitmq_response_ingress_body throughput",
+            "value": 3,
+            "unit": "req/s"
+          },
+          {
+            "name": "rabbitmq_reply_target throughput",
+            "value": 3,
+            "unit": "req/s"
+          },
+          {
+            "name": "rabbitmq_worker_ack_after_enqueue_observed throughput",
+            "value": 3,
+            "unit": "req/s"
+          },
+          {
+            "name": "azure_servicebus_request_response_success throughput",
+            "value": 3,
+            "unit": "req/s"
+          },
+          {
+            "name": "azure_servicebus_worker_default_ack_observed throughput",
+            "value": 3,
+            "unit": "req/s"
+          },
+          {
+            "name": "azure_servicebus_response_ingress_property throughput",
+            "value": 3,
+            "unit": "req/s"
+          },
+          {
+            "name": "azure_servicebus_response_ingress_body throughput",
+            "value": 3,
+            "unit": "req/s"
+          },
+          {
+            "name": "azure_servicebus_reply_target throughput",
+            "value": 3,
+            "unit": "req/s"
+          },
+          {
+            "name": "azure_servicebus_worker_ack_after_receive_observed throughput",
+            "value": 3,
+            "unit": "req/s"
+          },
+          {
+            "name": "sqs_request_response_success throughput",
+            "value": 3,
+            "unit": "req/s"
+          },
+          {
+            "name": "sqs_worker_default_ack_observed throughput",
+            "value": 3,
+            "unit": "req/s"
+          },
+          {
+            "name": "sqs_response_ingress_attribute throughput",
+            "value": 3,
+            "unit": "req/s"
+          },
+          {
+            "name": "sqs_response_ingress_body throughput",
+            "value": 3,
+            "unit": "req/s"
+          },
+          {
+            "name": "sqs_reply_target throughput",
+            "value": 3,
+            "unit": "req/s"
+          },
+          {
+            "name": "sqs_worker_ack_after_enqueue_observed throughput",
+            "value": 3,
+            "unit": "req/s"
+          },
+          {
+            "name": "redis_worker_default_ack_observed throughput",
+            "value": 3,
+            "unit": "req/s"
+          },
+          {
+            "name": "redis_response_ingress_field throughput",
+            "value": 3,
+            "unit": "req/s"
+          },
+          {
+            "name": "redis_response_ingress_body throughput",
+            "value": 3,
+            "unit": "req/s"
+          },
+          {
+            "name": "redis_reply_target throughput",
+            "value": 3,
+            "unit": "req/s"
+          },
+          {
+            "name": "redis_worker_ack_after_enqueue_observed throughput",
+            "value": 3,
+            "unit": "req/s"
+          },
+          {
+            "name": "nats_request_response_success throughput",
+            "value": 3,
+            "unit": "req/s"
+          },
+          {
+            "name": "nats_worker_default_ack_observed throughput",
+            "value": 3,
+            "unit": "req/s"
+          },
+          {
+            "name": "nats_response_ingress_header throughput",
+            "value": 3,
+            "unit": "req/s"
+          },
+          {
+            "name": "nats_response_ingress_body throughput",
+            "value": 3,
+            "unit": "req/s"
+          },
+          {
+            "name": "nats_reply_target throughput",
+            "value": 3,
+            "unit": "req/s"
+          },
+          {
+            "name": "nats_worker_ack_after_receive_observed throughput",
+            "value": 3,
+            "unit": "req/s"
+          },
+          {
+            "name": "postgresql_request_response_success throughput",
+            "value": 3,
+            "unit": "req/s"
+          },
+          {
+            "name": "postgresql_worker_default_ack_observed throughput",
+            "value": 3,
+            "unit": "req/s"
+          },
+          {
+            "name": "postgresql_response_ingress_header throughput",
+            "value": 3,
+            "unit": "req/s"
+          },
+          {
+            "name": "postgresql_response_ingress_body throughput",
+            "value": 3,
+            "unit": "req/s"
+          },
+          {
+            "name": "postgresql_reply_target throughput",
+            "value": 3,
+            "unit": "req/s"
+          },
+          {
+            "name": "postgresql_worker_ack_after_receive_observed throughput",
+            "value": 3,
+            "unit": "req/s"
+          },
+          {
+            "name": "kafka_worker_default_ack_observed throughput",
+            "value": 3,
+            "unit": "req/s"
+          },
+          {
+            "name": "kafka_response_ingress_header throughput",
+            "value": 3,
+            "unit": "req/s"
+          },
+          {
+            "name": "kafka_response_ingress_body throughput",
+            "value": 3,
+            "unit": "req/s"
+          },
+          {
+            "name": "kafka_reply_target throughput",
+            "value": 3,
+            "unit": "req/s"
+          },
+          {
+            "name": "kafka_worker_ack_after_enqueue_observed throughput",
+            "value": 3,
+            "unit": "req/s"
+          },
+          {
+            "name": "sqlserver_request_response_success throughput",
+            "value": 3,
+            "unit": "req/s"
+          },
+          {
+            "name": "sqlserver_worker_default_ack_observed throughput",
+            "value": 3,
+            "unit": "req/s"
+          },
+          {
+            "name": "sqlserver_response_ingress_header throughput",
+            "value": 3,
+            "unit": "req/s"
+          },
+          {
+            "name": "sqlserver_response_ingress_body throughput",
+            "value": 3,
+            "unit": "req/s"
+          },
+          {
+            "name": "sqlserver_reply_target throughput",
+            "value": 3,
+            "unit": "req/s"
+          },
+          {
+            "name": "sqlserver_worker_ack_after_enqueue_observed throughput",
+            "value": 3,
+            "unit": "req/s"
+          },
+          {
+            "name": "mongodb_request_response_success throughput",
+            "value": 3,
+            "unit": "req/s"
+          },
+          {
+            "name": "mongodb_worker_default_ack_observed throughput",
+            "value": 3,
+            "unit": "req/s"
+          },
+          {
+            "name": "mongodb_response_ingress_header throughput",
+            "value": 3,
+            "unit": "req/s"
+          },
+          {
+            "name": "mongodb_response_ingress_body throughput",
+            "value": 3,
+            "unit": "req/s"
+          },
+          {
+            "name": "mongodb_reply_target throughput",
+            "value": 3,
+            "unit": "req/s"
+          },
+          {
+            "name": "mongodb_worker_ack_after_enqueue_observed throughput",
+            "value": 3,
+            "unit": "req/s"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "tyunisov@gmail.com",
+            "name": "Sky4CE",
+            "username": "Sky4CE"
+          },
+          "committer": {
+            "email": "tyunisov@gmail.com",
+            "name": "Sky4CE",
+            "username": "Sky4CE"
+          },
+          "distinct": true,
+          "id": "cc8f87453928065cff2f5645f1f6efe7e2647740",
+          "message": "fix: apply round-43 review — round 42's transport fixes finished, host stop reaches in-process timers\n\nA whole-repository review (fixpoint round 1, repo round 43) found 313 candidates: 273 were real and\nare fixed here, 24 need a maintainer decision and 16 were refuted (both kinds recorded as standing\ndecisions). Round 42's \"every transport\" fixes had been cut short: the early-ACK dispatcher hoist,\nthe stop-between-messages rule, ack-after-handler reading one message at a time and RabbitMQ's\npublisher confirms were missing on Redis, RabbitMQ, Service Bus and Kafka. They now hold everywhere.\n\nDurable flows: a park releases its lease before its wake-up is published, so the holder unwinding\nits finally blocks is no longer mistaken for a live duplicate. Host stop now reaches in-process\ntimers — round 42 claimed it, but the token never arrived: such a timer is handed over (checkpoint,\nimmediate wake-up, acknowledge), and only when that is impossible is the delivery handed back with\nDurableFlowInterruptedException. Every transport recognises that hand-back by type: it is left\nunsettled and never counted as a failure, Kafka never skips past its offset, and under early ACK it\nis reported and dead-lettered as handed_back_after_commit. Timer hops fit the broker's in-flight\nceiling (RabbitMQ's share of consumer_timeout is floored at a minute). Replay survives type drift:\ngeneric type identity ignores only a well-formed assembly Version, so a different PublicKeyToken\nstays a different type for the callback allowlist.\n\nDatabase channels no longer lose a response whose INSERT committed behind the dispatch cursor (a\nshort lookback window). Sweeps are throttled by the push wake, broken off after a first wave of\ntransient failures, and dispatched 8 ids at a time. Database transports keep their lease through the\nhost stop. The PostgreSQL payload columns become text in one one-way ALTER TABLE, with a 5 s lock\nwait and a jittered retry window. Both SQL transports build a ready index when absent. MongoDB\nwrites are bounded by w:majority plus wtimeout, except lease writes. The flow stores gain\nLoadCurrentAsync (Cosmos: under Session or Strong a ttl-hidden ledger reads as absent).\n\nBroker transports: the Redis probe and scan follow the node table, with a 90 s failover grace. NATS\nbounds waiter registration and opens its KV bucket instead of re-creating it; its consumers are never\nrewritten. Kafka's detached handlers survive eager rebalances: librdkafka keeps a partition's pause\nacross a revoke, so a handed-back partition stayed parked for good. RabbitMQ waits for the running\nhandler on a graceful stop. Pub/Sub drains running handlers and holds late deliveries until its\nclient stops, instead of Nacking them into the live pull.\n\nEvery behavioural fix ships a regression test that fails on the old code. The pre-commit review ran\nfive passes over the fix diff. Four pass-2 changes were taken out on pass 3 and deferred to round 2\nwith their reasons. Operator-visible changes are listed at the top of the CHANGELOG's Round-43\nsection. Among them: the PostgreSQL text conversion is one-way, the NATS channel needs a new KV\nstream-info permission, and early ACK on both roles is validated against the host shutdown budget.\n\nVerified: Release build with 0 warnings; 3,932 unit tests on net8.0 and on net10.0; pack, package\ndependencies and the AOT smoke test; integration batches none, data, oracle-cosmos, brokers and\ncloud against real containers. The new real-broker tests (Kafka rebalance, RabbitMQ graceful stop,\nNATS delete-marker purge, PostgreSQL migration and lock timeout, Cosmos ttl lapse) pass, and the\nPub/Sub emulator stop-drain test passes in its matrix shard.",
+          "timestamp": "2026-09-26T01:58:30+02:00",
+          "tree_id": "b9ceb8d7a434bf3cb6eb940c9b73d83cc2e2cc82",
+          "url": "https://github.com/Sky4CE/AsyncResponse/commit/cc8f87453928065cff2f5645f1f6efe7e2647740"
+        },
+        "date": 1790381014294,
         "tool": "customBiggerIsBetter",
         "benches": [
           {
