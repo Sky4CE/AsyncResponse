@@ -13,6 +13,20 @@ work that has landed on `main` but not yet shipped. Security reporters credited 
 
 ### Changed
 
+- **Round-47 review (2026-09-26, fixpoint-light round 2 of `8ab4d04`): Redis message dispatch settles
+  despite a throwing logger, a timeout that loses the drain race no longer reports a timeout, and the
+  in-memory channel and RabbitMQ lapse burials match their twins.**
+  - *Redis channel.* `ProcessMessageAsync` logged before settling in every terminal branch, so a
+    throwing logger left the waiter unsettled and uncleaned; the waiter timeout logged, tagged and
+    counted a timeout before the drain, so a delivery that won the drain still produced a timeout
+    diagnostic; and `UnsubscribeQuietlyAsync`, documented as never faulting, logged unguarded. All
+    three now settle first and log through `SafeLog`, and the timeout is reported only when it wins.
+  - *In-memory channel.* The publish paths no longer mark the activity as an error for the caller's
+    own cancellation, and the recovery-delete failure log goes through `SafeLog` (the twins of the
+    round-46 Redis fixes).
+  - *RabbitMQ transport.* A never-started delivery buried by the drain lapse now carries the same
+    `drain_budget_lapsed_after_commit` reason on its dead-letter copy as a mid-handler lapse.
+
 - **Round-46 review (2026-09-26, fixpoint-light round 1 of `4ee3ad8`): a throwing logger or metrics
   listener can no longer leave a Redis waiter unsettled, caller cancellation is no longer logged as a
   publish failure, a DB-channel waiter created during disposal no longer leaves its subscription behind, a RabbitMQ handler cut

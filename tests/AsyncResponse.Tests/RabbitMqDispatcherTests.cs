@@ -2260,6 +2260,54 @@ public class RabbitMqDispatcherTests
     }
 
     [Fact]
+    public async Task Queued_ANeverStartedDrainLapse_TagsTheDeadLetterCopyWithTheSameReasonAsAMidHandlerLapse()
+    {
+        // Regression (fixpoint r2 R2-03): BuryLapsedAsync (a delivery still queued when the drain
+        // budget lapsed — its handler never started) dead-lettered its copy with no reason code at
+        // all, while the mid-handler lapse (round-46) tags drain_budget_lapsed_after_commit, and
+        // Kafka tags BOTH lapse kinds with that one code. Replay tooling that selects
+        // drain_budget_lapsed_after_commit copies (which it reads as "never started") missed every
+        // RabbitMQ never-started copy.
+        var channel = new FakeDispatcherChannel();
+        var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var dispatcher = RabbitMqMessageDispatcher.Create(
+            async (delivery, _) =>
+            {
+                if (delivery.DeliveryTag == 1)
+                {
+                    started.TrySetResult();
+                    await release.Task.ConfigureAwait(false); // ignores the drain token, like the ingress
+                }
+            },
+            new RabbitMqAsyncResponseOptions { DeadLetterExchange = "dlx" },
+            EnqueueSubscriber(workers: 1, capacity: 8, drain: TimeSpan.FromSeconds(2)), // a 500 ms reserve
+            NullLogger.Instance,
+            "worker.q",
+            RabbitMqSubscriberRole.Worker);
+
+        try
+        {
+            await dispatcher.HandleAsync(Delivery("m1", deliveryTag: 1), channel, CancellationToken.None);
+            await started.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            // Never started: still queued behind the wedged worker when the drain budget lapses.
+            await dispatcher.HandleAsync(Delivery("never-started", deliveryTag: 2), channel, CancellationToken.None);
+
+            await dispatcher.DisposeAsync();
+
+            var copy = Assert.Single(channel.Publishes);
+            Assert.StartsWith(
+                "drain_budget_lapsed_after_commit: ",
+                Assert.IsType<string>(copy.Properties.Headers!["AR-DeadLetter-Reason"]),
+                StringComparison.Ordinal);
+        }
+        finally
+        {
+            release.TrySetResult();
+        }
+    }
+
+    [Fact]
     public async Task Queued_AHandlerCutShortByTheDrainLapse_IsAWarning_NotAHandlerFailure()
     {
         // Regression (fixpoint r1 R1-01): a handler that honours the drain token and is cut short

@@ -170,6 +170,49 @@ public sealed class InMemoryChannelInternalCoverageTests
     }
 
     [Fact]
+    public async Task Cleanup_WhenTheRecoveryDeleteAndTheLoggerBothThrow_StillDoesNotFaultThePublisher()
+    {
+        // Regression (r2/R2-08): StartCleanupAsync's recovery-delete catch logged unguarded — the
+        // in-memory twin of the R1-06 Redis fix. When the store's delete AND the logger both
+        // throw, the escaping log fault propagated out of the one-shot cleanup task, which
+        // DispatchResponseAsync awaits, so it surfaced to the PUBLISHER even though the waiter had
+        // already been completed successfully.
+        var logger = new RecordingThrowingLogger<InMemoryAsyncResponseChannel> { ThrowOnMessageContaining = "Failed to delete recovery state" };
+        var (channel, store) = CreateChannel(logger);
+        store.Setup(s => s.TryDeleteAsync(It.IsAny<string>(), It.IsAny<Guid>(), It.IsAny<CancellationToken>()))
+             .ThrowsAsync(new InvalidOperationException("recovery store offline"));
+
+        await using var waiter = await channel.CreateResponseWaiter<OperationResult>("cleanup-throws-and-logs");
+
+        // Must not throw: the waiter already got its response, and a failed best-effort delete
+        // (even with a throwing logger on top) is not the publisher's problem.
+        await channel.SetResponse(new OperationResult { Status = OperationStatus.Completed, Message = "ok" }, "cleanup-throws-and-logs");
+
+        Assert.Equal("ok", (await waiter.ResponseTask.WaitAsync(TimeSpan.FromSeconds(5))).Message);
+    }
+
+    [Fact]
+    public async Task SetResponse_WhenThePublisherTokenCancelsDuringLostSubscriberDispatch_DoesNotTagTheActivityAsAnError()
+    {
+        // Regression (r2/R2-06): the publish catch marked the activity Error for the caller's own
+        // cancellation. R1-08 added the `catch (OperationCanceledException) when
+        // (cancellationToken.IsCancellationRequested)` exemption only to the Redis twins;
+        // conventions say cancellation != failure everywhere.
+        using var activities = new AsyncResponseActivityCollector();
+        var (channel, store) = CreateChannel();
+        store.Setup(s => s.GetAllAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()))
+             .ThrowsAsync(new OperationCanceledException());
+        using var cts = new CancellationTokenSource();
+        cts.Cancel();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            () => channel.SetResponse(new OperationResult { Status = OperationStatus.Completed }, "corr-no-subscriber-canceled", cts.Token));
+
+        var publish = Assert.Single(activities.All(), activity => activity.OperationName == "asyncresponse.set_response");
+        Assert.NotEqual(System.Diagnostics.ActivityStatusCode.Error, publish.Status);
+    }
+
+    [Fact]
     public async Task SetException_RemoteFailureMessage_ReachesTheWaitStatusOnlyAsACappedEscapedExcerpt()
     {
         // Wire-channel parity: the waiter's exception carries the whole message, but the wait

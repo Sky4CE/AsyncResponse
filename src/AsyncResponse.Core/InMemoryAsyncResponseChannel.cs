@@ -335,6 +335,13 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
             if (_logger.IsEnabled(LogLevel.Debug))
                 _logger.LogDebug("Published response for correlationId {CorrelationId}. PayloadType: {PayloadType}. Subscribers: {SubscriberCount}.", correlationId, typeof(T), subscribers.Count);
         }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            // Cancellation is not a failure: the caller's own token fired while this awaited the
+            // publish or a lost-subscriber probe. Rethrow without the Error activity status that a
+            // real publish failure gets (Redis-channel parity, SetResponseCore's twin catch).
+            throw;
+        }
         catch (Exception ex)
         {
             AsyncResponseDiagnostics.SetError(activity, ex);
@@ -407,6 +414,13 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
 
             if (_logger.IsEnabled(LogLevel.Debug))
                 _logger.LogDebug("Published raw response for correlationId {CorrelationId}. Subscribers: {SubscriberCount}.", correlationId, subscribers.Count);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            // Cancellation is not a failure: the caller's own token fired while this awaited the
+            // publish or a lost-subscriber probe. Rethrow without the Error activity status that a
+            // real publish failure gets (Redis-channel parity, SetResponseCore's twin catch).
+            throw;
         }
         catch (Exception ex)
         {
@@ -481,6 +495,13 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
 
             if (_logger.IsEnabled(LogLevel.Debug))
                 _logger.LogDebug("Published exception for correlationId {CorrelationId}. Subscribers: {SubscriberCount}.", correlationId, subscribers.Count);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            // Cancellation is not a failure: the caller's own token fired while this awaited the
+            // publish or a lost-subscriber probe. Rethrow without the Error activity status that a
+            // real publish failure gets (Redis-channel parity, SetResponseCore's twin catch).
+            throw;
         }
         catch (Exception ex)
         {
@@ -1092,10 +1113,13 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
                 // to the publisher — whose retry then found no subscriber but an intact
                 // registration and fired the recovery callback for a response the waiter already
                 // held. On the timeout path it was not observed at all.
-                _owner._logger.LogError(
-                    ex,
+                // Logged through SafeLog: a throwing logger provider must not fault this one-shot
+                // cleanup task either, or it reproduces the exact publisher-facing outcome this
+                // catch exists to prevent.
+                SafeLog.Try((Logger: _owner._logger, Error: ex, CorrelationId: CorrelationId), static state => state.Logger.LogError(
+                    state.Error,
                     "Failed to delete recovery state for correlationId {CorrelationId}; it will expire on its own.",
-                    CorrelationId);
+                    state.CorrelationId));
             }
             finally
             {

@@ -506,15 +506,24 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
             {
                 try
                 {
-                    // Logged/tagged through SafeLog: a throwing logger or metrics listener must not
-                    // skip DrainThenCleanupAsync below — the in-memory channel settles first for the
-                    // same reason, and a throw here would otherwise leave ResponseTask pending with
-                    // the SUBSCRIBE, executor and recovery registration leaked until disposal.
-                    SafeLog.Try(() => _owner._logger.LogWarning("Timed out waiting for response for correlationId {CorrelationId}.", _correlationId));
-                    SafeLog.Try(() => AsyncResponseDiagnostics.SetError(_activity, "timeout", $"Timed out waiting for response for correlationId {_correlationId}."));
-                    SafeLog.Try(() => AsyncResponseDiagnostics.RecordWaiterTimeout("redis"));
+                    // Logged/tagged through SafeLog, and only once the drain confirms the timeout
+                    // actually won: an in-flight delivery mid Until-predicate on a terminal message
+                    // can still win the race inside the drain below, in which case TrySetException
+                    // is a no-op and reporting "timeout" here would be a false diagnostic for a wait
+                    // that in fact carries a delivered result (mirrors OnOverloadedAsync and the
+                    // drain-lapse branch of DrainThenCleanupAsync, which log only when their fault
+                    // wins). A throwing logger or metrics listener must still not skip
+                    // DrainThenCleanupAsync below — the in-memory channel settles first for the same
+                    // reason, and a throw here would otherwise leave ResponseTask pending with the
+                    // SUBSCRIBE, executor and recovery registration leaked until disposal.
                     await DrainThenCleanupAsync(
-                        new TimeoutException($"Timed out waiting for response for correlationId {_correlationId}."))
+                        new TimeoutException($"Timed out waiting for response for correlationId {_correlationId}."),
+                        onTerminalSettled: () =>
+                        {
+                            SafeLog.Try(() => _owner._logger.LogWarning("Timed out waiting for response for correlationId {CorrelationId}.", _correlationId));
+                            SafeLog.Try(() => AsyncResponseDiagnostics.SetError(_activity, "timeout", $"Timed out waiting for response for correlationId {_correlationId}."));
+                            SafeLog.Try(() => AsyncResponseDiagnostics.RecordWaiterTimeout("redis"));
+                        })
                         .ConfigureAwait(false);
                 }
                 catch (Exception ex)
@@ -622,7 +631,7 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
                 return;
             }
 
-            _owner._logger.LogDebug("Received message on channel {Channel}.", ChannelName);
+            SafeLog.Try(() => _owner._logger.LogDebug("Received message on channel {Channel}.", ChannelName));
 
             bool finished = false;
             try
@@ -638,13 +647,16 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
 
                 if (envelope == null)
                 {
-                    _owner._logger.LogError("Failed to deserialize envelope for correlationId {CorrelationId}.", _correlationId);
-
                     finished = true;
                     var deserializationError = new JsonException($"Failed to deserialize envelope for correlationId {_correlationId}.");
-                    AsyncResponseDiagnostics.SetError(_activity, "deserialize_failure", deserializationError.Message);
-                    if (!_tcs.TrySetException(deserializationError))
-                        _owner._logger.LogWarning(deserializationError, "TaskCompletionSource already completed for correlationId {CorrelationId}.", _correlationId);
+                    // Settle BEFORE logging: every log below is through SafeLog, but the settle
+                    // itself must not depend on a throwing logger provider skipping it (the
+                    // sibling of the R1-02/R1-07 throwing-logger fixes).
+                    var deserializeSettled = _tcs.TrySetException(deserializationError);
+                    SafeLog.Try(() => _owner._logger.LogError("Failed to deserialize envelope for correlationId {CorrelationId}.", _correlationId));
+                    SafeLog.Try(() => AsyncResponseDiagnostics.SetError(_activity, "deserialize_failure", deserializationError.Message));
+                    if (!deserializeSettled)
+                        SafeLog.Try(() => _owner._logger.LogWarning(deserializationError, "TaskCompletionSource already completed for correlationId {CorrelationId}.", _correlationId));
                 }
                 else if (!AsyncResponseEnvelopeSchema.IsReadable(envelope.SchemaVersion))
                 {
@@ -652,9 +664,10 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
                     var schemaError = new InvalidOperationException(
                         $"Response envelope for correlationId {_correlationId} has schema version {envelope.SchemaVersion}, " +
                         $"which this build does not support (current: {AsyncResponseEnvelopeSchema.Current}).");
-                    AsyncResponseDiagnostics.SetError(_activity, "schema_mismatch", schemaError.Message);
-                    if (!_tcs.TrySetException(schemaError))
-                        _owner._logger.LogWarning(schemaError, "TaskCompletionSource already completed for correlationId {CorrelationId}.", _correlationId);
+                    var schemaSettled = _tcs.TrySetException(schemaError);
+                    SafeLog.Try(() => AsyncResponseDiagnostics.SetError(_activity, "schema_mismatch", schemaError.Message));
+                    if (!schemaSettled)
+                        SafeLog.Try(() => _owner._logger.LogWarning(schemaError, "TaskCompletionSource already completed for correlationId {CorrelationId}.", _correlationId));
                 }
                 else if (!envelope.Success)
                 {
@@ -667,34 +680,42 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
                         remoteFailure.Data["RemoteStackTrace"] = RemoteStackTrace.Cap(envelope.ExceptionStackTrace, _owner._options.MaxRemoteStackTraceLength);
                     }
 
+                    var remoteSettled = _tcs.TrySetException(remoteFailure);
+
                     // The remote's message stays out of the log (DB-channel parity) and goes into the
                     // activity status only as a capped, escaped excerpt: whoever produced the envelope
                     // chose it — megabytes of it, CR/LF forging log lines — and only the stack trace
                     // was bounded. The waiter still receives it whole, on the exception.
-                    _owner._logger.LogWarning("Received error response for correlationId {CorrelationId}.", _correlationId);
-                    AsyncResponseDiagnostics.SetError(_activity, "remote_failure", DiagnosticText.EscapedExcerpt(remoteFailure.Message, RemoteFailureStatusLength));
-                    if (!_tcs.TrySetException(remoteFailure))
-                        _owner._logger.LogWarning("TaskCompletionSource already completed for correlationId {CorrelationId}; the error response was dropped.", _correlationId);
+                    SafeLog.Try(() => _owner._logger.LogWarning("Received error response for correlationId {CorrelationId}.", _correlationId));
+                    SafeLog.Try(() => AsyncResponseDiagnostics.SetError(_activity, "remote_failure", DiagnosticText.EscapedExcerpt(remoteFailure.Message, RemoteFailureStatusLength)));
+                    if (!remoteSettled)
+                        SafeLog.Try(() => _owner._logger.LogWarning("TaskCompletionSource already completed for correlationId {CorrelationId}; the error response was dropped.", _correlationId));
                 }
                 else
                 {
-                    if (_owner._logger.IsEnabled(LogLevel.Debug))
-                        _owner._logger.LogDebug("Received response for correlationId {CorrelationId}.", _correlationId);
+                    SafeLog.Try(() =>
+                    {
+                        if (_owner._logger.IsEnabled(LogLevel.Debug))
+                            _owner._logger.LogDebug("Received response for correlationId {CorrelationId}.", _correlationId);
+                    });
 
                     finished = await _completionPredicate(envelope.Payload!).ConfigureAwait(false);
 
                     if (finished && !_tcs.TrySetResult(envelope.Payload!))
-                        _owner._logger.LogWarning("TaskCompletionSource already completed for correlationId {CorrelationId}.", _correlationId);
+                        SafeLog.Try(() => _owner._logger.LogWarning("TaskCompletionSource already completed for correlationId {CorrelationId}.", _correlationId));
                 }
             }
             catch (Exception ex)
             {
-                _owner._logger.LogError(ex, "Error processing message on channel {Channel} for correlationId {CorrelationId}.", ChannelName, _correlationId);
-
+                // Settle BEFORE logging: a throwing logger provider must not skip the settle (which
+                // frees the waiter) or the `finished = true` that makes the finally block below run
+                // cleanup — the sibling of the R1-02/R1-07 throwing-logger fixes.
                 finished = true;
-                AsyncResponseDiagnostics.SetError(_activity, ex);
-                if (!_tcs.TrySetException(ex))
-                    _owner._logger.LogWarning(ex, "TaskCompletionSource already completed for correlationId {CorrelationId}.", _correlationId);
+                var settled = _tcs.TrySetException(ex);
+                SafeLog.Try(() => _owner._logger.LogError(ex, "Error processing message on channel {Channel} for correlationId {CorrelationId}.", ChannelName, _correlationId));
+                SafeLog.Try(() => AsyncResponseDiagnostics.SetError(_activity, ex));
+                if (!settled)
+                    SafeLog.Try(() => _owner._logger.LogWarning(ex, "TaskCompletionSource already completed for correlationId {CorrelationId}.", _correlationId));
             }
             finally
             {
@@ -740,7 +761,7 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
         /// everything it ever admitted, so nothing is in flight and the plain cancel is truthful.
         /// </para>
         /// </summary>
-        public async ValueTask DrainThenCleanupAsync(Exception? terminalIfUndelivered = null)
+        public async ValueTask DrainThenCleanupAsync(Exception? terminalIfUndelivered = null, Action? onTerminalSettled = null)
         {
             if (Volatile.Read(ref _cleanupStarted) == 0 && ExecutorRegistered)
             {
@@ -794,8 +815,8 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
             // report a consumed response as a timeout; TrySet loses here if the delivery won, which
             // is the whole point. (A lapsed drain budget has already faulted the task as
             // indeterminate above, and TrySet is a no-op behind it.)
-            if (terminalIfUndelivered is not null)
-                _tcs.TrySetException(terminalIfUndelivered);
+            if (terminalIfUndelivered is not null && _tcs.TrySetException(terminalIfUndelivered))
+                onTerminalSettled?.Invoke();
 
             await CleanupOnceAsync().ConfigureAwait(false);
         }
@@ -845,9 +866,9 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
                 }
                 catch (TimeoutException)
                 {
-                    _owner._logger.LogError(
+                    SafeLog.Try(() => _owner._logger.LogError(
                         "Unsubscribe for channel {Channel} did not finish within {DisposalDrainTimeout}; abandoning the wait (its outcome is logged when it completes).",
-                        ChannelName, _owner._options.DisposalDrainTimeout);
+                        ChannelName, _owner._options.DisposalDrainTimeout));
                 }
             }
             finally
@@ -914,11 +935,11 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
             try
             {
                 await liveSubscription.DisposeAsync().ConfigureAwait(false);
-                _owner._logger.LogDebug("Unsubscribed from channel {Channel}.", ChannelName);
+                SafeLog.Try(() => _owner._logger.LogDebug("Unsubscribed from channel {Channel}.", ChannelName));
             }
             catch (Exception ex)
             {
-                _owner._logger.LogError(ex, "Error during unsubscribe-once for channel {Channel}.", ChannelName);
+                SafeLog.Try(() => _owner._logger.LogError(ex, "Error during unsubscribe-once for channel {Channel}.", ChannelName));
             }
         }
     }

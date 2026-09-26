@@ -56,6 +56,16 @@ public class RedisAsyncResponseChannelWaiterTests
         public Exception? UnsubscribeException { get; set; }
         public RedisValue? InvokeOnSubscribe { get; set; }
         public Action<RedisChannel>? OnSubscribe { get; set; }
+
+        /// <summary>
+        /// Run after <see cref="InvokeOnSubscribe"/> is admitted, given the subscription instance
+        /// (<c>onMessage.Target</c>) — lets a test await deterministically past the async
+        /// admission-only handoff (<c>HandleMessageAsync</c> returns once ADMITTED, not once the
+        /// message finished processing) before <see cref="SubscribeAsync"/> returns, so the inline
+        /// "cleanup started before the subscription was assigned" race is pinned instead of merely
+        /// possible.
+        /// </summary>
+        public Func<object, Task>? AfterInvokeOnSubscribe { get; set; }
         public int UnsubscribeCount => Volatile.Read(ref _unsubscribeCount);
 
         /// <summary>Every channel-wide unsubscribe, in call order (the channel names).</summary>
@@ -77,7 +87,11 @@ public class RedisAsyncResponseChannelWaiterTests
             Handler = onMessage;
             _handlers.Add(onMessage);
             if (InvokeOnSubscribe is { } message)
+            {
                 await onMessage(channel, message);
+                if (AfterInvokeOnSubscribe is { } hook)
+                    await hook(onMessage.Target!);
+            }
             return new Subscription(this);
         }
 
@@ -201,6 +215,53 @@ public class RedisAsyncResponseChannelWaiterTests
         // idempotent). The zombie being pinned away is "no unsubscribe ever", so the invariant is
         // eventually-at-least-one, not exactly-one-by-now.
         await Eventually(() => _channelSubscriber.UnsubscribeCount >= 1);
+    }
+
+    [Fact]
+    public async Task CreateResponseWaiter_TerminalDeliveryInsideSubscribe_WhenTheUnsubscribeLogThrows_DoesNotReportAFailedUnsubscribe()
+    {
+        // Regression (r2/R2-05): UnsubscribeQuietlyAsync is documented "Never faults", but its
+        // success-path LogDebug was unguarded — a throwing logger provider on that one line was
+        // caught by the method's OWN catch block and relogged as "Error during unsubscribe-once",
+        // reporting a real unsubscribe that succeeded as a failed one (unlike its twin,
+        // ReleasePubSubQuietlyAsync, whose lines already went through SafeLog independently).
+        _channelSubscriber.InvokeOnSubscribe =
+            """{"SchemaVersion":1,"Success":true,"Payload":{"Status":2,"Message":"inline"},"ExceptionMessage":null,"ExceptionStackTrace":null}""";
+        var logger = new RecordingThrowingLogger<RedisAsyncResponseChannel> { ThrowOnMessageContaining = "Unsubscribed from channel" };
+        var channel = CreateChannel(new RedisAsyncResponseOptions
+        {
+            DefaultTimeout = TimeSpan.FromSeconds(5),
+            RecoveryStateExpiry = TimeSpan.FromMinutes(5)
+        }, logger);
+
+        // HandleMessageAsync returns once the message is ADMITTED to the executor, not once it
+        // finished processing — so awaiting it alone does not guarantee CleanupStarted is true
+        // before SubscribeAsync returns (the compensation branch this pins). CleanupStarted is
+        // flipped synchronously as CleanupCoreAsync's very first statement, so once it is true it
+        // stays true — this only ever waits for that one-way transition, and a bounded real-time
+        // deadline here is a hang guard (a stuck cleanup fails the test loudly), not something the
+        // test's correctness depends on the way a fixed sleep would be. (A follow-up work item
+        // enqueued on the same channel's executor was tried as a "wait for an event" alternative,
+        // but that executor can retire — and get tombstoned — the instant this trivial synchronous
+        // predicate's delivery finishes, racing this very hook; enqueuing behind it then never
+        // runs at all, which is worse than polling a monotonic flag.)
+        _channelSubscriber.AfterInvokeOnSubscribe = async subscription =>
+        {
+            var cleanupStarted = subscription.GetType().GetProperty("CleanupStarted")!;
+            var guard = DateTime.UtcNow + TimeSpan.FromSeconds(5);
+            while (!(bool)cleanupStarted.GetValue(subscription)!)
+            {
+                Assert.True(DateTime.UtcNow < guard, "CleanupStarted never became true before SubscribeAsync returned");
+                await Task.Yield();
+            }
+        };
+
+        await using var waiter = await channel.CreateResponseWaiter<OperationResult>("corr-inline-log-throws");
+
+        Assert.Equal(OperationStatus.Completed, (await waiter.ResponseTask).Status);
+        Assert.True(_channelSubscriber.UnsubscribeCount >= 1);
+
+        Assert.False(logger.HasEntry(LogLevel.Error, "Error during unsubscribe-once"));
     }
 
     [Fact]
@@ -540,6 +601,60 @@ public class RedisAsyncResponseChannelWaiterTests
     }
 
     [Fact]
+    public async Task WaiterTimeout_WhenTheDrainWinsTheRace_DoesNotReportATimeoutDiagnostic()
+    {
+        // Regression (r2/R2-04): OnTimeout logged "Timed out", tagged the activity "timeout" and
+        // incremented the timeout counter BEFORE the drain, so a delivery already inside the
+        // executor that wins the drain race still got a timeout diagnostic on a wait that in fact
+        // carries the delivered result. The diagnostics now only fire once the drain confirms the
+        // timeout actually won (TrySetException succeeded).
+        //
+        // Determinism: the timeout is armed on an injected virtual clock (never a real 50ms timer
+        // plus a hopeful real sleep), and advancing the clock past it is not enough on its own —
+        // it only guarantees the callback was *invoked*, not that its fire-and-forget Task.Run has
+        // reached DrainThenCleanupAsync's enqueue. The drain marker showing up as pending work on
+        // the correlation's executor — behind the predicate item, which is still running — is the
+        // observable proof the timeout's drain has actually started before the predicate is let go.
+        using var activities = new AsyncResponseActivityCollector();
+        var clock = new VirtualTimeProvider();
+        var channel = CreateChannel(
+            new RedisAsyncResponseOptions { DefaultTimeout = TimeSpan.FromSeconds(5), RecoveryStateExpiry = TimeSpan.FromMinutes(5) },
+            timeProvider: clock);
+        var insidePredicate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releasePredicate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        await using (var waiter = await channel.CreateResponseWaiter<OperationResult>(
+            "corr-drain-race-diagnostic",
+            completionPredicate: async _ =>
+            {
+                insidePredicate.TrySetResult();
+                await releasePredicate.Task;
+                return true;
+            },
+            timeout: TimeSpan.FromMilliseconds(50)))
+        {
+            await PublishSuccess(new OperationResult { Status = OperationStatus.Completed, Message = "delivered" });
+            await insidePredicate.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+            // Fire the waiter's own timeout on the virtual clock while the predicate still holds
+            // the executor, then wait for the drain's marker to actually be admitted behind it.
+            var registry = GetExecutorRegistry(channel);
+            var channelName = _channelSubscriber.SubscribedChannel.ToString()!;
+            clock.Advance(TimeSpan.FromMilliseconds(51));
+            await Eventually(() => PendingWorkItems(registry, channelName) >= 1);
+            Assert.False(waiter.ResponseTask.IsCompleted, "the waiter was settled before the in-flight delivery had drained");
+
+            releasePredicate.TrySetResult();
+
+            var result = await waiter.ResponseTask.WaitAsync(TimeSpan.FromSeconds(10));
+            Assert.Equal("delivered", result.Message);
+        }
+
+        var wait = Assert.Single(activities.All(), activity => activity.OperationName == "asyncresponse.wait");
+        Assert.NotEqual(System.Diagnostics.ActivityStatusCode.Error, wait.Status);
+    }
+
+    [Fact]
     public async Task CreateResponseWaiter_StampsRegisteredAtFromTheInjectedTimeProvider()
     {
         // Regression (round 29): the stamp came from DateTime.UtcNow, which no host can substitute.
@@ -593,6 +708,33 @@ public class RedisAsyncResponseChannelWaiterTests
 
         var ex = await Assert.ThrowsAsync<TimeoutException>(() => waiter.ResponseTask.WaitAsync(TimeSpan.FromSeconds(5)));
         Assert.Contains("corr-timeout-throws-settle", ex.Message);
+    }
+
+    [Fact]
+    public async Task ProcessMessage_WhenACompletionPredicateFailureLogThrows_StillSettlesTheWaiter()
+    {
+        // Regression (r2/R2-01): ProcessMessageAsync's generic catch logged BEFORE setting
+        // `finished = true`/TrySetException, so a throwing logger provider on that line skipped
+        // the settle entirely AND left `finished` false, so the finally block's cleanup never
+        // ran either — the waiter hung until its own timeout, misreporting a consumed
+        // error/predicate failure as a TimeoutException (sibling of the R1-02/R1-07 fixes).
+        var logger = new RecordingThrowingLogger<RedisAsyncResponseChannel> { ThrowOnMessageContaining = "Error processing message" };
+        var channel = CreateChannel(new RedisAsyncResponseOptions
+        {
+            DefaultTimeout = TimeSpan.FromSeconds(5),
+            RecoveryStateExpiry = TimeSpan.FromMinutes(5)
+        }, logger);
+        var predicateFailure = new InvalidOperationException("predicate boom");
+
+        await using var waiter = await channel.CreateResponseWaiter<OperationResult>(
+            "corr-process-throws-settle",
+            completionPredicate: _ => throw predicateFailure,
+            timeout: TimeSpan.FromSeconds(5));
+
+        await PublishSuccess(new OperationResult { Status = OperationStatus.Completed, Message = "x" });
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => waiter.ResponseTask.WaitAsync(TimeSpan.FromSeconds(5)));
+        Assert.Same(predicateFailure, ex);
     }
 
     [Fact]
@@ -1391,6 +1533,31 @@ public class RedisAsyncResponseChannelWaiterTests
         }
 
         return false;
+    }
+
+    /// <summary>
+    /// Pending (accepted-but-not-yet-running) work items on the named channel's executor. Used to
+    /// observe deterministically that a drain marker was actually admitted behind an in-flight
+    /// item, rather than merely that a timer fired.
+    /// </summary>
+    private static int PendingWorkItems(object registry, string channelName)
+    {
+        var registryType = registry.GetType();
+        var gate = registryType.GetField("_gate", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(registry)!;
+        var executors = (System.Collections.IDictionary)registryType
+            .GetField("_executors", BindingFlags.Instance | BindingFlags.NonPublic)!
+            .GetValue(registry)!;
+        lock (gate)
+        {
+            if (!executors.Contains(channelName))
+                return 0;
+
+            var entry = executors[channelName]!;
+            var executor = entry.GetType().GetProperty("Executor")!.GetValue(entry)!;
+            return (int)executor.GetType()
+                .GetProperty("PendingCount", BindingFlags.Instance | BindingFlags.NonPublic)!
+                .GetValue(executor)!;
+        }
     }
 
     private static object GetExecutorRegistry(RedisAsyncResponseChannel channel)

@@ -1529,7 +1529,7 @@ internal sealed class QueuedRabbitMqMessageDispatcher : RabbitMqMessageDispatche
     {
         var lapsed = new OperationCanceledException(
             "The ACK-after-enqueue drain budget lapsed before this already-ACKed message was handled.");
-        if (await TryDeadLetterAlreadyAckedAsync(delivery, lapsed, handlerFailure: false, cancellationToken).ConfigureAwait(false))
+        if (await TryDeadLetterAlreadyAckedAsync(delivery, lapsed, handlerFailure: false, cancellationToken, reasonCode: DrainLapsedAfterCommitReason).ConfigureAwait(false))
         {
             SafeLog.Try(() => Logger.LogWarning(
                 "RabbitMQ background handler for already-ACKed delivery {DeliveryTag} on {Queue} was not started: the drain budget had lapsed. Dead-lettered a copy; surfacing via OnBackgroundFailure.",
