@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1790435326331,
+  "lastUpdate": 1790435361223,
   "repoUrl": "https://github.com/Sky4CE/AsyncResponse",
   "entries": {
     "AsyncResponse Microbenchmarks": [
@@ -115526,6 +115526,140 @@ window.BENCHMARK_DATA = {
           {
             "name": "durable-flow-storm throughput",
             "value": 2050.464725527252,
+            "unit": "flows/s"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "tyunisov@gmail.com",
+            "name": "Sky4CE",
+            "username": "Sky4CE"
+          },
+          "committer": {
+            "email": "tyunisov@gmail.com",
+            "name": "Sky4CE",
+            "username": "Sky4CE"
+          },
+          "distinct": true,
+          "id": "ddfdd97c4b0cf06360ecda700f2d9efc4955c8b6",
+          "message": "fix: apply round-45 review — MongoDB confirms absence, Redis write outcomes, unreadable recovery scans, NATS batched scan\n\n- MongoDB flow store: a plain load that finds no ledger confirms the absence with the bounded\n  linearizable read before answering null, so a deposed primary's stale \"absent\" can no longer\n  make RecoverAsync return and the dispatcher delete the registration; a set that cannot confirm\n  fails the load. A server that refuses the read concern itself (standalone, DocumentDB) falls\n  back to plain reads, logged once; timeouts and step-downs never count as a refusal.\n- Redis recovery store: the queued command is awaited after a committed EXEC, so a write Redis\n  rejects fails SaveAsync/TryDeleteAsync instead of reporting success; the key TTL is rounded up\n  to a whole millisecond (no more PX 0).\n- Recovery scanners (Redis, NATS, PostgreSQL, SQL Server, MongoDB) yield every readable\n  registration, then throw RecoveryStateScanUnreadableException with the unreadable count; the\n  watchdog reports UnreadableEntries, the health check degrades, new gauge\n  asyncresponse.recovery.unreadable.\n- NATS recovery scan reads values in concurrent batches of 128.\n\nRed-on-old regression tests for every fix (incl. a real-Redis integration test), docs and\nCHANGELOG updated.",
+          "timestamp": "2026-09-26T16:53:57+02:00",
+          "tree_id": "71ea656958003afa74bcb8062c9603151df7cc49",
+          "url": "https://github.com/Sky4CE/AsyncResponse/commit/ddfdd97c4b0cf06360ecda700f2d9efc4955c8b6"
+        },
+        "date": 1790435360193,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "waiter-storm throughput",
+            "value": 68677.88478707933,
+            "unit": "ops/s"
+          },
+          {
+            "name": "progress-storm throughput",
+            "value": 36536.56725797447,
+            "unit": "ops/s"
+          },
+          {
+            "name": "worker-storm throughput",
+            "value": 28915.11862832229,
+            "unit": "jobs/s"
+          },
+          {
+            "name": "google-pubsub-ack-after-enqueue-dispatch-storm throughput",
+            "value": 164109.83543065703,
+            "unit": "ops/s"
+          },
+          {
+            "name": "rabbitmq-ack-after-enqueue-dispatch-storm throughput",
+            "value": 257005.98309928653,
+            "unit": "ops/s"
+          },
+          {
+            "name": "redis-ack-after-enqueue-dispatch-storm throughput",
+            "value": 218789.65562508206,
+            "unit": "ops/s"
+          },
+          {
+            "name": "nats-ack-after-receive-dispatch-storm throughput",
+            "value": 203702.49657779804,
+            "unit": "ops/s"
+          },
+          {
+            "name": "postgresql-ack-after-receive-dispatch-storm throughput",
+            "value": 251372.49381623665,
+            "unit": "ops/s"
+          },
+          {
+            "name": "sqlserver-ack-after-enqueue-dispatch-storm throughput",
+            "value": 212626.61915170486,
+            "unit": "ops/s"
+          },
+          {
+            "name": "mongodb-ack-after-enqueue-dispatch-storm throughput",
+            "value": 238809.39189576448,
+            "unit": "ops/s"
+          },
+          {
+            "name": "azure-servicebus-ack-after-receive-dispatch-storm throughput",
+            "value": 234207.39533271504,
+            "unit": "ops/s"
+          },
+          {
+            "name": "sqs-ack-after-enqueue-dispatch-storm throughput",
+            "value": 276515.0258265034,
+            "unit": "ops/s"
+          },
+          {
+            "name": "kafka-ack-after-enqueue-dispatch-storm throughput",
+            "value": 256202.66655735354,
+            "unit": "ops/s"
+          },
+          {
+            "name": "race-burst throughput",
+            "value": 118018.99917056247,
+            "unit": "ops/s"
+          },
+          {
+            "name": "raw-ingress-storm throughput",
+            "value": 101178.9779223423,
+            "unit": "ops/s"
+          },
+          {
+            "name": "shared-response-fanout throughput",
+            "value": 44999.05681976905,
+            "unit": "ops/s"
+          },
+          {
+            "name": "exception-fanout throughput",
+            "value": 23559.345992555245,
+            "unit": "ops/s"
+          },
+          {
+            "name": "timeout-storm throughput",
+            "value": 4772.003229691785,
+            "unit": "ops/s"
+          },
+          {
+            "name": "dispose-cleanup-storm throughput",
+            "value": 207822.43651024564,
+            "unit": "ops/s"
+          },
+          {
+            "name": "context-isolation-storm throughput",
+            "value": 71906.85473664834,
+            "unit": "ops/s"
+          },
+          {
+            "name": "watchdog-scan-storm throughput",
+            "value": 1672156.915204923,
+            "unit": "entries/s"
+          },
+          {
+            "name": "durable-flow-storm throughput",
+            "value": 1260.4773397434153,
             "unit": "flows/s"
           }
         ]
