@@ -1,22 +1,22 @@
 Summary - AsyncResponse (Release / net8.0+net10.0 / unit+integration)
-  Generated on: 09/26/2026 - 22:16:24
-  Coverage date: 09/26/2026 - 21:59:57 - 09/26/2026 - 22:14:54
+  Generated on: 09/26/2026 - 22:55:47
+  Coverage date: 09/26/2026 - 22:38:46 - 09/26/2026 - 22:53:56
   Parser: MultiReport (16x Cobertura)
   Assemblies: 27
   Classes: 506
   Files: 249
   Line coverage: 94.5%
-  Covered lines: 35219
-  Uncovered lines: 2028
+  Covered lines: 35215
+  Uncovered lines: 2032
   Coverable lines: 37247
   Total lines: 75042
-  Branch coverage: 89% (13587 of 15265)
-  Covered branches: 13587
+  Branch coverage: 88.9% (13576 of 15265)
+  Covered branches: 13576
   Total branches: 15265
   Method coverage: 97.7% (4833 of 4943)
-  Full method coverage: 87.9% (4345 of 4943)
+  Full method coverage: 87.8% (4344 of 4943)
   Covered methods: 4833
-  Fully covered methods: 4345
+  Fully covered methods: 4344
   Total methods: 4943
 
 AsyncResponse.Abstractions                                                                               98.8%
@@ -55,8 +55,8 @@ AsyncResponse.Abstractions                                                      
   AsyncResponse.WorkerJobEnvelopeSchema                                                                   100%
   AsyncResponse.WorkerJobTooLargeException                                                                100%
 
-AsyncResponse.Channels.MongoDB                                                                             97%
-  AsyncResponse.Channels.DbAsyncResponseChannelBase                                                      96.1%
+AsyncResponse.Channels.MongoDB                                                                           96.9%
+  AsyncResponse.Channels.DbAsyncResponseChannelBase                                                        96%
   AsyncResponse.Channels.DbRecoveryStateStoreBase                                                         100%
   AsyncResponse.Channels.MongoDB.MongoChannelMessageDocument                                              100%
   AsyncResponse.Channels.MongoDB.MongoChannelSubscriberDocument                                            60%
@@ -88,8 +88,8 @@ AsyncResponse.Channels.NATS                                                     
   AsyncResponse.Channels.NATS.NatsSubjectSchema                                                           100%
   Microsoft.Extensions.DependencyInjection.NatsAsyncResponseChannelServiceCollectionExtensions            100%
 
-AsyncResponse.Channels.PostgreSQL                                                                        91.9%
-  AsyncResponse.Channels.DbAsyncResponseChannelBase                                                      88.4%
+AsyncResponse.Channels.PostgreSQL                                                                          92%
+  AsyncResponse.Channels.DbAsyncResponseChannelBase                                                      88.6%
   AsyncResponse.Channels.DbRecoveryStateStoreBase                                                        98.7%
   AsyncResponse.Channels.PostgreSQL.PostgreSqlAsyncResponseChannel                                       96.2%
   AsyncResponse.Channels.PostgreSQL.PostgreSqlAsyncResponseChannelOptions                                 100%
@@ -116,8 +116,8 @@ AsyncResponse.Channels.Redis                                                    
   AsyncResponse.Channels.Redis.RedisRecoveryStateStore                                                   94.9%
   Microsoft.Extensions.DependencyInjection.RedisAsyncResponseServiceCollectionExtensions                  100%
 
-AsyncResponse.Channels.SqlServer                                                                         93.2%
-  AsyncResponse.Channels.DbAsyncResponseChannelBase                                                      89.4%
+AsyncResponse.Channels.SqlServer                                                                         92.9%
+  AsyncResponse.Channels.DbAsyncResponseChannelBase                                                      88.9%
   AsyncResponse.Channels.DbRecoveryStateStoreBase                                                        98.7%
   AsyncResponse.Channels.SqlServer.SqlServerAsyncResponseChannel                                          100%
   AsyncResponse.Channels.SqlServer.SqlServerAsyncResponseChannelOptions                                   100%
@@ -138,7 +138,7 @@ AsyncResponse.Core                                                              
   AsyncResponse.AsyncResponseChannelMarker                                                                100%
   AsyncResponse.AsyncResponseChannelOptions                                                               100%
   AsyncResponse.AsyncResponseContextPropagation                                                           100%
-  AsyncResponse.AsyncResponseDiagnostics                                                                 99.3%
+  AsyncResponse.AsyncResponseDiagnostics                                                                   98%
   AsyncResponse.AsyncResponseDurableFlowStoreMarker                                                      95.2%
   AsyncResponse.AsyncResponseEnvelope<T>                                                                  100%
   AsyncResponse.AsyncResponseEnvelopeConverter<T>                                                         100%
@@ -157,7 +157,7 @@ AsyncResponse.Core                                                              
   AsyncResponse.AsyncResponseStaleRecoveryEntry                                                            50%
   AsyncResponse.AsyncResponseStartupValidator                                                            98.4%
   AsyncResponse.AsyncResponseTransportMarker                                                              100%
-  AsyncResponse.AsyncResponseTypeResolution                                                              96.9%
+  AsyncResponse.AsyncResponseTypeResolution                                                              97.9%
   AsyncResponse.AsyncResponseWatchdog                                                                    97.9%
   AsyncResponse.AsyncResponseWatchdogOptions                                                              100%
   AsyncResponse.AsyncResponseWatchdogReport                                                               100%
@@ -291,8 +291,8 @@ AsyncResponse.DurableFlows.SqlServer                                            
   AsyncResponse.Internal.SqlServerRelationVerifier                                                       69.4%
   Microsoft.Extensions.DependencyInjection.SqlServerDurableFlowServiceCollectionExtensions                100%
 
-AsyncResponse.Testing                                                                                    96.9%
-  AsyncResponse.Testing.AsyncResponseTestHarness                                                         95.2%
+AsyncResponse.Testing                                                                                      97%
+  AsyncResponse.Testing.AsyncResponseTestHarness                                                         95.5%
   AsyncResponse.Testing.AsyncResponseTestHarnessOptions                                                   100%
   AsyncResponse.Testing.FlowProbe                                                                        96.8%
   AsyncResponse.Testing.FlowProbeEvent                                                                    100%
@@ -440,7 +440,7 @@ AsyncResponse.Transports.NATS                                                   
   AsyncResponse.Transports.WorkerIntakeGate                                                               100%
   Microsoft.Extensions.DependencyInjection.NatsAsyncResponseTransportServiceCollectionExtensions          100%
 
-AsyncResponse.Transports.PostgreSQL                                                                      92.2%
+AsyncResponse.Transports.PostgreSQL                                                                      92.3%
   AsyncResponse.Internal.OpportunisticPrune                                                               100%
   AsyncResponse.Internal.PostgreSqlDdlGuard                                                              79.2%
   AsyncResponse.Internal.PostgreSqlListenConnection                                                      87.9%
@@ -464,7 +464,7 @@ AsyncResponse.Transports.PostgreSQL                                             
   AsyncResponse.Transports.PostgreSQL.PostgreSqlTransportDelivery                                         100%
   AsyncResponse.Transports.PostgreSQL.PostgreSqlTransportOptionsValidator                                 100%
   AsyncResponse.Transports.PostgreSQL.PostgreSqlTransportRetry                                            100%
-  AsyncResponse.Transports.PostgreSQL.PostgreSqlTransportStore                                           95.6%
+  AsyncResponse.Transports.PostgreSQL.PostgreSqlTransportStore                                           95.8%
   AsyncResponse.Transports.PostgreSQL.PostgreSqlWorkerSubscriber                                          100%
   AsyncResponse.Transports.PostgreSQL.PostgreSqlWorkerTransport                                          95.8%
   AsyncResponse.Transports.SubscriberSupervisor                                                            60%
