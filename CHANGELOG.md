@@ -59,6 +59,10 @@ work that has landed on `main` but not yet shipped. Security reporters credited 
     trip per key, over eight minutes of latency alone for 100,000 registrations at 5 ms. Values
     are now read in concurrent batches of 128 while the key listing streams; a failed read still
     fails the scan.
+  - *NATS channel (found by CI on macOS).* Disposing a waiter while its timeout was still waiting on
+    the recovery-registration delete (during a NATS outage, up to `DisposalDrainTimeout`) issued a
+    second delete beside the first: the disposal drain is not latched, and only the cleanup core
+    reused an in-flight attempt. Every path now joins the one delete in flight.
 
 - **Round-44 review (2026-09-26, whole repository): worker intake stops at host stop, a MongoDB
   replication timeout no longer duplicates or strands a response, a rebalance can no longer park

@@ -898,6 +898,53 @@ public class NatsAsyncResponseChannelTests
         _store.Verify(s => s.TryDeleteAsync("corr-dispose-order", It.IsAny<Guid>(), It.IsAny<CancellationToken>()), Times.Once);
     }
 
+    /// <summary>
+    /// Round 45 CI (macOS): the fact below failed there with TWO registration deletes. The drain is
+    /// not latched — cleanupStarted stays 0 while the timeout's drain waits on its delete — so a
+    /// dispose arriving in that window ran its own drain and issued a second KV delete beside the
+    /// first (the fact below only hits the window on a slow runner: its dispose waits for the
+    /// fault first). Here the dispose lands inside the window on purpose; it now joins the delete
+    /// already in flight.
+    /// </summary>
+    [Fact]
+    public async Task WaiterTimeout_ADisposeDuringTheTimeoutDrain_JoinsItsDelete_InsteadOfIssuingASecond()
+    {
+        var clock = new VirtualTimeProvider();
+        var reconnected = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var deletes = 0;
+        _store.Setup(s => s.TryDeleteAsync(It.IsAny<string>(), It.IsAny<Guid>(), It.IsAny<CancellationToken>()))
+            .Returns(() =>
+            {
+                Interlocked.Increment(ref deletes);
+                return reconnected.Task;
+            });
+        var channel = CreateChannel(drainTimeout: TimeSpan.FromSeconds(1), timeProvider: clock);
+        var waiter = await channel.CreateResponseWaiter<OperationResult>("corr-timeout-dispose", timeout: TimeSpan.FromMinutes(10));
+
+        clock.Advance(TimeSpan.FromMinutes(11));
+
+        // The timeout's drain has issued the delete and waits on it (up to its 1 s budget).
+        var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(10);
+        while (Volatile.Read(ref deletes) == 0 && DateTime.UtcNow < deadline)
+            await Task.Delay(5);
+        Assert.Equal(1, Volatile.Read(ref deletes));
+        Assert.False(waiter.ResponseTask.IsCompleted);
+
+        try
+        {
+            await waiter.DisposeAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(20));
+
+            await Assert.ThrowsAsync<AsyncResponseIndeterminateDeliveryException>(
+                () => waiter.ResponseTask.WaitAsync(TimeSpan.FromSeconds(10)));
+            Assert.Equal(1, Volatile.Read(ref deletes));
+            Assert.Equal(1, _client.SubscriptionDisposeCount);
+        }
+        finally
+        {
+            reconnected.TrySetResult(true);
+        }
+    }
+
     [Fact]
     public async Task WaiterTimeout_RegistrationDeleteWaitingOnAReconnectingConnection_StillSettlesWithinTheDrainBudget()
     {

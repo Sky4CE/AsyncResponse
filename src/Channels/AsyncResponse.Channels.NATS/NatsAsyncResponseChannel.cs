@@ -289,9 +289,10 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
                     // outage. On a lapse registrationDeleted stays unset, and the cleanup core
                     // waits a bounded while more on THIS attempt — never a second delete beside
                     // it — after the waiter is settled, before the stream ends (the attempt never
-                    // faults: it logs its own failure).
-                    var deleteAttempt = DeleteRegistrationAsync();
-                    Volatile.Write(ref drainDelete, deleteAttempt);
+                    // faults: it logs its own failure). A second drain — a dispose arriving while
+                    // the timeout's drain still waits here, with cleanup not yet started — joins
+                    // the same attempt too (see DeleteRegistrationOnceAsync).
+                    var deleteAttempt = DeleteRegistrationOnceAsync();
                     await deleteAttempt.WaitAsync(budget.Token).ConfigureAwait(false);
 
                     // ONE budget for the whole disposal: the latched cleanup below skips its own
@@ -417,6 +418,45 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
             }
         }
 
+        // At most ONE registration delete in flight, whichever path asks — the timeout's drain, a
+        // dispose's drain that overlaps it (the drain is not latched: cleanupStarted stays 0 for as
+        // long as the first one waits on its delete), and the cleanup core all join the attempt
+        // already running. The overlap used to issue a second KV delete beside the first: one
+        // more round trip parked on the connection per disposal during an outage. An attempt that
+        // completed without deleting may be retried by the next caller; a delete that succeeded
+        // is never repeated.
+        Task DeleteRegistrationOnceAsync()
+        {
+            while (true)
+            {
+                if (Volatile.Read(ref registrationDeleted) == 1)
+                    return Task.CompletedTask;
+
+                var current = Volatile.Read(ref drainDelete);
+                if (current is { IsCompleted: false })
+                    return current;
+
+                var attempt = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                if (Interlocked.CompareExchange(ref drainDelete, attempt.Task, current) != current)
+                    continue;
+
+                _ = RunDeleteAttemptAsync(attempt);
+                return attempt.Task;
+            }
+        }
+
+        async Task RunDeleteAttemptAsync(TaskCompletionSource attempt)
+        {
+            try
+            {
+                await DeleteRegistrationAsync().ConfigureAwait(false);
+            }
+            finally
+            {
+                attempt.TrySetResult();
+            }
+        }
+
         async Task CleanupCoreAsync()
         {
             Interlocked.Exchange(ref cleanupStarted, 1);
@@ -442,8 +482,7 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
                 // outcome, and the entry's TTL plus the recovery watchdog back it.
                 if (Volatile.Read(ref registrationDeleted) == 0)
                 {
-                    var pendingDelete = Volatile.Read(ref drainDelete);
-                    var deletion = pendingDelete is { IsCompleted: false } ? pendingDelete : DeleteRegistrationAsync();
+                    var deletion = DeleteRegistrationOnceAsync();
                     try
                     {
                         await deletion.WaitAsync(coreBudget.Token).ConfigureAwait(false);
