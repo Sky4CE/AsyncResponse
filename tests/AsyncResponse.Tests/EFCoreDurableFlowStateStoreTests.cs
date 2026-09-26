@@ -46,6 +46,19 @@ internal sealed class CaseSensitiveFlowDbContext(DbContextOptions<CaseSensitiveF
         => modelBuilder.ConfigureAsyncResponseDurableFlows(flowIdCollation: "Latin1_General_100_CS_AS");
 }
 
+/// <summary>
+/// An application whose global query filter reaches every entity type, the ledger included — the
+/// shape of an app-wide tenant filter. <c>r =&gt; false</c> is its extreme: it hides every row.
+/// </summary>
+internal sealed class QueryFilteredFlowDbContext(DbContextOptions<QueryFilteredFlowDbContext> options) : DbContext(options)
+{
+    protected override void OnModelCreating(ModelBuilder modelBuilder)
+    {
+        modelBuilder.ConfigureAsyncResponseDurableFlows();
+        modelBuilder.Entity<DurableFlowStateRecord>().HasQueryFilter(r => false);
+    }
+}
+
 public sealed class EFCoreDurableFlowStateStoreTests
 {
     [Fact]
@@ -407,6 +420,79 @@ public sealed class EFCoreDurableFlowStateStoreTests
         var loaded = await store.LoadAsync("expired-flow");
         Assert.NotNull(loaded);
         Assert.Equal("replaced", loaded!.LastMessage);
+    }
+
+    [Fact]
+    public async Task EFCoreStore_IgnoresTheApplicationsGlobalQueryFilters()
+    {
+        // Regression: every query went through the application's global query filters. The ledger
+        // is keyed by flow id alone, so an app-wide filter (a tenant filter applied to every entity
+        // type) hid rows written under another tenant: the worker's create hit the primary key of a
+        // row it could not see, its existence check answered "no", and every start job rethrew into
+        // the dead-letter queue. The store's reads, bulk updates/deletes and the prune's subquery
+        // must all see every row.
+        await using var database = new TempSqliteDatabase();
+        await database.EnsureSchemaAsync();
+        var services = new ServiceCollection();
+        services.AddDbContextFactory<QueryFilteredFlowDbContext>(options => options.UseSqlite(database.ConnectionString));
+        await using var provider = services.BuildServiceProvider(new ServiceProviderOptions { ValidateScopes = true });
+        IFlowStateStore store = new EFCoreFlowStateStore<QueryFilteredFlowDbContext>(
+            provider.GetRequiredService<IServiceScopeFactory>(),
+            Options.Create(new EFCoreDurableFlowOptions { PruneInterval = TimeSpan.Zero }));
+
+        var state = CreateState("filtered-flow");
+        Assert.True(await store.TryCreateAsync("filtered-flow", state, TimeSpan.FromMinutes(5)));
+        Assert.NotNull(await store.LoadAsync("filtered-flow"));
+        // A duplicate create is "exists", not the rethrown primary-key violation.
+        Assert.False(await store.TryCreateAsync("filtered-flow", CreateState("filtered-flow"), TimeSpan.FromMinutes(5)));
+
+        Assert.True(await store.TryAcquireLeaseAsync("filtered-flow", "owner", TimeSpan.FromMinutes(1)));
+        Assert.True(await store.TryRenewLeaseAsync("filtered-flow", "owner", TimeSpan.FromMinutes(1)));
+        Assert.Equal("owner", (await store.ObserveLeaseAsync("filtered-flow"))?.LeaseId);
+        state.Revision = 1;
+        Assert.True(await store.TryUpdateAsync("filtered-flow", state, 0, TimeSpan.FromMinutes(5), leaseId: "owner"));
+        await store.ReleaseLeaseAsync("filtered-flow", "owner");
+        Assert.Null((await store.ObserveLeaseAsync("filtered-flow"))?.LeaseId);
+
+        // The prune's batch subquery sees the expired row too.
+        Assert.True(await store.TryCreateAsync("expired-flow", CreateState("expired-flow"), TimeSpan.FromMinutes(5)));
+        await database.ExpireAsync("expired-flow");
+        Assert.True(await store.TryCreateAsync("trigger-flow", CreateState("trigger-flow"), TimeSpan.FromMinutes(5)));
+        Assert.Equal(0, await database.CountRowsAsync("expired-flow"));
+
+        Assert.True(await store.TryDeleteAsync("filtered-flow"));
+        Assert.Equal(0, await database.CountRowsAsync("filtered-flow"));
+    }
+
+    [Fact]
+    public async Task TryCreate_OnATableWithoutARevisionDefault_NamesTheColumnInItsInsert()
+    {
+        // Regression: HasDefaultValue(0L) alone made EF treat revision 0 — every create's — as
+        // database-generated and leave the column out of the INSERT, so a table provisioned the way
+        // the sibling packages document it (revision NOT NULL, no default required) rejected every
+        // new flow with a NOT NULL violation. The mapping keeps the default for migrations; the
+        // INSERT must name the column regardless.
+        await using var database = new TempSqliteDatabase();
+        await database.ExecuteSqlAsync(
+            """
+            CREATE TABLE asyncresponse_flow_state (
+                flow_id TEXT NOT NULL PRIMARY KEY,
+                state_json TEXT NOT NULL,
+                expires_at_utc TEXT NOT NULL,
+                updated_at_utc TEXT NOT NULL,
+                revision INTEGER NOT NULL,
+                lease_id TEXT NULL,
+                lease_expires_at_utc TEXT NULL);
+            """);
+        await using var provider = BuildFactoryProvider(database.ConnectionString);
+        var store = CreateStore(provider, pruneInterval: TimeSpan.FromHours(1));
+
+        Assert.True(await store.TryCreateAsync("fresh-flow", CreateState("fresh-flow"), TimeSpan.FromMinutes(5)));
+        Assert.Equal(0L, (await store.LoadAsync("fresh-flow"))!.Revision);
+
+        // And migrations still emit the default, so existing applications see no schema diff.
+        await using var context = provider.GetRequiredService<IDbContextFactory<TestFlowDbContext>>().CreateDbContext();
+        Assert.Matches(@"""revision"" INTEGER NOT NULL DEFAULT 0", context.Database.GenerateCreateScript());
     }
 
     [Fact]

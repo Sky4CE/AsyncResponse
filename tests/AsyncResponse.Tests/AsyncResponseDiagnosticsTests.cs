@@ -217,6 +217,64 @@ public class AsyncResponseDiagnosticsTests
         Assert.Equal(nameof(IRecoverySpy.OnWorkerJob), Tag(activity, "asyncresponse.worker.method"));
     }
 
+    [Fact]
+    public void SetCorrelationIdAndReplyTarget_TagStreamWrittenTextBoundedAndEscaped()
+    {
+        // Regression: the correlation-id and reply-target tags carried raw stream text. The worker
+        // ingress tags the envelope's id (checked against the portable contract only later, by the
+        // executor) and its reply target (checked only for blankness), and the response ingress
+        // tags the id as extracted, ahead of its routability check — so megabytes of text (the
+        // inbound budget allows 8 Mi characters) and raw line breaks reached the trace backend.
+        using var activity = new Activity("diagnostics").Start();
+
+        AsyncResponseDiagnostics.SetCorrelationId(activity, "corr\r\nFORGED " + new string('c', 1024 * 1024));
+        AsyncResponseDiagnostics.SetReplyTarget(activity, new AsyncResponseReplyTarget
+        {
+            Name = "replies\r\nFORGED " + new string('n', 100_000),
+            Transport = "bus\nFORGED",
+            Address = "test://replies"
+        });
+
+        var id = Assert.IsType<string>(Tag(activity, "asyncresponse.correlation_id"));
+        var name = Assert.IsType<string>(Tag(activity, "asyncresponse.reply_target.name"));
+        var transport = Assert.IsType<string>(Tag(activity, "asyncresponse.reply_target.transport"));
+        foreach (var tag in new[] { id, name, transport })
+        {
+            Assert.DoesNotContain("\r", tag, StringComparison.Ordinal);
+            Assert.DoesNotContain("\n", tag, StringComparison.Ordinal);
+        }
+
+        Assert.True(id.Length < 2_000, $"correlation id tag is {id.Length} characters");
+        Assert.True(name.Length < 2_000, $"reply target name tag is {name.Length} characters");
+
+        // An ordinary value is tagged unchanged — the same instance, nothing allocated.
+        const string ordinaryId = "corr-ordinary-7f3c";
+        AsyncResponseDiagnostics.SetCorrelationId(activity, ordinaryId);
+        Assert.Same(ordinaryId, Tag(activity, "asyncresponse.correlation_id"));
+        AsyncResponseDiagnostics.SetReplyTarget(activity, new AsyncResponseReplyTarget { Name = "default", Transport = "google-pubsub", Address = "a" });
+        Assert.Equal("default", Tag(activity, "asyncresponse.reply_target.name"));
+        Assert.Equal("google-pubsub", Tag(activity, "asyncresponse.reply_target.transport"));
+    }
+
+    [Fact]
+    public async Task ResponseIngress_UnroutableId_IsTaggedBoundedAndEscaped()
+    {
+        // The response ingress starts its activity with the id as extracted, BEFORE the
+        // routability check drops it — the one place a non-portable id reaches a tag.
+        using var collector = new AsyncResponseActivityCollector();
+        await using var provider = CreateProvider();
+        var ingress = provider.GetRequiredService<IAsyncResponseIngress>();
+
+        await ingress.HandleResponseMessageAsync(
+            JsonSerializer.Serialize(new OperationResult { Status = OperationStatus.Completed }),
+            "corr\r\nFORGED " + new string('c', 100_000));
+
+        var activity = Assert.Single(collector.All(), activity => activity.OperationName == "asyncresponse.ingress.response");
+        var id = Assert.IsType<string>(AsyncResponseActivityCollector.Tag(activity, "asyncresponse.correlation_id"));
+        Assert.DoesNotContain("\n", id, StringComparison.Ordinal);
+        Assert.True(id.Length < 2_000, $"correlation id tag is {id.Length} characters");
+    }
+
     private static ServiceProvider CreateProvider()
     {
         var services = new ServiceCollection();

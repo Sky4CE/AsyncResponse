@@ -208,13 +208,18 @@ public class NatsMessageDispatcherTests
     }
 
     [Fact]
-    public async Task FlowHostStopInterruption_WithLiveSubscriberToken_LeavesDeliveryUnsettled()
+    public async Task FlowHostStopInterruption_WithLiveSubscriberToken_HandsTheDeliveryBackAtOnce()
     {
         // The flow engine hands a delivery back on ApplicationStopping, which fires BEFORE any
         // hosted service stops — so the worker subscriber's own token is usually still live when
         // DurableFlowInterruptedException arrives. The old filter keyed on that token only, so the
         // interruption went through HandleFailureAsync: at the cap it dead-lettered and TERMed a
         // healthy flow wake-up (below it, a NAK logged as a handler failure).
+        //
+        // Fixpoint round 2: it was then left UNSETTLED "so a NAK does not hand it back to this
+        // stopping host" — but the latch stops this host's fetching before its next fetch, so the
+        // wake-up sat out a whole AckWait for no remaining reason. It is now latched, then NAKed
+        // with no delay: exactly one immediate hand-back for a live peer, still never a failure.
         var rec = new RecordingDelivery();
         await using var dispatcher = CreateDispatcher(
             (_, _) => throw new DurableFlowInterruptedException("Host is stopping."),
@@ -223,7 +228,7 @@ public class NatsMessageDispatcherTests
         await dispatcher.HandleAsync(rec.Create("payload", numDelivered: 5), CancellationToken.None);
 
         Assert.Equal(0, rec.Acks);
-        Assert.Empty(rec.Naks);
+        Assert.Equal([TimeSpan.Zero], rec.Naks);
         Assert.Equal(0, rec.Terms);
         Assert.Empty(_jetStream.Published);
         Assert.True(dispatcher.HandBackSignalled); // the subscriber stops fetching on it
@@ -254,7 +259,7 @@ public class NatsMessageDispatcherTests
         Assert.Equal("handed_back_after_commit: Host is stopping.", published.Headers!["AR-DeadLetter-Reason"]);
         Assert.Equal(1, rec.Acks); // ACKed at enqueue; never NAKed or TERMed afterwards
         Assert.True(dispatcher.HandBackSignalled);
-        Assert.True(logger.HasEntry(Microsoft.Extensions.Logging.LogLevel.Warning, "Dead-lettering a copy"));
+        Assert.True(logger.HasEntry(Microsoft.Extensions.Logging.LogLevel.Warning, "Dead-lettered a copy"));
         Assert.False(logger.HasEntry(Microsoft.Extensions.Logging.LogLevel.Error, string.Empty));
     }
 
@@ -282,8 +287,31 @@ public class NatsMessageDispatcherTests
         Assert.IsType<DurableFlowInterruptedException>(context.Exception);
         Assert.Empty(_jetStream.Published);
         Assert.True(logger.HasEntry(Microsoft.Extensions.Logging.LogLevel.Error, "no dead-letter destination is configured"));
-        Assert.False(logger.HasEntry(Microsoft.Extensions.Logging.LogLevel.Warning, "Dead-lettering a copy"));
+        Assert.False(logger.HasEntry(Microsoft.Extensions.Logging.LogLevel.Warning, "a copy"));
         Assert.True(dispatcher.HandBackSignalled);
+    }
+
+    [Fact]
+    public async Task EarlyAck_FlowHostStopInterruption_WhenTheDeadLetterWriteFails_LogsTheLossAtError_NotACopy()
+    {
+        // Red-on-old (fixpoint r2 pre-commit, J5): the hand-back logged the Warning "Dead-lettering
+        // a copy … and surfacing via OnBackgroundFailure" BEFORE the write, so a failed write left a
+        // Warning claiming a copy that does not exist, and no line said the wake-up was lost. The
+        // copy is now written first: a failed write is logged at Error (lost unless
+        // OnBackgroundFailure records it) — and the report is still made after it.
+        _jetStream.PublishFailureForAttempt = _ => new InvalidOperationException("dead-letter stream down");
+        var failure = new TaskCompletionSource<NatsBackgroundFailureContext>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var subscriber = new NatsSubscriberOptions { OnBackgroundFailure = ctx => { failure.TrySetResult(ctx); return ValueTask.CompletedTask; } }
+            .UseAckAfterEnqueue(backgroundWorkerCount: 1, backgroundQueueCapacity: 4, backgroundDrainTimeout: TimeSpan.FromSeconds(5));
+        var logger = new RecordingThrowingLogger<NatsMessageDispatcherTests>();
+        await using var dispatcher = CreateDispatcher((_, _) => throw new DurableFlowInterruptedException("Host is stopping."), subscriber, logger: logger);
+
+        await dispatcher.HandleAsync(new RecordingDelivery().Create("payload", numDelivered: 1), CancellationToken.None);
+
+        Assert.IsType<DurableFlowInterruptedException>((await failure.Task.WaitAsync(TimeSpan.FromSeconds(5))).Exception);
+        Assert.Empty(_jetStream.Published);
+        Assert.False(logger.HasEntry(Microsoft.Extensions.Logging.LogLevel.Warning, "a copy"));
+        Assert.True(logger.HasEntry(Microsoft.Extensions.Logging.LogLevel.Error, "the dead-letter write failed, so the wake-up is lost unless OnBackgroundFailure records it"));
     }
 
     [Theory]
@@ -880,6 +908,109 @@ public class NatsMessageDispatcherTests
         Assert.Equal(2, Volatile.Read(ref failures));
 
         release.TrySetResult();
+    }
+
+    [Fact]
+    public async Task DisposeAsync_ASlowOnBackgroundFailureCallback_CannotHoldTheReserve_EveryQueuedEntryIsBuriedFirst()
+    {
+        // The dispose reserve awaited the user's OnBackgroundFailure between burials with no bound:
+        // one slow callback (a write to a database that is down) held DisposeAsync past
+        // BackgroundDrainTimeout, and the entries behind it were neither buried nor counted. Every
+        // entry is now buried first; the reports follow, each bounded by what is left of the reserve.
+        // Wall-clock budget (the dispatcher has no clock seam); the guard below only catches a hang.
+        // A 4 s drain leaves a 1 s reserve for the two synchronous burials (a 250 ms one failed
+        // only on a GC pause or preemption).
+        var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var never = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var callbacks = 0;
+        var subscriber = new NatsSubscriberOptions
+        {
+            OnBackgroundFailure = _ =>
+            {
+                Interlocked.Increment(ref callbacks);
+                return new ValueTask(never.Task);
+            }
+        }.UseAckAfterEnqueue(
+            backgroundWorkerCount: 1,
+            backgroundQueueCapacity: 4,
+            backgroundDrainTimeout: TimeSpan.FromSeconds(4));
+        var logger = new RecordingThrowingLogger<NatsMessageDispatcher>();
+        var dispatcher = CreateDispatcher(
+            async (_, _) =>
+            {
+                started.TrySetResult();
+                await release.Task; // ignores the cancellation, like the real ingress handler
+            },
+            subscriber,
+            logger: logger);
+
+        try
+        {
+            await dispatcher.HandleAsync(new RecordingDelivery().Create("running", 1), CancellationToken.None);
+            await started.Task.WaitAsync(TimeSpan.FromSeconds(2));
+            await dispatcher.HandleAsync(new RecordingDelivery().Create("queued-1", 1), CancellationToken.None);
+            await dispatcher.HandleAsync(new RecordingDelivery().Create("queued-2", 1), CancellationToken.None);
+
+            await dispatcher.DisposeAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(10));
+
+            Assert.Equal(["queued-1", "queued-2"], _jetStream.Published.Select(p => p.Payload).Order().ToArray());
+            Assert.All(_jetStream.Published, p => Assert.Equal(DeadLetterSubject, p.Subject));
+            // The first report outlived the reserve, so the second was never started (on a runner
+            // slow enough to spend the whole reserve on the burials, not even the first).
+            Assert.True(Volatile.Read(ref callbacks) <= 1, $"{callbacks} reports were started past a report that never completed");
+            Assert.True(logger.HasEntry(Microsoft.Extensions.Logging.LogLevel.Error, "did not complete within the reserved"));
+        }
+        finally
+        {
+            never.TrySetResult();
+            release.TrySetResult();
+        }
+    }
+
+    [Fact]
+    public async Task DisposeAsync_WithDeadLetteringDisabled_SaysTheDrainLapsedEntryIsLost_InsteadOfClaimingACopy()
+    {
+        // Honest dead-letter logs: the reserve's routing logged "Dead-lettering and surfacing via
+        // OnBackgroundFailure" whatever DeadLetterEnabled said, and the loss line only counted what
+        // was still queued — with dead-lettering off, an already-ACKed job the reserve read was
+        // gone with a log line claiming a copy. It is now an Error saying the job is lost unless
+        // OnBackgroundFailure records it, and it is counted in the loss line.
+        var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var subscriber = new NatsSubscriberOptions().UseAckAfterEnqueue(
+            backgroundWorkerCount: 1,
+            backgroundQueueCapacity: 4,
+            backgroundDrainTimeout: TimeSpan.FromSeconds(2));
+        var logger = new RecordingThrowingLogger<NatsMessageDispatcher>();
+        var dispatcher = CreateDispatcher(
+            async (_, _) =>
+            {
+                started.TrySetResult();
+                await release.Task;
+            },
+            subscriber,
+            new NatsAsyncResponseTransportOptions { DeadLetterEnabled = false },
+            logger);
+
+        try
+        {
+            await dispatcher.HandleAsync(new RecordingDelivery().Create("running", 1), CancellationToken.None);
+            await started.Task.WaitAsync(TimeSpan.FromSeconds(2));
+            await dispatcher.HandleAsync(new RecordingDelivery().Create("queued", 1), CancellationToken.None);
+
+            await dispatcher.DisposeAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(10));
+
+            Assert.Empty(_jetStream.Published);
+            Assert.True(logger.HasEntry(Microsoft.Extensions.Logging.LogLevel.Error, "no dead-letter destination is configured, so the job is lost unless OnBackgroundFailure records it"));
+            Assert.True(logger.HasEntry(Microsoft.Extensions.Logging.LogLevel.Error, "1 with no dead-letter copy written"));
+            Assert.False(logger.HasEntry(Microsoft.Extensions.Logging.LogLevel.Warning, "Dead-letter"));
+            Assert.False(logger.HasEntry(Microsoft.Extensions.Logging.LogLevel.Warning, "dead-lettering the entries"));
+        }
+        finally
+        {
+            release.TrySetResult();
+        }
     }
 
     [Fact]

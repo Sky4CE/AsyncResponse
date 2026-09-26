@@ -42,16 +42,37 @@ internal abstract class AsyncResponseBuilderBase(
     internal const int MaxRedelayHopGrowth = 24;
 
     /// <summary>
+    /// How much longer an IMMEDIATE envelope can get when the durable-flow engine re-publishes it
+    /// as the same job past a live holder's lease: the <c>"NotBeforeUtc":null</c> measured here
+    /// becomes a round-trip UTC instant, at widest <c>"2026-09-26T12:34:56.1234567Z"</c> — 30
+    /// characters for 4. That hop can then be delivered early and stamped as well
+    /// (<see cref="MaxRedelayHopGrowth"/>).
+    /// </summary>
+    internal const int MaxDueTimeStampGrowth = 26;
+
+    /// <summary>
+    /// The same re-publish for a DELAYED envelope replaces its due time: a whole-second instant
+    /// (<c>"2026-09-26T12:34:56Z"</c>, 22 characters) widens to the full 30. The copy drops any
+    /// stamped remainder, so the early-delivery stamp on the new hop adds at most
+    /// <see cref="MaxRedelayHopGrowth"/> on top.
+    /// </summary>
+    internal const int MaxDueTimeWideningGrowth = 8;
+
+    /// <summary>
     /// Refuses an envelope the consuming ingress would acknowledge without executing. The ingress
     /// compares the delivered JSON's UTF-16 length against <see cref="AsyncResponseOptions.MaxInboundMessageChars"/>
     /// and drops what exceeds it (an oversized message never gets smaller, so redelivery would
     /// hot-loop); without this check the publish succeeded, the caller kept a flow id or a
     /// fire-and-forget "success", and the work silently never ran. Measured exactly — the same
     /// serialization the transports perform — but only when a cheap upper bound says it might
-    /// matter, so the hot path of small jobs pays no extra serialization. A delayed envelope is
-    /// measured as its largest re-published hop (<see cref="MaxRedelayHopGrowth"/>): measured as
-    /// published, one within a few characters of the limit passed here and was then dropped by
-    /// the ingress on the hop that stamped its remaining delay.
+    /// matter, so the hot path of small jobs pays no extra serialization. Every envelope is
+    /// measured as its largest re-published hop: a delayed one gains the remaining delay the
+    /// worker executor stamps on an early delivery (<see cref="MaxRedelayHopGrowth"/>), and any
+    /// job the durable-flow engine re-publishes as itself past a live holder's lease gains a due
+    /// time (<see cref="MaxDueTimeStampGrowth"/>, or <see cref="MaxDueTimeWideningGrowth"/> for
+    /// one that already had one) before that stamp. Measured as published, one within a few
+    /// characters of the limit passed here and was then dropped by the ingress on such a hop —
+    /// for a flow's start or wake-up job, the only copy.
     /// </summary>
     /// <exception cref="WorkerJobTooLargeException">The serialized envelope exceeds the budget.</exception>
     protected void ThrowIfOverInboundBudget(WorkerJobEnvelope envelope)
@@ -59,7 +80,7 @@ internal abstract class AsyncResponseBuilderBase(
         if (_options?.Value.MaxInboundMessageChars is not { } limit)
             return;
 
-        var hopGrowth = envelope.NotBeforeUtc is null ? 0 : MaxRedelayHopGrowth;
+        var hopGrowth = MaxRedelayHopGrowth + (envelope.NotBeforeUtc is null ? MaxDueTimeStampGrowth : MaxDueTimeWideningGrowth);
         if (TryEstimateUpperBound(envelope, out var upperBound) && upperBound + hopGrowth <= limit)
             return;
 
@@ -83,9 +104,10 @@ internal abstract class AsyncResponseBuilderBase(
         if (envelope.ReplyTarget is { } target)
         {
             total += Escaped(target.Name) + Escaped(target.Transport) + Escaped(target.Address);
-            // Null-tolerant: an inbound job's "Properties":null overwrites the initializer, and the
-            // worker executor pushes that target ambiently — every enqueue the handler made (a
-            // flow's own wake-up included) threw NullReferenceException here, on every delivery.
+            // Null-tolerant, as a backstop: the accessor now reads an inbound job's
+            // "Properties":null back as an empty map, but before it did, the worker executor pushed
+            // that target ambiently and every enqueue the handler made (a flow's own wake-up
+            // included) threw NullReferenceException here, on every delivery.
             if (target.Properties is { } properties)
             {
                 foreach (var (key, value) in properties)
@@ -561,24 +583,42 @@ internal sealed class RecoverableAsyncResponseBuilder<T> :
 
     // Validated at registration, like the expression overloads' binding check: a malformed
     // descriptor persisted into the recovery row can never be invoked when the response arrives.
-    private void SetResumeCallback(ReflectionCallDto callback)
+    private void SetResumeCallback(ReflectionCallDto callback, bool callerOwned = false)
     {
         ReflectionCallDtoGuard.ThrowIfMalformed(callback, nameof(callback));
-        _resumeCallback = callback;
+        _resumeCallback = callerOwned ? CopyOf(callback) : callback;
     }
 
-    private void SetFailureCallback(ReflectionCallDto callback)
+    private void SetFailureCallback(ReflectionCallDto callback, bool callerOwned = false)
     {
         ReflectionCallDtoGuard.ThrowIfMalformed(callback, nameof(callback));
-        _failureCallback = callback;
+        _failureCallback = callerOwned ? CopyOf(callback) : callback;
     }
+
+    // A descriptor the CALLER handed in is copied — the descriptor, its Params array and each
+    // CallbackParam — because the in-memory recovery store keeps what it is given by reference
+    // (a durable store serializes it at save). A caller reusing one template, setting
+    // Params[0].Value before each registration, otherwise left every in-memory registration
+    // aliasing that one object: after a restart each late response resumed with the LAST value,
+    // in tests only. The expression overloads build a fresh descriptor nothing else holds, so
+    // they (and the flow engine) skip the copy.
+    private static ReflectionCallDto CopyOf(ReflectionCallDto callback) => new()
+    {
+        ServiceInterfaceFullName = callback.ServiceInterfaceFullName,
+        MethodName = callback.MethodName,
+        Params = Array.ConvertAll(callback.Params, static parameter => new CallbackParam
+        {
+            Placeholder = parameter.Placeholder,
+            Value = parameter.Value
+        })
+    };
 
     [RequiresUnreferencedCode("The callback names its target service and method as strings, resolved by reflection when it fires after a " +
                               "subscriber loss; trimming may have removed them. Use the expression-based overload, which roots the service's " +
                               "public methods automatically.")]
     IRecoverableAsyncResponseAttachedBuilder<T> IRecoverableAsyncResponseAttachedBuilder<T>.OnLostSubscriberResume(ReflectionCallDto callback)
     {
-        SetResumeCallback(callback);
+        SetResumeCallback(callback, callerOwned: true);
         return this;
     }
 
@@ -593,7 +633,7 @@ internal sealed class RecoverableAsyncResponseBuilder<T> :
                               "public methods automatically.")]
     IRecoverableAsyncResponseAttachedBuilder<T> IRecoverableAsyncResponseAttachedBuilder<T>.OnLostSubscriberFailure(ReflectionCallDto callback)
     {
-        SetFailureCallback(callback);
+        SetFailureCallback(callback, callerOwned: true);
         return this;
     }
 
@@ -644,7 +684,7 @@ internal sealed class RecoverableAsyncResponseBuilder<T> :
                               "public methods automatically.")]
     IRecoverableAsyncResponseTriggeredBuilder<T> IRecoverableAsyncResponseTriggeredBuilder<T>.OnLostSubscriberResume(ReflectionCallDto callback)
     {
-        SetResumeCallback(callback);
+        SetResumeCallback(callback, callerOwned: true);
         return this;
     }
 
@@ -659,7 +699,7 @@ internal sealed class RecoverableAsyncResponseBuilder<T> :
                               "public methods automatically.")]
     IRecoverableAsyncResponseTriggeredBuilder<T> IRecoverableAsyncResponseTriggeredBuilder<T>.OnLostSubscriberFailure(ReflectionCallDto callback)
     {
-        SetFailureCallback(callback);
+        SetFailureCallback(callback, callerOwned: true);
         return this;
     }
 

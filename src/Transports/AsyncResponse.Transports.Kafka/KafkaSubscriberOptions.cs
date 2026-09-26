@@ -162,8 +162,11 @@ public sealed class KafkaSubscriberOptions
     /// Maximum gap between consumer polls before the broker evicts this consumer from its group
     /// and rebalances its partitions (the librdkafka <c>max.poll.interval.ms</c>). The poll thread's
     /// longest gap is one inline handler wait (<see cref="DetachHandlerAfter"/>) plus one poll
-    /// (<see cref="PollTimeout"/>), and validation requires that sum to fit within half this
-    /// interval; handler execution time itself is unbounded and no longer counts, because a
+    /// (<see cref="PollTimeout"/>), and validation requires that sum to fit within half the
+    /// interval the consumer runs with — this value, unless
+    /// <see cref="KafkaAsyncResponseTransportOptions.ConfigureConsumer"/> sets
+    /// <c>max.poll.interval.ms</c> itself, which then also bounds every dead-letter produce (to a
+    /// quarter of it); handler execution time itself is unbounded and no longer counts, because a
     /// handler that outlives the inline budget is detached while polling continues. Default:
     /// <c>5 minutes</c> (the librdkafka default).
     /// </summary>

@@ -42,6 +42,14 @@ internal abstract class KafkaSubscriberService : BackgroundService
     protected abstract string ConsumerGroup { get; }
     protected abstract KafkaSubscriberOptions SubscriberOptions { get; }
     protected abstract KafkaSubscriberRole SubscriberRole { get; }
+
+    /// <summary>
+    /// The host-stop signal the subscriber stops taking new deliveries at (see
+    /// <see cref="WorkerIntakeGate"/>): the worker role only — a response subscriber keeps
+    /// delivering to the waiters host stop deliberately does not interrupt.
+    /// </summary>
+    protected virtual WorkerIntakeGate? IntakeGate => null;
+
     /// <summary>Handles the delivered message.</summary>
     protected abstract Task HandleMessageAsync(KafkaDelivery delivery, CancellationToken cancellationToken);
 
@@ -77,13 +85,15 @@ internal abstract class KafkaSubscriberService : BackgroundService
                 failures,
                 Options.SubscriberRetryBaseDelay,
                 Options.SubscriberRetryMaxDelay),
-            (ex, retryDelay) => Logger.LogWarning(
+            // Guarded: a throwing logging provider escaping this callback ended the supervisor —
+            // and with it the subscriber — instead of retrying.
+            (ex, retryDelay) => SafeLog.Try(() => Logger.LogWarning(
                 ex,
                 "Kafka subscriber failed for topic {Topic} ({Role}); retrying in {RetryDelay}.",
                 Topic,
                 SubscriberRole,
-                retryDelay),
-            healthyRunThreshold: Options.SubscriberRetryMaxDelay).ConfigureAwait(false);
+                retryDelay)),
+            healthyRunThreshold: AsyncResponseRetry.MaxAttainableDelay(Options.SubscriberRetryBaseDelay, Options.SubscriberRetryMaxDelay)).ConfigureAwait(false);
     }
 
     private KafkaMessageDispatcher CreateDispatcher(IKafkaConsumerClient? consumer)
@@ -96,7 +106,8 @@ internal abstract class KafkaSubscriberService : BackgroundService
             Logger,
             Topic,
             ConsumerGroup,
-            SubscriberRole);
+            SubscriberRole,
+            IntakeGate);
 
     private async Task RunSubscriberAsync(KafkaMessageDispatcher? serviceDispatcher, CancellationToken stoppingToken)
     {
@@ -120,12 +131,12 @@ internal abstract class KafkaSubscriberService : BackgroundService
             // the attempt ends (released before the consumer closes).
             using var attached = serviceDispatcher?.AttachConsumer(consumer);
 
-            Logger.LogInformation(
+            SafeLog.Try(() => Logger.LogInformation(
                 "Kafka subscriber started. Topic: {Topic}. Group: {ConsumerGroup}. Role: {Role}. AckMode: {AckMode}.",
                 Topic,
                 ConsumerGroup,
                 SubscriberRole,
-                SubscriberOptions.AckMode);
+                SubscriberOptions.AckMode));
 
             var faulted = false;
             try
@@ -180,6 +191,7 @@ internal abstract class KafkaSubscriberService : BackgroundService
         CancellationToken stoppingToken)
     {
         var paused = false;
+        var intakeStopLogged = false;
         while (!stoppingToken.IsCancellationRequested)
         {
             // Handlers that outlived their inline budget are settled here, on the poll thread —
@@ -190,25 +202,40 @@ internal abstract class KafkaSubscriberService : BackgroundService
             KafkaIncomingMessage? message;
             if (!dispatcher.CanAcceptMore)
             {
-                // Backpressure: stop fetching from the assigned partitions while the bounded
-                // in-process queue is saturated. Keep calling Consume so the broker still sees the
-                // consumer polling (max.poll.interval.ms) and rebalance callbacks keep firing.
-                // Re-assert the pause on EVERY saturated tick, not only on the edge: Pause()
-                // snapshots the CURRENT assignment, and a rebalance during backpressure hands this
-                // member partitions with their pause state reset — an edge-triggered pause would
-                // leave those fetching into the full queue and park the poll thread on the bounded
-                // write. Pause is a local librdkafka call (no broker round trip), so the per-tick
-                // re-assert is cheap.
+                // Backpressure — the bounded in-process queue is saturated — or host stop (the
+                // worker's intake gate closed, and nothing lifts it again): stop fetching from the
+                // assigned partitions. Keep calling Consume so the broker still sees the consumer
+                // polling (max.poll.interval.ms) and rebalance callbacks keep firing.
+                // Re-assert the pause on EVERY such tick, not only on the edge: Pause() snapshots
+                // the CURRENT assignment, and a partition this member gains meanwhile (from a peer
+                // leaving the group) arrives unpaused — an edge-triggered pause would leave it
+                // fetching into the full queue and park the poll thread on the bounded write. (A
+                // partition the pause already covered keeps it across a revoke and a
+                // re-assignment: librdkafka holds an application pause on the partition, and the
+                // adapter lifts it on one that comes back after the resume below.) Pause is a
+                // local librdkafka call (no broker round trip), so the per-tick re-assert is cheap.
                 consumer.PauseAssignment();
-                if (!paused)
+                if (dispatcher.IntakeClosed && !intakeStopLogged)
                 {
-                    paused = true;
-                    Logger.LogDebug(
+                    intakeStopLogged = true;
+                    SafeLog.Try(() => Logger.LogInformation(
+                        "Kafka worker subscriber for {Topic} stopped taking new deliveries: the host is stopping. Its assignment is paused and the consumer keeps polling until the subscriber stops; anything consumed from here on is left unsettled for the partition's next owner.",
+                        Topic));
+                }
+                else if (!paused)
+                {
+                    SafeLog.Try(() => Logger.LogDebug(
                         "Kafka subscriber for {Topic} paused its assignment: the in-process queue is full.",
-                        Topic);
+                        Topic));
                 }
 
-                message = consumer.Consume(SubscriberOptions.BackpressurePollDelay);
+                paused = true;
+
+                // Once the host is stopping and nothing detached is left to settle, nothing can
+                // lift the pause any more: a full poll timeout per tick keeps the member alive.
+                message = consumer.Consume(dispatcher.IntakeClosed && !dispatcher.HasDetachedWork
+                    ? SubscriberOptions.PollTimeout
+                    : SubscriberOptions.BackpressurePollDelay);
             }
             else
             {
@@ -216,9 +243,9 @@ internal abstract class KafkaSubscriberService : BackgroundService
                 {
                     consumer.ResumeAssignment();
                     paused = false;
-                    Logger.LogDebug(
+                    SafeLog.Try(() => Logger.LogDebug(
                         "Kafka subscriber for {Topic} resumed its assignment: in-process queue capacity freed.",
-                        Topic);
+                        Topic));
                 }
 
                 // With detached handlers in flight, poll in short slices so a completion is
@@ -231,6 +258,24 @@ internal abstract class KafkaSubscriberService : BackgroundService
 
             if (message is null)
                 continue;
+
+            if (dispatcher.IntakeClosed)
+            {
+                // Consumed after host stop began — fetched before the pause took hold, or in the
+                // very poll the gate closed during. Neither started nor settled: its offset is not
+                // stored (and nothing later of its partition is, since nothing more is taken), so
+                // the partition's next owner redelivers it. Taken, early ACK committed it at
+                // enqueue, and a flow wake-up — the very kind this host's own timer hand-overs just
+                // published for a live replica — ran into the stopping host's hand-back and became
+                // a dead-letter copy stranding its flow; under ack-after-handler it spent a
+                // delivery and made the graceful stop wait for it.
+                SafeLog.Try((Logger, Message: message), static state => state.Logger.LogDebug(
+                    "Kafka message {Topic}[{Partition}]@{Offset} was consumed after the host began stopping; left unsettled for the partition's next owner.",
+                    state.Message.Topic,
+                    state.Message.Partition,
+                    state.Message.Offset));
+                continue;
+            }
 
             KafkaDelivery delivery;
             try
@@ -315,11 +360,11 @@ internal abstract class KafkaSubscriberService : BackgroundService
         }
         catch (Exception ex)
         {
-            Logger.LogWarning(
+            SafeLog.Try(() => Logger.LogWarning(
                 ex,
                 "Kafka consumer for topic {Topic} ({Role}) failed to close cleanly; uncommitted offsets will be redelivered.",
                 Topic,
-                SubscriberRole);
+                SubscriberRole));
         }
     }
 }
@@ -328,6 +373,7 @@ internal sealed class KafkaWorkerSubscriber : KafkaSubscriberService
 {
     private readonly IAsyncResponseIngress _ingress;
     private readonly KafkaTransportTopicSchema _topics;
+    private readonly WorkerIntakeGate _intakeGate;
 
     /// <summary>Runs the KafkaWorkerSubscriber operation.</summary>
     public KafkaWorkerSubscriber(
@@ -336,17 +382,20 @@ internal sealed class KafkaWorkerSubscriber : KafkaSubscriberService
         IKafkaProducerClient producer,
         IKafkaAdminClient adminClient,
         IAsyncResponseIngress ingress,
-        ILogger<KafkaWorkerSubscriber> logger)
+        ILogger<KafkaWorkerSubscriber> logger,
+        IHostApplicationLifetime? hostLifetime = null)
         : base(options, consumerFactory, producer, adminClient, logger)
     {
         _ingress = ingress;
         _topics = new KafkaTransportTopicSchema(options.Value);
+        _intakeGate = new WorkerIntakeGate(hostLifetime);
     }
 
     protected override string Topic => _topics.WorkerTopic;
     protected override string ConsumerGroup => Options.WorkerConsumerGroup;
     protected override KafkaSubscriberOptions SubscriberOptions => Options.WorkerSubscriber;
     protected override KafkaSubscriberRole SubscriberRole => KafkaSubscriberRole.Worker;
+    protected override WorkerIntakeGate IntakeGate => _intakeGate;
 
     /// <summary>Handles the delivered message.</summary>
     protected override Task HandleMessageAsync(KafkaDelivery delivery, CancellationToken cancellationToken)

@@ -94,8 +94,8 @@ public sealed class DbTransportSharedCoverageTests
 
     /// <summary>
     /// The retry is "until it succeeds or the fence is lost": a store that keeps failing is retried
-    /// on the short backoff — several attempts inside one lease — and the loop stops for good once
-    /// the renew reports that the <c>lock_id</c> no longer matches.
+    /// on the backoff that starts short — several attempts inside one lease — and the loop stops for
+    /// good once the renew reports that the <c>lock_id</c> no longer matches.
     /// </summary>
     [Theory]
     [InlineData(Provider.SqlServer)]
@@ -115,8 +115,9 @@ public sealed class DbTransportSharedCoverageTests
             var handling = handle(CancellationToken.None);
             try
             {
-                // Beat at 10 s, then four retries a second apart, then the fence-lost answer:
-                // five renew calls, all inside the one lease (at the old cadence there were two).
+                // Beat at 10 s, then four retries on the backoff (half-jittered 1, 2, 4 and 8 s
+                // steps: the fourth lands by 25 s), then the fence-lost answer: five renew calls,
+                // all inside the one lease (at the LockTimeout/2 cadence there were two).
                 await WalkAsync(clock, lockTimeout - TimeSpan.FromSeconds(1), until: () => Volatile.Read(ref calls.Renew) >= 5);
                 Assert.Equal(5, Volatile.Read(ref calls.Renew));
                 await Eventually(() => logger.Messages.Any(message => message.Contains("was lost", StringComparison.Ordinal)));
@@ -133,6 +134,86 @@ public sealed class DbTransportSharedCoverageTests
                 await handling.WaitAsync(TimeSpan.FromSeconds(30));
             }
         }
+    }
+
+    /// <summary>
+    /// Regression (fixpoint round 2, S1#6): a failed renew was retried at a FIXED second (or
+    /// LockTimeout/10) for as long as the store kept failing — past <c>locked_until</c> too — so a
+    /// database outage had every in-flight delivery renewing once a second: about twentyfold the
+    /// healthy renewal load, exactly while the store was down. The retries now back off
+    /// (half-jittered, doubling up to the beat interval). Virtual clock: three leases' worth of a
+    /// store that never answers.
+    /// </summary>
+    [Theory]
+    [InlineData(Provider.SqlServer)]
+    [InlineData(Provider.PostgreSql)]
+    [InlineData(Provider.MongoDb)]
+    public async Task LeaseRenewal_ARunOfFailures_BacksOffInsteadOfRetryingEverySecond(Provider provider)
+    {
+        var lockTimeout = TimeSpan.FromSeconds(30);
+        var clock = new VirtualTimeProvider();
+        var calls = new Calls { RenewThrows = true };
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var (dispatcher, handle) = CreateInlineDispatcher(provider, calls, () => release.Task, lockTimeout, clock, new CollectingLogger());
+
+        await using (dispatcher)
+        {
+            var handling = handle(CancellationToken.None);
+            try
+            {
+                // 90 s: the fixed cadence renews ~80 times (every second from the first beat on);
+                // the backoff at most ~20 (1, 2, 4, 8 s, one just before the lease ends, then every
+                // 5-10 s).
+                await WalkAsync(clock, TimeSpan.FromSeconds(90));
+                var renews = Volatile.Read(ref calls.Renew);
+                Assert.True(renews <= 25, $"{renews} renew attempts in 90 s of failures — the retry is not backing off");
+                Assert.True(renews >= 6, $"only {renews} renew attempts in 90 s of failures — the retry stopped");
+            }
+            finally
+            {
+                release.TrySetResult();
+                await handling.WaitAsync(TimeSpan.FromSeconds(30));
+            }
+        }
+    }
+
+    /// <summary>
+    /// The backoff never skips the end of the lease: while the lease is in hand, one retry always
+    /// lands a <c>retryInterval</c> short of it, so an outage that clears anywhere inside the lease
+    /// still renews it in time — the doubling alone would jump from ~25 s straight past the 30 s
+    /// <c>locked_until</c> and let a peer re-claim the row under a healthy handler.
+    /// </summary>
+    [Theory]
+    [InlineData(Provider.SqlServer)]
+    [InlineData(Provider.PostgreSql)]
+    [InlineData(Provider.MongoDb)]
+    public async Task LeaseRenewal_AnOutageThatClearsJustBeforeTheLeaseEnds_StillRenewsInsideIt(Provider provider)
+    {
+        var lockTimeout = TimeSpan.FromSeconds(30);
+        var clock = new VirtualTimeProvider();
+        var start = clock.GetTimestamp();
+        var calls = new Calls { RenewFailsWhile = () => clock.GetElapsedTime(start) < TimeSpan.FromSeconds(28.5) };
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var (dispatcher, handle) = CreateInlineDispatcher(provider, calls, () => release.Task, lockTimeout, clock, new CollectingLogger());
+
+        await using (dispatcher)
+        {
+            var handling = handle(CancellationToken.None);
+            try
+            {
+                await WalkAsync(clock, lockTimeout - TimeSpan.FromSeconds(0.5), until: () => Volatile.Read(ref calls.RenewSucceeded) >= 1);
+                Assert.True(
+                    Volatile.Read(ref calls.RenewSucceeded) >= 1,
+                    $"the outage cleared at 28.5 s but no renew landed before the 30 s lease ended ({Volatile.Read(ref calls.Renew)} attempts)");
+            }
+            finally
+            {
+                release.TrySetResult();
+                await handling.WaitAsync(TimeSpan.FromSeconds(30));
+            }
+        }
+
+        Assert.Equal(1, calls.Ack);
     }
 
     /// <summary>
@@ -670,6 +751,599 @@ public sealed class DbTransportSharedCoverageTests
         Assert.DoesNotContain(log.Messages, message => message.Contains("background handler failed", StringComparison.Ordinal));
     }
 
+    /// <summary>
+    /// Regression (fixpoint round 2): with <c>DeadLetterEnabled = false</c> every store reports a
+    /// burial as done without writing anything, so an early-ACK hand-back logged "Dead-lettered a
+    /// copy" at Warning — a copy that does not exist — and never the loss Error; the drain-lapse and
+    /// attempt-cap lines claimed "dead-lettering" too. Each now says no copy was written.
+    /// </summary>
+    [Theory]
+    [InlineData(Provider.SqlServer)]
+    [InlineData(Provider.PostgreSql)]
+    [InlineData(Provider.MongoDb)]
+    public async Task DeadLetteringDisabled_EarlyAckAndCapLogs_ClaimNoCopy(Provider provider)
+    {
+        // Hand-back after the early ACK.
+        var handBackLog = new CollectingLogger();
+        var handBackCalls = new Calls();
+        var handBackFailures = 0;
+        var (handBack, handleHandBack) = CreateEarlyAckDispatcher(
+            provider,
+            handBackCalls,
+            handler: _ => throw new DurableFlowInterruptedException("The host is stopping; the delivery is handed back."),
+            onBackgroundFailure: () => Interlocked.Increment(ref handBackFailures),
+            drain: TimeSpan.FromSeconds(5),
+            log: handBackLog,
+            deadLetterEnabled: false);
+        await using (handBack)
+        {
+            await handleHandBack(CancellationToken.None);
+            await Eventually(() => Volatile.Read(ref handBackFailures) == 1);
+        }
+
+        Assert.DoesNotContain(handBackLog.Messages, message => message.Contains("Dead-lettered a copy", StringComparison.Ordinal));
+        Assert.Contains(handBackLog.Messages, message => message.Contains("no dead-letter copy was written (DeadLetterEnabled is false)", StringComparison.Ordinal)
+            && message.Contains("resume the flow explicitly", StringComparison.Ordinal));
+
+        // Drain-budget lapse: the queued entry is routed, not started — and not claimed as buried.
+        var lapseLog = new CollectingLogger();
+        var lapseCalls = new Calls();
+        var lapseFailures = 0;
+        var releaseFirst = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var (lapse, handleLapse) = CreateEarlyAckDispatcher(
+            provider,
+            lapseCalls,
+            handler: _ => releaseFirst.Task,
+            onBackgroundFailure: () => Interlocked.Increment(ref lapseFailures),
+            drain: TimeSpan.FromMilliseconds(50),
+            log: lapseLog,
+            deadLetterEnabled: false);
+        try
+        {
+            await handleLapse(CancellationToken.None);
+            await handleLapse(CancellationToken.None);
+            await lapse.DisposeAsync();
+        }
+        finally
+        {
+            releaseFirst.TrySetResult();
+        }
+
+        await Eventually(() => Volatile.Read(ref lapseFailures) >= 1);
+        Assert.DoesNotContain(lapseLog.Messages, message => message.Contains("Dead-letter", StringComparison.Ordinal));
+        Assert.Contains(lapseLog.Messages, message => message.Contains("no dead-letter copy is written (DeadLetterEnabled is false)", StringComparison.Ordinal));
+
+        // Attempt cap on the inline path: the store drops the row, and the line says so.
+        var capLog = new CollectingLogger();
+        await RunAsync(
+            provider,
+            capLog,
+            lockTimeout: TimeSpan.FromSeconds(30),
+            calls: new Calls(),
+            handler: static () => throw new InvalidOperationException("handler blew up"),
+            maxDeliveryAttempts: 1,
+            deadLetterEnabled: false);
+
+        Assert.DoesNotContain(capLog.Messages, message => message.Contains("dead-lettering", StringComparison.Ordinal));
+        Assert.Contains(capLog.Messages, message => message.Contains("no dead-letter copy is written", StringComparison.Ordinal));
+    }
+
+    /// <summary>
+    /// Fixpoint r2 precommit E4: the dispose drain's own lines still claimed dead-lettering with
+    /// <c>DeadLetterEnabled = false</c> — "dead-lettering the entries still queued", "did not finish
+    /// dead-lettering the undrained entries", "were not all dead-lettered" — telling operators copies
+    /// were being written when none were. Each now branches on the option. Pre-fix: all three lines
+    /// said "dead-letter…".
+    /// </summary>
+    [Theory]
+    [InlineData(Provider.SqlServer)]
+    [InlineData(Provider.PostgreSql)]
+    [InlineData(Provider.MongoDb)]
+    public async Task DeadLetteringDisabled_DisposeDrainLines_ClaimNoCopy(Provider provider)
+    {
+        // Drain lapse, then the routing reserve lapses too: the worker is still inside the first
+        // handler, so the queued entry cannot be routed within the reserve.
+        var lapseLog = new CollectingLogger();
+        var releaseFirst = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var firstRunning = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var (lapse, handleLapse) = CreateEarlyAckDispatcher(
+            provider,
+            new Calls(),
+            handler: _ =>
+            {
+                firstRunning.TrySetResult();
+                return releaseFirst.Task;
+            },
+            onBackgroundFailure: static () => { },
+            drain: TimeSpan.FromMilliseconds(50),
+            log: lapseLog,
+            deadLetterEnabled: false);
+        try
+        {
+            await handleLapse(CancellationToken.None);
+            await firstRunning.Task.WaitAsync(TimeSpan.FromSeconds(30));
+            await handleLapse(CancellationToken.None);
+            await lapse.DisposeAsync();
+        }
+        finally
+        {
+            releaseFirst.TrySetResult();
+        }
+
+        Assert.Contains(lapseLog.Messages, message => message.Contains("did not drain within", StringComparison.Ordinal)
+            && message.Contains("without a dead-letter copy (DeadLetterEnabled is false)", StringComparison.Ordinal));
+        Assert.Contains(lapseLog.Messages, message => message.Contains("did not finish reporting the undrained entries", StringComparison.Ordinal));
+        Assert.DoesNotContain(lapseLog.Messages, message => message.Contains("dead-lettering", StringComparison.Ordinal));
+
+        // Every worker faulted, and routing what they left queued outruns the reserve.
+        var strandedLog = new CollectingLogger();
+        var strandedCalls = new Calls { DeadLetterDelay = TimeSpan.FromSeconds(5) };
+        var strandedRunning = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseStranded = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var (stranded, handleStranded) = CreateEarlyAckDispatcher(
+            provider,
+            strandedCalls,
+            handler: async _ =>
+            {
+                strandedRunning.TrySetResult();
+                await releaseStranded.Task;
+            },
+            onBackgroundFailure: static () => { },
+            drain: TimeSpan.FromMilliseconds(200),
+            log: strandedLog,
+            deadLetterEnabled: false);
+        try
+        {
+            await handleStranded(CancellationToken.None);
+            await strandedRunning.Task.WaitAsync(TimeSpan.FromSeconds(30));
+            await handleStranded(CancellationToken.None);
+            var workers = (Task[])stranded.GetType().BaseType!
+                .GetField("_backgroundWorkers", BindingFlags.Instance | BindingFlags.NonPublic)!
+                .GetValue(stranded)!;
+            workers[0] = Task.FromException(new InvalidOperationException("worker died"));
+            await stranded.DisposeAsync();
+        }
+        finally
+        {
+            releaseStranded.TrySetResult();
+        }
+
+        Assert.Contains(strandedLog.Messages, message => message.Contains("were not all reported within", StringComparison.Ordinal));
+        Assert.DoesNotContain(strandedLog.Messages, message => message.Contains("dead-lettered within", StringComparison.Ordinal));
+    }
+
+    /// <summary>
+    /// Regression (fixpoint round 2, S9#1): the database worker subscribers kept claiming after host
+    /// stop began, so a claim that landed as <c>ApplicationStopping</c> fired was started (and run up
+    /// to its first flow wait, then handed back with its lock held until the lease lapsed) or, under
+    /// early ACK, settled at enqueue. Once the host is stopping the dispatcher now hands such a
+    /// delivery straight back — an immediate NAK, never started, never acknowledged.
+    /// </summary>
+    [Theory]
+    [InlineData(Provider.SqlServer, false)]
+    [InlineData(Provider.PostgreSql, false)]
+    [InlineData(Provider.MongoDb, false)]
+    [InlineData(Provider.SqlServer, true)]
+    [InlineData(Provider.PostgreSql, true)]
+    [InlineData(Provider.MongoDb, true)]
+    public async Task HostStop_AClaimThatLandsAfterIt_IsHandedBackUnstarted(Provider provider, bool earlyAck)
+    {
+        using var host = new DurableFlowContextTestSupport.StoppingHost();
+        host.StopApplication();
+        var calls = new Calls();
+        var runs = 0;
+
+        await RunAsync(
+            provider,
+            new CollectingLogger(),
+            lockTimeout: TimeSpan.FromSeconds(30),
+            calls: calls,
+            handler: () => { Interlocked.Increment(ref runs); return Task.CompletedTask; },
+            earlyAck: earlyAck,
+            hostStopping: host.ApplicationStopping);
+
+        Assert.Equal(0, Volatile.Read(ref runs));
+        Assert.Equal(0, calls.Ack);
+        Assert.Equal(1, calls.Nak);
+        Assert.Equal(TimeSpan.Zero, calls.LastNakDelay);
+    }
+
+    /// <summary>
+    /// Regression (fixpoint round 2, S9#1): a claim parked on a full early-ACK queue kept waiting
+    /// through host stop — until the subscriber's own stop, which comes last — and was then either
+    /// enqueued and settled (a slot freed) or released with the full <c>RedeliveryDelay</c>. Host
+    /// stop now ends the park at once and releases the claim with no delay, for a live replica.
+    /// </summary>
+    [Theory]
+    [InlineData(Provider.SqlServer)]
+    [InlineData(Provider.PostgreSql)]
+    [InlineData(Provider.MongoDb)]
+    public async Task HostStop_EndsTheEarlyAckPark_AndReleasesTheClaimWithoutDelay(Provider provider)
+    {
+        using var host = new DurableFlowContextTestSupport.StoppingHost();
+        var calls = new Calls();
+        var firstRunning = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseFirst = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var (dispatcher, handle) = CreateEarlyAckDispatcher(
+            provider,
+            calls,
+            handler: async _ =>
+            {
+                firstRunning.TrySetResult();
+                await releaseFirst.Task;
+            },
+            onBackgroundFailure: static () => { },
+            drain: TimeSpan.FromSeconds(10),
+            queueCapacity: 1,
+            clock: new VirtualTimeProvider(),
+            hostStopping: host.ApplicationStopping);
+
+        try
+        {
+            // The first delivery occupies the single worker, the second fills the one-slot queue,
+            // the third parks.
+            await handle(CancellationToken.None);
+            await firstRunning.Task.WaitAsync(TimeSpan.FromSeconds(30));
+            await handle(CancellationToken.None);
+            var parked = handle(CancellationToken.None);
+            Assert.False(parked.IsCompleted);
+
+            host.StopApplication();
+            var released = await Task.WhenAny(parked, Task.Delay(TimeSpan.FromSeconds(10))) == parked;
+            Assert.True(released, "the parked claim kept waiting for a queue slot after host stop began");
+            await parked;
+
+            Assert.Equal(2, calls.Ack);
+            Assert.Equal(1, calls.Nak);
+            Assert.Equal(TimeSpan.Zero, calls.LastNakDelay);
+        }
+        finally
+        {
+            releaseFirst.TrySetResult();
+            await dispatcher.DisposeAsync();
+        }
+    }
+
+    /// <summary>
+    /// Fixpoint r2 precommit E3: a queue slot can free in the same instant ApplicationStopping
+    /// fires, and the park's wait then completes TRUE rather than cancelled — the loop judged only
+    /// the lease before writing, so the delivery was enqueued and early-ACKed on a stopping host
+    /// (and then handed back into a dead-letter copy at its first flow wait). The clock hook stops
+    /// the host exactly there: the park's lease check (between the slot freeing and the write) is the
+    /// first clock read once the hook is armed. Pre-fix: three ACKs, no NAK.
+    /// </summary>
+    [Theory]
+    [InlineData(Provider.SqlServer)]
+    [InlineData(Provider.PostgreSql)]
+    [InlineData(Provider.MongoDb)]
+    public async Task HostStop_LandingAsTheParkedSlotFrees_ReleasesTheClaimInsteadOfEnqueueingIt(Provider provider)
+    {
+        using var host = new DurableFlowContextTestSupport.StoppingHost();
+        var clock = new ClockReadHook(new VirtualTimeProvider());
+        var calls = new Calls();
+        var firstRunning = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseFirst = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var runs = 0;
+        var (dispatcher, handle) = CreateEarlyAckDispatcher(
+            provider,
+            calls,
+            handler: async _ =>
+            {
+                if (Interlocked.Increment(ref runs) == 1)
+                {
+                    firstRunning.TrySetResult();
+                    await releaseFirst.Task;
+                }
+            },
+            onBackgroundFailure: static () => { },
+            drain: TimeSpan.FromSeconds(10),
+            queueCapacity: 1,
+            clock: clock,
+            hostStopping: host.ApplicationStopping);
+
+        try
+        {
+            await handle(CancellationToken.None);
+            await firstRunning.Task.WaitAsync(TimeSpan.FromSeconds(30));
+            await handle(CancellationToken.None);
+            var parked = handle(CancellationToken.None);
+            Assert.False(parked.IsCompleted);
+
+            clock.OnNextRead = host.StopApplication;
+            releaseFirst.TrySetResult();
+            await parked.WaitAsync(TimeSpan.FromSeconds(30));
+
+            Assert.True(host.ApplicationStopping.IsCancellationRequested);
+            Assert.Equal(2, calls.Ack);
+            Assert.Equal(1, calls.Nak);
+            Assert.Equal(TimeSpan.Zero, calls.LastNakDelay);
+        }
+        finally
+        {
+            releaseFirst.TrySetResult();
+            await dispatcher.DisposeAsync();
+        }
+    }
+
+    /// <summary>A clock that runs a one-shot hook on its next timestamp read, then delegates.</summary>
+    private sealed class ClockReadHook(VirtualTimeProvider inner) : TimeProvider
+    {
+        public Action? OnNextRead;
+
+        public override long GetTimestamp()
+        {
+            Interlocked.Exchange(ref OnNextRead, null)?.Invoke();
+            return inner.GetTimestamp();
+        }
+
+        public override long TimestampFrequency => inner.TimestampFrequency;
+
+        public override DateTimeOffset GetUtcNow() => inner.GetUtcNow();
+
+        public override TimeZoneInfo LocalTimeZone => inner.LocalTimeZone;
+
+        public override ITimer CreateTimer(TimerCallback callback, object? state, TimeSpan dueTime, TimeSpan period)
+            => inner.CreateTimer(callback, state, dueTime, period);
+    }
+
+    /// <summary>
+    /// Regression (fixpoint round 2, S9#7): the park dropped a claim only on a POSITIVE "fence gone"
+    /// renew. A host cut off from the database while its peers were not saw every renew THROW —
+    /// never answer — so past LockTimeout a peer re-claimed and ran the row, and once a slot freed
+    /// this host enqueued and ran it too. Renewals still failing once LockTimeout has passed since
+    /// the last one that landed now count as a lost lease.
+    /// </summary>
+    [Theory]
+    [InlineData(Provider.SqlServer)]
+    [InlineData(Provider.PostgreSql)]
+    [InlineData(Provider.MongoDb)]
+    public async Task EarlyAckPark_DropsTheDelivery_WhenRenewalsKeepFailingPastLockTimeout(Provider provider)
+    {
+        var calls = new Calls { RenewThrows = true };
+        var clock = new VirtualTimeProvider();
+        var runs = 0;
+        var firstRunning = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseFirst = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var (dispatcher, handle) = CreateEarlyAckDispatcher(
+            provider,
+            calls,
+            handler: async _ =>
+            {
+                Interlocked.Increment(ref runs);
+                firstRunning.TrySetResult();
+                await releaseFirst.Task;
+            },
+            onBackgroundFailure: static () => { },
+            drain: TimeSpan.FromSeconds(10),
+            queueCapacity: 1,
+            clock: clock);
+
+        try
+        {
+            await handle(CancellationToken.None);
+            await firstRunning.Task.WaitAsync(TimeSpan.FromSeconds(30));
+            await handle(CancellationToken.None);
+
+            var parked = handle(CancellationToken.None);
+            await WalkAsync(clock, TimeSpan.FromSeconds(45), until: () => parked.IsCompleted);
+            Assert.True(parked.IsCompleted, $"the parked claim was still waiting after {Volatile.Read(ref calls.Renew)} failed renewals spanning more than LockTimeout");
+            await parked;
+            Assert.True(Volatile.Read(ref calls.Renew) >= 2);
+        }
+        finally
+        {
+            releaseFirst.TrySetResult();
+            await dispatcher.DisposeAsync();
+        }
+
+        Assert.Equal(2, Volatile.Read(ref runs));
+        Assert.Equal(2, calls.Ack);
+        Assert.Equal(0, calls.Nak);
+    }
+
+    /// <summary>
+    /// The same loss judged by the park itself: after a GC or VM pause the in-memory write can
+    /// complete before the timer-driven heartbeat has run again, so a slot that frees once the lease
+    /// is past LockTimeout (the heartbeat here wedged inside a renew that never answers) drops the
+    /// claim instead of enqueueing it. Before round 2 the park's WriteAsync enqueued and ran it.
+    /// </summary>
+    [Theory]
+    [InlineData(Provider.SqlServer)]
+    [InlineData(Provider.PostgreSql)]
+    [InlineData(Provider.MongoDb)]
+    public async Task EarlyAckPark_DropsTheDelivery_WhenASlotFreesAfterTheLeaseLapsed(Provider provider)
+    {
+        var calls = new Calls { RenewGate = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously) };
+        var clock = new VirtualTimeProvider();
+        var runs = 0;
+        var firstRunning = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseFirst = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var (dispatcher, handle) = CreateEarlyAckDispatcher(
+            provider,
+            calls,
+            handler: async _ =>
+            {
+                Interlocked.Increment(ref runs);
+                firstRunning.TrySetResult();
+                await releaseFirst.Task;
+            },
+            onBackgroundFailure: static () => { },
+            drain: TimeSpan.FromSeconds(10),
+            queueCapacity: 1,
+            clock: clock);
+
+        try
+        {
+            await handle(CancellationToken.None);
+            await firstRunning.Task.WaitAsync(TimeSpan.FromSeconds(30));
+            await handle(CancellationToken.None);
+
+            // The park's first beat (10 s) wedges in the store; then the lease runs out from under it.
+            var parked = handle(CancellationToken.None);
+            clock.Advance(TimeSpan.FromSeconds(10));
+            await Eventually(() => Volatile.Read(ref calls.Renew) == 1);
+            clock.Advance(TimeSpan.FromSeconds(21));
+            Assert.False(parked.IsCompleted);
+
+            // A slot frees: the park judges the lease's age before writing.
+            releaseFirst.TrySetResult();
+            await parked.WaitAsync(TimeSpan.FromSeconds(30));
+        }
+        finally
+        {
+            releaseFirst.TrySetResult();
+            calls.RenewGate.TrySetResult(true);
+            await dispatcher.DisposeAsync();
+        }
+
+        Assert.Equal(2, Volatile.Read(ref runs));
+        Assert.Equal(2, calls.Ack);
+        Assert.Equal(0, calls.Nak);
+    }
+
+    /// <summary>
+    /// Regression (fixpoint round 2, GS3#3): the early-ACK worker logged a background failure BEFORE
+    /// dead-lettering it, and Microsoft.Extensions.Logging rethrows a provider's failure — so a
+    /// throwing logger cost the already-ACKed job its dead-letter copy and its OnBackgroundFailure
+    /// report, and ended the worker (nothing ran the jobs queued behind it). The copy and the report
+    /// now come first and the log line cannot end the worker.
+    /// </summary>
+    [Theory]
+    [InlineData(Provider.SqlServer)]
+    [InlineData(Provider.PostgreSql)]
+    [InlineData(Provider.MongoDb)]
+    public async Task EarlyAck_ThrowingLogger_NeitherLosesTheFailureRecordNorEndsTheWorker(Provider provider)
+    {
+        var calls = new Calls();
+        var log = new CollectingLogger { ThrowOnMessageContaining = "background handler failed" };
+        var backgroundFailures = 0;
+        var runs = 0;
+        var secondRan = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var (dispatcher, handle) = CreateEarlyAckDispatcher(
+            provider,
+            calls,
+            handler: _ =>
+            {
+                if (Interlocked.Increment(ref runs) == 1)
+                    throw new InvalidOperationException("handler blew up");
+                secondRan.TrySetResult();
+                return Task.CompletedTask;
+            },
+            onBackgroundFailure: () => Interlocked.Increment(ref backgroundFailures),
+            drain: TimeSpan.FromSeconds(5),
+            log: log);
+
+        await using (dispatcher)
+        {
+            await handle(CancellationToken.None);
+            await handle(CancellationToken.None);
+            var survived = await Task.WhenAny(secondRan.Task, Task.Delay(TimeSpan.FromSeconds(10))) == secondRan.Task;
+            Assert.True(survived, "the background worker died on the throwing log line, so the job queued behind it never ran");
+        }
+
+        Assert.Equal(1, calls.DeadLetter);
+        Assert.Equal(1, Volatile.Read(ref backgroundFailures));
+    }
+
+    /// <summary>
+    /// The drain-lapse arm under the same throwing logger: it logged "was not started" before the
+    /// burial, so the first lapsed entry's log line ended the worker with that entry and every one
+    /// queued behind it neither dead-lettered nor reported.
+    /// </summary>
+    [Theory]
+    [InlineData(Provider.SqlServer)]
+    [InlineData(Provider.PostgreSql)]
+    [InlineData(Provider.MongoDb)]
+    public async Task EarlyAck_DrainLapse_UnderAThrowingLogger_StillRoutesEveryQueuedEntry(Provider provider)
+    {
+        var calls = new Calls();
+        var log = new CollectingLogger { ThrowOnMessageContaining = "drain budget had lapsed" };
+        var backgroundFailures = 0;
+        var firstRunning = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseFirst = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var (dispatcher, handle) = CreateEarlyAckDispatcher(
+            provider,
+            calls,
+            handler: _ =>
+            {
+                firstRunning.TrySetResult();
+                return releaseFirst.Task;
+            },
+            onBackgroundFailure: () => Interlocked.Increment(ref backgroundFailures),
+            drain: TimeSpan.FromMilliseconds(50),
+            log: log);
+
+        try
+        {
+            // One running, three queued behind it; the dispose lapses the budget before the first
+            // is released, so all three are routed past it.
+            await handle(CancellationToken.None);
+            await firstRunning.Task.WaitAsync(TimeSpan.FromSeconds(30));
+            for (var i = 0; i < 3; i++)
+                await handle(CancellationToken.None);
+            await dispatcher.DisposeAsync();
+        }
+        finally
+        {
+            releaseFirst.TrySetResult();
+        }
+
+        await Eventually(() => calls.DeadLetter == 3 && Volatile.Read(ref backgroundFailures) == 3);
+    }
+
+    /// <summary>
+    /// Regression (fixpoint round 2, GS3#3): when every background worker had already ended with a
+    /// fault, the drain's join completed faulted at once and DisposeAsync only logged it at Debug —
+    /// the already-ACKed entries still queued (their rows deleted by the early ACK) were lost with no
+    /// dead-letter copy and no report. DisposeAsync now routes them itself, inside the reserve. The
+    /// fault is injected by swapping the worker task: no real fault can end a worker any more.
+    /// </summary>
+    [Theory]
+    [InlineData(Provider.SqlServer)]
+    [InlineData(Provider.PostgreSql)]
+    [InlineData(Provider.MongoDb)]
+    public async Task EarlyAck_DisposeAfterEveryWorkerFaulted_StillRoutesTheQueuedEntries(Provider provider)
+    {
+        var calls = new Calls();
+        var backgroundFailures = 0;
+        var firstRunning = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseFirst = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var (dispatcher, handle) = CreateEarlyAckDispatcher(
+            provider,
+            calls,
+            handler: async _ =>
+            {
+                firstRunning.TrySetResult();
+                await releaseFirst.Task;
+            },
+            onBackgroundFailure: () => Interlocked.Increment(ref backgroundFailures),
+            drain: TimeSpan.FromSeconds(8));
+
+        try
+        {
+            await handle(CancellationToken.None);
+            await firstRunning.Task.WaitAsync(TimeSpan.FromSeconds(30));
+            await handle(CancellationToken.None);
+            await handle(CancellationToken.None);
+
+            // The one worker is busy with the first entry; make the drain see it as having faulted.
+            var workers = (Task[])dispatcher.GetType().BaseType!
+                .GetField("_backgroundWorkers", BindingFlags.Instance | BindingFlags.NonPublic)!
+                .GetValue(dispatcher)!;
+            workers[0] = Task.FromException(new InvalidOperationException("worker died"));
+
+            await dispatcher.DisposeAsync();
+
+            // Synchronous: both queued entries were routed before DisposeAsync returned.
+            Assert.Equal(2, calls.DeadLetter);
+            Assert.Equal(2, Volatile.Read(ref backgroundFailures));
+        }
+        finally
+        {
+            releaseFirst.TrySetResult();
+        }
+    }
+
     private static (IAsyncDisposable Dispatcher, Func<CancellationToken, Task> Handle) CreateEarlyAckDispatcher(
         Provider provider,
         Calls calls,
@@ -679,7 +1353,9 @@ public sealed class DbTransportSharedCoverageTests
         int queueCapacity = 8,
         TimeSpan? lockTimeout = null,
         TimeProvider? clock = null,
-        CollectingLogger? log = null)
+        CollectingLogger? log = null,
+        CancellationToken hostStopping = default,
+        bool deadLetterEnabled = true)
     {
         var logger = log ?? new CollectingLogger();
         var lease = lockTimeout ?? TimeSpan.FromSeconds(30);
@@ -690,12 +1366,13 @@ public sealed class DbTransportSharedCoverageTests
                 var options = new SqlServerAsyncResponseTransportOptions
                 {
                     ConnectionString = "Server=localhost;Database=unused;User ID=sa;Password=unused;TrustServerCertificate=True",
-                    LockTimeout = lease
+                    LockTimeout = lease,
+                    DeadLetterEnabled = deadLetterEnabled
                 };
                 var subscriber = new SqlServerSubscriberOptions();
                 subscriber.UseAckAfterEnqueue(1, queueCapacity, drain);
                 subscriber.OnBackgroundFailure = _ => { onBackgroundFailure(); return ValueTask.CompletedTask; };
-                var dispatcher = new SqlServerMessageDispatcher((_, token) => handler(token), options, subscriber, logger, SqlServerSubscriberRole.Worker, clock);
+                var dispatcher = new SqlServerMessageDispatcher((_, token) => handler(token), options, subscriber, logger, SqlServerSubscriberRole.Worker, clock, hostStopping);
                 return (dispatcher, token => dispatcher.HandleAsync(
                     new SqlServerTransportDelivery(
                         Guid.NewGuid(), "worker", "{}", Headers, 1,
@@ -705,11 +1382,11 @@ public sealed class DbTransportSharedCoverageTests
 
             case Provider.PostgreSql:
             {
-                var options = new PostgreSqlAsyncResponseTransportOptions { LockTimeout = lease };
+                var options = new PostgreSqlAsyncResponseTransportOptions { LockTimeout = lease, DeadLetterEnabled = deadLetterEnabled };
                 var subscriber = new PostgreSqlSubscriberOptions();
                 subscriber.UseAckAfterEnqueue(1, queueCapacity, drain);
                 subscriber.OnBackgroundFailure = _ => { onBackgroundFailure(); return ValueTask.CompletedTask; };
-                var dispatcher = new PostgreSqlMessageDispatcher((_, token) => handler(token), options, subscriber, logger, PostgreSqlSubscriberRole.Worker, clock);
+                var dispatcher = new PostgreSqlMessageDispatcher((_, token) => handler(token), options, subscriber, logger, PostgreSqlSubscriberRole.Worker, clock, hostStopping);
                 return (dispatcher, token => dispatcher.HandleAsync(
                     new PostgreSqlTransportDelivery(
                         Guid.NewGuid(), "worker", "{}", Headers, 1,
@@ -719,11 +1396,11 @@ public sealed class DbTransportSharedCoverageTests
 
             default:
             {
-                var options = new MongoDbAsyncResponseTransportOptions { LockTimeout = lease };
+                var options = new MongoDbAsyncResponseTransportOptions { LockTimeout = lease, DeadLetterEnabled = deadLetterEnabled };
                 var subscriber = new MongoDbSubscriberOptions();
                 subscriber.UseAckAfterEnqueue(1, queueCapacity, drain);
                 subscriber.OnBackgroundFailure = _ => { onBackgroundFailure(); return ValueTask.CompletedTask; };
-                var dispatcher = new MongoDbMessageDispatcher((_, token) => handler(token), options, subscriber, logger, MongoDbSubscriberRole.Worker, clock);
+                var dispatcher = new MongoDbMessageDispatcher((_, token) => handler(token), options, subscriber, logger, MongoDbSubscriberRole.Worker, clock, hostStopping);
                 return (dispatcher, token => dispatcher.HandleAsync(
                     new MongoDbTransportDelivery(
                         Guid.NewGuid(), "worker", "{}", Headers, 1,
@@ -1201,7 +1878,9 @@ public sealed class DbTransportSharedCoverageTests
         Action? onBackgroundFailure = null,
         int? maxDeliveryAttempts = null,
         int attempt = 1,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        bool deadLetterEnabled = true,
+        CancellationToken hostStopping = default)
     {
         switch (provider)
         {
@@ -1210,7 +1889,8 @@ public sealed class DbTransportSharedCoverageTests
                 var options = new SqlServerAsyncResponseTransportOptions
                 {
                     ConnectionString = "Server=localhost;Database=unused;User ID=sa;Password=unused;TrustServerCertificate=True",
-                    LockTimeout = lockTimeout
+                    LockTimeout = lockTimeout,
+                    DeadLetterEnabled = deadLetterEnabled
                 };
                 var subscriber = new SqlServerSubscriberOptions();
                 if (maxDeliveryAttempts is { } sqlCap)
@@ -1221,7 +1901,7 @@ public sealed class DbTransportSharedCoverageTests
                     subscriber.UseAckAfterEnqueue(1, 8, TimeSpan.FromMilliseconds(50));
 
                 await using var dispatcher = new SqlServerMessageDispatcher(
-                    (_, _) => handler(), options, subscriber, logger, SqlServerSubscriberRole.Worker);
+                    (_, _) => handler(), options, subscriber, logger, SqlServerSubscriberRole.Worker, hostStopping: hostStopping);
                 await dispatcher.HandleAsync(
                     new SqlServerTransportDelivery(
                         Guid.NewGuid(), "worker", "{}", Headers, attempt,
@@ -1232,7 +1912,7 @@ public sealed class DbTransportSharedCoverageTests
 
             case Provider.PostgreSql:
             {
-                var options = new PostgreSqlAsyncResponseTransportOptions { LockTimeout = lockTimeout };
+                var options = new PostgreSqlAsyncResponseTransportOptions { LockTimeout = lockTimeout, DeadLetterEnabled = deadLetterEnabled };
                 var subscriber = new PostgreSqlSubscriberOptions();
                 if (maxDeliveryAttempts is { } pgCap)
                     subscriber.MaxDeliveryAttempts = pgCap;
@@ -1242,7 +1922,7 @@ public sealed class DbTransportSharedCoverageTests
                     subscriber.UseAckAfterEnqueue(1, 8, TimeSpan.FromMilliseconds(50));
 
                 await using var dispatcher = new PostgreSqlMessageDispatcher(
-                    (_, _) => handler(), options, subscriber, logger, PostgreSqlSubscriberRole.Worker);
+                    (_, _) => handler(), options, subscriber, logger, PostgreSqlSubscriberRole.Worker, hostStopping: hostStopping);
                 await dispatcher.HandleAsync(
                     new PostgreSqlTransportDelivery(
                         Guid.NewGuid(), "worker", "{}", Headers, attempt,
@@ -1253,7 +1933,7 @@ public sealed class DbTransportSharedCoverageTests
 
             default:
             {
-                var options = new MongoDbAsyncResponseTransportOptions { LockTimeout = lockTimeout };
+                var options = new MongoDbAsyncResponseTransportOptions { LockTimeout = lockTimeout, DeadLetterEnabled = deadLetterEnabled };
                 var subscriber = new MongoDbSubscriberOptions();
                 if (maxDeliveryAttempts is { } mongoCap)
                     subscriber.MaxDeliveryAttempts = mongoCap;
@@ -1263,7 +1943,7 @@ public sealed class DbTransportSharedCoverageTests
                     subscriber.UseAckAfterEnqueue(1, 8, TimeSpan.FromMilliseconds(50));
 
                 await using var dispatcher = new MongoDbMessageDispatcher(
-                    (_, _) => handler(), options, subscriber, logger, MongoDbSubscriberRole.Worker);
+                    (_, _) => handler(), options, subscriber, logger, MongoDbSubscriberRole.Worker, hostStopping: hostStopping);
                 await dispatcher.HandleAsync(
                     new MongoDbTransportDelivery(
                         Guid.NewGuid(), "worker", "{}", Headers, attempt,
@@ -1300,8 +1980,12 @@ public sealed class DbTransportSharedCoverageTests
             return ValueTask.CompletedTask;
         }
 
+        /// <summary>The delay the last NAK asked for.</summary>
+        public TimeSpan? LastNakDelay;
+
         public ValueTask NakAsync(TimeSpan delay)
         {
+            LastNakDelay = delay;
             Interlocked.Increment(ref Nak);
             if (NakThrows)
                 throw new InvalidOperationException("release store unavailable");
@@ -1353,10 +2037,13 @@ public sealed class DbTransportSharedCoverageTests
         /// <summary>When set, every renew hangs until the token it was handed fires (a black-holed connection).</summary>
         public bool RenewHangsUntilCancelled;
 
+        /// <summary>When set, a renew throws while this answers true (an outage that clears on cue).</summary>
+        public Func<bool>? RenewFailsWhile;
+
         public ValueTask<bool> RenewAsync(CancellationToken cancellationToken)
         {
             Interlocked.Increment(ref Renew);
-            if (RenewThrows || Interlocked.Decrement(ref RenewFailuresRemaining) >= 0)
+            if (RenewThrows || RenewFailsWhile?.Invoke() == true || Interlocked.Decrement(ref RenewFailuresRemaining) >= 0)
                 throw new InvalidOperationException("lease store unavailable");
             if (RenewHangsUntilCancelled)
                 return new ValueTask<bool>(HangAsync(cancellationToken));

@@ -93,6 +93,28 @@ public class NatsRegistrationTests
         await validator.StopAsync(CancellationToken.None);
     }
 
+    [Fact]
+    public async Task WithNatsChannel_DisposingTheContainer_UnhooksTheConnectionsMessageDroppedHandler()
+    {
+        // Red-on-old (fixpoint r2 pre-commit, H-res): the requester hooked MessageDropped on the
+        // application-owned connection and never unhooked it, so every container built over one
+        // shared connection (a test host per test, a rebuilt host) left its handler — and the
+        // requester behind it — on the connection for good.
+        var services = new ServiceCollection();
+        services.AddSingleton(typeof(ILogger<>), typeof(NullLogger<>));
+        var connection = new Mock<INatsConnection>();
+        connection.SetupGet(c => c.Opts).Returns(NatsOpts.Default);
+        services.AddSingleton(connection.Object);
+        services.AddAsyncResponse().WithNatsChannel();
+        var provider = services.BuildServiceProvider();
+
+        _ = provider.GetRequiredService<INatsResponseChannelClient>();
+        connection.VerifyAdd(c => c.MessageDropped += It.IsAny<AsyncEventHandler<NatsMessageDroppedEventArgs>>(), Times.Once);
+        await provider.DisposeAsync();
+
+        connection.VerifyRemove(c => c.MessageDropped -= It.IsAny<AsyncEventHandler<NatsMessageDroppedEventArgs>>(), Times.Once);
+    }
+
     private static ServiceProvider Build(Action<AsyncResponseRegistrationBuilder> configure)
     {
         var services = new ServiceCollection();

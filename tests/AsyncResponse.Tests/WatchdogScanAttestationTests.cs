@@ -171,9 +171,19 @@ public class WatchdogScanAttestationTests
         services.AddSingleton<IRecoveryStateStore>(new DeleteFailingRecoveryStateStore());
         services.AddAsyncResponse().WithInMemoryChannel();
         await using var provider = services.BuildServiceProvider();
+
+        // Never null: Microsoft.Extensions.DI tolerates a null factory result, but other
+        // containers (Autofac's delegate activator) reject it — pre-fix the watchdog failed to
+        // activate there. A non-scanning store resolves to a sentinel the watchdog idles on.
+        var scanners = provider.GetServices<IRecoveryStateScanner>().ToArray();
+        Assert.NotEmpty(scanners);
+        Assert.All(scanners, scanner => Assert.NotNull(scanner));
+        // ...and scanning it directly refuses rather than enumerating nothing (a false clean pass).
+        Assert.Throws<NotSupportedException>(() => scanners[0].ScanAsync());
+
         var state = new AsyncResponseWatchdogState();
         var watchdog = new AsyncResponseWatchdog(
-            provider.GetServices<IRecoveryStateScanner>(),
+            scanners,
             provider.GetServices<IActiveSubscriberProbe>(),
             state,
             Options(),

@@ -241,6 +241,36 @@ public sealed class SqsWorkerTransport : IWorkerTransport, IDelayedWorkerTranspo
         return true;
     }
 
+    /// <summary>The SQS message-attribute name length limit.</summary>
+    private const int MaxMessageAttributeNameLength = 256;
+
+    /// <summary>
+    /// Whether SQS accepts <paramref name="name"/> as a message-attribute name: at most 256
+    /// characters of ASCII letters, digits, <c>_</c>, <c>-</c> and <c>.</c>; no leading, trailing
+    /// or consecutive periods; and no <c>AWS.</c> or <c>Amazon.</c> prefix in any casing (reserved
+    /// by AWS). SQS rejects a <c>SendMessage</c> carrying any other name — non-retryably.
+    /// </summary>
+    internal static bool IsValidMessageAttributeName(string name)
+    {
+        if (name.Length is 0 or > MaxMessageAttributeNameLength
+            || name[0] == '.'
+            || name[^1] == '.'
+            || name.StartsWith("AWS.", StringComparison.OrdinalIgnoreCase)
+            || name.StartsWith("Amazon.", StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        for (var index = 0; index < name.Length; index++)
+        {
+            var character = name[index];
+            if (character == '.' ? name[index - 1] == '.' : !char.IsAsciiLetterOrDigit(character) && character is not ('_' or '-'))
+                return false;
+        }
+
+        return true;
+    }
+
     /// <summary>Whether SQS accepts the value as a <c>MessageGroupId</c> (or <c>MessageDeduplicationId</c>).</summary>
     internal static bool IsValidMessageGroupId(string value)
     {

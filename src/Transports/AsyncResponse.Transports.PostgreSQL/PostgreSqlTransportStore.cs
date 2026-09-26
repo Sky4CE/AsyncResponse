@@ -34,15 +34,19 @@ internal sealed record PostgreSqlTransportDelivery(
     Func<CancellationToken, ValueTask<bool>> RenewAsync);
 
 /// <summary>Small SQL adapter for the PostgreSQL transport queue table.</summary>
-internal sealed class PostgreSqlTransportStore
+internal sealed class PostgreSqlTransportStore : IDisposable
 {
     private readonly NpgsqlDataSource _dataSource;
     private readonly PostgreSqlAsyncResponseTransportOptions _options;
     private readonly ILogger<PostgreSqlTransportStore>? _logger;
     private readonly SemaphoreSlim _ensureGate = new(1, 1);
+    private readonly CancellationTokenSource _lifetime = new();
+    private readonly CancellationToken _lifetimeToken;
+    private readonly PostgreSqlDdlGuard _ddl;
     private bool _created;
-    private DdlBackoff? _ddlBackoff;
+    private Task? _ensureAttempt;
     private readonly long _schemaLockKey;
+    private readonly long _tableLockKey;
     private long _lastDeadLetterPruneStamp;
 
     public PostgreSqlTransportStore(
@@ -57,150 +61,102 @@ internal sealed class PostgreSqlTransportStore
         Schema = Quote(_options.SchemaName);
         MessageTable = $"{Schema}.{Quote(_options.MessageTable)}";
         _schemaLockKey = SchemaAdvisoryLockKey(_options.SchemaName);
+        _tableLockKey = TableAdvisoryLockKey(_options.SchemaName, _options.MessageTable);
+        _lifetimeToken = _lifetime.Token;
+        _ddl = new PostgreSqlDdlGuard("transport", $"'{_options.SchemaName}.{_options.MessageTable}'", "docs/postgresql.md", logger);
     }
 
     public string Schema { get; }
     public string MessageTable { get; }
 
-    /// <summary>The clock of the lock-timeout retry-after window (test seam; see <see cref="DdlLockTimeoutBackoff"/>).</summary>
-    internal TimeProvider Clock { get; set; } = TimeProvider.System;
+    /// <summary>The clock of the startup-DDL retry-after window (test seam; see <see cref="DdlLockTimeoutBackoff"/>).</summary>
+    internal TimeProvider Clock
+    {
+        get => _ddl.Clock;
+        set => _ddl.Clock = value;
+    }
 
+    /// <summary>
+    /// Ensures the queue table exists — and, when this store owns the schema, is converted and
+    /// indexed — before the first statement that needs it. One attempt runs at a time, shared by
+    /// every caller that arrives while it runs, and it runs under the store's own lifetime, not a
+    /// caller's token: the attempt can be the hour-bounded jsonb rewrite or first index build, and a
+    /// publish whose request token fired partway — after a retry-after window it is as often a
+    /// request as the subscriber that reaches the gate first — cancelled and rolled it back after the
+    /// table had been locked all that time, for the next caller to start from scratch. A caller's
+    /// token bounds only its own wait; the attempt is bounded by its command timeouts and the store's
+    /// disposal.
+    /// </summary>
     public async Task EnsureCreatedAsync(CancellationToken cancellationToken = default)
     {
         if (_created)
             return;
 
-        ThrowIfDdlBackingOff();
+        _ddl.ThrowIfBackingOff();
+        Task attempt;
         await _ensureGate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
             if (_created)
                 return;
 
-            // Again under the gate: a caller that queued behind the attempt that just lost its lock
-            // wait fails here instead of starting the next one.
-            ThrowIfDdlBackingOff();
-
-            await using var connection = await _dataSource.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
-            await using var transaction = await connection.BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
-
-            var readyIndex = IndexName(_options.MessageTable, "ready");
-            var createdIndex = IndexName(_options.MessageTable, "created");
-            var readyIndexState = ReadyIndexState.Usable;
-            if (_options.AutoCreateSchema)
+            if (_ensureAttempt is { } running)
             {
-                // Serialize schema creation across processes. CREATE ... IF NOT EXISTS is not atomic against a
-                // concurrent create of the same object: two instances starting together both pass the existence
-                // check and collide on the system catalog ("duplicate key ... pg_type_typname_nsp_index"). A
-                // transaction-scoped advisory lock (keyed by schema, shared with the channel store) lets one
-                // instance build the schema while the rest wait and then find it already present.
-                await using (var lockCommand = connection.CreateCommand())
-                {
-                    lockCommand.Transaction = transaction;
-                    lockCommand.CommandText = "SELECT pg_advisory_xact_lock(@lock_key);";
-                    lockCommand.Parameters.AddWithValue("lock_key", _schemaLockKey);
-                    await lockCommand.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
-                }
-
-                // The dequeue index is (queue, available_at, created_at) and the claim orders by
-                // exactly that tail, so a claim is one ordered index descent that stops at the
-                // first unleased row. The previous pair — an index over (queue, available_at,
-                // locked_until, created_at) behind ORDER BY created_at — could not serve its own
-                // ordering past the available_at range: the planner either walked the created_at
-                // index through every older row of the OTHER logical queues (dead letters kept for
-                // retention, delayed jobs) or sorted the whole ready set, on every claim, so
-                // draining a burst cost its square. A table created by an older build keeps its
-                // "<table>_claim_idx"; nothing reads it any more and nothing here drops it (DROP
-                // INDEX needs an ACCESS EXCLUSIVE lock on a live queue) — see docs/postgresql.md.
-                //
-                // The DDL transaction runs under a lock_timeout (see DdlLockTimeout): the startup DDL
-                // is otherwise bounded only by the command timeout, and while its ACCESS EXCLUSIVE
-                // (the jsonb rewrite) or SHARE (an index build) request waits, every later statement
-                // on the queue table — old-build hosts' renewals included — queues behind it.
-                try
-                {
-                    await using (var command = connection.CreateCommand())
-                    {
-                        command.Transaction = transaction;
-                        command.CommandText =
-                            $"""
-                            SET LOCAL lock_timeout = '{DdlLockTimeout}';
-                            CREATE SCHEMA IF NOT EXISTS {Schema};
-
-                            CREATE TABLE IF NOT EXISTS {MessageTable} (
-                                id uuid PRIMARY KEY,
-                                queue text NOT NULL,
-                                payload_json text NOT NULL,
-                                headers_json text NOT NULL DEFAULT {EmptyJsonObjectLiteral},
-                                created_at timestamptz NOT NULL DEFAULT now(),
-                                available_at timestamptz NOT NULL DEFAULT now(),
-                                locked_until timestamptz NULL,
-                                lock_id uuid NULL,
-                                attempts integer NOT NULL DEFAULT 0,
-                                dead_letter_reason text NULL
-                            );
-                            """;
-                        await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
-                    }
-
-                    // jsonb REJECTS the \u0000 escape that System.Text.Json emits for U+0000 (SQLSTATE
-                    // 22P05), so any job or response whose payload, context value, or callback argument
-                    // carried a NUL was unpublishable on PostgreSQL alone (SQL Server and MongoDB store
-                    // it), and jsonb's key re-sorting moved a "$type" discriminator behind other keys.
-                    // Nothing here ever queries INSIDE the documents — both are read back with ::text —
-                    // so text costs nothing (round-29 channel / flow-store parity). A table an older
-                    // build created is converted once, in ONE statement: it rewrites the table under
-                    // ACCESS EXCLUSIVE (see docs/postgresql.md).
-                    var (payloadJsonb, headersJsonb) = await GetJsonbColumnsAsync(connection, transaction, cancellationToken).ConfigureAwait(false);
-                    if (payloadJsonb || headersJsonb)
-                    {
-                        await using var migration = LongRunningDdlCommand(JsonbToTextMigrationSql(MessageTable, payloadJsonb, headersJsonb), connection, transaction);
-                        await migration.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
-                    }
-
-                    // Only an ABSENT index is created. CREATE INDEX IF NOT EXISTS takes its SHARE lock
-                    // on the table BEFORE it finds the name taken, so on every start it queued behind
-                    // an operator's CREATE INDEX CONCURRENTLY for the whole build (docs/postgresql.md
-                    // recommends one on large tables), with every writer queued behind it in turn.
-                    readyIndexState = await GetIndexStateAsync(connection, transaction, readyIndex, cancellationToken).ConfigureAwait(false);
-                    var createdIndexAbsent = await GetIndexStateAsync(connection, transaction, createdIndex, cancellationToken).ConfigureAwait(false) is ReadyIndexState.Absent;
-                    if (readyIndexState is ReadyIndexState.Absent || createdIndexAbsent)
-                    {
-                        var builds = new StringBuilder();
-                        if (readyIndexState is ReadyIndexState.Absent)
-                            builds.Append($"CREATE INDEX IF NOT EXISTS {Quote(readyIndex)} ON {MessageTable} (queue, available_at, created_at);\n");
-                        if (createdIndexAbsent)
-                            builds.Append($"CREATE INDEX IF NOT EXISTS {Quote(createdIndex)} ON {MessageTable} (created_at);\n");
-                        await using var build = LongRunningDdlCommand(builds.ToString(), connection, transaction);
-                        await build.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
-                        if (readyIndexState is ReadyIndexState.Absent)
-                            readyIndexState = ReadyIndexState.Usable;
-                    }
-                }
-                catch (PostgresException ex) when (ex.SqlState is PostgresErrorCodes.WrongObjectType or PostgresErrorCodes.UndefinedColumn)
-                {
-                    // E.g. CREATE INDEX ... ON a name that is really another component's index:
-                    // IF NOT EXISTS skipped the table create, and the dependent statement then hits
-                    // the wrong relation kind mid-batch — surface the namespace collision instead of
-                    // the raw "cannot open relation".
-                    throw new InvalidOperationException(PostgreSqlRelationVerifier.DdlCollisionMessage("transport", _options.SchemaName), ex);
-                }
-                catch (PostgresException ex) when (ex.SqlState is PostgresErrorCodes.LockNotAvailable)
-                {
-                    var retryAfter = BackOffDdlAfterLockTimeout(ex);
-                    _logger?.LogWarning(
-                        ex,
-                        "PostgreSQL transport startup DDL on {Schema}.{Table} could not take its table lock within {LockTimeout} " +
-                        "(another session holds a conflicting lock); nothing was changed. This host retries it in {RetryAfter}, " +
-                        "and its transport operations fail at once until then.",
-                        _options.SchemaName,
-                        _options.MessageTable,
-                        DdlLockTimeout,
-                        retryAfter);
-                    throw;
-                }
+                attempt = running;
             }
-            else if (!await RelationExistsAsync(connection, transaction, _options.MessageTable, cancellationToken).ConfigureAwait(false))
+            else
+            {
+                // Again under the gate: a caller that queued behind the attempt that just failed —
+                // and latched the retry-after window — fails here instead of starting the next one.
+                _ddl.ThrowIfBackingOff();
+                attempt = _ensureAttempt = RunEnsureAttemptAsync();
+                // Every caller may have stopped waiting by the time it fails.
+                _ = attempt.ContinueWith(
+                    static failed => _ = failed.Exception,
+                    CancellationToken.None,
+                    TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously,
+                    TaskScheduler.Default);
+            }
+        }
+        finally
+        {
+            _ensureGate.Release();
+        }
+
+        await attempt.WaitAsync(cancellationToken).ConfigureAwait(false);
+    }
+
+    private async Task RunEnsureAttemptAsync()
+    {
+        try
+        {
+            await EnsureCreatedCoreAsync(_lifetimeToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            // Under the gate, after a success set _created: a caller either joins this attempt or
+            // finds the store created (or, after a failure, starts the next attempt).
+            await _ensureGate.WaitAsync(CancellationToken.None).ConfigureAwait(false);
+            _ensureAttempt = null;
+            _ensureGate.Release();
+        }
+    }
+
+    /// <summary>Cancels a startup-DDL attempt still running (see <see cref="EnsureCreatedAsync"/>).</summary>
+    public void Dispose()
+    {
+        _lifetime.Cancel();
+        _lifetime.Dispose();
+    }
+
+    private async Task EnsureCreatedCoreAsync(CancellationToken cancellationToken)
+    {
+        await using var connection = await _dataSource.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
+
+        if (!_options.AutoCreateSchema)
+        {
+            await using var transaction = await connection.BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
+            if (!await RelationExistsAsync(connection, transaction, _options.MessageTable, cancellationToken).ConfigureAwait(false))
             {
                 // Operator-managed schema and the migration has not run yet: the first query
                 // surfaces a clear PostgreSQL error (the documented "create it yourself, later"
@@ -211,88 +167,231 @@ internal sealed class PostgreSqlTransportStore
                 return;
             }
 
-            // The transport can share a schema with the channel and durable-flow stores (and
-            // unrelated objects), whose derived names its own validation cannot see — and
-            // IF NOT EXISTS also accepts a same-name index with the WRONG definition, exactly as
-            // an operator-provisioned table can carry the wrong shape. Verify against the catalog
-            // that every relation actually IS what this store reads and writes, definitions
-            // included (in-transaction, under the shared DDL lock when this build just ran the DDL).
-            //
-            // The dequeue index is REQUIRED only where this build's DDL just guaranteed it. On an
-            // operator-managed schema it is verified when present and only warned about when
-            // absent: it is claim performance, not correctness, and a migration written for an
-            // older build (which carried "<table>_claim_idx" instead) must not fail startup over it.
-            //
-            // "Present" means valid and ready, too, on BOTH paths. docs/postgresql.md has operators
-            // build the index with CREATE INDEX CONCURRENTLY — on a large auto-created table too,
-            // ahead of the rollout — and its catalog row exists (indisvalid / indisready false) for
-            // the whole build, and stays, invalid, after a build that failed, which the DDL above
-            // then leaves alone on every rerun. Verified as present, that index failed EnsureCreated
-            // (and so every publish) on every host that started during the build, and forever after
-            // a failed one. An unusable index is claim performance lost, exactly like an absent one:
-            // warn and carry on.
-            if (!_options.AutoCreateSchema)
-            {
-                await ThrowIfJsonbColumnsAsync(connection, transaction, cancellationToken).ConfigureAwait(false);
-                readyIndexState = await GetIndexStateAsync(connection, transaction, readyIndex, cancellationToken).ConfigureAwait(false);
-            }
-
-            var verifyReadyIndex = readyIndexState is ReadyIndexState.Usable;
-            if (readyIndexState is ReadyIndexState.Absent)
-            {
-                _logger?.LogWarning(
-                    "PostgreSQL transport table {Schema}.{Table} has no dequeue index {Index} and AutoCreateSchema is disabled. " +
-                    "Claims still work, but their cost grows with the backlog — performance only; create the index over " +
-                    "(queue, available_at, created_at) as described in docs/postgresql.md.",
-                    _options.SchemaName,
-                    _options.MessageTable,
-                    readyIndex);
-            }
-            else if (readyIndexState is ReadyIndexState.NotReady)
-            {
-                _logger?.LogWarning(
-                    "PostgreSQL transport dequeue index {Schema}.{Index} exists but is not valid and ready (a CREATE INDEX " +
-                    "CONCURRENTLY still running, or one that failed). Claims still work, but their cost grows with the backlog " +
-                    "until it is usable — performance only; if its build failed, drop it and run the CREATE INDEX CONCURRENTLY " +
-                    "from docs/postgresql.md again.",
-                    _options.SchemaName,
-                    readyIndex);
-            }
-
-            await PostgreSqlRelationVerifier.VerifyAsync(
-                connection,
-                transaction,
-                _options.SchemaName,
-                "transport",
-                [
-                    new(_options.MessageTable, 'r', Columns:
-                        [
-                            new("id", "uuid", Nullable: false),
-                            new("queue", "text", Nullable: false, RequiresDeterministicCollation: true),
-                            new("payload_json", "text", Nullable: false),
-                            new("headers_json", "text", Nullable: false, DefaultExpression: "'{}'::text"),
-                            new("created_at", "timestamp with time zone", Nullable: false, DefaultExpression: "now()"),
-                            new("available_at", "timestamp with time zone", Nullable: false, DefaultExpression: "now()"),
-                            new("locked_until", "timestamp with time zone", Nullable: true),
-                            new("lock_id", "uuid", Nullable: true),
-                            new("attempts", "integer", Nullable: false, DefaultExpression: "0"),
-                            new("dead_letter_reason", "text", Nullable: true),
-                        ], PrimaryKey: ["id"]),
-                    .. verifyReadyIndex
-                        ? (PostgreSqlRelationVerifier.ExpectedRelation[])
-                            [new(readyIndex, 'i', _options.MessageTable, ["queue", "available_at", "created_at"])]
-                        : [],
-                    new(createdIndex, 'i', _options.MessageTable, ["created_at"]),
-                ],
-                cancellationToken).ConfigureAwait(false);
-
+            await ThrowIfJsonbColumnsAsync(connection, transaction, cancellationToken).ConfigureAwait(false);
+            var readyIndexState = await PostgreSqlDdlGuard.GetIndexStateAsync(
+                connection, transaction, _options.SchemaName, IndexName(_options.MessageTable, "ready"), cancellationToken).ConfigureAwait(false);
+            await VerifyRelationsAsync(connection, transaction, readyIndexState, cancellationToken).ConfigureAwait(false);
             await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
             _created = true;
+            return;
         }
-        finally
+
+        // The dequeue index is (queue, available_at, created_at) and the claim orders by
+        // exactly that tail, so a claim is one ordered index descent that stops at the
+        // first unleased row. The previous pair — an index over (queue, available_at,
+        // locked_until, created_at) behind ORDER BY created_at — could not serve its own
+        // ordering past the available_at range: the planner either walked the created_at
+        // index through every older row of the OTHER logical queues (dead letters kept for
+        // retention, delayed jobs) or sorted the whole ready set, on every claim, so
+        // draining a burst cost its square. A table created by an older build keeps its
+        // "<table>_claim_idx"; nothing reads it any more and nothing here drops it (DROP
+        // INDEX needs an ACCESS EXCLUSIVE lock on a live queue) — see docs/postgresql.md.
+        //
+        // Every DDL transaction runs under a lock_timeout (see PostgreSqlDdlGuard.DdlLockTimeout):
+        // the startup DDL is otherwise bounded only by the command timeout, and while its ACCESS
+        // EXCLUSIVE (the jsonb rewrite) or SHARE (an index build) request waits, every later
+        // statement on the queue table — old-build hosts' renewals included — queues behind it.
+        try
         {
-            _ensureGate.Release();
+            // 1. The schema-shared DDL, under the schema's advisory key (shared with the channel
+            //    and durable-flow stores): only statements whose run time does not grow with the
+            //    table. CREATE TABLE IF NOT EXISTS takes no lock on a table that already exists.
+            await using (var transaction = await PostgreSqlDdlGuard.BeginLockedTransactionAsync(connection, _schemaLockKey, cancellationToken).ConfigureAwait(false))
+            {
+                await using (var command = connection.CreateCommand())
+                {
+                    command.Transaction = transaction;
+                    command.CommandText =
+                        $"""
+                        CREATE SCHEMA IF NOT EXISTS {Schema};
+
+                        CREATE TABLE IF NOT EXISTS {MessageTable} (
+                            id uuid PRIMARY KEY,
+                            queue text NOT NULL,
+                            payload_json text NOT NULL,
+                            headers_json text NOT NULL DEFAULT {EmptyJsonObjectLiteral},
+                            created_at timestamptz NOT NULL DEFAULT now(),
+                            available_at timestamptz NOT NULL DEFAULT now(),
+                            locked_until timestamptz NULL,
+                            lock_id uuid NULL,
+                            attempts integer NOT NULL DEFAULT 0,
+                            dead_letter_reason text NULL
+                        );
+                        """;
+                    await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+                }
+
+                var work = await ReadTableWorkAsync(connection, transaction, cancellationToken).ConfigureAwait(false);
+                if (work.IsEmpty)
+                {
+                    await VerifyRelationsAsync(connection, transaction, work.ReadyIndex, cancellationToken).ConfigureAwait(false);
+                    await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+                    _created = true;
+                    return;
+                }
+
+                await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+            }
+
+            // 2. The table work whose run time grows with the table — the jsonb rewrite, an index
+            //    build — in a transaction of its own under a key scoped to this table: held for up
+            //    to an hour, the schema-wide key would stop every host starting meanwhile from
+            //    initializing ANY AsyncResponse store on the schema. Re-read under the key: another
+            //    host may have done the work while this one waited for it.
+            await using (var transaction = await PostgreSqlDdlGuard.BeginLockedTransactionAsync(connection, _tableLockKey, cancellationToken).ConfigureAwait(false))
+            {
+                var work = await ReadTableWorkAsync(connection, transaction, cancellationToken).ConfigureAwait(false);
+
+                // jsonb REJECTS the \u0000 escape that System.Text.Json emits for U+0000 (SQLSTATE
+                // 22P05), so any job or response whose payload, context value, or callback argument
+                // carried a NUL was unpublishable on PostgreSQL alone (SQL Server and MongoDB store
+                // it), and jsonb's key re-sorting moved a "$type" discriminator behind other keys.
+                // Nothing here ever queries INSIDE the documents — both are read back with ::text —
+                // so text costs nothing (round-29 channel / flow-store parity). A table an older
+                // build created is converted once, in ONE statement: it rewrites the table under
+                // ACCESS EXCLUSIVE (see docs/postgresql.md).
+                if (work.PayloadJsonb || work.HeadersJsonb)
+                {
+                    await _ddl.ExecuteLongRunningAsync(
+                        JsonbToTextMigrationSql(MessageTable, work.PayloadJsonb, work.HeadersJsonb), connection, transaction, cancellationToken).ConfigureAwait(false);
+                }
+
+                // Only an ABSENT index is created. CREATE INDEX IF NOT EXISTS takes its SHARE lock
+                // on the table BEFORE it finds the name taken, so on every start it queued behind
+                // an operator's CREATE INDEX CONCURRENTLY for the whole build (docs/postgresql.md
+                // recommends one on large tables), with every writer queued behind it in turn.
+                var readyIndexState = work.ReadyIndex;
+                if (readyIndexState is PostgreSqlDdlGuard.IndexState.Absent || work.CreatedIndexAbsent)
+                {
+                    var builds = new StringBuilder();
+                    if (readyIndexState is PostgreSqlDdlGuard.IndexState.Absent)
+                        builds.Append($"CREATE INDEX IF NOT EXISTS {Quote(IndexName(_options.MessageTable, "ready"))} ON {MessageTable} (queue, available_at, created_at);\n");
+                    if (work.CreatedIndexAbsent)
+                        builds.Append($"CREATE INDEX IF NOT EXISTS {Quote(IndexName(_options.MessageTable, "created"))} ON {MessageTable} (created_at);\n");
+                    await _ddl.ExecuteLongRunningAsync(builds.ToString(), connection, transaction, cancellationToken).ConfigureAwait(false);
+                    if (readyIndexState is PostgreSqlDdlGuard.IndexState.Absent)
+                        readyIndexState = PostgreSqlDdlGuard.IndexState.Usable;
+                }
+
+                await VerifyRelationsAsync(connection, transaction, readyIndexState, cancellationToken).ConfigureAwait(false);
+                await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+                _created = true;
+            }
         }
+        catch (PostgresException ex) when (ex.SqlState is PostgresErrorCodes.WrongObjectType or PostgresErrorCodes.UndefinedColumn)
+        {
+            // E.g. CREATE INDEX ... ON a name that is really another component's index:
+            // IF NOT EXISTS skipped the table create, and the dependent statement then hits
+            // the wrong relation kind mid-batch — surface the namespace collision instead of
+            // the raw "cannot open relation".
+            throw new InvalidOperationException(PostgreSqlRelationVerifier.DdlCollisionMessage("transport", _options.SchemaName), ex);
+        }
+        catch (PostgresException ex) when (ex.SqlState is PostgresErrorCodes.LockNotAvailable)
+        {
+            // A lock wait lost anywhere in the DDL — the advisory key's included — latches the
+            // retry-after window (a long-running step's own failure latched it already).
+            _ddl.BackOff(ex);
+            throw;
+        }
+    }
+
+    /// <summary>
+    /// The one-time table work the auto-create path still owes: which document columns still carry
+    /// the pre-text <c>jsonb</c> type, and the state of the two indexes (only an absent one is built).
+    /// </summary>
+    private readonly record struct TableWork(bool PayloadJsonb, bool HeadersJsonb, PostgreSqlDdlGuard.IndexState ReadyIndex, bool CreatedIndexAbsent)
+    {
+        public bool IsEmpty => !PayloadJsonb && !HeadersJsonb && ReadyIndex is not PostgreSqlDdlGuard.IndexState.Absent && !CreatedIndexAbsent;
+    }
+
+    private async Task<TableWork> ReadTableWorkAsync(NpgsqlConnection connection, NpgsqlTransaction transaction, CancellationToken cancellationToken)
+    {
+        var (payloadJsonb, headersJsonb) = await GetJsonbColumnsAsync(connection, transaction, cancellationToken).ConfigureAwait(false);
+        var readyIndex = await PostgreSqlDdlGuard.GetIndexStateAsync(
+            connection, transaction, _options.SchemaName, IndexName(_options.MessageTable, "ready"), cancellationToken).ConfigureAwait(false);
+        var createdIndex = await PostgreSqlDdlGuard.GetIndexStateAsync(
+            connection, transaction, _options.SchemaName, IndexName(_options.MessageTable, "created"), cancellationToken).ConfigureAwait(false);
+        return new TableWork(payloadJsonb, headersJsonb, readyIndex, createdIndex is PostgreSqlDdlGuard.IndexState.Absent);
+    }
+
+    /// <summary>
+    /// The catalog verification both paths end with. The transport can share a schema with the
+    /// channel and durable-flow stores (and unrelated objects), whose derived names its own
+    /// validation cannot see — and IF NOT EXISTS also accepts a same-name index with the WRONG
+    /// definition, exactly as an operator-provisioned table can carry the wrong shape. Verify
+    /// against the catalog that every relation actually IS what this store reads and writes,
+    /// definitions included (in the DDL transaction, under its advisory key, when this build just
+    /// ran the DDL).
+    /// </summary>
+    /// <remarks>
+    /// The dequeue index is REQUIRED only where this build's DDL just guaranteed it. On an
+    /// operator-managed schema it is verified when present and only warned about when absent: it is
+    /// claim performance, not correctness, and a migration written for an older build (which
+    /// carried "&lt;table&gt;_claim_idx" instead) must not fail startup over it.
+    /// <para>
+    /// "Present" means valid and ready, too, on BOTH paths. docs/postgresql.md has operators build
+    /// the index with CREATE INDEX CONCURRENTLY — on a large auto-created table too, ahead of the
+    /// rollout — and its catalog row exists (indisvalid / indisready false) for the whole build, and
+    /// stays, invalid, after a build that failed, which the DDL then leaves alone on every rerun.
+    /// Verified as present, that index failed EnsureCreated (and so every publish) on every host that
+    /// started during the build, and forever after a failed one. An unusable index is claim
+    /// performance lost, exactly like an absent one: warn and carry on.
+    /// </para>
+    /// </remarks>
+    private async Task VerifyRelationsAsync(
+        NpgsqlConnection connection,
+        NpgsqlTransaction transaction,
+        PostgreSqlDdlGuard.IndexState readyIndexState,
+        CancellationToken cancellationToken)
+    {
+        var readyIndex = IndexName(_options.MessageTable, "ready");
+        if (readyIndexState is PostgreSqlDdlGuard.IndexState.Absent && _logger is { } absentLogger)
+        {
+            SafeLog.Try(() => absentLogger.LogWarning(
+                "PostgreSQL transport table {Schema}.{Table} has no dequeue index {Index} and AutoCreateSchema is disabled. " +
+                "Claims still work, but their cost grows with the backlog — performance only; create the index over " +
+                "(queue, available_at, created_at) as described in docs/postgresql.md.",
+                _options.SchemaName,
+                _options.MessageTable,
+                readyIndex));
+        }
+        else if (readyIndexState is PostgreSqlDdlGuard.IndexState.NotReady && _logger is { } notReadyLogger)
+        {
+            SafeLog.Try(() => notReadyLogger.LogWarning(
+                "PostgreSQL transport dequeue index {Schema}.{Index} exists but is not valid and ready (a CREATE INDEX " +
+                "CONCURRENTLY still running, or one that failed). Claims still work, but their cost grows with the backlog " +
+                "until it is usable — performance only; if its build failed, drop it and run the CREATE INDEX CONCURRENTLY " +
+                "from docs/postgresql.md again.",
+                _options.SchemaName,
+                readyIndex));
+        }
+
+        await PostgreSqlRelationVerifier.VerifyAsync(
+            connection,
+            transaction,
+            _options.SchemaName,
+            "transport",
+            [
+                new(_options.MessageTable, 'r', Columns:
+                    [
+                        new("id", "uuid", Nullable: false),
+                        new("queue", "text", Nullable: false, RequiresDeterministicCollation: true),
+                        new("payload_json", "text", Nullable: false),
+                        new("headers_json", "text", Nullable: false, DefaultExpression: "'{}'::text"),
+                        new("created_at", "timestamp with time zone", Nullable: false, DefaultExpression: "now()"),
+                        new("available_at", "timestamp with time zone", Nullable: false, DefaultExpression: "now()"),
+                        new("locked_until", "timestamp with time zone", Nullable: true),
+                        new("lock_id", "uuid", Nullable: true),
+                        new("attempts", "integer", Nullable: false, DefaultExpression: "0"),
+                        new("dead_letter_reason", "text", Nullable: true),
+                    ], PrimaryKey: ["id"]),
+                .. readyIndexState is PostgreSqlDdlGuard.IndexState.Usable
+                    ? (PostgreSqlRelationVerifier.ExpectedRelation[])
+                        [new(readyIndex, 'i', _options.MessageTable, ["queue", "available_at", "created_at"])]
+                    : [],
+                new(IndexName(_options.MessageTable, "created"), 'i', _options.MessageTable, ["created_at"]),
+            ],
+            cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -315,40 +414,6 @@ internal sealed class PostgreSqlTransportStore
         command.Parameters.AddWithValue("schema", _options.SchemaName);
         command.Parameters.AddWithValue("table", relation);
         return (bool)(await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false))!;
-    }
-
-    private enum ReadyIndexState
-    {
-        Absent,
-        Usable,
-        NotReady
-    }
-
-    /// <summary>
-    /// Whether an index is absent, usable, or present but not valid and ready (a concurrent build
-    /// in progress, or one that failed). A relation of another kind under the name counts as
-    /// present, so verification names the precise wrong-kind reason.
-    /// </summary>
-    private async Task<ReadyIndexState> GetIndexStateAsync(NpgsqlConnection connection, NpgsqlTransaction transaction, string index, CancellationToken cancellationToken)
-    {
-        await using var command = connection.CreateCommand();
-        command.Transaction = transaction;
-        command.CommandText =
-            """
-            SELECT COALESCE(i.indisvalid AND i.indisready, true)
-            FROM pg_catalog.pg_class c
-            JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
-            LEFT JOIN pg_catalog.pg_index i ON i.indexrelid = c.oid
-            WHERE n.nspname = @schema AND c.relname = @index;
-            """;
-        command.Parameters.AddWithValue("schema", _options.SchemaName);
-        command.Parameters.AddWithValue("index", index);
-        return await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false) switch
-        {
-            null or DBNull => ReadyIndexState.Absent,
-            true => ReadyIndexState.Usable,
-            _ => ReadyIndexState.NotReady
-        };
     }
 
     /// <summary>
@@ -409,88 +474,24 @@ internal sealed class PostgreSqlTransportStore
         return $"ALTER TABLE {messageTable} {string.Join(", ", subcommands)};";
     }
 
-    /// <summary>
-    /// The lock-wait bound of the auto-create DDL transaction (<c>SET LOCAL lock_timeout</c>). While
-    /// the jsonb rewrite's ACCESS EXCLUSIVE request — or an index build's SHARE request — waits, every
-    /// later statement on the queue table queues behind it, on every host, so the wait IS a queue
-    /// outage. 5 s outwaits the transport's own statements (single-statement, sub-second) and an
-    /// ORDINARY autovacuum, which cancels itself for a conflicting lock request after
-    /// <c>deadlock_timeout</c> (1 s by default), and stays under the lease-renewal beat
-    /// (<c>LockTimeout</c>/3, 10 s by default), so no running handler's lease lapses behind it. What
-    /// does not yield — an anti-wraparound autovacuum, a manual VACUUM or ANALYZE, pg_dump, an
-    /// idle-in-transaction session — fails the DDL fast instead, changing nothing, and
-    /// <see cref="DdlLockTimeoutBackoff"/> paces the retries.
-    /// </summary>
-    internal const string DdlLockTimeout = "5s";
+    /// <summary>The lock-wait bound of the auto-create DDL (see <see cref="PostgreSqlDdlGuard.DdlLockTimeout"/>).</summary>
+    internal const string DdlLockTimeout = PostgreSqlDdlGuard.DdlLockTimeout;
 
-    /// <summary>
-    /// The shortest retry-after window a lock-timeout failure of the startup DDL latches; the actual
-    /// window is jittered up to twice this (30–60 s). Without it every operation on the host started
-    /// the next attempt at once, and a lock held for minutes or hours (the holders named on
-    /// <see cref="DdlLockTimeout"/>) stalled the whole queue — every host's statements, parked behind
-    /// each attempt's lock request — in back-to-back 5 s cycles, the k-th caller queued on the gate
-    /// waiting k × 5 s to fail. 30 s keeps one host's attempts to a small fraction of the table's time;
-    /// the jitter keeps a fleet started together from retrying in lockstep (the advisory lock would
-    /// chain their waits back to back), and the 60 s ceiling bounds how long this host stays unable
-    /// to publish or claim after the conflicting lock is gone.
-    /// </summary>
-    internal static readonly TimeSpan DdlLockTimeoutBackoff = TimeSpan.FromSeconds(30);
+    /// <summary>The shortest startup-DDL retry-after window (see <see cref="PostgreSqlDdlGuard.RetryAfter"/>).</summary>
+    internal static TimeSpan DdlLockTimeoutBackoff => PostgreSqlDdlGuard.RetryAfter;
 
-    /// <summary>
-    /// The command timeout of DDL whose run time grows with the table — the jsonb rewrite, the first
-    /// build of an index on an existing table — in seconds. Not the data source's (30 s by default):
-    /// each is one-time, and one that outran it was rolled back and retried by EVERY later operation
-    /// (EnsureCreated runs until it succeeds), each attempt holding its ACCESS EXCLUSIVE or SHARE lock
-    /// for another full timeout and never finishing. Not unbounded either: the command runs holding
-    /// the store's gate, and Npgsql sends no keepalive by default, so a socket black-holed mid-rewrite
-    /// (a failover to a new address, a NAT or load-balancer drop) left it waiting forever and every
-    /// later operation on the host queued on the gate behind it. An hour is an order of magnitude past
-    /// what a queue table's rewrite takes; a larger one is converted ahead of the rollout
-    /// (docs/postgresql.md).
-    /// </summary>
-    internal const int LongRunningDdlCommandTimeoutSeconds = 3600;
+    /// <summary>The long-running DDL command timeout (see <see cref="PostgreSqlDdlGuard.LongRunningDdlCommandTimeoutSeconds"/>).</summary>
+    internal const int LongRunningDdlCommandTimeoutSeconds = PostgreSqlDdlGuard.LongRunningDdlCommandTimeoutSeconds;
 
-    /// <summary>
-    /// A command for DDL whose run time grows with the table (see
-    /// <see cref="LongRunningDdlCommandTimeoutSeconds"/>). Lock WAITS stay bounded by
-    /// <see cref="DdlLockTimeout"/>; a <c>statement_timeout</c> the operator configured still applies.
-    /// </summary>
+    /// <inheritdoc cref="PostgreSqlDdlGuard.LongRunningDdlCommand"/>
     internal static NpgsqlCommand LongRunningDdlCommand(string sql, NpgsqlConnection? connection = null, NpgsqlTransaction? transaction = null)
-        => new(sql, connection, transaction) { CommandTimeout = LongRunningDdlCommandTimeoutSeconds };
+        => PostgreSqlDdlGuard.LongRunningDdlCommand(sql, connection, transaction);
 
     /// <summary>
-    /// Latches this store's retry-after window after the startup DDL lost its lock wait (see
-    /// <see cref="DdlLockTimeoutBackoff"/>) and returns its length. Until it ends,
-    /// <see cref="EnsureCreatedAsync"/> fails at once — no connection, no transaction, no lock
-    /// request queued ahead of the other hosts' statements.
+    /// Latches this store's startup-DDL retry-after window after <paramref name="cause"/> (see
+    /// <see cref="PostgreSqlDdlGuard.BackOff"/>) and returns its length.
     /// </summary>
-    internal TimeSpan BackOffDdlAfterLockTimeout(Exception cause)
-    {
-        var window = DdlLockTimeoutBackoff + TimeSpan.FromTicks(Random.Shared.NextInt64(DdlLockTimeoutBackoff.Ticks));
-        Volatile.Write(ref _ddlBackoff, new DdlBackoff(Clock.GetTimestamp(), window, cause));
-        return window;
-    }
-
-    private void ThrowIfDdlBackingOff()
-    {
-        if (Volatile.Read(ref _ddlBackoff) is not { } backoff)
-            return;
-
-        var remaining = backoff.Window - Clock.GetElapsedTime(backoff.StartedAt);
-        if (remaining <= TimeSpan.Zero)
-            return;
-
-        throw new InvalidOperationException(
-            $"The PostgreSQL transport's startup DDL on '{_options.SchemaName}.{_options.MessageTable}' could not take its table " +
-            $"lock within {DdlLockTimeout}: another session holds a conflicting lock on the table (an anti-wraparound or manual " +
-            "VACUUM, ANALYZE, pg_dump, or a long-running or idle-in-transaction session — find it in pg_locks joined to " +
-            $"pg_stat_activity). Nothing was changed. This host retries it in {Math.Ceiling(remaining.TotalSeconds):0} s — every " +
-            "attempt parks every statement on the queue table, on every host, behind its lock request — and its transport " +
-            "operations fail until the DDL succeeds; see docs/postgresql.md.",
-            backoff.Cause);
-    }
-
-    private sealed record DdlBackoff(long StartedAt, TimeSpan Window, Exception Cause);
+    internal TimeSpan BackOffDdlAfterLockTimeout(Exception cause) => _ddl.BackOff(cause);
 
     /// <summary>
     /// Publishes a queue row. The caller supplies the id so a retried publish is idempotent
@@ -504,7 +505,7 @@ internal sealed class PostgreSqlTransportStore
         CancellationToken cancellationToken,
         TimeSpan? delay = null)
     {
-        await InsertAsync(id, queue, payload, headers, deadLetterReason: null, notify: true, cancellationToken, delay).ConfigureAwait(false);
+        await InsertAsync(id, queue, payload, headers, deadLetterReason: null, notify: WakesSubscribers(delay), cancellationToken, delay).ConfigureAwait(false);
 
         // The row is committed: nothing after this line may fail the publish. A prune that threw
         // (a lock timeout, a dropped connection, the caller's token firing mid-DELETE) reported a
@@ -520,6 +521,15 @@ internal sealed class PostgreSqlTransportStore
             "PostgreSQL",
             cancellationToken).ConfigureAwait(false);
     }
+
+    /// <summary>
+    /// Whether a publish NOTIFYs the queue's subscribers: only when its row is claimable at once.
+    /// A delayed row is not claimable until its delay has passed (the NAK's reasoning), so a wake
+    /// sent at publish sent every idle subscriber of the queue, in every process, into a claim that
+    /// found nothing — on every durable-flow timer park and redelay hop and every delayed enqueue.
+    /// The row is picked up by the first poll tick after it falls due.
+    /// </summary>
+    internal static bool WakesSubscribers(TimeSpan? delay) => delay is null;
 
     public async Task<PostgreSqlTransportDelivery?> TryClaimAsync(string queue, TimeSpan lockTimeout, CancellationToken cancellationToken)
     {
@@ -822,7 +832,7 @@ internal sealed class PostgreSqlTransportStore
             // returned one more still-listening connection to the pool, every one of them
             // receiving every transport NOTIFY. Bounded, so a half-open socket cannot hold the
             // restart (see PostgreSqlListenConnection); never replaces an unwinding fault.
-            await PostgreSqlListenConnection.ReleaseAsync(_dataSource, connection, listening).ConfigureAwait(false);
+            await PostgreSqlListenConnection.ReleaseAsync(_dataSource, connection, listening, _logger).ConfigureAwait(false);
         }
     }
 
@@ -887,19 +897,14 @@ internal sealed class PostgreSqlTransportStore
     /// to the channel store's algorithm/discriminator so that, for a shared schema, the channel and
     /// transport take the same lock and never race each other on CREATE SCHEMA.
     /// </summary>
-    internal static long SchemaAdvisoryLockKey(string schemaName)
-    {
-        const ulong offset = 14695981039346656037UL;
-        const ulong prime = 1099511628211UL;
-        var hash = offset;
-        foreach (var b in Encoding.UTF8.GetBytes($"asyncresponse:ddl:{schemaName}"))
-        {
-            hash ^= b;
-            hash *= prime;
-        }
+    internal static long SchemaAdvisoryLockKey(string schemaName) => PostgreSqlDdlGuard.SchemaLockKey(schemaName);
 
-        return unchecked((long)hash);
-    }
+    /// <summary>
+    /// The advisory key the one-time table work (the jsonb rewrite, an index build) runs under,
+    /// after the schema-shared DDL has released <see cref="SchemaAdvisoryLockKey"/> (see
+    /// <see cref="PostgreSqlDdlGuard.TableLockKey"/>).
+    /// </summary>
+    internal static long TableAdvisoryLockKey(string schemaName, string table) => PostgreSqlDdlGuard.TableLockKey(schemaName, table);
 
     private static string Quote(string identifier) => "\"" + identifier + "\"";
 

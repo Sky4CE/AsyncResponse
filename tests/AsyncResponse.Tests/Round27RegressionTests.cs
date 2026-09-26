@@ -321,7 +321,8 @@ public sealed class Round27RegressionTests
         // Fixpoint r1 (S1#16): a failed beat waited out another full renew interval. Defaults: a
         // 60 s lease renewed every 20 s — the beats at t=20 and t=40 fail (a ~25 s store blip) and
         // the next one, at t=60, is already past the deadline: the lease was lost although the
-        // store came back at t=41. Now a failed beat retries every second.
+        // store came back at t=41. Now a failed beat retries on a short backoff (the first retry
+        // within a second, the next within two).
         var clock = new VirtualTimeProvider();
         var store = new FlakyRenewalStore(new InMemoryFlowStateStore(clock), failures: 2);
         var options = new DurableFlowOptions();
@@ -336,8 +337,113 @@ public sealed class Round27RegressionTests
 
         Assert.False(lease.LostToken.IsCancellationRequested);
         lease.ThrowIfLost();
-        // t=20 and t=21 fail; t=22, t=42 and t=62 renew.
+        // t=20 and ~t=21 fail; ~t=22, ~t=42 and ~t=62 renew (all by t=65, whatever the jitter).
         Assert.Equal(5, store.RenewAttempts);
+    }
+
+    [Fact]
+    public async Task FailedRenewals_BackOff_InsteadOfHammeringTheStore_AndStillRideOutABlipEndingBeforeTheDeadline()
+    {
+        // Fixpoint r2 (S1#6): the short retry had no backoff — every second for as long as the store
+        // kept failing, about twenty times the renewal load per running flow. The retries now back
+        // off, capped at half the time the lease has left, so they keep landing before the deadline:
+        // a blip that ends in time still keeps the lease.
+        var clock = new VirtualTimeProvider();
+        var store = new OutageRenewalStore(new InMemoryFlowStateStore(clock), clock)
+        {
+            FailUntil = clock.GetUtcNow() + TimeSpan.FromSeconds(50)
+        };
+        var options = new DurableFlowOptions();
+
+        Assert.True(await store.TryCreateAsync("flow-backoff", RunningState("flow-backoff"), TimeSpan.FromDays(1)));
+        Assert.True(await store.TryAcquireLeaseAsync("flow-backoff", "lease-1", options.ExecutionLeaseDuration));
+
+        await using var lease = new FlowExecutionLease(store, "flow-backoff", "lease-1", options, NullLogger.Instance, clock);
+
+        // Thirty seconds of failures, from the first failed beat (t=20) to t=50: one attempt per
+        // second was 31; backing off, at most nine whatever the jitter draws.
+        clock.Advance(TimeSpan.FromSeconds(50));
+        Assert.InRange(store.FailedRenewals, 1, 10);
+
+        // The store is back at t=50, ten seconds before the deadline: an attempt still lands in
+        // time, and the lease outlives its original deadline by far.
+        clock.Advance(TimeSpan.FromSeconds(40));
+        Assert.False(lease.LostToken.IsCancellationRequested);
+        lease.ThrowIfLost();
+        Assert.True((await store.ObserveLeaseAsync("flow-backoff"))!.ExpiresAtUtc > clock.GetUtcNow().UtcDateTime);
+    }
+
+    [Fact]
+    public async Task AThrowingLoggingProvider_NeitherStopsRenewal_NorFaultsTheLeasesDisposal()
+    {
+        // Fixpoint r2 (GS1#2): the renewal loop logged a failed beat unguarded. A logging provider
+        // that throws (Microsoft.Extensions.Logging rethrows a provider's failure) faulted the loop,
+        // so nothing renewed the lease for the rest of the execution — a two-beat blip lost it at
+        // the deadline anyway — and disposal's join rethrew the fault out of an execution that had
+        // finished, skipping the release.
+        var clock = new VirtualTimeProvider();
+        var inner = new InMemoryFlowStateStore(clock);
+        var store = new FlakyRenewalStore(inner, failures: 2);
+        var options = new DurableFlowOptions();
+        var logger = new CollectingLogger { ThrowOnMessageContaining = "Failed to renew" };
+
+        Assert.True(await store.TryCreateAsync("flow-throwing-logger", RunningState("flow-throwing-logger"), TimeSpan.FromDays(1)));
+        Assert.True(await store.TryAcquireLeaseAsync("flow-throwing-logger", "lease-1", options.ExecutionLeaseDuration));
+        var lease = new FlowExecutionLease(store, "flow-throwing-logger", "lease-1", options, logger, clock);
+
+        clock.Advance(TimeSpan.FromSeconds(65));
+
+        Assert.Contains(logger.Messages, message => message.Contains("Failed to renew", StringComparison.Ordinal));
+        Assert.False(lease.LostToken.IsCancellationRequested);
+        lease.ThrowIfLost();
+
+        await lease.DisposeAsync();
+        Assert.Null((await inner.ObserveLeaseAsync("flow-throwing-logger"))!.LeaseId);
+    }
+
+    [Fact]
+    public async Task AThrowingLoggingProvider_StillLetsTheDeadlineWatcherCancelLostToken()
+    {
+        // Fixpoint r2 (GS1#2): the deadline watcher logged BEFORE it marked the lease lost, so a
+        // throwing logging provider left LostToken live past the deadline — the one thing the
+        // watcher exists to fire while a renewal is wedged.
+        var clock = new VirtualTimeProvider();
+        var store = new WedgedRenewalStore();
+        var options = new DurableFlowOptions
+        {
+            ExecutionLeaseDuration = TimeSpan.FromSeconds(30),
+            ExecutionLeaseRenewInterval = TimeSpan.FromSeconds(10),
+        };
+        var logger = new CollectingLogger { ThrowOnMessageContaining = "reached its deadline" };
+
+        await using var lease = new FlowExecutionLease(store, "flow-wedged-throwing-logger", "lease-1", options, logger, clock);
+        clock.Advance(TimeSpan.FromSeconds(11));
+        await store.RenewEntered.WaitAsync(TimeSpan.FromSeconds(10));
+        clock.Advance(TimeSpan.FromSeconds(30));
+
+        Assert.True(
+            lease.LostToken.WaitHandle.WaitOne(TimeSpan.FromSeconds(10)),
+            "LostToken stayed live past the lease deadline because the watcher's log line threw before it marked the lease lost.");
+        Assert.Contains(logger.Messages, message => message.Contains("reached its deadline", StringComparison.Ordinal));
+    }
+
+    /// <summary>The in-memory store, whose renewals throw until <see cref="FailUntil"/> on the virtual clock.</summary>
+    private sealed class OutageRenewalStore(InMemoryFlowStateStore inner, VirtualTimeProvider clock) : DurableFlowContextTestSupport.DelegatingFlowStateStore(inner)
+    {
+        private int _failedRenewals;
+
+        public DateTimeOffset FailUntil { get; init; }
+
+        public int FailedRenewals => Volatile.Read(ref _failedRenewals);
+
+        public override Task<bool> TryRenewLeaseAsync(string flowId, string leaseId, TimeSpan leaseDuration, CancellationToken cancellationToken = default)
+        {
+            if (clock.GetUtcNow() >= FailUntil)
+                return base.TryRenewLeaseAsync(flowId, leaseId, leaseDuration, cancellationToken);
+
+            Interlocked.Increment(ref _failedRenewals);
+            return Task.FromException<bool>(new TimeoutException("store unreachable"));
+        }
     }
 
     [Fact]

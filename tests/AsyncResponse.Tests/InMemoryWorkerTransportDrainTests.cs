@@ -453,7 +453,7 @@ public sealed class InMemoryWorkerTransportDrainTests
             // BackgroundService-based host the deferred ExecuteAsync was discarded un-run, no
             // drain ever happened, and this list stayed empty.
             var retained = Assert.Single(retention);
-            Assert.Equal(typeof(IDrainProbe).FullName, retained.Call.ServiceInterfaceFullName);
+            Assert.Equal(typeof(IDrainProbe).FullName, retained.Job.Call.ServiceInterfaceFullName);
 
             gate.Set();
             await stopping.WaitAsync(TimeSpan.FromSeconds(10));
@@ -647,6 +647,110 @@ public sealed class InMemoryWorkerTransportDrainTests
         Assert.False(cutoff.IsCancellationRequested, "the stop should have drained on its own, not been cut off");
         Assert.Equal(2, probe.Executed);
         Assert.Equal(0, transport.OutstandingJobs);
+        // The throwing line really ran (CollectingLogger records before it throws): the second job
+        // started during the drain, which is the path under test.
+        Assert.Contains(logger.Messages, message => message.Contains("Draining in-memory worker job", StringComparison.Ordinal));
+    }
+
+    public sealed record DrainSleepInput(string Name);
+
+    /// <summary>Sleeps an hour at once: past the in-process threshold, so the flow suspends on a delayed wake-up.</summary>
+    public sealed class DrainSleepFlow : IDurableFlow<DrainSleepInput>
+    {
+        public async Task ExecuteAsync(IDurableFlowContext flow, DrainSleepInput input)
+            => await flow.DelayAsync("nap", TimeSpan.FromHours(1));
+    }
+
+    [Fact]
+    public async Task AFlowParkingOnATimerDuringTheShutdownDrain_ParksOnce_InsteadOfFailingAndReplaying()
+    {
+        // S4#1 (fixpoint r2): a delayed publish made during the drain threw, so a flow the drain
+        // ran that suspended on a timer turned its park into a failed attempt: the drain's retry
+        // ladder replayed the flow MaxDeliveryAttempts times (each failing the same way) and then
+        // dropped it with an Error and a `dropped` outcome — on every deploy with such a flow
+        // queued. The wake-up from inside a draining job is now dropped like any pending delayed
+        // job at shutdown (the documented contract), and the park commits.
+        var gate = new DrainProbe();
+        var logger = new CollectingLogger();
+        var services = new ServiceCollection();
+        services.AddSingleton(typeof(Microsoft.Extensions.Logging.ILogger<>), typeof(NullLogger<>));
+        services.AddSingleton(logger.For<InMemoryWorkerHost>());
+        services.AddSingleton<IDrainProbe>(gate);
+        services.AddAsyncResponse()
+            .WithInMemoryChannel()
+            .WithInMemoryTransport()
+            .WithInMemoryDurableFlows()
+            .WithDurableFlow<DrainSleepFlow, DrainSleepInput>();
+        await using var provider = services.BuildServiceProvider();
+        var hosted = provider.GetServices<IHostedService>().ToArray();
+        foreach (var service in hosted)
+            await service.StartAsync(CancellationToken.None);
+        var transport = provider.GetRequiredService<InMemoryWorkerTransport>();
+        var host = hosted.OfType<InMemoryWorkerHost>().Single();
+        var flows = provider.GetRequiredService<IDurableFlows>();
+
+        // The only worker is busy when the stop begins, with the flow's start queued behind it.
+        await transport.PublishAsync(OverflowJob("hold-the-worker"));
+        await gate.FirstStarted.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        var flowId = await flows.StartAsync<DrainSleepFlow, DrainSleepInput>(new DrainSleepInput("drain"));
+
+        using var cutoff = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        var stop = host.StopAsync(cutoff.Token);
+        gate.ReleaseFirst.TrySetResult();
+        await stop;
+
+        Assert.False(cutoff.IsCancellationRequested, "the stop should have drained on its own, not been cut off");
+        var state = await flows.GetStateAsync(flowId);
+        Assert.NotNull(state);
+        Assert.Equal(FlowRunStatus.Running, state!.Status);
+        Assert.Equal(1, state.Attempts);
+        Assert.Contains("sleeping until", state.LastMessage, StringComparison.Ordinal);
+        Assert.Contains(logger.Messages, message => message.Contains("published by a job during the shutdown drain", StringComparison.Ordinal));
+        Assert.DoesNotContain(logger.Messages, message => message.Contains("failed on attempt", StringComparison.Ordinal));
+        Assert.DoesNotContain(logger.Messages, message => message.Contains("dropping it", StringComparison.Ordinal));
+
+        foreach (var service in Enumerable.Reverse(hosted))
+            await service.StopAsync(CancellationToken.None);
+    }
+
+    [Fact]
+    public async Task AfterASimulatedRestartClosedStarts_AWorkerHoldsBackTheJobItReads_ForTheRestartToCarryOver()
+    {
+        // S4#11 (fixpoint r2): a simulated restart takes the unstarted jobs out under the pump gate,
+        // but the dying incarnation's workers read the queue WITHOUT it — a worker freed after the
+        // stop (a lingering execution ending, a park ended by a background reply) could read a
+        // job beside the take and run it in the dying incarnation, against a provider disposed a
+        // moment later: failing on every attempt, dropped, never carried over. Once the restart
+        // closes starts, a worker holds back what it reads, still outstanding, for the take.
+        var probe = new DrainProbe();
+        probe.ReleaseFirst.TrySetResult();
+        await using var provider = new ServiceCollection().AddSingleton<IDrainProbe>(probe).BuildServiceProvider();
+        var transport = new InMemoryWorkerTransport();
+        var executor = new WorkerJobExecutor(provider.GetRequiredService<IServiceScopeFactory>(), NullLogger<WorkerJobExecutor>.Instance);
+        var host = new InMemoryWorkerHost(transport, executor, NullLogger<InMemoryWorkerHost>.Instance);
+        await host.StartAsync(CancellationToken.None);
+
+        transport.StopStartingJobs();
+        await transport.PublishAsync(OverflowJob("read-after-the-stop"));
+
+        // Hang guard only: the idle worker reads the job at once.
+        var guard = DateTime.UtcNow + TimeSpan.FromSeconds(10);
+        while (transport.HeldBackJobs == 0 && probe.Executed == 0)
+        {
+            Assert.True(DateTime.UtcNow < guard, "the worker never read the job");
+            await Task.Delay(TimeSpan.FromMilliseconds(1));
+        }
+
+        Assert.Equal(0, probe.Executed);
+        var carried = Assert.Single(transport.TakeUnstartedJobs(reopen: true));
+        Assert.Equal("read-after-the-stop", carried.Job.CorrelationId);
+        Assert.Equal(0, transport.OutstandingJobs);
+
+        // The final take reopened starts: what arrives after it runs here, as before.
+        await transport.PublishAsync(OverflowJob("after-the-final-take"));
+        await probe.FirstStarted.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        await host.StopAsync(CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(10));
+        Assert.Equal(1, probe.Executed);
     }
 
     public interface IFireAndForgetProbe

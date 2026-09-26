@@ -59,11 +59,18 @@ public sealed class AsyncResponseCallbackAllowList
             _allowedTypes.Add(executorName);
 
         // Compared by type identity (TypeNameIdentity), as resolution matches them: an allowlisted
-        // closed generic persisted by a build whose argument assembly had another version — a
-        // recovery row written before the deploy that bumped it — used to be refused.
+        // closed generic persisted by a build whose argument assembly had another version or key
+        // — a recovery row written before the deploy that bumped or re-signed it — used to be
+        // refused. The configured spelling is kept next to its normal form so the common exact
+        // match (a descriptor persisted by this very build) is one lookup, without normalizing
+        // the name on every check; an exact match always implies a normalized one, so the extra
+        // entries admit nothing new.
         var allowed = new HashSet<string>(StringComparer.Ordinal);
         foreach (var name in _allowedTypes)
+        {
+            allowed.Add(name);
             allowed.Add(TypeNameIdentity.Normalize(name)!);
+        }
 
         return new AllowListAuthorizer(allowed, _predicates);
     }
@@ -74,10 +81,13 @@ public sealed class AsyncResponseCallbackAllowList
         /// <summary>Runs the IsAllowed operation.</summary>
         public bool IsAllowed(string serviceInterfaceFullName, string methodName)
         {
-            // Normalized like the allowlist (Build); a name outside the persisted type-name limits
-            // is left untouched and must match verbatim.
-            if (allowedTypes.Contains(TypeNameIdentity.Normalize(serviceInterfaceFullName)!))
+            // Verbatim first, then normalized like the allowlist (Build); a name outside the
+            // persisted type-name limits is left untouched and must match verbatim.
+            if (allowedTypes.Contains(serviceInterfaceFullName)
+                || allowedTypes.Contains(TypeNameIdentity.Normalize(serviceInterfaceFullName)!))
+            {
                 return true;
+            }
 
             foreach (var predicate in predicates)
             {

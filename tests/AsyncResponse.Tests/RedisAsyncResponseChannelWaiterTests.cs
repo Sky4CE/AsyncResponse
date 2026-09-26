@@ -6,6 +6,7 @@ using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
 using Moq;
 using StackExchange.Redis;
+using System.Diagnostics;
 using System.Net;
 using System.Reflection;
 using System.Text;
@@ -56,6 +57,15 @@ public class RedisAsyncResponseChannelWaiterTests
         public RedisValue? InvokeOnSubscribe { get; set; }
         public Action<RedisChannel>? OnSubscribe { get; set; }
         public int UnsubscribeCount => Volatile.Read(ref _unsubscribeCount);
+
+        /// <summary>Every channel-wide unsubscribe, in call order (the channel names).</summary>
+        public System.Collections.Concurrent.ConcurrentQueue<string> UnsubscribeAllCalls { get; } = new();
+
+        public Task UnsubscribeAllAsync(RedisChannel channel)
+        {
+            UnsubscribeAllCalls.Enqueue(channel.ToString()!);
+            return Task.CompletedTask;
+        }
 
         public async Task<IRedisChannelSubscription> SubscribeAsync(RedisChannel channel, Func<RedisChannel, RedisValue, Task> onMessage)
         {
@@ -627,6 +637,218 @@ public class RedisAsyncResponseChannelWaiterTests
             It.IsAny<TimeSpan>(),
             It.IsAny<CancellationToken>()), Times.Never);
         _store.Verify(s => s.TryDeleteAsync("corr-a", It.IsAny<Guid>(), It.IsAny<CancellationToken>()), Times.Once);
+    }
+
+    /// <summary>
+    /// Fixpoint round 2 (GS4#2). StackExchange.Redis registers a subscription's queue BEFORE it
+    /// sends SUBSCRIBE and does not undo that when the command fails, so a failed subscribe never
+    /// handed back the queue to remove: it stayed registered unread, was re-subscribed on every
+    /// reconnect until process exit, and kept PUBLISH/NUMSUB counting a phantom waiter for a reused
+    /// correlation id. The failed waiter's cleanup, holding the channel alone, now removes every
+    /// local registration for it. Pre-fix: no channel-wide unsubscribe at all.
+    /// </summary>
+    [Fact]
+    public async Task CreateResponseWaiter_SubscribeFailure_RemovesTheQueueTheClientLeftRegistered()
+    {
+        _channelSubscriber.SubscribeException = new RedisTimeoutException(CommandFlags.None, "subscribe timed out", CommandStatus.WaitingInBacklog);
+        var channel = CreateChannel();
+
+        await Assert.ThrowsAsync<RedisTimeoutException>(() => channel.CreateResponseWaiter<OperationResult>("corr-orphan"));
+
+        var removed = Assert.Single(_channelSubscriber.UnsubscribeAllCalls);
+        Assert.EndsWith("corr-orphan", removed, StringComparison.Ordinal);
+        Assert.Equal(0, _channelSubscriber.UnsubscribeCount);
+    }
+
+    /// <summary>
+    /// Fixpoint round 2 (GS4#2): the channel-wide unsubscribe removes EVERY registration for the
+    /// channel, so it must not run while a sibling waiter on the same correlation id still holds it
+    /// — that would silently cut the sibling off. The failed waiter leaves the orphaned queue to the
+    /// last holder, whose release removes it. Pre-fix: the orphan outlives the sibling too.
+    /// </summary>
+    [Fact]
+    public async Task CreateResponseWaiter_SubscribeFailureBesideALiveSibling_LeavesTheOrphanToTheLastHolder()
+    {
+        var channel = CreateChannel();
+        var sibling = await channel.CreateResponseWaiter<OperationResult>("corr-shared");
+
+        _channelSubscriber.SubscribeException = new RedisTimeoutException(CommandFlags.None, "subscribe timed out", CommandStatus.WaitingInBacklog);
+        await Assert.ThrowsAsync<RedisTimeoutException>(() => channel.CreateResponseWaiter<OperationResult>("corr-shared"));
+        _channelSubscriber.SubscribeException = null;
+
+        Assert.Empty(_channelSubscriber.UnsubscribeAllCalls); // the sibling is still served
+
+        await sibling.DisposeAsync();
+
+        var removed = Assert.Single(_channelSubscriber.UnsubscribeAllCalls);
+        Assert.EndsWith("corr-shared", removed, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Fixpoint round 2 (GS4#2), against the real client: a SUBSCRIBE that fails (a closed local
+    /// port, fail-fast backlog) leaves NO subscription registered in the multiplexer once the create
+    /// has failed. Pre-fix: one subscription stays registered — re-subscribed on every reconnect.
+    /// </summary>
+    [Fact]
+    public async Task CreateResponseWaiter_SubscribeFailureOnARealMultiplexer_LeavesNoSubscriptionRegistered()
+    {
+        int closedPort;
+        using (var probe = new System.Net.Sockets.TcpListener(IPAddress.Loopback, 0))
+        {
+            probe.Start();
+            closedPort = ((IPEndPoint)probe.LocalEndpoint).Port;
+            probe.Stop();
+        }
+
+        var configuration = new ConfigurationOptions
+        {
+            AbortOnConnectFail = false,
+            ConnectTimeout = 200,
+            AsyncTimeout = 500,
+            SyncTimeout = 500,
+            ConnectRetry = 0,
+            BacklogPolicy = BacklogPolicy.FailFast
+        };
+        configuration.EndPoints.Add(IPAddress.Loopback, closedPort);
+        await using var multiplexer = await ConnectionMultiplexer.ConnectAsync(configuration);
+        var subscriptionsCount = typeof(ConnectionMultiplexer).GetMethod("GetSubscriptionsCount", BindingFlags.Instance | BindingFlags.NonPublic);
+        Assert.NotNull(subscriptionsCount);
+        var channel = new RedisAsyncResponseChannel(
+            _services.GetRequiredService<IServiceScopeFactory>(),
+            multiplexer,
+            _store.Object,
+            Options.Create(new RedisAsyncResponseOptions()),
+            new AsyncResponseContextPropagation([]),
+            NullLogger<RedisAsyncResponseChannel>.Instance);
+
+        await Assert.ThrowsAnyAsync<RedisException>(() => channel.CreateResponseWaiter<OperationResult>("corr-real-orphan").WaitAsync(TimeSpan.FromSeconds(30)));
+
+        Assert.Equal(0, (int)subscriptionsCount.Invoke(multiplexer, null)!);
+        await channel.DisposeAsync();
+    }
+
+    /// <summary>
+    /// Fixpoint round 2 (S2#13). The subscribe-failure path logged BEFORE cleaning up; a logging
+    /// provider that throws (Microsoft.Extensions.Logging rethrows provider failures) skipped the
+    /// cleanup, leaving the SUBSCRIBE and the executor registration behind with no timer — a
+    /// zombie that publish and NUMSUB count as a live waiter — and replaced the registration
+    /// failure with the logger's. Cleanup now runs first and the log is guarded. Pre-fix: the
+    /// logger's exception escapes and nothing is unsubscribed.
+    /// </summary>
+    [Fact]
+    public async Task CreateResponseWaiter_RegistrationFailure_WithAThrowingLogger_StillCleansUp_AndThrowsTheRealFailure()
+    {
+        var failure = new InvalidOperationException("recovery save failed");
+        _store
+            .Setup(s => s.SaveAsync(It.IsAny<string>(), It.IsAny<RecoveryState>(), It.IsAny<TimeSpan>(), It.IsAny<CancellationToken>()))
+            .ThrowsAsync(failure);
+        var logger = new RecordingThrowingLogger<RedisAsyncResponseChannel> { ThrowOnMessageContaining = "Failed to subscribe" };
+        var channel = CreateChannel(new RedisAsyncResponseOptions(), logger);
+
+        var thrown = await Assert.ThrowsAsync<InvalidOperationException>(() => channel.CreateResponseWaiter<OperationResult>("corr-zombie"));
+
+        Assert.Same(failure, thrown);
+        Assert.Equal(1, _channelSubscriber.UnsubscribeCount);
+        Assert.False(HasExecutorRegistration(GetExecutorRegistry(channel), _channelSubscriber.SubscribedChannel.ToString()!));
+        _store.Verify(s => s.TryDeleteAsync("corr-zombie", It.IsAny<Guid>(), It.IsAny<CancellationToken>()), Times.Once);
+    }
+
+    /// <summary>
+    /// Fixpoint round 2 (S2#13): the settled-waiter warning was unguarded — a throwing logging
+    /// provider turned a delivered response into a create failure after all. Pre-fix: the create
+    /// throws the logger's exception.
+    /// </summary>
+    [Fact]
+    public async Task CreateResponseWaiter_SaveFailureAfterTerminalSettledTheWait_WithAThrowingLogger_StillReturnsTheWaiter()
+    {
+        var saveStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var cleanupDeleteIssued = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        _store
+            .Setup(s => s.SaveAsync(It.IsAny<string>(), It.IsAny<RecoveryState>(), It.IsAny<TimeSpan>(), It.IsAny<CancellationToken>()))
+            .Returns(async () =>
+            {
+                saveStarted.TrySetResult();
+                await cleanupDeleteIssued.Task;
+                throw new InvalidOperationException("recovery save failed");
+            });
+        _store
+            .Setup(s => s.TryDeleteAsync(It.IsAny<string>(), It.IsAny<Guid>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(true)
+            .Callback(() => cleanupDeleteIssued.TrySetResult());
+        var logger = new RecordingThrowingLogger<RedisAsyncResponseChannel> { ThrowOnMessageContaining = "Registration step failed" };
+        var channel = CreateChannel(new RedisAsyncResponseOptions(), logger);
+
+        var waiterTask = channel.CreateResponseWaiter<OperationResult>("corr-save-fail-log");
+        await saveStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await _channelSubscriber.Handler!(
+            _channelSubscriber.SubscribedChannel,
+            """{"SchemaVersion":1,"Success":true,"Payload":{"Status":2,"Message":"settled"},"ExceptionMessage":null,"ExceptionStackTrace":null}""");
+
+        await using var waiter = await waiterTask.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal("settled", (await waiter.ResponseTask).Message);
+    }
+
+    /// <summary>
+    /// Fixpoint round 2 (S2#2). The create path's "already settled" filter is evaluated when the
+    /// catch is chosen — BEFORE the second catch's drain. A delivery still inside the executor at
+    /// that moment (mid Until predicate) settles the wait during the drain, and the unconditional
+    /// rethrow then discarded a response the publisher was told was delivered. The wait is now
+    /// re-checked after the drain. Deterministic: the save fails while the predicate is parked, and
+    /// the predicate is released only once the failure path has begun (its activity carries the
+    /// subscribe failure). Pre-fix: the create throws the save failure.
+    /// </summary>
+    [Fact]
+    public async Task CreateResponseWaiter_SaveFailsWhileADeliveryIsInsideItsPredicate_ReturnsTheWaiterThatDeliverySettled()
+    {
+        var waitActivities = new System.Collections.Concurrent.ConcurrentQueue<Activity>();
+        using var listener = new ActivityListener
+        {
+            ShouldListenTo = source => source.Name == AsyncResponseDiagnostics.ActivitySourceName,
+            Sample = (ref ActivityCreationOptions<ActivityContext> _) => ActivitySamplingResult.AllDataAndRecorded,
+            ActivityStarted = activity =>
+            {
+                if (activity.OperationName == "asyncresponse.wait")
+                    waitActivities.Enqueue(activity);
+            }
+        };
+        ActivitySource.AddActivityListener(listener);
+
+        var saveStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var failSave = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        _store
+            .Setup(s => s.SaveAsync(It.IsAny<string>(), It.IsAny<RecoveryState>(), It.IsAny<TimeSpan>(), It.IsAny<CancellationToken>()))
+            .Returns(async () =>
+            {
+                saveStarted.TrySetResult();
+                await failSave.Task;
+                throw new InvalidOperationException("recovery save failed");
+            });
+        var insidePredicate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releasePredicate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var channel = CreateChannel();
+
+        var waiterTask = channel.CreateResponseWaiter<OperationResult>(
+            "corr-s2-2",
+            completionPredicate: async _ =>
+            {
+                insidePredicate.TrySetResult();
+                await releasePredicate.Task;
+                return true;
+            });
+        await saveStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await _channelSubscriber.Handler!(
+            _channelSubscriber.SubscribedChannel,
+            """{"SchemaVersion":1,"Success":true,"Payload":{"Status":2,"Message":"in flight"},"ExceptionMessage":null,"ExceptionStackTrace":null}""");
+        await insidePredicate.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        failSave.TrySetResult();
+        await Eventually(() => waitActivities.Any(activity =>
+            activity.GetTagItem("asyncresponse.correlation_id") as string == "corr-s2-2"
+            && activity.GetTagItem("error.type") as string == "subscribe_failure"));
+        releasePredicate.TrySetResult();
+
+        await using var waiter = await waiterTask.WaitAsync(TimeSpan.FromSeconds(10));
+        Assert.Equal("in flight", (await waiter.ResponseTask).Message);
     }
 
     [Fact]
@@ -1228,10 +1450,10 @@ public class RedisAsyncResponseChannelWaiterTests
     // registration.
     [InlineData(true, false, false, 0L, -1L)]
     // Outside a cluster the unreachable "primary" is the old one of a failover, which the
-    // multiplexer keeps listing (disconnected) until it rejoins: once it has been down for the
-    // failover grace, the promoted primary's zero is the whole answer, as it is for the recovery
-    // scan. Read as unknown, every lost-subscriber publish threw until the old primary came back
-    // or the process restarted.
+    // multiplexer keeps listing (disconnected) until it rejoins: the promoted primary's zero is
+    // the whole answer, as it is for the recovery scan (no failover grace: this process never saw
+    // the node connected). Read as unknown, every lost-subscriber publish threw until the old
+    // primary came back or the process restarted.
     [InlineData(false, false, false, 0L, 0L)]
     // Every primary answered: a zero is now the whole answer.
     [InlineData(true, true, false, 0L, 0L)]
@@ -1270,19 +1492,13 @@ public class RedisAsyncResponseChannelWaiterTests
             .ReturnsAsync(reachableCount);
         multiplexer.Setup(m => m.GetServer(siblingEndPoint, It.IsAny<object?>())).Returns(sibling.Object);
 
-        var clock = new VirtualTimeProvider();
         var channel = new RedisAsyncResponseChannel(
             _services.GetRequiredService<IServiceScopeFactory>(),
             multiplexer.Object,
             _store.Object,
             Options.Create(new RedisAsyncResponseOptions()),
             new AsyncResponseContextPropagation([]),
-            new TestLogger<RedisAsyncResponseChannel>(),
-            timeProvider: clock);
-
-        // The verdict once any disconnection has outlasted the failover grace (pinned separately).
-        await channel.CountActiveSubscribersAsync("corr");
-        clock.Advance(RedisAsyncResponseChannel.DisconnectedEndPointGrace);
+            new TestLogger<RedisAsyncResponseChannel>());
 
         Assert.Equal(expected, await channel.CountActiveSubscribersAsync("corr"));
     }
@@ -1359,31 +1575,47 @@ public class RedisAsyncResponseChannelWaiterTests
         shardB.Setup(s => s.ClusterNodesRawAsync(It.IsAny<CommandFlags>())).ReturnsAsync(nodeTable);
         var disconnected = ProbeClusterServer(disconnectedAddress, connected: false, subscribers: 0);
 
-        var clock = new VirtualTimeProvider();
-        var channel = CreateProbeChannel(clock, shardA, shardB, disconnected);
-        await channel.CountActiveSubscribersAsync("corr");
-        clock.Advance(RedisAsyncResponseChannel.DisconnectedEndPointGrace);
+        var channel = CreateProbeChannel(shardA, shardB, disconnected);
 
         Assert.Equal(expected, await channel.CountActiveSubscribersAsync("corr"));
     }
 
-    /// <summary>The table excuses nothing that owns slots: an unreachable shard keeps the zero unknown.</summary>
+    /// <summary>
+    /// The table excuses nothing that owns slots: an unreachable shard keeps the zero unknown.
+    /// Fixpoint round 2 (S11#3): the probe must actually reach the node table for this to pin
+    /// anything. The old version probed once, inside the failover grace, and got its -1 from the
+    /// grace alone — the probe's final "every owner answered" mapping could have returned 0 (the
+    /// false zero that consumes a live waiter's registration) and this stayed green. The shard now
+    /// went down more than the grace ago, so only the table can keep the zero unknown.
+    /// </summary>
     [Fact]
     public async Task CountActiveSubscribersAsync_ClusterNodeTable_AnUnreachableSlotOwnerStaysUnknown()
     {
         var shardA = ProbeClusterServer("10.0.0.1", connected: true, subscribers: 0);
         shardA.Setup(s => s.ClusterNodesRawAsync(It.IsAny<CommandFlags>())).ReturnsAsync(ProbeClusterNodeTable);
-        var shardB = ProbeClusterServer("10.0.0.2", connected: false, subscribers: 0);
+        var shardB = ProbeClusterServer("10.0.0.2", connected: true, subscribers: 0);
         var downReplica = ProbeClusterServer("10.0.0.7", connected: false, subscribers: 0);
-
-        var channel = CreateProbeChannel(shardA, shardB, downReplica);
+        var clock = new VirtualTimeProvider();
+        var channel = CreateProbeChannel(clock, shardA, shardB, downReplica);
+        SetConnected(shardB, false);
+        RaiseConnectionFailed(_multiplexer, shardB);
+        await channel.CountActiveSubscribersAsync("corr");
+        clock.Advance(RedisAsyncResponseChannel.DisconnectedEndPointGrace);
 
         Assert.Equal(-1, await channel.CountActiveSubscribersAsync("corr"));
+        shardA.Verify(s => s.ClusterNodesRawAsync(It.IsAny<CommandFlags>()), Times.Once); // the verdict came from the table
     }
 
     /// <summary>
     /// The lost-subscriber publish routes the same verdict: with the never-connected replica
-    /// excused, a publish that reaches nobody consumes the registration instead of throwing.
+    /// excused, a publish that reaches nobody consumes the registration instead of throwing — at
+    /// once. Carried from fixpoint round 1 (pre-commit review, pass 2): the failover grace started
+    /// at the first probe that saw ANY primary-flagged endpoint down, so a replica that never
+    /// connected made every process throw its lost-subscriber publishes for 90 s at its first probe
+    /// — longer than most response transports' redelivery budgets, so those responses were
+    /// dead-lettered. The grace now covers only an endpoint this process saw go from connected to
+    /// disconnected: the failed connect attempt StackExchange.Redis reports for a node it never
+    /// reached starts nothing.
     /// </summary>
     [Fact]
     public async Task SetResponse_ClusterWithANeverConnectedReplica_RoutesTheLostResponseInsteadOfThrowing()
@@ -1392,19 +1624,14 @@ public class RedisAsyncResponseChannelWaiterTests
         shardA.Setup(s => s.ClusterNodesRawAsync(It.IsAny<CommandFlags>())).ReturnsAsync(ProbeClusterNodeTable);
         var shardB = ProbeClusterServer("10.0.0.2", connected: true, subscribers: 0);
         var neverConnectedReplica = ProbeClusterServer("10.0.0.7", connected: false, subscribers: 0);
-        var clock = new VirtualTimeProvider();
-        var channel = CreateProbeChannel(clock, shardA, shardB, neverConnectedReplica);
+        var channel = CreateProbeChannel(new VirtualTimeProvider(), shardA, shardB, neverConnectedReplica);
+        RaiseConnectionFailed(_multiplexer, neverConnectedReplica, ConnectionFailureType.UnableToConnect);
         _subscriber
             .Setup(s => s.PublishAsync(It.IsAny<RedisChannel>(), It.IsAny<RedisValue>(), It.IsAny<CommandFlags>()))
             .ReturnsAsync(0L);
         _store
             .Setup(s => s.GetAllAsync("corr-lost", It.IsAny<CancellationToken>()))
             .ReturnsAsync(Array.Empty<RecoveryState>());
-
-        // Past the failover grace (a replica that never connected is only excused once it has
-        // stayed down that long).
-        await channel.CountActiveSubscribersAsync("corr-lost");
-        clock.Advance(RedisAsyncResponseChannel.DisconnectedEndPointGrace);
 
         await channel.SetResponse(new OperationResult { Status = OperationStatus.Completed }, "corr-lost");
     }
@@ -1422,25 +1649,11 @@ public class RedisAsyncResponseChannelWaiterTests
     [InlineData(false)]
     public async Task CountActiveSubscribersAsync_JustDisconnectedPrimary_StaysUnknownUntilItHasBeenDownForTheGrace(bool cluster)
     {
-        // After the failover: the old owner (10.0.0.2) is down and flagged failed, its slots moved
-        // to the promoted replica (10.0.0.7), which answers zero — the waiter has not re-subscribed.
-        const string failedOverTable =
-            "07c37dfeb235213a872192d90877d0cd55635b91 10.0.0.1:6379@16379 myself,master - 0 0 1 connected 0-8191\n" +
-            "67ed2db8d677e59ec4a4cefb06858cf2a1a89fa1 10.0.0.2:6379@16379 master,fail - 0 1426238316232 2 disconnected\n" +
-            "292f8b365bb7edb5e285caf0b7e6ddc7265d2f4f 10.0.0.7:6379@16379 master - 0 1426238317741 3 connected 8192-16383\n";
-        var serverType = cluster ? ServerType.Cluster : ServerType.Standalone;
-        var shardA = ProbeClusterServer("10.0.0.1", connected: true, subscribers: 0);
-        shardA.SetupGet(s => s.ServerType).Returns(serverType);
-        shardA.Setup(s => s.ClusterNodesRawAsync(It.IsAny<CommandFlags>())).ReturnsAsync(failedOverTable);
-        var oldOwnerConnected = false;
-        var oldOwner = ProbeClusterServer("10.0.0.2", connected: false, subscribers: 0);
-        oldOwner.SetupGet(s => s.IsConnected).Returns(() => oldOwnerConnected);
-        oldOwner.SetupGet(s => s.ServerType).Returns(serverType);
-        var promoted = ProbeClusterServer("10.0.0.7", connected: true, subscribers: 0);
-        promoted.SetupGet(s => s.ServerType).Returns(serverType);
-        var clock = new VirtualTimeProvider();
-        var channel = CreateProbeChannel(clock, shardA, oldOwner, promoted);
+        var (_, oldOwner, clock, channel) = CreateFailedOverProbeChannel(cluster);
 
+        // The old owner goes down: from its ConnectionFailed on, the promoted node's zero proves nothing.
+        SetConnected(oldOwner, false);
+        RaiseConnectionFailed(_multiplexer, oldOwner);
         Assert.Equal(-1, await channel.CountActiveSubscribersAsync("corr"));
         clock.Advance(RedisAsyncResponseChannel.DisconnectedEndPointGrace - TimeSpan.FromSeconds(1));
         Assert.Equal(-1, await channel.CountActiveSubscribersAsync("corr"));
@@ -1449,12 +1662,161 @@ public class RedisAsyncResponseChannelWaiterTests
 
         // Only a CONTINUOUS disconnection counts: a node that came back and dropped again is a
         // fresh failover window.
-        oldOwnerConnected = true;
+        SetConnected(oldOwner, true);
+        RaiseConnectionRestored(_multiplexer, oldOwner);
         Assert.Equal(0, await channel.CountActiveSubscribersAsync("corr"));
-        oldOwnerConnected = false;
+        SetConnected(oldOwner, false);
+        RaiseConnectionFailed(_multiplexer, oldOwner);
         Assert.Equal(-1, await channel.CountActiveSubscribersAsync("corr"));
         clock.Advance(RedisAsyncResponseChannel.DisconnectedEndPointGrace);
         Assert.Equal(0, await channel.CountActiveSubscribersAsync("corr"));
+    }
+
+    /// <summary>
+    /// Carried from fixpoint round 1 (pre-commit review, pass 2): the "down since" a probe recorded
+    /// was cleared only when a later probe happened to see the node connected. Probes are rare (a
+    /// lost-subscriber publish, a watchdog sweep every few hours), so a blip one probe saw — the
+    /// node back a moment later, no probe in between — left a days-old timestamp behind, and the
+    /// next real failover of that node was excused at once: the double resume the grace exists to
+    /// prevent. The multiplexer's own ConnectionRestored now ends the disconnection. Pre-fix: 0
+    /// right after the day-later failover.
+    /// </summary>
+    [Fact]
+    public async Task CountActiveSubscribersAsync_ABlipThatEndedUnprobed_DoesNotShortenTheNextFailoversGrace()
+    {
+        var (_, oldOwner, clock, channel) = CreateFailedOverProbeChannel(cluster: true);
+
+        SetConnected(oldOwner, false);
+        RaiseConnectionFailed(_multiplexer, oldOwner);
+        Assert.Equal(-1, await channel.CountActiveSubscribersAsync("corr")); // a probe during the blip
+        SetConnected(oldOwner, true);
+        RaiseConnectionRestored(_multiplexer, oldOwner); // back, with no probe to see it
+
+        clock.Advance(TimeSpan.FromDays(1));
+        SetConnected(oldOwner, false);
+        RaiseConnectionFailed(_multiplexer, oldOwner); // the real failover, a day later
+
+        Assert.Equal(-1, await channel.CountActiveSubscribersAsync("corr"));
+        clock.Advance(RedisAsyncResponseChannel.DisconnectedEndPointGrace);
+        Assert.Equal(0, await channel.CountActiveSubscribersAsync("corr"));
+    }
+
+    /// <summary>
+    /// Carried from fixpoint round 1 (pre-commit review, pass 2): a probe that saw the node down
+    /// wrote its "down since" only after awaiting the other endpoints' answers, over whatever a
+    /// later probe had recorded meanwhile — here a later probe that saw the node back — so a stale
+    /// timestamp survived the reconnection and excused the node's next failover at once. The probe
+    /// no longer writes the disconnection state at all. Pre-fix: 0 right after the next failover.
+    /// </summary>
+    [Fact]
+    public async Task CountActiveSubscribersAsync_AnOlderProbeFinishingLate_DoesNotResurrectAnEndedDisconnection()
+    {
+        var (shardA, oldOwner, clock, channel) = CreateFailedOverProbeChannel(cluster: true);
+        var shardAAnswer = new TaskCompletionSource<long>(TaskCreationOptions.RunContinuationsAsynchronously);
+        shardA.Setup(s => s.SubscriptionSubscriberCountAsync(It.IsAny<RedisChannel>(), It.IsAny<CommandFlags>()))
+            .Returns(() => shardAAnswer.Task);
+
+        SetConnected(oldOwner, false);
+        RaiseConnectionFailed(_multiplexer, oldOwner);
+        var olderProbe = channel.CountActiveSubscribersAsync("corr").AsTask(); // saw the node down; waits on 10.0.0.1
+
+        SetConnected(oldOwner, true);
+        RaiseConnectionRestored(_multiplexer, oldOwner);
+        shardA.Setup(s => s.SubscriptionSubscriberCountAsync(It.IsAny<RedisChannel>(), It.IsAny<CommandFlags>()))
+            .ReturnsAsync(0L);
+        Assert.Equal(0, await channel.CountActiveSubscribersAsync("corr")); // a later probe sees it back
+        shardAAnswer.SetResult(0);
+        Assert.Equal(-1, await olderProbe); // its own observation: inside the grace
+
+        clock.Advance(RedisAsyncResponseChannel.DisconnectedEndPointGrace);
+        SetConnected(oldOwner, false);
+        RaiseConnectionFailed(_multiplexer, oldOwner);
+
+        Assert.Equal(-1, await channel.CountActiveSubscribersAsync("corr"));
+    }
+
+    /// <summary>
+    /// Red-on-old (fixpoint r2 pre-commit, H2): StackExchange.Redis raises ConnectionFailed and
+    /// ConnectionRestored on separate work items, so a blip's failure can be handled after its
+    /// restore. The late failure recorded "down since" for a CONNECTED node, the next real
+    /// failure's transition from connected was never recorded, and that failover's grace was
+    /// measured from the blip — a day old, so the old owner was excused at once (a double resume).
+    /// Pre-fix: 0 right after the day-later failover.
+    /// </summary>
+    [Fact]
+    public async Task CountActiveSubscribersAsync_ABlipsFailureHandledAfterItsRestore_DoesNotShortenTheNextFailoversGrace()
+    {
+        var (_, oldOwner, clock, channel) = CreateFailedOverProbeChannel(cluster: true);
+
+        RaiseConnectionRestored(_multiplexer, oldOwner);
+        RaiseConnectionFailed(_multiplexer, oldOwner); // the blip's failure, handled late: the node is connected
+
+        clock.Advance(TimeSpan.FromDays(1));
+        SetConnected(oldOwner, false);
+        RaiseConnectionFailed(_multiplexer, oldOwner); // the real failover, a day later
+
+        Assert.Equal(-1, await channel.CountActiveSubscribersAsync("corr"));
+        clock.Advance(RedisAsyncResponseChannel.DisconnectedEndPointGrace);
+        Assert.Equal(0, await channel.CountActiveSubscribersAsync("corr"));
+    }
+
+    /// <summary>
+    /// Red-on-old (fixpoint r2 pre-commit, H2): the probe's half of the fix. A "down since" still
+    /// recorded for a node a probe sees connected is stale — whatever delayed its restore — and the
+    /// probe now clears it (by compare-and-swap from the value it read), so it cannot excuse the
+    /// node's next failover at once. Pre-fix: 0 right after the day-later failover.
+    /// </summary>
+    [Fact]
+    public async Task CountActiveSubscribersAsync_AProbeThatSeesTheNodeConnected_ClearsAStaleDownSince()
+    {
+        var (_, oldOwner, clock, channel) = CreateFailedOverProbeChannel(cluster: true);
+
+        SetConnected(oldOwner, false);
+        RaiseConnectionFailed(_multiplexer, oldOwner);
+        SetConnected(oldOwner, true); // back, its ConnectionRestored not handled yet
+        Assert.Equal(0, await channel.CountActiveSubscribersAsync("corr"));
+
+        clock.Advance(TimeSpan.FromDays(1));
+        SetConnected(oldOwner, false);
+        RaiseConnectionFailed(_multiplexer, oldOwner); // the real failover, a day later
+
+        Assert.Equal(-1, await channel.CountActiveSubscribersAsync("corr"));
+    }
+
+    /// <summary>
+    /// The redo of the round-1 rework is null-safe: a stand-in multiplexer that answers null for its
+    /// endpoint list and servers (the JIT probe's no-op proxy) must still build the channel. Round 1's
+    /// version dereferenced <c>GetEndPoints()</c> in the constructor and threw
+    /// <see cref="NullReferenceException"/> there.
+    /// </summary>
+    [Fact]
+    public async Task Channel_OverAMultiplexerThatAnswersNullEndPoints_StillBuildsAndDisposes()
+    {
+        var multiplexer = new Mock<IConnectionMultiplexer>();
+        multiplexer.Setup(m => m.GetSubscriber(It.IsAny<object?>())).Returns(_subscriber.Object);
+        multiplexer.Setup(m => m.GetEndPoints(It.IsAny<bool>())).Returns((EndPoint[])null!);
+
+        var channel = new RedisAsyncResponseChannel(
+            _services.GetRequiredService<IServiceScopeFactory>(),
+            multiplexer.Object,
+            _store.Object,
+            Options.Create(new RedisAsyncResponseOptions()),
+            new AsyncResponseContextPropagation([]),
+            NullLogger<RedisAsyncResponseChannel>.Instance);
+
+        await channel.DisposeAsync();
+    }
+
+    /// <summary>The channel does not outlive its hooks on the application-owned multiplexer.</summary>
+    [Fact]
+    public async Task DisposeAsync_UnhooksTheMultiplexersConnectionEvents()
+    {
+        var channel = CreateProbeChannel(ProbeClusterServer("10.0.0.1", connected: true, subscribers: 0));
+
+        await channel.DisposeAsync();
+
+        _multiplexer.VerifyRemove(m => m.ConnectionFailed -= It.IsAny<EventHandler<ConnectionFailedEventArgs>>(), Times.Once);
+        _multiplexer.VerifyRemove(m => m.ConnectionRestored -= It.IsAny<EventHandler<ConnectionFailedEventArgs>>(), Times.Once);
     }
 
     /// <summary>Inside the grace the lost-subscriber publish throws for a retry instead of consuming the registration.</summary>
@@ -1464,8 +1826,10 @@ public class RedisAsyncResponseChannelWaiterTests
         var shardA = ProbeClusterServer("10.0.0.1", connected: true, subscribers: 0);
         shardA.Setup(s => s.ClusterNodesRawAsync(It.IsAny<CommandFlags>())).ReturnsAsync(ProbeClusterNodeTable);
         var shardB = ProbeClusterServer("10.0.0.2", connected: true, subscribers: 0);
-        var justDown = ProbeClusterServer("10.0.0.7", connected: false, subscribers: 0);
+        var justDown = ProbeClusterServer("10.0.0.7", connected: true, subscribers: 0);
         var channel = CreateProbeChannel(new VirtualTimeProvider(), shardA, shardB, justDown);
+        SetConnected(justDown, false);
+        RaiseConnectionFailed(_multiplexer, justDown);
         _subscriber
             .Setup(s => s.PublishAsync(It.IsAny<RedisChannel>(), It.IsAny<RedisValue>(), It.IsAny<CommandFlags>()))
             .ReturnsAsync(0L);
@@ -1518,6 +1882,47 @@ public class RedisAsyncResponseChannelWaiterTests
             .ReturnsAsync(subscribers);
         return server;
     }
+
+    /// <summary>
+    /// After a failover: the old owner (10.0.0.2) — connected when the channel was created — is
+    /// flagged failed and its slots moved to the promoted replica (10.0.0.7), which answers zero:
+    /// the waiter has not re-subscribed yet. The test takes the old owner down.
+    /// </summary>
+    private (Mock<IServer> ShardA, Mock<IServer> OldOwner, VirtualTimeProvider Clock, RedisAsyncResponseChannel Channel) CreateFailedOverProbeChannel(bool cluster)
+    {
+        const string failedOverTable =
+            "07c37dfeb235213a872192d90877d0cd55635b91 10.0.0.1:6379@16379 myself,master - 0 0 1 connected 0-8191\n" +
+            "67ed2db8d677e59ec4a4cefb06858cf2a1a89fa1 10.0.0.2:6379@16379 master,fail - 0 1426238316232 2 disconnected\n" +
+            "292f8b365bb7edb5e285caf0b7e6ddc7265d2f4f 10.0.0.7:6379@16379 master - 0 1426238317741 3 connected 8192-16383\n";
+        var serverType = cluster ? ServerType.Cluster : ServerType.Standalone;
+        var shardA = ProbeClusterServer("10.0.0.1", connected: true, subscribers: 0);
+        shardA.SetupGet(s => s.ServerType).Returns(serverType);
+        shardA.Setup(s => s.ClusterNodesRawAsync(It.IsAny<CommandFlags>())).ReturnsAsync(failedOverTable);
+        var oldOwner = ProbeClusterServer("10.0.0.2", connected: true, subscribers: 0);
+        oldOwner.SetupGet(s => s.ServerType).Returns(serverType);
+        var promoted = ProbeClusterServer("10.0.0.7", connected: true, subscribers: 0);
+        promoted.SetupGet(s => s.ServerType).Returns(serverType);
+        var clock = new VirtualTimeProvider();
+        return (shardA, oldOwner, clock, CreateProbeChannel(clock, shardA, oldOwner, promoted));
+    }
+
+    private static void SetConnected(Mock<IServer> server, bool connected)
+        => server.SetupGet(s => s.IsConnected).Returns(connected);
+
+    /// <summary>Raises the multiplexer's ConnectionFailed for the server's interactive connection, as StackExchange.Redis does.</summary>
+    private static void RaiseConnectionFailed(
+        Mock<IConnectionMultiplexer> multiplexer,
+        Mock<IServer> server,
+        ConnectionFailureType failure = ConnectionFailureType.SocketClosed)
+        => multiplexer.Raise(
+            m => m.ConnectionFailed += null,
+            new ConnectionFailedEventArgs(multiplexer.Object, server.Object.EndPoint!, ConnectionType.Interactive, failure, new InvalidOperationException("connection lost"), "test"));
+
+    /// <summary>Raises the multiplexer's ConnectionRestored for the server's interactive connection.</summary>
+    private static void RaiseConnectionRestored(Mock<IConnectionMultiplexer> multiplexer, Mock<IServer> server)
+        => multiplexer.Raise(
+            m => m.ConnectionRestored += null,
+            new ConnectionFailedEventArgs(multiplexer.Object, server.Object.EndPoint!, ConnectionType.Interactive, ConnectionFailureType.None, null!, "test"));
 
     private RedisAsyncResponseChannel CreateProbeChannel(params Mock<IServer>[] servers)
         => CreateProbeChannel(timeProvider: null, servers);

@@ -154,13 +154,14 @@ internal sealed class RedisStreamDatabaseAdapter(IDatabase _database, TimeSpan _
         // silently. Neither path dead-letters it: the cap must sit above the deepest backlog the
         // stream can build up (see RedisAsyncResponseTransportOptions.StreamMaxLength).
         => WithCancellation(
-            _database.StreamAddAsync(
-                stream,
-                values,
+            static (database, s) => database.StreamAddAsync(
+                s.stream,
+                s.values,
                 messageId: (RedisValue?)null,
-                maxLength: ToInt32MaxLength(maxLength),
-                useApproximateMaxLength: useApproximateMaxLength,
+                maxLength: ToInt32MaxLength(s.maxLength),
+                useApproximateMaxLength: s.useApproximateMaxLength,
                 flags: CommandFlags.None),
+            (stream, values, maxLength, useApproximateMaxLength),
             cancellationToken);
 
     // Redis caps a stream's MAXLEN well below int.MaxValue in practice; clamp so the classic overload
@@ -190,7 +191,8 @@ internal sealed class RedisStreamDatabaseAdapter(IDatabase _database, TimeSpan _
         }
 
         return (RedisValue)await WithCancellation(
-            _database.ScriptEvaluateAsync(AppendOnceScript, [stream, dedupKey], args),
+            static (database, s) => database.ScriptEvaluateAsync(AppendOnceScript, [s.stream, s.dedupKey], s.args),
+            (stream, dedupKey, args),
             cancellationToken).ConfigureAwait(false);
     }
 
@@ -202,7 +204,8 @@ internal sealed class RedisStreamDatabaseAdapter(IDatabase _database, TimeSpan _
         CancellationToken cancellationToken)
     {
         var result = await WithCancellation(
-            _database.ScriptEvaluateAsync(DeleteIdleConsumerScript, [stream], [groupName, consumerName]),
+            static (database, s) => database.ScriptEvaluateAsync(DeleteIdleConsumerScript, [s.stream], [s.groupName, s.consumerName]),
+            (stream, groupName, consumerName),
             cancellationToken).ConfigureAwait(false);
         return (long)result >= 0;
     }
@@ -215,7 +218,8 @@ internal sealed class RedisStreamDatabaseAdapter(IDatabase _database, TimeSpan _
         bool createStream,
         CancellationToken cancellationToken)
         => WithCancellation(
-            _database.StreamCreateConsumerGroupAsync(stream, groupName, position, createStream),
+            static (database, s) => database.StreamCreateConsumerGroupAsync(s.stream, s.groupName, s.position, s.createStream),
+            (stream, groupName, position, createStream),
             cancellationToken);
 
     /// <summary>Runs the StreamReadGroupAsync operation.</summary>
@@ -226,13 +230,14 @@ internal sealed class RedisStreamDatabaseAdapter(IDatabase _database, TimeSpan _
         int count,
         CancellationToken cancellationToken)
         => WithCancellation(
-            _database.StreamReadGroupAsync(
-                stream,
-                groupName,
-                consumerName,
+            static (database, s) => database.StreamReadGroupAsync(
+                s.stream,
+                s.groupName,
+                s.consumerName,
                 position: StreamPosition.NewMessages,
-                count: count,
+                count: s.count,
                 noAck: false),
+            (stream, groupName, consumerName, count),
             cancellationToken);
 
     /// <summary>Runs the StreamAcknowledgeAsync operation.</summary>
@@ -242,7 +247,8 @@ internal sealed class RedisStreamDatabaseAdapter(IDatabase _database, TimeSpan _
         RedisValue messageId,
         CancellationToken cancellationToken)
         => WithCancellation(
-            _database.StreamAcknowledgeAsync(stream, groupName, messageId),
+            static (database, s) => database.StreamAcknowledgeAsync(s.stream, s.groupName, s.messageId),
+            (stream, groupName, messageId),
             cancellationToken);
 
     /// <summary>Runs the StreamPendingMessagesAsync operation.</summary>
@@ -256,14 +262,15 @@ internal sealed class RedisStreamDatabaseAdapter(IDatabase _database, TimeSpan _
         long minIdleTimeInMilliseconds,
         CancellationToken cancellationToken)
         => WithCancellation(
-            _database.StreamPendingMessagesAsync(
-                stream,
-                groupName,
-                count,
-                consumerName,
-                minId,
-                maxId,
-                minIdleTimeInMilliseconds),
+            static (database, s) => database.StreamPendingMessagesAsync(
+                s.stream,
+                s.groupName,
+                s.count,
+                s.consumerName,
+                s.minId,
+                s.maxId,
+                s.minIdleTimeInMilliseconds),
+            (stream, groupName, count, consumerName, minId, maxId, minIdleTimeInMilliseconds),
             cancellationToken);
 
     /// <summary>Runs the StreamClaimAsync operation.</summary>
@@ -275,12 +282,13 @@ internal sealed class RedisStreamDatabaseAdapter(IDatabase _database, TimeSpan _
         RedisValue[] messageIds,
         CancellationToken cancellationToken)
         => WithCancellation(
-            _database.StreamClaimAsync(
-                stream,
-                groupName,
-                consumerName,
-                minIdleTimeInMilliseconds,
-                messageIds),
+            static (database, s) => database.StreamClaimAsync(
+                s.stream,
+                s.groupName,
+                s.consumerName,
+                s.minIdleTimeInMilliseconds,
+                s.messageIds),
+            (stream, groupName, consumerName, minIdleTimeInMilliseconds, messageIds),
             cancellationToken);
 
     /// <summary>Runs the StreamClaimIdsOnlyAsync operation.</summary>
@@ -292,16 +300,32 @@ internal sealed class RedisStreamDatabaseAdapter(IDatabase _database, TimeSpan _
         RedisValue[] messageIds,
         CancellationToken cancellationToken)
         => WithCancellation(
-            _database.StreamClaimIdsOnlyAsync(
-                stream,
-                groupName,
-                consumerName,
-                minIdleTimeInMilliseconds,
-                messageIds),
+            static (database, s) => database.StreamClaimIdsOnlyAsync(
+                s.stream,
+                s.groupName,
+                s.consumerName,
+                s.minIdleTimeInMilliseconds,
+                s.messageIds),
+            (stream, groupName, consumerName, minIdleTimeInMilliseconds, messageIds),
             cancellationToken);
 
-    private async Task<T> WithCancellation<T>(Task<T> command, CancellationToken cancellationToken)
+    /// <summary>
+    /// Starts the command only once the caller's token has been checked, then bounds it. The
+    /// command is built INSIDE, not by the caller: StackExchange.Redis queues a command the moment
+    /// it is called, so a caller already cancelled — a stop landing between two loop steps — still
+    /// sent it, and an XREADGROUP or XCLAIM moved entries into the stopping consumer's pending list
+    /// while its reply was discarded. Settlements pass <see cref="CancellationToken.None"/> and are
+    /// unaffected. <paramref name="start"/> is static and takes its arguments as
+    /// <paramref name="state"/>, so a call allocates no closure.
+    /// </summary>
+    private async Task<T> WithCancellation<TState, T>(
+        Func<IDatabase, TState, Task<T>> start,
+        TState state,
+        CancellationToken cancellationToken)
     {
+        cancellationToken.ThrowIfCancellationRequested();
+        var command = start(_database, state);
+
         // StackExchange.Redis enforces its own sync/async command timeouts; this adds an upper bound that
         // also honors the caller's token (e.g. host shutdown). On timeout the in-flight command is
         // abandoned best-effort — the multiplexer keeps running it — and surfaced as a TimeoutException so

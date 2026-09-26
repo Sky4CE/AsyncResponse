@@ -131,6 +131,39 @@ public class DurableFlowRecoveryHardeningTests
         Assert.Equal(FlowRunStatus.Succeeded, final!.Status);
     }
 
+    [Fact]
+    public async Task ExecuteAsync_RecoveryCheckpointThatOnlyACurrentReadShows_StillShortCircuitsTheReattach()
+    {
+        // Fixpoint r2 (S1#4): the post-registration re-read decided "not completed" on a plain
+        // load, a decision nothing fences. On a store whose plain loads can lag behind another
+        // process's write (a Cosmos session read behind the recovery's checkpoint) the re-attached
+        // step went on to wait out its whole deadline for a response recovery had already consumed.
+        // The wait below times out at once, so a missed short-circuit fails the attempt instead.
+        ReattachProbeFlow.Reset();
+        var inner = new InMemoryFlowStateStore();
+        var state = NewState("reattach-lagging-read", FlowRunStatus.Running, pendingType: typeof(OperationResult).FullName);
+        state.FlowTypeName = typeof(ReattachProbeFlow).FullName;
+        state.InputTypeName = typeof(HardeningFlowInput).FullName;
+        state.InputJson = """{"Id":1}""";
+        await SeedAsync(inner, state);
+        var store = new LaggingPlainReadStore(inner);
+
+        await using var harness = Harness.Create(
+            store,
+            services => services.AddSingleton<ReattachProbeFlow>(),
+            (_, _) => new RecoverDuringRegistrationBehindALaggingReplicaSubscriber(
+                inner,
+                store,
+                flowId: "reattach-lagging-read",
+                resultJson: AsyncResponseJson.Serialize(new OperationResult { Status = OperationStatus.Completed, Message = "recovered" })));
+
+        await harness.Executor.ExecuteAsync("reattach-lagging-read");
+
+        Assert.Equal(0, ReattachProbeFlow.TriggerCount);
+        Assert.Equal("recovered", ReattachProbeFlow.Result);
+        Assert.Equal(FlowRunStatus.Succeeded, (await inner.LoadAsync("reattach-lagging-read"))!.Status);
+    }
+
     // ---------------------------------------------------------------------------------------
     // Harness
     // ---------------------------------------------------------------------------------------
@@ -241,6 +274,71 @@ public class DurableFlowRecoveryHardeningTests
 
             return waiter;
         }
+    }
+
+    /// <summary>
+    /// Plain loads served by a replica still holding <see cref="StaleJson"/> once it is set; the
+    /// current read and every write go to the authoritative store.
+    /// </summary>
+    private sealed class LaggingPlainReadStore(InMemoryFlowStateStore inner) : DurableFlowContextTestSupport.DelegatingFlowStateStore(inner)
+    {
+        public string? StaleJson { get; set; }
+
+        public override Task<FlowState?> LoadAsync(string flowId, CancellationToken cancellationToken = default)
+            => StaleJson is { } stale
+                ? Task.FromResult<FlowState?>(FlowStateJson.Deserialize(stale, flowId))
+                : base.LoadAsync(flowId, cancellationToken);
+
+        public override Task<FlowState?> LoadCurrentAsync(string flowId, CancellationToken cancellationToken = default)
+            => Inner.LoadAsync(flowId, cancellationToken);
+    }
+
+    /// <summary>
+    /// Inside the step's waiter registration, recovery (another process) checkpoints the step while
+    /// this process's replica keeps serving the ledger as it was; the wait itself then times out at
+    /// once, standing in for the step deadline a missed short-circuit would sit out.
+    /// </summary>
+    private sealed class RecoverDuringRegistrationBehindALaggingReplicaSubscriber(
+        InMemoryFlowStateStore _authoritative,
+        LaggingPlainReadStore _replica,
+        string flowId,
+        string resultJson) : IAsyncResponseSubscriber
+    {
+        public async Task<IAsyncResponseWaiter<T>> CreateResponseWaiter<T>(
+            string correlationId,
+            Func<T, ValueTask<bool>>? completionPredicate = null,
+            TimeSpan? timeout = null) where T : IAsyncResponsePayload
+        {
+            var beforeRecovery = FlowStateJson.Serialize((await _authoritative.LoadAsync(flowId))!);
+            await FlowStateConcurrency.MutateAsync(
+                _authoritative,
+                flowId,
+                TimeSpan.FromMinutes(5),
+                timeProvider: null,
+                state =>
+                {
+                    var step = state.Steps![StepName];
+                    step.Completed = true;
+                    step.ResultJson = resultJson;
+                    step.PendingCorrelationId = null;
+                    step.PendingPayloadTypeFullName = null;
+                    return true;
+                });
+            _replica.StaleJson = beforeRecovery;
+
+            return new TimedOutWaiter<T>(correlationId);
+        }
+    }
+
+    private sealed class TimedOutWaiter<T>(string correlationId) : IAsyncResponseWaiter<T> where T : IAsyncResponsePayload
+    {
+        private Task<T>? _responseTask;
+
+        // Created on first read: a short-circuited step never looks at it, and an unread faulted
+        // task would surface as an unobserved exception.
+        public Task<T> ResponseTask => _responseTask ??= Task.FromException<T>(new TimeoutException($"Timed out waiting for response for correlationId {correlationId}."));
+
+        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
     }
 }
 

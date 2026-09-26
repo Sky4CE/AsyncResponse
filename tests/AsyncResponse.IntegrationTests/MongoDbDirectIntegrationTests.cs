@@ -566,6 +566,60 @@ public sealed class MongoDbDirectIntegrationTests(DataBatchFixture fixture) : In
         }
     }
 
+    [Fact]
+    public async Task TransportStore_ClaimOrder_IsAvailabilityOrder()
+    {
+        // r2 S9#5 (PostgreSQL round-42 / SQL Server round-43 parity): the claim sorts by the claim
+        // index's own key order, (available_at, created_at), so a delayed or redelivered document
+        // queues by when it became due. The created_at sort took the earlier-published one.
+        var (database, options) = NewTransportDatabase("claim-order");
+        using var store = new MongoDbTransportStore(database, Options.Create(options));
+        var first = Guid.NewGuid();
+        var second = Guid.NewGuid();
+        await store.PublishAsync(first, options.WorkerQueue, "{}", null, CancellationToken.None);
+        await store.PublishAsync(second, options.WorkerQueue, "{}", null, CancellationToken.None);
+        var raw = database.GetCollection<BsonDocument>(options.MessageCollection);
+        foreach (var (id, dueAgo) in new[] { (first, 1_000), (second, 60_000) })
+        {
+            await raw.UpdateOneAsync(
+                new BsonDocument("_id", new BsonBinaryData(id, GuidRepresentation.Standard)),
+                Builders<BsonDocument>.Update.Pipeline(new[]
+                {
+                    new BsonDocument("$set", new BsonDocument("available_at", new BsonDocument("$subtract", new BsonArray { "$$NOW", dueAgo })))
+                }));
+        }
+
+        var claimed = await store.TryClaimAsync(options.WorkerQueue, TimeSpan.FromSeconds(30), CancellationToken.None);
+
+        Assert.Equal(second, claimed!.Id);
+    }
+
+    [Fact]
+    public async Task EnsureCreated_AcceptsEquivalentIndexesUnderTheirDefaultNames()
+    {
+        // r2 GS3#5: the indexes the AutoCreateIndexes = false warnings prescribe, created the way an
+        // operator creates them — createIndex without a name, so MongoDB names them expires_at_1 and
+        // queue_1_available_at_1_created_at_1 — made the store's own createIndexes fail with 85
+        // IndexOptionsConflict on every operation once AutoCreateIndexes was back on.
+        var (channelDatabase, channelOptions) = NewChannelDatabase("equivalent-channel");
+        await channelDatabase.GetCollection<BsonDocument>(channelOptions.MessageCollection).Indexes.CreateOneAsync(
+            new CreateIndexModel<BsonDocument>(new BsonDocument("expires_at", 1), new CreateIndexOptions { ExpireAfter = TimeSpan.Zero }));
+        using var channelStore = new MongoDbChannelStore(channelDatabase, Options.Create(channelOptions));
+        await channelStore.EnsureCreatedAsync();
+
+        var (transportDatabase, transportOptions) = NewTransportDatabase("equivalent-transport");
+        await transportDatabase.GetCollection<BsonDocument>(transportOptions.MessageCollection).Indexes.CreateOneAsync(
+            new CreateIndexModel<BsonDocument>(new BsonDocument { ["queue"] = 1, ["available_at"] = 1, ["created_at"] = 1 }));
+        using var transportStore = new MongoDbTransportStore(transportDatabase, Options.Create(transportOptions));
+        await transportStore.EnsureCreatedAsync();
+
+        // The operator's indexes are kept, not replaced.
+        using var channelIndexes = await channelDatabase.GetCollection<BsonDocument>(channelOptions.MessageCollection).Indexes.ListAsync();
+        Assert.Contains(await channelIndexes.ToListAsync(), index => index["name"] == "expires_at_1");
+        using var transportIndexes = await transportDatabase.GetCollection<BsonDocument>(transportOptions.MessageCollection).Indexes.ListAsync();
+        Assert.Contains(await transportIndexes.ToListAsync(), index => index["name"] == "queue_1_available_at_1_created_at_1");
+    }
+
     private (IMongoDatabase Database, MongoDbAsyncResponseChannelOptions Options) NewChannelDatabase(string prefix)
     {
         var database = _client.GetDatabase(NewDatabaseName(prefix));

@@ -146,8 +146,10 @@ public sealed class MongoDbStoreQueryTests
         Assert.Equal("worker", set["queue"]["$literal"].AsString);
         Assert.Equal("""{"job":1}""", set["payload"]["$literal"].AsString);
         Assert.Equal(new BsonArray { "$created_at", "$$NOW" }, set["created_at"]["$ifNull"].AsBsonArray);
+        // Immediately due on the server clock — the claim order's first key (r2 S9#5: an epoch stamp
+        // would sort every immediate document ahead of every due NAKed or delayed one).
         Assert.Equal(
-            new BsonArray { "$available_at", new BsonDateTime(DateTime.UnixEpoch) },
+            new BsonArray { "$available_at", "$$NOW" },
             set["available_at"]["$ifNull"].AsBsonArray);
         Assert.Equal(new BsonArray { "$attempts", 0 }, set["attempts"]["$ifNull"].AsBsonArray);
         Assert.Equal("$headers", set["headers"]["$ifNull"].AsBsonArray[0]);
@@ -478,6 +480,260 @@ public sealed class MongoDbStoreQueryTests
         Assert.Equal("{\"envelope\":1}", message.EnvelopeJson);
     }
 
+    /// <summary>
+    /// Regression (r2 S5#1): under the bounded majority an insert whose wtimeout lapsed was already
+    /// stored on the primary, but it failed the publish — not transient, so no same-id retry — and
+    /// the ingress re-published it under a NEW message id: an Until waiter received the response
+    /// once per attempt, then a failure envelope on top. The stored document is read back by id on
+    /// the primary (a read waits on no replication) and reported stored, with its own stamps.
+    /// </summary>
+    [Fact]
+    public async Task ChannelInsert_WhoseReplicationWaitLapsed_ReadsTheStoredDocumentBack()
+    {
+        var id = Guid.NewGuid();
+        var createdAt = new DateTime(2031, 3, 14, 9, 26, 53, 589, DateTimeKind.Utc);
+        var collection = new Mock<IMongoCollection<MongoChannelMessageDocument>>(MockBehavior.Loose);
+        collection
+            .Setup(c => c.FindOneAndUpdateAsync(
+                It.IsAny<FilterDefinition<MongoChannelMessageDocument>>(),
+                It.IsAny<UpdateDefinition<MongoChannelMessageDocument>>(),
+                It.IsAny<FindOneAndUpdateOptions<MongoChannelMessageDocument, MongoChannelMessageDocument>>(),
+                It.IsAny<CancellationToken>()))
+            .ThrowsAsync(MongoReplicationTimeouts.Command());
+        collection.FindsReturning(new MongoChannelMessageDocument { Id = id, CorrelationId = "corr", CreatedAtUtc = createdAt });
+        var store = CreateChannelStore(collection);
+
+        var message = await store.InsertMessageAsync(id, "corr", "{\"envelope\":1}", TimeSpan.FromHours(1), CancellationToken.None);
+
+        Assert.Equal(id, message.Id);
+        Assert.Equal(new DateTimeOffset(createdAt, TimeSpan.Zero), message.CreatedAtUtc);
+        Assert.Null(message.AckedAtUtc);
+        Assert.Equal("{\"envelope\":1}", message.EnvelopeJson);
+        collection.Verify(
+            c => c.FindOneAndUpdateAsync(
+                It.IsAny<FilterDefinition<MongoChannelMessageDocument>>(),
+                It.IsAny<UpdateDefinition<MongoChannelMessageDocument>>(),
+                It.IsAny<FindOneAndUpdateOptions<MongoChannelMessageDocument, MongoChannelMessageDocument>>(),
+                It.IsAny<CancellationToken>()),
+            Times.Once);
+    }
+
+    /// <summary>
+    /// Regression (r2 S5#1): a delivery claim whose wtimeout lapsed had already stamped acked_at on
+    /// the primary — which the publisher's acknowledgement poll and its recovery claim both read as
+    /// "delivered" — yet it threw, so the response was never dispatched: acknowledged and lost. The
+    /// stamp the claim leaves decides it: acked_at present and not recovery-claimed. Fixpoint r2
+    /// precommit E2: the read-back used to re-evaluate the claim's own filter, whose server-clock
+    /// expiry check ran a wtimeout (~10 s) after the claim — a response that expired in between
+    /// read back as unclaimed although the claim had stamped it, so it was acknowledged and never
+    /// dispatched. The read-back filter carries no expiry clause.
+    /// </summary>
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task ChannelDeliveryClaim_WhoseReplicationWaitLapsed_IsDecidedByTheClaimStamp(bool stillMatches)
+    {
+        var id = Guid.NewGuid();
+        FilterDefinition<MongoChannelMessageDocument>? readBack = null;
+        var collection = new Mock<IMongoCollection<MongoChannelMessageDocument>>(MockBehavior.Loose);
+        collection
+            .Setup(c => c.FindOneAndUpdateAsync(
+                It.IsAny<FilterDefinition<MongoChannelMessageDocument>>(),
+                It.IsAny<UpdateDefinition<MongoChannelMessageDocument>>(),
+                It.IsAny<FindOneAndUpdateOptions<MongoChannelMessageDocument, MongoChannelMessageDocument>>(),
+                It.IsAny<CancellationToken>()))
+            .ThrowsAsync(MongoReplicationTimeouts.Command());
+        collection
+            .Setup(c => c.FindAsync(
+                It.IsAny<FilterDefinition<MongoChannelMessageDocument>>(),
+                It.IsAny<FindOptions<MongoChannelMessageDocument, MongoChannelMessageDocument>>(),
+                It.IsAny<CancellationToken>()))
+            .Callback((FilterDefinition<MongoChannelMessageDocument> filter, FindOptions<MongoChannelMessageDocument, MongoChannelMessageDocument> _, CancellationToken _) => readBack = filter)
+            .ReturnsAsync(() => new MongoListCursor<MongoChannelMessageDocument>(
+                stillMatches ? [new MongoChannelMessageDocument { Id = id }] : []));
+        var store = CreateChannelStore(collection);
+
+        Assert.Equal(stillMatches, await store.TryClaimForDeliveryAsync(id, CancellationToken.None));
+
+        var rendered = readBack!.Render(ChannelRenderArgs());
+        Assert.Equal(new BsonBinaryData(id, GuidRepresentation.Standard), rendered["_id"]);
+        Assert.Equal(BsonBoolean.False, rendered["recovery_claimed"]);
+        Assert.Equal(new BsonDocument("$ne", BsonNull.Value), rendered["acked_at"]);
+        Assert.False(rendered.Contains("$expr"), rendered.ToJson());
+        Assert.False(rendered.Contains("expires_at"), rendered.ToJson());
+    }
+
+    /// <summary>
+    /// Fixpoint r2 precommit E1: the replication-timeout read-backs inherited the database's read
+    /// concern. Under readConcernLevel=majority a read-back taken while the set is degraded reads
+    /// the majority snapshot, which by definition lacks the write whose majority acknowledgement
+    /// just lapsed: a recovery claim that won read back as lost (the publisher then treated the
+    /// response as delivered, and no delivery claim could take it any more — lost with no record),
+    /// a delivery claim as unclaimed, a stored insert as missing. The read-backs go through a
+    /// local-concern handle. The mocks model it: the inherited handle cannot see the write, the
+    /// local-concern handle can. Pre-fix every read-back went to the inherited handle.
+    /// </summary>
+    [Theory]
+    [InlineData("insert")]
+    [InlineData("delivery claim")]
+    [InlineData("recovery claim")]
+    public async Task ChannelReadBacks_AfterAReplicationTimeout_ReadAtLocalConcern(string operation)
+    {
+        var id = Guid.NewGuid();
+        var collection = new Mock<IMongoCollection<MongoChannelMessageDocument>>(MockBehavior.Loose);
+        collection
+            .Setup(c => c.FindOneAndUpdateAsync(
+                It.IsAny<FilterDefinition<MongoChannelMessageDocument>>(),
+                It.IsAny<UpdateDefinition<MongoChannelMessageDocument>>(),
+                It.IsAny<FindOneAndUpdateOptions<MongoChannelMessageDocument, MongoChannelMessageDocument>>(),
+                It.IsAny<CancellationToken>()))
+            .ThrowsAsync(MongoReplicationTimeouts.Command());
+        collection.FindsReturning<MongoChannelMessageDocument, MongoChannelMessageDocument>();
+        var local = new Mock<IMongoCollection<MongoChannelMessageDocument>>(MockBehavior.Loose)
+            .FindsReturning(new MongoChannelMessageDocument
+            {
+                Id = id,
+                CorrelationId = "corr",
+                CreatedAtUtc = DateTime.UtcNow,
+                AckedAtUtc = operation == "delivery claim" ? DateTime.UtcNow : null,
+                RecoveryClaimed = operation == "recovery claim"
+            });
+        var store = CreateChannelStore(collection, localConcernReads: local);
+
+        switch (operation)
+        {
+            case "insert":
+                Assert.Equal(id, (await store.InsertMessageAsync(id, "corr", "{}", TimeSpan.FromHours(1), CancellationToken.None)).Id);
+                break;
+            case "delivery claim":
+                Assert.True(await store.TryClaimForDeliveryAsync(id, CancellationToken.None));
+                break;
+            default:
+                Assert.True(await store.TryClaimForRecoveryAsync(id, CancellationToken.None));
+                break;
+        }
+
+        collection.Verify(
+            c => c.FindAsync(
+                It.IsAny<FilterDefinition<MongoChannelMessageDocument>>(),
+                It.IsAny<FindOptions<MongoChannelMessageDocument, MongoChannelMessageDocument>>(),
+                It.IsAny<CancellationToken>()),
+            Times.Never);
+    }
+
+    /// <summary>
+    /// The claim's ack-sequence draw lapses the same way (the counter is bounded-majority too), and
+    /// throwing there stalled every delivery claim for as long as the set stayed degraded. The $inc
+    /// applied, so the counter's current value — read before the claim lands — stands in for it.
+    /// </summary>
+    [Fact]
+    public async Task ChannelDeliveryClaim_WhoseSequenceDrawLapsed_UsesTheCounterReadBack()
+    {
+        UpdateDefinition<MongoChannelMessageDocument>? claimUpdate = null;
+        var collection = new Mock<IMongoCollection<MongoChannelMessageDocument>>(MockBehavior.Loose);
+        collection
+            .Setup(c => c.FindOneAndUpdateAsync(
+                It.IsAny<FilterDefinition<MongoChannelMessageDocument>>(),
+                It.IsAny<UpdateDefinition<MongoChannelMessageDocument>>(),
+                It.IsAny<FindOneAndUpdateOptions<MongoChannelMessageDocument, MongoChannelMessageDocument>>(),
+                It.IsAny<CancellationToken>()))
+            .Callback((FilterDefinition<MongoChannelMessageDocument> _, UpdateDefinition<MongoChannelMessageDocument> update, FindOneAndUpdateOptions<MongoChannelMessageDocument, MongoChannelMessageDocument> _, CancellationToken _) => claimUpdate = update)
+            .ReturnsAsync(new MongoChannelMessageDocument { Id = Guid.NewGuid() });
+        var counters = new Mock<IMongoCollection<BsonDocument>>(MockBehavior.Loose).SelfPinning();
+        counters
+            .Setup(c => c.FindOneAndUpdateAsync(
+                It.IsAny<FilterDefinition<BsonDocument>>(),
+                It.IsAny<UpdateDefinition<BsonDocument>>(),
+                It.IsAny<FindOneAndUpdateOptions<BsonDocument, BsonDocument>>(),
+                It.IsAny<CancellationToken>()))
+            .ThrowsAsync(MongoReplicationTimeouts.Command());
+        counters.FindsReturning(new BsonDocument { ["_id"] = "ack_seq", ["seq"] = 42L });
+        var store = CreateChannelStore(collection, counters);
+
+        Assert.True(await store.TryClaimForDeliveryAsync(Guid.NewGuid(), CancellationToken.None));
+
+        var set = claimUpdate!.Render(ChannelRenderArgs()).AsBsonArray[0]["$set"].AsBsonDocument;
+        Assert.Equal(42L, set["acked_seq"]["$cond"].AsBsonArray[1].ToInt64());
+    }
+
+    /// <summary>
+    /// Fixpoint r2 precommit E1, the counter: its read-back inherited the database's read concern
+    /// too, and under readConcernLevel=majority it read a value from before the lapsed draw (or no
+    /// counter at all, which threw) — breaking the "at or past that draw" premise the ordering
+    /// relies on. It reads through a local-concern handle. Pre-fix: the inherited handle answered
+    /// (here: no counter yet), and the claim threw the replication timeout.
+    /// </summary>
+    [Fact]
+    public async Task ChannelDeliveryClaim_WhoseSequenceDrawLapsed_ReadsTheCounterBackAtLocalConcern()
+    {
+        UpdateDefinition<MongoChannelMessageDocument>? claimUpdate = null;
+        var collection = new Mock<IMongoCollection<MongoChannelMessageDocument>>(MockBehavior.Loose);
+        collection
+            .Setup(c => c.FindOneAndUpdateAsync(
+                It.IsAny<FilterDefinition<MongoChannelMessageDocument>>(),
+                It.IsAny<UpdateDefinition<MongoChannelMessageDocument>>(),
+                It.IsAny<FindOneAndUpdateOptions<MongoChannelMessageDocument, MongoChannelMessageDocument>>(),
+                It.IsAny<CancellationToken>()))
+            .Callback((FilterDefinition<MongoChannelMessageDocument> _, UpdateDefinition<MongoChannelMessageDocument> update, FindOneAndUpdateOptions<MongoChannelMessageDocument, MongoChannelMessageDocument> _, CancellationToken _) => claimUpdate = update)
+            .ReturnsAsync(new MongoChannelMessageDocument { Id = Guid.NewGuid() });
+        var counters = new Mock<IMongoCollection<BsonDocument>>(MockBehavior.Loose).SelfPinning();
+        counters
+            .Setup(c => c.FindOneAndUpdateAsync(
+                It.IsAny<FilterDefinition<BsonDocument>>(),
+                It.IsAny<UpdateDefinition<BsonDocument>>(),
+                It.IsAny<FindOneAndUpdateOptions<BsonDocument, BsonDocument>>(),
+                It.IsAny<CancellationToken>()))
+            .ThrowsAsync(MongoReplicationTimeouts.Command());
+        counters.FindsReturning<BsonDocument, BsonDocument>();
+        var localCounters = new Mock<IMongoCollection<BsonDocument>>(MockBehavior.Loose).SelfPinning()
+            .FindsReturning(new BsonDocument { ["_id"] = "ack_seq", ["seq"] = 42L });
+        counters.Setup(c => c.WithReadConcern(ReadConcern.Local)).Returns(localCounters.Object);
+        var store = CreateChannelStore(collection, counters);
+
+        Assert.True(await store.TryClaimForDeliveryAsync(Guid.NewGuid(), CancellationToken.None));
+
+        var set = claimUpdate!.Render(ChannelRenderArgs()).AsBsonArray[0]["$set"].AsBsonDocument;
+        Assert.Equal(42L, set["acked_seq"]["$cond"].AsBsonArray[1].ToInt64());
+    }
+
+    /// <summary>
+    /// Regression (r2 S5#1): the recovery claim likewise — it ran on the primary, and throwing
+    /// failed a publish whose response was already stored, which the ingress re-published under a
+    /// new id. recovery_claimed is set only by that claim and only while acked_at is null, so a
+    /// document carrying it is one recovery won.
+    /// </summary>
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task ChannelRecoveryClaim_WhoseReplicationWaitLapsed_IsDecidedByTheRecoveryFlag(bool recoveryClaimed)
+    {
+        var id = Guid.NewGuid();
+        FilterDefinition<MongoChannelMessageDocument>? readBack = null;
+        var collection = new Mock<IMongoCollection<MongoChannelMessageDocument>>(MockBehavior.Loose);
+        collection
+            .Setup(c => c.FindOneAndUpdateAsync(
+                It.IsAny<FilterDefinition<MongoChannelMessageDocument>>(),
+                It.IsAny<UpdateDefinition<MongoChannelMessageDocument>>(),
+                It.IsAny<FindOneAndUpdateOptions<MongoChannelMessageDocument, MongoChannelMessageDocument>>(),
+                It.IsAny<CancellationToken>()))
+            .ThrowsAsync(MongoReplicationTimeouts.Command());
+        collection
+            .Setup(c => c.FindAsync(
+                It.IsAny<FilterDefinition<MongoChannelMessageDocument>>(),
+                It.IsAny<FindOptions<MongoChannelMessageDocument, MongoChannelMessageDocument>>(),
+                It.IsAny<CancellationToken>()))
+            .Callback((FilterDefinition<MongoChannelMessageDocument> filter, FindOptions<MongoChannelMessageDocument, MongoChannelMessageDocument> _, CancellationToken _) => readBack = filter)
+            .ReturnsAsync(() => new MongoListCursor<MongoChannelMessageDocument>(
+                recoveryClaimed ? [new MongoChannelMessageDocument { Id = id, RecoveryClaimed = true }] : []));
+        var store = CreateChannelStore(collection);
+
+        Assert.Equal(recoveryClaimed, await store.TryClaimForRecoveryAsync(id, CancellationToken.None));
+
+        var rendered = readBack!.Render(ChannelRenderArgs());
+        Assert.Equal(new BsonBinaryData(id, GuidRepresentation.Standard), rendered["_id"]);
+        Assert.Equal(BsonBoolean.True, rendered["recovery_claimed"]);
+    }
+
     [Fact]
     public void IsChangeStreamUnsupported_FlagsReplicaSetRequirementOnly()
     {
@@ -529,16 +785,29 @@ public sealed class MongoDbStoreQueryTests
         return new MongoDbTransportStore(database.Object, Options.Create(options));
     }
 
-    private static MongoDbChannelStore CreateChannelStore(Mock<IMongoCollection<MongoChannelMessageDocument>> collection)
+    private static MongoDbChannelStore CreateChannelStore(
+        Mock<IMongoCollection<MongoChannelMessageDocument>> collection,
+        Mock<IMongoCollection<BsonDocument>>? counters = null,
+        Mock<IMongoCollection<MongoChannelMessageDocument>>? localConcernReads = null)
     {
         var options = new MongoDbAsyncResponseChannelOptions { AutoCreateIndexes = false };
         var database = new Mock<IMongoDatabase>(MockBehavior.Loose);
+        collection.SelfPinning();
+        if (localConcernReads is not null)
+            collection.Setup(c => c.WithReadConcern(ReadConcern.Local)).Returns(localConcernReads.SelfPinning().Object);
         database
             .Setup(d => d.GetCollection<MongoChannelMessageDocument>(options.MessageCollection, It.IsAny<MongoCollectionSettings>()))
-            .Returns(collection.SelfPinning().Object);
+            .Returns(collection.Object);
         database.WithLooseCollection<MongoRecoveryStateDocument>();
         database.WithLooseCollection<MongoChannelSubscriberDocument>();
         database.WithCounters();
+        if (counters is not null)
+        {
+            database
+                .Setup(d => d.GetCollection<BsonDocument>(options.MessageCollection + "_counters", It.IsAny<MongoCollectionSettings>()))
+                .Returns(counters.Object);
+        }
+
         return new MongoDbChannelStore(database.Object, Options.Create(options));
     }
 

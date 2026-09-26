@@ -65,10 +65,30 @@ internal static class AsyncResponseRetry
         }
     }
 
+    /// <summary>
+    /// The exponent cap of <see cref="Backoff"/>: its multiplier stops doubling at 2^10 = 1024, so
+    /// no failure count ever waits longer than <c>baseDelay × 1024</c>.
+    /// </summary>
+    private const int MaxBackoffExponent = 10;
+
+    /// <summary>
+    /// The longest delay <see cref="Backoff"/> can ever produce for this policy:
+    /// <c>min(maxDelay, baseDelay × 1024)</c>. <paramref name="maxDelay"/> alone is only a ceiling —
+    /// with a small base and a large maximum (10 ms / 60 s, which every validator accepts) the
+    /// doubling stops at about 10 s, and a threshold judged against the 60 s maximum ("the run
+    /// outlived the longest delay the policy can impose") waited for a length of run the policy
+    /// never makes anyone wait. Saturating: a base whose ×1024 would overflow is capped at the
+    /// maximum before the multiplication.
+    /// </summary>
+    public static TimeSpan MaxAttainableDelay(TimeSpan baseDelay, TimeSpan maxDelay)
+        => baseDelay.Ticks > maxDelay.Ticks >> MaxBackoffExponent
+            ? maxDelay
+            : TimeSpan.FromTicks(baseDelay.Ticks << MaxBackoffExponent);
+
     /// <summary>Computes the retry backoff delay: exponential with half-jitter.</summary>
     public static TimeSpan Backoff(int completedAttempts, TimeSpan baseDelay, TimeSpan maxDelay)
     {
-        var multiplier = 1 << Math.Min(Math.Max(completedAttempts, 1) - 1, 10);
+        var multiplier = 1 << Math.Min(Math.Max(completedAttempts, 1) - 1, MaxBackoffExponent);
         var milliseconds = Math.Min(maxDelay.TotalMilliseconds, baseDelay.TotalMilliseconds * multiplier);
 
         // Half-jitter: keep at least half the exponential step so backoff still backs off, and

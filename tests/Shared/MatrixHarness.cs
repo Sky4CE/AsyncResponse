@@ -520,6 +520,13 @@ public sealed class MatrixHarness : IAsyncDisposable
                         options.WorkerSubscriber.PendingMessageMinIdleTime = redisRedelivery;
                         options.WorkerSubscriber.PendingClaimInterval = redisRedelivery;
                     }
+                    if (Tuning.UnsettledRedeliveryHorizon is { } redisHorizon)
+                    {
+                        // The same reclaim, for an entry nobody settled: it is idle in the pending
+                        // list, and a peer's XAUTOCLAIM picks it up once idle for this long.
+                        options.WorkerSubscriber.PendingMessageMinIdleTime = redisHorizon;
+                        options.WorkerSubscriber.PendingClaimInterval = redisHorizon;
+                    }
                     if (Tuning.HostShutdownTimeout is { } redisShutdown)
                         options.HostShutdownTimeout = redisShutdown;
                 });
@@ -539,6 +546,8 @@ public sealed class MatrixHarness : IAsyncDisposable
                         options.WorkerSubscriber.UseAckAfterEnqueue(backgroundWorkerCount: 4, backgroundQueueCapacity: 256);
                     if (Tuning.RedeliveryDelay is { } natsRedelivery)
                         options.WorkerSubscriber.RedeliveryDelay = natsRedelivery;
+                    if (Tuning.UnsettledRedeliveryHorizon is { } natsHorizon)
+                        options.AckWait = natsHorizon;
                     if (Tuning.HostShutdownTimeout is { } natsShutdown)
                         options.HostShutdownTimeout = natsShutdown;
                 });
@@ -557,6 +566,8 @@ public sealed class MatrixHarness : IAsyncDisposable
                         options.WorkerSubscriber.UseAckAfterEnqueue(backgroundWorkerCount: 4, backgroundQueueCapacity: 256);
                     if (Tuning.RedeliveryDelay is { } postgresqlRedelivery)
                         options.WorkerSubscriber.RedeliveryDelay = postgresqlRedelivery;
+                    if (Tuning.UnsettledRedeliveryHorizon is { } pgHorizon)
+                        options.LockTimeout = pgHorizon;
                     if (Tuning.HostShutdownTimeout is { } pgShutdown)
                         options.HostShutdownTimeout = pgShutdown;
                 });
@@ -575,6 +586,8 @@ public sealed class MatrixHarness : IAsyncDisposable
                         options.WorkerSubscriber.UseAckAfterEnqueue(backgroundWorkerCount: 4, backgroundQueueCapacity: 256);
                     if (Tuning.RedeliveryDelay is { } sqlserverRedelivery)
                         options.WorkerSubscriber.RedeliveryDelay = sqlserverRedelivery;
+                    if (Tuning.UnsettledRedeliveryHorizon is { } sqlHorizon)
+                        options.LockTimeout = sqlHorizon;
                     if (Tuning.HostShutdownTimeout is { } sqlShutdown)
                         options.HostShutdownTimeout = sqlShutdown;
                 });
@@ -593,6 +606,8 @@ public sealed class MatrixHarness : IAsyncDisposable
                         options.WorkerSubscriber.UseAckAfterEnqueue(backgroundWorkerCount: 4, backgroundQueueCapacity: 256);
                     if (Tuning.RedeliveryDelay is { } mongodbRedelivery)
                         options.WorkerSubscriber.RedeliveryDelay = mongodbRedelivery;
+                    if (Tuning.UnsettledRedeliveryHorizon is { } mongoHorizon)
+                        options.LockTimeout = mongoHorizon;
                     if (Tuning.HostShutdownTimeout is { } mongoShutdown)
                         options.HostShutdownTimeout = mongoShutdown;
                 });
@@ -664,6 +679,12 @@ public sealed class MatrixHarness : IAsyncDisposable
                         options.MaxReceiveCount = attempts;
                     if (Tuning.EarlyAck)
                         options.WorkerSubscriber.UseAckAfterEnqueue(backgroundWorkerCount: 4, backgroundQueueCapacity: 256);
+                    if (Tuning.UnsettledRedeliveryHorizon is { } sqsHorizon)
+                    {
+                        // Renewed while the handler runs, so only an abandoned message reappears.
+                        options.WorkerSubscriber.VisibilityTimeout = sqsHorizon;
+                        options.WorkerSubscriber.VisibilityRenewalInterval = sqsHorizon / 3;
+                    }
                     if (Tuning.HostShutdownTimeout is { } sqsShutdown)
                         options.HostShutdownTimeout = sqsShutdown;
                 });
@@ -1225,6 +1246,22 @@ public sealed record MatrixTransportTuning
 
     /// <summary>Shortens the transport's shutdown budget so a drain assertion does not wait it out.</summary>
     public TimeSpan? HostShutdownTimeout { get; init; }
+
+    /// <summary>
+    /// How long a delivery that was taken but never settled stays invisible before another consumer
+    /// receives it — what a fact asserting "nothing comes back" has to wait out. Maps to
+    /// <c>LockTimeout</c> on the database queues, <c>AckWait</c> on NATS, the pending-entry reclaim
+    /// window (<c>PendingMessageMinIdleTime</c> and <c>PendingClaimInterval</c>) on Redis, and the
+    /// worker's <c>VisibilityTimeout</c> (renewed at a third of it) on SQS. The holder keeps its
+    /// in-flight deliveries alive through each transport's renewal, so shortening the horizon only
+    /// shortens how long an ABANDONED delivery takes to reappear.
+    /// <para>
+    /// Not tunable here: RabbitMQ and Kafka hand an unsettled delivery back at once (the channel
+    /// closes, the group rebalances), the Service Bus emulator's lock duration is fixed by its static
+    /// config (PT1M), and the harness's Pub/Sub subscriptions carry a 60-second ack deadline.
+    /// </para>
+    /// </summary>
+    public TimeSpan? UnsettledRedeliveryHorizon { get; init; }
 }
 
 /// <summary>

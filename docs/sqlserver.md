@@ -102,7 +102,7 @@ success), so a retried publish never enqueues the same job twice.
 There is no cross-process publish notification: a publish in the same process wakes its subscribers
 immediately through an in-process signal, and other processes pick the row up within
 `WorkerSubscriber.EmptyPollDelay` / `ResponseSubscriber.EmptyPollDelay` (default 250 ms). A NAK
-raises no wake: the released row is not claimable until its redelivery delay has passed, and the
+and a delayed publish raise no wake: the row is not claimable until its delay has passed, and the
 next poll after that picks it up.
 
 The claim orders by `(available_at, created_at)` — availability order, which equals publish order
@@ -123,7 +123,13 @@ Both packages can create their schema, tables, and indexes on startup (`AutoCrea
 Channel and transport take the same transaction-scoped application lock
 (`sp_getapplock`, resource `asyncresponse:ddl:{SchemaName}`) before DDL runs, so concurrent app
 instances — and the channel and transport inside one app — never race each other through the
-`IF NOT EXISTS` guards.
+`IF NOT EXISTS` guards. The transport holds it only for the schema and the table: its index builds,
+whose run time grows with the table, run afterwards in a transaction of their own under the
+table's lock (`asyncresponse:ddl:{SchemaName}.{MessageTable}`), so the channel's and the
+durable-flow store's startup DDL on the same schema never waits for them. In the transport, one
+startup-DDL attempt runs at a time, shared by every operation waiting for it, and a caller's
+cancellation ends only that caller's wait — it does not roll back an index build in progress (the
+channel runs its DDL on the calling operation's own token).
 
 The packages do **not** create the database itself: point `ConnectionString` at an existing database
 (the sample app ships a small provisioner that creates it for containers/dev). Set
@@ -218,21 +224,29 @@ created_at)` behind `ORDER BY created_at` could not serve its own ordering past 
 so competing `READPAST` claimers skipped them all and slept — or walked `created_idx` through the
 older rows of the other logical queues (retained dead letters, delayed jobs), so draining a burst
 of K rows cost O(K²). On an auto-created schema this build creates the new index itself when it
-is absent, and leaves the old one alone. That build is a plain, offline `CREATE INDEX`: it blocks
-every write to the queue table — publishes, claims, acks, NAKs, and lease renewals, old-build
-hosts' included — for as long as it runs. It runs under an hour-long command timeout instead of
-SqlClient's 30 s, so it finishes once instead of timing out and being retried by every later
-operation (the store retries its startup DDL on each operation until it succeeds); waiting for its
-lock is bounded by a 5 s `LOCK_TIMEOUT`. On a busy table — a long-running transaction, an index
-rebuild, a bulk load holding a conflicting lock — it fails without changing anything, and the host
-waits 30–60 s (jittered) before its next attempt: every attempt queues every write to the queue
-table, on every host, behind its lock request for those 5 s, so until the retry the host's
-transport operations fail at once, naming the lock wait. Find the holder in `sys.dm_tran_locks`
+is absent, and leaves the old one alone. That build — and the `created_at` index's, when that one is
+missing — is a plain, offline `CREATE INDEX`, run under the table's own application lock after the
+schema-wide one is released (see [Schema creation](#schema-creation)): it blocks every write to the
+queue table — publishes, claims, acks, NAKs, and lease renewals, old-build hosts' included — for as
+long as it runs. It runs under an hour-long command timeout instead of SqlClient's 30 s, so it
+finishes once instead of timing out and being retried by every later operation (the store retries
+its startup DDL until it succeeds); waiting for its lock is bounded by a 5 s `LOCK_TIMEOUT`. On a
+busy table — a long-running transaction, an index rebuild, a bulk load holding a conflicting lock,
+another host's build of the same index — it fails without changing anything, and the host waits
+30–60 s (jittered) before its next attempt: every attempt queues every write to the queue table, on
+every host, behind its lock request for those 5 s, so until the retry the host's transport
+operations fail at once, naming the lock wait. A build that fails any other way — a full log (9002)
+or filegroup (1105), a build that outran its command timeout — is retried after the same window
+rather than by the next operation. A transient connection fault on the table-lock step (severity
+20 or above, a reset connection, an Azure failover error) latches nothing: that step took no lock,
+and the next operation retries at once. Find the holder in `sys.dm_tran_locks`
 joined to `sys.dm_exec_sessions`. On a large table (retained dead letters, parked durable-flow
 timers) create the index **before** rolling out — with `ONLINE = ON` where your edition supports
 it (Enterprise, Developer, Azure SQL), which keeps the table writable while it builds — and the
 store then finds it and builds nothing. With `AutoCreateSchema = false`, create it when convenient and drop the old one once no
-host runs the previous build:
+host runs the previous build; until then the store logs a warning at startup unless some enabled,
+unfiltered index is keyed `(queue, available_at, created_at)` — under any name, but the previous
+build's `_claim_idx` does not count, since it cannot serve the claim's order:
 
 ```sql
 CREATE INDEX asyncresponse_transport_messages_ready_idx
@@ -308,15 +322,21 @@ Connection-string notes:
   even while the row has lapsed, so it is delivered instead of routed to lost-subscriber recovery.
 - Normal scans retain a forward `created_at, id` cursor per local subscription group. Caught-up
   polls revisit only the last database-clock tick, so a new message with the same timestamp and
-  a lower random id is picked up promptly. Older consumed headers are not read on every poll. New
-  subscriptions reset the cursor to apply each waiter's own watermark; acknowledged messages
-  remain eligible for legitimate cross-process fan-out.
+  a lower random id is picked up promptly; older consumed headers are read again only by the
+  late-commit lookback window below (at most once per poll interval, and at most the lookback
+  apart, per correlation id) and by
+  history reconciliation. New subscriptions reset the cursor to apply each waiter's own
+  watermark; acknowledged messages remain eligible for legitimate cross-process fan-out.
 - `created_at` is stamped when a response's INSERT runs, not when it commits, so a response can
   become visible *behind* a cursor that already read a later row. For a short while after the
-  cursor moves (twice the window), each pass therefore revisits a lookback window behind it —
+  cursor moves (twice the window), a pass therefore revisits a lookback window behind it —
   half of `DeliveryConfirmationTimeout`, at most 2 seconds — and the next full sweep (every
   `ActivePollInterval` poll under the default `FullSweepInterval = null`) delivers it before its
-  publisher's confirmation budget runs out. A commit slower than that
+  publisher's confirmation budget runs out. The whole window is revisited at most once per poll
+  interval per correlation id — or once per lookback, when the poll interval is longer: the
+  passes in between (every local publish signals one) read the last tick only and schedule a
+  rescan of the id for when that throttle ends, so a steady stream on one id no longer re-reads
+  the window on every pass. A commit slower than that
   window from its stamp is left to history reconciliation (below) and can route to recovery.
   Rows a revisit reads again are not re-queued: processed ones are screened by the waiters' seen
   sets, and ones still waiting in the executor by the scan's own queued set.
@@ -335,13 +355,23 @@ Connection-string notes:
   an immediate rewind. Acknowledged payload bodies are hydrated only when a waiter needs them,
   in statements of at most 1,000 ids (SQL Server's 2,100-parameter cap), whatever the page size.
 - A full sweep (every subscribed correlation id) dispatches up to 8 correlation ids at a time,
-  and one id's failure no longer stops the others. When the first 8 ids of a pass all fail with a
-  transient fault (the database is down, not one row poisoned) the rest of the pass is skipped,
-  and the logged exception carries the first 3 failures and counts the others. Each sweep's duration is recorded on the
-  `asyncresponse.channel.sweep.duration` histogram (tag `asyncresponse.channel`), and a sweep
-  longer than half of `DeliveryConfirmationTimeout` logs a warning (at most once a minute): past
-  that point, responses only the sweep delivers can be claimed for lost-subscriber recovery
-  under live waiters.
+  and one id's failure no longer stops the others. When the first 8 ids of a pass to query the
+  store all fail with a transient fault (the database is down, not one row poisoned) the rest of
+  the pass is skipped, and the logged exception carries the first 3 failures and counts the
+  others; an id whose waiters are all mid-cleanup queries nothing and does not count. A
+  requested sweep the breaker cuts short is retried after `min(FullSweepInterval,
+  DeliveryConfirmationTimeout / 4)`, never sooner, and when `FullSweepInterval` is set longer
+  than that, an id whose own pass failed transiently without tripping it is rescanned on its own
+  after that same floor instead of waiting for the next throttled sweep. (Under the default
+  `FullSweepInterval = null` every poll is a full sweep, which covers both.) The pool running out
+  of connections — SqlClient's "Timeout expired … obtaining a connection from the pool", an
+  `InvalidOperationException` — is raised as a transient `TimeoutException`, so the retry
+  policies and this breaker count it. Each sweep that visited a waiter without any failure has
+  its duration recorded on the `asyncresponse.channel.sweep.duration` histogram (tag
+  `asyncresponse.channel`), and such a sweep longer than half of `DeliveryConfirmationTimeout`
+  logs a warning (at most once a minute): past that point, responses only the sweep delivers can
+  be claimed for lost-subscriber recovery under live waiters. A sweep with failures is neither
+  recorded nor warned about — it measured connect timeouts, not the sweep.
 - Keep `DeliveryConfirmationTimeout` long enough for the slowest expected live delivery (including
   one cross-process `ActivePollInterval`), but short enough that a truly lost subscriber routes to
   recovery promptly. A transient fault in the confirmation poll reads as "not yet delivered"

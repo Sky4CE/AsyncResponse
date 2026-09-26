@@ -49,9 +49,9 @@ internal static class PostgreSqlRelationVerifier
     /// One expected relation: kind 'r' (table, verified against <paramref name="Columns"/> and
     /// <paramref name="PrimaryKey"/> when given), 'S' (sequence, verified <c>bigint</c>,
     /// increment 1, cache 1, no cycle, full positive range), or 'i' (index, verified to sit on
-    /// <paramref name="OwningTable"/> as a plain — non-unique, non-partial, valid and ready —
-    /// btree over exactly <paramref name="KeyColumns"/> in order). All relations must be
-    /// permanent (not UNLOGGED or temporary).
+    /// <paramref name="OwningTable"/> as a plain — non-unique, non-partial, and, unless
+    /// <see cref="Optional"/>, valid and ready — btree over exactly <paramref name="KeyColumns"/>
+    /// in order). All relations must be permanent (not UNLOGGED or temporary).
     /// </summary>
     internal readonly record struct ExpectedRelation(
         string Name,
@@ -62,15 +62,20 @@ internal static class PostgreSqlRelationVerifier
         string[]? PrimaryKey = null)
     {
         /// <summary>
-        /// Verified in full when present, but its ABSENCE is not an error: a performance-only
-        /// index on an operator-managed schema, which a migration tool may have named or omitted
-        /// differently. <see cref="VerifyAsync"/> returns the absent ones so the store can warn.
+        /// Verified in full when present, but neither its ABSENCE nor — for an index — its being
+        /// present but not valid and ready is an error: a performance-only index on an
+        /// operator-managed schema, which a migration tool may have named or omitted differently, or
+        /// which an operator is building (or failed to build) with <c>CREATE INDEX CONCURRENTLY</c>.
+        /// <see cref="VerifyAsync"/> returns both kinds so the store can warn.
         /// </summary>
         public bool Optional { get; init; }
     }
 
-    /// <returns>The <see cref="ExpectedRelation.Optional"/> relations that do not exist.</returns>
-    public static async Task<IReadOnlyList<string>> VerifyAsync(
+    /// <returns>
+    /// The <see cref="ExpectedRelation.Optional"/> relations that do not exist, and the Optional
+    /// indexes that exist with the expected shape but are not valid and ready.
+    /// </returns>
+    public static async Task<(IReadOnlyList<string> Absent, IReadOnlyList<string> NotReady)> VerifyAsync(
         NpgsqlConnection connection,
         NpgsqlTransaction? transaction,
         string schemaName,
@@ -211,7 +216,7 @@ internal static class PostgreSqlRelationVerifier
         return actual;
     }
 
-    internal static IReadOnlyList<string> Evaluate(
+    internal static (IReadOnlyList<string> Absent, IReadOnlyList<string> NotReady) Evaluate(
         string schemaName,
         string componentName,
         IReadOnlyList<ExpectedRelation> expected,
@@ -224,6 +229,7 @@ internal static class PostgreSqlRelationVerifier
         // also forgotten an index — so reporting "does not exist" first would name a victim and
         // hide the culprit. Anything that is present and wrong is checked first; absence is only
         // reported once nothing present explains it.
+        List<string>? notReadyOptional = null;
         foreach (var relation in expected)
         {
             if (!relations.TryGetValue(relation.Name, out var found))
@@ -254,7 +260,14 @@ internal static class PostgreSqlRelationVerifier
 
             if (relation.Kind == 'i' && relation.KeyColumns is { } keyColumns)
             {
-                if (!found.IsValidAndReady)
+                // Not valid and ready is fatal only for an index the store requires. An Optional
+                // one is performance-only, exactly like an absent one, and an operator's CREATE
+                // INDEX CONCURRENTLY leaves its row in this state for the whole build — and forever
+                // after a failed one, where "restart so the store can recreate it" is false, since
+                // nothing recreates an operator-managed index: throwing failed every operation on
+                // every host that started meanwhile. Its shape is still checked below (the catalog
+                // records it from the start of the build).
+                if (!found.IsValidAndReady && !relation.Optional)
                     throw new InvalidOperationException(
                         $"The PostgreSQL {componentName} store's index '{schemaName}.{relation.Name}' exists but is invalid or not ready " +
                         "(a failed CREATE INDEX CONCURRENTLY leaves such an index behind). Drop it and restart so the store can recreate it.");
@@ -266,6 +279,9 @@ internal static class PostgreSqlRelationVerifier
                         $"{(found.IsUnique ? "a UNIQUE " : "a ")}{(found.HasPredicate ? "partial " : "")}{found.AccessMethod} index over " +
                         $"({string.Join(", ", found.KeyColumns)}). CREATE INDEX IF NOT EXISTS accepts ANY existing index with the name and " +
                         "guarantees nothing about its shape — drop or rename the existing index so the store can create the correct one.");
+
+                if (!found.IsValidAndReady)
+                    (notReadyOptional ??= []).Add(relation.Name);
             }
 
             if (relation.Kind == 'r' && relation.PrimaryKey is { } primaryKey && !found.PrimaryKey.AsSpan().SequenceEqual(primaryKey))
@@ -293,7 +309,7 @@ internal static class PostgreSqlRelationVerifier
                 "but it does not. " + CollisionGuidance);
         }
 
-        return absentOptional ?? (IReadOnlyList<string>)[];
+        return (absentOptional ?? (IReadOnlyList<string>)[], notReadyOptional ?? (IReadOnlyList<string>)[]);
     }
 
     /// <summary>

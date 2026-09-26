@@ -84,6 +84,11 @@ public sealed class DurableFlowIdConflictException : InvalidOperationException
 /// retried start with the SAME id then dedupes against that run, while a retry with a fresh
 /// generated id starts a second, independent run — supply deterministic ids where callers retry.
 /// </para>
+/// <para>
+/// The caller's own cancellation token firing during the publish is not a dispatch failure and
+/// surfaces as an <see cref="OperationCanceledException"/> instead. It is just as ambiguous, so it
+/// carries the id the same way: named in its message and stored in <c>Exception.Data["FlowId"]</c>.
+/// </para>
 /// </summary>
 public sealed class DurableFlowNotDispatchedException : InvalidOperationException
 {

@@ -437,6 +437,133 @@ public abstract class TransportConformanceSuite
         Assert.Equal(1, probe.GatedCompletions);
     }
 
+    [Fact]
+    public async Task Contract_ShutdownWithAnInFlightJob_SettlesIt_SoAPeerNeverReceivesItAgain()
+    {
+        // The drain fact above proves the handler FINISHED during shutdown, not that its settlement
+        // landed — and it runs early-ACK wherever the transport has the mode, where the message is
+        // settled before the handler even starts. So the ack-after-handler stop path (settling on a
+        // channel or consumer that is closing underneath) never ran in the contract at all; round
+        // 43's RabbitMQ ACK-on-a-closed-channel and Pub/Sub SDK hand-back both lived there. Here the
+        // holder acks after its handler, is stopped mid-handler, drains, and is gone; a peer then
+        // starts on the same queue and must never receive the drained job. A lost settlement hands
+        // it back, and the peer runs it a second time.
+        var horizon = TimeSpan.FromSeconds(5);
+        var tuning = new MatrixTransportTuning
+        {
+            HostShutdownTimeout = TimeSpan.FromSeconds(30),
+            EarlyAck = false,
+            UnsettledRedeliveryHorizon = horizon
+        };
+        var names = new MatrixNames(Cell, Guid.NewGuid().ToString("N"));
+
+        // teardownNamespaces: false — the peer below consumes from whatever the holder leaves behind.
+        var holder = await CreateHarnessAsync(tuning, sharedNames: names, teardownNamespaces: false);
+        var holderProbe = holder.Provider.GetRequiredService<TransportProbe>();
+        holderProbe.Gate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        // Read now: the holder's provider is disposed with it. The peer must lease the same pair.
+        var holderServiceBusQueue = Transport == MatrixTransport.AzureServiceBus
+            ? holder.Provider.GetRequiredService<IOptions<AzureServiceBusAsyncResponseOptions>>().Value.WorkerQueue
+            : null;
+
+        // The WORKER subscriber is stopped first, and deterministically: the harness stops hosted
+        // services in reverse registration order, so the response ingress (registered after the
+        // worker by every transport) stopped first, and on a broker whose ingress stop is slow the
+        // held job was released — and settled — on a worker that was still fully running, so the
+        // "settle on a closing channel or consumer" path this fact exists for never ran. Its stop
+        // is signalled before StopAsync returns (the stopping token is cancelled synchronously).
+        var worker = holder.Provider.GetServices<Microsoft.Extensions.Hosting.IHostedService>().Single(hosted =>
+            hosted.GetType().Name.Contains("WorkerSubscriber", StringComparison.Ordinal)
+            || hosted.GetType().Name == "InMemoryWorkerHost");
+        using var workerStopBudget = new CancellationTokenSource(TimeSpan.FromSeconds(60));
+        Task? workerStop = null;
+        try
+        {
+            await EnqueueAsync(holder, names.NewCorrelationId("settle"), token: 23);
+            await ExpectAsync(holderProbe.GateReached.Task, holder, "the in-flight job to reach its hold");
+
+            workerStop = worker.StopAsync(workerStopBudget.Token);
+            await Task.Delay(500);
+            Assert.False(workerStop.IsCompleted, "the worker subscriber stopped while a delivered job was still executing");
+
+            holderProbe.Gate.TrySetResult();
+            await workerStop.WaitAsync(TimeSpan.FromSeconds(60));
+            Assert.Equal(1, holderProbe.GatedCompletions);
+        }
+        finally
+        {
+            // Never leave a gated subscriber alive in the collection process, even when an assertion
+            // above failed: release its handler, and stop the whole holder (a second stop of the
+            // worker is a no-op).
+            holderProbe.Gate.TrySetResult();
+            try
+            {
+                if (workerStop is not null)
+                    await workerStop.WaitAsync(TimeSpan.FromSeconds(60));
+                await holder.DisposeAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(60));
+            }
+            catch (Exception) when (workerStop is null || !workerStop.IsCompletedSuccessfully)
+            {
+                // Best-effort cleanup after a failure; the original assertion is the one to report.
+            }
+        }
+
+        var holderStoppedAt = System.Diagnostics.Stopwatch.GetTimestamp();
+
+        // Only now the peer. On Service Bus this order is mandatory: the harness leases queue pairs
+        // from a pool of one, and the holder returned its pair on disposal — a peer created beside it
+        // would wait for the lease forever.
+        await using var peer = await CreateHarnessAsync(tuning, sharedNames: names);
+        var peerProbe = peer.Provider.GetRequiredService<TransportProbe>();
+
+        // The liveness proof below reads only the peer's own queue: on Service Bus that is the
+        // holder's queue only while the pool holds a single pair.
+        if (holderServiceBusQueue is not null)
+        {
+            Assert.Equal(
+                holderServiceBusQueue,
+                peer.Provider.GetRequiredService<IOptions<AzureServiceBusAsyncResponseOptions>>().Value.WorkerQueue);
+        }
+
+        // Prove the peer consumes the shared queue, or "it received nothing" would prove nothing.
+        await EnqueueAsync(peer, names.NewCorrelationId("peer"), token: 24);
+        await EventuallyAsync(() => peerProbe.Calls.Any(call => call.Token == 24), "the peer consumes the shared queue", peer);
+
+        // Then wait out the window in which an unsettled delivery would reappear (at least 2 s
+        // more). Monotonic: a wall-clock step or a stall between two reads made the delay negative.
+        var remaining = UnsettledRedeliveryWindow(horizon) - System.Diagnostics.Stopwatch.GetElapsedTime(holderStoppedAt);
+        await Task.Delay(remaining > TimeSpan.FromSeconds(2) ? remaining : TimeSpan.FromSeconds(2));
+
+        Assert.DoesNotContain(peerProbe.Calls, call => call.Token == 23);
+    }
+
+    /// <summary>
+    /// How long after the holder stopped a delivery it took but never settled could still reach a
+    /// peer on the same queue — what the settlement fact has to wait out before "nothing came back"
+    /// means anything.
+    /// </summary>
+    private TimeSpan UnsettledRedeliveryWindow(TimeSpan horizon) => Transport switch
+    {
+        // Nothing outlives the in-process host, so no peer can ever see the holder's job: the fact
+        // pins that absence (see DurableWhileConsumerIsDown) rather than skipping.
+        MatrixTransport.InMemory => TimeSpan.Zero,
+
+        // Handed back at once — requeued when the channel closes, re-read from the committed offset
+        // (auto.offset.reset=earliest) when the peer joins the group — so it would reach the peer
+        // ahead of the peer's own liveness job on the same queue or single partition.
+        MatrixTransport.RabbitMq or MatrixTransport.Kafka => TimeSpan.Zero,
+
+        // Fixed by infrastructure the harness cannot tune: the Service Bus emulator's PT1M lock
+        // duration, and the 60-second ack deadline of the harness's Pub/Sub subscriptions (the
+        // streaming client extends its lease until the stop, not past it).
+        MatrixTransport.AzureServiceBus or MatrixTransport.GooglePubSub => TimeSpan.FromSeconds(70),
+
+        // Tuned through MatrixTransportTuning.UnsettledRedeliveryHorizon — twice over, because Redis
+        // reclaims an entry idle for the horizon on a scan that itself runs every horizon.
+        _ => horizon * 2 + TimeSpan.FromSeconds(5)
+    };
+
     /// <summary>
     /// Counts poison jobs in this transport's dead-letter destination, reading the effective
     /// entity names from the harness's own resolved options so the count inspects exactly what

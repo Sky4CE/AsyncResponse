@@ -156,6 +156,42 @@ internal static class DurableFlowContextTestSupport
         public TimeSpan? MaxInFlightDuration { get; } = ceiling;
     }
 
+    /// <summary>
+    /// Forwards every call to an inner store through overridable members, so a test replaces only
+    /// the one call it intercepts instead of re-implementing the whole interface.
+    /// </summary>
+    public class DelegatingFlowStateStore(IFlowStateStore inner) : IFlowStateStore
+    {
+        protected IFlowStateStore Inner => inner;
+
+        public virtual Task<bool> TryCreateAsync(string flowId, FlowState state, TimeSpan ttl, CancellationToken cancellationToken = default)
+            => inner.TryCreateAsync(flowId, state, ttl, cancellationToken);
+
+        public virtual Task<FlowState?> LoadAsync(string flowId, CancellationToken cancellationToken = default)
+            => inner.LoadAsync(flowId, cancellationToken);
+
+        public virtual Task<FlowState?> LoadCurrentAsync(string flowId, CancellationToken cancellationToken = default)
+            => inner.LoadCurrentAsync(flowId, cancellationToken);
+
+        public virtual Task<bool> TryUpdateAsync(string flowId, FlowState state, long expectedRevision, TimeSpan ttl, string? leaseId = null, CancellationToken cancellationToken = default)
+            => inner.TryUpdateAsync(flowId, state, expectedRevision, ttl, leaseId, cancellationToken);
+
+        public virtual Task<bool> TryAcquireLeaseAsync(string flowId, string leaseId, TimeSpan leaseDuration, CancellationToken cancellationToken = default)
+            => inner.TryAcquireLeaseAsync(flowId, leaseId, leaseDuration, cancellationToken);
+
+        public virtual Task<bool> TryRenewLeaseAsync(string flowId, string leaseId, TimeSpan leaseDuration, CancellationToken cancellationToken = default)
+            => inner.TryRenewLeaseAsync(flowId, leaseId, leaseDuration, cancellationToken);
+
+        public virtual Task ReleaseLeaseAsync(string flowId, string leaseId, CancellationToken cancellationToken = default)
+            => inner.ReleaseLeaseAsync(flowId, leaseId, cancellationToken);
+
+        public virtual Task<FlowLeaseObservation?> ObserveLeaseAsync(string flowId, CancellationToken cancellationToken = default)
+            => inner.ObserveLeaseAsync(flowId, cancellationToken);
+
+        public virtual Task<bool> TryDeleteAsync(string flowId, CancellationToken cancellationToken = default)
+            => inner.TryDeleteAsync(flowId, cancellationToken);
+    }
+
     /// <summary>A transport WITH native delayed delivery: long timers suspend on a delayed wake-up.</summary>
     public sealed class RecordingDelayedTransport : RecordingTransport, IDelayedWorkerTransport
     {

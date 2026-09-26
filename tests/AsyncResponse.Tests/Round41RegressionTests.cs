@@ -261,10 +261,12 @@ public sealed class Round41RegressionTests
     }
 
     // ---------------------------------------------------------------------------------------
-    // F7: PortableText.Excerpt cut an offending id at a fixed UTF-16 index. With a non-BMP
-    // character straddling unit 40 the cut kept the high surrogate and dropped its low half — so
-    // the helper that quotes an id inside the "unpaired surrogate" rejection could mint an
-    // unpaired surrogate of its own, in a message that is logged and persisted as UTF-8.
+    // F7: the id excerpt cut an offending id at a fixed UTF-16 index. With a non-BMP character
+    // straddling unit 40 the cut kept the high surrogate and dropped its low half — so the helper
+    // that quotes an id inside the "unpaired surrogate" rejection could mint an unpaired
+    // surrogate of its own, in a message that is logged and persisted as UTF-8. (Fixpoint r2
+    // S3#9: the unescaped PortableText.Excerpt was dead code and is gone; ids are quoted through
+    // DiagnosticText.EscapedExcerpt, which cuts the same way.)
     // ---------------------------------------------------------------------------------------
 
     [Fact]
@@ -272,7 +274,7 @@ public sealed class Round41RegressionTests
     {
         var id = new string('a', 39) + "\U0001F600" + new string('b', 20);
 
-        var excerpt = PortableText.Excerpt(id);
+        var excerpt = DiagnosticText.EscapedExcerpt(id);
 
         Assert.Equal(-1, PortableText.IndexOfIllFormedUtf16(excerpt));
         Assert.Equal(new string('a', 39) + "…", excerpt);

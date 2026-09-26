@@ -559,10 +559,113 @@ public class AsyncResponseIngressErrorTests
         public Task Run(Dictionary<string, JsonSafetyTests.AbstractInput> input) => throw new InvalidOperationException("Must fail before dispatch.");
     }
 
+    [Fact]
+    public async Task HandleResponseMessageAsync_RecoveryStateUnreadable_IsPacedByTheLadder_ThenPropagatesWithoutSetException()
+    {
+        // The store holds registrations this build cannot interpret, and the SetException
+        // escalation's own dispatch reads them first and throws the same exception again (an
+        // escalation that could also fault a waiter attaching meanwhile with a store error): it
+        // propagates untouched, like RecoveryCallbackFailedException, for the transport to
+        // redeliver or dead-letter. But it still pays the 4-attempt ladder (pre-commit r2 B1):
+        // excluded from it too, nothing paced the redelivery — RabbitMQ's default unlimited
+        // requeue spun at broker speed, and capped brokers spent their attempts in milliseconds.
+        var time = new VirtualTimeProvider();
+        var original = new RecoveryStateUnreadableException("corr-unreadable", 2);
+        var rawPublisher = new ThrowingRawPublisher(original);
+        var publisher = new RecordingPublisher();
+        var ingress = CreateIngress(rawPublisher, publisher, timeProvider: time);
+
+        var handling = ingress.HandleResponseMessageAsync("""{"Status":2}""", "corr-unreadable");
+        await DriveVirtualTimeUntilCompletedAsync(time, handling);
+
+        var thrown = await Assert.ThrowsAsync<RecoveryStateUnreadableException>(() => handling);
+        Assert.Same(original, thrown);
+        Assert.Equal(4, rawPublisher.RawJsonCalls);
+        Assert.Null(publisher.Exception);
+    }
+
+    /// <summary>
+    /// Fires each backoff the ingress arms on the virtual clock (every ladder delay is at most
+    /// 2 s) until <paramref name="task"/> completes; the real-time poll only waits for the next
+    /// arm, it never decides an outcome.
+    /// </summary>
+    private static async Task DriveVirtualTimeUntilCompletedAsync(VirtualTimeProvider time, Task task)
+    {
+        var deadline = DateTime.UtcNow.AddSeconds(30);
+        while (!task.IsCompleted && DateTime.UtcNow < deadline)
+        {
+            if (time.NextTimerDueAt is not null)
+                time.Advance(TimeSpan.FromSeconds(2));
+            else
+                await Task.Delay(5);
+        }
+    }
+
+    [Theory]
+    [InlineData("oversized-response")]
+    [InlineData("unroutable-response")]
+    [InlineData("oversized-worker")]
+    [InlineData("unparseable-worker")]
+    public async Task DropPaths_UnderAThrowingLoggingProvider_StillAcknowledge(string route)
+    {
+        // The drop-and-ack paths exist so a message that can never succeed is not redelivered
+        // forever (RabbitMQ's default MaxDeliveryAttempts = 0 has no cap). Pre-fix each logged its
+        // Error BEFORE returning, so a provider that throws (MEL rethrows provider failures)
+        // turned the deliberate acknowledge into an exception — and back into that loop.
+        var logger = new CollectingLogger { ThrowOnMessageContaining = "without dispatch" };
+        var rawPublisher = new ThrowingRawPublisher();
+        var ingress = CreateIngress(
+            rawPublisher,
+            new RecordingPublisher(),
+            logger.For<AsyncResponseIngress>(),
+            Microsoft.Extensions.Options.Options.Create(new AsyncResponseOptions { MaxInboundMessageChars = 64 }));
+
+        var handling = route switch
+        {
+            "oversized-response" => ingress.HandleResponseMessageAsync(new string('x', 65), "corr-drop"),
+            "unroutable-response" => ingress.HandleResponseMessageAsync("""{"Status":2}""", " corr-drop"),
+            "oversized-worker" => ingress.HandleWorkerMessageAsync(new string('x', 65)),
+            _ => ingress.HandleWorkerMessageAsync("{not-json")
+        };
+        await handling;
+
+        Assert.Equal(0, rawPublisher.RawJsonCalls);
+        Assert.Contains(logger.Messages, message => message.Contains("without dispatch", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task HandleResponseMessageAsync_UnderAThrowingLoggingProvider_StillEscalatesAndNeverFaultsWithTheLoggersError()
+    {
+        // Two log lines sat on the decision path: the Debug receipt line inside the retried try
+        // (a throw there was escalated as the RESPONSE's failure, faulting the waiter with the
+        // logger's exception) and the Error line before SetException (a throw there skipped the
+        // escalation). Neither may change what the waiter is told.
+        var logger = new CollectingLogger { ThrowOnMessageContaining = "Ingress" };
+        var original = new InvalidDataException("bad payload");
+        var failing = new ThrowingRawPublisher(original);
+        var publisher = new RecordingPublisher();
+        var ingress = CreateIngress(failing, publisher, logger.For<AsyncResponseIngress>());
+
+        await ingress.HandleResponseMessageAsync("<html>bad gateway</html>", "corr-log");
+
+        Assert.Equal(1, failing.RawJsonCalls);
+        Assert.Same(original, publisher.Exception);
+
+        var succeeding = new ThrowingRawPublisher();
+        var quiet = new RecordingPublisher();
+        await CreateIngress(succeeding, quiet, logger.For<AsyncResponseIngress>())
+            .HandleResponseMessageAsync("""{"Status":2}""", "corr-log");
+
+        Assert.Equal(1, succeeding.RawJsonCalls);
+        Assert.Null(quiet.Exception);
+    }
+
     private static AsyncResponseIngress CreateIngress(
         IRawAsyncResponsePublisher rawPublisher,
         IAsyncResponsePublisher publisher,
-        ILogger<AsyncResponseIngress>? logger = null)
+        ILogger<AsyncResponseIngress>? logger = null,
+        Microsoft.Extensions.Options.IOptions<AsyncResponseOptions>? options = null,
+        TimeProvider? timeProvider = null)
     {
         var provider = new ServiceCollection().BuildServiceProvider();
         return new AsyncResponseIngress(
@@ -570,7 +673,9 @@ public class AsyncResponseIngressErrorTests
             publisher,
             new WorkerJobExecutor(provider.GetRequiredService<IServiceScopeFactory>(), NullLogger<WorkerJobExecutor>.Instance),
             new AsyncResponseContextPropagation([]),
-            logger ?? NullLogger<AsyncResponseIngress>.Instance);
+            logger ?? NullLogger<AsyncResponseIngress>.Instance,
+            _timeProvider: timeProvider,
+            _options: options);
     }
 
     public interface IHandBackWorker

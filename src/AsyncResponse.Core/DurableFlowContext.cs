@@ -160,6 +160,11 @@ internal sealed class DurableFlowContext : IDurableFlowContext
             return;
 
         cancellationToken.ThrowIfCancellationRequested();
+
+        // A checkpoint cancelled mid-write before this step may have committed: settled here,
+        // before the body's side effect, not by the compare-and-swap after it — which could then
+        // only fail, and the redelivery would run the side effect again.
+        await _lease.ResolveUncertainSaveAsync(_state).ConfigureAwait(false);
         await NotifyStepAsync(static (o, e) => o.OnStepStartingAsync(e), name, DurableFlowStepKind.Local).ConfigureAwait(false);
         await step().ConfigureAwait(false);
         _lease.ThrowIfLost();
@@ -183,6 +188,7 @@ internal sealed class DurableFlowContext : IDurableFlowContext
             return DeserializeResult<TResult>(checkpoint.ResultJson);
 
         cancellationToken.ThrowIfCancellationRequested();
+        await _lease.ResolveUncertainSaveAsync(_state).ConfigureAwait(false);
         await NotifyStepAsync(static (o, e) => o.OnStepStartingAsync(e), name, DurableFlowStepKind.Local).ConfigureAwait(false);
         var result = await step().ConfigureAwait(false);
         _lease.ThrowIfLost();
@@ -246,6 +252,11 @@ internal sealed class DurableFlowContext : IDurableFlowContext
     /// <summary>The timer itself; the caller holds the step guard (<see cref="EnterStep"/>).</summary>
     private async Task DelayCoreAsync(string name, FlowStepState checkpoint, DateTime wakeAtUtc, CancellationToken cancellationToken)
     {
+        // Host stop wins over a caller token it cancelled too (flow code passing ApplicationStopping
+        // in): both mean "stop this execution", but only the interruption is read as a hand-back —
+        // a plain cancellation cost the delivery a failed attempt on every deploy.
+        if (_hostStopping.IsCancellationRequested && cancellationToken.IsCancellationRequested)
+            throw Interrupt(new OperationCanceledException(_hostStopping));
         cancellationToken.ThrowIfCancellationRequested();
         await NotifyStepAsync(static (o, e) => o.OnStepStartingAsync(e), name, DurableFlowStepKind.Timer, wakeAtUtc: wakeAtUtc).ConfigureAwait(false);
 
@@ -303,7 +314,7 @@ internal sealed class DurableFlowContext : IDurableFlowContext
                 // while it sleeps. Mirrors the child-flow suspension ordering: persist, enqueue,
                 // throw — a crash between the persist and the enqueue leaves this job unacked, so
                 // broker redelivery re-runs the step and re-enqueues the wake-up.
-                await SuspendForTimerAsync(name, wakeAtUtc, remaining, cancellationToken).ConfigureAwait(false);
+                await SuspendForTimerAsync(name, wakeAtUtc, cancellationToken).ConfigureAwait(false);
                 throw new InvalidOperationException("Unreachable.");
             }
 
@@ -428,7 +439,8 @@ internal sealed class DurableFlowContext : IDurableFlowContext
     /// </summary>
     private async Task WaitInProcessAsync(string name, DateTime wakeAtUtc, TimeSpan wait, CancellationToken cancellationToken)
     {
-        if (_hostStopping.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
+        // Host stop decides even when the caller's token is cancelled with it (see DelayCoreAsync).
+        if (_hostStopping.IsCancellationRequested)
             throw Interrupt(new OperationCanceledException(_hostStopping));
 
         using var linked = cancellationToken.CanBeCanceled || _hostStopping.CanBeCanceled
@@ -442,7 +454,7 @@ internal sealed class DurableFlowContext : IDurableFlowContext
         catch (OperationCanceledException ex)
         {
             _lease.ThrowIfLost(ex);
-            if (_hostStopping.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
+            if (_hostStopping.IsCancellationRequested)
                 await HandOverAtHostStopAsync(name, wakeAtUtc, ex).ConfigureAwait(false);
             throw;
         }
@@ -469,11 +481,15 @@ internal sealed class DurableFlowContext : IDurableFlowContext
         }
         catch (Exception ex) when (ex is not DurableFlowSuspendedException)
         {
-            _logger.LogWarning(
-                ex,
-                "Flow {FlowId} could not hand its in-process timer '{Step}' over to a fresh delivery at host stop; the delivery is handed back to the worker transport instead.",
-                FlowId,
-                name);
+            // Guarded: a throwing logging provider replaced the interruption, and the transport
+            // counted the hand-back as a failed attempt.
+            SafeLog.Try(
+                (Logger: _logger, Error: ex, FlowId, Step: name),
+                static s => s.Logger.LogWarning(
+                    s.Error,
+                    "Flow {FlowId} could not hand its in-process timer '{Step}' over to a fresh delivery at host stop; the delivery is handed back to the worker transport instead.",
+                    s.FlowId,
+                    s.Step));
             throw Interrupt(stop);
         }
     }
@@ -494,13 +510,16 @@ internal sealed class DurableFlowContext : IDurableFlowContext
         return interrupted;
     }
 
-    private Task SuspendForTimerAsync(string name, DateTime wakeAtUtc, TimeSpan remaining, CancellationToken cancellationToken)
+    private Task SuspendForTimerAsync(string name, DateTime wakeAtUtc, CancellationToken cancellationToken)
     {
         _state.LastMessage = $"Flow {FlowId} sleeping until {wakeAtUtc:O} at step '{name}'.";
         var id = FlowId;
         return ParkAsync(
             wakeAtUtc,
-            () => _builder.EnqueueWorkerAsync<IDurableFlowExecutor>(executor => executor.ExecuteAsync(id), remaining),
+            // The delay is measured when the wake-up is published, after the park's checkpoints and
+            // its renewal join: a remainder measured before them made the wake-up late by however
+            // long they took. One already due publishes at once (the builder's zero-delay path).
+            () => _builder.EnqueueWorkerAsync<IDurableFlowExecutor>(executor => executor.ExecuteAsync(id), wakeAtUtc - UtcNow),
             cancellationToken);
     }
 
@@ -546,7 +565,20 @@ internal sealed class DurableFlowContext : IDurableFlowContext
         try
         {
             await SaveForSleepAsync(waitEndsUtc, cancellationToken).ConfigureAwait(false);
-            await _lease.PauseRenewalAsync().ConfigureAwait(false);
+            if (!await _lease.PauseRenewalAsync().ConfigureAwait(false))
+            {
+                // A renewal is still in flight past the join budget (a store call ignoring its
+                // cancellation). The wake-up judges the lease by whether it changes, so that
+                // renewal landing after the publish read as a live holder running another job —
+                // the park's own continuation acknowledged as a duplicate, and the release skipped.
+                // Nothing is published: the attempt fails as retriable, and its redelivery carries
+                // this same job, which a late renewal can never get acknowledged.
+                throw new InvalidOperationException(
+                    $"Durable flow '{FlowId}' could not park: its execution lease renewal did not stop within {FlowExecutionLease.DisposeJoinLimit} " +
+                    "(a flow state store call that ignores its cancellation token), and a renewal landing after the wake-up is published would have " +
+                    "that wake-up acknowledged as a duplicate. Nothing was published; the delivery retries from the checkpoint.");
+            }
+
             try
             {
                 await publishWakeUp().ConfigureAwait(false);
@@ -903,6 +935,8 @@ internal sealed class DurableFlowContext : IDurableFlowContext
             return completedChild;
         }
 
+        // Settled before the child's ledger is created (see StepAsync).
+        await _lease.ResolveUncertainSaveAsync(_state).ConfigureAwait(false);
         await NotifyStepAsync(static (o, e) => o.OnStepStartingAsync(e), name, DurableFlowStepKind.ChildFlow).ConfigureAwait(false);
 
         var child = await _store.LoadAsync(childFlowId, cancellationToken).ConfigureAwait(false);
@@ -1017,6 +1051,9 @@ internal sealed class DurableFlowContext : IDurableFlowContext
         // historical plain-TTL stamp and re-arm-in-full replays.
         var waitWindow = stepTimeout ?? _channelDefaultWaitTimeout;
 
+        // Settled before the trigger, or before a re-attach adopts a recovered checkpoint's revision
+        // (see StepAsync).
+        await _lease.ResolveUncertainSaveAsync(_state).ConfigureAwait(false);
         await NotifyStepAsync(static (o, e) => o.OnStepStartingAsync(e), name, DurableFlowStepKind.Awaited, correlationId).ConfigureAwait(false);
 
         if (reattach && checkpoint.AwaitDeadlineUtc is { } awaitDeadline)
@@ -1333,7 +1370,10 @@ internal sealed class DurableFlowContext : IDurableFlowContext
     {
         try
         {
-            var persisted = await _store.LoadAsync(FlowId).ConfigureAwait(false);
+            // A current read: "not completed" is a decision nothing fences — a lagging copy (a
+            // Cosmos session read behind the recovery's write) left the re-attached step waiting
+            // out its whole deadline for a response recovery had already checkpointed.
+            var persisted = await _store.LoadCurrentAsync(FlowId).ConfigureAwait(false);
             if (persisted?.Steps is null
                 || !persisted.Steps.TryGetValue(name, out var persistedStep)
                 || !persistedStep.Completed)
@@ -1930,6 +1970,18 @@ internal sealed class DurableFlowContext : IDurableFlowContext
         if (estimate >= NextLedgerWarningBand(threshold, estimateBefore))
             LogLedgerLarge(logger, written, estimate, threshold);
     }
+
+    /// <summary>
+    /// The growth warning for the executor's own save of this execution's ledger — a retriable
+    /// failure's message — judged exactly like this context's saves: against the band seeded from
+    /// the ledger as this execution loaded it (see <see cref="InitialLedgerWarningChars"/>) and
+    /// raised by every warning since. A crossing only that message makes is warned once, by the
+    /// attempt that first persists it; a redelivery that fails the same way writes the same message
+    /// back and loads a ledger already that large, so it does not repeat the warning. Measuring the
+    /// crossing from the in-memory ledger before that save instead re-warned on every redelivery
+    /// whose progress report had shortened the message in between.
+    /// </summary>
+    internal void WarnIfLedgerLargeAfterExecutorSave() => WarnIfLedgerLarge();
 
     /// <summary>
     /// Every checkpoint rewrites the whole ledger, so a run whose steps retain sizeable results

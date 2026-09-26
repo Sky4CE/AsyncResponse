@@ -173,11 +173,67 @@ public sealed class VirtualTimeProvider : TimeProvider
         }
     }
 
+    /// <summary>
+    /// Advances to <paramref name="target"/>, or — when another driver already moved the clock past
+    /// it — only fires what is due at the current instant: never backwards. Decided under the
+    /// advance gate, so two drivers (a pending harness publish and the test's own advance) cannot
+    /// both read "now", and the later one throw "Cannot advance virtual time backwards" after the
+    /// other passed its target.
+    /// </summary>
+    internal void AdvanceToAtLeast(DateTimeOffset target)
+    {
+        target = target.ToUniversalTime();
+        lock (_advanceGate)
+        {
+            var now = GetUtcNow();
+            AdvanceTo(target > now ? target : now);
+        }
+    }
+
+    /// <summary>
+    /// Starts <paramref name="operation"/> with every timer created on its async flow — its own
+    /// retry backoffs, for instance — attributed to <paramref name="owner"/>
+    /// (<see cref="NextTimerDueAtFor"/>). Continuations the operation schedules carry the
+    /// attribution; code it merely unblocks (a waiter it completes) runs on its own flow and does
+    /// not, and neither does work it enqueues on the in-memory transport — a job, or a delayed
+    /// job's due time (<see cref="InMemoryWorkerTransport.TimerAttribution"/>). The caller's own
+    /// flow is left unattributed.
+    /// </summary>
+    internal static Task StartAttributed(object owner, Func<Task> operation)
+    {
+        var previous = InMemoryWorkerTransport.TimerAttribution.Current;
+        InMemoryWorkerTransport.TimerAttribution.Current = owner;
+        try
+        {
+            return operation();
+        }
+        finally
+        {
+            InMemoryWorkerTransport.TimerAttribution.Current = previous;
+        }
+    }
+
+    /// <summary>The earliest armed timer attributed to <paramref name="owner"/>, or <c>null</c> when none is armed.</summary>
+    internal DateTimeOffset? NextTimerDueAtFor(object owner)
+    {
+        lock (_gate)
+        {
+            // Ordered by due time: the first match is the earliest.
+            foreach (var timer in _armed)
+            {
+                if (ReferenceEquals(timer.Owner, owner))
+                    return timer.DueAt;
+            }
+
+            return null;
+        }
+    }
+
     /// <inheritdoc/>
     public override ITimer CreateTimer(TimerCallback callback, object? state, TimeSpan dueTime, TimeSpan period)
     {
         ArgumentNullException.ThrowIfNull(callback);
-        var timer = new VirtualTimer(this, callback, state);
+        var timer = new VirtualTimer(this, callback, state) { Owner = InMemoryWorkerTransport.TimerAttribution.Current };
         timer.Change(dueTime, period);
         return timer;
     }
@@ -190,6 +246,9 @@ public sealed class VirtualTimeProvider : TimeProvider
 
         internal DateTimeOffset DueAt { get; private set; }
         internal long Sequence { get; private set; }
+
+        /// <summary>The attributed operation that created this timer (<see cref="StartAttributed"/>), if any.</summary>
+        internal object? Owner { get; init; }
         private TimeSpan _period = Timeout.InfiniteTimeSpan;
         private bool _armed;
         private bool _disposed;

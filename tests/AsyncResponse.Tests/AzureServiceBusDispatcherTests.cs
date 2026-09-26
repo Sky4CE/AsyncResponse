@@ -595,12 +595,13 @@ public sealed class AzureServiceBusDispatcherTests
     }
 
     [Fact]
-    public async Task AckAfterEnqueue_FlowHandBack_WarnsAndSurfacesIt_WithoutAnErrorLog()
+    public async Task AckAfterEnqueue_FlowHandBack_LogsTheLostWakeUpAtError_AndSurfacesIt()
     {
         // Fixpoint r1 pre-commit (H6): an early-ACK job the flow engine hands back at host stop
         // cannot be redelivered (it was completed at enqueue) and a completed message cannot be
-        // dead-lettered, so it is surfaced through OnBackgroundFailure — at Warning, not as a
-        // handler failure at Error.
+        // dead-lettered, so it is surfaced through OnBackgroundFailure. Red-on-old (fixpoint r2,
+        // S8#2): it was logged at Warning, while every sibling transport logs a hand-back no copy
+        // records at Error — the wake-up is lost unless the callback records it.
         var calls = new SettlementCalls();
         var failure = new TaskCompletionSource<AzureServiceBusBackgroundFailureContext>(TaskCreationOptions.RunContinuationsAsynchronously);
         var logger = new CapturingLogger<AzureServiceBusDispatcherTests>();
@@ -624,9 +625,48 @@ public sealed class AzureServiceBusDispatcherTests
         var surfaced = await failure.Task.WaitAsync(TimeSpan.FromSeconds(5));
         Assert.IsType<DurableFlowInterruptedException>(surfaced.Exception);
         Assert.Equal(1, calls.Complete);
-        Assert.Contains(logger.Entries, entry => entry.Level == Microsoft.Extensions.Logging.LogLevel.Warning
-            && entry.Message.Contains("handed back by the flow engine", StringComparison.Ordinal));
-        Assert.DoesNotContain(logger.Entries, entry => entry.Level >= Microsoft.Extensions.Logging.LogLevel.Error);
+        var handBack = Assert.Single(logger.Entries, entry => entry.Message.Contains("handed back by the flow engine", StringComparison.Ordinal));
+        Assert.Equal(Microsoft.Extensions.Logging.LogLevel.Error, handBack.Level);
+        Assert.Contains("the wake-up is lost unless OnBackgroundFailure records it", handBack.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task AckAfterEnqueue_ThrowingLoggerOnAFailedJob_KeepsTheWorkerRunning()
+    {
+        // Red-on-old (fixpoint r2, throwing-logger rule): the worker logged a failed job's Error
+        // before its OnBackgroundFailure call, and Microsoft.Extensions.Logging rethrows a
+        // provider's failure — so a throwing provider skipped the report and ended the worker
+        // loop, and every already-completed job queued behind it never ran.
+        var healthyRan = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var reported = new TaskCompletionSource<AzureServiceBusBackgroundFailureContext>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var logger = new CollectingLogger { ThrowOnMessageContaining = "background handler failed" };
+        await using var dispatcher = AzureServiceBusMessageDispatcher.Create(
+            (delivery, _) =>
+            {
+                if (delivery.Body == "poison")
+                    return Task.FromException(new InvalidOperationException("boom"));
+
+                healthyRan.TrySetResult();
+                return Task.CompletedTask;
+            },
+            new AzureServiceBusAsyncResponseOptions(),
+            new AzureServiceBusSubscriberOptions
+            {
+                OnBackgroundFailure = context =>
+                {
+                    reported.TrySetResult(context);
+                    return ValueTask.CompletedTask;
+                }
+            }.UseAckAfterEnqueue(1, 8, TimeSpan.FromSeconds(5)),
+            logger,
+            "workers",
+            AzureServiceBusSubscriberRole.Worker);
+
+        await dispatcher.HandleAsync(Delivery(new SettlementCalls(), body: "poison", messageId: "m1"), CancellationToken.None);
+        await dispatcher.HandleAsync(Delivery(new SettlementCalls(), body: "healthy", messageId: "m2"), CancellationToken.None);
+
+        Assert.Equal("m1", (await reported.Task.WaitAsync(TimeSpan.FromSeconds(5))).MessageId);
+        await healthyRan.Task.WaitAsync(TimeSpan.FromSeconds(5));
     }
 
     [Fact]
@@ -749,6 +789,41 @@ public sealed class AzureServiceBusDispatcherTests
 
         Assert.Equal(1, calls.Abandon);
         release.TrySetResult();
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task AckAfterEnqueue_Overflow_ClaimsTheAbandonOnlyWhenItSucceeded(bool abandonFails)
+    {
+        // Red-on-old (fixpoint r2 pre-commit, G3): the rejected-queue Warning ran after the abandon
+        // whatever its outcome, so a failed abandon logged "Failed to abandon …" and then, at once,
+        // "… abandoned for redelivery" — two lines contradicting each other.
+        var calls = new SettlementCalls { AbandonException = abandonFails ? new InvalidOperationException("lock lost") : null };
+        var logger = new CollectingLogger();
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        await using var dispatcher = AzureServiceBusMessageDispatcher.Create(
+            async (_, _) =>
+            {
+                entered.TrySetResult();
+                await release.Task.ConfigureAwait(false);
+            },
+            new AzureServiceBusAsyncResponseOptions(),
+            new AzureServiceBusSubscriberOptions().UseAckAfterEnqueue(1, 1, TimeSpan.FromSeconds(5)),
+            logger,
+            "workers",
+            AzureServiceBusSubscriberRole.Worker);
+
+        await dispatcher.HandleAsync(Delivery(calls), CancellationToken.None);
+        await entered.Task.WaitAsync(TimeSpan.FromSeconds(30));
+        await dispatcher.HandleAsync(Delivery(calls), CancellationToken.None);
+        await dispatcher.HandleAsync(Delivery(calls), CancellationToken.None);
+        release.TrySetResult();
+
+        Assert.Equal(1, calls.Abandon);
+        Assert.Equal(!abandonFails, logger.Messages.Any(message => message.Contains("abandoned for redelivery", StringComparison.Ordinal)));
+        Assert.Equal(abandonFails, logger.Messages.Any(message => message.Contains("abandoning it failed", StringComparison.Ordinal)));
     }
 
     [Fact]

@@ -96,8 +96,10 @@ public sealed class SqlServerAsyncResponseTransportOptions
     /// <summary>
     /// The hosting shutdown budget that must contain
     /// <see cref="SqlServerSubscriberOptions.BackgroundDrainTimeout"/> when a subscriber uses
-    /// <see cref="SqlServerAckMode.AckAfterEnqueue"/>. Defaults to the Generic Host default of
-    /// 30 seconds. Set to <c>null</c> only when this budget is validated externally.
+    /// <see cref="SqlServerAckMode.AckAfterEnqueue"/> — the sum of both subscribers'
+    /// <see cref="SqlServerSubscriberOptions.BackgroundDrainTimeout"/> when both use it, since the host
+    /// stops them one after the other. Defaults to the Generic Host default of 30 seconds. Set to
+    /// <c>null</c> only when this budget is validated externally.
     /// </summary>
     public TimeSpan? HostShutdownTimeout { get; set; } = TimeSpan.FromSeconds(30);
 

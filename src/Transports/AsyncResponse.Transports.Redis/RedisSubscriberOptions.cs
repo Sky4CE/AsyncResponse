@@ -122,7 +122,12 @@ public sealed class RedisSubscriberOptions
     /// </summary>
     public int BackgroundQueueCapacity { get; set; }
 
-    /// <summary>Maximum time to wait for queued/running background handlers while the hosted subscriber stops.</summary>
+    /// <summary>
+    /// Maximum time the hosted subscriber's stop spends on the background queue: three quarters
+    /// let queued and running handlers finish, and the last quarter is reserved for dead-lettering
+    /// and reporting (<see cref="OnBackgroundFailure"/>) the already-ACKed entries still queued
+    /// when that lapses — Redis will not redeliver them.
+    /// </summary>
     public TimeSpan BackgroundDrainTimeout { get; set; } = TimeSpan.FromSeconds(20);
 
     /// <summary>

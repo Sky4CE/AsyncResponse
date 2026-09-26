@@ -230,7 +230,12 @@ public static class EFCoreDurableFlowModelBuilderExtensions
             entity.Property(r => r.StateJson).HasColumnName("state_json").IsRequired();
             entity.Property(r => r.ExpiresAtUtc).HasColumnName("expires_at_utc");
             entity.Property(r => r.UpdatedAtUtc).HasColumnName("updated_at_utc");
-            entity.Property(r => r.Revision).HasColumnName("revision").HasDefaultValue(0L);
+            // The default keeps migrations emitting DEFAULT 0 (dropping it would be a schema diff in
+            // every application), but a default alone makes EF treat revision 0 — every create's —
+            // as "let the database generate it" and leave the column out of the INSERT, so a table
+            // provisioned without the default (the shape the sibling packages document and accept)
+            // rejected every new flow. ValueGeneratedNever: the INSERT always names the column.
+            entity.Property(r => r.Revision).HasColumnName("revision").HasDefaultValue(0L).ValueGeneratedNever();
             entity.Property(r => r.LeaseId).HasColumnName("lease_id").HasMaxLength(64);
             entity.Property(r => r.LeaseExpiresAtUtc).HasColumnName("lease_expires_at_utc");
             entity.HasIndex(r => r.ExpiresAtUtc).HasDatabaseName($"{tableName}_expires_idx");
@@ -516,7 +521,14 @@ public sealed class EFCoreFlowStateStore<[DynamicallyAccessedMembers(Dynamically
                 "session runs with SET NOCOUNT ON (a server-wide 'user options' default of 512, or a connection-level setting) — " +
                 "turn NOCOUNT off for the durable-flow store's connections.");
 
-    private static DbSet<DurableFlowStateRecord> Records(TContext db) => db.Set<DurableFlowStateRecord>();
+    /// <summary>
+    /// Every query the store runs starts here — reads, <c>ExecuteUpdate</c>/<c>ExecuteDelete</c>, and
+    /// the prune's batch subquery. The application's global query filters are switched off: the
+    /// ledger is keyed by flow id alone, so no filter can be right for it, and an app-wide one (a
+    /// tenant filter applied to every entity type) hid rows written under another tenant — the
+    /// worker's create collided with a row it could not see and dead-lettered every start job.
+    /// </summary>
+    private static IQueryable<DurableFlowStateRecord> Records(TContext db) => db.Set<DurableFlowStateRecord>().IgnoreQueryFilters();
 
     private async Task<bool> UpdateLeaseAsync(
         string flowId,

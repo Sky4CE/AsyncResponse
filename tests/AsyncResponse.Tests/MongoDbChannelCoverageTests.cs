@@ -295,6 +295,9 @@ public sealed class MongoDbChannelCoverageTests
         indexManager
             .Setup(i => i.DropOneAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()))
             .Returns(Task.CompletedTask);
+        // The conflict path lists the indexes first (r2 GS3#5): nothing equivalent under another
+        // name, so the same-named index is replaced as before.
+        ListsIndexes(indexManager, SameNamedTtlIndexWithOtherOptions());
         fixture.Recovery.SetupGet(c => c.Indexes).Returns(indexManager.Object);
         SetupSuccessfulIndexes(fixture.Messages);
         SetupSuccessfulIndexes(fixture.Subscribers);
@@ -306,6 +309,143 @@ public sealed class MongoDbChannelCoverageTests
             It.IsAny<CancellationToken>()), Times.Once);
         await fixture.Channel.DisposeAsync();
     }
+
+    /// <summary>
+    /// Regression (r2 GS3#5): the TTL index the AutoCreateIndexes = false warning prescribes —
+    /// <c>createIndex({ expires_at: 1 }, { expireAfterSeconds: 0 })</c>, named <c>expires_at_1</c> —
+    /// conflicted (85) with the store's own name; the conflict handler dropped the store's name
+    /// (absent: 27, swallowed), recreated, got 85 again, and every operation rethrew it once
+    /// AutoCreateIndexes was switched back on. An equivalent index under another name is accepted
+    /// now, and nothing of the operator's is dropped.
+    /// </summary>
+    [Fact]
+    public async Task ChannelStore_AcceptsAnEquivalentTtlIndexUnderAnotherName()
+    {
+        var fixture = new ChannelFixture(autoCreateIndexes: true);
+        var indexManager = new Mock<IMongoIndexManager<MongoRecoveryStateDocument>>();
+        indexManager
+            .SetupSequence(i => i.CreateOneAsync(
+                It.IsAny<CreateIndexModel<MongoRecoveryStateDocument>>(),
+                It.IsAny<CreateOneIndexOptions>(),
+                It.IsAny<CancellationToken>()))
+            .ThrowsAsync(MongoCommandException(85))
+            .ReturnsAsync("correlation");
+        ListsIndexes(indexManager, new BsonDocument
+        {
+            ["name"] = "expires_at_1",
+            ["key"] = new BsonDocument("expires_at", 1.0),
+            ["expireAfterSeconds"] = 0
+        });
+        fixture.Recovery.SetupGet(c => c.Indexes).Returns(indexManager.Object);
+        SetupSuccessfulIndexes(fixture.Messages);
+        SetupSuccessfulIndexes(fixture.Subscribers);
+
+        await fixture.Store.EnsureCreatedAsync();
+
+        indexManager.Verify(i => i.DropOneAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()), Times.Never);
+        indexManager.Verify(i => i.CreateOneAsync(
+            It.IsAny<CreateIndexModel<MongoRecoveryStateDocument>>(),
+            It.IsAny<CreateOneIndexOptions>(),
+            It.IsAny<CancellationToken>()), Times.Exactly(2));
+        await fixture.Channel.DisposeAsync();
+    }
+
+    /// <summary>
+    /// ...but an index on the same key WITHOUT the TTL is not the reaper the store needs: it is
+    /// never accepted in its place (the same-named replace then runs and the conflict surfaces).
+    /// </summary>
+    [Fact]
+    public async Task ChannelStore_DoesNotAcceptANonTtlIndexForTheTtlIndex()
+    {
+        var fixture = new ChannelFixture(autoCreateIndexes: true);
+        var indexManager = new Mock<IMongoIndexManager<MongoRecoveryStateDocument>>();
+        indexManager
+            .Setup(i => i.CreateOneAsync(
+                It.IsAny<CreateIndexModel<MongoRecoveryStateDocument>>(),
+                It.IsAny<CreateOneIndexOptions>(),
+                It.IsAny<CancellationToken>()))
+            .ThrowsAsync(MongoCommandException(85));
+        indexManager
+            .Setup(i => i.DropOneAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .ThrowsAsync(MongoCommandException(27));
+        ListsIndexes(indexManager, new BsonDocument { ["name"] = "expires_at_1", ["key"] = new BsonDocument("expires_at", 1) });
+        fixture.Recovery.SetupGet(c => c.Indexes).Returns(indexManager.Object);
+
+        Assert.Equal(85, (await Assert.ThrowsAsync<MongoCommandException>(() => fixture.Store.EnsureCreatedAsync())).Code);
+        await fixture.Channel.DisposeAsync();
+    }
+
+    /// <summary>
+    /// Regression (r2 S5#10): nothing noticed a channel collection created with a folding default
+    /// collation, under which a read for "ABC" also returns "abc"'s documents — each discarded by
+    /// the ordinal re-check with an Error, on every pass. EnsureCreated now warns once per such
+    /// collection (the reads stay unpinned: a simple collation could not use the collection's
+    /// indexes), and a deployment that cannot list collections just skips the check.
+    /// </summary>
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task ChannelStore_WarnsOnceAboutAFoldingDefaultCollation(bool listable)
+    {
+        var database = new Mock<IMongoDatabase>(MockBehavior.Loose).WithTestNamespace();
+        database.WithLooseCollection<MongoRecoveryStateDocument>();
+        database.WithLooseCollection<MongoChannelMessageDocument>();
+        database.WithLooseCollection<MongoChannelSubscriberDocument>();
+        var listing = database.Setup(d => d.ListCollectionsAsync(It.IsAny<ListCollectionsOptions>(), It.IsAny<CancellationToken>()));
+        if (listable)
+        {
+            listing.ReturnsAsync(() => new MongoListCursor<BsonDocument>(
+            [
+                new BsonDocument
+                {
+                    ["name"] = "asyncresponse_channel_messages",
+                    ["options"] = new BsonDocument("collation", new BsonDocument { ["locale"] = "en", ["strength"] = 2 })
+                },
+                new BsonDocument
+                {
+                    ["name"] = "asyncresponse_recovery_state",
+                    ["options"] = new BsonDocument("collation", new BsonDocument("locale", "simple"))
+                },
+                new BsonDocument { ["name"] = "asyncresponse_channel_subscribers", ["options"] = new BsonDocument() }
+            ]));
+        }
+        else
+        {
+            listing.ThrowsAsync(MongoCommandException(13));
+        }
+
+        var logger = new CollectingLogger();
+        using var store = new MongoDbChannelStore(
+            database.Object,
+            Options.Create(new MongoDbAsyncResponseChannelOptions { AutoCreateIndexes = false, UseOwnershipLedger = false }),
+            logger: logger.For<MongoDbChannelStore>());
+
+        await store.EnsureCreatedAsync();
+        await store.EnsureCreatedAsync();
+
+        var warnings = logger.Messages.Where(message => message.Contains("default collation", StringComparison.Ordinal)).ToList();
+        if (!listable)
+        {
+            Assert.Empty(warnings);
+            return;
+        }
+
+        var warning = Assert.Single(warnings);
+        Assert.Contains("asyncresponse_channel_messages", warning, StringComparison.Ordinal);
+        Assert.Contains("\"strength\" : 2", warning, StringComparison.Ordinal);
+    }
+
+    private static void ListsIndexes<TDocument>(Mock<IMongoIndexManager<TDocument>> manager, params BsonDocument[] indexes)
+        => manager
+            .Setup(i => i.ListAsync(It.IsAny<CancellationToken>()))
+            .ReturnsAsync(() => new MongoListCursor<BsonDocument>(indexes));
+
+    private static BsonDocument SameNamedTtlIndexWithOtherOptions() => new()
+    {
+        ["name"] = "asyncresponse_recovery_state_expires_idx",
+        ["key"] = new BsonDocument("expires_at", 1),
+        ["expireAfterSeconds"] = 3600
+    };
 
     [Fact]
     public async Task CollectDispatchScopeAsync_CoversAllBranches()
@@ -1193,6 +1333,7 @@ public sealed class MongoDbChannelCoverageTests
         indexManager
             .Setup(i => i.DropOneAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()))
             .ThrowsAsync(MongoCommandException(27));
+        ListsIndexes(indexManager, SameNamedTtlIndexWithOtherOptions());
         fixture.Recovery.SetupGet(c => c.Indexes).Returns(indexManager.Object);
         SetupSuccessfulIndexes(fixture.Messages);
         SetupSuccessfulIndexes(fixture.Subscribers);

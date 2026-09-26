@@ -34,6 +34,7 @@ internal sealed class NatsMessageDispatcher : IAsyncDisposable
     private readonly Channel<NatsJobDelivery>? _backgroundQueue;
     private readonly Task[]? _backgroundWorkers;
     private readonly CancellationTokenSource? _backgroundCts;
+    private readonly WorkerIntakeGate? _intakeGate;
     private int _handBackSignalled;
 
     /// <summary>Runs the NatsMessageDispatcher operation.</summary>
@@ -45,10 +46,12 @@ internal sealed class NatsMessageDispatcher : IAsyncDisposable
         NatsTransportSubjectSchema schema,
         ILogger logger,
         NatsSubscriberRole role,
-        string consumer)
+        string consumer,
+        WorkerIntakeGate? intakeGate = null)
     {
         NatsTransportOptionsValidator.ValidateSubscriber(options, subscriberOptions, role.ToString());
 
+        _intakeGate = intakeGate;
         _handler = handler;
         _jetStream = jetStream;
         _options = options;
@@ -81,6 +84,14 @@ internal sealed class NatsMessageDispatcher : IAsyncDisposable
     /// come back from a stop.
     /// </summary>
     public bool HandBackSignalled => Volatile.Read(ref _handBackSignalled) != 0;
+
+    /// <summary>
+    /// Whether the subscriber must take no new delivery: a hand-back latched
+    /// (<see cref="HandBackSignalled"/>), or — for the worker role — host stop has begun
+    /// (<see cref="WorkerIntakeGate"/>). The latch stays the fallback when no host lifetime is
+    /// registered. Both mean a live peer should take what this host has not started.
+    /// </summary>
+    public bool IntakeClosed => HandBackSignalled || (_intakeGate?.IsClosed ?? false);
 
     /// <summary>Handles the delivered message.</summary>
     public async Task HandleAsync(NatsJobDelivery delivery, CancellationToken cancellationToken)
@@ -147,26 +158,33 @@ internal sealed class NatsMessageDispatcher : IAsyncDisposable
         {
             // Host shutdown, not a handler failure: the failure path would NAK it with the
             // redelivery delay and, at the attempt cap, dead-letter — or, with dead-lettering
-            // disabled, TERMINATE — healthy work. Leave the delivery unsettled; AckWait lapses on
-            // its own and at-least-once redelivery applies after restart (parity with the
-            // RabbitMQ/Redis/Kafka/DB dispatchers). This does NOT spare the delivery attempt:
-            // JetStream counted it when it handed the message over, settled or not. It is not
-            // NAKed for immediate redelivery either — while this host is still fetching, that
-            // would hand the job straight back to the host that is stopping.
+            // disabled, TERMINATE — healthy work. On the subscriber's own stop the delivery is
+            // left unsettled; AckWait lapses on its own and at-least-once redelivery applies after
+            // restart (parity with the RabbitMQ/Redis/Kafka/DB dispatchers). This does NOT spare
+            // the delivery attempt: JetStream counted it when it handed the message over, settled
+            // or not.
             //
             // The flow engine's own hand-back (DurableFlowInterruptedException) arrives on
             // ApplicationStopping, which fires before any hosted service stops — so this
-            // subscriber's token can still be live. It means the same thing: return without
-            // settling instead of rethrowing, because a throw with a live token reaches the
-            // supervisor as a subscriber failure (a Warning and a rebuild) for a routine deploy.
+            // subscriber's token can still be live. It means the same thing: return instead of
+            // rethrowing, because a throw with a live token reaches the supervisor as a subscriber
+            // failure (a Warning and a rebuild) for a routine deploy.
             if (cancellationToken.IsCancellationRequested)
                 throw;
 
+            // Latch FIRST, then hand the delivery straight back with no delay: the latch stops
+            // this host's fetch loop before its next fetch (and ack-after-handler fetches one
+            // message at a time, so no pull request is outstanding), so the NAK can only reach a
+            // live peer. Left unsettled — the old reason being that a NAK would hand the job back
+            // to this stopping host, which the latch now rules out — a handed-back flow wake-up
+            // sat out its whole AckWait (30 s by default, often raised) before any replica could
+            // take it.
             Volatile.Write(ref _handBackSignalled, 1);
-            _logger.LogInformation(
-                "Handler for message on subject {Subject} ({Role}) was interrupted because the host is stopping; leaving the delivery unsettled for redelivery.",
+            await NakQuietlyAsync(delivery, TimeSpan.Zero).ConfigureAwait(false);
+            SafeLog.Try(() => _logger.LogInformation(
+                "Handler for message on subject {Subject} ({Role}) was interrupted because the host is stopping; handed the delivery back for immediate redelivery to a live peer.",
                 delivery.Subject,
-                _role);
+                _role));
             return;
         }
         catch (Exception ex)
@@ -233,17 +251,32 @@ internal sealed class NatsMessageDispatcher : IAsyncDisposable
             {
                 _logger.LogDebug("Background queue full for {Role}; pausing the consume loop until capacity frees.", _role);
 
-                // Wait for the slot, then re-check the hand-back latch before taking it: a
-                // delivery parked here when a worker set HandBackSignalled was still enqueued and
-                // ACKed once a slot freed — the next flow wake-up for this stopping host to hand
-                // back, a dead-letter copy where a live peer could have run it. Hand it back
-                // unstarted instead, with no delay, as the batch loop does with the rest of its batch.
+                // Wait for the slot, then re-check intake before taking it: a delivery parked here
+                // when a worker set HandBackSignalled was still enqueued and ACKed once a slot
+                // freed — the next flow wake-up for this stopping host to hand back, a dead-letter
+                // copy where a live peer could have run it. Hand it back unstarted instead, with no
+                // delay, as the batch loop does with the rest of its batch. Host stop (the worker's
+                // intake gate) wakes the wait at once rather than when a slot frees: from then on
+                // nothing new is settled first.
+                using var parked = _intakeGate is null
+                    ? null
+                    : CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _intakeGate.HostStopping);
                 do
                 {
-                    if (!await _backgroundQueue.Writer.WaitToWriteAsync(cancellationToken).ConfigureAwait(false))
+                    bool writable;
+                    try
+                    {
+                        writable = await _backgroundQueue.Writer.WaitToWriteAsync(parked?.Token ?? cancellationToken).ConfigureAwait(false);
+                    }
+                    catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested && IntakeClosed)
+                    {
+                        writable = true; // the intake gate closed: hand it back below
+                    }
+
+                    if (!writable)
                         throw new ChannelClosedException();
 
-                    if (HandBackSignalled)
+                    if (IntakeClosed)
                     {
                         await NakQuietlyAsync(delivery, TimeSpan.Zero).ConfigureAwait(false);
                         return;
@@ -323,25 +356,31 @@ internal sealed class NatsMessageDispatcher : IAsyncDisposable
                 // but the message was ACKed at enqueue and JetStream will never redeliver it, so
                 // beyond the OnBackgroundFailure report a dead-letter copy under its own reason is
                 // its only durable record (Redis dispatcher parity): a replay is safe, the run
-                // resuming from its last checkpoint.
+                // resuming from its last checkpoint. The copy is written FIRST and the log says
+                // whether it exists (Redis/Kafka/RabbitMQ parity): logged before the write, the
+                // Warning claimed a copy a failed write never made, and no Error said the wake-up
+                // was lost. With dead-lettering disabled no copy is attempted (the burial would
+                // only log it as dropped).
                 Volatile.Write(ref _handBackSignalled, 1);
-                if (_options.DeadLetterEnabled)
+                var copied = _options.DeadLetterEnabled
+                    && await DeadLetterAsync(delivery, ex, CancellationToken.None, HandedBackAfterCommitReason).ConfigureAwait(false);
+                if (copied)
                 {
-                    _logger.LogWarning(
-                        "NATS background handler for already-ACKed message on subject {Subject} ({Role}) was handed back by the flow engine because the host is stopping; JetStream will not redeliver it. Dead-lettering a copy ({Reason}) and surfacing via OnBackgroundFailure.",
+                    SafeLog.Try(() => _logger.LogWarning(
+                        "NATS background handler for already-ACKed message on subject {Subject} ({Role}) was handed back by the flow engine because the host is stopping; JetStream will not redeliver it. Dead-lettered a copy ({Reason}) and surfacing via OnBackgroundFailure.",
                         delivery.Subject,
                         _role,
-                        HandedBackAfterCommitReason);
-                    await DeadLetterAsync(delivery, ex, CancellationToken.None, HandedBackAfterCommitReason).ConfigureAwait(false);
+                        HandedBackAfterCommitReason));
                 }
                 else
                 {
-                    // No copy can be written (the burial would only log it as dropped): the
-                    // wake-up is lost unless the report records it, so say so at Error.
-                    _logger.LogError(
-                        "NATS background handler for already-ACKed message on subject {Subject} ({Role}) was handed back by the flow engine because the host is stopping; JetStream will not redeliver it, and no dead-letter destination is configured, so the wake-up is lost unless OnBackgroundFailure records it (resume the flow explicitly).",
+                    // No copy exists: the wake-up is lost unless the report records it, so say so at Error.
+                    var why = _options.DeadLetterEnabled ? "the dead-letter write failed" : "no dead-letter destination is configured";
+                    SafeLog.Try(() => _logger.LogError(
+                        "NATS background handler for already-ACKed message on subject {Subject} ({Role}) was handed back by the flow engine because the host is stopping; JetStream will not redeliver it, and {Why}, so the wake-up is lost unless OnBackgroundFailure records it (resume the flow explicitly).",
                         delivery.Subject,
-                        _role);
+                        _role,
+                        why));
                 }
 
                 await InvokeBackgroundFailureAsync(delivery, ex).ConfigureAwait(false);
@@ -351,15 +390,15 @@ internal sealed class NatsMessageDispatcher : IAsyncDisposable
                 // The drain budget lapsed with this already-ACKed message still unprocessed:
                 // JetStream will not redeliver it, so surface the drop through OnBackgroundFailure
                 // instead of dead-lettering a never-run job as a handler failure.
-                _logger.LogWarning(
+                SafeLog.Try(() => _logger.LogWarning(
                     "NATS background handler for already-ACKed message on subject {Subject} ({Role}) was canceled during dispatcher shutdown; surfacing via OnBackgroundFailure.",
                     delivery.Subject,
-                    _role);
+                    _role));
                 await InvokeBackgroundFailureAsync(delivery, ex).ConfigureAwait(false);
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "Background handler failed for {Role} on subject {Subject} after early ACK.", _role, delivery.Subject);
+                SafeLog.Try(() => _logger.LogError(ex, "Background handler failed for {Role} on subject {Subject} after early ACK.", _role, delivery.Subject));
                 await DeadLetterAsync(delivery, ex, CancellationToken.None).ConfigureAwait(false);
                 await InvokeBackgroundFailureAsync(delivery, ex).ConfigureAwait(false);
             }
@@ -367,19 +406,55 @@ internal sealed class NatsMessageDispatcher : IAsyncDisposable
     }
 
     /// <summary>
-    /// Buries an already-ACKed entry the drain budget left unstarted: JetStream will never
-    /// redeliver it, so the dead-letter copy and the OnBackgroundFailure report are its only record.
+    /// Buries an already-ACKed entry the drain budget left unstarted, then reports it: JetStream
+    /// will never redeliver it, so the dead-letter copy and the OnBackgroundFailure report are its
+    /// only record. For a worker that came free after the drain lapsed; the dispose reserve buries
+    /// everything first and reports afterwards, each report bounded (see <see cref="DisposeAsync"/>).
     /// </summary>
     private async Task RouteUndrainedAsync(NatsJobDelivery delivery, CancellationToken cancellationToken)
     {
-        var lapsed = new OperationCanceledException(
-            "The ACK-after-enqueue drain budget lapsed before this already-ACKed message was handled.");
-        _logger.LogWarning(
-            "NATS background handler for already-ACKed message on subject {Subject} ({Role}) was not started: the drain budget had lapsed. Dead-lettering and surfacing via OnBackgroundFailure.",
-            delivery.Subject,
-            _role);
-        await DeadLetterAsync(delivery, lapsed, cancellationToken).ConfigureAwait(false);
+        var lapsed = DrainLapsed();
+        await BuryUndrainedAsync(delivery, lapsed, cancellationToken).ConfigureAwait(false);
         await InvokeBackgroundFailureAsync(delivery, lapsed).ConfigureAwait(false);
+    }
+
+    private static OperationCanceledException DrainLapsed()
+        => new("The ACK-after-enqueue drain budget lapsed before this already-ACKed message was handled.");
+
+    /// <summary>
+    /// Writes the dead-letter copy of an already-ACKed entry the drain budget left unstarted and
+    /// returns whether one was written. The log claims a copy only when there is one: with
+    /// dead-lettering disabled, or a burial that failed, the job is lost unless the
+    /// OnBackgroundFailure report records it — which is said at Error.
+    /// </summary>
+    private async Task<bool> BuryUndrainedAsync(NatsJobDelivery delivery, Exception lapsed, CancellationToken cancellationToken)
+    {
+        if (!_options.DeadLetterEnabled)
+        {
+            SafeLog.Try(() => _logger.LogError(
+                "NATS background handler for already-ACKed message on subject {Subject} ({Role}) was not started: the drain budget had lapsed. JetStream will not redeliver it, and no dead-letter destination is configured, so the job is lost unless OnBackgroundFailure records it.",
+                delivery.Subject,
+                _role));
+            return false;
+        }
+
+        var buried = await DeadLetterAsync(delivery, lapsed, cancellationToken).ConfigureAwait(false);
+        if (buried)
+        {
+            SafeLog.Try(() => _logger.LogWarning(
+                "NATS background handler for already-ACKed message on subject {Subject} ({Role}) was not started: the drain budget had lapsed. Dead-lettered it; surfacing via OnBackgroundFailure.",
+                delivery.Subject,
+                _role));
+        }
+        else
+        {
+            SafeLog.Try(() => _logger.LogError(
+                "NATS background handler for already-ACKed message on subject {Subject} ({Role}) was not started: the drain budget had lapsed, and its dead-letter copy could not be written. JetStream will not redeliver it, so the job is lost unless OnBackgroundFailure records it.",
+                delivery.Subject,
+                _role));
+        }
+
+        return buried;
     }
 
     private async Task HandleFailureAsync(NatsJobDelivery delivery, Exception exception, CancellationToken cancellationToken)
@@ -474,11 +549,11 @@ internal sealed class NatsMessageDispatcher : IAsyncDisposable
     {
         if (!_options.DeadLetterEnabled)
         {
-            _logger.LogError(
+            SafeLog.Try(() => _logger.LogError(
                 exception,
                 "Message on subject {Subject} ({Role}) is unprocessable and dead-lettering is disabled; it will be dropped.",
                 delivery.Subject,
-                _role);
+                _role));
             return true;
         }
 
@@ -507,14 +582,16 @@ internal sealed class NatsMessageDispatcher : IAsyncDisposable
         try
         {
             await _jetStream.PublishAsync(_schema.DeadLetterSubject, delivery.Payload, headers, cancellationToken).ConfigureAwait(false);
-            _logger.LogInformation("Dead-lettered message from subject {Subject} ({Role}) to {DeadLetterSubject}.", delivery.Subject, _role, _schema.DeadLetterSubject);
-            return true;
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Failed to dead-letter message from subject {Subject} ({Role}).", delivery.Subject, _role);
+            SafeLog.Try(() => _logger.LogError(ex, "Failed to dead-letter message from subject {Subject} ({Role}).", delivery.Subject, _role));
             return false;
         }
+
+        // Logged after the outcome, outside the try: a throwing provider read as a failed burial.
+        SafeLog.Try(() => _logger.LogInformation("Dead-lettered message from subject {Subject} ({Role}) to {DeadLetterSubject}.", delivery.Subject, _role, _schema.DeadLetterSubject));
+        return true;
     }
 
     private async Task InvokeBackgroundFailureAsync(NatsJobDelivery delivery, Exception exception)
@@ -563,8 +640,11 @@ internal sealed class NatsMessageDispatcher : IAsyncDisposable
         }
         catch (TimeoutException)
         {
-            _logger.LogWarning("Background handlers for {Role} did not drain within {Timeout}; dead-lettering the entries still queued.", _role, drainBudget);
             await _backgroundCts!.CancelAsync().ConfigureAwait(false);
+            if (_options.DeadLetterEnabled)
+                SafeLog.Try(() => _logger.LogWarning("Background handlers for {Role} did not drain within {Timeout}; dead-lettering the entries still queued.", _role, drainBudget));
+            else
+                SafeLog.Try(() => _logger.LogWarning("Background handlers for {Role} did not drain within {Timeout}; reporting the entries still queued through OnBackgroundFailure (dead-lettering is disabled).", _role, drainBudget));
         }
         catch (Exception ex)
         {
@@ -580,30 +660,39 @@ internal sealed class NatsMessageDispatcher : IAsyncDisposable
         // once some handler happened to finish, after this method had returned and the host had
         // torn the connection down or exited. Those already-ACKed jobs vanished with only a
         // warning. A worker that does come free routes entries too; each is read exactly once.
+        //
+        // EVERY entry is buried before ANY is reported: the report awaits the user's
+        // OnBackgroundFailure, and awaited between burials with no bound, one slow callback (a
+        // write to a database that is down) held this reserve — and DisposeAsync — past
+        // BackgroundDrainTimeout, with the entries behind it neither buried nor counted.
         using var reserve = new CancellationTokenSource(routingReserve);
+        var lapsed = DrainLapsed();
+        var routed = new List<NatsJobDelivery>();
+        var unburied = 0;
         while (!reserve.IsCancellationRequested && _backgroundQueue.Reader.TryRead(out var undrained))
-            await RouteUndrainedAsync(undrained, reserve.Token).ConfigureAwait(false);
+        {
+            routed.Add(undrained);
+            if (!await BuryUndrainedAsync(undrained, lapsed, reserve.Token).ConfigureAwait(false))
+                unburied++;
+        }
+
+        await ReportUndrainedAsync(routed, lapsed, routingReserve, reserve.Token).ConfigureAwait(false);
 
         try
         {
             // What remains of the reserve lets a handler that honors the cancellation report it.
             await workers.WaitAsync(reserve.Token).ConfigureAwait(false);
+            ReportLostUndrained(unburied, routingReserve);
             _backgroundCts.Dispose();
             return;
         }
         catch (OperationCanceledException) when (reserve.IsCancellationRequested)
         {
-            if (_backgroundQueue.Reader.Count > 0)
-            {
-                _logger.LogError(
-                    "{Count} already-ACKed NATS message(s) for {Role} were still queued when the reserved {Reserve} ran out; they are lost at process exit (JetStream will not redeliver them).",
-                    _backgroundQueue.Reader.Count,
-                    _role,
-                    routingReserve);
-            }
+            ReportLostUndrained(unburied, routingReserve);
         }
         catch (Exception ex)
         {
+            ReportLostUndrained(unburied, routingReserve);
             _logger.LogDebug(ex, "Background worker drain for {Role} ended with an error.", _role);
             _backgroundCts.Dispose();
             return;
@@ -617,5 +706,56 @@ internal sealed class NatsMessageDispatcher : IAsyncDisposable
             CancellationToken.None,
             TaskContinuationOptions.ExecuteSynchronously,
             TaskScheduler.Default);
+    }
+
+    /// <summary>
+    /// Reports the entries the dispose reserve routed through OnBackgroundFailure, each bounded by
+    /// what remains of the reserve. A callback that outlives it is abandoned — it keeps running,
+    /// and never faults (<see cref="InvokeBackgroundFailureAsync"/> logs its own failure) — and it
+    /// and the reports behind it are counted in one Error.
+    /// </summary>
+    private async Task ReportUndrainedAsync(List<NatsJobDelivery> routed, Exception lapsed, TimeSpan routingReserve, CancellationToken reserve)
+    {
+        if (_subscriberOptions.OnBackgroundFailure is null)
+            return;
+
+        for (var i = 0; i < routed.Count; i++)
+        {
+            try
+            {
+                reserve.ThrowIfCancellationRequested();
+                await InvokeBackgroundFailureAsync(routed[i], lapsed).WaitAsync(reserve).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (reserve.IsCancellationRequested)
+            {
+                var unreported = routed.Count - i;
+                SafeLog.Try(() => _logger.LogError(
+                    "{Count} OnBackgroundFailure report(s) for drain-lapsed NATS message(s) ({Role}) did not complete within the reserved {Reserve}; they were not awaited further (their dead-letter copies are unaffected).",
+                    unreported,
+                    _role,
+                    routingReserve));
+                return;
+            }
+        }
+    }
+
+    /// <summary>
+    /// The loss line of the dispose reserve: every already-ACKed entry it did not bury — still
+    /// queued when the reserve ran out, or read with no dead-letter copy written (burial failed or
+    /// dead-lettering is disabled) — is gone at process exit, since JetStream will not redeliver it.
+    /// </summary>
+    private void ReportLostUndrained(int unburied, TimeSpan routingReserve)
+    {
+        var stillQueued = _backgroundQueue!.Reader.Count;
+        if (stillQueued + unburied == 0)
+            return;
+
+        SafeLog.Try(() => _logger.LogError(
+            "{Count} already-ACKed NATS message(s) for {Role} were not dead-lettered by the end of the reserved {Reserve} ({Queued} still queued, {Unburied} with no dead-letter copy written); they are lost at process exit (JetStream will not redeliver them) unless OnBackgroundFailure recorded them.",
+            stillQueued + unburied,
+            _role,
+            routingReserve,
+            stillQueued,
+            unburied));
     }
 }

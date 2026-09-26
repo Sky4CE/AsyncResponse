@@ -217,6 +217,17 @@ retry ladder.
 A direct caller of `SetResponse`/`SetException` (an HTTP callback endpoint) sees the same
 exception; answer the remote system with a retriable status.
 
+**When the stored registrations cannot be read.** A recovery store holding registrations for the
+correlation id that this build cannot interpret — none of them — throws
+`RecoveryStateUnreadableException` rather than reporting "no registration". The broker ingress
+propagates it without a `SetException` escalation (its dispatch reads the same rows first and fails
+identically), so the transport redelivers or dead-letters the message for a build, or an
+operator, that can resolve it. It still runs the ingress's retry ladder (4 attempts, about 1.75 s)
+first: that is what paces each redelivery. A broker without a delivery cap — RabbitMQ with its
+default `MaxDeliveryAttempts = 0` — keeps redelivering it at that pace until a build that can read
+the registrations consumes it or an operator removes them; a capped broker dead-letters it once its
+delivery count is spent.
+
 The complete multi-step recipe built on these rules — a persisted step ledger, re-attach via the
 pending correlation id, subset runs, and compensation — is documented in
 [durable-flows.md](durable-flows.md).
@@ -262,7 +273,10 @@ signal of stuck flows. The watchdog also feeds the `asyncresponse.recovery.*` ga
 Before the first scan completes, the check reports one of three states: **idle** — this host's
 watchdog deliberately does not scan (`Watchdog.Enabled = false`, or the channel registers no
 `IRecoveryStateScanner`) — stays `Healthy` with `scanning: false` and a `reason` in its data, since
-staleness is attested by whichever host does scan; **armed** — the scan loop is running but still
+staleness is attested by whichever host does scan (with the in-memory channel the scanner is the
+capability of whatever `IRecoveryStateStore` resolves: a custom store — or a decorator over the
+built-in one — that does not implement or forward `IRecoveryStateScanner` idles the watchdog this
+way); **armed** — the scan loop is running but still
 inside its first-scan budget (`StartupDelay` plus twice `Interval`) — stays `Healthy` with
 `scanning: true` and a `firstScanDueByUtc`; and **overdue** — armed but past that budget with
 nothing published — reports `Degraded`, the same as a scan loop that stopped publishing after its
@@ -319,11 +333,14 @@ Recovery state lives in the durable channel's store and survives a redeploy:
   Waiter-liveness probing asks every endpoint `PUBSUB NUMSUB` concurrently: a positive count
   anywhere is proof of a live waiter, and a zero is conclusive once the nodes that could hold the
   subscription have answered. Every endpoint flagged as a primary must have answered, except one
-  that has been **disconnected for at least 90 seconds** (counted from the first probe in this
-  process that saw it down, and reset when a probe sees it connected again — but a reconnection no
-  probe observed, or one observed while an older probe was still in flight, goes unnoticed, so an
-  earlier outage can shorten a later failover's grace): a node that went down moments ago may be the old owner
-  of a failover whose waiters have not re-subscribed on the promoted node yet (StackExchange.Redis
+  that this process saw disconnect **at least 90 seconds** ago (counted from the multiplexer's
+  `ConnectionFailed` for it and reset by its `ConnectionRestored` — or by finding the endpoint
+  connected when that failure is handled or when a probe asks it, since StackExchange.Redis can
+  deliver a blip's failure after its restore — so a blip that ended unprobed cannot shorten a
+  later failover's grace; an endpoint this process never saw connected — a
+  replica that never connected, a node already down when the channel was created — gets no grace
+  at all): a node that went down moments ago may be the old owner of a failover whose waiters
+  have not re-subscribed on the promoted node yet (StackExchange.Redis
   moves a subscription once it learns the new topology — at the latest on its `ConfigCheckSeconds`
   check, 60 s by default — and the failover itself takes the cluster node timeout or Sentinel's
   `down-after-milliseconds`), so the promoted node's zero proves nothing during that window. Past
@@ -331,10 +348,10 @@ Recovery state lives in the durable channel's store and survives a redeploy:
   listing the old primary, disconnected, until it rejoins); in a cluster the `CLUSTER NODES` table
   is read — only then, when a primary-flagged endpoint is disconnected — and the disconnected
   endpoints are excused only when every slot owner the table lists answered, so a replica that
-  never connected or a seed endpoint the cluster no longer lists does not block the verdict for
-  longer than the grace. Without the table, an endpoint still flagged as a replica is not treated
-  as a possible owner, even after a promotion this process has not seen yet; once the table is
-  read, every slot owner it lists must answer. Anything less is **unprobeable**,
+  never connected or a seed endpoint the cluster no longer lists does not block the verdict.
+  Without the table, an endpoint still flagged as a replica is not treated as a possible owner,
+  even after a promotion this process has not seen yet; once the table is read, every slot owner
+  it lists must answer. Anything less is **unprobeable**,
   and a lost-subscriber publish then throws for its caller to retry (the transport redelivers it)
   instead of consuming a live waiter's registration; if you raise `ConfigCheckSeconds` above the
   default, a waiter can take longer than the grace to follow a failover. Inside the grace a lost

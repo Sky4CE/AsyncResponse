@@ -19,6 +19,7 @@ public sealed class KafkaWorkerTransport : IWorkerTransport
     private readonly KafkaAsyncResponseTransportOptions _options;
     private readonly IKafkaProducerClient _producer;
     private readonly KafkaTransportTopicSchema _topics;
+    private int _messageMaxBytes;
 
     /// <summary>Runs the KafkaWorkerTransport operation.</summary>
     public KafkaWorkerTransport(IOptions<KafkaAsyncResponseTransportOptions> options)
@@ -62,10 +63,12 @@ public sealed class KafkaWorkerTransport : IWorkerTransport
         {
             var payload = Encoding.UTF8.GetBytes(AsyncResponseJson.Serialize(job));
             var headers = CreateMessageHeaders(job.CorrelationId, _options);
+            var key = string.IsNullOrWhiteSpace(job.CorrelationId) ? null : job.CorrelationId;
+            ThrowIfCannotBeBuried(key, payload, headers);
             var result = await KafkaTransportRetry.ExecuteAsync(
                 token => _producer.PublishAsync(
                     _topics.WorkerTopic,
-                    string.IsNullOrWhiteSpace(job.CorrelationId) ? null : job.CorrelationId,
+                    key,
                     payload,
                     headers,
                     token),
@@ -84,6 +87,44 @@ public sealed class KafkaWorkerTransport : IWorkerTransport
         }
     }
 
+    /// <summary>
+    /// Refuses a job whose dead-letter copy could never fit the producer's <c>message.max.bytes</c>
+    /// (from <see cref="KafkaAsyncResponseTransportOptions.ConfigureProducer"/>, default 1,000,000):
+    /// the copy carries the record plus the burial headers, and only the two exception-text headers
+    /// can be shortened. A job within that margin of the limit was accepted here, failed its
+    /// handler, and could then never be buried — librdkafka rejects the copy locally on every
+    /// attempt — so the worker subscriber restarted on it for ever, re-running the handler each
+    /// time, with its partition stalled. Checked only while dead-lettering is enabled (without it
+    /// nothing is ever copied, and librdkafka still enforces the limit itself).
+    /// </summary>
+    private void ThrowIfCannotBeBuried(string? key, byte[] payload, IReadOnlyList<KafkaTransportHeader> headers)
+    {
+        if (!_options.DeadLetterEnabled)
+            return;
+
+        var recordBytes = KafkaMessageDispatcher.EstimateRecordSize(key, payload, headers);
+        var burialBytes = KafkaMessageDispatcher.BurialOverheadBytes(_topics.WorkerTopic, _options.WorkerConsumerGroup);
+        var limit = MessageMaxBytes;
+        if (recordBytes + burialBytes > limit)
+            throw new KafkaRecordTooLargeException(_topics.WorkerTopic, recordBytes, burialBytes, limit);
+    }
+
+    /// <summary>The producer's <c>message.max.bytes</c>, resolved on first publish.</summary>
+    private int MessageMaxBytes
+    {
+        get
+        {
+            var resolved = Volatile.Read(ref _messageMaxBytes);
+            if (resolved == 0)
+            {
+                resolved = KafkaProducerClientAdapter.ResolveMessageMaxBytes(_options);
+                Volatile.Write(ref _messageMaxBytes, resolved);
+            }
+
+            return resolved;
+        }
+    }
+
     internal static IReadOnlyList<KafkaTransportHeader> CreateMessageHeaders(
         string? correlationId,
         KafkaAsyncResponseTransportOptions options)
@@ -96,4 +137,23 @@ public sealed class KafkaWorkerTransport : IWorkerTransport
             ? []
             : [KafkaTransportHeader.Utf8(correlationHeader, correlationId)];
     }
+}
+
+/// <summary>
+/// A worker job refused before it was produced: the record plus the headers its dead-letter copy
+/// would add exceed the producer's <c>message.max.bytes</c>, so a failed run of it could never be
+/// buried. Nothing was published; the refusal is deterministic, so it is not retried.
+/// </summary>
+internal sealed class KafkaRecordTooLargeException(string topic, long recordBytes, long burialBytes, int messageMaxBytes)
+    : InvalidOperationException(
+        $"The worker job for Kafka topic '{topic}' encodes to about {recordBytes} bytes (key, value and headers), and its dead-letter copy " +
+        $"would add up to {burialBytes} bytes of burial headers — over the producer's message.max.bytes ({messageMaxBytes}), so a failed " +
+        "run of it could never be buried and the worker subscriber would restart on it for ever. Nothing was published. Put large " +
+        "arguments behind a claim check (persist the data and pass a reference), or raise MessageMaxBytes through " +
+        $"{nameof(KafkaAsyncResponseTransportOptions)}.{nameof(KafkaAsyncResponseTransportOptions.ConfigureProducer)} (and the topics' " +
+        "max.message.bytes on the broker).")
+{
+    public long RecordBytes { get; } = recordBytes;
+    public long BurialBytes { get; } = burialBytes;
+    public int MessageMaxBytes { get; } = messageMaxBytes;
 }

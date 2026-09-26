@@ -134,10 +134,10 @@ internal sealed class MongoDbAsyncResponseChannel : DbAsyncResponseChannelBase
                 // only wake.
                 _changeStreamsUnavailable = true;
                 _watching = false;
-                _logger.LogWarning(
+                SafeLog.Try(() => _logger.LogWarning(
                     ex,
                     "MongoDB change streams are unavailable (the server is not a replica set); response wakes fall back to {PollInterval} polling.",
-                    _options.ListenerPollInterval);
+                    _options.ListenerPollInterval));
                 return;
             }
             catch (Exception ex)
@@ -149,7 +149,9 @@ internal sealed class MongoDbAsyncResponseChannel : DbAsyncResponseChannelBase
                     failures = 0;
                 failures++;
                 var delay = AsyncResponseRetry.Backoff(failures, TimeSpan.FromMilliseconds(100), WakeListenerMaxRetryDelay);
-                _logger.LogWarning(ex, "MongoDB change-stream loop failed; retrying in {Delay}.", delay);
+                // Guarded: a throwing logging provider ended this loop for good, leaving the
+                // waiters on the throttled sweep alone.
+                SafeLog.Try(() => _logger.LogWarning(ex, "MongoDB change-stream loop failed; retrying in {Delay}.", delay));
                 await Task.Delay(delay, cancellationToken).ConfigureAwait(false);
             }
         }

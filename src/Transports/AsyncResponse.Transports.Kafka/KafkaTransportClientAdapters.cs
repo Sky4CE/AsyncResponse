@@ -76,10 +76,18 @@ internal interface IKafkaConsumerClient : IDisposable
     /// </summary>
     long GetAssignmentGeneration(string topic, int partition);
 
-    /// <summary>Pauses fetching on all currently assigned partitions (backpressure).</summary>
+    /// <summary>
+    /// Pauses fetching on all currently assigned partitions (backpressure). The pause holds until
+    /// <see cref="ResumeAssignment"/>, across a revoke and a re-assignment of the partition too, so
+    /// a partition handed back while it holds does not fetch into the full queue.
+    /// </summary>
     void PauseAssignment();
 
-    /// <summary>Resumes fetching on all currently assigned partitions.</summary>
+    /// <summary>
+    /// Lifts the <see cref="PauseAssignment"/> pause: at once on the currently assigned partitions,
+    /// and on a partition it covered that is not assigned right now (an eager rebalance revoked it
+    /// and has not handed it back yet) as soon as that partition is assigned to this consumer again.
+    /// </summary>
     void ResumeAssignment();
 
     /// <summary>
@@ -305,6 +313,24 @@ internal sealed class KafkaConsumerClientAdapter(
     /// </summary>
     private readonly HashSet<(string Topic, int Partition)> _pausedPartitions = [];
 
+    /// <summary>
+    /// Partitions the backpressure pause (<see cref="PauseAssignment"/>) set librdkafka's application
+    /// pause on and no <see cref="ResumeAssignment"/> has lifted since — assigned right now or not:
+    /// librdkafka keeps that pause on the partition across a revoke and a re-assignment, so one taken
+    /// before an eager revoke is still in force when the partition comes back. Poll-thread only.
+    /// </summary>
+    private readonly HashSet<(string Topic, int Partition)> _backpressurePaused = [];
+
+    /// <summary>Whether the poll loop's backpressure pause is in force (between PauseAssignment and ResumeAssignment).</summary>
+    private bool _backpressure;
+
+    /// <summary>
+    /// Partitions assigned again while still carrying a backpressure pause that was lifted while
+    /// they were unassigned: resumed at the next poll, once the assignment has taken effect (the
+    /// assigned callback runs BEFORE the client assigns them). Poll-thread only.
+    /// </summary>
+    private List<TopicPartition>? _resumeOnceAssigned;
+
     /// <summary>Subscribes the consumer group member to the given topic.</summary>
     public void Subscribe(string topic)
         => _consumer.Subscribe(topic);
@@ -312,6 +338,7 @@ internal sealed class KafkaConsumerClientAdapter(
     /// <summary>Polls for one message.</summary>
     public KafkaIncomingMessage? Consume(TimeSpan maxWait)
     {
+        ResumeReassigned();
         var result = _consumer.Consume(maxWait);
         if (result is null || result.IsPartitionEOF)
             return null;
@@ -345,11 +372,30 @@ internal sealed class KafkaConsumerClientAdapter(
 
     /// <summary>Pauses fetching on all currently assigned partitions.</summary>
     public void PauseAssignment()
-        => _consumer.Pause(_consumer.Assignment);
+    {
+        var assignment = _consumer.Assignment;
+        _consumer.Pause(assignment);
+        _backpressure = true;
+        foreach (var partition in assignment)
+            _backpressurePaused.Add((partition.Topic, partition.Partition.Value));
+    }
 
-    /// <summary>Resumes fetching on all currently assigned partitions.</summary>
+    /// <summary>
+    /// Resumes fetching on all currently assigned partitions. A partition the backpressure pause
+    /// covered that is not assigned right now stays marked, and is resumed once it is assigned
+    /// again (<see cref="OnPartitionsAssigned"/>): resuming only the current assignment — empty
+    /// between an eager revoke and the re-assignment that follows it — left the partitions handed
+    /// back paused for the life of the consumer, since nothing was fetched into the queue again to
+    /// trip another pause-and-resume.
+    /// </summary>
     public void ResumeAssignment()
-        => _consumer.Resume(_consumer.Assignment);
+    {
+        var assignment = _consumer.Assignment;
+        _consumer.Resume(assignment);
+        _backpressure = false;
+        foreach (var partition in assignment)
+            _backpressurePaused.Remove((partition.Topic, partition.Partition.Value));
+    }
 
     /// <summary>Pauses fetching on one partition.</summary>
     public void PausePartition(string topic, int partition)
@@ -376,8 +422,10 @@ internal sealed class KafkaConsumerClientAdapter(
     /// the life of the consumer. The callback runs while the partitions are still assigned, just
     /// before the client unassigns them; the unassign discards whatever the resume might still
     /// fetch for the old assignment. The assignment-wide backpressure pause
-    /// (<see cref="PauseAssignment"/>) is left alone: the poll loop re-asserts and lifts that one
-    /// itself, and a partition handed back while it holds stays paused, as before.
+    /// (<see cref="PauseAssignment"/>) is left in force while it holds — a partition handed back
+    /// during backpressure must not fetch into the full queue — and is lifted by
+    /// <see cref="ResumeAssignment"/>, on a partition that is away at that moment once it comes back
+    /// (<see cref="OnPartitionsAssigned"/>).
     /// </summary>
     internal void OnPartitionsRemoved(List<TopicPartitionOffset> partitions)
     {
@@ -386,7 +434,13 @@ internal sealed class KafkaConsumerClientAdapter(
         List<TopicPartition>? paused = null;
         foreach (var partition in partitions)
         {
-            if (_pausedPartitions.Remove((partition.Topic, partition.Partition.Value)))
+            var key = (partition.Topic, partition.Partition.Value);
+            if (_pausedPartitions.Remove(key))
+                (paused ??= []).Add(partition.TopicPartition);
+
+            // Assigned and revoked again inside one poll, before the resume it was due: lifted
+            // here, while it is still assigned, like a pause taken behind a detached handler.
+            if (_resumeOnceAssigned?.RemoveAll(pending => pending.Topic == key.Topic && pending.Partition.Value == key.Value) > 0)
                 (paused ??= []).Add(partition.TopicPartition);
         }
 
@@ -402,6 +456,51 @@ internal sealed class KafkaConsumerClientAdapter(
             // Includes the per-partition TopicPartitionException. A throw here would escape the
             // rebalance callback and fault the poll loop; a partition that is still assigned (as it
             // is during this callback) resumes without error.
+        }
+    }
+
+    /// <summary>
+    /// The assigned rebalance callback, run inside <see cref="Consume"/> just BEFORE the client
+    /// assigns <paramref name="partitions"/>. A partition coming back with a backpressure pause
+    /// that <see cref="ResumeAssignment"/> lifted while it was away (librdkafka kept the pause on it
+    /// across the revoke) is queued for resuming at the next poll, once it is assigned. While the
+    /// backpressure pause still holds, one it covered simply comes back paused, and the loop's
+    /// resume lifts it with the rest of the assignment.
+    /// </summary>
+    internal void OnPartitionsAssigned(List<TopicPartition> partitions)
+    {
+        if (_backpressure)
+            return;
+
+        foreach (var partition in partitions)
+        {
+            if (_backpressurePaused.Remove((partition.Topic, partition.Partition.Value)))
+                (_resumeOnceAssigned ??= []).Add(partition);
+        }
+    }
+
+    /// <summary>
+    /// Resumes the partitions <see cref="OnPartitionsAssigned"/> queued, now that the assignment
+    /// the previous poll ran has taken effect — unless the backpressure pause was taken again in
+    /// between, which then covers them (they are assigned, so PauseAssignment marked them).
+    /// </summary>
+    private void ResumeReassigned()
+    {
+        if (_resumeOnceAssigned is not { } partitions)
+            return;
+
+        _resumeOnceAssigned = null;
+        if (_backpressure || partitions.Count == 0)
+            return;
+
+        try
+        {
+            _consumer.Resume(partitions);
+        }
+        catch (KafkaException)
+        {
+            // Includes the per-partition TopicPartitionException: a partition no longer assigned
+            // has nothing to fetch here, and a throw would fault the poll loop.
         }
     }
 
@@ -436,11 +535,13 @@ internal sealed class KafkaConsumerClientFactory(KafkaAsyncResponseTransportOpti
         // Revocation-aware settlement: every revoke/loss advances the partition's generation, so a
         // handler that outlived its partition's assignment can tell it must not store its offset
         // (see IKafkaConsumerClient.GetAssignmentGeneration), and lifts the partition's own pause
-        // (see KafkaConsumerClientAdapter.OnPartitionsRemoved). The Action overloads keep the
-        // client's own (incremental) unassign after each callback. The callbacks fire only inside
-        // Consume and Close, after the adapter below exists.
+        // (see KafkaConsumerClientAdapter.OnPartitionsRemoved); every assign lets a backpressure
+        // pause lifted while the partition was away be lifted on it too (OnPartitionsAssigned). The
+        // Action overloads keep the client's own (incremental) assign and unassign after each
+        // callback. The callbacks fire only inside Consume and Close, after the adapter below exists.
         KafkaConsumerClientAdapter? adapter = null;
         var consumer = new ConsumerBuilder<string?, byte[]>(config)
+            .SetPartitionsAssignedHandler((_, assigned) => adapter!.OnPartitionsAssigned(assigned))
             .SetPartitionsRevokedHandler((_, revoked) => adapter!.OnPartitionsRemoved(revoked))
             .SetPartitionsLostHandler((_, lost) => adapter!.OnPartitionsRemoved(lost))
             .Build();
@@ -454,10 +555,48 @@ internal sealed class KafkaConsumerClientFactory(KafkaAsyncResponseTransportOpti
     /// — so startup validation can check the final values without building a consumer.
     /// </summary>
     internal static ConsumerConfig BuildConfig(KafkaAsyncResponseTransportOptions options, KafkaSubscriberRole role)
+        => BuildConfig(
+            options,
+            role,
+            role is KafkaSubscriberRole.Worker ? options.WorkerSubscriber : options.ResponseSubscriber);
+
+    /// <summary>librdkafka's <c>max.poll.interval.ms</c> default.</summary>
+    private const int LibrdkafkaDefaultMaxPollIntervalMs = 300_000;
+
+    /// <summary>
+    /// The <c>max.poll.interval.ms</c> the role's consumer will actually run with:
+    /// <paramref name="subscriberOptions"/>'s <see cref="KafkaSubscriberOptions.MaxPollInterval"/>,
+    /// unless <see cref="KafkaAsyncResponseTransportOptions.ConfigureConsumer"/> overrides it (the
+    /// hook runs last and may set <c>MaxPollIntervalMs</c>). The poll-gap rule and the dead-letter
+    /// budget are derived from this, not from the option: judged against the option, a 60 s
+    /// override passed validation for a 5 min interval, and a burial blocking the poll thread for up
+    /// to a quarter of 5 min got the consumer evicted. Falls back to the option when the hook throws
+    /// (startup reports that failure itself, when it builds the configuration).
+    /// </summary>
+    internal static TimeSpan ResolveMaxPollInterval(
+        KafkaAsyncResponseTransportOptions options,
+        KafkaSubscriberRole role,
+        KafkaSubscriberOptions subscriberOptions)
     {
-        var subscriberOptions = role is KafkaSubscriberRole.Worker
-            ? options.WorkerSubscriber
-            : options.ResponseSubscriber;
+        try
+        {
+            // A hook that clears the setting leaves librdkafka on its own default.
+            var milliseconds = BuildConfig(options, role, subscriberOptions).MaxPollIntervalMs ?? LibrdkafkaDefaultMaxPollIntervalMs;
+            return milliseconds > 0
+                ? TimeSpan.FromMilliseconds(milliseconds)
+                : subscriberOptions.MaxPollInterval;
+        }
+        catch (Exception ex) when (ex is not OutOfMemoryException)
+        {
+            return subscriberOptions.MaxPollInterval;
+        }
+    }
+
+    private static ConsumerConfig BuildConfig(
+        KafkaAsyncResponseTransportOptions options,
+        KafkaSubscriberRole role,
+        KafkaSubscriberOptions subscriberOptions)
+    {
         var config = new ConsumerConfig
         {
             BootstrapServers = KafkaTransportOptionsValidator.Required(

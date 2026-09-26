@@ -12,6 +12,7 @@ namespace AsyncResponse.Transports.PostgreSQL;
 internal abstract class PostgreSqlSubscriberService : BackgroundService
 {
     private readonly PostgreSqlTransportStore _store;
+    private readonly WorkerIntakeGate? _intakeGate;
     private readonly Channel<bool> _signals = Channel.CreateBounded<bool>(new BoundedChannelOptions(1)
     {
         SingleReader = true,
@@ -19,15 +20,22 @@ internal abstract class PostgreSqlSubscriberService : BackgroundService
         FullMode = BoundedChannelFullMode.DropWrite
     });
 
+    /// <param name="options">The transport options.</param>
+    /// <param name="store">The queue store.</param>
+    /// <param name="logger">The subscriber's logger.</param>
+    /// <param name="intakeGate">The worker subscriber's host-stop intake gate; <c>null</c> for the
+    /// response subscriber, which keeps delivering to waiters through host stop.</param>
     protected PostgreSqlSubscriberService(
         IOptions<PostgreSqlAsyncResponseTransportOptions> options,
         PostgreSqlTransportStore store,
-        ILogger logger)
+        ILogger logger,
+        WorkerIntakeGate? intakeGate = null)
     {
         Options = options.Value;
         PostgreSqlTransportOptionsValidator.ValidateCommon(Options);
         _store = store;
         Logger = logger;
+        _intakeGate = intakeGate;
     }
 
     protected PostgreSqlAsyncResponseTransportOptions Options { get; }
@@ -68,14 +76,15 @@ internal abstract class PostgreSqlSubscriberService : BackgroundService
             Options,
             SubscriberOptions,
             Logger,
-            Role);
+            Role,
+            hostStopping: _intakeGate?.HostStopping ?? CancellationToken.None);
 
         await SubscriberSupervisor.RunAsync(
             attemptToken => RunSubscriberAsync(dispatcher, attemptToken),
             stoppingToken,
             failures => AsyncResponseRetry.Backoff(failures, Options.SubscriberRetryBaseDelay, Options.SubscriberRetryMaxDelay),
             (ex, delay) => Logger.LogWarning(ex, "PostgreSQL subscriber failed for queue {Queue} ({Role}); retrying in {RetryDelay}.", Queue, Role, delay),
-            healthyRunThreshold: Options.SubscriberRetryMaxDelay).ConfigureAwait(false);
+            healthyRunThreshold: AsyncResponseRetry.MaxAttainableDelay(Options.SubscriberRetryBaseDelay, Options.SubscriberRetryMaxDelay)).ConfigureAwait(false);
     }
 
     private async Task RunSubscriberAsync(PostgreSqlMessageDispatcher dispatcher, CancellationToken stoppingToken)
@@ -100,11 +109,28 @@ internal abstract class PostgreSqlSubscriberService : BackgroundService
 
             while (!stoppingToken.IsCancellationRequested)
             {
+                // Worker intake stops at host stop (WorkerIntakeGate): once ApplicationStopping has
+                // fired, claim nothing more — the rows stay in the table for a live replica — and
+                // wait for this subscriber's own stop. Claiming on through the stop window took the
+                // very wake-ups this host's own flow hand-overs had just published and handed them
+                // back: an attempt spent and the row locked until its lease lapsed (or, under early
+                // ACK, a settled wake-up turned into a dead-letter copy), where a live peer would
+                // have run it at once.
+                if (_intakeGate?.IsClosed == true)
+                {
+                    await ParkAtHostStopAsync(stoppingToken).ConfigureAwait(false);
+                    break;
+                }
+
                 var claimed = 0;
                 await foreach (var delivery in _store.ClaimBatchAsync(Queue, SubscriberOptions.BatchSize, Options.LockTimeout, stoppingToken).ConfigureAwait(false))
                 {
                     claimed++;
                     await dispatcher.HandleAsync(delivery, stoppingToken).ConfigureAwait(false);
+
+                    // The batch claims lazily, one row per step, so leaving it here claims nothing more.
+                    if (_intakeGate?.IsClosed == true)
+                        break;
                 }
 
                 if (claimed > 0)
@@ -190,6 +216,16 @@ internal abstract class PostgreSqlSubscriberService : BackgroundService
             }
         }
     }
+
+    // The worker loop's host-stop park: no claim until this subscriber's own stop (the LISTEN wake
+    // keeps signalling into the one-slot, drop-on-full channel, which nothing reads any more).
+    private async Task ParkAtHostStopAsync(CancellationToken stoppingToken)
+    {
+        SafeLog.Try((Logger, Queue), static s => s.Logger.LogDebug(
+            "PostgreSQL worker subscriber for queue {Queue} stopped claiming: the host is stopping, so the rows are left for a live replica.",
+            s.Queue));
+        await Task.Delay(Timeout.InfiniteTimeSpan, stoppingToken).ConfigureAwait(ConfigureAwaitOptions.SuppressThrowing);
+    }
 }
 
 /// <summary>Consumes worker-job rows and executes them through the AsyncResponse ingress.</summary>
@@ -197,12 +233,19 @@ internal sealed class PostgreSqlWorkerSubscriber : PostgreSqlSubscriberService
 {
     private readonly IAsyncResponseIngress _ingress;
 
+    /// <param name="options">The transport options.</param>
+    /// <param name="store">The queue store.</param>
+    /// <param name="ingress">The ingress the worker jobs run through.</param>
+    /// <param name="logger">The subscriber's logger.</param>
+    /// <param name="hostLifetime">The host lifetime whose <c>ApplicationStopping</c> stops worker
+    /// intake (see <see cref="WorkerIntakeGate"/>); without one the gate never closes.</param>
     public PostgreSqlWorkerSubscriber(
         IOptions<PostgreSqlAsyncResponseTransportOptions> options,
         PostgreSqlTransportStore store,
         IAsyncResponseIngress ingress,
-        ILogger<PostgreSqlWorkerSubscriber> logger)
-        : base(options, store, logger)
+        ILogger<PostgreSqlWorkerSubscriber> logger,
+        IHostApplicationLifetime? hostLifetime = null)
+        : base(options, store, logger, new WorkerIntakeGate(hostLifetime))
         => _ingress = ingress;
 
     protected override string Queue => Options.WorkerQueue;

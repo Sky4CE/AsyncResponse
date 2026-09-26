@@ -438,6 +438,14 @@ name reproduces exactly — since Oracle shares one namespace for
 tables and indexes and the index create would otherwise fail with an error indistinguishable from a
 benign already-exists race, silently leaving the expiry index never created.
 
+Give the store its own connection string, one no other component runs `ALTER SESSION` on. The
+startup check that refuses linguistic comparison (`NLS_COMP=LINGUISTIC` with a folding `NLS_SORT`)
+reads one pooled session, which stands for every session the instance, client configuration and
+logon triggers set up — but ODP.NET returns pooled sessions with their altered NLS state intact,
+so a component sharing the connection string (and therefore the pool) that alters the sessions it
+opens can later lend the store a session whose `flow_id =` predicates fold case. Any distinct
+connection string gets its own pool.
+
 ### MongoDB
 
 ```csharp
@@ -474,10 +482,32 @@ set whose secondary was down (the majority of data-bearing nodes can then never 
 is why MongoDB 5.0+ defaults such sets to `w: 1`). A lapsed `wtimeout` fails the write as a
 retriable error even though the primary applied it; the revision and lease fences already make
 the retry safe. Restore the secondary — or remove the arbiter — rather than lowering the write
-concern. The read concern is left as registered — primary reads already see every write the store
-had acknowledged. The MongoDB channel pins the same bounded majority, and so does the transport
-on its publishes, dead letters and deletes (its claim/renew/NAK lease writes keep the connection's
-own concern — see [transport semantics](transport-semantics.md)).
+concern. The read concern is left as registered for ordinary loads — primary reads see every
+write the store had acknowledged, and the revision and lease fences reject whatever a stale read
+would otherwise decide. `LoadCurrentAsync`, which the engine uses where it acts on a load with no
+fence behind it (a recovered response matching no pending step, a failure or resume for a run
+that is not running, the read-back after a start's create lost, a re-attaching step checking
+whether recovery already completed it, and settling whether a checkpoint cancelled mid-write
+committed), reads with `linearizable` read concern instead: a primary that a network partition
+has deposed without its noticing still serves reads for up to an election timeout, and only a
+linearizable read refuses there (a majority snapshot on that node is just as stale). It is bounded
+by `maxTimeMS` (10 s, the default write bound), so while the set is degraded it fails rather than
+blocking — the delivery is then retried, except that `IDurableFlows.ResumeAsync` surfaces the
+failure to its caller and the re-attach check falls through to the normal wait; a standalone
+server rejects the read concern and the store falls back to the plain read there. The MongoDB
+channel pins the same bounded majority (a response or claim whose `wtimeout` lapsed was applied on
+the primary, so the channel reads it back by id with `local` read concern — a majority read,
+inherited from the database, could miss the very write it checks — and acts on what is stored),
+and so does the transport on its publishes and dead-letter inserts (one
+whose `wtimeout` lapsed counts as written; its lease writes and deletes use `w: 1` — see
+[transport semantics](transport-semantics.md)).
+
+The collection must keep the default **simple** collation. A collection created with a default
+collation builds its `_id` index — the flow id — under it, so case- or accent-variant flow ids
+would collide; the store checks the `_id` index at first use (on either `AutoCreateIndexes`
+setting; with `AutoCreateIndexes = true`, only when its credentials may list indexes) and refuses
+a folding collation with an actionable error. The `_id` index cannot be
+rebuilt: recreate the collection without a collation and copy the documents over.
 
 The ledger's instants are always written as BSON dates, whatever `DateTime` serializer the host
 registered globally — every expiry and lease filter compares them with `$$NOW`, and the TTL
@@ -575,13 +605,21 @@ authoritative "no such ledger" and its `412` means the ledger exists; the SDK al
   checkpointed the breadcrumb, this process's replica has not applied it) dropped the recovered
   payload, the failure, or the operator's resume for good. A start job whose create reported an
   existing ledger also reads it back this way when its plain load finds no ledger, or one bound to
-  different work, so the starter's fresh create is not missed and the start is not dropped.
+  different work, so the starter's fresh create is not missed and the start is not dropped. Two
+  more reads go through it: a re-attaching awaited step checking whether a recovery already
+  completed it (a stale "no" would wait out the step's whole deadline), and an execution whose
+  caller cancelled a checkpoint mid-write, which settles once, before its next step, whether that
+  write committed.
 
 What that guarantees depends on the client's effective consistency level: **Strong**, and **Bounded
 Staleness** read from the write region, were already current; **Session** (the account default)
 is made current by the recorded token; **Bounded Staleness** read from another region,
 **Consistent Prefix**, and **Eventual** send no session token on reads, so only the absence answer
 is authoritative there and an observation can still lag — run the store at Session or Strong.
+When the store has a logger with warnings enabled (it gets the host's through
+`WithCosmosDurableFlows`), provisioning resolves the effective level once and logs a warning when it
+is neither Session nor Strong (Bounded Staleness included); it does not refuse to run, since the
+emulator defaults to Eventual.
 An account with **multiple write regions** has no single authoritative write path (two regions can
 both win the same ETag-fenced lease write), so none of these guarantees hold on one.
 
@@ -606,6 +644,14 @@ request-unit charge still follows the service's accounting for the loaded docume
 on your own ledger sizes before sizing throughput. A projection that comes back without `_etag`
 (a serializer that hides system properties) throws rather than reporting the lease free.
 Checkpoints (`TryUpdateAsync`) still replace the document — they carry the new ledger.
+
+Because a lease write reads first and patches second, any write to the document between the two
+moves the `_etag` and fails the patch with `412` — most often the holder's own checkpoints, which
+a checkpoint-dense flow commits back to back. The store retries after a short jittered pause. A
+renewal whose attempts all lose that race while every read showed the lease still held and live
+throws instead of answering `false`: the engine retries a failed renewal on its short backoff until
+the lease deadline, whereas `false` would abandon a healthy execution as having lost its lease. An
+acquire that keeps losing the race still answers `false`.
 
 ### DynamoDB
 
@@ -675,7 +721,12 @@ conditional updates/deletes execute in the database. Those decide from the affec
 a provider that reports none (SQL Server sessions with NOCOUNT on by default) fails with an
 actionable `InvalidOperationException` instead of reading every write as lost. The opportunistic
 prune deletes in expiry order and re-checks expiry on every row it deletes, so a ledger a
-concurrent create has just replaced in place is never removed with the expired batch.
+concurrent create has just replaced in place is never removed with the expired batch. Every store
+query ignores the context's global query filters (`IgnoreQueryFilters()`): the ledger is keyed by
+flow id alone, so an application-wide filter — a tenant filter added to every entity type — would
+otherwise hide rows written under another tenant, and the worker's create would collide with a row
+it cannot see. The `revision` column keeps its `DEFAULT 0` in migrations, but every insert names
+it, so a table provisioned without the default works too.
 
 After adding `ConfigureAsyncResponseDurableFlows()`, generate and deploy a normal EF migration.
 The package never creates or alters the schema itself.
@@ -749,9 +800,22 @@ On PostgreSQL `state_json` is `text`, not `jsonb`: `jsonb` rejects the `\u0000` 
 `System.Text.Json` emits for U+0000 (SQLSTATE 22P05), so a ledger every other store accepts would
 fail every write — the flow could not start, or its checkpoints failed until the job dead-lettered.
 Nothing queries inside the ledger, so `text` costs nothing. With `AutoCreateSchema = true` an
-existing `jsonb` column is converted in place on first use; with your own migration, deploy
+existing `jsonb` column is converted in place on first use — one `ALTER TABLE` that rewrites the
+table under an ACCESS EXCLUSIVE lock, blocking every flow operation on every host while it runs, so
+on a large table run it by hand before the rollout; with your own migration, deploy
 `ALTER TABLE ... ALTER COLUMN state_json TYPE text USING state_json::text` — the startup verifier
 rejects a `jsonb` column with that instruction rather than failing later on one unlucky payload.
+
+The PostgreSQL store's startup DDL runs under the bounds described in
+[PostgreSQL › Schema creation](postgresql.md#schema-creation), shared with the channel and the
+transport: the expiry index is built only when the catalog shows it absent (`CREATE INDEX IF NOT
+EXISTS` takes its SHARE lock on the table before it finds the name taken, which queued every start
+behind any open checkpoint writer or an operator's `CREATE INDEX CONCURRENTLY`); lock waits,
+the schema's advisory lock included, are bounded by a 5 s `lock_timeout`; the conversion and the
+index build run in a transaction of their own, under the table's advisory lock and an hour-long
+command timeout; and a failed attempt — a lock held elsewhere, a `statement_timeout` the rewrite
+outran — is retried after a jittered 30–60 s window, during which that host's flow operations fail
+at once, naming the cause.
 
 The library does not silently upgrade an incomplete concurrency schema:
 
@@ -763,8 +827,9 @@ The library does not silently upgrade an incomplete concurrency schema:
   and full-precision timestamps stay required. No `revision` default is required — every insert
   names the column. The expiry index is performance-only and never fails startup: PostgreSQL
   verifies `{table}_expires_idx` when it is present and logs a warning when no index carries that
-  name (harmless when your migration created an index on `expires_at_utc` under another name), and
-  the other packages do not check theirs.
+  name (harmless when your migration created an index on `expires_at_utc` under another name) or
+  when it exists but is not yet valid and ready (a `CREATE INDEX CONCURRENTLY` still running, or one
+  that failed — drop and recreate it then), and the other packages do not check theirs.
 - MongoDB creates the required TTL index when missing (and, with `AutoCreateIndexes = false`,
   verifies an equivalent one exists — the TTL index is its only cleanup mechanism). It does not
   drop or rewrite a conflicting application-owned index; an equivalent TTL index under another

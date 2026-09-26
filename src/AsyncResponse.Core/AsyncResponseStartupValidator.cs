@@ -156,12 +156,14 @@ internal sealed class DurableFlowObserverLifetimeAudit(IServiceCollection servic
 /// <c>1.2.0-rc.1</c> from <c>1.2.0-rc.2</c>, and the metadata suffix is the source-control
 /// revision, which legitimately differs between assemblies of one incremental local build. The
 /// baseline is the Core running the check — never whichever Core copy the process happened to
-/// load first. Only plain attribute and name reads: nothing here needs trimming annotations.
+/// load first. Only plain attribute and name reads (plus, for a Core copy other than the
+/// executing one, a by-name lookup in its load context): nothing here needs trimming annotations.
 /// </para>
 /// </summary>
 internal static class AsyncResponsePackageVersions
 {
     private const string Core = "AsyncResponse.Core";
+    private const string Abstractions = "AsyncResponse.Abstractions";
 
     /// <summary>A loaded package assembly: its simple name and its package version.</summary>
     internal readonly record struct LoadedPackage(string Name, string Version);
@@ -172,7 +174,7 @@ internal static class AsyncResponsePackageVersions
     /// prefix (this repository's tests and samples do) and version independently.
     /// </summary>
     internal static bool IsPackageAssembly(string assemblySimpleName)
-        => assemblySimpleName is Core or "AsyncResponse.Abstractions" or "AsyncResponse.Testing"
+        => assemblySimpleName is Core or Abstractions or "AsyncResponse.Testing"
            || assemblySimpleName.StartsWith("AsyncResponse.Channels.", StringComparison.Ordinal)
            || assemblySimpleName.StartsWith("AsyncResponse.Transports.", StringComparison.Ordinal)
            || assemblySimpleName.StartsWith("AsyncResponse.DurableFlows.", StringComparison.Ordinal);
@@ -192,12 +194,18 @@ internal static class AsyncResponsePackageVersions
     /// is signed with Core's key. The process-wide list spans every
     /// <see cref="AssemblyLoadContext"/>: a context that loaded a Core copy of its own — an
     /// isolated plugin carrying its own AsyncResponse packages — binds its packages to that copy,
-    /// never to this Core, so its assemblies are skipped whatever their version.
+    /// never to this Core, so its assemblies are skipped whatever their version. The one
+    /// exception is the Abstractions assembly <paramref name="core"/> itself binds to: a plugin
+    /// context that carries its own Core but lets Abstractions fall back to the default context
+    /// runs THAT Core on the host's Abstractions, so from the plugin Core's side the host's
+    /// context holds another Core, and skipping all of it dropped the very Abstractions it runs
+    /// on — an older plugin Core on the host's newer Abstractions binds silently and passed.
     /// </summary>
     internal static IReadOnlyList<LoadedPackage> Loaded(Assembly core, IReadOnlyList<Assembly> assemblies)
     {
         var coreToken = core.GetName().GetPublicKeyToken() ?? [];
         var coreContext = AssemblyLoadContext.GetLoadContext(core);
+        var boundAbstractions = BoundAbstractions(core);
 
         HashSet<AssemblyLoadContext>? ownCoreContexts = null;
         foreach (var assembly in assemblies)
@@ -218,6 +226,7 @@ internal static class AsyncResponsePackageVersions
                 continue;
 
             if (ownCoreContexts is not null
+                && assembly != boundAbstractions
                 && AssemblyLoadContext.GetLoadContext(assembly) is { } context
                 && ownCoreContexts.Contains(context))
             {
@@ -228,6 +237,32 @@ internal static class AsyncResponsePackageVersions
         }
 
         return packages;
+    }
+
+    /// <summary>
+    /// The Abstractions assembly <paramref name="core"/> binds to. For the executing Core (the
+    /// production caller) that is exact: the assembly of an Abstractions type it references. For
+    /// another copy, its own load context resolves the name the way the runtime resolves the
+    /// reference — the context's own <c>Load</c>, then the default context — and returns the
+    /// instance already loaded there. <c>null</c> when that cannot be answered; nothing is then
+    /// exempt from the skip.
+    /// </summary>
+    private static Assembly? BoundAbstractions(Assembly core)
+    {
+        if (core == typeof(AsyncResponsePackageVersions).Assembly)
+            return typeof(IAsyncResponsePayload).Assembly;
+
+        if (AssemblyLoadContext.GetLoadContext(core) is not { } context)
+            return null;
+
+        try
+        {
+            return context.LoadFromAssemblyName(new AssemblyName(Abstractions));
+        }
+        catch (Exception ex) when (ex is IOException or BadImageFormatException)
+        {
+            return null;
+        }
     }
 
     /// <summary>The simple name of a shipped package assembly signed with Core's key, or <c>null</c>.</summary>
@@ -310,8 +345,7 @@ internal sealed class AsyncResponseStartupValidator(
     IEnumerable<DurableFlowOptions>? _flowOptions = null,
     ILogger<AsyncResponseStartupValidator>? _logger = null,
     DurableFlowObserverLifetimeAudit? _observerAudit = null,
-    IServiceProvider? _serviceProvider = null,
-    IEnumerable<IAsyncResponseCallbackAuthorizer>? _authorizers = null) : IHostedService
+    IServiceProvider? _serviceProvider = null) : IHostedService
 {
     /// <summary>Starts this service.</summary>
     public async Task StartAsync(CancellationToken cancellationToken)
@@ -323,7 +357,7 @@ internal sealed class AsyncResponseStartupValidator(
 
         ValidateWatchdogOptions(_options.Value.Watchdog);
         ValidateInboundMessageBudget(_options.Value);
-        ValidateSingleCallbackAuthorizer();
+        await ValidateSingleCallbackAuthorizerAsync().ConfigureAwait(false);
         _observerAudit?.Validate();
 
         var channelNames = _channels.Select(c => c.Name).Distinct(StringComparer.Ordinal).ToArray();
@@ -434,10 +468,21 @@ internal sealed class AsyncResponseStartupValidator(
     /// redelivered to the dead-letter queue. Same class as the duplicate
     /// <see cref="DurableFlowOptions"/> check, so the same answer: fail on the duplicate.
     /// The same instance registered twice drops nothing and passes.
+    /// <para>
+    /// Resolved inside a scope of its own, like every runtime consumer resolves the authorizer:
+    /// the interface puts no constraint on its lifetime, and injecting the enumerable into this
+    /// singleton made a directly registered SCOPED authorizer fail the host start under scope
+    /// validation (<c>ValidateScopes</c>, which the Testing harness always sets) with "Cannot
+    /// consume scoped service". (Null only in unit tests that construct the validator directly.)
+    /// </para>
     /// </summary>
-    private void ValidateSingleCallbackAuthorizer()
+    private async Task ValidateSingleCallbackAuthorizerAsync()
     {
-        var registered = _authorizers?.Distinct().ToArray() ?? [];
+        if (_serviceProvider is null)
+            return;
+
+        await using var scope = _serviceProvider.CreateAsyncScope();
+        var registered = scope.ServiceProvider.GetServices<IAsyncResponseCallbackAuthorizer>().Distinct().ToArray();
         if (registered.Length > 1)
         {
             throw new InvalidOperationException(

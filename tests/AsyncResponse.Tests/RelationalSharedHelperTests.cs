@@ -67,6 +67,72 @@ public sealed class RelationalSharedHelperTests
         Assert.False(SqlServerTransportRetry.IsTransient(new InvalidOperationException()));
     }
 
+    public enum SqlServerPackage
+    {
+        Channel,
+        Transport
+    }
+
+    /// <summary>
+    /// Fixpoint r2 S5#7: SqlClient reports an exhausted pool ("Timeout expired … obtaining a
+    /// connection from the pool") as a plain <see cref="InvalidOperationException"/>, which the
+    /// classifier rightly never accepts (see the pin above), so a sustained exhaustion never
+    /// counted toward the retry policies or the channel sweep's outage breaker. The shared open
+    /// helper both packages use now rethrows it as a transient <see cref="TimeoutException"/>
+    /// when the open waited out the whole connect timeout with pooling on — judged by the wait,
+    /// never the localized message. Red with the translation disabled: nothing was recognized.
+    /// </summary>
+    [Theory]
+    [InlineData(SqlServerPackage.Channel)]
+    [InlineData(SqlServerPackage.Transport)]
+    public void SqlServerOpen_APoolWaitThatRanOutTheConnectTimeout_IsAPoolTimeout(SqlServerPackage package)
+    {
+        var poolTimeout = new InvalidOperationException("Timeout expired. The timeout period elapsed prior to obtaining a connection from the pool.");
+        const string pooled = "Server=unused;Connect Timeout=2;Max Pool Size=1";
+
+        Assert.True(IsPoolTimeout(package, poolTimeout, pooled, TimeSpan.FromSeconds(2)));
+        Assert.True(IsPoolTimeout(package, poolTimeout, pooled, TimeSpan.FromSeconds(5)));
+
+        // Everything an open throws at once is a usage error, whatever it says.
+        Assert.False(IsPoolTimeout(package, poolTimeout, pooled, TimeSpan.FromMilliseconds(500)));
+        // Without pooling there is no pool to wait for; with no connect timeout nothing times out.
+        Assert.False(IsPoolTimeout(package, poolTimeout, "Server=unused;Connect Timeout=2;Pooling=false", TimeSpan.FromSeconds(5)));
+        Assert.False(IsPoolTimeout(package, poolTimeout, "Server=unused;Connect Timeout=0", TimeSpan.FromSeconds(5)));
+        Assert.False(IsPoolTimeout(package, new ObjectDisposedException(nameof(SqlConnection)), pooled, TimeSpan.FromSeconds(5)));
+
+        // What the helper rethrows it as is transient on both sides.
+        var translated = new TimeoutException(poolTimeout.Message, poolTimeout);
+        Assert.True(SqlServerChannelSql.IsTransient(translated));
+        Assert.True(SqlServerTransportRetry.IsTransient(translated));
+    }
+
+    /// <summary>
+    /// The open helper itself: an <see cref="InvalidOperationException"/> an open throws at once
+    /// (here: no connection string) passes through untranslated, and stays non-transient.
+    /// </summary>
+    [Theory]
+    [InlineData(SqlServerPackage.Channel)]
+    [InlineData(SqlServerPackage.Transport)]
+    public async Task SqlServerOpen_AnImmediateUsageError_PassesThroughUntranslated(SqlServerPackage package)
+    {
+        await using var connection = new SqlConnection();
+        var open = TransientFaultsType(package).GetMethod("OpenAsync", BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic)!;
+
+        var failure = await Assert.ThrowsAsync<InvalidOperationException>(() => (Task)open.Invoke(null, [connection, CancellationToken.None])!);
+
+        Assert.False(SqlServerChannelSql.IsTransient(failure));
+    }
+
+    private static bool IsPoolTimeout(SqlServerPackage package, InvalidOperationException exception, string connectionString, TimeSpan elapsed)
+        => (bool)TransientFaultsType(package)
+            .GetMethod("IsPoolTimeout", BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic)!
+            .Invoke(null, [exception, connectionString, elapsed])!;
+
+    /// <summary>The source-linked classifier as compiled into one package (the two internal types share one full name).</summary>
+    private static Type TransientFaultsType(SqlServerPackage package)
+        => (package == SqlServerPackage.Channel ? typeof(SqlServerChannelSql).Assembly : typeof(SqlServerTransportRetry).Assembly)
+            .GetType("AsyncResponse.Internal.SqlServerTransientFaults", throwOnError: true)!;
+
     [Fact]
     public void PostgreSqlChannelAndTransport_ClassifyTheSameWay()
     {

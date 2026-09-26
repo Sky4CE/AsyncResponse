@@ -18,6 +18,10 @@ public sealed class CoreCoverageTests
             .ReturnsAsync((FlowState?)null)
             .ReturnsAsync(new FlowState { FlowId = "finished", Status = FlowRunStatus.Succeeded })
             .ReturnsAsync(new FlowState { FlowId = "running", Status = FlowRunStatus.Running });
+        // Deliberately no LoadCurrentAsync setup (pre-commit r2 A4): a resume that reads anything
+        // but Running looks again through the current read, which Moq answers — as the interface's
+        // default member — with null. That look must fall back to the first read, so a user's
+        // mocked store keeps ignoring a finished run instead of reporting it unknown.
         var services = new ServiceCollection();
         services.AddSingleton(store.Object);
         using var provider = services.BuildServiceProvider();

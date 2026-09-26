@@ -26,6 +26,18 @@ internal interface IRedisChannelSubscriber
     /// message sequentially (a message's task is awaited before the next is delivered).
     /// </summary>
     Task<IRedisChannelSubscription> SubscribeAsync(RedisChannel channel, Func<RedisChannel, RedisValue, Task> onMessage);
+
+    /// <summary>
+    /// Removes EVERY local registration for <paramref name="channel"/> and unsubscribes on the
+    /// server — including the queue a failed <see cref="SubscribeAsync"/> leaves behind:
+    /// StackExchange.Redis registers the queue before it sends SUBSCRIBE and does not undo that
+    /// when the command fails, so that queue was never handed back to remove, stayed registered
+    /// unread, and was re-subscribed on every reconnect until process exit. Only for a channel no
+    /// live waiter in this process holds any more. The local removal has run by the time this
+    /// returns; the task covers the server round trip. Carries a remove-nothing default so
+    /// out-of-package fakes keep compiling.
+    /// </summary>
+    Task UnsubscribeAllAsync(RedisChannel channel) => Task.CompletedTask;
 }
 
 /// <summary>
@@ -43,6 +55,9 @@ internal sealed class RedisChannelMessageQueueSubscriber(ISubscriber _subscriber
         queue.OnMessage(message => onMessage(message.Channel, message.Message));
         return new Subscription(queue);
     }
+
+    /// <summary>The handler-less unsubscribe: drops every handler and queue registered for the channel.</summary>
+    public Task UnsubscribeAllAsync(RedisChannel channel) => _subscriber.UnsubscribeAsync(channel);
 
     private sealed class Subscription(ChannelMessageQueue _queue) : IRedisChannelSubscription
     {

@@ -125,6 +125,15 @@ public sealed class NatsAsyncResponseChannelOptions : DurableAsyncResponseChanne
                     "(allowed characters: letters, digits, '-', '_').");
         }
 
+        // The bucket is backed by the JetStream stream KV_{bucket}, and nats-server caps stream
+        // names at 255 characters. NATS.Net's bucket-name check has no length rule, and the bucket
+        // is created lazily, so a longer name passed startup and then failed every registration's
+        // stream creation instead (the transport validator enforces the same cap on its streams).
+        if (RecoveryBucket.Length > MaxRecoveryBucketLength)
+            throw new InvalidOperationException(
+                $"{nameof(NatsAsyncResponseChannelOptions)}.{nameof(RecoveryBucket)} is {RecoveryBucket.Length} characters; its backing JetStream stream " +
+                $"'KV_{{bucket}}' must fit NATS's 255-character stream-name limit, so the bucket name can be at most {MaxRecoveryBucketLength} characters.");
+
         // A subject prefix becomes leading tokens of every response subject; it must not contain the
         // NATS subject wildcards or whitespace that would break addressing.
         if (SubjectPrefix.IndexOfAny([' ', '\t', '*', '>', '\r', '\n']) >= 0)
@@ -140,6 +149,9 @@ public sealed class NatsAsyncResponseChannelOptions : DurableAsyncResponseChanne
             throw new InvalidOperationException(
                 $"{nameof(NatsAsyncResponseChannelOptions)}.{nameof(SubjectPrefix)} '{SubjectPrefix}' must not begin or end with '.' or contain '..' (an empty NATS subject token).");
     }
+
+    /// <summary>Longest <see cref="RecoveryBucket"/>: JetStream's 255-character stream-name cap less the <c>KV_</c> prefix of its backing stream.</summary>
+    private const int MaxRecoveryBucketLength = 255 - 3;
 
     private static void Required(string? value, string name)
     {

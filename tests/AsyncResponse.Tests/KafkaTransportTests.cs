@@ -117,6 +117,49 @@ public class KafkaTransportTests
     }
 
     [Fact]
+    public async Task PublishAsync_AJobWhoseDeadLetterCopyCouldNeverFit_IsRefusedBeforeItIsProduced()
+    {
+        // Regression (r2 S7#4): the dead-letter copy carries the record plus the burial headers, and
+        // only the two exception-text headers can be cut. A job within that margin of the
+        // producer's message.max.bytes was accepted, failed its handler, and could then never be
+        // buried — librdkafka refuses the copy locally on every attempt — so the worker subscriber
+        // restarted on it for ever, re-running the handler each time. It is refused at publish now.
+        var job = Envelope("corr-1", new string('x', 5_000));
+        var producer = new FakeKafkaProducerClient();
+        var transport = CreateTransport(
+            producer,
+            // Room for the record itself — not for the headers its dead-letter copy adds.
+            options => options.ConfigureProducer = config => config.MessageMaxBytes = (int)RecordBytes(job) + 100);
+
+        var ex = await Assert.ThrowsAsync<KafkaRecordTooLargeException>(() => transport.PublishAsync(job));
+
+        Assert.Contains("ConfigureProducer", ex.Message, StringComparison.Ordinal);
+        Assert.Equal(0, producer.PublishAttempts);
+    }
+
+    [Fact]
+    public async Task PublishAsync_AJobWhoseDeadLetterCopyFits_IsProduced_AndWithoutDeadLetteringNothingIsReserved()
+    {
+        var job = Envelope("corr-1", new string('x', 5_000));
+        var options = KafkaTestData.NewOptions();
+        var reserve = KafkaMessageDispatcher.BurialOverheadBytes(new KafkaTransportTopicSchema(options).WorkerTopic, options.WorkerConsumerGroup);
+
+        var fits = new FakeKafkaProducerClient();
+        await CreateTransport(fits, o => o.ConfigureProducer = config => config.MessageMaxBytes = (int)(RecordBytes(job) + reserve))
+            .PublishAsync(job);
+        Assert.Single(fits.Publishes);
+
+        var nothingToBury = new FakeKafkaProducerClient();
+        await CreateTransport(nothingToBury, o =>
+            {
+                o.DeadLetterEnabled = false;
+                o.ConfigureProducer = config => config.MessageMaxBytes = (int)RecordBytes(job) + 100;
+            })
+            .PublishAsync(job);
+        Assert.Single(nothingToBury.Publishes);
+    }
+
+    [Fact]
     public void Transport_MissingBootstrapServers_FailsFast()
         => Assert.Throws<InvalidOperationException>(() => new KafkaWorkerTransport(
             Options.Create(new KafkaAsyncResponseTransportOptions()),
@@ -302,6 +345,97 @@ public class KafkaTransportTests
 
         consumer.Verify(c => c.Resume(Moq.It.IsAny<IEnumerable<TopicPartition>>()), Moq.Times.Never);
         Assert.Equal(1L, adapter.GetAssignmentGeneration("jobs", 3));
+    }
+
+    [Fact]
+    public void ConsumerAdapter_ABackpressurePauseLiftedWhileThePartitionWasAway_IsLiftedOnceItIsAssignedAgain()
+    {
+        // Regression (r2 S7#1): librdkafka keeps the backpressure pause on a partition across an
+        // eager revoke, and between the revoke and the re-assignment nothing is assigned — so a
+        // resume in that window (a queue slot freed while the group re-joined) resumed an empty
+        // assignment, the poll loop took the pause as lifted, and the partitions handed straight
+        // back stayed paused for the life of the consumer: nothing more was fetched, so nothing
+        // ever tripped another pause-and-resume. The lift now reaches them once they are back.
+        var jobs3 = new TopicPartition("jobs", new Partition(3));
+        var librdkafka = new PauseTrackingConsumer(jobs3);
+        var adapter = new KafkaConsumerClientAdapter(librdkafka.Mock.Object);
+
+        adapter.PauseAssignment();                                                   // the queue is full
+        adapter.OnPartitionsRemoved([new TopicPartitionOffset(jobs3, Offset.Unset)]); // an eager revoke...
+        librdkafka.Assignment.Clear();                                                // ...then nothing assigned
+        adapter.ResumeAssignment();                                                   // a slot frees meanwhile
+        adapter.OnPartitionsAssigned([jobs3]);                                        // handed straight back,
+        librdkafka.Assignment.Add(jobs3);                                             // still paused by librdkafka
+        Assert.Contains(jobs3, librdkafka.Paused);
+
+        adapter.Consume(TimeSpan.Zero); // the next poll, once the assignment has taken effect
+
+        Assert.DoesNotContain(jobs3, librdkafka.Paused);
+    }
+
+    [Fact]
+    public void ConsumerAdapter_APartitionHandedBackWhileTheBackpressurePauseHolds_StaysPaused_UntilTheLoopLiftsIt()
+    {
+        // The other half of the r2 S7#1 contract: while the queue is still full, a partition handed
+        // back must not fetch into it — it comes back paused, and the loop's resume lifts it with
+        // the rest of the assignment.
+        var jobs3 = new TopicPartition("jobs", new Partition(3));
+        var librdkafka = new PauseTrackingConsumer(jobs3);
+        var adapter = new KafkaConsumerClientAdapter(librdkafka.Mock.Object);
+
+        adapter.PauseAssignment();
+        adapter.OnPartitionsRemoved([new TopicPartitionOffset(jobs3, Offset.Unset)]);
+        librdkafka.Assignment.Clear();
+        adapter.OnPartitionsAssigned([jobs3]);
+        librdkafka.Assignment.Add(jobs3);
+        adapter.Consume(TimeSpan.Zero);
+        Assert.Contains(jobs3, librdkafka.Paused);
+
+        adapter.ResumeAssignment();
+
+        Assert.DoesNotContain(jobs3, librdkafka.Paused);
+    }
+
+    [Fact]
+    public void ConsumerAdapter_APartitionRevokedAgainBeforeItsDeferredResume_IsResumedWhileStillAssigned()
+    {
+        // r2 S7#1 edge: assigned and revoked again inside one poll — the deferred resume would find
+        // it unassigned, so the revoke callback lifts it while it still is.
+        var jobs3 = new TopicPartition("jobs", new Partition(3));
+        var librdkafka = new PauseTrackingConsumer(jobs3);
+        var adapter = new KafkaConsumerClientAdapter(librdkafka.Mock.Object);
+
+        adapter.PauseAssignment();
+        adapter.OnPartitionsRemoved([new TopicPartitionOffset(jobs3, Offset.Unset)]);
+        librdkafka.Assignment.Clear();
+        adapter.ResumeAssignment();
+        adapter.OnPartitionsAssigned([jobs3]);
+        librdkafka.Assignment.Add(jobs3);
+        adapter.OnPartitionsRemoved([new TopicPartitionOffset(jobs3, Offset.Unset)]);
+
+        Assert.DoesNotContain(jobs3, librdkafka.Paused);
+    }
+
+    /// <summary>
+    /// A Moq <see cref="IConsumer{TKey, TValue}"/> with librdkafka's application-pause semantics:
+    /// Pause/Resume set and clear a per-partition flag that survives the partition leaving and
+    /// rejoining <see cref="Assignment"/> (verified against a real broker, r1).
+    /// </summary>
+    private sealed class PauseTrackingConsumer
+    {
+        public PauseTrackingConsumer(params TopicPartition[] assignment)
+        {
+            Assignment.AddRange(assignment);
+            Mock.SetupGet(c => c.Assignment).Returns(() => [.. Assignment]);
+            Mock.Setup(c => c.Pause(Moq.It.IsAny<IEnumerable<TopicPartition>>()))
+                .Callback<IEnumerable<TopicPartition>>(Paused.UnionWith);
+            Mock.Setup(c => c.Resume(Moq.It.IsAny<IEnumerable<TopicPartition>>()))
+                .Callback<IEnumerable<TopicPartition>>(Paused.ExceptWith);
+        }
+
+        public Moq.Mock<IConsumer<string?, byte[]>> Mock { get; } = new();
+        public List<TopicPartition> Assignment { get; } = [];
+        public HashSet<TopicPartition> Paused { get; } = [];
     }
 
     [Fact]
@@ -836,6 +970,25 @@ public class KafkaTransportTests
                 Params = [CallbackParam.ForValue(42)]
             }
         };
+
+    private static WorkerJobEnvelope Envelope(string? correlationId, string argument)
+        => new()
+        {
+            CorrelationId = correlationId,
+            Call = new ReflectionCallDto
+            {
+                ServiceInterfaceFullName = "AsyncResponse.Tests.IKafkaWorkerSpy",
+                MethodName = "OnWorkerJob",
+                Params = [CallbackParam.ForValue(argument)]
+            }
+        };
+
+    /// <summary>The size librdkafka checks the job's record against, as the transport would produce it.</summary>
+    private static long RecordBytes(WorkerJobEnvelope job)
+        => KafkaMessageDispatcher.EstimateRecordSize(
+            job.CorrelationId,
+            Encoding.UTF8.GetBytes(AsyncResponseJson.Serialize(job)),
+            KafkaWorkerTransport.CreateMessageHeaders(job.CorrelationId, KafkaTestData.NewOptions()));
 
     private static KafkaWorkerTransport CreateTransport(
         FakeKafkaProducerClient producer,

@@ -22,8 +22,12 @@ internal static class RedisClusterNodeTable
     internal readonly record struct Node(string Address, string? HostName, int Port, bool IsReplica, bool HasSlots)
     {
         /// <summary>
-        /// A primary with a slot field of any kind — a migration marker counts: a primary that is
-        /// importing its first slot already holds the keys moved into it so far.
+        /// A primary with a slot field of any kind, a migration marker included. That covers an
+        /// importing primary only on its OWN line: Redis prints the <c>[slot-&lt;-id]</c> /
+        /// <c>[slot-&gt;-id]</c> markers solely on the answering node's <c>myself</c> line, and the
+        /// table is only ever read from nodes that answered — so a primary that is importing its
+        /// first slot and could not be asked shows no slot fields in any table this code reads,
+        /// and is classified as owning none.
         /// </summary>
         public bool IsSlotOwner => !IsReplica && HasSlots;
     }
@@ -146,7 +150,10 @@ internal static class RedisClusterNodeTable
     /// hold anything the covering nodes missed: each is logged at Debug and excused. Excusing an
     /// unlisted endpoint rests on the table being current; a table read before a newly added
     /// owner was announced would cover without it, which is why a table that cannot be read at
-    /// all never gets here — callers keep that "unknown".
+    /// all never gets here — callers keep that "unknown". One residual of the same kind: an
+    /// unanswered primary that is importing its first slot looks slot-less to every other node
+    /// (see <see cref="Node.IsSlotOwner"/>), so it is excused too, and keys already migrated to it
+    /// go unread until it answers again.
     /// </summary>
     internal static List<string> UncoveredSlotOwners(
         List<Node> nodes,

@@ -99,7 +99,8 @@ public sealed class RabbitMqSubscriberOptions
     /// configure a dead-letter exchange, or raise/disable <c>delivery-limit</c> by policy. Ignored for
     /// <see cref="RabbitMqAckMode.AckAfterEnqueue"/>, which acknowledges before handling, so the broker never
     /// redelivers a failed handler's message; its dead-letter copy, if it comes back through the dead-letter
-    /// exchange (a TTL-retry cycle) and fails again, is parked instead of copied into that cycle a second time.
+    /// exchange (a TTL-retry cycle) and fails again, is parked instead of copied into that cycle a second time
+    /// (a host-stop hand-back or a drain lapse of it is no failure and goes to the dead-letter exchange again).
     /// </summary>
     public int MaxDeliveryAttempts { get; set; }
 
@@ -129,7 +130,11 @@ public sealed class RabbitMqSubscriberOptions
     /// <summary>
     /// Optional callback invoked when a background handler fails after the delivery was already ACKed.
     /// Use it to publish to a dead-letter path, increment operator-visible metrics, or alert on
-    /// already-ACKed work that RabbitMQ cannot redeliver.
+    /// already-ACKed work that RabbitMQ cannot redeliver. It runs after the dead-letter copy (when
+    /// <see cref="RabbitMqAsyncResponseOptions.DeadLetterExchange"/> is set) was written. For the
+    /// deliveries the stop itself settles once the drain budget lapses, every copy is written first
+    /// and each callback is then awaited only for what is left of the reserved quarter of
+    /// <see cref="BackgroundDrainTimeout"/>.
     /// </summary>
     public Func<RabbitMqBackgroundFailureContext, ValueTask>? OnBackgroundFailure { get; set; }
 

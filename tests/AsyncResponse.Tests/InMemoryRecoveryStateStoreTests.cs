@@ -302,6 +302,80 @@ public class InMemoryRecoveryStateStoreTests
         Assert.Empty(await store.GetAllAsync("corr-a"));
     }
 
+    [Fact]
+    public async Task SaveAsync_SnapshotsPrimitivesAndEnums_AsTheJsonElementADurableStoreHandsBack()
+    {
+        // Pre-fix primitives and enums were exempt as "immutable". They are — but a durable store
+        // still hands them back as a JsonElement, which the conversion plan reads into a parameter
+        // of the value's own type and NOT into an object- or interface-typed one: `tag is MyEnum`
+        // passed under the in-memory store (and the Testing harness) and failed on every durable
+        // store. Strings stay exempt (the flow engine's allocation-free hot path).
+        var store = new InMemoryRecoveryStateStore();
+        var state = State(Guid.NewGuid(), "scalars");
+        state.ResumeCallback = new ReflectionCallDto
+        {
+            ServiceInterfaceFullName = "Contoso.IOrderFlow",
+            MethodName = "Resume",
+            Params = [CallbackParam.ForValue(42), CallbackParam.ForValue(DayOfWeek.Friday), CallbackParam.ForValue("flow-1")]
+        };
+        await store.SaveAsync("corr-a", state, TimeSpan.FromMinutes(1));
+
+        var stored = Assert.Single(await store.GetAllAsync("corr-a")).ResumeCallback!.Params;
+        var number = Assert.IsType<System.Text.Json.JsonElement>(stored[0].Value);
+        Assert.Equal(42, number.GetInt32());
+        var weekday = Assert.IsType<System.Text.Json.JsonElement>(stored[1].Value);
+        Assert.Equal((int)DayOfWeek.Friday, weekday.GetInt32());
+        Assert.Same(state.ResumeCallback.Params[2].Value, stored[2].Value);
+    }
+
+    [Theory]
+    [InlineData("nan")]
+    [InlineData("intptr")]
+    public async Task SaveAsync_APrimitiveWithNoWireForm_ThrowsAtSave_AsADurableStoreWould(string shape)
+    {
+        // A durable store's save serializes the argument, and System.Text.Json writes neither a
+        // non-finite double nor an IntPtr: pre-fix the in-memory store accepted both.
+        var store = new InMemoryRecoveryStateStore();
+        var state = State(Guid.NewGuid(), "no-wire-form");
+        state.ResumeCallback = new ReflectionCallDto
+        {
+            ServiceInterfaceFullName = "Contoso.IOrderFlow",
+            MethodName = "Resume",
+            Params = [CallbackParam.ForValue(shape == "nan" ? double.NaN : (object)new IntPtr(7))]
+        };
+
+        // The serializer's own exceptions, exactly what a durable store's save surfaces.
+        var thrown = await Record.ExceptionAsync(() => store.SaveAsync("corr-a", state, TimeSpan.FromMinutes(1)));
+        if (shape == "nan")
+            Assert.IsAssignableFrom<ArgumentException>(thrown);
+        else
+            Assert.IsType<NotSupportedException>(thrown);
+        Assert.Empty(await store.GetAllAsync("corr-a"));
+    }
+
+    [Fact]
+    public async Task SaveAsync_AJsonElementArgument_IsClonedOffTheCallersDocument()
+    {
+        // A durable store serializes a JsonElement argument at save. Kept by reference here, one
+        // whose JsonDocument the caller disposed after registering threw ObjectDisposedException
+        // at in-memory dispatch only.
+        var store = new InMemoryRecoveryStateStore();
+        var state = State(Guid.NewGuid(), "element");
+        var document = System.Text.Json.JsonDocument.Parse("""{"orderId":"ORD-7"}""");
+        state.ResumeCallback = new ReflectionCallDto
+        {
+            ServiceInterfaceFullName = "Contoso.IOrderFlow",
+            MethodName = "Resume",
+            Params = [CallbackParam.ForValue(document.RootElement)]
+        };
+        await store.SaveAsync("corr-a", state, TimeSpan.FromMinutes(1));
+        document.Dispose();
+
+        var stored = Assert.Single(await store.GetAllAsync("corr-a")).ResumeCallback!.Params;
+        var element = Assert.IsType<System.Text.Json.JsonElement>(stored[0].Value);
+        Assert.Equal("ORD-7", element.GetProperty("orderId").GetString());
+    }
+
     public sealed class CapturedOrder
     {
         public string? Reference { get; set; }

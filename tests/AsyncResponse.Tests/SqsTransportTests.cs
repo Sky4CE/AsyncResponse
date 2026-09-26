@@ -756,6 +756,79 @@ public sealed class SqsTransportTests
             nameof(SqsAsyncResponseOptions.DeadLetterQueueSuffix));
     }
 
+    [Theory]
+    [InlineData("arn:aws:sqs:us-east-1:000000000000:jobs", true)]
+    [InlineData("arn:aws:sqs:us-east-1:000000000000:jobs", false)]
+    [InlineData("jobs.worker", true)]  // '.' is outside the SQS name character set
+    [InlineData("jobs ", false)]       // a stray trailing space
+    [InlineData("jobs.FIFO.x", true)]
+    public void QueueStringThatIsNeitherAUrlNorAValidName_FailsAtStartup_WithoutCreateQueues(string queue, bool asWorkerQueue)
+    {
+        // Red-on-old (fixpoint r2, S8#9): the name rule was checked only under CreateQueues, so an
+        // ARN — or any string SQS can never resolve as a name — passed startup; the subscriber
+        // then retried GetQueueUrl forever and every publish failed.
+        var optionName = asWorkerQueue ? nameof(SqsAsyncResponseOptions.WorkerQueue) : nameof(SqsAsyncResponseOptions.ResponseQueue);
+        AssertInvalidCommon(
+            options =>
+            {
+                if (asWorkerQueue)
+                    options.WorkerQueue = queue;
+                else
+                    options.ResponseQueue = queue;
+            },
+            optionName);
+
+        var options = new SqsAsyncResponseOptions { WorkerQueue = asWorkerQueue ? queue : "workers", ResponseQueue = asWorkerQueue ? "responses" : queue };
+        var ex = Assert.Throws<InvalidOperationException>(() => new SqsWorkerSubscriber(
+            Options.Create(options),
+            new FakeSqsClient(),
+            Mock.Of<IAsyncResponseIngress>(),
+            NullLogger<SqsWorkerSubscriber>.Instance));
+        Assert.Contains("Queue ARNs are not accepted", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData("workers")]
+    [InlineData("workers.fifo")]
+    [InlineData("https://sqs.us-east-1.amazonaws.com/000000000000/workers")] // a URL is not name-checked
+    public void ValidQueueNamesAndUrls_StillStart(string workerQueue)
+        => _ = new SqsWorkerTransport(
+            Options.Create(new SqsAsyncResponseOptions { WorkerQueue = workerQueue, ResponseQueue = "responses" }),
+            new FakeSqsClient());
+
+    [Theory]
+    [InlineData("AWS.correlation")]
+    [InlineData("amazon.correlation")] // reserved in any casing
+    [InlineData(".correlation")]
+    [InlineData("correlation.")]
+    [InlineData("correlation..id")]
+    [InlineData("correlation id")]
+    [InlineData("corrélation")]
+    [InlineData(null)] // 257 characters, built below
+    public void CorrelationIdAttributeSqsWouldReject_FailsAtStartup(string? attribute)
+    {
+        // Red-on-old (fixpoint r2, GS5#5): only blankness was checked, so a name SQS rejects
+        // passed startup and then every correlated publish failed with a non-retryable 400.
+        attribute ??= new string('a', 257);
+        AssertInvalidCommon(
+            options => options.CorrelationIdAttribute = attribute,
+            nameof(SqsAsyncResponseOptions.CorrelationIdAttribute));
+    }
+
+    [Theory]
+    [InlineData("correlationId")] // the default
+    [InlineData("x-correlation.id")]
+    [InlineData("a_b-c.d")]
+    [InlineData("AWSCorrelation")] // the reserved prefix includes its period
+    [InlineData(null)] // 256 characters, built below
+    public void CorrelationIdAttributeSqsAccepts_Starts(string? attribute)
+    {
+        attribute ??= new string('a', 256);
+        _ = new SqsWorkerTransport(
+            Options.Create(new SqsAsyncResponseOptions { WorkerQueue = "workers", ResponseQueue = "responses", CorrelationIdAttribute = attribute }),
+            new FakeSqsClient());
+    }
+
     [Fact]
     public void WorkerTransport_WorkerAndResponseQueueNamingOneQueueAsTwoUrls_FailsAtStartup()
     {

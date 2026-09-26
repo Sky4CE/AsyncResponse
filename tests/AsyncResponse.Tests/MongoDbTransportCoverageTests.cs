@@ -5,6 +5,7 @@ using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
 using MongoDB.Bson;
 using MongoDB.Bson.Serialization;
+using MongoDB.Bson.Serialization.Serializers;
 using MongoDB.Driver;
 using Moq;
 using System.Reflection;
@@ -51,9 +52,10 @@ public sealed class MongoDbTransportCoverageTests
             sets[0]["headers"]["$ifNull"].AsBsonArray[1]["$literal"].AsBsonArray);
         Assert.Empty(sets[1]["headers"]["$ifNull"].AsBsonArray[1]["$literal"].AsBsonArray);
         // Fresh publishes must be claimable regardless of client/server clock skew: the claim
-        // filter compares available_at against the server's $$NOW, so inserts stamp epoch.
+        // filter compares available_at against the server's $$NOW, so inserts stamp the server's
+        // $$NOW too — the claim order's first key (r2 S9#5; they stamped epoch before).
         Assert.All(sets, set => Assert.Equal(
-            new BsonArray { "$available_at", new BsonDateTime(DateTime.UnixEpoch) },
+            new BsonArray { "$available_at", "$$NOW" },
             set["available_at"]["$ifNull"].AsBsonArray));
 
         collection
@@ -73,13 +75,34 @@ public sealed class MongoDbTransportCoverageTests
     /// The dead-letter prune must age rows on the SERVER clock ($$NOW), not this instance's: the
     /// dead letters it deletes were stamped by OTHER instances' publishes, and an app-clock cutoff
     /// let a behind-clock pruner destroy fresh dead letters the moment they arrived.
+    /// <para>
+    /// r2 S9#8: and it deletes in bounded batches — the ids of at most
+    /// <c>OpportunisticPrune.BatchSize</c> eligible documents, then a <c>deleteMany</c> of those ids —
+    /// like the PostgreSQL / SQL Server siblings. It was one unbounded <c>deleteMany</c>, which the
+    /// first publish after <c>DeadLetterRetention</c> was enabled over a large backlog waited out
+    /// in full, with the drain budget never applying.
+    /// </para>
     /// </summary>
     [Fact]
-    public async Task Publish_PrunesDeadLettersWithAServerClockCutoff()
+    public async Task Publish_PrunesDeadLettersInBoundedBatchesWithAServerClockCutoff()
     {
+        FilterDefinition<MongoTransportMessageDocument>? findFilter = null;
+        FindOptions<MongoTransportMessageDocument, Guid>? findOptions = null;
         FilterDefinition<MongoTransportMessageDocument>? pruneFilter = null;
         DeleteOptions? pruneOptions = null;
+        var expired = new[] { Guid.NewGuid(), Guid.NewGuid() };
         var collection = new Mock<IMongoCollection<MongoTransportMessageDocument>>(MockBehavior.Loose).SelfPinning();
+        collection
+            .Setup(c => c.FindAsync(
+                It.IsAny<FilterDefinition<MongoTransportMessageDocument>>(),
+                It.IsAny<FindOptions<MongoTransportMessageDocument, Guid>>(),
+                It.IsAny<CancellationToken>()))
+            .Callback((FilterDefinition<MongoTransportMessageDocument> filter, FindOptions<MongoTransportMessageDocument, Guid> options, CancellationToken _) =>
+            {
+                findFilter = filter;
+                findOptions = options;
+            })
+            .ReturnsAsync(() => new MongoListCursor<Guid>(expired));
         collection
             .Setup(c => c.DeleteManyAsync(
                 It.IsAny<FilterDefinition<MongoTransportMessageDocument>>(),
@@ -90,7 +113,7 @@ public sealed class MongoDbTransportCoverageTests
                 pruneFilter = filter;
                 pruneOptions = deleteOptions;
             })
-            .ReturnsAsync(new DeleteResult.Acknowledged(0));
+            .ReturnsAsync(new DeleteResult.Acknowledged(expired.Length));
         var options = Options.Create(new MongoDbAsyncResponseTransportOptions
         {
             AutoCreateIndexes = false,
@@ -100,18 +123,29 @@ public sealed class MongoDbTransportCoverageTests
 
         await store.PublishAsync(Guid.NewGuid(), "worker", "{}", headers: null, CancellationToken.None);
 
-        Assert.NotNull(pruneFilter);
-        // Binary collation, like the claim: under a folding collection collation the prune matched
-        // live-queue documents whose name differed only by case.
-        Assert.NotNull(pruneOptions);
-        Assert.Same(Collation.Simple, pruneOptions!.Collation);
-        var rendered = pruneFilter!.Render(TransportRenderArgs());
+        // The lookup: bounded by the batch size, binary collation like the claim (under a folding
+        // collection collation the prune matched live-queue documents whose name differed only by case).
+        Assert.NotNull(findOptions);
+        Assert.Equal(1000, findOptions!.Limit);
+        Assert.Same(Collation.Simple, findOptions.Collation);
+        var rendered = findFilter!.Render(TransportRenderArgs());
         Assert.Equal(options.Value.DeadLetterQueue, rendered["queue"].AsString);
         Assert.True(rendered.Contains("$expr"), $"prune cutoff is not server-clock based: {rendered}");
         Assert.Equal("$created_at", rendered["$expr"]["$lt"].AsBsonArray[0]);
         Assert.Equal(
             new BsonArray { "$$NOW", 1_800_000d },
             rendered["$expr"]["$lt"].AsBsonArray[1]["$subtract"].AsBsonArray);
+
+        // The delete: exactly those ids, the eligibility filter re-applied.
+        Assert.NotNull(pruneOptions);
+        Assert.Same(Collation.Simple, pruneOptions!.Collation);
+        var deleted = pruneFilter!.Render(TransportRenderArgs()).ToJson();
+        Assert.Contains("$in", deleted, StringComparison.Ordinal);
+        Assert.Contains("$created_at", deleted, StringComparison.Ordinal);
+        // Short of a full batch: the backlog is gone, one pass.
+        collection.Verify(
+            c => c.DeleteManyAsync(It.IsAny<FilterDefinition<MongoTransportMessageDocument>>(), It.IsAny<DeleteOptions>(), It.IsAny<CancellationToken>()),
+            Times.Once);
     }
 
     /// <summary>
@@ -133,6 +167,7 @@ public sealed class MongoDbTransportCoverageTests
                 It.IsAny<CancellationToken>()))
             .Callback(() => upserts++)
             .ReturnsAsync(new UpdateResult.Acknowledged(0, 0, BsonNull.Value));
+        collection.FindsReturning(Guid.NewGuid());
         collection
             .Setup(c => c.DeleteManyAsync(
                 It.IsAny<FilterDefinition<MongoTransportMessageDocument>>(),
@@ -193,6 +228,235 @@ public sealed class MongoDbTransportCoverageTests
         Assert.Same(Collation.Simple, claimOptions!.Collation);
         Assert.Equal(ReturnDocument.After, claimOptions.ReturnDocument);
     }
+
+    /// <summary>
+    /// Regression (r2 S9#5): the claim sorted by <c>created_at</c> behind the claim index
+    /// <c>(queue, available_at, created_at)</c> — a sort key after a range key the index cannot
+    /// order by, so every claim sorted all of the queue's due documents in memory to take one, and
+    /// a NAKed or delayed document jumped ahead of everything published while it waited. It sorts
+    /// by the index's own key order now (PostgreSQL / SQL Server parity), which immediate publishes
+    /// support by stamping <c>available_at = $$NOW</c> instead of epoch.
+    /// </summary>
+    [Fact]
+    public async Task Claim_SortsByTheClaimIndexKeyOrder()
+    {
+        FindOneAndUpdateOptions<BsonDocument, BsonDocument>? claimOptions = null;
+        var collection = new Mock<IMongoCollection<MongoTransportMessageDocument>>(MockBehavior.Loose).SelfPinning();
+        var database = Database(collection.Object);
+        var raw = database.WithRawTransportMessages();
+        raw
+            .Setup(c => c.FindOneAndUpdateAsync(
+                It.IsAny<FilterDefinition<BsonDocument>>(),
+                It.IsAny<UpdateDefinition<BsonDocument>>(),
+                It.IsAny<FindOneAndUpdateOptions<BsonDocument, BsonDocument>>(),
+                It.IsAny<CancellationToken>()))
+            .Callback((
+                FilterDefinition<BsonDocument> _,
+                UpdateDefinition<BsonDocument> _,
+                FindOneAndUpdateOptions<BsonDocument, BsonDocument> options,
+                CancellationToken _) => claimOptions = options)
+            .ReturnsAsync((BsonDocument)null!);
+        using var store = new MongoDbTransportStore(database.Object, Options.Create(new MongoDbAsyncResponseTransportOptions { AutoCreateIndexes = false }));
+
+        Assert.Null(await store.TryClaimAsync("worker", TimeSpan.FromSeconds(1), CancellationToken.None));
+
+        var sort = claimOptions!.Sort.Render(new RenderArgs<BsonDocument>(BsonDocumentSerializer.Instance, BsonSerializer.SerializerRegistry));
+        Assert.Equal(new BsonDocument { ["available_at"] = 1, ["created_at"] = 1 }, sort);
+    }
+
+    /// <summary>
+    /// Regression (r2 S9#3/S4#3): under the bounded majority a publish whose wtimeout lapsed was
+    /// already applied on the primary — subscribers claim from there, so the job runs — yet it
+    /// surfaced as a failed publish: not transient, so not retried, and the caller's own retry
+    /// published a NEW job (the flow engine re-parks the same way). A same-id retry would be no
+    /// safer, since the job may be claimed, run and deleted inside the retry window and the upsert
+    /// then re-creates it. It now counts as published, with a warning, and is never retried.
+    /// </summary>
+    [Fact]
+    public async Task Publish_WhoseReplicationWaitLapsed_CountsAsPublished_WithoutARetry()
+    {
+        var upserts = 0;
+        var collection = new Mock<IMongoCollection<MongoTransportMessageDocument>>(MockBehavior.Loose).SelfPinning();
+        collection
+            .Setup(c => c.UpdateOneAsync(
+                It.IsAny<FilterDefinition<MongoTransportMessageDocument>>(),
+                It.IsAny<UpdateDefinition<MongoTransportMessageDocument>>(),
+                It.IsAny<UpdateOptions>(),
+                It.IsAny<CancellationToken>()))
+            .Callback(() => upserts++)
+            .ThrowsAsync(MongoReplicationTimeouts.Write());
+        var logger = new CollectingLogger();
+        var options = Options.Create(new MongoDbAsyncResponseTransportOptions
+        {
+            AutoCreateIndexes = false,
+            UseOwnershipLedger = false,
+            PublishRetryBaseDelay = TimeSpan.FromMilliseconds(1),
+            PublishRetryMaxDelay = TimeSpan.FromMilliseconds(1)
+        });
+        using var store = new MongoDbTransportStore(Database(collection.Object).Object, options, logger: logger.For<MongoDbTransportStore>());
+        var transport = new MongoDbWorkerTransport(options, store);
+
+        await transport.PublishAsync(Job("corr-lapsed"));
+
+        Assert.Equal(1, upserts);
+        Assert.Contains(logger.Messages, message => message.Contains("majority acknowledgement timed out", StringComparison.Ordinal));
+    }
+
+    /// <summary>
+    /// The burial's dead-letter insert takes the same path: a copy written on the primary under a
+    /// lapsed wtimeout is a copy, and the burial proceeds to delete the source — it reported "no
+    /// dead-letter copy could be written" and released the job for retry before.
+    /// </summary>
+    [Fact]
+    public async Task DeadLetter_WhoseInsertReplicationWaitLapsed_StillBuries()
+    {
+        var collection = new Mock<IMongoCollection<MongoTransportMessageDocument>>(MockBehavior.Loose).SelfPinning();
+        collection
+            .Setup(c => c.UpdateOneAsync(
+                It.IsAny<FilterDefinition<MongoTransportMessageDocument>>(),
+                It.IsAny<UpdateDefinition<MongoTransportMessageDocument>>(),
+                It.IsAny<UpdateOptions>(),
+                It.IsAny<CancellationToken>()))
+            .ThrowsAsync(MongoReplicationTimeouts.Write());
+        collection
+            .Setup(c => c.DeleteOneAsync(It.IsAny<FilterDefinition<MongoTransportMessageDocument>>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new DeleteResult.Acknowledged(1));
+        var database = Database(collection.Object);
+        database.WithRawTransportMessages().ClaimsInOrder(
+            new MongoTransportMessageDocument { Id = Guid.NewGuid(), Queue = "worker", Payload = "{}", Attempts = 5 }.ToBsonDocument());
+        using var store = new MongoDbTransportStore(
+            database.Object,
+            Options.Create(new MongoDbAsyncResponseTransportOptions { AutoCreateIndexes = false, UseOwnershipLedger = false }));
+
+        var delivery = await store.TryClaimAsync("worker", TimeSpan.FromSeconds(30), CancellationToken.None);
+
+        Assert.True(await delivery!.DeadLetterAsync(new InvalidOperationException("poison"), true, CancellationToken.None));
+        collection.Verify(c => c.DeleteOneAsync(It.IsAny<FilterDefinition<MongoTransportMessageDocument>>(), It.IsAny<CancellationToken>()), Times.Once);
+    }
+
+    /// <summary>
+    /// Regression (r2 GS3#4): every insert event woke every subscriber of the queue on every
+    /// process — a DELAYED publish too (a flow timer, a redelay hop), for a document none of them
+    /// could claim yet. An insert whose <c>available_at</c> is later than its write time
+    /// (<c>clusterTime</c>, second resolution, plus a second of slack) no longer wakes; the claim
+    /// poll picks it up once due. Anything missing or unreadable still wakes.
+    /// </summary>
+    [Fact]
+    public void QueueWake_SkipsDocumentsNotYetDue()
+    {
+        var writtenAt = new BsonTimestamp(1_900_000_000, 1);
+        var at = DateTimeOffset.FromUnixTimeSeconds(1_900_000_000);
+        BsonDocument Event(BsonValue? availableAt, bool withClusterTime = true)
+        {
+            var change = new BsonDocument { ["operationType"] = "insert" };
+            if (withClusterTime)
+                change["clusterTime"] = writtenAt;
+            change["fullDocument"] = availableAt is null ? new BsonDocument() : new BsonDocument("available_at", availableAt);
+            return change;
+        }
+
+        Assert.True(MongoDbTransportStore.IsClaimableOnArrival(Event(new BsonDateTime(at.AddMilliseconds(400).UtcDateTime))));
+        Assert.True(MongoDbTransportStore.IsClaimableOnArrival(Event(new BsonDateTime(at.AddSeconds(1).UtcDateTime))));
+        Assert.True(MongoDbTransportStore.IsClaimableOnArrival(Event(new BsonDateTime(DateTime.UnixEpoch))));
+        Assert.False(MongoDbTransportStore.IsClaimableOnArrival(Event(new BsonDateTime(at.AddSeconds(30).UtcDateTime))));
+
+        // Unknown shapes wake: an extra wake costs one empty claim, a skipped one a poll interval.
+        Assert.True(MongoDbTransportStore.IsClaimableOnArrival(Event(availableAt: null)));
+        Assert.True(MongoDbTransportStore.IsClaimableOnArrival(Event("soon")));
+        Assert.True(MongoDbTransportStore.IsClaimableOnArrival(Event(new BsonDateTime(at.AddSeconds(30).UtcDateTime), withClusterTime: false)));
+        Assert.True(MongoDbTransportStore.IsClaimableOnArrival(new BsonDocument("operationType", "insert")));
+        Assert.True(MongoDbTransportStore.IsClaimableOnArrival(null));
+    }
+
+    /// <summary>
+    /// ...and the watch applies it per event: one due and one delayed insert wake the queue once.
+    /// </summary>
+    [Fact]
+    public async Task WatchQueue_WakesOnlyForDocumentsDueOnArrival()
+    {
+        var writtenAt = new BsonTimestamp(1_900_000_000, 1);
+        var at = DateTimeOffset.FromUnixTimeSeconds(1_900_000_000);
+        ChangeStreamDocument<MongoTransportMessageDocument> Change(DateTimeOffset availableAt) => new(
+            new BsonDocument
+            {
+                ["operationType"] = "insert",
+                ["clusterTime"] = writtenAt,
+                // A foreign ObjectId _id: the wake must not read the typed full document.
+                ["fullDocument"] = new BsonDocument { ["_id"] = ObjectId.GenerateNewId(), ["available_at"] = new BsonDateTime(availableAt.UtcDateTime) }
+            },
+            BsonSerializer.LookupSerializer<MongoTransportMessageDocument>());
+        var cursor = new Mock<IChangeStreamCursor<ChangeStreamDocument<MongoTransportMessageDocument>>>();
+        cursor.SetupSequence(c => c.MoveNextAsync(It.IsAny<CancellationToken>())).ReturnsAsync(true).ReturnsAsync(false);
+        cursor.SetupGet(c => c.Current).Returns([Change(at), Change(at.AddMinutes(5))]);
+        var collection = new Mock<IMongoCollection<MongoTransportMessageDocument>>(MockBehavior.Loose).SelfPinning();
+        collection
+            .Setup(c => c.WatchAsync(
+                It.IsAny<PipelineDefinition<ChangeStreamDocument<MongoTransportMessageDocument>, ChangeStreamDocument<MongoTransportMessageDocument>>>(),
+                It.IsAny<ChangeStreamOptions>(),
+                It.IsAny<CancellationToken>()))
+            .ReturnsAsync(cursor.Object);
+        using var store = CreateStore(collection.Object, Options.Create(new MongoDbAsyncResponseTransportOptions { AutoCreateIndexes = false, UseOwnershipLedger = false }));
+        var wakes = 0;
+
+        await store.WatchQueueAsync("worker", () => { wakes++; return Task.CompletedTask; }, CancellationToken.None);
+
+        Assert.Equal(1, wakes);
+    }
+
+    /// <summary>
+    /// Regression (r2 GS3#5): with AutoCreateIndexes on, a claim index the collection already
+    /// carries under ANOTHER name — the default-named one the AutoCreateIndexes = false warning
+    /// tells operators to create — made createIndexes fail with 85 IndexOptionsConflict, and every
+    /// operation rethrew it (each runs EnsureCreated first). An equivalent index is accepted; one
+    /// that differs in what it indexes still fails loudly — and so does a HIDDEN one (fixpoint r2
+    /// precommit): the planner never uses it, so accepting it silently turned every claim into a
+    /// collection scan. Pre-fix the hidden case was accepted.
+    /// </summary>
+    [Theory]
+    [InlineData(false, false, false)]
+    [InlineData(true, false, true)]
+    [InlineData(false, true, true)]
+    public async Task EnsureCreated_AcceptsAnEquivalentClaimIndexUnderAnotherName(bool unique, bool hidden, bool fails)
+    {
+        var existing = new BsonDocument
+        {
+            ["name"] = "queue_1_available_at_1_created_at_1",
+            ["key"] = new BsonDocument { ["queue"] = 1.0, ["available_at"] = 1.0, ["created_at"] = 1.0 }
+        };
+        if (unique)
+            existing["unique"] = true;
+        if (hidden)
+            existing["hidden"] = true;
+        var collection = new Mock<IMongoCollection<MongoTransportMessageDocument>>(MockBehavior.Loose).SelfPinning().WithListedIndexes(existing);
+        var indexes = Mock.Get(collection.Object.Indexes);
+        indexes
+            .Setup(m => m.CreateOneAsync(
+                It.Is<CreateIndexModel<MongoTransportMessageDocument>>(model => model.Options.Name!.EndsWith("_claim_idx", StringComparison.Ordinal)),
+                It.IsAny<CreateOneIndexOptions>(),
+                It.IsAny<CancellationToken>()))
+            .ThrowsAsync(IndexConflict());
+        using var store = CreateStore(collection.Object, Options.Create(new MongoDbAsyncResponseTransportOptions { UseOwnershipLedger = false }));
+
+        if (fails)
+        {
+            Assert.Equal(85, (await Assert.ThrowsAsync<MongoCommandException>(() => store.EnsureCreatedAsync())).Code);
+            return;
+        }
+
+        await store.EnsureCreatedAsync();
+        indexes.Verify(m => m.DropOneAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()), Times.Never);
+        indexes.Verify(m => m.CreateOneAsync(
+            It.Is<CreateIndexModel<MongoTransportMessageDocument>>(model => model.Options.Name!.EndsWith("_created_idx", StringComparison.Ordinal)),
+            It.IsAny<CreateOneIndexOptions>(),
+            It.IsAny<CancellationToken>()), Times.Once);
+    }
+
+    private static MongoCommandException IndexConflict()
+        => new(
+            MongoReplicationTimeouts.Connection,
+            "createIndexes failed",
+            new BsonDocument("createIndexes", "asyncresponse_transport_messages"),
+            new BsonDocument { ["ok"] = 0, ["code"] = 85, ["errmsg"] = "Index already exists with a different name" });
 
     private static RenderArgs<MongoTransportMessageDocument> TransportRenderArgs()
         => new(BsonSerializer.LookupSerializer<MongoTransportMessageDocument>(), BsonSerializer.SerializerRegistry);
@@ -448,7 +712,8 @@ public sealed class MongoDbTransportCoverageTests
     private static MongoDbTransportStore CreateStore(
         IMongoCollection<MongoTransportMessageDocument> collection,
         IOptions<MongoDbAsyncResponseTransportOptions> options,
-        IMongoCollection<BsonDocument>? claims = null)
+        IMongoCollection<BsonDocument>? claims = null,
+        ILogger<MongoDbTransportStore>? logger = null)
     {
         var database = Database(collection);
         if (claims is not null)
@@ -458,7 +723,120 @@ public sealed class MongoDbTransportCoverageTests
                 .Returns(claims);
         }
 
-        return new(database.Object, options);
+        return new(database.Object, options, logger: logger);
+    }
+
+    /// <summary>
+    /// Fixpoint r2 precommit J7: the unreadable-document burial logged its Error BEFORE burying,
+    /// unguarded, so a throwing logging provider (Microsoft.Extensions.Logging rethrows a provider's
+    /// failure) aborted the burial: the poison document stayed claimed and came back every
+    /// LockTimeout, faulting the claim each time. The burial now runs first and the line after it,
+    /// guarded. Red on the old code: the claim threw and the document was never deleted.
+    /// </summary>
+    [Fact]
+    public async Task UnreadableDocumentBurial_UnderAThrowingLogger_StillBuriesAndDeletesTheDocument()
+    {
+        var collection = new Mock<IMongoCollection<MongoTransportMessageDocument>>(MockBehavior.Loose).SelfPinning();
+        var claims = new Mock<IMongoCollection<BsonDocument>>(MockBehavior.Loose).SelfPinning();
+        // A foreign producer's ObjectId _id: unreadable by the class map, then the queue is empty.
+        claims.ClaimsInOrder(new BsonDocument { ["_id"] = ObjectId.GenerateNewId(), ["queue"] = "worker", ["payload"] = "{}" }, null);
+        claims
+            .Setup(c => c.DeleteOneAsync(It.IsAny<FilterDefinition<BsonDocument>>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new DeleteResult.Acknowledged(1));
+        var logger = new CollectingLogger { ThrowOnMessageContaining = "could not be read as a transport message" };
+        using var store = CreateStore(
+            collection.Object,
+            Options.Create(new MongoDbAsyncResponseTransportOptions { AutoCreateIndexes = false, UseOwnershipLedger = false }),
+            claims.Object,
+            logger.For<MongoDbTransportStore>());
+
+        Assert.Null(await store.TryClaimAsync("worker", TimeSpan.FromSeconds(30), CancellationToken.None));
+
+        claims.Verify(c => c.DeleteOneAsync(It.IsAny<FilterDefinition<BsonDocument>>(), It.IsAny<CancellationToken>()), Times.Once);
+        Assert.Contains(logger.Messages, message => message.Contains("dead-lettered it without executing it", StringComparison.Ordinal));
+    }
+
+    /// <summary>
+    /// Fixpoint r2 precommit pass 2: moving the unreadable-document Error after the burial meant a
+    /// burial that fails on every claim (a dead-letter copy over the document size limit) never
+    /// logged which document is poison or why it could not be read — the claim just threw once per
+    /// LockTimeout. A failed burial now logs the document and the read error, then propagates.
+    /// Red on the pass-1 code: no line named the document.
+    /// </summary>
+    [Fact]
+    public async Task UnreadableDocumentBurial_ThatFails_StillNamesTheDocumentBeforeItPropagates()
+    {
+        var collection = new Mock<IMongoCollection<MongoTransportMessageDocument>>(MockBehavior.Loose).SelfPinning();
+        collection
+            .Setup(c => c.UpdateOneAsync(
+                It.IsAny<FilterDefinition<MongoTransportMessageDocument>>(),
+                It.IsAny<UpdateDefinition<MongoTransportMessageDocument>>(),
+                It.IsAny<UpdateOptions>(),
+                It.IsAny<CancellationToken>()))
+            .ThrowsAsync(new InvalidOperationException("dead-letter copy too large"));
+        var claims = new Mock<IMongoCollection<BsonDocument>>(MockBehavior.Loose).SelfPinning();
+        var poisonId = ObjectId.GenerateNewId();
+        claims.ClaimsInOrder(new BsonDocument { ["_id"] = poisonId, ["queue"] = "worker", ["payload"] = "{}" }, null);
+        var logger = new CollectingLogger();
+        using var store = CreateStore(
+            collection.Object,
+            Options.Create(new MongoDbAsyncResponseTransportOptions { AutoCreateIndexes = false, UseOwnershipLedger = false }),
+            claims.Object,
+            logger.For<MongoDbTransportStore>());
+
+        var failure = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => store.TryClaimAsync("worker", TimeSpan.FromSeconds(30), CancellationToken.None));
+
+        Assert.Equal("dead-letter copy too large", failure.Message);
+        claims.Verify(c => c.DeleteOneAsync(It.IsAny<FilterDefinition<BsonDocument>>(), It.IsAny<CancellationToken>()), Times.Never);
+        Assert.Contains(
+            logger.Messages,
+            message => message.Contains(poisonId.ToString(), StringComparison.Ordinal)
+                && message.Contains("burying it failed", StringComparison.Ordinal));
+    }
+
+    /// <summary>
+    /// Fixpoint r2 precommit J7: a failed dead-letter write is reported to its caller as <c>false</c>
+    /// (the redelivery consequence is decided from it), but the Error logged on the way ran
+    /// unguarded, so a throwing logging provider turned that <c>false</c> into an exception out of
+    /// the settlement. Red on the old code: DeadLetterAsync threw.
+    /// </summary>
+    [Fact]
+    public async Task DeadLetterWriteFailure_UnderAThrowingLogger_StillReportsFalse()
+    {
+        var message = new MongoTransportMessageDocument
+        {
+            Id = Guid.NewGuid(),
+            Queue = "worker",
+            Payload = "{}",
+            Headers = new Dictionary<string, string>()
+        };
+        var collection = new Mock<IMongoCollection<MongoTransportMessageDocument>>(MockBehavior.Loose).SelfPinning();
+        collection
+            .Setup(c => c.UpdateOneAsync(
+                It.IsAny<FilterDefinition<MongoTransportMessageDocument>>(),
+                It.IsAny<UpdateDefinition<MongoTransportMessageDocument>>(),
+                It.IsAny<UpdateOptions>(),
+                It.IsAny<CancellationToken>()))
+            .ThrowsAsync(new InvalidOperationException("dlq unavailable"));
+        var claims = new Mock<IMongoCollection<BsonDocument>>(MockBehavior.Loose).SelfPinning();
+        claims
+            .Setup(c => c.FindOneAndUpdateAsync(
+                It.IsAny<FilterDefinition<BsonDocument>>(),
+                It.IsAny<UpdateDefinition<BsonDocument>>(),
+                It.IsAny<FindOneAndUpdateOptions<BsonDocument, BsonDocument>>(),
+                It.IsAny<CancellationToken>()))
+            .ReturnsAsync(() => message.ToBsonDocument());
+        var logger = new CollectingLogger { ThrowOnMessageContaining = "Failed to write MongoDB dead-letter document" };
+        using var store = CreateStore(
+            collection.Object,
+            Options.Create(new MongoDbAsyncResponseTransportOptions { AutoCreateIndexes = false }),
+            claims.Object,
+            logger.For<MongoDbTransportStore>());
+        var delivery = Assert.IsType<MongoDbTransportDelivery>(
+            await store.TryClaimAsync("worker", TimeSpan.FromSeconds(1), CancellationToken.None));
+
+        Assert.False(await delivery.DeadLetterAsync(new InvalidOperationException("poison"), true, CancellationToken.None));
     }
 
     private static Mock<IMongoDatabase> Database(IMongoCollection<MongoTransportMessageDocument> collection)

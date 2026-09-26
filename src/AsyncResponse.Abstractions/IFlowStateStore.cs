@@ -40,18 +40,22 @@ public interface IFlowStateStore
     /// for it where a load's answer lets it acknowledge a delivery WITHOUT writing: a recovered
     /// response that matches no pending step, a correlation-scoped failure for an id no step is
     /// pending on, a failure signal for a run that reads <see cref="FlowRunStatus.Suspended"/>, a
-    /// resume of a run that does not read <see cref="FlowRunStatus.Running"/>. A decision that ends
-    /// in a revision- or lease-fenced write is corrected by the fence when its read was stale; these
-    /// have no fence behind them, and a stale copy drops the payload, the failure, or the resume for
-    /// good. A start job whose create reported an existing ledger also re-reads through it when its
-    /// plain load finds no ledger or one bound to different work, so a lagging copy neither hides
-    /// the starter's fresh create from it nor drops the start.
+    /// resume of a run that does not read <see cref="FlowRunStatus.Running"/>, a re-attaching
+    /// awaited step deciding that no recovery completed it. A decision that ends in a revision- or
+    /// lease-fenced write is corrected by the fence when its read was stale; these have no fence
+    /// behind them, and a stale copy drops the payload, the failure, or the resume for good. A start
+    /// job whose create reported an existing ledger also re-reads through it when its plain load
+    /// finds no ledger or one bound to different work, so a lagging copy neither hides the starter's
+    /// fresh create from it nor drops the start; and an execution whose caller cancelled a
+    /// checkpoint mid-write reads through it once, before its next step, to settle whether that
+    /// write committed.
     /// <para>
     /// The default is <see cref="LoadAsync"/>, which is already current in every store whose reads
     /// cannot return an older copy of a present ledger (the relational stores, DynamoDB with
-    /// consistent reads, MongoDB with primary reads). A store whose reads can lag behind another
-    /// process's writes overrides it — the Cosmos DB store confirms on the container's write path
-    /// first.
+    /// consistent reads). A store whose reads can lag behind another process's writes overrides it —
+    /// the Cosmos DB store confirms on the container's write path first, and the MongoDB store reads
+    /// linearizably (a deposed primary can still serve a plain read that misses a
+    /// majority-acknowledged write).
     /// </para>
     /// </summary>
     /// <exception cref="FlowStateUnreadableException">The ledger exists but is uninterpretable or inconsistent.</exception>

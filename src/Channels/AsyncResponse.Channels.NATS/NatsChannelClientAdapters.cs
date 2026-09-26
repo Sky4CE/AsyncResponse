@@ -4,6 +4,7 @@ using NATS.Client.JetStream;
 using NATS.Client.JetStream.Models;
 using NATS.Client.KeyValueStore;
 using NATS.Net;
+using System.Collections.Concurrent;
 using System.Runtime.CompilerServices;
 using System.Threading.Channels;
 
@@ -53,8 +54,13 @@ internal interface INatsResponseChannelClient
     /// </summary>
     Task<NatsDeliveryOutcome> RequestAsync(string subject, string? payload, bool probe, TimeSpan timeout, CancellationToken cancellationToken);
 
-    /// <summary>Establishes a subscription to <paramref name="subject"/>; awaiting the result guarantees the subscription is registered.</summary>
-    Task<INatsChannelSubscription> SubscribeAsync(string subject, CancellationToken cancellationToken);
+    /// <summary>
+    /// Establishes a subscription to <paramref name="subject"/>; awaiting the result guarantees the
+    /// subscription is registered. <paramref name="onMessagesDropped"/> is invoked — possibly many
+    /// times, from the client's event loop — with the number of messages already buffered whenever
+    /// the client drops an inbound message because the subscription's bounded buffer is full.
+    /// </summary>
+    Task<INatsChannelSubscription> SubscribeAsync(string subject, Action<int> onMessagesDropped, CancellationToken cancellationToken);
 
     /// <summary>Round-trips to the server so previously issued subscriptions are guaranteed processed before the caller proceeds.</summary>
     Task FlushAsync(CancellationToken cancellationToken);
@@ -80,6 +86,13 @@ internal interface INatsRawRequester
     /// <summary>Establishes (and awaits registration of) a Core subscription to <paramref name="subject"/>.</summary>
     Task<INatsSub<string>> SubscribeAsync(string subject, CancellationToken cancellationToken);
 
+    /// <summary>
+    /// Routes the connection's MessageDropped events for <paramref name="subscription"/> to
+    /// <paramref name="onDropped"/> (with the count already buffered) until the returned
+    /// registration is disposed.
+    /// </summary>
+    IDisposable WatchDrops(INatsSub<string> subscription, Action<int> onDropped);
+
     /// <summary>Publishes an empty acknowledgement to <paramref name="replyTo"/>.</summary>
     ValueTask PublishReplyAsync(string replyTo, CancellationToken cancellationToken);
 
@@ -87,9 +100,25 @@ internal interface INatsRawRequester
     Task FlushAsync(CancellationToken cancellationToken);
 }
 
-/// <summary>Production <see cref="INatsRawRequester"/> over a NATS <see cref="INatsConnection"/>.</summary>
-internal sealed class NatsRawRequester(INatsConnection _connection) : INatsRawRequester
+/// <summary>
+/// Production <see cref="INatsRawRequester"/> over a NATS <see cref="INatsConnection"/>. Disposing
+/// it unhooks its MessageDropped handler from the application-owned connection, which can outlive
+/// the container (and be shared by several).
+/// </summary>
+internal sealed class NatsRawRequester : INatsRawRequester, IDisposable
 {
+    private readonly INatsConnection _connection;
+
+    // One connection-wide MessageDropped handler routing to the watched subscription, not one
+    // handler per waiter: a multicast event copies its whole invocation list on every add/remove.
+    private readonly ConcurrentDictionary<object, Action<int>> _dropWatchers = new(ReferenceEqualityComparer.Instance);
+
+    public NatsRawRequester(INatsConnection connection)
+    {
+        _connection = connection;
+        _connection.MessageDropped += OnMessageDroppedAsync;
+    }
+
     /// <summary>Runs the RequestAsync operation.</summary>
     public async Task RequestAsync(string subject, string? payload, NatsHeaders? headers, TimeSpan timeout, CancellationToken cancellationToken)
         => _ = await _connection.RequestAsync<string?, string>(
@@ -114,14 +143,55 @@ internal sealed class NatsRawRequester(INatsConnection _connection) : INatsRawRe
     /// <summary>Runs the FlushAsync operation.</summary>
     public async Task FlushAsync(CancellationToken cancellationToken)
         => await _connection.PingAsync(cancellationToken).ConfigureAwait(false);
+
+    /// <inheritdoc />
+    public IDisposable WatchDrops(INatsSub<string> subscription, Action<int> onDropped)
+    {
+        _dropWatchers[subscription] = onDropped;
+        return new DropWatch(_dropWatchers, subscription);
+    }
+
+    // NATS.Net raises this for every message a subscription's bounded buffer could not admit
+    // (DropNewest by default: SubPendingChannelCapacity, 16,384). The subscription is the NatsSub
+    // SubscribeCoreAsync returned, so a reference lookup finds the waiter it belongs to.
+    private ValueTask OnMessageDroppedAsync(object? sender, NatsMessageDroppedEventArgs args)
+    {
+        if (_dropWatchers.TryGetValue(args.Subscription, out var onDropped))
+        {
+            try
+            {
+                onDropped(args.Pending);
+            }
+            catch
+            {
+                // Never let a waiter's reaction fail the connection's shared event loop.
+            }
+        }
+
+        return ValueTask.CompletedTask;
+    }
+
+    /// <inheritdoc />
+    public void Dispose() => _connection.MessageDropped -= OnMessageDroppedAsync;
+
+    private sealed class DropWatch(ConcurrentDictionary<object, Action<int>> watchers, object subscription) : IDisposable
+    {
+        public void Dispose() => watchers.TryRemove(subscription, out _);
+    }
 }
 
 /// <summary>
 /// Production <see cref="INatsResponseChannelClient"/>: maps NATS request/reply outcomes and wraps Core
 /// subscriptions, delegating the raw (un-mockable) calls to an <see cref="INatsRawRequester"/>.
 /// </summary>
-internal sealed class NatsResponseChannelClient(INatsRawRequester _raw) : INatsResponseChannelClient
+internal sealed class NatsResponseChannelClient(INatsRawRequester _raw) : INatsResponseChannelClient, IDisposable
 {
+    /// <summary>
+    /// Releases the requester's hook on the connection. The container calls it when it disposes
+    /// the singleton it built; the connection itself belongs to the application.
+    /// </summary>
+    public void Dispose() => (_raw as IDisposable)?.Dispose();
+
     /// <summary>Runs the RequestAsync operation.</summary>
     public async Task<NatsDeliveryOutcome> RequestAsync(string subject, string? payload, bool probe, TimeSpan timeout, CancellationToken cancellationToken)
     {
@@ -161,38 +231,51 @@ internal sealed class NatsResponseChannelClient(INatsRawRequester _raw) : INatsR
     }
 
     /// <summary>Runs the SubscribeAsync operation.</summary>
-    public async Task<INatsChannelSubscription> SubscribeAsync(string subject, CancellationToken cancellationToken)
+    public async Task<INatsChannelSubscription> SubscribeAsync(string subject, Action<int> onMessagesDropped, CancellationToken cancellationToken)
     {
         var subscription = await _raw.SubscribeAsync(subject, cancellationToken).ConfigureAwait(false);
-        return new NatsChannelSubscription(subscription, _raw);
+        return new NatsChannelSubscription(subscription, _raw, _raw.WatchDrops(subscription, onMessagesDropped));
     }
 
     /// <summary>Runs the FlushAsync operation.</summary>
     public Task FlushAsync(CancellationToken cancellationToken) => _raw.FlushAsync(cancellationToken);
 
-    private sealed class NatsChannelSubscription(INatsSub<string> _subscription, INatsRawRequester _raw) : INatsChannelSubscription
+    private sealed class NatsChannelSubscription(INatsSub<string> _subscription, INatsRawRequester _raw, IDisposable? _dropWatch) : INatsChannelSubscription
     {
         /// <summary>Runs the ReadAsync operation.</summary>
         public async IAsyncEnumerable<NatsInboundResponse> ReadAsync([EnumeratorCancellation] CancellationToken cancellationToken)
         {
-            await foreach (var message in _subscription.Msgs.ReadAllAsync(cancellationToken).ConfigureAwait(false))
+            try
             {
-                var isProbe = message.Headers is { } headers
-                    && headers.TryGetValue(NatsChannelHeaders.Probe, out var marker)
-                    && marker == "1";
+                await foreach (var message in _subscription.Msgs.ReadAllAsync(cancellationToken).ConfigureAwait(false))
+                {
+                    var isProbe = message.Headers is { } headers
+                        && headers.TryGetValue(NatsChannelHeaders.Probe, out var marker)
+                        && marker == "1";
 
-                var replyTo = message.ReplyTo;
-                ValueTask Reply()
-                    => string.IsNullOrEmpty(replyTo)
-                        ? ValueTask.CompletedTask
-                        : _raw.PublishReplyAsync(replyTo, CancellationToken.None);
+                    var replyTo = message.ReplyTo;
+                    ValueTask Reply()
+                        => string.IsNullOrEmpty(replyTo)
+                            ? ValueTask.CompletedTask
+                            : _raw.PublishReplyAsync(replyTo, CancellationToken.None);
 
-                yield return new NatsInboundResponse(message.Data, isProbe, Reply);
+                    yield return new NatsInboundResponse(message.Data, isProbe, Reply);
+                }
+            }
+            finally
+            {
+                // The stream ended (disposed, or ended by its lifetime token when teardown did not
+                // complete): nothing is left to report a drop to.
+                _dropWatch?.Dispose();
             }
         }
 
         /// <summary>Releases resources held by this instance.</summary>
-        public ValueTask DisposeAsync() => _subscription.DisposeAsync();
+        public ValueTask DisposeAsync()
+        {
+            _dropWatch?.Dispose();
+            return _subscription.DisposeAsync();
+        }
     }
 }
 
@@ -203,10 +286,10 @@ internal sealed class NatsResponseChannelClient(INatsRawRequester _raw) : INatsR
 /// </summary>
 internal interface INatsKvStore
 {
-    /// <summary>Creates <paramref name="key"/> only when absent; <c>false</c> when it already exists.</summary>
+    /// <summary>Creates <paramref name="key"/> only when absent; <c>false</c> when it already exists. Any other failure throws.</summary>
     Task<bool> TryCreateAsync(string key, string value, CancellationToken cancellationToken);
 
-    /// <summary>Replaces <paramref name="key"/> only while its revision still equals <paramref name="expectedRevision"/>; <c>false</c> on a conflict.</summary>
+    /// <summary>Replaces <paramref name="key"/> only while its revision still equals <paramref name="expectedRevision"/>; <c>false</c> on a conflict. Any other failure throws.</summary>
     Task<bool> TryUpdateAsync(string key, string value, ulong expectedRevision, CancellationToken cancellationToken);
 
     /// <summary>Returns the stored entry (value plus revision) for <paramref name="key"/>, or <c>null</c> when absent or deleted.</summary>
@@ -242,20 +325,61 @@ internal sealed class NatsKvStoreAdapter(INatsKVContext _kvContext, NatsAsyncRes
     private readonly SemaphoreSlim _initGate = new(1, 1);
     private INatsKVStore? _store;
 
-    /// <summary>Runs the TryCreateAsync operation.</summary>
+    /// <summary>
+    /// Creates <paramref name="key"/> only when absent: a revision-0 conditional write, made here
+    /// rather than through NATS.Net's TryCreateAsync. The SDK's create answers ANY failure of its
+    /// revision-0 write by re-reading the key and returning the read's outcome, so a real
+    /// JetStream rejection — a value over the bucket's max value size, a full bucket with
+    /// discard-new, a permission error — came back as "key not found" and was read as a
+    /// conflict: the save re-read and retried until it gave up with no cause attached.
+    /// </summary>
     public async Task<bool> TryCreateAsync(string key, string value, CancellationToken cancellationToken)
     {
         var store = await GetStoreAsync(cancellationToken).ConfigureAwait(false);
-        var result = await store.TryCreateAsync(key, value, cancellationToken: cancellationToken).ConfigureAwait(false);
-        return result.Success;
+        var created = await store.TryUpdateAsync(key, value, revision: 0, cancellationToken: cancellationToken).ConfigureAwait(false);
+        if (created.Success)
+            return true;
+        if (created.Error is not NatsKVWrongLastRevisionException)
+            throw created.Error;
+
+        // The key's subject already has a last revision: a live value (the conflict), or the
+        // delete marker a removal left behind, which — as the SDK's create does — is written over
+        // at the marker's own revision.
+        var current = await store.TryGetEntryAsync<string>(key, cancellationToken: cancellationToken).ConfigureAwait(false);
+        if (current.Success)
+            return false;
+        if (current.Error is NatsKVKeyDeletedException deleted)
+            return ConditionalWriteSucceeded(await store.TryUpdateAsync(key, value, deleted.Revision, cancellationToken: cancellationToken).ConfigureAwait(false));
+
+        // Purged between the write and the read: a conflict the caller's re-read resolves.
+        if (current.Error is NatsKVKeyNotFoundException)
+            return false;
+
+        throw current.Error;
     }
 
     /// <summary>Runs the TryUpdateAsync operation.</summary>
     public async Task<bool> TryUpdateAsync(string key, string value, ulong expectedRevision, CancellationToken cancellationToken)
     {
         var store = await GetStoreAsync(cancellationToken).ConfigureAwait(false);
-        var result = await store.TryUpdateAsync(key, value, expectedRevision, cancellationToken: cancellationToken).ConfigureAwait(false);
-        return result.Success;
+        return ConditionalWriteSucceeded(
+            await store.TryUpdateAsync(key, value, expectedRevision, cancellationToken: cancellationToken).ConfigureAwait(false));
+    }
+
+    /// <summary>
+    /// Only a revision mismatch is a conflict (<c>false</c>). NATS.Net returns every other failure
+    /// of a conditional write inside the result as well — a server rejection, no stream response,
+    /// a connection error — and collapsing those to <c>false</c> made a real JetStream error look
+    /// like a lost optimistic race, retried as one and reported with no cause.
+    /// </summary>
+    private static bool ConditionalWriteSucceeded(NatsResult<ulong> result)
+    {
+        if (result.Success)
+            return true;
+        if (result.Error is NatsKVWrongLastRevisionException)
+            return false;
+
+        throw result.Error;
     }
 
     /// <summary>Runs the GetAsync operation.</summary>

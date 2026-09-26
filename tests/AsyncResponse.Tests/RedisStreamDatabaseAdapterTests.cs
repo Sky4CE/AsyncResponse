@@ -142,6 +142,36 @@ public class RedisStreamDatabaseAdapterTests
             adapter.StreamAcknowledgeAsync("stream", "group", "1-0", cts.Token));
     }
 
+    /// <summary>
+    /// Fixpoint round 2 (S6a#3). The adapter built each command BEFORE looking at the caller's
+    /// token, and StackExchange.Redis queues a command the moment it is called: with a stop already
+    /// requested, XREADGROUP and XCLAIM still reached the server, moving entries into the stopping
+    /// consumer's pending list while their replies were discarded. A cancelled caller now sends
+    /// nothing. Pre-fix: every one of these calls reaches the strict mock and throws a
+    /// <see cref="MockException"/> instead of cancelling.
+    /// </summary>
+    [Fact]
+    public async Task StreamMethods_WithAnAlreadyCancelledToken_SendNothing()
+    {
+        var database = new Mock<IDatabase>(MockBehavior.Strict);
+        var adapter = new RedisStreamDatabaseAdapter(database.Object, TimeSpan.FromSeconds(30));
+        using var cts = new CancellationTokenSource();
+        await cts.CancelAsync();
+        var token = cts.Token;
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => adapter.StreamReadGroupAsync("stream", "group", "consumer", 1, token));
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => adapter.StreamClaimAsync("stream", "group", "consumer", 250, ["1-0"], token));
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => adapter.StreamClaimIdsOnlyAsync("stream", "group", "consumer", 0, ["1-0"], token));
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => adapter.StreamPendingMessagesAsync("stream", "group", 1, RedisValue.Null, null, null, 250, token));
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => adapter.StreamAcknowledgeAsync("stream", "group", "1-0", token));
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => adapter.StreamAddAsync("stream", [new NameValueEntry("payload", "{}")], null, true, token));
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => adapter.StreamAddOnceAsync("stream", "dedup", TimeSpan.FromMinutes(1), [new NameValueEntry("payload", "{}")], null, true, token));
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => adapter.StreamCreateConsumerGroupAsync("stream", "group", StreamPosition.Beginning, true, token));
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => adapter.TryDeleteIdleConsumerAsync("stream", "group", "consumer", token));
+
+        Assert.Empty(database.Invocations);
+    }
+
     [Fact]
     public async Task StreamMethods_ApplyOperationTimeoutWhileRedisCommandIsPending()
     {

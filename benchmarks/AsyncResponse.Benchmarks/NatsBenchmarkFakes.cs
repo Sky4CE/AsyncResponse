@@ -15,7 +15,7 @@ internal sealed class BenchmarkNatsJetStreamTransport : INatsJetStreamTransport
     public Task EnsureDeadLetterStreamAsync(string stream, string subject, long? maxMessages, CancellationToken cancellationToken)
         => Task.CompletedTask;
 
-    public Task<TimeSpan> EnsureConsumerAsync(string stream, string durable, TimeSpan ackWait, int maxDeliveryAttempts, CancellationToken cancellationToken)
+    public Task<TimeSpan> EnsureConsumerAsync(string stream, string subject, string durable, TimeSpan ackWait, int maxDeliveryAttempts, CancellationToken cancellationToken)
         => Task.FromResult(ackWait);
 
     public Task<string> PublishAsync(string subject, string payload, IReadOnlyDictionary<string, string>? headers, CancellationToken cancellationToken)

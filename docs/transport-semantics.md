@@ -59,11 +59,11 @@ These hold for every transport in the matrix, verified per package:
   survived only as an error log line.
 - **`BackgroundDrainTimeout` = 20 s.** The maximum time to wait for queued and running
   background handlers while a hosted subscriber stops. The database transports, NATS, RabbitMQ,
-  and Kafka split it — three quarters for the handlers, one quarter reserved for dead-lettering
-  what is still queued when that lapses (see [their notes](#postgresql-sql-server-mongodb) and
-  [NATS](#nats)); NATS, RabbitMQ, and Kafka route those entries from the stop itself, so a worker
-  stuck in a long handler cannot keep them from being recorded. SQS, Azure Service Bus and Google
-  Pub/Sub split it the same way, and in the reserve the dispose itself reports every entry still
+  Kafka, and Redis split it — three quarters for the handlers, one quarter reserved for
+  dead-lettering what is still queued when that lapses (see [their notes](#postgresql-sql-server-mongodb),
+  [NATS](#nats) and [Redis](#redis)); NATS, RabbitMQ, Kafka, and Redis route those entries from
+  the stop itself, so a worker stuck in a long handler cannot keep them from being recorded. SQS,
+  Azure Service Bus and Google Pub/Sub split it the same way, and in the reserve the dispose itself reports every entry still
   queued through `OnBackgroundFailure` (they cannot be dead-lettered: the broker already forgot
   them), logging the loss at Error with its count — the background workers may all still be busy,
   so leaving it to them lost those entries at process exit with no callback.
@@ -91,17 +91,32 @@ These hold for every transport in the matrix, verified per package:
   delivery is handed back instead (`DurableFlowInterruptedException`), and because the host fires
   `ApplicationStopping` *before* it stops any hosted service, this arrives while the worker
   subscriber's own token is still live. Every transport's ack-after-handler dispatcher recognizes
-  it by type: the delivery is left for redelivery (unsettled — Google Pub/Sub NACKs it back once,
-  when its client stops), never counted as a failure, retried or dead-lettered, exactly as if the
-  subscriber's own stop had cancelled it. The redelivery still spends a delivery attempt where the
+  it by type: the delivery is handed back for redelivery — left unsettled on most transports; NATS
+  NAKs it with no delay, for a live peer; SQS shortens its visibility to `HostShutdownTimeout` when
+  `VisibilityTimeout` is longer; Google Pub/Sub NACKs it back once, when its client stops — never
+  counted as a failure, retried or dead-lettered, exactly as if the subscriber's own stop had
+  cancelled it. The redelivery still spends a delivery attempt where the
   broker or store counts them, so a hand-back at the attempt cap is dead-lettered on redelivery
   without running (on Service Bus only against the entity's own `MaxDeliveryCount`). Under early
-  ACK the broker has already forgotten the message: the hand-back is logged as a warning, reported
-  through `OnBackgroundFailure`, and — where the transport can dead-letter (Kafka, RabbitMQ, Redis,
-  NATS and the database transports) — copied to the dead-letter destination with a reason starting
-  `handed_back_after_commit`; on Kafka, RabbitMQ, Redis and NATS it is logged as an error instead
-  when no destination is configured (the database transports log the warning even with
-  `DeadLetterEnabled = false`, where no copy is written).
+  ACK the broker has already forgotten the message: where the transport can dead-letter (Kafka,
+  RabbitMQ, Redis, NATS and the database transports) the hand-back is first copied to the
+  dead-letter destination with a reason starting `handed_back_after_commit`, then logged as a
+  warning and reported through `OnBackgroundFailure`; when no copy is written — no destination is
+  configured (the database transports' `DeadLetterEnabled = false`), or the copy's write failed —
+  and always on Azure Service Bus, SQS and Google Pub/Sub, which can write no copy of a settled
+  message, it is logged at Error: the wake-up is lost unless the report records it, so resume the
+  flow explicitly. Every broker and database worker subscriber — except Google Pub/Sub in
+  `AckAfterHandlerCompletes`, which keeps starting deliveries until its own stop — also takes no
+  new delivery from `ApplicationStopping` on (when the host registers `IHostApplicationLifetime`;
+  response subscribers keep serving waiters), so the immediate wake-ups a stopping host's
+  hand-overs publish are left to a live replica instead of coming straight back to it; a delivery
+  already received but not started is handed back without running (left unacknowledged on
+  RabbitMQ, Kafka and Redis; made visible again on SQS; abandoned on Service Bus; NAKed with no
+  delay on NATS and the database transports; NACKed at client stop on Pub/Sub). The gate cannot
+  tell a flow wake-up from a plain request/response job, and that has a cost: on a single replica,
+  or when the whole fleet stops, worker jobs still queued behind the stop are not run on the
+  stopping host — they stay queued and run on the next start, a request waiting on one times out,
+  and a recoverable request's response is recovered once the job runs.
   Application code must never throw `DurableFlowInterruptedException` itself. On Kafka, which
   commits a position, the handed-back message's partition is also parked for the rest of the
   stop, so no later offset of it is stored past the unsettled message.
@@ -133,14 +148,14 @@ These hold for every transport in the matrix, verified per package:
 |---|---|---|---|---|---|---|
 | **AzureServiceBus** | peek-lock: complete on success, abandon on failure | broker `DeliveryCount`; dead-letter at `MaxDeliveryAttempts` (`0` = defer to the entity's `MaxDeliveryCount`) | native dead-letter subqueue (broker built-in, nothing to declare) | log + `OnBackgroundFailure`; the lock is settled, no DLQ write possible | drain + close 5 s (renewal-task join, then receiver/sender close; validated in both ack modes — two `ShutdownTimeout` terms with renewal on, one with it off) | `LockRenewalInterval` 10 s, on by default; `null` disables |
 | **GooglePubSub** | streaming pull: ACK on success, NACK on failure | native — subscription retry policy + `DeadLetterPolicy` `maxDeliveryAttempts`; no app counter by design | subscription `DeadLetterPolicy` (delegated to infra) | log + `OnBackgroundFailure`; already ACKed, no DLQ write possible | drain + close 5 s (subscriber-client stop) | — (the Pub/Sub client manages the ack deadline) |
-| **Kafka** | manual offset store, auto-committed every `OffsetCommitInterval` 5 s; offsets cannot NACK one message | in-process retries with backoff (100 ms → 5 s); counted per process delivery — a restart before the commit resets the count | `{topic}.deadletter` (or one `DeadLetterTopic`); declared by `CreateTopics` (default on) | retried in-process, then log + `OnBackgroundFailure` + produced to the DLQ topic | drain only | — (stay under `max.poll.interval.ms` instead) |
-| **MongoDB** | claimed document: delete on success, reschedule after `RedeliveryDelay` 5 s on failure | store — the `findOneAndUpdate` claim increments the attempt | `deadletter` logical queue in the same collection; `DeadLetterEnabled` default on, optional `DeadLetterRetention` | log + `OnBackgroundFailure` + DLQ document | drain + close 5 s (change-stream listen join) | automatic fenced renewal at `LockTimeout`/3 (server-clock `$$NOW`, `lock_id` fence) |
-| **NATS** | JetStream explicit ack: ACK on success, NAK + `RedeliveryDelay` 5 s on failure | broker `NumDelivered`; at `MaxDeliveryAttempts` the message is ACKed + dead-lettered — including a delivery whose earlier attempts never settled (process killed mid-handler), refused before execution | `{prefix}.transport.deadletter` subject/stream; declared by `CreateStreams` (default on) | log + `OnBackgroundFailure` + published to the DLQ subject | drain only | automatic in-progress heartbeat every `AckWait`/3 across the in-flight batch (not configurable) |
-| **PostgreSQL** | claimed row: delete on success, reschedule after `RedeliveryDelay` 5 s on failure | store — the `FOR UPDATE SKIP LOCKED` claim increments `attempts` | `deadletter` logical queue in the same table; `DeadLetterEnabled` default on, optional `DeadLetterRetention` | log + `OnBackgroundFailure` + DLQ row | drain + close 5 s (LISTEN task join) | automatic fenced renewal at `LockTimeout`/3 (`lock_id` fence) |
-| **RabbitMQ** | per-delivery `basic.ack`; `basic.nack` + requeue on failure | broker `x-death` header + `redelivered` flag, judged before the handler runs; **`MaxDeliveryAttempts` default `0` = unlimited**; values > 2 need a TTL-retry DLX cycle, and at the cap a message that has ridden it is parked terminally (see notes) | optional `DeadLetterExchange` (default `null` → exhausted messages are **dropped**); declared when set and `DeclareTopology` is on; a message capped after riding the DLX cycle is parked in `ParkQueue` (else `DeadLetterQueue`) via the default exchange (ACKed and dropped when neither is configured) | log + `OnBackgroundFailure` + published to the `DeadLetterExchange` when one is configured (the early ACK already foreclosed the native reject-without-requeue route); a copy that comes back through the DLX and fails again is parked instead. With `DeadLetterExchange`, `DeadLetterQueue` or `ParkQueue` set the subscriber channel enables publisher confirmations, so an unroutable copy or park fails loudly instead of logging a false success | drain + close 5 s ×2 (consumer cancel, then channel/connection close); ack-after-handler waits for the running handler within what the host budget leaves | — (unacked deliveries hold no expiring lock) |
-| **Redis** | consumer group: `XACK` on success; a failed entry stays in the PEL and is reclaimed after `PendingMessageMinIdleTime` 30 s | broker — PEL delivery count (`XPENDING`) + 1 at claim; at `MaxDeliveryAttempts` the entry is dead-lettered + `XACK`ed | `{prefix}:transport:deadletter` stream (`XADD` auto-creates it); `DeadLetterEnabled` default on | log + `OnBackgroundFailure` + `XADD` to the DLQ stream | drain only | automatic idle-reset heartbeat (`XCLAIM … JUSTID`, no delivery-count bump) every `PendingMessageMinIdleTime`/3 while an entry is in flight (not configurable) |
-| **SQS** | visibility settle: delete on success; failure lets the visibility timeout lapse (or shortens it to `RedeliveryDelay`) | native `ApproximateReceiveCount` + redrive `maxReceiveCount`; no app counter by design | native redrive DLQ; delegated — or declared by `CreateQueues` (default **off**): `{queue}-dlq` + `MaxReceiveCount` 5 | log + `OnBackgroundFailure`; already deleted, no DLQ write possible | drain + up to `ShutdownTimeout` joining the visibility-renewal task on the final batch | opt-in `VisibilityRenewalInterval` (default off); suppressed per message once the failure path schedules `RedeliveryDelay` |
-| **SqlServer** | claimed row: delete on success, reschedule after `RedeliveryDelay` 5 s on failure | store — the `UPDLOCK/READPAST` claim increments `attempts` | `deadletter` logical queue in the same table; `DeadLetterEnabled` default on, optional `DeadLetterRetention` | log + `OnBackgroundFailure` + DLQ row | drain only | automatic fenced renewal at `LockTimeout`/3 (`lock_id` fence) |
+| **Kafka** | manual offset store, auto-committed every `OffsetCommitInterval` 5 s; offsets cannot NACK one message | in-process retries with backoff (100 ms → 5 s); counted per process delivery — a restart before the commit resets the count | `{topic}.deadletter` (or one `DeadLetterTopic`); declared by `CreateTopics` (default on) | retried in-process, then produced to the DLQ topic + log + `OnBackgroundFailure` | drain only | — (stay under `max.poll.interval.ms` instead) |
+| **MongoDB** | claimed document: delete on success, reschedule after `RedeliveryDelay` 5 s on failure | store — the `findOneAndUpdate` claim increments the attempt | `deadletter` logical queue in the same collection; `DeadLetterEnabled` default on, optional `DeadLetterRetention` | DLQ document + log + `OnBackgroundFailure` | drain + close 5 s (change-stream listen join) | automatic fenced renewal at `LockTimeout`/3 (server-clock `$$NOW`, `lock_id` fence) |
+| **NATS** | JetStream explicit ack: ACK on success, NAK + `RedeliveryDelay` 5 s on failure | broker `NumDelivered`; at `MaxDeliveryAttempts` the message is ACKed + dead-lettered — including a delivery whose earlier attempts never settled (process killed mid-handler), refused before execution | `{prefix}.transport.deadletter` subject/stream; declared by `CreateStreams` (default on) | published to the DLQ subject + log + `OnBackgroundFailure` | drain only | automatic in-progress heartbeat every `AckWait`/3 across the in-flight batch (not configurable) |
+| **PostgreSQL** | claimed row: delete on success, reschedule after `RedeliveryDelay` 5 s on failure | store — the `FOR UPDATE SKIP LOCKED` claim increments `attempts` | `deadletter` logical queue in the same table; `DeadLetterEnabled` default on, optional `DeadLetterRetention` | DLQ row + log + `OnBackgroundFailure` | drain + close 5 s (LISTEN task join) | automatic fenced renewal at `LockTimeout`/3 (`lock_id` fence) |
+| **RabbitMQ** | per-delivery `basic.ack`; `basic.nack` + requeue on failure | broker `x-death` header + `redelivered` flag, judged before the handler runs; **`MaxDeliveryAttempts` default `0` = unlimited**; values > 2 need a TTL-retry DLX cycle, and at the cap a message that has ridden it is parked terminally (see notes) | optional `DeadLetterExchange` (default `null` → exhausted messages are **dropped**); declared when set and `DeclareTopology` is on; a message capped after riding the DLX cycle is parked in `ParkQueue` (else `DeadLetterQueue`) via the default exchange (ACKed and dropped when neither is configured) | published to the `DeadLetterExchange` when one is configured (the early ACK already foreclosed the native reject-without-requeue route) + log + `OnBackgroundFailure`; a copy that comes back through the DLX and fails again is parked instead. With `DeadLetterExchange`, `DeadLetterQueue` or `ParkQueue` set the subscriber channel enables publisher confirmations, so an unroutable copy or park fails loudly instead of logging a false success | drain + close 5 s ×2 (consumer cancel, then channel/connection close); ack-after-handler waits for the running handler within what the host budget leaves | — (unacked deliveries hold no expiring lock) |
+| **Redis** | consumer group: `XACK` on success; a failed entry stays in the PEL and is reclaimed after `PendingMessageMinIdleTime` 30 s | broker — PEL delivery count (`XPENDING`) + 1 at claim; at `MaxDeliveryAttempts` the entry is dead-lettered + `XACK`ed | `{prefix}:transport:deadletter` stream (`XADD` auto-creates it); `DeadLetterEnabled` default on | `XADD` to the DLQ stream + log + `OnBackgroundFailure` | drain only | automatic idle-reset heartbeat (`XCLAIM … JUSTID`, no delivery-count bump) every `PendingMessageMinIdleTime`/3 while an entry is in flight (not configurable) |
+| **SQS** | visibility settle: delete on success; failure lets the visibility timeout lapse (or shortens it to `RedeliveryDelay`) | native `ApproximateReceiveCount` + redrive `maxReceiveCount`; no app counter by design | native redrive DLQ; delegated — or declared by `CreateQueues` (default **off**): `{queue}-dlq` + `MaxReceiveCount` 5 | log + `OnBackgroundFailure`; already deleted, no DLQ write possible | drain + close 5 s (the visibility-renewal join on the final batch, which the hand-back of its unstarted messages overlaps — spent with renewal off too; validated in both ack modes) | opt-in `VisibilityRenewalInterval` (default off); suppressed per message once the failure path schedules `RedeliveryDelay` |
+| **SqlServer** | claimed row: delete on success, reschedule after `RedeliveryDelay` 5 s on failure | store — the `UPDLOCK/READPAST` claim increments `attempts` | `deadletter` logical queue in the same table; `DeadLetterEnabled` default on, optional `DeadLetterRetention` | DLQ row + log + `OnBackgroundFailure` | drain only | automatic fenced renewal at `LockTimeout`/3 (`lock_id` fence) |
 
 ## Delayed delivery (`IDelayedWorkerTransport`)
 
@@ -156,7 +171,7 @@ remainder, which is how capped transports chunk long delays with no transport-sp
 | **SQS** | ✅ | 15 min (chunked) | `DelaySeconds`; standard queues only — a FIFO worker queue advertises no delay capability (`MaxPublishDelay` = zero), so flow timers fall back in process and a delayed enqueue fails fast at publish |
 | **PostgreSQL** | ✅ | — | insert with `available_at = now() + delay` (database clock); pickup latency ≤ `EmptyPollDelay` |
 | **SqlServer** | ✅ | — | insert with `available_at = SYSUTCDATETIME() + delay`; pickup latency ≤ `EmptyPollDelay` |
-| **MongoDB** | ✅ | — | insert stamps `available_at` server-relative (`$$NOW + delay`) via an atomic upsert pipeline, so client clock skew cannot shift it |
+| **MongoDB** | ✅ | — | insert stamps `available_at` server-relative (`$$NOW + delay`) via an atomic upsert pipeline, so client clock skew cannot shift it; an insert due more than a second out does not wake the queue's change-stream watchers (nothing could claim it yet); pickup latency ≤ `EmptyPollDelay` |
 | **Kafka, RabbitMQ, GooglePubSub, Redis, NATS** | — | — | no native mechanism; flow timers wait in process under the lease, bare delayed enqueue throws with guidance |
 
 ## What `OnBackgroundFailure` receives
@@ -187,10 +202,18 @@ Only cells that need more than a phrase.
   locks — and, when a lock lapses, counts — every message a receive hands over, so a batch worked
   serially let a process-killing handler take its batch-mates' `DeliveryCount` with it on every
   crash, and a long handler kept them locked while idle peers waited. `MaxMessagesPerReceive`
-  applies to early ACK and to the response subscriber (whose handler is the library's own).
-  Once the flow engine hands a delivery back at `ApplicationStopping` (left locked, not
-  abandoned), the subscriber stops receiving until its own stop, so the wake-ups the engine hands
-  over reach a replica still running instead of being taken, and locked, by this stopping host.
+  applies to early ACK and to the response subscriber — whose handler is not always short: a
+  response whose waiter is gone runs that correlation's recovery callbacks inline, retries
+  included, so with `ResponseSubscriber.LockRenewalInterval = null` slow callbacks can let the
+  locks of the batch-mates behind them lapse and a peer runs those callbacks too (callbacks are
+  at-least-once by contract; keep renewal on where they can be slow).
+  From `ApplicationStopping` on, the worker subscriber takes nothing new: it stops receiving until
+  its own stop, and a batch received as the stop began is abandoned rather than dispatched (under
+  early ACK never completed first) — so the wake-ups the flow engine's hand-overs publish reach a
+  replica still running instead of being taken, handed back again and, under early ACK, lost on
+  this stopping host. A delivery the engine hands back (left locked, not abandoned) ends receiving
+  the same way, which is the only stop signal when no `IHostApplicationLifetime` is registered. The
+  response subscriber is never gated: it keeps serving waiters.
   `LockRenewalInterval` (10 s, cancellable per beat) renews the peek-lock of the message in
   the handler, so slow handlers do not hit `MessageLockLostException` redeliveries of
   already-processed messages
@@ -208,10 +231,17 @@ Only cells that need more than a phrase.
   `LockRenewalInterval = null`, and in early ACK alongside `BackgroundDrainTimeout`: without a
   renewal join to overlap, abandoning a batch's unstarted messages and the receiver close share
   that one `ShutdownTimeout`). With renewal off the worker transport advertises the
-  5-minute `LockDuration` maximum as its in-flight ceiling to the durable-flow engine.
+  5-minute `LockDuration` maximum as its in-flight ceiling to the durable-flow engine — only an
+  upper bound, since the entity's real `LockDuration` (60 s by default) is a value the transport
+  never reads, so the worker subscriber warns at startup in that configuration. A renewal that
+  races the handler's own Complete/Abandon/DeadLetter is skipped once settlement has begun, and a
+  renew failing behind a settle is logged at Debug, not as a lost lock.
 - `PrefetchCount` (default 0) buffers locked messages the renewal heartbeat never reaches; in
   ack-after-handler mode keep `PrefetchCount × handler latency` well under `LockDuration`, or
-  leave it at 0 (startup warns when it is positive).
+  leave it at 0. In early ACK the buffer waits the same way whenever the background queue stays
+  saturated — the receive loop waits for capacity while the buffered locks tick — so keep it at 0,
+  or well under what the background workers drain within one `LockDuration`. Startup warns when
+  it is positive in either mode.
 - Queue names are compared case-insensitively in the worker/response and reply-target collision
   guards: Service Bus entity names are case-insensitive, so `Jobs` and `jobs` are one entity.
 - Every abandon burns broker `DeliveryCount`, which also counts toward the *entity's*
@@ -238,8 +268,17 @@ Only cells that need more than a phrase.
 - In early ACK, the streaming pull's flow control is bounded to `BackgroundQueueCapacity`
   (`maxOutstandingElementCount`), and a full background queue **parks the delivery callback
   until capacity frees instead of NACKing** — a queue-full NACK would burn a
-  `DeadLetterPolicy` delivery attempt on a healthy, never-executed message. A NACK is returned
-  only when the enqueue fails during shutdown/dispose, so the message redelivers elsewhere.
+  `DeadLetterPolicy` delivery attempt on a healthy, never-executed message. Apart from the
+  host-stop hold below (a NACK at the client stop), a NACK is returned only when the enqueue fails
+  during shutdown/dispose, so the message redelivers elsewhere.
+  From `ApplicationStopping` on, the early-ACK worker acknowledges nothing new: the streaming pull
+  cannot stop short of the client stop, so each delivery arriving then — and any parked in the
+  queue-full wait when the stop begins — is **held unstarted** and handed back with the client
+  stop (see below), instead of being ACKed and then, if the flow engine hands it back on this
+  stopping host, lost. Each such delivery costs one `DeadLetterPolicy` attempt. The response
+  subscriber is never gated. The ack-after-handler worker is not gated this way: it keeps
+  starting deliveries until its own stop's drain (holding every one after the first hand-back
+  would cost non-flow jobs an attempt each — a deferred behaviour choice).
 - On stop in ack-after-handler mode the subscriber first **drains the handlers already running**
   for up to `BackgroundDrainTimeout` (default 20 s) — shortened to what `HostShutdownTimeout`
   still leaves after `ShutdownTimeout`, measured from `ApplicationStopping` because hosted
@@ -253,7 +292,12 @@ Only cells that need more than a phrase.
   at `ApplicationStopping` — are **held, not NACKed**, and handed back with the client stop: the
   streaming pull runs until then, so an immediate NACK was redelivered straight back, often to
   the same stream, in a loop that spent a `DeadLetterPolicy`'s delivery attempts; held, they keep
-  their flow-control slots, so the pull stalls once the slots are full. Startup validates `ShutdownTimeout` against
+  their flow-control slots, so the pull stalls once the slots are full. Held is not free, though:
+  every handler that finishes during the drain frees its slot, the pull refills it with a delivery
+  that is then held, and each held delivery costs one `DeadLetterPolicy` attempt (plus the
+  `RetryPolicy` delay) when the client stop hands it back — at most one refill per slot freed
+  during the drain, per replica stop. Size `MaxOutstandingMessages` and the policy's
+  `maxDeliveryAttempts` for rolling deploys accordingly. Startup validates `ShutdownTimeout` against
   `HostShutdownTimeout` in both ack modes.
 - Reply targets name the correlation attribute (`correlationIdAttribute`) a remote producer must
   set, like every other broker transport's `correlationId*` property. A correlation id over the
@@ -289,13 +333,45 @@ Only cells that need more than a phrase.
   committed, and retrying a committed message forever wedged the background worker with no
   record — after which the message is dead-lettered and surfaced via `OnBackgroundFailure`. A
   flow's host-stop hand-back (`DurableFlowInterruptedException`) of an early-ACK job ends the
-  ladder at once and is not a failure: it is logged as a Warning, surfaced via
-  `OnBackgroundFailure` and dead-lettered with reason `handed_back_after_commit` (the offset is
+  ladder at once and is not a failure — nor a drain lapse, even when it arrives after the drain
+  budget has lapsed: it is dead-lettered with reason `handed_back_after_commit` (the offset is
   already committed, so the copy is the only way to replay it; the flow's checkpoints make that
-  replay safe). With `DeadLetterEnabled = false` no copy is written: the hand-back is logged at
-  Error instead, because the wake-up is lost unless `OnBackgroundFailure` records it.
+  replay safe), then logged as a Warning and surfaced via `OnBackgroundFailure`. With no copy
+  written (`DeadLetterEnabled = false`, or the produce failed) the hand-back is logged at Error
+  instead, because the wake-up is lost unless `OnBackgroundFailure` records it. Every early-ACK
+  record — hand-back, failure at the cap, drain lapse — is written to the dead-letter topic
+  *before* `OnBackgroundFailure` is awaited, and the log names the copy only when one was
+  written: awaited first, a slow callback during the stop held the only durable record back
+  until the drain had lapsed and the producer was disposed.
 - In early ACK, a full background queue pauses consumption on all assigned partitions
-  (re-checked every `BackpressurePollDelay` 50 ms) rather than dropping or re-fetching.
+  (re-checked every `BackpressurePollDelay` 50 ms) rather than dropping or re-fetching. The
+  pause holds across a rebalance — librdkafka keeps it on a partition revoked and handed back,
+  so a partition returned while the queue is full does not fetch into it — and is lifted once
+  the queue has room: on a partition that is unassigned at that moment (an eager rebalance
+  revoked it and the group has not re-joined yet) as soon as it is assigned again. Lifting only
+  the current assignment — empty in that window — left the partitions handed back paused for
+  the rest of the consumer's life, with nothing fetched to trip another pause.
+- **Worker intake stops at host stop.** From `ApplicationStopping` on, the worker subscriber takes
+  no new message (the response subscriber is not affected): its assignment is paused while the
+  poll loop keeps polling for group liveness, a record it still consumes (fetched before the
+  pause took hold) is neither started nor stored — its partition's next owner redelivers it —
+  and, in ack-after-handler mode, messages held behind a detached handler are not started (the
+  running handler still settles and stores its offset). Before, the subscriber — which stops
+  after the web host and the response subscriber — kept consuming in that window: under early
+  ACK each flow wake-up this host's own timer hand-overs had just published for a live replica
+  was committed at enqueue, ran into the stopping host's hand-back, and became a
+  `handed_back_after_commit` copy stranding its flow. Two at-least-once edges remain (never a
+  loss): once intake has closed, a detached handler whose partition is revoked and re-assigned
+  during the stop cannot be re-adopted (nothing of the new assignment is consumed to decide it —
+  see *revocation-aware* below), so its message runs again on the partition's next owner; and a
+  malformed message held behind a detached handler is buried off the poll thread, so a revoke
+  during that burial can leave a second dead-letter copy of it.
+- The drain's reserved quarter dead-letters the messages still queued first, as far as the reserve
+  reaches, then reports each buried one through `OnBackgroundFailure`, waiting for each callback
+  only as long as the reserve lasts (a callback still running then is logged and no longer waited
+  for); anything left unburied is counted in one Error. Reported first and waited for without a
+  bound, one hung callback held the stop past its budget, and the entries behind it were neither
+  buried nor counted.
 - A message that cannot be projected at all (empty payload, unresolvable correlation id) is
   produced to the dead-letter topic and its offset stored, ignoring the stopping token like every
   other settlement path — a shutdown landing mid-burial would leave the poison message neither
@@ -311,7 +387,8 @@ Only cells that need more than a phrase.
   assignment generation and lifts the pause taken behind a detached handler: librdkafka itself
   keeps an application pause across a revoke and a re-assignment, so a partition paused behind a
   detached handler used to come back to the same member still paused and never fetch again (the
-  early-ACK backpressure pause is left to the poll loop, which lifts it once the queue has room).
+  early-ACK backpressure pause is kept across the revoke instead, and lifted once the queue has
+  room — see above).
   The package keeps librdkafka's default assignor (`range,roundrobin`, the eager protocol), which
   revokes *every* partition on every rebalance — any member joining or leaving — and usually hands
   most of them straight back. The first message of the new assignment (it starts at the group's
@@ -338,7 +415,17 @@ Only cells that need more than a phrase.
   has its earlier `sourceTopic`/`reason`/`exception*` set replaced; any other record keeps all of
   its own headers, including ones named `reason` or `attempts`. `exceptionMessage` (then
   `exceptionType`) is shortened so the copy stays under the producer's `message.max.bytes` (from
-  `ConfigureProducer`, default 1,000,000).
+  `ConfigureProducer`, default 1,000,000). The other burial headers cannot be shortened, so the
+  worker transport reserves them at publish: while `DeadLetterEnabled`, a job whose record plus
+  their widest size would exceed the limit is refused before it is produced (an
+  `InvalidOperationException` naming the sizes; nothing is published) — accepted, a failed run of
+  it could never be buried and the subscriber restarted on it for ever. A durable-flow start
+  refused this way is still retried by `StartAsync`'s ladder and surfaces as
+  `DurableFlowNotDispatchedException`; do not retry that start — every retry is refused the same
+  way — but raise the producer's `message.max.bytes` (or shrink the input). A record that still
+  leaves no room (a foreign one, or one published under a larger limit) fails its burial before the
+  produce with an error naming the size and `ConfigureProducer` as the remedy, instead of one
+  blaming the dead-letter topic.
 - **Publish retries are for transient errors only.** `Local_MsgTimedOut` (raised only after
   librdkafka already retried for `message.timeout.ms`), message/record-size and topic/cluster
   authorization errors fail the publish at once instead of burning `PublishMaxAttempts`.
@@ -358,12 +445,17 @@ Only cells that need more than a phrase.
   failure disabled the whole subscriber for as long as an unrelated long handler took and the
   configured reconnect policy never ran. A graceful stop is not bounded here; the host's shutdown
   budget bounds it.
-- Every dead-letter produce's retry ladder is bounded to a quarter of `MaxPollInterval`: the
-  malformed-message discard runs it on the poll thread, and an undeliverable dead-letter topic
-  (auto-create off, a leaderless partition, an over-sized payload) would otherwise wait out
-  librdkafka's `message.timeout.ms` per attempt, overrun `max.poll.interval.ms`, and evict the
-  consumer mid-burial; the ack-after-handler burial runs inside the (possibly detached) handler
-  task and keeps the same bound so a partition is not parked on it either.
+- Every dead-letter produce's retry ladder is bounded to a quarter of the `max.poll.interval.ms`
+  the consumer actually runs with (`MaxPollInterval`, or the value `ConfigureConsumer` sets — the
+  poll-gap validation reads the same effective value): the malformed-message discard runs it on
+  the poll thread, and an undeliverable dead-letter topic (auto-create off, a leaderless
+  partition, an over-sized payload) would otherwise wait out librdkafka's `message.timeout.ms` per
+  attempt, overrun `max.poll.interval.ms`, and evict the consumer mid-burial; the
+  ack-after-handler burial runs inside the (possibly detached) handler task and keeps the same
+  bound so a partition is not parked on it either. At most one burial blocks the poll thread per
+  poll: a malformed message held behind a detached handler is buried detached in its turn, like a
+  handler, and its offset stored on a later tick — buried inline, every held one behind every
+  settled partition was produced back to back with no poll in between.
 - **A burial that fails for good faults the subscriber** (ack-after-handler mode and the
   malformed-message discard). Kafka commits a partition *position*, not per-record
   acknowledgements, so merely leaving the failed message's offset unstored protects nothing: the
@@ -373,9 +465,10 @@ Only cells that need more than a phrase.
   supervisor rebuilds it after its backoff (`SubscriberRetryBaseDelay` → `SubscriberRetryMaxDelay`);
   the restarted consumer re-consumes from the committed position, re-runs the handler up to
   `MaxDeliveryAttempts`, and retries the burial — a loud, bounded-rate loop that parks **every**
-  partition of that subscriber at the poison message until the dead-letter topic is fixed (each
-  restart logs the failure). That is the at-least-once outcome; the previous swallow was a silent
-  loss. Messages already committed at enqueue time (early ACK) are outside this rule: their
+  partition of that subscriber at the poison message until the dead-letter topic is fixed — or,
+  for a record whose copy cannot fit, the producer's `message.max.bytes` is raised (each restart
+  logs the failure and names which). That is the at-least-once outcome; the previous swallow was
+  a silent loss. Messages already committed at enqueue time (early ACK) are outside this rule: their
   burial failure is logged and surfaced through `OnBackgroundFailure`, because Kafka will not
   redeliver them either way.
 
@@ -422,9 +515,9 @@ Only cells that need more than a phrase.
   unfloored share turned a large prefetch into a republish storm (1,000 → a 0.9 s timer hop).
   `PrefetchCount = 0`, AMQP's "unlimited" (which the subscriber rejects at startup), advertises
   that floor. When the share falls below the floor — `PrefetchCount` above 30 at the default
-  30-minute timeout — the worker subscriber logs a startup warning with durable flows
-  registered: the last buffered delivery can then outlive `consumer_timeout` when most of the
-  buffer is parked flows.
+  30-minute timeout — the worker subscriber logs a startup warning in ack-after-handler mode
+  (durable-flow jobs ride the worker queue): the last buffered delivery can then outlive
+  `consumer_timeout` when most of the buffer is parked flows.
 - In early ACK, a full background queue parks the delivery on the bounded in-process channel
   until capacity frees; a NACK with requeue is sent only when that enqueue fails during
   shutdown/dispose (or the channel it arrived on dies), so backpressure itself never churns
@@ -438,7 +531,13 @@ Only cells that need more than a phrase.
   publishes its dead-letter copy through the live channel. Only a host stop drains it. A failed
   job's copy that comes back through the dead-letter exchange (a TTL-retry queue bound to it)
   and fails again is parked in `ParkQueue`/`DeadLetterQueue` instead of copied into the cycle a
-  second time (dropped with an error when neither is set).
+  second time (dropped with an error when neither is set). That rule is for handler failures
+  only: a returned copy that is handed back at host stop again, or lapses in a drain, is no
+  failure of the job and goes to the dead-letter exchange again. When the drain budget lapses,
+  the stop dead-letters the entries still queued, as far as the reserved quarter reaches, before
+  any callback, then reports them through `OnBackgroundFailure` while the reserve lasts — entries
+  the reserve no longer covers get no callback, counted in a Warning — and anything left unburied
+  is counted in one Error; the copy is always written before the callback on the worker path too.
 - **A graceful stop does not cut off the running handler (ack-after-handler).** The stop cancels
   the consumer, waits for the handler still running in its delivery callback — up to
   `BackgroundDrainTimeout`, shortened to what `HostShutdownTimeout` leaves after the two
@@ -457,17 +556,30 @@ Only cells that need more than a phrase.
   `x-death` already counts further). With
   `MaxDeliveryAttempts = 1` that is past the cap, so the redelivery is rejected (dead-lettered,
   or dropped without a dead-letter exchange) before its handler runs, and the flow's wake-up is
-  lost; the same happens to any delivery requeued under a running handler. The worker subscriber
-  logs a startup warning for `MaxDeliveryAttempts = 1` when durable flows are registered — use 2
-  or more (or 0). In early ACK the delivery was already acknowledged and is never redelivered:
-  a hand-back is logged at Warning (not Error), reported through `OnBackgroundFailure`, and
-  copied to the dead-letter exchange with an `AR-DeadLetter-Reason` that starts with
-  `handed_back_after_commit:` — replaying it is safe, the run resumes from its checkpoint.
-  Without a `DeadLetterExchange` (the default) no copy is written: the hand-back is logged at
-  Error instead, because the wake-up is lost unless `OnBackgroundFailure` records it.
+  lost; the same happens to any delivery requeued under a running handler. In that mode the worker
+  subscriber logs a startup warning for `MaxDeliveryAttempts = 1` (durable-flow jobs ride the
+  worker queue) — use 2 or more (or 0). In early ACK the delivery was already acknowledged and is
+  never redelivered: a hand-back is copied to the dead-letter exchange with an
+  `AR-DeadLetter-Reason` that starts with `handed_back_after_commit:` — replaying it is safe, the
+  run resumes from its checkpoint — then logged at Warning (not Error) and reported through
+  `OnBackgroundFailure`. When no copy could be written — no `DeadLetterExchange` (the default), or
+  the publish failed — the hand-back is logged at Error instead, because the wake-up is lost unless
+  `OnBackgroundFailure` records it; a drain lapse is reported the same way.
+- **The worker subscriber takes no new delivery once the host is stopping.** From
+  `ApplicationStopping` on — which fires before any hosted service stops, and the worker
+  subscriber stops after the response subscriber and the web host — it neither starts nor settles
+  a delivery (in early ACK it enqueues and ACKs none, and a delivery waiting for a free background
+  slot is NACKed back once): each stays unacknowledged, holding a prefetch credit so the broker soon
+  stops sending to this consumer, until the channel close at the subscriber's own stop requeues it
+  for a live replica. A durable-flow wake-up among them — host stop publishes one for every
+  in-process timer it hands over — would only have been handed back here (the flow engine hands back
+  every timer wait that starts on a stopping host), in early ACK as a dead-letter copy. The requeue
+  sets `redelivered`, so in ack-after-handler mode such a delivery comes back as attempt 2 (see the
+  `MaxDeliveryAttempts = 1` warning above). The response subscriber keeps delivering throughout.
 - Shutdown spends `ShutdownTimeout` twice — cancelling the consumer, then closing the channel
   and connection after the background drain — and startup validation sums both plus
-  `BackgroundDrainTimeout` against `HostShutdownTimeout` (early ACK).
+  `BackgroundDrainTimeout` against `HostShutdownTimeout` (early ACK). `ShutdownTimeout` itself
+  must be positive and timer-backed in both ack modes (startup fails otherwise).
 - A correlation id longer than an AMQP short string (255 UTF-8 bytes — as few as ~86 characters
   above U+0800) travels in the `CorrelationIdHeader` header only; the native `correlation-id`
   property, which the client cannot encode past that, is left unset.
@@ -502,8 +614,24 @@ Only cells that need more than a phrase.
   still waiting their turn) with `XCLAIM … JUSTID` every `PendingMessageMinIdleTime`/3, resetting
   the idle clock without bumping the delivery count, so a slow handler is not stolen by a peer's
   reclaim. The heartbeat is not tied to the stop signal — a handler takes no token and outlives
-  it — and ends only when the loop lets go of the entry. On stop nothing new starts: the rest of
-  a batch, and any reclaim candidate not yet claimed, stays pending (Redis has no NACK) for a peer.
+  it — and ends only when the loop lets go of the entry. On stop nothing new starts and nothing
+  more is read or claimed (the stream adapter checks the stop before it sends a command — Redis
+  queues a command the moment it is called, so one sent with a cancelled token still moved an
+  entry into the stopping consumer's pending list): the rest of a batch, and any reclaim candidate
+  not yet claimed, stays pending (Redis has no NACK) for a peer, and from the stop on the heartbeat
+  keeps only the entry in the handler. The worker subscriber stops at host stop itself
+  (`ApplicationStopping`, before its own token): from then on it reads and claims nothing and
+  starts nothing it has read — an early-ACK entry is never enqueued and ACKed after it — so the
+  wake-ups this host's own hand-overs publish are left to a live replica. The response subscriber
+  keeps delivering to waiters through the stop.
+- Early ACK at stop: `BackgroundDrainTimeout` is split (see above) — three quarters let queued and
+  running handlers finish, then the stop itself dead-letters the entries still queued (reason
+  `drain_budget_lapsed_after_ack`), as far as the reserved quarter reaches, before any callback,
+  and only then reports them through `OnBackgroundFailure` while the reserve lasts (NATS parity: a
+  slow callback cannot keep the entries behind it from being buried); whatever the reserve could
+  not bury is logged at Error with its count, lost at process exit (it was ACKed at enqueue).
+  Before, the stop waited out the whole budget and left the queued entries to a worker that came
+  free only after the host had moved on.
 - In early ACK, `XREADGROUP` reads and `XCLAIM` pending claims are clamped to the dispatcher's
   free capacity (Azure Service Bus/SQS parity), so an entry is never read only to be deferred
   into the PEL with a bumped delivery count — backpressure pauses consumption instead of
@@ -512,15 +640,17 @@ Only cells that need more than a phrase.
   type, since it arrives while the subscriber's own token is still live: the entry stays pending,
   unsettled, with no failure log and no dead-letter write of its own (the redelivery still counts:
   a hand-back at `MaxDeliveryAttempts` is dead-lettered on redelivery without running). An
-  early-ACK entry was already ACKed, so Redis can never redeliver it: its hand-back is logged as a
-  warning, reported through `OnBackgroundFailure`, and dead-lettered with reason
-  `handed_back_after_commit` (replaying the copy is safe — the run resumes from its last
-  checkpoint); with `DeadLetterEnabled = false` no copy can be written, so it is logged as an error
-  instead — the wake-up is lost unless your `OnBackgroundFailure` records it. After the first
-  hand-back the subscriber reads and claims nothing more until its own stop, so the rest of the stop
-  window's wake-ups stay unread (or pending, unclaimed) for a live peer instead of being handed back
-  one by one. (The engine raises it only while the host is stopping; application code must never
-  throw it, or the subscriber stops consuming until the process restarts.)
+  early-ACK entry was already ACKed, so Redis can never redeliver it: its hand-back is
+  dead-lettered with reason `handed_back_after_commit` (replaying the copy is safe — the run
+  resumes from its last checkpoint), logged as a warning, and only then reported through
+  `OnBackgroundFailure` — every early-ACK arm that writes a copy writes it first, so a slow
+  callback cannot outlive the stop before the only durable record exists. With
+  `DeadLetterEnabled = false`, or when the dead-letter write fails, no copy exists, so it is logged
+  as an error instead — the wake-up is lost unless your `OnBackgroundFailure` records it. After the
+  first hand-back the subscriber reads and claims nothing more until its own stop, so the rest of
+  the stop window's wake-ups stay unread (or pending, unclaimed) for a live peer instead of being
+  handed back one by one. (The engine raises it only while the host is stopping; application code
+  must never throw it, or the subscriber stops consuming until the process restarts.)
 - The ack-after-handler reclaim loop re-reads each candidate's pending entry (`XPENDING` for that
   one id) right before claiming it, so the attempt number reflects claims a peer made while this
   consumer worked through the earlier candidates.
@@ -531,7 +661,9 @@ Only cells that need more than a phrase.
   trimmed while still pending; that tombstone is ACKed by its pending id so it drains rather than
   being re-dead-lettered every claim cycle (7.0+ drops such an id from the pending list itself).
   Either way the job is gone — see `StreamMaxLength` below. Discarding an unparsable entry is a
-  settlement and ignores cancellation like every other one.
+  settlement and ignores cancellation like every other one. With `DeadLetterEnabled = false` a
+  burial is only the `XACK`: the entry is dropped with no copy, and that drop is logged at Error
+  (with the failure that buried it) — no log line claims a dead-letter write that did not happen.
 - **`StreamMaxLength` (default `100000`) evicts unprocessed work.** Worker publishes append with
   `XADD … MAXLEN ~ N`, and Redis trims by length alone, whatever the consumer group has read: past
   the cap the oldest entries are deleted — including jobs never read and jobs pending in a
@@ -559,9 +691,31 @@ Only cells that need more than a phrase.
   of a cluster in transition — `TRYAGAIN` (the two-key append during its slot's migration),
   `CLUSTERDOWN`, `LOADING`, `MASTERDOWN`, `READONLY` — which the server raises before running
   anything; every other server error fails the publish at once.
+- **An acknowledged write is only as durable as your Redis deployment.** A worker publish (a flow
+  wake-up included) returns once the primary has run the append script, and the Redis channel's
+  recovery registrations return once the primary has applied the `SET`; neither waits for a
+  replica (`WAIT`) or for the append-only file to reach disk. Redis replicates asynchronously, so a
+  primary that fails over inside the replication lag — or restarts from a snapshot or a
+  non-fsynced AOF — can roll back an acknowledged job (with its dedup marker) or a registration:
+  the job never runs, and a late response finds no registration to recover through. Run replicas
+  with AOF persistence (`appendfsync everysec` or `always`) where that matters; `WAIT` would narrow
+  the window but not close it (a timed-out `WAIT` still leaves the write on the primary, and the
+  dedup marker makes a retry of the publish safe). The MongoDB transport, by contrast, waits for a
+  bounded `w: "majority"` on its publishes (a publish whose wait times out is kept, with a warning,
+  and can still be rolled back — see [its notes](#postgresql-sql-server-mongodb)).
 
 ### NATS
 
+- **The NATS *channel* never loses a response silently to its client buffer.** NATS.Net buffers each
+  wait's inbound responses in a bounded subscription channel (the connection's
+  `SubPendingChannelCapacity`, 16,384 by default) behind the wait's serial processing, and drops
+  the newest once it is full — a slow `Until` predicate under a flood of progress messages. A
+  dropped message was never acknowledged, so its publisher counted it delivered. The channel
+  listens for the client's `MessageDropped` event: the wait is faulted with the overload form of
+  `AsyncResponseIndeterminateDeliveryException` (the dropped message may have been the terminal
+  one), ended — its registration deleted, its subscription closed, what is still buffered skipped —
+  and counted in `asyncresponse.channel.overloaded_waits` (Redis-channel parity). Durable flows
+  restart the (idempotent) step.
 - Attempts are the broker's `NumDelivered` for the JetStream consumer; the consumer is durable,
   so counts survive subscriber restarts (unlike Kafka's in-process counter). The consumer is
   created with `MaxDeliver = -1` because the dispatcher itself bounds attempts — including a
@@ -598,17 +752,27 @@ Only cells that need more than a phrase.
 - A flow handing its delivery back because the host is stopping (`DurableFlowInterruptedException`)
   is treated like the subscriber's own shutdown even while the subscriber's token is still live
   (the engine reacts to `ApplicationStopping`, which fires before any hosted service stops): the
-  delivery is left unsettled for redelivery after `AckWait`, with no NAK, failure log or
-  dead-letter. JetStream still counts that delivery attempt. In early ACK the message was already
-  ACKed, so JetStream can never redeliver it: the hand-back is logged as a warning, reported through
-  `OnBackgroundFailure`, and dead-lettered with an `AR-DeadLetter-Reason` starting
+  subscriber stops fetching first, then NAKs the delivery with no delay — so it goes straight to a
+  live peer instead of sitting out its `AckWait` — with no failure log or dead-letter. JetStream
+  still counts that delivery attempt. In early ACK the message was already ACKed, so JetStream can
+  never redeliver it: the hand-back is first dead-lettered with an `AR-DeadLetter-Reason` starting
   `handed_back_after_commit` (replaying the copy is safe — the run resumes from its last
-  checkpoint). With dead-lettering disabled no copy can be written, so it is logged as an error
-  instead: the wake-up is lost unless your `OnBackgroundFailure` records it. After the first
+  checkpoint), then logged as a warning and reported through `OnBackgroundFailure`. When no copy is
+  written — dead-lettering disabled, or the copy's write failed — it is logged as an error instead:
+  the wake-up is lost unless your `OnBackgroundFailure` records it. After the first
   hand-back the subscriber fetches nothing more until its own stop; what a batch had not started — a
   message waiting for room in the early-ACK queue included — is NAKed with no delay for a live peer.
   (The engine raises it only while the host is stopping; application code must never throw it, or
   the subscriber stops consuming until the process restarts.)
+- **The worker subscriber stops taking deliveries at host stop.** From `ApplicationStopping` on —
+  when an `IHostApplicationLifetime` is registered, as under the Generic Host — the flow engine hands
+  back every timer or lease wait that starts on this host, so a job taken then would only run up to
+  its first wait and come back (in early ACK, already ACKed: a dead-letter copy). The worker
+  subscriber therefore ends an idle long poll at once and fetches nothing more; a batch's unstarted
+  messages — one waiting for room in the early-ACK queue included — are NAKed with no delay for a
+  live peer, and nothing is ACKed at enqueue after that point. Handlers already running are not
+  interrupted. The response subscriber is not gated: waiters keep being served until its own stop.
+  Without a registered lifetime the first hand-back (above) is the only signal.
 - Consumption fetches what is already available (`FetchNoWaitAsync`), or long-polls for a single
   message (`FetchAsync`) when idle, and dispatches serially. In the default ack-after-handler mode
   every fetch takes exactly **one** message, whatever `BatchSize` says: JetStream counts a
@@ -631,14 +795,20 @@ Only cells that need more than a phrase.
 - The durable consumers are created when missing and never modified — whatever `CreateStreams`
   says — so settings an operator tuned on a live consumer (`MaxAckPending`, `BackOff`, metadata)
   survive every subscriber start. An existing consumer this transport cannot work with is refused
-  by name: a push consumer, an ack policy other than explicit, or a finite max deliver at or below
+  by name: a push consumer, an ack policy other than explicit, a finite max deliver at or below
   `MaxDeliveryAttempts` — any finite one when it is 0 (the server would stop redelivering before the dispatcher could bury the
-  message). A refusal does not fail host startup: every subscriber attempt fails with that error,
+  message), a headers-only consumer (every job would arrive without its body, be read as
+  unparsable and acknowledged without running), or a consumer whose filter subject(s) do not
+  capture the transport's subject (every long poll would come back empty while the jobs pile up).
+  A refusal does not fail host startup: every subscriber attempt fails with that error,
   logged as a warning and retried with backoff, and the subscriber consumes nothing until the
   consumer is fixed or deleted (the next attempt then recreates it). An existing consumer's own ack
   wait is used as it is: the in-progress heartbeat renews at a third of the **shorter** of the live
   ack wait and `AckWait`, so raising `AckWait` without editing the consumer keeps renewing inside
-  the window the server actually enforces. The drift is logged once as a warning; apply the new
+  the window the server actually enforces. On a consumer with a `BackOff`, the live ack wait is its
+  shortest step: the server enforces `BackOff[n]` as the window of the n-th redelivery but reports
+  only `BackOff[0]`, so a non-ascending `BackOff` would otherwise lapse under a live handler. The
+  drift is logged once as a warning; apply the new
   value to the consumer yourself (`nats consumer edit`) to get the longer window.
 - Header-first correlation reads NATS headers through NATS.Net's default ASCII header encoding,
   which turns every non-ASCII character into `?`. A header that is exactly the `?`-mangled form of
@@ -662,12 +832,21 @@ Only cells that need more than a phrase.
   serially let a process-killing handler bump its batch-mates' receive counts toward the redrive
   policy on every crash, spent the later positions' visibility (and 12-hour ceiling) while they
   waited, and on FIFO ran a failed message's same-group batch-mates ahead of its redelivery.
-  `MaxMessagesPerReceive` applies to early ACK and to the response subscriber (whose handler is
-  the library's own). `ReceiveWaitTime = 0` (short polling) backs off on the subscriber retry
-  schedule between empty receives instead of re-polling once per round trip. Once the flow
-  engine hands a delivery back at `ApplicationStopping` (its visibility left untouched), the
-  subscriber stops receiving until its own stop, so the wake-ups the engine hands over reach a
-  replica still running instead of being taken, and hidden, by this stopping host.
+  `MaxMessagesPerReceive` applies to early ACK and to the response subscriber — whose handler is
+  not always short: a response whose waiter is gone runs that correlation's recovery callbacks
+  inline, retries included, so slow callbacks can outlast the visibility of the batch-mates behind
+  them and a peer runs those callbacks too (callbacks are at-least-once by contract; set
+  `ResponseSubscriber.VisibilityTimeout` and `VisibilityRenewalInterval` where they can be slow).
+  `ReceiveWaitTime = 0` (short polling) backs off on the subscriber retry schedule between empty
+  receives instead of re-polling once per round trip. From `ApplicationStopping` on, the worker
+  subscriber takes nothing new: it stops receiving until its own stop, and a batch received as the
+  stop began is made visible again rather than dispatched (under early ACK never deleted first) —
+  so the wake-ups the flow engine's hand-overs publish reach a replica still running instead of
+  being taken, handed back again and, under early ACK, lost on this stopping host. A delivery the
+  engine hands back ends receiving the same way (the only stop signal when no
+  `IHostApplicationLifetime` is registered); it is not released at once — replicas stopping
+  alongside could bounce it — but its visibility is shortened to `HostShutdownTimeout` (30 s when
+  `null`) when `VisibilityTimeout` is longer. The response subscriber is never gated.
 - `VisibilityRenewalInterval` is off by default because extending visibility silently overrides
   redrive timing operators tune on the queue, and on FIFO queues an extended message keeps its
   whole message group blocked if the consumer wedges. When enabled, it requires
@@ -706,7 +885,10 @@ Only cells that need more than a phrase.
   connections, eventual consistency right after a create, credentials or the instance-metadata
   endpoint not ready yet, the SDK's own client-side timeout); a deterministic rejection such as
   AccessDenied fails startup at once instead of after the whole retry budget.
-- Queue strings may be names or URLs. The worker/response, derived dead-letter and reply-target
+- Queue strings may be names or URLs — not ARNs: a `WorkerQueue` or `ResponseQueue` that is not a
+  URL must pass the SQS name rule (above) at startup whether or not `CreateQueues` is on, since
+  `GetQueueUrl` can never resolve anything else (reply-target queue strings are not checked
+  against it). The worker/response, derived dead-letter and reply-target
   collision guards compare two names, or two URLs (normalized: scheme, host and default port
   folded), exactly, and fail startup — or `GetReplyTarget` — on a match. A name and a URL that
   share the queue name (`jobs` and `https://sqs.…/123456789012/jobs`) may be one queue (the name
@@ -718,6 +900,9 @@ Only cells that need more than a phrase.
   case-insensitive inbound header lookup — AWS message attribute names are themselves
   case-sensitive, so `CorrelationId` and `correlationId` can coexist as two distinct attributes on
   one message; a case-folding lookup would alias them. The outbound publish path is also ordinal.
+  Startup validates the name against the SQS attribute-name rule (at most 256 ASCII letters,
+  digits, `_`, `-` and `.`; no leading, trailing or consecutive periods; no `AWS.`/`Amazon.`
+  prefix in any casing): SQS rejects a publish carrying any other name.
 
 ### PostgreSQL, SQL Server, MongoDB
 
@@ -730,8 +915,11 @@ Only cells that need more than a phrase.
   If the fence no longer matches — the lease lapsed and a peer re-claimed the row/document —
   renewal stops and the fenced ack/NAK no-ops for the stale claim: at-least-once is preserved,
   and the loss is logged. Renewal *failures* (transient DB errors) are logged and retried on a
-  short backoff (a second, or `LockTimeout`/10 when shorter), so one failed beat still renews with
-  most of the lease left. Each renew attempt is **bounded** by the beat interval (the stores
+  backoff that starts short (a second, or `LockTimeout`/10 when shorter), so one failed beat still
+  renews with most of the lease left, and doubles (half-jittered) up to the beat interval, so a
+  database outage does not have every in-flight delivery renewing once a second; while the lease is
+  still in hand one retry always lands that first step short of its end, so an outage that clears
+  inside the lease still renews it. Each renew attempt is **bounded** by the beat interval (the stores
   cancel the connect and command, and SQL Server also sets the command timeout): a renew hung on a
   black-holed pooled connection or a failover is abandoned and retried on a fresh connection
   inside the lease, instead of outliving it at the provider's own command timeout (30 s on
@@ -744,23 +932,52 @@ Only cells that need more than a phrase.
   (`DurableFlowInterruptedException`, which arrives before this subscriber's own stop token is
   cancelled) is left **unsettled** exactly like the subscriber's own shutdown: no "failed on
   attempt" warning, no NAK, no dead-letter write of its own. The lease lapses and the row is
-  redelivered after the restart — as its next attempt, so a hand-back at the cap is dead-lettered
-  on that redelivery without running.
+  redelivered — to a live replica, or after the restart — as its next attempt, so a hand-back at
+  the cap is dead-lettered on that redelivery without running.
+- **Worker intake stops at host stop.** From `ApplicationStopping` on (when the host registers
+  `IHostApplicationLifetime`) the worker subscriber claims nothing more — not even the rest of the
+  batch in hand — and waits for its own stop, so the wake-ups this host's own flow hand-overs have
+  just published stay in the table for a live replica instead of being claimed here and handed back
+  (an attempt spent, the row locked until its lease lapsed, or under early ACK a settled wake-up
+  turned into a dead-letter copy). A claim already in flight when the stop began is released at once
+  (a NAK with no delay; its attempt is spent) without being started or early-ACKed, and an
+  early-ACK claim parked on a full background queue is released the same way. The response
+  subscriber is not gated: it keeps delivering to waiters, which host stop does not interrupt.
 - Under early ACK, a claim that parks on a full background queue keeps its lease renewed for the
-  park's duration; if that heartbeat reports the lease **lost** (a peer re-claimed the row), the
-  park drops the delivery instead of enqueueing and running a job a peer already owns.
+  park's duration; if that heartbeat reports the lease **lost** (a peer re-claimed the row) — or
+  its renewals are still failing once `LockTimeout` has passed since the last one that landed, so
+  a peer may hold the row — the park drops the delivery instead of enqueueing and running a job a
+  peer already owns. The park judges the lease's age again when a slot frees, so a GC or VM pause
+  that resumes the write before the heartbeat cannot enqueue it either.
 - The MongoDB transport pins its collection handle to the primary (channel and flow-store
   parity), so a `secondaryPreferred` client cannot route the change-stream wake to a lagging
-  secondary, and writes its publishes, dead letters and deletes (ack, burial, prune) with
-  `w: "majority"` bounded by a `wtimeout` (an inherited `wtimeoutMS` or `journal` is kept; 10 s
-  otherwise) — under an inherited `w: 1` a failover could roll back a job, or a durable flow's
-  wake-up, whose publish the caller had already seen succeed. A lapsed `wtimeout` surfaces as a
-  failed (retried) publish whose write may still have been applied: the idempotent insert absorbs
-  the retry. The lease writes — claim, renew, NAK — keep the connection's own write concern: a
-  rolled-back lease write only makes the document claimable again, exactly like a lapsed lease,
-  whereas a claim that applied but reported a `wtimeout` would burn a delivery attempt for a job
-  that never ran, and one acknowledged only after the replication wait could return after its own
-  lease had expired. The claim reads the stamped document as raw BSON: a
+  secondary, and writes its inserts — publishes and dead letters — with `w: "majority"` bounded
+  by a `wtimeout` (an inherited `wtimeoutMS` or `journal` is kept; 10 s otherwise): under an
+  inherited `w: 1` a failover could roll back a job, or a durable flow's wake-up, whose publish
+  the caller had already seen succeed. A lapsed `wtimeout` means the insert was applied on the
+  primary — subscribers claim from there, so the job runs — and only its majority
+  acknowledgement timed out: the publish (or burial) counts as written and logs a Warning, and
+  is never retried. Reporting it failed made callers re-publish the job under a new id, and a
+  same-id retry is no safer, because a subscriber can claim, run and delete the job inside the
+  retry window and the retried upsert then re-creates it; what such a write gives up is only the
+  majority guarantee, so restore the replica set's secondaries (or remove the arbiter) rather
+  than lowering the write concern. Everything else — the lease writes (claim, renew, NAK) and
+  the deletes (ack, burial, prune) — is written with `w: 1`, stated explicitly (the connection's
+  own concern is itself majority on an Atlas-style `w=majority` string or a 5.0+
+  primary-secondary-secondary set) and keeping the inherited `journal`: rolling one of them back
+  only makes the document claimable again, exactly like a lapsed lease, whereas a claim that
+  applied but reported a `wtimeout` would burn a delivery attempt for a job that never ran, one
+  acknowledged only after the replication wait could return after its own lease had expired, and
+  a majority ack held the claim loop for the whole `wtimeout` before reporting a delete the
+  primary had applied as failed. The claim takes documents in the claim index's own order
+  (`queue, available_at, created_at`): immediate publishes stamp `available_at` with the
+  server's `$$NOW`, so a NAKed or delayed document queues by when it became due instead of
+  jumping ahead of everything published while it waited, and a claim walks the index instead of
+  sorting the queue's whole due backlog in memory. With `AutoCreateIndexes = true` an equivalent
+  index the collection already carries under another name (such as the default-named one the
+  check below tells operators to create) is accepted rather than failing startup — unless it is
+  hidden (`hidden: true`), which the planner never uses: unhide it or drop it. The claim
+  reads the stamped document as raw BSON: a
   document the transport cannot read — a foreign producer's driver-generated `ObjectId` `_id`, a
   `payload` written as an embedded document, any mistyped field — is **dead-lettered on sight**
   (fenced by the claim's `lock_id`, payload/headers kept, reason in `AR-DeadLetter-Reason`) and
@@ -793,11 +1010,12 @@ Only cells that need more than a phrase.
   `DeadLetterQueue` logical name; it has no consumer by default, so set `DeadLetterRetention`
   if entries should be pruned instead of kept for manual inspection. The prune runs after a
   publish, at most once a minute per process (on the monotonic clock, so a wall-clock step cannot
-  suspend it) — on MongoDB as one `deleteMany`, on PostgreSQL and SQL Server in bounded batches
-  of 1,000 rows (SQL Server `DELETE TOP (1000)`, PostgreSQL a
-  `ctid … LIMIT 1000` batch — an unbounded delete escalated to a table lock that `READPAST`
-  cannot skip on SQL Server, and on PostgreSQL outran the command timeout over a large backlog,
-  rolled back, and never shrank it), draining further batches for up to 2 s while each comes
+  suspend it) — in bounded batches of 1,000 rows/documents (SQL Server `DELETE TOP (1000)`,
+  PostgreSQL a `ctid … LIMIT 1000` batch, MongoDB the ids of up to 1,000 eligible documents and
+  one `deleteMany` of those — an unbounded delete escalated to a table lock that `READPAST`
+  cannot skip on SQL Server, on PostgreSQL outran the command timeout over a large backlog,
+  rolled back, and never shrank it, and on MongoDB held the publish it follows for the whole
+  backlog), draining further batches for up to 2 s while each comes
   back full and warning when it stops with rows remaining. A prune failure — or the publisher's
   token firing mid-prune — is logged and never fails the publish it follows, which had already
   committed. DDL is owned by `AutoCreateSchema` (PostgreSQL, SQL Server) / `AutoCreateIndexes`

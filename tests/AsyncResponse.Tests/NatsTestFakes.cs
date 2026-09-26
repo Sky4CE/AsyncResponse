@@ -306,10 +306,14 @@ internal sealed class FakeNatsResponseChannelClient : INatsResponseChannelClient
         return Task.FromResult(outcome);
     }
 
-    public async Task<INatsChannelSubscription> SubscribeAsync(string subject, CancellationToken cancellationToken)
+    /// <summary>The drop callback the channel handed to the live subscription.</summary>
+    private Action<int>? _onMessagesDropped;
+
+    public async Task<INatsChannelSubscription> SubscribeAsync(string subject, Action<int> onMessagesDropped, CancellationToken cancellationToken)
     {
         SubscribedSubjects.Add(subject);
         SubscriptionLifetime = cancellationToken;
+        _onMessagesDropped = onMessagesDropped;
         if (SubscribeBehavior is { } behavior)
             await behavior(cancellationToken);
 
@@ -330,6 +334,13 @@ internal sealed class FakeNatsResponseChannelClient : INatsResponseChannelClient
 
     public void PushWithReplyFailure(string? payload, Exception exception)
         => _subscription!.Push(new NatsInboundResponse(payload, IsProbe: false, () => throw exception));
+
+    /// <summary>Pushes a message whose acknowledgement runs <paramref name="reply"/> (e.g. one that never completes).</summary>
+    public void PushWithReply(string? payload, Func<ValueTask> reply)
+        => _subscription!.Push(new NatsInboundResponse(payload, IsProbe: false, reply));
+
+    /// <summary>Reports that the client dropped an inbound message with <paramref name="buffered"/> already queued (NATS.Net's MessageDropped).</summary>
+    public void DropMessage(int buffered) => _onMessagesDropped!(buffered);
 
     /// <summary>Faults the live subscription's read loop with <paramref name="exception"/>.</summary>
     public void FailSubscription(Exception exception) => _subscription!.Fail(exception);
@@ -483,7 +494,7 @@ internal sealed class FakeNatsJetStreamTransport : INatsJetStreamTransport
     /// </summary>
     public TimeSpan? LiveAckWait { get; set; }
 
-    public Task<TimeSpan> EnsureConsumerAsync(string stream, string durable, TimeSpan ackWait, int maxDeliveryAttempts, CancellationToken cancellationToken)
+    public Task<TimeSpan> EnsureConsumerAsync(string stream, string subject, string durable, TimeSpan ackWait, int maxDeliveryAttempts, CancellationToken cancellationToken)
     {
         _ensureConsumerAttempts++;
         var failure = EnsureConsumerFailureForAttempt?.Invoke(_ensureConsumerAttempts);
@@ -521,6 +532,9 @@ internal sealed class FakeNatsJetStreamTransport : INatsJetStreamTransport
         }
     }
 
+    /// <summary>Completed when a long poll is ended by its caller's token (rather than expiring or delivering).</summary>
+    public TaskCompletionSource LongPollCancelled { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
     /// <summary>Long poll: waits for the first delivery (or expiry/completion), then drains up to the batch.</summary>
     public async IAsyncEnumerable<NatsJobDelivery> FetchAsync(string stream, string durable, int maxMessages, TimeSpan expires, [EnumeratorCancellation] CancellationToken cancellationToken)
     {
@@ -537,6 +551,11 @@ internal sealed class FakeNatsJetStreamTransport : INatsJetStreamTransport
             catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
             {
                 yield break; // the fetch expired empty — a real fetch completes without error
+            }
+            catch (OperationCanceledException)
+            {
+                LongPollCancelled.TrySetResult();
+                throw;
             }
             catch (ChannelClosedException)
             {

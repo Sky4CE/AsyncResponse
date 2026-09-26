@@ -751,6 +751,204 @@ public class KafkaSubscriberTests
         await subscriber.StopAsync(CancellationToken.None);
     }
 
+    // ---------- Fixpoint round 2 (G9) ----------
+
+    [Fact]
+    public async Task WorkerSubscriber_EarlyAck_ARebalanceDuringBackpressure_DoesNotLeaveTheHandedBackPartitionPaused()
+    {
+        // Regression (r2 S7#1), through the real poll loop and the real consumer adapter over a
+        // scripted librdkafka: the queue is full, so the assignment is paused; an eager rebalance
+        // revokes the partition (librdkafka keeps the pause on it) and, while the group re-joins, a
+        // queue slot frees — the resume then covers an empty assignment and the loop takes the
+        // pause as lifted. The partition is handed straight back still paused: job-3 was never
+        // fetched, nothing refilled the queue to trip another pause-and-resume, and the member
+        // stayed stalled, polling, for the rest of the consumer's life.
+        var librdkafka = new RebalancingKafkaConsumer("workers", 0);
+        librdkafka.Enqueue(partition: 0, offset: 1, "job-1");
+        librdkafka.Enqueue(partition: 0, offset: 2, "job-2");
+        librdkafka.Enqueue(partition: 0, offset: 3, "job-3");
+
+        var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var handled = new System.Collections.Concurrent.ConcurrentQueue<string>();
+        var ingress = new Mock<IAsyncResponseIngress>();
+        ingress.Setup(i => i.HandleWorkerMessageAsync(It.IsAny<string>()))
+            .Returns(async (string payload) =>
+            {
+                if (payload == "job-1")
+                {
+                    started.TrySetResult();
+                    await release.Task.ConfigureAwait(false);
+                }
+
+                handled.Enqueue(payload);
+            });
+
+        var subscriber = new KafkaWorkerSubscriber(
+            Options.Create(NewOptions(options =>
+            {
+                options.WorkerTopic = "workers";
+                options.WorkerSubscriber.UseAckAfterEnqueue(backgroundWorkerCount: 1, backgroundQueueCapacity: 1, TimeSpan.FromSeconds(5));
+            })),
+            new FakeKafkaConsumerClientFactory(librdkafka.Adapter),
+            new FakeKafkaProducerClient(),
+            new FakeKafkaAdminClient(),
+            ingress.Object,
+            NullLogger<KafkaWorkerSubscriber>.Instance);
+
+        await subscriber.StartAsync(CancellationToken.None);
+        try
+        {
+            // job-1 runs, job-2 fills the one-slot queue: the loop pauses the assignment (steady —
+            // job-2 consumed and the pause taken after it; a pause taken before job-2 was consumed
+            // is lifted again at once).
+            await started.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            await KafkaTestData.WaitUntilAsync(() => librdkafka.PendingMessages == 1 && librdkafka.IsPaused(0));
+
+            librdkafka.RevokeAll();
+            await KafkaTestData.WaitUntilAsync(() => librdkafka.AssignedCount == 0);
+
+            // A slot frees while nothing is assigned: the loop's resume covers an empty assignment.
+            release.SetResult();
+            await KafkaTestData.WaitUntilAsync(() => librdkafka.ResumesWhileUnassigned >= 1);
+
+            librdkafka.Assign(0);
+            await KafkaTestData.WaitUntilAsync(() => handled.Contains("job-3"));
+        }
+        finally
+        {
+            release.TrySetResult();
+            await subscriber.StopAsync(CancellationToken.None);
+        }
+
+        Assert.Equal(["job-1", "job-2", "job-3"], handled.ToArray());
+    }
+
+    [Fact]
+    public async Task WorkerSubscriber_EarlyAck_TakesNothingNewOnceTheHostBeginsStopping()
+    {
+        // Regression (r2 S7#2, the round-2 worker intake rule): the flow engine hands every
+        // in-process timer over at ApplicationStopping by publishing an immediate wake-up for a
+        // live replica — and this subscriber, which stops only after the web host and the response
+        // subscriber, kept consuming meanwhile: each such wake-up was committed at enqueue, ran
+        // into the stopping host's hand-back, and became a handed_back_after_commit dead-letter
+        // copy stranding its flow. From ApplicationStopping on nothing new is taken: the assignment
+        // is paused (the loop keeps polling), and a record consumed anyway — fetched before the
+        // pause took hold — is neither started nor stored, so the partition's next owner gets it.
+        using var host = new DurableFlowContextTestSupport.StoppingHost();
+        var consumer = new FakeKafkaConsumerClient();
+        consumer.Enqueue(KafkaTestData.Message("workers", offset: 1, payload: "job-1"));
+        var handled = new System.Collections.Concurrent.ConcurrentQueue<string>();
+        var ingress = new Mock<IAsyncResponseIngress>();
+        ingress.Setup(i => i.HandleWorkerMessageAsync(It.IsAny<string>()))
+            .Returns((string payload) =>
+            {
+                handled.Enqueue(payload);
+                return Task.CompletedTask;
+            });
+
+        var subscriber = new KafkaWorkerSubscriber(
+            Options.Create(NewOptions(options =>
+            {
+                options.WorkerTopic = "workers";
+                options.WorkerSubscriber.UseAckAfterEnqueue(backgroundWorkerCount: 1, backgroundQueueCapacity: 8, TimeSpan.FromSeconds(5));
+            })),
+            new FakeKafkaConsumerClientFactory(consumer),
+            new FakeKafkaProducerClient(),
+            new FakeKafkaAdminClient(),
+            ingress.Object,
+            NullLogger<KafkaWorkerSubscriber>.Instance,
+            host);
+
+        await subscriber.StartAsync(CancellationToken.None);
+        try
+        {
+            await KafkaTestData.WaitUntilAsync(() => handled.Count == 1 && consumer.StoredOffsets.Count == 1);
+
+            host.StopApplication();
+            await KafkaTestData.WaitUntilAsync(() => consumer.Paused);
+
+            consumer.IgnoreAssignmentPause = true; // a record fetched before the pause took hold
+            consumer.Enqueue(KafkaTestData.Message("workers", offset: 2, payload: "job-2"));
+            await KafkaTestData.WaitUntilAsync(() => consumer.PendingMessages == 0);
+            var polls = consumer.ConsumeCalls;
+            await KafkaTestData.WaitUntilAsync(() => consumer.ConsumeCalls > polls + 3); // the loop is past it
+        }
+        finally
+        {
+            await subscriber.StopAsync(CancellationToken.None);
+        }
+
+        Assert.Equal(["job-1"], handled.ToArray());
+        Assert.Equal(1, Assert.Single(consumer.StoredOffsets).Offset);
+        Assert.Equal(0, consumer.ResumeCount); // never resumed once the host began stopping
+    }
+
+    [Fact]
+    public async Task WorkerSubscriber_AckAfterHandler_StartsNothingItHeldOnceTheHostBeginsStopping()
+    {
+        // r2 S7#2 under ack-after-handler: a message held behind a detached handler was received
+        // but not started. Started after ApplicationStopping, a flow wake-up only runs into the
+        // stopping host's hand-back, and any job holds the graceful stop, which waits for detached
+        // handlers. The running handler still settles and stores its offset; what it held is left
+        // unsettled (offset unstored) for the partition's next owner.
+        using var host = new DurableFlowContextTestSupport.StoppingHost();
+        var consumer = new FakeKafkaConsumerClient { IgnorePartitionPause = true }; // @6 arrives behind the detached @5
+        consumer.Enqueue(KafkaTestData.Message("workers", offset: 5, payload: "slow-job"));
+        consumer.Enqueue(KafkaTestData.Message("workers", offset: 6, payload: "held-job"));
+
+        var slowStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseSlow = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var handled = new System.Collections.Concurrent.ConcurrentQueue<string>();
+        var ingress = new Mock<IAsyncResponseIngress>();
+        ingress.Setup(i => i.HandleWorkerMessageAsync(It.IsAny<string>()))
+            .Returns(async (string payload) =>
+            {
+                handled.Enqueue(payload);
+                if (payload == "slow-job")
+                {
+                    slowStarted.TrySetResult();
+                    await releaseSlow.Task.ConfigureAwait(false);
+                }
+            });
+
+        var subscriber = new KafkaWorkerSubscriber(
+            Options.Create(NewOptions(options =>
+            {
+                options.WorkerTopic = "workers";
+                options.WorkerSubscriber.DetachHandlerAfter = TimeSpan.FromMilliseconds(20);
+            })),
+            new FakeKafkaConsumerClientFactory(consumer),
+            new FakeKafkaProducerClient(),
+            new FakeKafkaAdminClient(),
+            ingress.Object,
+            NullLogger<KafkaWorkerSubscriber>.Instance,
+            host);
+
+        await subscriber.StartAsync(CancellationToken.None);
+        try
+        {
+            await slowStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            // @6 consumed and held: holding it re-asserts the partition's pause (the detach paused it first).
+            await KafkaTestData.WaitUntilAsync(() => consumer.PartitionPauses.Count >= 2);
+
+            host.StopApplication();
+            await KafkaTestData.WaitUntilAsync(() => consumer.Paused);
+            releaseSlow.SetResult();
+            await KafkaTestData.WaitUntilAsync(() => consumer.StoredOffsets.Count == 1);
+            var polls = consumer.ConsumeCalls;
+            await KafkaTestData.WaitUntilAsync(() => consumer.ConsumeCalls > polls + 3);
+        }
+        finally
+        {
+            releaseSlow.TrySetResult();
+            await subscriber.StopAsync(CancellationToken.None);
+        }
+
+        Assert.Equal(["slow-job"], handled.ToArray());
+        Assert.Equal(5, Assert.Single(consumer.StoredOffsets).Offset);
+    }
+
     // ---------- Helpers ----------
 
     private static readonly Dictionary<KafkaSubscriberService, FakeKafkaConsumerClientFactory> Factories = [];

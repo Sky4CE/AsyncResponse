@@ -15,36 +15,69 @@ public sealed class TypeNameIdentityTests
     internal static string OtherVersion(string fullName) => Regex.Replace(fullName, "Version=[0-9.]+", "Version=9.9.9.9");
 
     /// <summary>The same name with every generic argument's assembly signed by another key.</summary>
-    private static string OtherKey(string fullName) => Regex.Replace(fullName, "PublicKeyToken=[0-9a-f]+", "PublicKeyToken=0123456789abcdef");
+    private static string OtherKey(string fullName) => WithKey(fullName, "0123456789abcdef");
+
+    /// <summary>The same name with every generic argument's public key token replaced by <paramref name="token"/> (<c>null</c>: not strong-named).</summary>
+    private static string WithKey(string fullName, string token) => Regex.Replace(fullName, "PublicKeyToken=[0-9a-f]+", "PublicKeyToken=" + token);
 
     [Fact]
-    public void Normalize_DropsOnlyTheVersionOfGenericArguments_AtAnyDepth_AndKeepsTheRestOfTheAssemblyName()
+    public void Normalize_DropsTheVersionCultureAndKeyOfGenericArguments_AtAnyDepth_AndKeepsTheSimpleName()
     {
         var name = typeof(Dictionary<string, List<int[]>>).FullName!;
         Assert.Contains("Version=", name, StringComparison.Ordinal);
-        var coreLib = $"System.Private.CoreLib, Culture=neutral, PublicKeyToken={Convert.ToHexString(typeof(object).Assembly.GetName().GetPublicKeyToken()!).ToLowerInvariant()}";
+        Assert.Contains("Culture=neutral", name, StringComparison.Ordinal);
+        Assert.Contains("PublicKeyToken=", name, StringComparison.Ordinal);
+        const string coreLib = "System.Private.CoreLib";
 
         var normalized = TypeNameIdentity.Normalize(name)!;
 
-        Assert.DoesNotContain("Version=", normalized, StringComparison.Ordinal);
         Assert.Equal(
             $"System.Collections.Generic.Dictionary`2[[System.String, {coreLib}],[System.Collections.Generic.List`1[[System.Int32[], {coreLib}]], {coreLib}]]",
             normalized);
+        Assert.Same(normalized, TypeNameIdentity.Normalize(normalized));
         Assert.True(TypeNameIdentity.Same(name, OtherVersion(name)));
     }
 
     [Fact]
-    public void AnArgumentFromASameNamedAssemblySignedWithAnotherKey_IsADifferentType()
+    public void AnArgumentFromAReSignedOrNewlyStrongNamedAssembly_IsTheSameType_AsResolutionBindsIt()
     {
-        // Precommit review (A5): the key was stripped along with the version, so a same-named
-        // assembly signed with another key — a plugin load context's impostor — normalized to the
-        // same identity. A version bump never changes a key; only the version is dropped.
+        // Fixpoint r2 (S3#1), reversing precommit review A5: the key was kept on the premise that a
+        // same-named assembly signed with another key is an impostor type. Resolution binds an
+        // assembly-qualified argument by SIMPLE name only (AssemblyName.ReferenceMatchesDefinition
+        // compares nothing else), so both spellings run the same loaded type — keeping the key only
+        // refused, after a deploy that strong-named or re-signed the argument's assembly, the runs
+        // and callbacks the reflection path resolves.
         var name = typeof(List<int>).FullName!;
         Assert.NotEqual(name, OtherKey(name));
 
-        Assert.False(TypeNameIdentity.Same(name, OtherKey(name)));
-        Assert.False(TypeNameIdentity.Same(name, OtherKey(OtherVersion(name))));
-        Assert.Contains("PublicKeyToken=0123456789abcdef", TypeNameIdentity.Normalize(OtherKey(name)), StringComparison.Ordinal);
+        Assert.True(TypeNameIdentity.Same(name, OtherKey(name)));
+        Assert.True(TypeNameIdentity.Same(name, OtherKey(OtherVersion(name))));
+        Assert.True(TypeNameIdentity.Same(name, WithKey(name, "null")));
+        Assert.True(TypeNameIdentity.Same(name, name.Replace("Culture=neutral", "Culture=en-US", StringComparison.Ordinal)));
+        Assert.Equal("System.Collections.Generic.List`1[[System.Int32, System.Private.CoreLib]]", TypeNameIdentity.Normalize(OtherKey(name)));
+
+        // The simple name still counts: another assembly's type is another type.
+        Assert.False(TypeNameIdentity.Same(name, name.Replace("System.Private.CoreLib", "Contoso.CoreLib", StringComparison.Ordinal)));
+    }
+
+    [Theory]
+    [InlineData("PublicKeyToken=[0-9a-f]+", "PublicKeyToken=0123456789abcde")]
+    [InlineData("PublicKeyToken=[0-9a-f]+", "PublicKeyToken=0123456789abcdef0")]
+    [InlineData("PublicKeyToken=[0-9a-f]+", "PublicKeyToken=0123456789abcdeg")]
+    [InlineData("PublicKeyToken=[0-9a-f]+", "PublicKeyToken=NULL")]
+    [InlineData("PublicKeyToken=[0-9a-f]+", "PublicKeyToken=")]
+    [InlineData("Culture=neutral", "Culture=")]
+    [InlineData("Culture=neutral", "Culture=neu tral")]
+    [InlineData("Culture=neutral", "Culture=-neutral")]
+    [InlineData("Culture=neutral", "Culture=en--US")]
+    [InlineData("Culture=neutral", "Culture=neutral[")]
+    public void AKeyOrCultureValueThatIsMalformed_LeavesTheNameAsItIs(string pattern, string malformed)
+    {
+        // Same rule as a malformed Version: only what a runtime writes is dropped.
+        var name = Regex.Replace(typeof(List<int>).FullName!, pattern, malformed);
+
+        Assert.Same(name, TypeNameIdentity.Normalize(name));
+        Assert.False(TypeNameIdentity.Same(typeof(List<int>).FullName, name));
     }
 
     [Theory]
@@ -90,12 +123,15 @@ public sealed class TypeNameIdentityTests
         }
     }
 
-    /// <summary>A run of <see cref="ListInputFlow"/> persisted by a build whose argument assemblies had another version.</summary>
-    private static FlowState PersistedByTheOtherBuild(string flowId, Type inputType) => new()
+    /// <summary>
+    /// A run of <see cref="ListInputFlow"/> persisted by a build whose argument assemblies had
+    /// another version (and, with <paramref name="token"/>, another public key token).
+    /// </summary>
+    private static FlowState PersistedByTheOtherBuild(string flowId, Type inputType, string? token = null) => new()
     {
         FlowId = flowId,
         FlowTypeName = typeof(ListInputFlow).FullName,
-        InputTypeName = OtherVersion(inputType.FullName!),
+        InputTypeName = token is null ? OtherVersion(inputType.FullName!) : WithKey(OtherVersion(inputType.FullName!), token),
         InputJson = "[1,2]",
         Status = FlowRunStatus.Running,
         CreatedAtUtc = DateTime.UtcNow,
@@ -119,8 +155,26 @@ public sealed class TypeNameIdentityTests
         // every in-flight run of a flow with a generic input failed "incompatible flow definition"
         // on each redelivery and dead-lettered — while the reflection path, which resolves by
         // simple assembly name, would have run it.
+        await AssertTheRegisteredFlowRuns(PersistedByTheOtherBuild("generic-input", typeof(List<int>)));
+    }
+
+    [Theory]
+    [InlineData("0123456789abcdef")]
+    [InlineData("null")]
+    public async Task ARegisteredFlowWithAGenericInput_StillExecutesARunPersistedUnderAnotherArgumentKey(string token)
+    {
+        // Fixpoint r2 (S3#1): the identity kept PublicKeyToken, so a run written before a deploy
+        // that re-signed the argument's assembly (another token) or strong-named it (token "null"
+        // in the ledger) failed "incompatible flow definition" on every redelivery and
+        // dead-lettered — while resolution, which binds the argument by simple name, runs it.
+        await AssertTheRegisteredFlowRuns(PersistedByTheOtherBuild($"generic-input-key-{token}", typeof(List<int>), token));
+    }
+
+    /// <summary>Executes <paramref name="persisted"/> through the statically-typed (registered) path and asserts it ran to success.</summary>
+    private static async Task AssertTheRegisteredFlowRuns(FlowState persisted)
+    {
         var store = new InMemoryFlowStateStore();
-        await store.TryCreateAsync("generic-input", PersistedByTheOtherBuild("generic-input", typeof(List<int>)), TimeSpan.FromDays(1));
+        await store.TryCreateAsync(persisted.FlowId!, persisted, TimeSpan.FromDays(1));
         var flow = new ListInputFlow();
         var services = new ServiceCollection();
         services.AddSingleton<IFlowStateStore>(store);
@@ -136,10 +190,10 @@ public sealed class TypeNameIdentityTests
             Microsoft.Extensions.Logging.Abstractions.NullLogger<DurableFlowExecutor>.Instance,
             registrations: [ListInputRegistration()]);
 
-        await executor.ExecuteAsync("generic-input");
+        await executor.ExecuteAsync(persisted.FlowId!);
 
         Assert.Equal(1, flow.Executions);
-        Assert.Equal(FlowRunStatus.Succeeded, (await store.LoadAsync("generic-input"))!.Status);
+        Assert.Equal(FlowRunStatus.Succeeded, (await store.LoadAsync(persisted.FlowId!))!.Status);
     }
 
     [Fact]
@@ -147,6 +201,7 @@ public sealed class TypeNameIdentityTests
     {
         var store = new InMemoryFlowStateStore();
         await store.TryCreateAsync("generic-restart", PersistedByTheOtherBuild("generic-restart", typeof(List<int>)), TimeSpan.FromDays(1));
+        await store.TryCreateAsync("generic-restart-key", PersistedByTheOtherBuild("generic-restart-key", typeof(List<int>), "null"), TimeSpan.FromDays(1));
         await store.TryCreateAsync("generic-other-type", PersistedByTheOtherBuild("generic-other-type", typeof(List<long>)), TimeSpan.FromDays(1));
         var services = new ServiceCollection();
         services.AddSingleton<IFlowStateStore>(store);
@@ -159,6 +214,8 @@ public sealed class TypeNameIdentityTests
             Microsoft.Extensions.Logging.Abstractions.NullLogger<DurableFlowService>.Instance);
 
         Assert.Equal("generic-restart", await starter.StartAsync<ListInputFlow, List<int>>([1, 2], "generic-restart"));
+        // Fixpoint r2 (S3#1): nor is a run written before the argument's assembly was strong-named.
+        Assert.Equal("generic-restart-key", await starter.StartAsync<ListInputFlow, List<int>>([1, 2], "generic-restart-key"));
 
         // A different argument type is still different work.
         await Assert.ThrowsAsync<DurableFlowIdConflictException>(
@@ -176,9 +233,33 @@ public sealed class TypeNameIdentityTests
         Assert.True(authorizer.IsAllowed(OtherVersion(typeof(IComparable<int>).FullName!), "CompareTo"));
         Assert.False(authorizer.IsAllowed(OtherVersion(typeof(IComparable<long>).FullName!), "CompareTo"));
 
-        // Precommit review (A5): the version only — an argument from a same-named assembly signed
-        // with another key is not the allowlisted type.
-        Assert.False(authorizer.IsAllowed(OtherKey(typeof(IComparable<int>).FullName!), "CompareTo"));
-        Assert.False(authorizer.IsAllowed(OtherKey(OtherVersion(typeof(IComparable<int>).FullName!)), "CompareTo"));
+        // Fixpoint r2 (S3#1), reversing precommit review A5: an argument whose assembly was
+        // re-signed resolves to the same type (simple-name binding), so it is the allowlisted type.
+        Assert.True(authorizer.IsAllowed(OtherKey(typeof(IComparable<int>).FullName!), "CompareTo"));
+        Assert.True(authorizer.IsAllowed(OtherKey(OtherVersion(typeof(IComparable<int>).FullName!)), "CompareTo"));
+        Assert.False(authorizer.IsAllowed(OtherKey(typeof(IComparable<long>).FullName!), "CompareTo"));
+    }
+
+    [Fact]
+    public void TheAllowlist_MatchesADescriptorOfThisBuildVerbatim_WithoutNormalizingItPerCheck()
+    {
+        // Fixpoint r2 (S3#8): only normalized names were stored, so every check of a generic
+        // service name — twice per worker job — scanned it and built a normalized copy (a
+        // StringBuilder and a string), although a descriptor persisted by the running build spells
+        // the allowlisted name exactly. The configured spelling is now looked up first.
+        var authorizer = new AsyncResponseCallbackAllowList().Allow<IComparable<int>>().Build();
+        var name = typeof(IComparable<int>).FullName!;
+        Assert.True(authorizer.IsAllowed(name, "CompareTo")); // warm-up (JIT, first-call paths)
+
+        const int iterations = 100;
+        var before = GC.GetAllocatedBytesForCurrentThread();
+        var allowed = true;
+        for (var i = 0; i < iterations; i++)
+            allowed &= authorizer.IsAllowed(name, "CompareTo");
+        var allocated = GC.GetAllocatedBytesForCurrentThread() - before;
+
+        Assert.True(allowed);
+        // Normalizing costs a StringBuilder plus a string of the name's length (~300 B) per check.
+        Assert.True(allocated < iterations * 16, $"{allocated} bytes allocated over {iterations} exact-match checks.");
     }
 }

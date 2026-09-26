@@ -1,5 +1,10 @@
+using System.Net;
+using System.Reflection;
 using MongoDB.Bson;
 using MongoDB.Driver;
+using MongoDB.Driver.Core.Clusters;
+using MongoDB.Driver.Core.Connections;
+using MongoDB.Driver.Core.Servers;
 using Moq;
 
 namespace AsyncResponse.Tests;
@@ -15,10 +20,11 @@ namespace AsyncResponse.Tests;
 internal static class MongoTestCounters
 {
     /// <summary>
-    /// Stubs the driver's fluent <c>WithReadPreference</c> and <c>WithWriteConcern</c> to return
-    /// the mock itself. The stores pin <c>ReadPreference.Primary</c> — and the flow-state store
-    /// also <c>WriteConcern.WMajority</c> — on every collection handle at construction, so a loose
-    /// mock returning null there would replace the test's stubbed collection with null.
+    /// Stubs the driver's fluent <c>WithReadPreference</c>, <c>WithWriteConcern</c> and
+    /// <c>WithReadConcern</c> to return the mock itself. The stores pin <c>ReadPreference.Primary</c>
+    /// and a write concern on every collection handle at construction (the flow store also derives
+    /// a linearizable-read handle), so a loose mock returning null there would replace the test's
+    /// stubbed collection with null.
     /// </summary>
     public static Mock<IMongoCollection<T>> SelfPinning<T>(this Mock<IMongoCollection<T>> collection)
     {
@@ -28,6 +34,21 @@ internal static class MongoTestCounters
         collection
             .Setup(c => c.WithWriteConcern(It.IsAny<WriteConcern>()))
             .Returns(collection.Object);
+        collection
+            .Setup(c => c.WithReadConcern(It.IsAny<ReadConcern>()))
+            .Returns(collection.Object);
+        return collection;
+    }
+
+    /// <summary>Answers every <c>Find</c> projecting to <typeparamref name="TProjection"/> with <paramref name="results"/>.</summary>
+    public static Mock<IMongoCollection<T>> FindsReturning<T, TProjection>(this Mock<IMongoCollection<T>> collection, params TProjection[] results)
+    {
+        collection
+            .Setup(c => c.FindAsync(
+                It.IsAny<FilterDefinition<T>>(),
+                It.IsAny<FindOptions<T, TProjection>>(),
+                It.IsAny<CancellationToken>()))
+            .ReturnsAsync(() => new MongoListCursor<TProjection>(results));
         return collection;
     }
 
@@ -135,26 +156,95 @@ internal static class MongoTestCounters
     /// correctly provisioned reaper, so mocked stores pass the operator-schema check.
     /// </summary>
     public static Mock<IMongoCollection<T>> WithProvisionedTtlIndex<T>(this Mock<IMongoCollection<T>> collection)
-    {
-        var cursor = new Mock<IAsyncCursor<BsonDocument>>();
-        cursor.SetupSequence(c => c.MoveNextAsync(It.IsAny<CancellationToken>()))
-            .ReturnsAsync(true)
-            .ReturnsAsync(false);
-        cursor.SetupGet(c => c.Current).Returns(
-        [
-            new BsonDocument
-            {
-                ["name"] = "flows_expires_idx",
-                ["key"] = new BsonDocument("expires_at_utc", 1),
-                ["expireAfterSeconds"] = 0
-            }
-        ]);
+        => collection.WithListedIndexes(new BsonDocument
+        {
+            ["name"] = "flows_expires_idx",
+            ["key"] = new BsonDocument("expires_at_utc", 1),
+            ["expireAfterSeconds"] = 0
+        });
 
-        var indexes = new Mock<IMongoIndexManager<T>>();
-        indexes
+    /// <summary>Stubs the collection's index listing with <paramref name="indexes"/>, answering every listing call.</summary>
+    public static Mock<IMongoCollection<T>> WithListedIndexes<T>(this Mock<IMongoCollection<T>> collection, params BsonDocument[] indexes)
+    {
+        var manager = new Mock<IMongoIndexManager<T>>();
+        manager
             .Setup(m => m.ListAsync(It.IsAny<CancellationToken>()))
-            .ReturnsAsync(cursor.Object);
-        collection.SetupGet(c => c.Indexes).Returns(indexes.Object);
+            .ReturnsAsync(() => new MongoListCursor<BsonDocument>(indexes));
+        collection.SetupGet(c => c.Indexes).Returns(manager.Object);
         return collection;
     }
+}
+
+/// <summary>A driver cursor over a fixed list: one batch, then the end.</summary>
+internal sealed class MongoListCursor<T>(IEnumerable<T> items) : IAsyncCursor<T>
+{
+    private bool _moved;
+
+    public IEnumerable<T> Current { get; private set; } = [];
+
+    public bool MoveNext(CancellationToken cancellationToken = default)
+    {
+        if (_moved)
+            return false;
+        _moved = true;
+        Current = items;
+        return true;
+    }
+
+    public Task<bool> MoveNextAsync(CancellationToken cancellationToken = default) => Task.FromResult(MoveNext(cancellationToken));
+
+    public void Dispose()
+    {
+    }
+}
+
+/// <summary>
+/// The shapes a lapsed majority <c>wtimeout</c> reaches a store in (MongoDB.Driver 3.12): a
+/// command write (<c>findAndModify</c>) throws <see cref="MongoWriteConcernException"/> before
+/// reading its reply; a CRUD write goes through the bulk path and throws
+/// <see cref="MongoWriteException"/> with a write-concern error and no write error.
+/// </summary>
+internal static class MongoReplicationTimeouts
+{
+    public static readonly ConnectionId Connection = new(new ServerId(new ClusterId(), new DnsEndPoint("localhost", 27017)));
+
+    public static BsonDocument WriteConcernErrorDocument(int code = 64, bool wtimeout = true) => new()
+    {
+        ["code"] = code,
+        ["codeName"] = code == 64 ? "WriteConcernFailed" : "UnsatisfiableWriteConcern",
+        ["errmsg"] = "waiting for replication timed out",
+        ["errInfo"] = wtimeout ? new BsonDocument("wtimeout", true) : new BsonDocument()
+    };
+
+    /// <summary>What a <c>findAndModify</c> whose replication wait lapsed throws.</summary>
+    public static MongoWriteConcernException Command(int code = 64, bool wtimeout = true)
+        => new(Connection, "waiting for replication timed out", new WriteConcernResult(new BsonDocument
+        {
+            ["ok"] = 1,
+            ["n"] = 1,
+            ["writeConcernError"] = WriteConcernErrorDocument(code, wtimeout)
+        }));
+
+    /// <summary>What an <c>updateOne</c>/<c>deleteOne</c> whose replication wait lapsed throws.</summary>
+    public static MongoWriteException Write(int code = 64, WriteError? writeError = null, bool wtimeout = true)
+        => new(Connection, writeError, WriteConcernError(code, wtimeout), innerException: null);
+
+    public static WriteConcernError WriteConcernError(int code = 64, bool wtimeout = true)
+    {
+        var details = WriteConcernErrorDocument(code, wtimeout);
+        return (WriteConcernError)Activator.CreateInstance(
+            typeof(WriteConcernError),
+            BindingFlags.Instance | BindingFlags.NonPublic,
+            binder: null,
+            [code, details["codeName"].AsString, details["errmsg"].AsString, details["errInfo"].AsBsonDocument, Array.Empty<string>()],
+            culture: null)!;
+    }
+
+    public static WriteError DuplicateKeyError()
+        => (WriteError)Activator.CreateInstance(
+            typeof(WriteError),
+            BindingFlags.Instance | BindingFlags.NonPublic,
+            binder: null,
+            [ServerErrorCategory.DuplicateKey, 11000, "E11000 duplicate key error", new BsonDocument()],
+            culture: null)!;
 }

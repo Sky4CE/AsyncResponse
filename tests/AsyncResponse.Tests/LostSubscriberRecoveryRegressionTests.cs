@@ -192,6 +192,62 @@ public class LostSubscriberRecoveryRegressionTests
     }
 
     [Fact]
+    public async Task TypedPublish_PolymorphicFailRoutedPayload_PayloadJsonIsTheWireJson()
+    {
+        // PayloadJson promises the payload as published. Pre-fix it re-serialized the MATERIALIZED
+        // instance by its runtime type — a derived type serialized as itself carries no
+        // discriminator — so the diagnostic JSON differed from what the broker carried.
+        await using var harness = Harness.Create();
+        await harness.ArmRegistrationAsync(
+            typeof(PolyStepBase).FullName,
+            resume: IncidentResumeCallback(),
+            failure: IncidentFailureCallback());
+
+        await harness.Publisher.SetResponse<PolyStepBase>(new PolyStepFailed { Message = "poly failed" }, CorrelationId);
+
+        Assert.Empty(harness.Spy.Resumed);
+        var (payload, exception) = Assert.Single(harness.Spy.Failed);
+        Assert.IsType<PolyStepFailed>(payload);
+        var domain = Assert.IsType<AsyncResponseDomainFailureException>(exception);
+        Assert.Contains("\"$kind\":\"failed\"", domain.PayloadJson, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Ingress_FailRoutedRawJson_PayloadJsonKeepsMembersTheRegisteredTypeLacks()
+    {
+        // Same rule for a broker delivery: materialization drops wire members the registered type
+        // does not declare, and re-serializing that instance dropped them from PayloadJson too.
+        await using var harness = Harness.Create();
+        await harness.ArmIncidentRegistrationAsync();
+
+        await harness.Ingress.HandleResponseMessageAsync(
+            """{"Status":3,"Message":"remote step failed","VendorCode":"E-4711"}""", CorrelationId);
+
+        var (_, exception) = Assert.Single(harness.Spy.Failed);
+        var domain = Assert.IsType<AsyncResponseDomainFailureException>(exception);
+        Assert.Contains("E-4711", domain.PayloadJson, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task LostDispatch_TagsTheRealPayloadType_NotItsWireContainer()
+    {
+        // The dispatch receives the WIRE form of the payload, and its span tagged that form's
+        // runtime type: asyncresponse.payload_type read System.String for every typed publish and
+        // System.Text.Json.JsonElement for every broker delivery.
+        using var collector = new AsyncResponseActivityCollector();
+        await using var harness = Harness.Create();
+        await harness.ArmIncidentRegistrationAsync();
+
+        await harness.Ingress.HandleResponseMessageAsync("""{"Status":2,"Message":"pipeline succeeded"}""", CorrelationId);
+        await harness.Publisher.SetResponse(new IncidentStepResult { Status = IncidentStepStatus.Succeeded }, "no-registration-correlation-id");
+
+        var dispatches = collector.All().Where(activity => activity.OperationName == "asyncresponse.lost_subscriber.dispatch").ToArray();
+        Assert.Equal(2, dispatches.Length);
+        Assert.All(dispatches, dispatch =>
+            Assert.Equal(typeof(IncidentStepResult).FullName, AsyncResponseActivityCollector.Tag(dispatch, "asyncresponse.payload_type")));
+    }
+
+    [Fact]
     public async Task TypedPublish_JsonIgnoredState_CannotInfluenceRecoveryRouting()
     {
         // Exact-type instance reuse leaked in-process-only state into the verdict: a [JsonIgnore]d
@@ -676,6 +732,7 @@ public sealed class DerivedStepResult : BaseStepResult
 /// </summary>
 [System.Text.Json.Serialization.JsonPolymorphic(TypeDiscriminatorPropertyName = "$kind")]
 [System.Text.Json.Serialization.JsonDerivedType(typeof(PolyStepCompleted), "completed")]
+[System.Text.Json.Serialization.JsonDerivedType(typeof(PolyStepFailed), "failed")]
 public abstract class PolyStepBase : IAsyncResponsePayload
 {
     public string? Message { get; set; }
@@ -688,6 +745,11 @@ public abstract class PolyStepBase : IAsyncResponsePayload
 public sealed class PolyStepCompleted : PolyStepBase
 {
     public override RecoveryAction OnRecovery() => RecoveryAction.Resume;
+}
+
+/// <summary>The fail-routed member of the polymorphic contract (keeps the base's Fail verdict).</summary>
+public sealed class PolyStepFailed : PolyStepBase
+{
 }
 
 /// <summary>In-process state that never crosses the wire must never decide recovery routing.</summary>

@@ -348,8 +348,12 @@ public static class AsyncResponseCoreServiceCollectionExtensions
         // whatever IRecoveryStateStore resolves, not necessarily the built-in one (an app may
         // register its own store, before or after this call). Bound to the built-in instance, a
         // custom store left the watchdog scanning an empty map and publishing a clean pass forever.
-        // A store without the capability yields no scanner, which idles the watchdog as documented.
-        services.TryAddSingleton<IRecoveryStateScanner>(provider => (provider.GetRequiredService<IRecoveryStateStore>() as IRecoveryStateScanner)!);
+        // A store without the capability yields the non-scanning sentinel — never null, which
+        // containers other than Microsoft.Extensions.DI reject from a factory — and the watchdog
+        // idles on it as documented.
+        services.TryAddSingleton<IRecoveryStateScanner>(provider =>
+            provider.GetRequiredService<IRecoveryStateStore>() as IRecoveryStateScanner
+            ?? AsyncResponseWatchdog.NonScanningRecoveryStateScanner.Instance);
 
         services.TryAddSingleton<InMemoryAsyncResponseChannel>();
         services.TryAddSingleton<IAsyncResponsePublisher>(provider => provider.GetRequiredService<InMemoryAsyncResponseChannel>());

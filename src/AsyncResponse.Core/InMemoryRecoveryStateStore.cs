@@ -131,11 +131,24 @@ internal sealed class InMemoryRecoveryStateStore : IRecoveryStateStore, IRecover
     /// and then behaved differently in production. Such an argument is therefore snapshotted
     /// through the same serializer, as the <see cref="JsonElement"/> a durable store hands back.
     /// <para>
-    /// Only what can diverge pays: null, strings, primitives and enums are immutable and round-trip
-    /// losslessly through the conversion plan, and already-wire <see cref="JsonElement"/> values
-    /// are left alone — so placeholder-only and string-literal registrations (the flow engine's)
-    /// keep the caller's instance, allocation-free, on the waiter-creation hot path. A descriptor
-    /// with no parameter list is stored as is; dispatch refuses it as malformed.
+    /// Primitives and enums are snapshotted too, although they are immutable: a durable store
+    /// hands them back as a <see cref="JsonElement"/> as well, which the conversion plan reads
+    /// back into a parameter of the value's own type but NOT into an <c>object</c>- or
+    /// interface-typed one — kept live, <c>tag is MyEnum</c> passed in-memory and failed on every
+    /// durable store — and a value with no wire form (<c>double.NaN</c>, <c>IntPtr</c>) must
+    /// throw at save here as it does there. A <see cref="JsonElement"/> is cloned: the caller's
+    /// may belong to a document it disposes after registering, which a durable store never sees.
+    /// </para>
+    /// <para>
+    /// Only strings (and null) are kept as given — immutable, and exempt so placeholder-only and
+    /// string-literal registrations (the flow engine's, into <c>string</c> parameters) keep the
+    /// caller's instance, allocation-free, on the waiter-creation hot path. The one divergence
+    /// left is documented rather than paid for: an <c>object</c>- or interface-typed parameter
+    /// receives a <see cref="JsonElement"/> from every durable store, strings included, but the
+    /// string itself here. A descriptor with no parameter list is stored as is; dispatch refuses
+    /// it as malformed. The descriptor itself is kept by reference: the builder's descriptor
+    /// overloads copy what the caller hands them, so one reused template cannot alias several
+    /// registrations.
     /// </para>
     /// </summary>
     private static RecoveryState SnapshotCallbackArguments(RecoveryState state)
@@ -174,7 +187,7 @@ internal sealed class InMemoryRecoveryStateStore : IRecoveryStateStore, IRecover
             snapshot[i] = new CallbackParam
             {
                 Placeholder = parameter.Placeholder,
-                Value = ToWireElement(value)
+                Value = value is JsonElement element ? element.Clone() : ToWireElement(value)
             };
         }
 
@@ -188,14 +201,7 @@ internal sealed class InMemoryRecoveryStateStore : IRecoveryStateStore, IRecover
             };
     }
 
-    private static bool DivergesAcrossTheWire(object value)
-    {
-        if (value is string or JsonElement)
-            return false;
-
-        var type = value.GetType();
-        return !type.IsPrimitive && !type.IsEnum;
-    }
+    private static bool DivergesAcrossTheWire(object value) => value is not string;
 
     // The object-typed member is written by its runtime type, exactly as a durable store writes
     // CallbackParam.Value — and throws the same way for a value that has no wire form.

@@ -278,7 +278,9 @@ public sealed class RedisTransportRound33RegressionTests
             stopping = subscriber.StopAsync(CancellationToken.None);
             var beatsAtStop = database.Heartbeats.Count;
             await WaitUntilAsync(() => database.Heartbeats.Count > beatsAtStop, "an idle-reset heartbeat after the stop");
-            Assert.All(database.Heartbeats.Skip(beatsAtStop), ids => Assert.Equal<string>(["1-0"], ids));
+            // (An ack-after-handler batch holds this one entry only, so which ids a heartbeat
+            // keeps after the stop is pinned on an early-ACK batch instead: see
+            // Subscriber_OnStop_TheHeartbeatKeepsOnlyTheEntryInFlight.)
         }
         finally
         {
@@ -379,7 +381,10 @@ public sealed class RedisTransportRound33RegressionTests
     /// wake-ups would be handed back by the next worker in turn, and every one, already ACKed, would
     /// become a dead-letter copy instead of a pending entry a live peer takes. Deterministic: the
     /// first ACK holds the loop until the worker has reported the hand-back. Pre-fix: 2-0 and 3-0
-    /// are enqueued and ACKed.
+    /// are enqueued and ACKed. Fixpoint round 2 (S11#10): the latch at the top of the read loop was
+    /// unpinned — without it the loop spun on through the stop window and, once the pending-claim
+    /// interval came round, listed and claimed again. After the hand-back, monotonic time is moved
+    /// past the interval and no further XPENDING may follow.
     /// </summary>
     [Fact]
     public async Task EarlyAckSubscriber_AWorkersHostStopHandBack_LeavesTheRestOfTheBatchPending()
@@ -393,11 +398,14 @@ public sealed class RedisTransportRound33RegressionTests
                 : null
         };
         var handBackReported = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var acksOfTheFirstEntry = 0;
         database.OnAck = id =>
         {
             // Runs on the loop, inside the first entry's enqueue-and-ACK: the worker (another
-            // thread) runs p1 and reports its hand-back before the loop moves on to 2-0.
-            if (id == "1-0")
+            // thread) runs p1 and reports its hand-back before the loop moves on to 2-0. Only that
+            // first XACK waits: the worker's burial XACKs 1-0 again BEFORE it reports (copy first,
+            // report second), and holding that one would wait on itself.
+            if (id == "1-0" && Interlocked.Increment(ref acksOfTheFirstEntry) == 1)
                 handBackReported.Task.Wait(WaitBudget);
         };
         var subscriber = WorkerSubscriber(
@@ -413,12 +421,20 @@ public sealed class RedisTransportRound33RegressionTests
                     return ValueTask.CompletedTask;
                 };
             });
+        var clock = new SteppingClock();
+        subscriber.Clock = clock;
 
         await subscriber.StartAsync(CancellationToken.None);
         try
         {
             await handBackReported.Task.WaitAsync(WaitBudget);
             await WaitUntilAsync(() => database.Adds.Count == 1, "the handed-back entry's dead-letter copy");
+
+            // The next claim pass falls due: a loop still running would list (XPENDING) at once.
+            var listingsAtHandBack = database.PendingCounts.Count;
+            clock.Step(wall: TimeSpan.Zero, monotonic: TimeSpan.FromMinutes(1));
+            await Task.Delay(TimeSpan.FromMilliseconds(200)); // settle window: absence can only be sampled
+            Assert.Equal(listingsAtHandBack, database.PendingCounts.Count);
         }
         finally
         {
@@ -430,6 +446,198 @@ public sealed class RedisTransportRound33RegressionTests
         Assert.Equal<string>(["2-0", "3-0"], database.PendingIds);
         Assert.Equal("handed_back_after_commit", RedisTransportTests.Field(Assert.Single(database.Adds), "reason"));
         Assert.Empty(ingress.Handled);
+    }
+
+    /// <summary>
+    /// Fixpoint round 2 (S6a#3). A stop landing while a reclaimed candidate's handler ran ended the
+    /// claim pass, and the loop went straight on to XREADGROUP with the cancelled token — which the
+    /// adapter queues the moment it is called: the next new entry moved into this stopping
+    /// consumer's pending list (its reply discarded), where it waited out PendingMessageMinIdleTime
+    /// before a peer could take it, the peer's claim spending an attempt. Pre-fix: one XREADGROUP
+    /// after the stop, 3-0 stranded in the pending list.
+    /// </summary>
+    [Fact]
+    public async Task AckAfterHandlerSubscriber_AStopDuringAReclaimedHandler_ReadsNothingMore()
+    {
+        var database = new ModelRedisStreamDatabase();
+        database.AddPending("1-0", Entry("1-0", "p1"));
+        database.Append(Entry("3-0", "p3"));
+        var ingress = new GatedWorkerIngress("p1");
+        var subscriber = WorkerSubscriber(database, ingress, _ => { });
+
+        await subscriber.StartAsync(CancellationToken.None);
+        Task stopping = Task.CompletedTask;
+        try
+        {
+            await ingress.Started("p1").WaitAsync(WaitBudget);
+            stopping = subscriber.StopAsync(CancellationToken.None); // cancels the token; the handler runs on
+        }
+        finally
+        {
+            ingress.ReleaseAll();
+            await stopping.WaitAsync(WaitBudget);
+        }
+
+        Assert.Equal<string>(["p1"], ingress.Handled);
+        Assert.Empty(database.Reads);
+        Assert.Equal<string>(["1-0"], database.Acks);
+        Assert.Empty(database.PendingIds); // 3-0 was never read: still new, for any consumer
+    }
+
+    /// <summary>
+    /// Fixpoint round 2 (WorkerIntakeGate): the worker subscriber takes no new delivery from host
+    /// stop on — ApplicationStopping, which fires before the subscriber's own token. Between the
+    /// two, the loop went on reading and claiming: each flow wake-up it took there (this host's own
+    /// hand-overs, published for a live replica) was handed back again, pending on this stopping
+    /// consumer with an attempt spent. Here the gate closes while 1-0 runs; the loop then claims
+    /// 2-0 and reads 3-0 never, though its token is still live. Pre-fix (no gate): 2-0 is claimed
+    /// and run, and 3-0 is read.
+    /// </summary>
+    [Fact]
+    public async Task WorkerSubscriber_FromApplicationStopping_ReadsAndClaimsNothingMore_ThoughItsTokenIsLive()
+    {
+        var database = new ModelRedisStreamDatabase();
+        database.AddPending("1-0", Entry("1-0", "p1"));
+        database.AddPending("2-0", Entry("2-0", "p2"));
+        database.Append(Entry("3-0", "p3"));
+        var ingress = new GatedWorkerIngress("p1");
+        using var host = new DurableFlowContextTestSupport.StoppingHost();
+        var subscriber = WorkerSubscriber(database, ingress, options => options.PendingClaimBatchSize = 16, hostLifetime: host);
+
+        await subscriber.StartAsync(CancellationToken.None);
+        try
+        {
+            await ingress.Started("p1").WaitAsync(WaitBudget);
+            host.StopApplication();
+            ingress.Release("p1");
+            await WaitUntilAsync(() => database.Acks.Contains("1-0"), "1-0, already running, to finish and be ACKed");
+
+            // The loop is parked now, not merely between passes: give a still-running loop the
+            // chance to claim or read (absence can only be sampled).
+            await Task.Delay(TimeSpan.FromMilliseconds(200));
+            Assert.Equal<string[]>([["1-0"]], database.Claims);
+            Assert.Empty(database.Reads);
+        }
+        finally
+        {
+            ingress.ReleaseAll();
+            await subscriber.StopAsync(CancellationToken.None);
+        }
+
+        Assert.Equal<string>(["p1"], ingress.Handled);
+        Assert.Equal<string>(["2-0"], database.PendingIds); // for a live peer, its count untouched
+    }
+
+    /// <summary>
+    /// Fixpoint round 2 (WorkerIntakeGate), the early-ACK half: an entry read before host stop but
+    /// not yet dispatched is never enqueued and ACKed after it — it stays pending for a live peer
+    /// instead of becoming, once a worker hands it back, a dead-letter copy. The gate closes inside
+    /// the first entry's enqueue-and-ACK. Pre-fix: 2-0 and 3-0 are enqueued and ACKed.
+    /// </summary>
+    [Fact]
+    public async Task EarlyAckWorkerSubscriber_FromApplicationStopping_LeavesTheRestOfTheBatchPending()
+    {
+        var database = new ModelRedisStreamDatabase();
+        database.Append(Entry("1-0", "p1"), Entry("2-0", "p2"), Entry("3-0", "p3"));
+        var ingress = new GatedWorkerIngress();
+        using var host = new DurableFlowContextTestSupport.StoppingHost();
+        database.OnAck = id =>
+        {
+            if (id == "1-0")
+                host.StopApplication();
+        };
+        var subscriber = WorkerSubscriber(
+            database,
+            ingress,
+            options =>
+            {
+                options.BatchSize = 3;
+                options.UseAckAfterEnqueue(1, 3, TimeSpan.FromSeconds(5));
+            },
+            hostLifetime: host);
+
+        await subscriber.StartAsync(CancellationToken.None);
+        try
+        {
+            await WaitUntilAsync(() => ingress.Handled.Contains("p1"), "1-0, enqueued before the stop, to run");
+            await Task.Delay(TimeSpan.FromMilliseconds(200)); // absence can only be sampled
+        }
+        finally
+        {
+            await subscriber.StopAsync(CancellationToken.None);
+        }
+
+        Assert.Single(database.Reads);
+        Assert.Equal<string>(["1-0"], database.Acks);
+        Assert.Equal<string>(["2-0", "3-0"], database.PendingIds);
+        Assert.Equal<string>(["p1"], ingress.Handled);
+    }
+
+    public static TheoryData<bool> StopSignals() => new() { false, true };
+
+    /// <summary>
+    /// Fixpoint round 2 (S11#16 d, and the intake gate): once stopping, the in-flight batch's
+    /// idle-reset heartbeat keeps only the entry the loop is inside — the rest will not start here,
+    /// so their idle clocks must run out for a peer's reclaim. An ack-after-handler batch holds one
+    /// entry, so this is pinned on an early-ACK batch whose first XACK is wedged (the loop is
+    /// inside entry 1 of 3). Stopped by the subscriber's token, or by ApplicationStopping through the
+    /// worker's intake gate. Pre-fix: the gate variant's heartbeats keep claiming all three.
+    /// </summary>
+    [Theory]
+    [MemberData(nameof(StopSignals))]
+    public async Task Subscriber_OnStop_TheHeartbeatKeepsOnlyTheEntryInFlight(bool viaApplicationStopping)
+    {
+        var database = new ModelRedisStreamDatabase();
+        database.Append(Entry("1-0", "p1"), Entry("2-0", "p2"), Entry("3-0", "p3"));
+        var ingress = new GatedWorkerIngress();
+        using var host = new DurableFlowContextTestSupport.StoppingHost();
+        var ackEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseAck = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        database.OnAck = id =>
+        {
+            if (id != "1-0")
+                return;
+            ackEntered.TrySetResult();
+            releaseAck.Task.Wait(WaitBudget);
+        };
+        // A 90 ms reclaim window puts the heartbeat at 30 ms.
+        var subscriber = WorkerSubscriber(
+            database,
+            ingress,
+            options =>
+            {
+                options.BatchSize = 3;
+                options.PendingMessageMinIdleTime = TimeSpan.FromMilliseconds(90);
+                options.UseAckAfterEnqueue(1, 3, TimeSpan.FromSeconds(5));
+            },
+            hostLifetime: host);
+
+        await subscriber.StartAsync(CancellationToken.None);
+        Task stopping = Task.CompletedTask;
+        try
+        {
+            await ackEntered.Task.WaitAsync(WaitBudget);
+            await WaitUntilAsync(() => database.Heartbeats.Count > 0, "a heartbeat while the batch runs");
+            Assert.Equal<string>(["1-0", "2-0", "3-0"], database.Heartbeats[0]);
+
+            if (viaApplicationStopping)
+                host.StopApplication();
+            else
+                stopping = subscriber.StopAsync(CancellationToken.None);
+
+            // A sweep already in flight may still carry the whole batch; the ones after it may not.
+            var beatsAtStop = database.Heartbeats.Count;
+            await WaitUntilAsync(() => database.Heartbeats.Count > beatsAtStop + 1, "two heartbeats after the stop");
+            Assert.All(database.Heartbeats.Skip(beatsAtStop + 1), ids => Assert.Equal<string>(["1-0"], ids));
+        }
+        finally
+        {
+            releaseAck.TrySetResult();
+            await stopping.WaitAsync(WaitBudget);
+            await subscriber.StopAsync(CancellationToken.None);
+        }
+
+        Assert.Equal<string>(["2-0", "3-0"], database.PendingIds);
     }
 
     /// <summary>
@@ -651,8 +859,11 @@ public sealed class RedisTransportRound33RegressionTests
     /// Fixpoint r1 (S6a#15). The pending-claim schedule ran on the wall clock
     /// (<c>next = UtcNow + PendingClaimInterval</c>), so a backward clock step — a VM resume, an NTP
     /// correction — suspended every reclaim for the size of the step. It now runs on the monotonic
-    /// timestamp. Red on a variant scheduled on the seam's wall clock: after the hour-long backward
-    /// step no second XPENDING ever comes.
+    /// timestamp. Red on a variant scheduled on the seam's wall clock (after the hour-long backward
+    /// step no second XPENDING ever comes) and — fixpoint round 2 (S11#4) — on the pre-fix code,
+    /// scheduled on the REAL wall clock: the interval is an hour, so only a monotonic schedule on
+    /// the seam can issue the second XPENDING inside the wait budget. (With a 5 s interval the
+    /// real-clock schedule fired its second XPENDING inside the 5 s budget on its own.)
     /// </summary>
     [Fact]
     public async Task Subscriber_PendingClaimSchedule_SurvivesABackwardWallClockStep()
@@ -660,7 +871,7 @@ public sealed class RedisTransportRound33RegressionTests
         var database = new ModelRedisStreamDatabase();
         var clock = new SteppingClock();
         var ingress = new GatedWorkerIngress();
-        var subscriber = WorkerSubscriber(database, ingress, options => options.PendingClaimInterval = TimeSpan.FromSeconds(5));
+        var subscriber = WorkerSubscriber(database, ingress, options => options.PendingClaimInterval = TimeSpan.FromHours(1));
         subscriber.Clock = clock;
 
         await subscriber.StartAsync(CancellationToken.None);
@@ -671,7 +882,7 @@ public sealed class RedisTransportRound33RegressionTests
             Assert.Single(database.PendingCounts);
 
             // The wall clock jumps an hour back while monotonic time moves past the interval.
-            clock.Step(wall: TimeSpan.FromHours(-1), monotonic: TimeSpan.FromSeconds(6));
+            clock.Step(wall: TimeSpan.FromHours(-1), monotonic: TimeSpan.FromHours(1) + TimeSpan.FromSeconds(1));
             await WaitUntilAsync(() => database.PendingCounts.Count >= 2, "the next scheduled XPENDING");
         }
         finally
@@ -821,7 +1032,8 @@ public sealed class RedisTransportRound33RegressionTests
         IRedisStreamDatabase database,
         IAsyncResponseIngress ingress,
         Action<RedisSubscriberOptions> configure,
-        ILogger<RedisWorkerSubscriber>? logger = null)
+        ILogger<RedisWorkerSubscriber>? logger = null,
+        Microsoft.Extensions.Hosting.IHostApplicationLifetime? hostLifetime = null)
     {
         var options = new RedisAsyncResponseTransportOptions
         {
@@ -843,7 +1055,8 @@ public sealed class RedisTransportRound33RegressionTests
             Options.Create(options),
             database,
             ingress,
-            logger ?? NullLogger<RedisWorkerSubscriber>.Instance);
+            logger ?? NullLogger<RedisWorkerSubscriber>.Instance,
+            hostLifetime);
     }
 
     /// <summary>

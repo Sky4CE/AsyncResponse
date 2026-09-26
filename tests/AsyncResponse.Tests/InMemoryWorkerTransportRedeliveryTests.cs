@@ -336,6 +336,40 @@ public sealed class InMemoryWorkerTransportRedeliveryTests
         await host.DisposeAsync();
     }
 
+    [Fact]
+    public async Task StopDuringARetryBackoff_WithBoundedAttempts_RetriesDuringTheDrain_InsteadOfDropping()
+    {
+        // S4#2 (fixpoint r2): a stop that interrupted the retry backoff dropped the job even with
+        // bounded attempts left — the same failure a moment after the stop took the drain's
+        // ladder and kept them, and the MaxDeliveryAttempts doc promises exactly that ("With a
+        // positive value the remaining attempts keep running during the drain"). A durable flow
+        // whose wake-up failed transiently just before a deploy was stranded. The job now retries
+        // at once, during the drain; only unlimited retries (0) still drop at the stop.
+        var probe = new RedeliveryProbe();
+        probe.FailuresBeforeSuccess["flaky"] = 1;
+        var logger = new CollectingLogger();
+        var host = await StartHostAsync(probe, new InMemoryWorkerTransportOptions
+        {
+            MaxDeliveryAttempts = 5,
+            RetryBaseDelay = TimeSpan.FromMinutes(10),
+            RetryMaxDelay = TimeSpan.FromMinutes(10)
+        }, logger);
+
+        await host.PublishAsync("flaky");
+        // Logged just before the ten-minute backoff begins: the stop below interrupts that sleep.
+        await logger.WaitForAsync("failed on attempt 1; retrying in");
+
+        using var cutoff = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        await host.StopAsync(cutoff.Token);
+
+        Assert.False(cutoff.IsCancellationRequested, "the stop should have drained on its own, not been cut off");
+        Assert.True(probe.Completed.Task.IsCompletedSuccessfully, "the interrupted job must keep its remaining attempts through the drain");
+        Assert.Equal(2, probe.Attempts("flaky"));
+        Assert.Contains(logger.Messages, message => message.Contains("retrying it now, during the shutdown drain", StringComparison.Ordinal));
+        Assert.DoesNotContain(logger.Messages, message => message.Contains("dropping it", StringComparison.Ordinal));
+        await host.DisposeAsync();
+    }
+
     private static async Task<HostHandle> StartHostAsync(
         RedeliveryProbe probe,
         InMemoryWorkerTransportOptions options,

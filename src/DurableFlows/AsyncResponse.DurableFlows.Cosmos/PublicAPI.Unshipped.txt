@@ -17,7 +17,7 @@ AsyncResponse.DurableFlows.Cosmos.CosmosDurableFlowOptions.Throughput.get -> int
 AsyncResponse.DurableFlows.Cosmos.CosmosDurableFlowOptions.Throughput.set -> void
 AsyncResponse.DurableFlows.Cosmos.CosmosDurableFlowOptions.Validate() -> void
 AsyncResponse.DurableFlows.Cosmos.CosmosFlowStateStore
-AsyncResponse.DurableFlows.Cosmos.CosmosFlowStateStore.CosmosFlowStateStore(Microsoft.Azure.Cosmos.CosmosClient! client, Microsoft.Extensions.Options.IOptions<AsyncResponse.DurableFlows.Cosmos.CosmosDurableFlowOptions!>! options, bool ownsClient = false) -> void
+AsyncResponse.DurableFlows.Cosmos.CosmosFlowStateStore.CosmosFlowStateStore(Microsoft.Azure.Cosmos.CosmosClient! client, Microsoft.Extensions.Options.IOptions<AsyncResponse.DurableFlows.Cosmos.CosmosDurableFlowOptions!>! options, bool ownsClient = false, Microsoft.Extensions.Logging.ILogger<AsyncResponse.DurableFlows.Cosmos.CosmosFlowStateStore!>? logger = null) -> void
 AsyncResponse.DurableFlows.Cosmos.CosmosFlowStateStore.Dispose() -> void
 AsyncResponse.DurableFlows.Cosmos.CosmosFlowStateStore.LoadAsync(string! flowId, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task<AsyncResponse.FlowState?>!
 AsyncResponse.DurableFlows.Cosmos.CosmosFlowStateStore.LoadCurrentAsync(string! flowId, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task<AsyncResponse.FlowState?>!

@@ -119,6 +119,10 @@ invocation. If you do not use durable flows, or want to gate the executor yourse
 
 A **custom** `IAsyncResponseCallbackAuthorizer` gets no implicit entries: when durable flows are
 enabled it must allow `IDurableFlowExecutor` itself, or flow recovery callbacks will be refused.
+Register it as a singleton, as `AuthorizeCallbacks` does. The startup check resolves the
+authorizer in a scope of its own, so a scoped registration no longer fails there — but with a
+broker transport the ingress, a singleton, still takes the authorizer directly, so a scoped
+authorizer still fails scope validation (`ValidateScopes`/`ValidateOnBuild`) there.
 
 > Default = no authorizer = allow all = unchanged behavior. The authorizer is type-level; it does
 > **not** read per-method attributes.
@@ -249,9 +253,10 @@ logged and skipped rather than throwing, so bad input cannot crash ingress.
 ## Type resolution for plugins / AssemblyLoadContext
 
 Recovery callbacks and worker payloads are persisted as **type name strings** and resolved on the
-receiving side — against the assemblies **already loaded** into the process only, every component
-of the name included: a generic argument naming an assembly the process has not loaded resolves
-the whole name to unresolved rather than forcing that assembly to load. "Loaded" spans every
+receiving side — by default against the assemblies **already loaded** into the process only, every
+component of the name included: a generic argument naming an assembly the process has not loaded
+resolves the whole name to unresolved rather than forcing that assembly to load (a registered
+assembly or resolver, below, is not held to this). "Loaded" spans every
 `AssemblyLoadContext`: a plugin's types resolve once its context has loaded them, and a name
 defined in several loaded assemblies (the same plugin in two contexts) resolves to the first one
 loaded. If your callback/payload types may not be loaded yet when a persisted name arrives
@@ -270,6 +275,17 @@ IDisposable assemblyRegistration =
 IDisposable resolverRegistration = AsyncResponseTypeResolution.RegisterResolver(name =>
     PluginCatalog.TryFind(name, out var t) ? t : null);
 ```
+
+**A registered assembly may load what the name asks for.** `RegisterAssembly` resolves a name with
+the runtime's own type-name parser (`Assembly.GetType`), which is not confined to loaded
+assemblies: when a generic argument names an assembly that is not loaded yet, the registered
+assembly's `AssemblyLoadContext` loads it — from the plugin's dependencies or the application's
+trusted platform assemblies — on the way to a verdict, and that name is written by whoever can
+write the recovery store or the worker stream. Only files the application or plugin deploys can
+load this way (never one the name's author supplies), and the resolved type must still pass the
+payload marker gate, the DI registration, and the callback authorizer before anything uses it. If
+even the load is unacceptable, register a `RegisterResolver` delegate that answers only the names
+you expect (as `PluginCatalog` above) instead of the whole assembly.
 
 **Keep the returned handle and dispose it when the plugin goes away.** A registration lives in a
 process-wide list, and `RegisterAssembly` holds the assembly strongly — so an undisposed

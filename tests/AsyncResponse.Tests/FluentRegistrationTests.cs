@@ -106,6 +106,37 @@ public class FluentRegistrationTests
     }
 
     [Fact]
+    public async Task StartupValidator_ScopedAuthorizers_AreCountedUnderScopeValidation_NotRefusedAsCaptive()
+    {
+        // Fixpoint r2 (GS2#2): the single-authorizer check injected
+        // IEnumerable<IAsyncResponseCallbackAuthorizer> into the singleton validator, so with
+        // ValidateScopes on (the Testing harness always sets it) a directly registered SCOPED
+        // authorizer failed the host start with "Cannot consume scoped service" — although every
+        // runtime consumer resolves the authorizer from a scope. The check now resolves in a
+        // scope: one scoped authorizer starts, two are still two.
+        await using var single = Build(builder =>
+        {
+            builder.WithInMemoryChannel().WithInMemoryTransport().WithInMemoryDurableFlows();
+            builder.Services.AddScoped<IAsyncResponseCallbackAuthorizer, AllowEverythingAuthorizer>();
+        }, validateScopes: true);
+        await StartupValidator(single).StartAsync(CancellationToken.None);
+
+        await using var twice = Build(builder =>
+        {
+            builder.WithInMemoryChannel().WithInMemoryTransport().WithInMemoryDurableFlows();
+            builder.Services.AddScoped<IAsyncResponseCallbackAuthorizer, AllowEverythingAuthorizer>();
+            builder.Services.AddScoped<IAsyncResponseCallbackAuthorizer, AllowEverythingAuthorizer>();
+        }, validateScopes: true);
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => StartupValidator(twice).StartAsync(CancellationToken.None));
+        Assert.Contains($"{nameof(IAsyncResponseCallbackAuthorizer)} is registered 2 times", ex.Message, StringComparison.Ordinal);
+    }
+
+    private sealed class AllowEverythingAuthorizer : IAsyncResponseCallbackAuthorizer
+    {
+        public bool IsAllowed(string serviceInterfaceFullName, string methodName) => true;
+    }
+
+    [Fact]
     public async Task StartupValidator_KeyedScopedObserver_IsNotAuditedAsTheExecutorsObserver()
     {
         // Regression: the observer-lifetime audit matched keyed descriptors too, although the
@@ -193,12 +224,12 @@ public class FluentRegistrationTests
         Assert.Equal(0, await probe.CountActiveSubscribersAsync(correlationId));
     }
 
-    private static ServiceProvider Build(Action<AsyncResponseRegistrationBuilder> configure)
+    private static ServiceProvider Build(Action<AsyncResponseRegistrationBuilder> configure, bool validateScopes = false)
     {
         var services = new ServiceCollection();
         services.AddSingleton(typeof(ILogger<>), typeof(NullLogger<>));
         configure(services.AddAsyncResponse());
-        return services.BuildServiceProvider();
+        return services.BuildServiceProvider(new ServiceProviderOptions { ValidateScopes = validateScopes });
     }
 
     private static AsyncResponseStartupValidator StartupValidator(IServiceProvider provider)

@@ -306,6 +306,123 @@ public sealed class SubscriberSupervisorTests
         Assert.Equal(new List<int> { 1, 2, 3 }, observedFailureCounts);
     }
 
+    /// <summary>
+    /// Regression (fixpoint r2): the retry's log callback ran bare, so a logging provider that
+    /// throws (MEL rethrows a provider's failure) turned it into an exception out of the loop —
+    /// the subscriber's BackgroundService faulted (stopping the host under the default behavior)
+    /// for a failure the loop exists to ride out.
+    /// </summary>
+    [Fact]
+    public async Task RunAsync_KeepsRetrying_WhenTheRetryLogThrows()
+    {
+        var attempt = 0;
+        var logCalls = 0;
+
+        await RunAsync(
+            _ =>
+            {
+                attempt++;
+                return attempt < 3 ? throw new InvalidOperationException($"attempt {attempt} fails") : Task.CompletedTask;
+            },
+            CancellationToken.None,
+            _ => TimeSpan.Zero,
+            (_, _) =>
+            {
+                logCalls++;
+                throw new InvalidOperationException("logger exploded");
+            }).WaitAsync(TimeSpan.FromSeconds(30));
+
+        Assert.Equal(3, attempt);
+        Assert.Equal(2, logCalls);
+    }
+
+    /// <summary>
+    /// The longest delay the half-jittered <c>AsyncResponseRetry.Backoff</c> can produce is
+    /// <c>min(max, base × 1024)</c> — its multiplier stops doubling at 2^10 — not the configured
+    /// maximum alone.
+    /// </summary>
+    [Fact]
+    public void MaxAttainableDelay_IsTheLongestDelayBackoffCanProduce()
+    {
+        Assert.Equal(TimeSpan.FromMilliseconds(10_240), AsyncResponseRetry.MaxAttainableDelay(TimeSpan.FromMilliseconds(10), TimeSpan.FromSeconds(60)));
+        Assert.Equal(TimeSpan.FromSeconds(5), AsyncResponseRetry.MaxAttainableDelay(TimeSpan.FromMilliseconds(100), TimeSpan.FromSeconds(5)));
+        Assert.Equal(TimeSpan.FromSeconds(1), AsyncResponseRetry.MaxAttainableDelay(TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(1)));
+
+        // Saturating: a base whose ×1024 overflows TimeSpan is capped at the maximum.
+        Assert.Equal(TimeSpan.MaxValue, AsyncResponseRetry.MaxAttainableDelay(TimeSpan.MaxValue / 2, TimeSpan.MaxValue));
+
+        var baseDelay = TimeSpan.FromMilliseconds(10);
+        var maxDelay = TimeSpan.FromSeconds(60);
+        var ceiling = AsyncResponseRetry.MaxAttainableDelay(baseDelay, maxDelay);
+        for (var failures = 1; failures <= 64; failures++)
+            Assert.True(AsyncResponseRetry.Backoff(failures, baseDelay, maxDelay) <= ceiling, $"Backoff({failures}) exceeded {ceiling}");
+    }
+
+    /// <summary>
+    /// S6a#8 (fixpoint r2): with a small base and a large maximum (10 ms / 60 s — every validator
+    /// accepts it) the policy never waits more than ~10 s, so judging a healthy run against the
+    /// 60 s maximum kept the streak for runs that stayed up 10–60 s and the next blip waited
+    /// seconds instead of milliseconds. <c>MaxAttainableDelay</c> is the threshold that matches the
+    /// supervisor's "outlived the longest delay the policy can impose".
+    /// </summary>
+    [Fact]
+    public async Task RunAsync_WithTheAttainableCeilingAsThreshold_ResetsAfterARunLongerThanAnyRealDelay()
+    {
+        var clock = new VirtualTimeProvider();
+        var baseDelay = TimeSpan.FromMilliseconds(10);
+        var maxDelay = TimeSpan.FromSeconds(60);
+        var attempt = 0;
+        var delays = new List<TimeSpan>();
+
+        var task = RunAsync(
+            _ =>
+            {
+                attempt++;
+                switch (attempt)
+                {
+                    case <= 11:
+                        throw new InvalidOperationException("a burst of failures past the multiplier cap");
+                    case 12:
+                        // Healthy for 20 s: longer than any delay this policy can produce (~10 s).
+                        clock.Advance(TimeSpan.FromSeconds(20));
+                        throw new InvalidOperationException("an unrelated blip");
+                    default:
+                        return Task.CompletedTask;
+                }
+            },
+            CancellationToken.None,
+            failures =>
+            {
+                var delay = AsyncResponseRetry.Backoff(failures, baseDelay, maxDelay);
+                lock (delays) delays.Add(delay);
+                return delay;
+            },
+            (_, _) => { },
+            clock,
+            healthyRunThreshold: AsyncResponseRetry.MaxAttainableDelay(baseDelay, maxDelay));
+
+        // Drive each retry wait on the virtual clock (a hang guard only, never an assertion window).
+        var guard = DateTime.UtcNow + TimeSpan.FromSeconds(30);
+        while (!task.IsCompleted)
+        {
+            Assert.True(DateTime.UtcNow < guard, "the supervisor never finished its retries");
+            if (clock.NextTimerDueAt is { } due)
+                clock.AdvanceTo(due);
+            else
+                await Task.Delay(TimeSpan.FromMilliseconds(1));
+        }
+
+        await task;
+        lock (delays)
+        {
+            Assert.Equal(12, delays.Count);
+            // The blip after the healthy run starts a new streak: the base delay's half-jitter
+            // range, not the capped ~5–10 s the eleventh consecutive failure waited.
+            Assert.InRange(delays[^1], TimeSpan.FromMilliseconds(1), baseDelay);
+            Assert.True(delays[^2] >= TimeSpan.FromSeconds(5), $"the eleventh failure waited only {delays[^2]}");
+        }
+    }
+
     /// <summary>The retry wait runs on the supplied clock, so a virtual clock decides when it ends.</summary>
     [Fact]
     public async Task RunAsync_WaitsOutTheRetryDelay_OnTheSuppliedClock()

@@ -12,6 +12,7 @@ namespace AsyncResponse.Transports.MongoDB;
 internal abstract class MongoDbSubscriberService : BackgroundService
 {
     private readonly MongoDbTransportStore _store;
+    private readonly WorkerIntakeGate? _intakeGate;
     private readonly Channel<bool> _signals = Channel.CreateBounded<bool>(new BoundedChannelOptions(1)
     {
         SingleReader = true,
@@ -19,15 +20,22 @@ internal abstract class MongoDbSubscriberService : BackgroundService
         FullMode = BoundedChannelFullMode.DropWrite
     });
 
+    /// <param name="options">The transport options.</param>
+    /// <param name="store">The queue store.</param>
+    /// <param name="logger">The subscriber's logger.</param>
+    /// <param name="intakeGate">The worker subscriber's host-stop intake gate; <c>null</c> for the
+    /// response subscriber, which keeps delivering to waiters through host stop.</param>
     protected MongoDbSubscriberService(
         IOptions<MongoDbAsyncResponseTransportOptions> options,
         MongoDbTransportStore store,
-        ILogger logger)
+        ILogger logger,
+        WorkerIntakeGate? intakeGate = null)
     {
         Options = options.Value;
         MongoDbTransportOptionsValidator.ValidateCommon(Options);
         _store = store;
         Logger = logger;
+        _intakeGate = intakeGate;
     }
 
     protected MongoDbAsyncResponseTransportOptions Options { get; }
@@ -68,14 +76,15 @@ internal abstract class MongoDbSubscriberService : BackgroundService
             Options,
             SubscriberOptions,
             Logger,
-            Role);
+            Role,
+            hostStopping: _intakeGate?.HostStopping ?? CancellationToken.None);
 
         await SubscriberSupervisor.RunAsync(
             attemptToken => RunSubscriberAsync(dispatcher, attemptToken),
             stoppingToken,
             failures => AsyncResponseRetry.Backoff(failures, Options.SubscriberRetryBaseDelay, Options.SubscriberRetryMaxDelay),
             (ex, delay) => Logger.LogWarning(ex, "MongoDB subscriber failed for queue {Queue} ({Role}); retrying in {RetryDelay}.", Queue, Role, delay),
-            healthyRunThreshold: Options.SubscriberRetryMaxDelay).ConfigureAwait(false);
+            healthyRunThreshold: AsyncResponseRetry.MaxAttainableDelay(Options.SubscriberRetryBaseDelay, Options.SubscriberRetryMaxDelay)).ConfigureAwait(false);
     }
 
     private async Task RunSubscriberAsync(MongoDbMessageDispatcher dispatcher, CancellationToken stoppingToken)
@@ -102,11 +111,29 @@ internal abstract class MongoDbSubscriberService : BackgroundService
 
             while (!stoppingToken.IsCancellationRequested)
             {
+                // Worker intake stops at host stop (WorkerIntakeGate): once ApplicationStopping has
+                // fired, claim nothing more — the documents stay in the collection for a live
+                // replica — and wait for this subscriber's own stop. Claiming on through the stop
+                // window took the very wake-ups this host's own flow hand-overs had just published
+                // and handed them back: an attempt spent and the document locked until its lease
+                // lapsed (or, under early ACK, a settled wake-up turned into a dead-letter copy),
+                // where a live peer would have run it at once.
+                if (_intakeGate?.IsClosed == true)
+                {
+                    await ParkAtHostStopAsync(stoppingToken).ConfigureAwait(false);
+                    break;
+                }
+
                 var claimed = 0;
                 await foreach (var delivery in _store.ClaimBatchAsync(Queue, SubscriberOptions.BatchSize, Options.LockTimeout, stoppingToken).ConfigureAwait(false))
                 {
                     claimed++;
                     await dispatcher.HandleAsync(delivery, stoppingToken).ConfigureAwait(false);
+
+                    // The batch claims lazily, one document per step, so leaving it here claims
+                    // nothing more.
+                    if (_intakeGate?.IsClosed == true)
+                        break;
                 }
 
                 if (claimed > 0)
@@ -156,17 +183,19 @@ internal abstract class MongoDbSubscriberService : BackgroundService
             {
                 // Structural, not transient: a standalone server never grows change streams, so
                 // retrying is pointless — the poll loop is the permanent delivery path here.
-                Logger.LogInformation(
+                SafeLog.Try(() => Logger.LogInformation(
                     "MongoDB change streams are unavailable for queue {Queue} (the server is not a replica set); polling continues at {PollDelay}.",
                     Queue,
-                    SubscriberOptions.EmptyPollDelay);
+                    SubscriberOptions.EmptyPollDelay));
                 return;
             }
             catch (Exception ex)
             {
                 failures++;
                 var delay = AsyncResponseRetry.Backoff(failures, Options.SubscriberRetryBaseDelay, Options.SubscriberRetryMaxDelay);
-                Logger.LogWarning(ex, "MongoDB change-stream wake for queue {Queue} failed; retrying in {RetryDelay} (polling continues meanwhile).", Queue, delay);
+                // Guarded: a throwing logging provider ended this loop for good (poll-only wakes
+                // for the rest of the process's uptime).
+                SafeLog.Try(() => Logger.LogWarning(ex, "MongoDB change-stream wake for queue {Queue} failed; retrying in {RetryDelay} (polling continues meanwhile).", Queue, delay));
                 try
                 {
                     await Task.Delay(delay, cancellationToken).ConfigureAwait(false);
@@ -198,6 +227,17 @@ internal abstract class MongoDbSubscriberService : BackgroundService
             }
         }
     }
+
+    // The worker loop's host-stop park: no claim until this subscriber's own stop (the
+    // change-stream wake keeps signalling into the one-slot, drop-on-full channel, which nothing
+    // reads any more).
+    private async Task ParkAtHostStopAsync(CancellationToken stoppingToken)
+    {
+        SafeLog.Try((Logger, Queue), static s => s.Logger.LogDebug(
+            "MongoDB worker subscriber for queue {Queue} stopped claiming: the host is stopping, so the documents are left for a live replica.",
+            s.Queue));
+        await Task.Delay(Timeout.InfiniteTimeSpan, stoppingToken).ConfigureAwait(ConfigureAwaitOptions.SuppressThrowing);
+    }
 }
 
 /// <summary>Consumes worker-job documents and executes them through the AsyncResponse ingress.</summary>
@@ -205,12 +245,19 @@ internal sealed class MongoDbWorkerSubscriber : MongoDbSubscriberService
 {
     private readonly IAsyncResponseIngress _ingress;
 
+    /// <param name="options">The transport options.</param>
+    /// <param name="store">The queue store.</param>
+    /// <param name="ingress">The ingress the worker jobs run through.</param>
+    /// <param name="logger">The subscriber's logger.</param>
+    /// <param name="hostLifetime">The host lifetime whose <c>ApplicationStopping</c> stops worker
+    /// intake (see <see cref="WorkerIntakeGate"/>); without one the gate never closes.</param>
     public MongoDbWorkerSubscriber(
         IOptions<MongoDbAsyncResponseTransportOptions> options,
         MongoDbTransportStore store,
         IAsyncResponseIngress ingress,
-        ILogger<MongoDbWorkerSubscriber> logger)
-        : base(options, store, logger)
+        ILogger<MongoDbWorkerSubscriber> logger,
+        IHostApplicationLifetime? hostLifetime = null)
+        : base(options, store, logger, new WorkerIntakeGate(hostLifetime))
         => _ingress = ingress;
 
     protected override string Queue => Options.WorkerQueue;

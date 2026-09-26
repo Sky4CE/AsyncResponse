@@ -358,8 +358,8 @@ public class AsyncResponseBuilderTests
             .Until(payload => payload.Status == OperationStatus.Completed)
             .WaitAsync();
 
-        Assert.Same(resumeCallback, resume);
-        Assert.Same(failureCallback, failure);
+        AssertCopyOf(resumeCallback, resume);
+        AssertCopyOf(failureCallback, failure);
         Assert.Equal(TimeSpan.FromSeconds(3), timeout);
         Assert.NotNull(predicate);
         Assert.True(await predicate!(new OperationResult { Status = OperationStatus.Completed }));
@@ -693,8 +693,8 @@ public class AsyncResponseBuilderTests
             .Until(payload => payload.Status == OperationStatus.Completed)
             .WaitAsync(_ => Task.CompletedTask);
 
-        Assert.Same(resumeCallback, resume);
-        Assert.Same(failureCallback, failure);
+        AssertCopyOf(resumeCallback, resume);
+        AssertCopyOf(failureCallback, failure);
         Assert.Equal(TimeSpan.FromSeconds(3), timeout);
         Assert.NotNull(predicate);
         Assert.True(await predicate!(new OperationResult { Status = OperationStatus.Completed }));
@@ -886,6 +886,31 @@ public class AsyncResponseBuilderTests
         var chained = Assert.Single(published);
         Assert.Equal(nameof(IExpressionWorker.Run), chained.Call.MethodName);
         Assert.Equal("default", chained.ReplyTarget?.Name);
+
+        // The target the handler saw ambiently (and every enqueue copied) reads as an empty map,
+        // not null: pre-fix a handler reading AsyncResponseContext.ReplyTarget!.Properties threw
+        // NullReferenceException on every delivery of such a job.
+        Assert.NotNull(chained.ReplyTarget!.Properties);
+        Assert.Empty(chained.ReplyTarget.Properties);
+    }
+
+    [Fact]
+    public void ReplyTargetProperties_AssignedNull_ReadsAsAnEmptyMap()
+    {
+        // The contract is non-nullable, so the accessor holds it: a foreign producer's wire null
+        // and a hand-built null both read back empty, and a real map is kept as given.
+        var parsed = System.Text.Json.JsonSerializer.Deserialize<AsyncResponseReplyTarget>(
+            """{"Name":"default","Transport":"test","Address":"test://default","Properties":null}""",
+            AsyncResponseJson.Default)!;
+        Assert.NotNull(parsed.Properties);
+        Assert.Empty(parsed.Properties);
+
+        var built = new AsyncResponseReplyTarget { Name = "n", Transport = "t", Address = "a", Properties = null! };
+        Assert.NotNull(built.Properties);
+        Assert.Empty(built.Properties);
+
+        var map = new Dictionary<string, string>(StringComparer.Ordinal) { ["topicId"] = "replies" };
+        Assert.Same(map, new AsyncResponseReplyTarget { Name = "n", Transport = "t", Address = "a", Properties = map }.Properties);
     }
 
     public interface IChainingWorker
@@ -925,16 +950,75 @@ public class AsyncResponseBuilderTests
         Assert.Equal(published + 5, ex.Limit);
         Assert.Empty(budgeted.Published);
 
-        // The worst-case hop is accounted for exactly, not with extra slack...
+        // The worst-case hop is accounted for exactly, not with extra slack: the stamped remainder,
+        // after the flow engine's own-job re-publish has widened the due time.
         var exact = new CapturingDelayedTransport();
-        await Producer(exact, clock, limit: published + AsyncResponseBuilderBase.MaxRedelayHopGrowth)
+        await Producer(exact, clock, limit: published + AsyncResponseBuilderBase.MaxDueTimeWideningGrowth + AsyncResponseBuilderBase.MaxRedelayHopGrowth)
             .EnqueueWorkerAsync<IPaddedWorker>(worker => worker.RunAsync(padding), delay);
         Assert.Single(exact.Published);
+    }
 
-        // ...and an immediate job, which is never re-published, keeps the plain comparison.
-        var immediate = new CapturingDelayedTransport();
-        await Producer(immediate, clock, limit: published + 5).EnqueueWorkerAsync<IPaddedWorker>(worker => worker.RunAsync(padding));
-        Assert.Single(immediate.Published);
+    [Fact]
+    public async Task ImmediateEnqueue_ThatOnlyFitsTheBudgetBeforeAnOwnJobRepublish_ThrowsAtTheProducer()
+    {
+        // Regression: an immediate job was measured with no hop growth at all, as "never
+        // re-published". The durable-flow engine does re-publish one — its own job, as the same
+        // job past a live holder's lease — and that copy gains a due time ("NotBeforeUtc":null
+        // becomes a 30-character instant), then a remaining-delay stamp if delivered early. A
+        // flow start or wake-up job within that margin of the limit passed here and its hop was
+        // acknowledged WITHOUT executing by the consuming ingress: the only copy, gone.
+        var clock = new FixedClock(new DateTimeOffset(2026, 1, 1, 0, 0, 0, TimeSpan.Zero));
+        var padding = new string('x', 2000);
+
+        var measuring = new CapturingDelayedTransport();
+        await Producer(measuring, clock, limit: null).EnqueueWorkerAsync<IPaddedWorker>(worker => worker.RunAsync(padding));
+        var envelope = Assert.Single(measuring.Published);
+        var published = AsyncResponseJson.Serialize(envelope).Length;
+
+        // What the ingress measures on the re-published, then early-delivered, hop.
+        var hop = DurableFlowExecutor.CopyForRedelay(envelope, new DateTime(2026, 1, 1, 0, 59, 59, DateTimeKind.Utc).AddTicks(1_234_567));
+        hop.LastRedelayRemaining = new TimeSpan(0, 44, 59) + TimeSpan.FromTicks(9_876_543);
+        Assert.True(AsyncResponseJson.Serialize(hop).Length > published + 26);
+
+        var budgeted = new CapturingDelayedTransport();
+        var ex = await Assert.ThrowsAsync<WorkerJobTooLargeException>(() =>
+            Producer(budgeted, clock, limit: published + 26).EnqueueWorkerAsync<IPaddedWorker>(worker => worker.RunAsync(padding)));
+        Assert.Equal(published + 26, ex.Limit);
+        Assert.Empty(budgeted.Published);
+
+        var exact = new CapturingDelayedTransport();
+        await Producer(exact, clock, limit: published + AsyncResponseBuilderBase.MaxDueTimeStampGrowth + AsyncResponseBuilderBase.MaxRedelayHopGrowth)
+            .EnqueueWorkerAsync<IPaddedWorker>(worker => worker.RunAsync(padding));
+        Assert.Single(exact.Published);
+    }
+
+    [Fact]
+    public void DueTimeGrowthConstants_CoverTheWidestOwnJobRepublish()
+    {
+        // The flow engine's own-job hop (CopyForRedelay) stamps "now + delay" as the due time:
+        // a round-trip UTC instant with up to seven fraction digits. From null it grows by at
+        // most MaxDueTimeStampGrowth; replacing a whole-second due time, by at most
+        // MaxDueTimeWideningGrowth. The early-delivery stamp on that hop is pinned below.
+        var widest = new DateTime(2026, 9, 26, 12, 34, 56, DateTimeKind.Utc).AddTicks(1_234_567);
+        var immediate = new WorkerJobEnvelope
+        {
+            Call = new ReflectionCallDto { ServiceInterfaceFullName = "S", MethodName = "M", Params = [] },
+            JobId = Guid.NewGuid().ToString("N")
+        };
+        var delayed = DurableFlowExecutor.CopyForRedelay(immediate, new DateTime(2026, 9, 26, 12, 0, 0, DateTimeKind.Utc));
+
+        foreach (var due in new[] { widest, DateTime.MaxValue, new DateTime(9999, 12, 31, 23, 59, 59, DateTimeKind.Utc).AddTicks(9_999_999) })
+        {
+            var fromImmediate = AsyncResponseJson.Serialize(DurableFlowExecutor.CopyForRedelay(immediate, due)).Length - AsyncResponseJson.Serialize(immediate).Length;
+            Assert.True(fromImmediate <= AsyncResponseBuilderBase.MaxDueTimeStampGrowth, $"{due:O}: the immediate job grows by {fromImmediate}");
+
+            var fromDelayed = AsyncResponseJson.Serialize(DurableFlowExecutor.CopyForRedelay(delayed, due)).Length - AsyncResponseJson.Serialize(delayed).Length;
+            Assert.True(fromDelayed <= AsyncResponseBuilderBase.MaxDueTimeWideningGrowth, $"{due:O}: the delayed job grows by {fromDelayed}");
+        }
+
+        Assert.Equal(
+            AsyncResponseBuilderBase.MaxDueTimeStampGrowth,
+            AsyncResponseJson.Serialize(DurableFlowExecutor.CopyForRedelay(immediate, widest)).Length - AsyncResponseJson.Serialize(immediate).Length);
     }
 
     [Fact]
@@ -1003,6 +1087,67 @@ public class AsyncResponseBuilderTests
         MethodName = methodName,
         Params = [CallbackParam.ForPlaceholder(placeholder)]
     };
+
+    /// <summary>
+    /// A descriptor the caller handed a builder overload reaches the subscriber as an equal COPY
+    /// (descriptor, Params array and every CallbackParam), never the caller's own instances.
+    /// </summary>
+    private static void AssertCopyOf(ReflectionCallDto expected, ReflectionCallDto? actual)
+    {
+        Assert.NotNull(actual);
+        Assert.NotSame(expected, actual);
+        Assert.NotSame(expected.Params, actual!.Params);
+        Assert.Equal(expected.ServiceInterfaceFullName, actual.ServiceInterfaceFullName);
+        Assert.Equal(expected.MethodName, actual.MethodName);
+        Assert.Equal(expected.Params.Length, actual.Params.Length);
+        for (var i = 0; i < expected.Params.Length; i++)
+        {
+            Assert.NotSame(expected.Params[i], actual.Params[i]);
+            Assert.Equal(expected.Params[i].Placeholder, actual.Params[i].Placeholder);
+            Assert.Equal(expected.Params[i].Value, actual.Params[i].Value);
+        }
+    }
+
+    [Fact]
+    public async Task RecoverableBuilder_DescriptorOverloads_RegisterACopy_SoAReusedTemplateCannotAliasRegistrations()
+    {
+        // Regression: the builder handed the caller's descriptor straight through, and the
+        // in-memory recovery store keeps what it is given by reference (a durable store
+        // serializes it at save). A caller reusing one template — Params[0].Value = order id
+        // before each registration — left every in-memory registration aliasing that one object:
+        // after a (harness) restart each late response resumed with the LAST order id.
+        var registered = new List<ReflectionCallDto?>();
+        _recoverableSubscriber
+            .Setup(s => s.CreateRecoverableResponseWaiter<OperationResult>(
+                It.IsAny<string>(),
+                It.IsAny<ReflectionCallDto?>(),
+                It.IsAny<ReflectionCallDto?>(),
+                It.IsAny<Func<OperationResult, ValueTask<bool>>?>(),
+                It.IsAny<TimeSpan?>()))
+            .Callback<string, ReflectionCallDto?, ReflectionCallDto?, Func<OperationResult, ValueTask<bool>>?, TimeSpan?>(
+                (_, resume, failure, _, _) => { registered.Add(resume); registered.Add(failure); })
+            .ReturnsAsync(_waiter.Object);
+        var template = new ReflectionCallDto
+        {
+            ServiceInterfaceFullName = typeof(IRecoverySpy).FullName!,
+            MethodName = nameof(IRecoverySpy.OnWorkerJob),
+            Params = [CallbackParam.ForValue(0)]
+        };
+
+        foreach (var orderId in new[] { 1, 2 })
+        {
+            template.Params[0].Value = orderId;
+            IRecoverableAsyncResponseAttachedBuilder<OperationResult> builder =
+                new RecoverableAsyncResponseBuilder(_recoverableSubscriber.Object).For<OperationResult>($"corr-order-{orderId}");
+            await builder.OnLostSubscriberResume(template).OnLostSubscriberFailure(template).WaitAsync();
+        }
+
+        template.Params[0].Value = 99;
+
+        Assert.Equal(4, registered.Count);
+        Assert.Equal(new[] { 1, 1, 2, 2 }, registered.Select(descriptor => (int)descriptor!.Params[0].Value!).ToArray());
+        Assert.All(registered, descriptor => Assert.NotSame(template, descriptor));
+    }
 }
 
 public interface IExpressionWorker

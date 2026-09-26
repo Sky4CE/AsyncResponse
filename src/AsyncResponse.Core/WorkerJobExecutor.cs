@@ -65,12 +65,14 @@ internal sealed class WorkerJobExecutor(
         {
             // Escaped: the id has not been through the portability check yet (that runs below, and
             // only for a readable envelope), so it is still raw wire text — a CR/LF in it would
-            // forge a log line.
-            _logger.LogWarning(
-                "Worker job for correlationId {CorrelationId} has unsupported schema version {SchemaVersion} (current: {Current}); rejecting it.",
-                job.CorrelationId is { } rawId ? DiagnosticText.EscapedExcerpt(rawId, AsyncResponseChannelOptions.MaxCorrelationIdLength) : null,
-                job.SchemaVersion, WorkerJobEnvelopeSchema.Current);
+            // forge a log line. Every log line of this executor goes through SafeLog: it is the
+            // decision path of every transport, and a logging provider that throws (MEL rethrows
+            // a provider's failure) must not decide whether a job runs, fails, or is redelivered.
             AsyncResponseDiagnostics.RecordWorkerOutcome("rejected");
+            SafeLog.Try((Logger: _logger, Job: job), static state => state.Logger.LogWarning(
+                "Worker job for correlationId {CorrelationId} has unsupported schema version {SchemaVersion} (current: {Current}); rejecting it.",
+                state.Job.CorrelationId is { } rawId ? DiagnosticText.EscapedExcerpt(rawId, AsyncResponseChannelOptions.MaxCorrelationIdLength) : null,
+                state.Job.SchemaVersion, WorkerJobEnvelopeSchema.Current));
             throw new InvalidOperationException(
                 $"Worker job schema version {job.SchemaVersion} is not supported by this build " +
                 $"(current: {WorkerJobEnvelopeSchema.Current}) and cannot be executed safely.");
@@ -90,10 +92,13 @@ internal sealed class WorkerJobExecutor(
         if (!string.IsNullOrWhiteSpace(job.CorrelationId)
             && AsyncResponseChannelOptions.CorrelationIdNotPortable(job.CorrelationId) is { } rejection)
         {
-            _logger.LogError(
-                "Worker job carries a correlation id outside the portable contract; it cannot be executed and is acknowledged without dispatch. {Rejection}",
-                rejection);
+            // Decided first, logged second, through SafeLog: a logging provider that throws (MEL
+            // rethrows a provider's failure) turned this documented drop into the very poison
+            // message it exists to prevent.
             AsyncResponseDiagnostics.RecordWorkerOutcome("rejected");
+            SafeLog.Try((Logger: _logger, Rejection: rejection), static state => state.Logger.LogError(
+                "Worker job carries a correlation id outside the portable contract; it cannot be executed and is acknowledged without dispatch. {Rejection}",
+                state.Rejection));
             return;
         }
 
@@ -148,25 +153,26 @@ internal sealed class WorkerJobExecutor(
                     // instead — see WorkerJobSkewScope.
                     forcedEarly = WorkerJobSkewScope.Enter();
 
-                    _logger.LogWarning(
+                    SafeLog.Try((Logger: _logger, Job: job, Remaining: remaining, NotBeforeUtc: notBeforeUtc, StallCount: stallCount), static state => state.Logger.LogWarning(
                         "Worker job {Target}.{Method} was redelivered {Remaining} before its due time {NotBeforeUtc} with no progress over {StallCount} consecutive hops ({LastRemaining} previously); " +
                         "the publishing and delivery-gating clocks disagree (clock skew). Executing it now instead of re-publishing.",
-                        AsyncResponseTypeResolution.DescribeForDiagnostics(job.Call.ServiceInterfaceFullName), DiagnosticText.EscapedExcerpt(job.Call.MethodName, 256),
-                        remaining, notBeforeUtc, stallCount, job.LastRedelayRemaining);
+                        AsyncResponseTypeResolution.DescribeForDiagnostics(state.Job.Call.ServiceInterfaceFullName), DiagnosticText.EscapedExcerpt(state.Job.Call.MethodName, 256),
+                        state.Remaining, state.NotBeforeUtc, state.StallCount, state.Job.LastRedelayRemaining));
                     // No outcome recorded here: the execution below records exactly one outcome
                     // ("executed"/"failed") for this delivery, like every other path.
                 }
                 else
                 {
-                    if (_logger.IsEnabled(LogLevel.Debug))
+                    SafeLog.Try((Logger: _logger, Job: job, Remaining: remaining, NotBeforeUtc: notBeforeUtc), static state =>
                     {
-                        _logger.LogDebug(
-                            "Worker job {Target}.{Method} delivered {Remaining} before its due time {NotBeforeUtc}; re-publishing the next hop.",
-                            AsyncResponseTypeResolution.DescribeForDiagnostics(job.Call.ServiceInterfaceFullName), DiagnosticText.EscapedExcerpt(job.Call.MethodName, 256),
-                            remaining, notBeforeUtc);
-                    }
-
-                    AsyncResponseDiagnostics.RecordWorkerOutcome("redelayed");
+                        if (state.Logger.IsEnabled(LogLevel.Debug))
+                        {
+                            state.Logger.LogDebug(
+                                "Worker job {Target}.{Method} delivered {Remaining} before its due time {NotBeforeUtc}; re-publishing the next hop.",
+                                AsyncResponseTypeResolution.DescribeForDiagnostics(state.Job.Call.ServiceInterfaceFullName), DiagnosticText.EscapedExcerpt(state.Job.Call.MethodName, 256),
+                                state.Remaining, state.NotBeforeUtc);
+                        }
+                    });
 
                     // The next hop is a COPY carrying the new stall counters; the delivered
                     // envelope is never modified. The transport still owns it and may retry it as
@@ -179,7 +185,21 @@ internal sealed class WorkerJobExecutor(
                     next.LastRedelayRemaining = remaining;
                     next.RedelayStallCount = stallCount;
                     var hop = remaining <= delayedTransport.MaxPublishDelay ? remaining : delayedTransport.MaxPublishDelay;
-                    await delayedTransport.PublishAsync(next, hop).ConfigureAwait(false);
+
+                    // Recorded once the hop is out, as exactly one outcome per delivery: counted
+                    // before the publish, a hop the transport rejected read as "redelayed" — and
+                    // each retry of the delivery as one more — while no attempt ever read "failed".
+                    try
+                    {
+                        await delayedTransport.PublishAsync(next, hop).ConfigureAwait(false);
+                    }
+                    catch
+                    {
+                        AsyncResponseDiagnostics.RecordWorkerOutcome("failed");
+                        throw;
+                    }
+
+                    AsyncResponseDiagnostics.RecordWorkerOutcome("redelayed");
                     return;
                 }
             }
@@ -194,15 +214,18 @@ internal sealed class WorkerJobExecutor(
 
         // Escaped: the target is still unresolved wire text here (resolution and authorization run
         // below), and a blank correlation id skipped the portability check above.
-        if (_logger.IsEnabled(LogLevel.Debug))
+        SafeLog.Try((Logger: _logger, Job: job), static state =>
         {
-            _logger.LogDebug(
-                "Executing worker job {Target}.{Method} (correlationId: {CorrelationId}, replyTarget: {ReplyTarget}).",
-                AsyncResponseTypeResolution.DescribeForDiagnostics(job.Call.ServiceInterfaceFullName),
-                DiagnosticText.EscapedExcerpt(job.Call.MethodName, 256),
-                job.CorrelationId is { } correlationId ? DiagnosticText.EscapedExcerpt(correlationId, AsyncResponseChannelOptions.MaxCorrelationIdLength) : null,
-                job.ReplyTarget?.Name is { } replyTarget ? DiagnosticText.EscapedExcerpt(replyTarget, 256) : null);
-        }
+            if (state.Logger.IsEnabled(LogLevel.Debug))
+            {
+                state.Logger.LogDebug(
+                    "Executing worker job {Target}.{Method} (correlationId: {CorrelationId}, replyTarget: {ReplyTarget}).",
+                    AsyncResponseTypeResolution.DescribeForDiagnostics(state.Job.Call.ServiceInterfaceFullName),
+                    DiagnosticText.EscapedExcerpt(state.Job.Call.MethodName, 256),
+                    state.Job.CorrelationId is { } correlationId ? DiagnosticText.EscapedExcerpt(correlationId, AsyncResponseChannelOptions.MaxCorrelationIdLength) : null,
+                    state.Job.ReplyTarget?.Name is { } replyTarget ? DiagnosticText.EscapedExcerpt(replyTarget, 256) : null);
+            }
+        });
 
         try
         {
@@ -228,8 +251,15 @@ internal sealed class WorkerJobExecutor(
             await using var scope = _scopeFactory.CreateAsyncScope();
             await scope.ServiceProvider.InvokeAsync(invocation).ConfigureAwait(false);
 
-            _logger.LogDebug("Executed worker job {Target}.{Method} successfully.", job.Call.ServiceInterfaceFullName, job.Call.MethodName);
+            // Recorded first, logged second, through SafeLog: the job has run, and a logging
+            // provider that threw here (MEL rethrows a provider's failure) landed in the catch
+            // below — a "failed" outcome, and a redelivery that ran the job's side effects again.
             AsyncResponseDiagnostics.RecordWorkerOutcome("executed");
+            SafeLog.Try((Logger: _logger, job.Call), static state =>
+            {
+                if (state.Logger.IsEnabled(LogLevel.Debug))
+                    state.Logger.LogDebug("Executed worker job {Target}.{Method} successfully.", state.Call.ServiceInterfaceFullName, state.Call.MethodName);
+            });
         }
         // A DurableFlowInterruptedException passes through unrecorded: it is the flow engine
         // handing the delivery back at host stop — a cancellation by contract, never a job

@@ -544,6 +544,8 @@ public sealed class OracleCosmosStoreContractTests(OracleCosmosBatchFixture fixt
             var sessionConsistent = account.Consistency.DefaultConsistencyLevel is ConsistencyLevel.Session or ConsistencyLevel.Strong;
             foreach (var load in new Func<Task<FlowState?>>[] { () => store.LoadAsync("ttl-lapsed"), () => store.LoadCurrentAsync("ttl-lapsed") })
             {
+                // The strict branch runs only against a Session or Strong account, never on the
+                // (Eventual) emulator CI uses.
                 if (sessionConsistent)
                 {
                     Assert.Null(await load());
@@ -600,9 +602,15 @@ public sealed class OracleCosmosStoreContractTests(OracleCosmosBatchFixture fixt
                     IndexingPolicy = new IndexingPolicy { IndexingMode = IndexingMode.None, Automatic = false }
                 });
             }
-            catch (CosmosException ex) when (ex.StatusCode == System.Net.HttpStatusCode.BadRequest)
+            catch (CosmosException ex) when (ex.StatusCode == System.Net.HttpStatusCode.BadRequest
+                && ex.Message.Contains("automatic: false is not supported", StringComparison.OrdinalIgnoreCase))
             {
-                Assert.Skip($"This Cosmos endpoint refuses an unindexed container with TTL enabled ({ex.Message}); the store requires TTL, so the case cannot arise here.");
+                // Only the emulator's known refusal of the flag IndexingMode.None requires; any
+                // other 400 fails the test instead of skipping it.
+                Assert.Skip(
+                    "This Cosmos endpoint (the emulator) does not support IndexingMode.None (Automatic = false), so an unindexed " +
+                    "container cannot be created here. The scan fix is pinned by the unit test " +
+                    "LeaseQuery_AllowsAScan_SoAContainerWithoutIndexingStillServesLeases; run against a real Cosmos account to exercise it.");
             }
 
             IFlowStateStore store = new CosmosFlowStateStore(

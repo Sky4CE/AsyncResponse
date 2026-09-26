@@ -30,7 +30,7 @@ public sealed class PostgreSqlTransportStoreStatementTests
     [Fact]
     public void QueueTable_StoresAndBindsPayloadAndHeadersAsText()
     {
-        var ddl = Literals(AsyncBody(typeof(PostgreSqlTransportStore), nameof(PostgreSqlTransportStore.EnsureCreatedAsync)));
+        var ddl = Literals(AsyncBody(typeof(PostgreSqlTransportStore), "EnsureCreatedCoreAsync"));
         Assert.Contains(ddl, literal => literal.Contains("payload_json text NOT NULL", StringComparison.Ordinal));
         Assert.Contains(ddl, literal => literal.Contains("headers_json text NOT NULL DEFAULT", StringComparison.Ordinal));
         Assert.DoesNotContain(ddl, literal => literal.Contains("jsonb NOT NULL", StringComparison.Ordinal));
@@ -88,21 +88,129 @@ public sealed class PostgreSqlTransportStoreStatementTests
     [Fact]
     public void AutoCreateDdl_BoundsItsLockWaits_AndGivesTheRewriteAnHourLongCommandTimeout()
     {
-        var ddl = Literals(AsyncBody(typeof(PostgreSqlTransportStore), nameof(PostgreSqlTransportStore.EnsureCreatedAsync)));
-        // The first statement of the DDL transaction (the constant is interpolated after the literal).
-        Assert.Contains(ddl, literal => literal.StartsWith("SET LOCAL lock_timeout = '", StringComparison.Ordinal));
+        // Every DDL transaction is opened by the shared guard (src/Shared/PostgreSqlDdlGuard.cs, since
+        // fixpoint r2), whose first statement is the lock_timeout — see PostgreSqlDdlGuardTests.
         Assert.Equal("5s", PostgreSqlTransportStore.DdlLockTimeout);
-
         using var command = PostgreSqlTransportStore.LongRunningDdlCommand("ALTER TABLE t ALTER COLUMN c TYPE text;");
         Assert.Equal(3600, command.CommandTimeout);
 
-        // And the rewrite goes through that command — no other command in EnsureCreated carries it.
-        var calls = Decode(AsyncBody(typeof(PostgreSqlTransportStore), nameof(PostgreSqlTransportStore.EnsureCreatedAsync)))
+        // The DDL (in the shared attempt, EnsureCreatedCoreAsync) opens its transactions through the
+        // guard, and the rewrite goes through the guard's long-running command.
+        var calls = Decode(AsyncBody(typeof(PostgreSqlTransportStore), "EnsureCreatedCoreAsync"))
             .Select(instruction => instruction.Operand)
             .OfType<MethodBase>()
             .ToArray();
+        Assert.Contains(calls, method => method.Name == "BeginLockedTransactionAsync");
         Assert.Contains(calls, method => method.Name == nameof(PostgreSqlTransportStore.JsonbToTextMigrationSql));
-        Assert.Contains(calls, method => method.Name == nameof(PostgreSqlTransportStore.LongRunningDdlCommand));
+        Assert.Contains(calls, method => method.Name == "ExecuteLongRunningAsync");
+        Assert.DoesNotContain(
+            Literals(AsyncBody(typeof(PostgreSqlTransportStore), "EnsureCreatedCoreAsync")),
+            literal => literal.Contains("pg_advisory_xact_lock", StringComparison.Ordinal));
+    }
+
+    /// <summary>
+    /// Regression (fixpoint r2 S9#6): the hour-bounded jsonb rewrite and first index build ran inside
+    /// the transaction holding the schema-wide advisory key <c>asyncresponse:ddl:{schema}</c> — the key
+    /// the PostgreSQL channel and flow store take for their own DDL — so for the whole rewrite every
+    /// host starting meanwhile could not initialize ANY AsyncResponse store on the schema (other
+    /// applications' with different table names included). The schema-shared DDL now commits first,
+    /// and the table work runs in a transaction of its own under a key scoped to the table.
+    /// </summary>
+    [Fact]
+    public void LongRunningTableWork_RunsAfterTheSchemaKeyIsReleased_UnderATableScopedKey()
+    {
+        Assert.NotEqual(
+            PostgreSqlTransportStore.SchemaAdvisoryLockKey("public"),
+            PostgreSqlTransportStore.TableAdvisoryLockKey("public", "jobs"));
+        Assert.NotEqual(
+            PostgreSqlTransportStore.TableAdvisoryLockKey("public", "jobs"),
+            PostgreSqlTransportStore.TableAdvisoryLockKey("public", "other"));
+
+        var calls = Decode(AsyncBody(typeof(PostgreSqlTransportStore), "EnsureCreatedCoreAsync"))
+            .Select(instruction => instruction.Operand)
+            .OfType<MethodBase>()
+            .Select(method => method.Name)
+            .ToList();
+        var schemaTransaction = calls.IndexOf("BeginLockedTransactionAsync");
+        var tableTransaction = calls.LastIndexOf("BeginLockedTransactionAsync");
+        var rewrite = calls.IndexOf("ExecuteLongRunningAsync");
+        Assert.True(schemaTransaction >= 0 && tableTransaction > schemaTransaction && rewrite > tableTransaction, string.Join(", ", calls));
+        Assert.Contains(calls.Skip(schemaTransaction).Take(tableTransaction - schemaTransaction), name => name == "CommitAsync");
+
+        // The second transaction's key is the table's (the store computes both up front).
+        using var dataSource = NpgsqlDataSource.Create("Host=127.0.0.1;Port=1;Username=u;Password=p;Database=d");
+        using var store = new PostgreSqlTransportStore(
+            dataSource,
+            Options.Create(new PostgreSqlAsyncResponseTransportOptions { SchemaName = "s", MessageTable = "jobs" }));
+        Assert.Equal(PostgreSqlTransportStore.TableAdvisoryLockKey("s", "jobs"), Field<long>(store, "_tableLockKey"));
+        Assert.Equal(PostgreSqlTransportStore.SchemaAdvisoryLockKey("s"), Field<long>(store, "_schemaLockKey"));
+    }
+
+    /// <summary>
+    /// Regression (fixpoint r2 S9#9): the startup DDL ran under the token of whichever caller took the
+    /// gate first, so a publish whose request token fired partway cancelled the hour-bounded rewrite
+    /// or index build and rolled it back — after the table had been locked all that time — for the
+    /// next caller to start from scratch. One attempt now runs under the store's own lifetime, shared
+    /// by every caller that arrives meanwhile; a caller's token bounds only its own wait. The server
+    /// here never answers, so the attempt stays in flight until the test drops its connection: the
+    /// cancelled caller leaves, the attempt carries on, and the caller that joined it sees its real
+    /// outcome — on the one connection it opened. Red on the old shape (the gate held around the DDL,
+    /// run under the first caller's token): the cancelled caller could not leave until its own
+    /// attempt ended; and with the attempt run under the caller's token, the joined caller saw that
+    /// caller's cancellation instead of the attempt's outcome.
+    /// </summary>
+    [Fact]
+    public async Task EnsureCreated_ACallerTokenBoundsOnlyItsOwnWait_AndTheAttemptRunsOnForTheOthers()
+    {
+        await using var server = new SilentTcpServer();
+        await using var dataSource = NpgsqlDataSource.Create(
+            $"Host=127.0.0.1;Port={server.Port};Username=u;Password=p;Database=d;SSL Mode=Disable;Gss Encryption Mode=Disable;Timeout=120;Pooling=false");
+        var store = new PostgreSqlTransportStore(dataSource, Options.Create(new PostgreSqlAsyncResponseTransportOptions()));
+        using var caller = new CancellationTokenSource();
+
+        var cancelled = store.EnsureCreatedAsync(caller.Token);
+        await server.FirstAccepted.WaitAsync(HangGuard);
+        var joined = store.EnsureCreatedAsync();
+        caller.Cancel();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => cancelled.WaitAsync(HangGuard));
+        Assert.False(joined.IsCompleted);
+
+        // The attempt's own failure — the dropped connection (Npgsql surfaces it as an
+        // NpgsqlException, or on some runtimes as the raw SocketException of its next socket
+        // option) — not a cancellation, and not the hang guard.
+        server.CloseAll();
+        var failure = await Record.ExceptionAsync(() => joined.WaitAsync(HangGuard));
+        Assert.NotNull(failure);
+        Assert.IsNotAssignableFrom<OperationCanceledException>(failure);
+        Assert.IsNotType<TimeoutException>(failure);
+        Assert.Equal(1, server.Accepted);
+    }
+
+    /// <summary>
+    /// Regression (fixpoint r2 GS3#4): a delayed publish NOTIFYed the queue for a row nobody can claim
+    /// until its delay has passed, sending every idle subscriber of the queue, in every process, into
+    /// a claim that found nothing — on every durable-flow timer park and redelay hop (the NAK stopped
+    /// doing the same in round 42). Only a row claimable at once wakes the subscribers now. The fake
+    /// server records the statements each publish sent.
+    /// </summary>
+    [Fact]
+    public async Task Publish_NotifiesOnlyForARowClaimableAtOnce()
+    {
+        await using var server = new FakePostgresWireServer();
+        await using var dataSource = NpgsqlDataSource.Create(server.ConnectionString());
+        var store = new PostgreSqlTransportStore(dataSource, Options.Create(new PostgreSqlAsyncResponseTransportOptions()));
+        typeof(PostgreSqlTransportStore).GetField("_created", BindingFlags.Instance | BindingFlags.NonPublic)!.SetValue(store, true);
+
+        await store.PublishAsync(Guid.NewGuid(), "worker", "{}", null, CancellationToken.None, delay: TimeSpan.FromSeconds(5));
+        var delayed = server.Statements.Select(statement => statement.Sql).ToArray();
+        Assert.DoesNotContain(delayed, sql => sql.Contains("pg_notify", StringComparison.Ordinal));
+        Assert.Contains(delayed, sql => sql.Contains("INSERT INTO", StringComparison.Ordinal));
+
+        await store.PublishAsync(Guid.NewGuid(), "worker", "{}", null, CancellationToken.None);
+        Assert.Contains(server.Statements.Skip(delayed.Length), statement => statement.Sql.Contains("pg_notify", StringComparison.Ordinal));
+        Assert.False(PostgreSqlTransportStore.WakesSubscribers(TimeSpan.FromMilliseconds(1)));
+        Assert.True(PostgreSqlTransportStore.WakesSubscribers(null));
     }
 
     /// <summary>
@@ -140,7 +248,7 @@ public sealed class PostgreSqlTransportStoreStatementTests
         // A new operation inside the window: at once, naming the lock wait, the lock timeout as its cause.
         var refused = await Assert.ThrowsAsync<InvalidOperationException>(() => store.EnsureCreatedAsync());
         Assert.Same(lockTimeout, refused.InnerException);
-        Assert.Contains("could not take its table lock within 5s", refused.Message, StringComparison.Ordinal);
+        Assert.Contains("could not take its lock within 5s", refused.Message, StringComparison.Ordinal);
         clock.Advance(window - TimeSpan.FromSeconds(1));
         await Assert.ThrowsAsync<InvalidOperationException>(() => store.EnsureCreatedAsync());
 
@@ -148,11 +256,12 @@ public sealed class PostgreSqlTransportStoreStatementTests
         clock.Advance(TimeSpan.FromSeconds(1));
         await Assert.ThrowsAnyAsync<NpgsqlException>(() => store.EnsureCreatedAsync());
 
-        // Only the lock-timeout arm of EnsureCreated latches it.
-        var arms = Decode(AsyncBody(typeof(PostgreSqlTransportStore), nameof(PostgreSqlTransportStore.EnsureCreatedAsync)))
+        // The lock-timeout arm of the DDL latches it (a failed long-running step latches it inside
+        // the guard — see PostgreSqlDdlGuardTests).
+        var arms = Decode(AsyncBody(typeof(PostgreSqlTransportStore), "EnsureCreatedCoreAsync"))
             .Select(instruction => instruction.Operand)
             .OfType<MethodBase>()
-            .Count(method => method.Name == nameof(PostgreSqlTransportStore.BackOffDdlAfterLockTimeout));
+            .Count(method => method.Name == "BackOff");
         Assert.Equal(1, arms);
     }
 
@@ -220,6 +329,11 @@ public sealed class PostgreSqlTransportStoreStatementTests
         Assert.Contains("LIMIT 1000", sql, StringComparison.Ordinal);
         Assert.Contains("queue = @queue AND created_at < now() - @retention", sql, StringComparison.Ordinal);
     }
+
+    private static readonly TimeSpan HangGuard = TimeSpan.FromSeconds(30);
+
+    private static T Field<T>(object target, string name)
+        => (T)target.GetType().GetField(name, BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(target)!;
 
     /// <summary>
     /// S5#18: the channel's table-wide prunes are bounded batches too; the one on the publish path

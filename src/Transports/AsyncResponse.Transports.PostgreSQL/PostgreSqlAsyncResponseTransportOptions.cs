@@ -98,10 +98,12 @@ public sealed class PostgreSqlAsyncResponseTransportOptions
     public TimeSpan ShutdownTimeout { get; set; } = TimeSpan.FromSeconds(5);
 
     /// <summary>
-    /// The hosting shutdown budget that must contain PostgreSQL subscriber shutdown plus
-    /// <see cref="PostgreSqlSubscriberOptions.BackgroundDrainTimeout"/> when a subscriber uses
-    /// <see cref="PostgreSqlAckMode.AckAfterEnqueue"/>. Defaults to the Generic Host default of
-    /// 30 seconds. Set to <c>null</c> only when this budget is validated externally.
+    /// The hosting shutdown budget that must contain PostgreSQL subscriber shutdown
+    /// (<see cref="ShutdownTimeout"/>) plus <see cref="PostgreSqlSubscriberOptions.BackgroundDrainTimeout"/>
+    /// when a subscriber uses <see cref="PostgreSqlAckMode.AckAfterEnqueue"/> — the sum of both
+    /// subscribers' shutdown and <see cref="PostgreSqlSubscriberOptions.BackgroundDrainTimeout"/> when
+    /// both use it, since the host stops them one after the other. Defaults to the Generic Host
+    /// default of 30 seconds. Set to <c>null</c> only when this budget is validated externally.
     /// </summary>
     public TimeSpan? HostShutdownTimeout { get; set; } = TimeSpan.FromSeconds(30);
 

@@ -99,6 +99,36 @@ public sealed class OpportunisticPruneTests
     }
 
     /// <summary>
+    /// Regression (fixpoint r2): the helper's log calls ran bare, so a logging provider that throws
+    /// (MEL rethrows a provider's failure) escaped this never-throw helper — from the failure
+    /// catch, and from the budget-lapse warning via that same catch's own log — failing a transport
+    /// publish AFTER its row committed, so the caller's retry ran the job twice.
+    /// </summary>
+    [Theory]
+    [MemberData(nameof(AnchorTypes))]
+    public async Task Drain_NeverThrows_WhenItsOwnLogLinesThrow(Type anchor)
+    {
+        var logger = new CollectingLogger { ThrowOnMessageContaining = "test prune" };
+
+        // A failed batch: its warning throws.
+        await DrainAsync(anchor, _ => throw new InvalidOperationException("deadlock victim"), logger, CancellationToken.None);
+
+        // A lapsed budget with rows remaining: its warning throws (and, bare, was caught by the
+        // failure arm and logged a second time — which threw out of the helper).
+        await DrainAsync(anchor, _ => Task.FromResult(1000), logger, CancellationToken.None, TimeSpan.Zero);
+
+        // A cancellation the caller asked for: its Debug line throws.
+        using var cancelled = new CancellationTokenSource();
+        await cancelled.CancelAsync();
+        await DrainAsync(anchor, token => Task.FromCanceled<int>(token), logger, cancelled.Token);
+
+        Assert.Contains(logger.Messages, message => message.Contains("failed after deleting 0", StringComparison.Ordinal));
+        Assert.Single(logger.Messages, message => message.Contains("stopped at its", StringComparison.Ordinal));
+        Assert.DoesNotContain(logger.Messages, message => message.Contains("failed after deleting 1000", StringComparison.Ordinal));
+        Assert.Contains(logger.Messages, message => message.Contains("was cancelled", StringComparison.Ordinal));
+    }
+
+    /// <summary>
     /// The throttle's first call always runs (0 = never pruned) and a second inside the interval does
     /// not; a stamp one interval old in the MONOTONIC past lets the next window through.
     /// </summary>

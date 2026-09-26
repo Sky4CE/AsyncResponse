@@ -60,6 +60,14 @@ public interface IDurableFlows
     /// }
     /// </code>
     /// </exception>
+    /// <exception cref="OperationCanceledException">
+    /// <paramref name="cancellationToken"/> was cancelled before the start job was published. It
+    /// ends the publish retry ladder as a cancellation, not as
+    /// <see cref="DurableFlowNotDispatchedException"/>. A cancellation that interrupts the publish
+    /// is still ambiguous — the job may have landed — so the exception names the flow id in its
+    /// message and carries it (including a generated one) in <c>Exception.Data["FlowId"]</c>:
+    /// retry with that id and the start stays idempotent.
+    /// </exception>
     /// <exception cref="FlowStateTooLargeException">
     /// The initial ledger exceeds the selected store's size budget. Built-in stores reject this
     /// before the start job is published. Keep large inputs in application storage and pass keys.

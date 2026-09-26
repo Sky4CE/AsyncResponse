@@ -71,6 +71,18 @@ public class NatsAsyncResponseChannelOptionsTests
     }
 
     [Fact]
+    public void Validate_Throws_ForRecoveryBucketPastTheBackingStreamNameCap()
+    {
+        // The bucket is backed by stream KV_{bucket}, capped at 255 characters by nats-server:
+        // an over-long name passed startup and then failed every registration's lazy bucket creation.
+        var ex = Assert.Throws<InvalidOperationException>(() =>
+            new NatsAsyncResponseChannelOptions { RecoveryBucket = new string('b', 253) }.Validate());
+        Assert.Contains(nameof(NatsAsyncResponseChannelOptions.RecoveryBucket), ex.Message, StringComparison.Ordinal);
+
+        new NatsAsyncResponseChannelOptions { RecoveryBucket = new string('b', 252) }.Validate();
+    }
+
+    [Fact]
     public void Validate_Accepts_DashAndUnderscoreBucket()
         => new NatsAsyncResponseChannelOptions { RecoveryBucket = "ar-recovery_1" }.Validate();
 

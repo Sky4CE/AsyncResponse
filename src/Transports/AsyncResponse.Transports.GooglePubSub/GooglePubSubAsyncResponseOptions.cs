@@ -49,8 +49,9 @@ public sealed class GooglePubSubAsyncResponseOptions
     public Dictionary<string, GooglePubSubReplyTargetOptions> ReplyTargets { get; } = new(StringComparer.Ordinal);
 
     /// <summary>
-    /// Pub/Sub message attribute that carries the AsyncResponse correlation id. Default:
-    /// <c>correlationId</c>.
+    /// Pub/Sub message attribute that carries the AsyncResponse correlation id. Must be a valid
+    /// Pub/Sub attribute key (at most 256 bytes in UTF-8, not starting with <c>goog</c>), checked
+    /// at startup. Default: <c>correlationId</c>.
     /// </summary>
     public string CorrelationIdAttribute { get; set; } = "correlationId";
 

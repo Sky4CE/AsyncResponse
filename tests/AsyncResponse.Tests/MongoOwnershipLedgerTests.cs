@@ -43,6 +43,8 @@ public sealed class MongoOwnershipLedgerTests
 
     private static Mock<IMongoDatabase> Database(Mock<IMongoCollection<BsonDocument>> collection)
     {
+        // The ledger pins the primary and the bounded majority on its handle.
+        collection.SelfPinning();
         var database = new Mock<IMongoDatabase>();
         database
             .Setup(d => d.GetCollection<BsonDocument>(It.IsAny<string>(), It.IsAny<MongoCollectionSettings>()))
@@ -219,5 +221,110 @@ public sealed class MongoOwnershipLedgerTests
         });
 
         await ClaimAsync(database.Object, "MongoDB durable-flow store", ("flow_state", "state"));
+    }
+
+    /// <summary>
+    /// Regression (r2 S4#14): the ledger claimed with the database's INHERITED write concern while
+    /// every other store handle pinned the bounded majority — under an inherited w=1 a failover
+    /// rolled back an acknowledged claim, and a component misconfigured onto the same collection on
+    /// another host then claimed it without error.
+    /// </summary>
+    [Fact]
+    public async Task ClaimAsync_PinsTheBoundedMajorityAndThePrimaryOnTheLedgerHandle()
+    {
+        var collection = new Mock<IMongoCollection<BsonDocument>>();
+        collection
+            .Setup(c => c.FindOneAndUpdateAsync(
+                It.IsAny<FilterDefinition<BsonDocument>>(),
+                It.IsAny<UpdateDefinition<BsonDocument>>(),
+                It.IsAny<FindOneAndUpdateOptions<BsonDocument, BsonDocument>>(),
+                It.IsAny<CancellationToken>()))
+            .ReturnsAsync((BsonDocument)null!);
+        var database = Database(collection);
+        database.SetupGet(d => d.Settings).Returns(new MongoDatabaseSettings { WriteConcern = WriteConcern.W1 });
+
+        await ClaimAsync(database.Object, "MongoDB durable-flow store", ("flow_state", "state"));
+
+        collection.Verify(
+            c => c.WithWriteConcern(It.Is<WriteConcern>(concern => concern.W == WriteConcern.WMajority.W && concern.WTimeout == TimeSpan.FromSeconds(10))),
+            Times.Once);
+        collection.Verify(c => c.WithReadPreference(ReadPreference.Primary), Times.Once);
+    }
+
+    /// <summary>
+    /// With the bounded majority, a lapsed wtimeout throws after the claim applied on the primary,
+    /// and the reply's before-image is lost with it. The claim the primary now holds is read back
+    /// and checked instead: ours (or the one that was already ours) passes — failing would fail
+    /// every operation of the store for as long as the set stays degraded — and a foreign one is
+    /// still the actionable conflict.
+    /// </summary>
+    [Theory]
+    [InlineData("MongoDB durable-flow store", "state", false)]
+    [InlineData("MongoDB channel", "messages", true)]
+    public async Task ClaimAsync_ReadsTheClaimBackAfterAReplicationTimeout(string holder, string holderPurpose, bool conflicts)
+    {
+        var collection = new Mock<IMongoCollection<BsonDocument>>();
+        collection
+            .Setup(c => c.FindOneAndUpdateAsync(
+                It.IsAny<FilterDefinition<BsonDocument>>(),
+                It.IsAny<UpdateDefinition<BsonDocument>>(),
+                It.IsAny<FindOneAndUpdateOptions<BsonDocument, BsonDocument>>(),
+                It.IsAny<CancellationToken>()))
+            .ThrowsAsync(MongoReplicationTimeouts.Command());
+        collection.FindsReturning(new BsonDocument
+        {
+            { "_id", "flow_state" },
+            { "component", holder },
+            { "purpose", holderPurpose }
+        });
+
+        var claim = ClaimAsync(Database(collection).Object, "MongoDB durable-flow store", ("flow_state", "state"));
+
+        if (conflicts)
+            Assert.Contains("already claimed by the MongoDB channel (messages)", (await Assert.ThrowsAsync<InvalidOperationException>(() => claim)).Message);
+        else
+            await claim;
+        collection.Verify(
+            c => c.FindOneAndUpdateAsync(
+                It.IsAny<FilterDefinition<BsonDocument>>(),
+                It.IsAny<UpdateDefinition<BsonDocument>>(),
+                It.IsAny<FindOneAndUpdateOptions<BsonDocument, BsonDocument>>(),
+                It.IsAny<CancellationToken>()),
+            Times.Once);
+    }
+
+    /// <summary>
+    /// Fixpoint r2 precommit E1: the read-back inherited the database's read concern, and under
+    /// readConcernLevel=majority it read the majority snapshot, which lacks the claim whose majority
+    /// acknowledgement just lapsed — a FOREIGN claim written in that window read back as absent,
+    /// and the misconfigured component started without the conflict error. It reads at local
+    /// concern. The mocks model it: the inherited handle sees no claim, the local-concern handle
+    /// sees the foreign one. Pre-fix: no error.
+    /// </summary>
+    [Fact]
+    public async Task ClaimAsync_ReadsTheClaimBackAtLocalConcern()
+    {
+        var collection = new Mock<IMongoCollection<BsonDocument>>();
+        collection
+            .Setup(c => c.FindOneAndUpdateAsync(
+                It.IsAny<FilterDefinition<BsonDocument>>(),
+                It.IsAny<UpdateDefinition<BsonDocument>>(),
+                It.IsAny<FindOneAndUpdateOptions<BsonDocument, BsonDocument>>(),
+                It.IsAny<CancellationToken>()))
+            .ThrowsAsync(MongoReplicationTimeouts.Command());
+        collection.FindsReturning<BsonDocument, BsonDocument>();
+        var database = Database(collection);
+        var local = new Mock<IMongoCollection<BsonDocument>>().SelfPinning().FindsReturning(new BsonDocument
+        {
+            { "_id", "flow_state" },
+            { "component", "MongoDB channel" },
+            { "purpose", "messages" }
+        });
+        collection.Setup(c => c.WithReadConcern(ReadConcern.Local)).Returns(local.Object);
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => ClaimAsync(database.Object, "MongoDB durable-flow store", ("flow_state", "state")));
+
+        Assert.Contains("already claimed by the MongoDB channel (messages)", ex.Message);
     }
 }

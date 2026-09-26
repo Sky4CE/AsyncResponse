@@ -153,6 +153,15 @@ public sealed class HandOverTimerFlow : IDurableFlow<HandOverInput>
     }
 }
 
+public sealed record TimedAwaitInput(string Name);
+
+/// <summary>An awaited step with a one-minute deadline: a timed-out attempt faults it, and the retry restarts it under a fresh correlation id.</summary>
+public sealed class TimedAwaitFlow : IDurableFlow<TimedAwaitInput>
+{
+    public async Task ExecuteAsync(IDurableFlowContext flow, TimedAwaitInput input)
+        => await flow.AwaitStepAsync<OperationResult>("remote", trigger: _ => Task.CompletedTask, timeout: TimeSpan.FromMinutes(1));
+}
+
 public class FlowTestHarnessShowcaseTests
 {
     private static async Task<(FlowTestHarness Harness, RecordingProvisioningClient Client, StepRecorder Recorder)> StartAsync()
@@ -234,6 +243,47 @@ public class FlowTestHarnessShowcaseTests
         await run.WaitForTimerStepAsync("settle");
         await harness.AdvanceAsync(TimeSpan.FromHours(6));
         Assert.Equal(FlowRunStatus.Succeeded, await run.WaitForFinishedAsync());
+    }
+
+    [Fact]
+    public async Task CrashAfterStep_ThenARestartBeforeTheClockMoves_TheCrashedAttemptDiesWithTheOldIncarnation()
+    {
+        // Pre-commit review (fixpoint r2, C1): a production host stop that interrupts a retry
+        // backoff now retries a job with attempts left during the drain (S4#2). The harness
+        // restart used the same stop, so the crashed attempt re-ran inside the restart — the
+        // flow's next step ran in the dying incarnation — contradicting the documented crash
+        // semantics: the attempt dies with the old incarnation and the run waits for an explicit
+        // resume.
+        var (harness, client, recorder) = await StartAsync();
+        await using var _ = harness;
+        var transport = harness.Engine.Services.GetRequiredService<InMemoryWorkerTransport>();
+
+        harness.CrashAfterStep("create-workspace");
+        var run = await harness.StartFlowAsync<TenantOnboardingFlow, OnboardingInput>(new OnboardingInput(31));
+
+        var guard = TimeProvider.System.GetUtcNow() + TimeSpan.FromSeconds(10);
+        while (transport.BackingOffJobs != 1)
+        {
+            Assert.True(TimeProvider.System.GetUtcNow() < guard, "the crashed attempt never reached its redelivery backoff");
+            await Task.Delay(TimeSpan.FromMilliseconds(1));
+        }
+
+        await harness.Engine.SimulateRestartAsync();
+
+        // The next step has not run: nothing retried the crashed attempt in either incarnation.
+        Assert.Empty(client.Calls);
+
+        await run.ResumeAsync();
+        await run.WaitForAwaitingStepAsync("run-migration");
+        await run.ReplyAsync(new OperationResult { Status = OperationStatus.Completed });
+        await run.WaitForAwaitingStepAsync("import-data");
+        await run.ReplyAsync(new OperationResult { Status = OperationStatus.Completed });
+        await run.WaitForTimerStepAsync("settle");
+        await harness.AdvanceAsync(TimeSpan.FromHours(6));
+
+        Assert.Equal(FlowRunStatus.Succeeded, await run.WaitForFinishedAsync());
+        Assert.Equal(1, recorder.Count("create-workspace"));
+        Assert.Equal(["migrate:31", "import:31"], client.Calls);
     }
 
     [Fact]
@@ -588,6 +638,43 @@ public class FlowTestHarnessShowcaseTests
 
         await harness.AdvanceAsync(TimeSpan.FromDays(60) + TimeSpan.FromMinutes(1));
         Assert.Equal(FlowRunStatus.Succeeded, await run.WaitForFinishedAsync());
+    }
+
+    [Fact]
+    public async Task ReplyAfterAnAttemptTimedOut_WaitsForTheRetrysFreshCorrelationId_InsteadOfTheDeadOne()
+    {
+        // S4#10 (fixpoint r2): between a faulted awaited-step attempt and its retry, ReplyAsync
+        // (and WaitForAwaitingStepAsync) treated the faulted attempt's Waiting as live and handed
+        // back its correlation id — whose waiter and recovery registration the fault had deleted —
+        // so the reply was silently dropped, the retry parked under a fresh id, and the run never
+        // finished. The probe now marks where a failed attempt ended; a wait it released is dead,
+        // and the reply parks for the retry's.
+        await using var harness = await FlowTestHarness.StartAsync(options =>
+            options.ConfigureAsyncResponse = builder => builder.WithDurableFlow<TimedAwaitFlow, TimedAwaitInput>());
+
+        var run = await harness.StartFlowAsync<TimedAwaitFlow, TimedAwaitInput>(new TimedAwaitInput("deadline"));
+        var faulted = await run.WaitForAwaitingStepAsync("remote");
+
+        // Exactly to the deadline: the attempt times out and its redelivery backoff is armed just
+        // past the advance target — the run is between the faulted attempt and its retry.
+        await harness.AdvanceAsync(TimeSpan.FromMinutes(1));
+        var transport = harness.Engine.Services.GetRequiredService<InMemoryWorkerTransport>();
+        var guard = TimeProvider.System.GetUtcNow() + TimeSpan.FromSeconds(10);
+        while (transport.BackingOffJobs != 1)
+        {
+            Assert.True(TimeProvider.System.GetUtcNow() < guard, "the timed-out attempt never reached its redelivery backoff");
+            await Task.Delay(TimeSpan.FromMilliseconds(5));
+        }
+
+        var reply = run.ReplyAsync(new OperationResult { Status = OperationStatus.Completed });
+        Assert.False(reply.IsCompleted, "the reply went to the faulted attempt's correlation id");
+
+        await harness.AdvanceAsync(TimeSpan.FromSeconds(1));
+        await reply;
+
+        Assert.Equal(FlowRunStatus.Succeeded, await run.WaitForFinishedAsync());
+        var retried = run.Events.Last(e => e.Kind == Testing.FlowProbe.EventKind.Waiting).Step.CorrelationId;
+        Assert.NotEqual(faulted, retried);
     }
 
     [Fact]

@@ -6,12 +6,14 @@ namespace AsyncResponse;
 /// Owns the per-channel <see cref="ChannelSerialExecutor"/> instances for a response channel and
 /// coordinates their lifecycle so that, for any one channel key, work is never enqueued onto an
 /// executor that is concurrently being retired — which would silently drop the message — and at
-/// most one <em>live</em> executor exists per channel at a time.
+/// most one <em>admitting</em> executor exists per channel at a time.
 /// <para>
 /// The coordination is a single lock guarding the map. <see cref="EnqueueAsync"/> reserves the live
 /// executor under that lock, then waits for bounded queue capacity outside it. Retirement closes
 /// admission, waits for those reservations, drains the executor, and only then lets a new executor
-/// be created. Disposal runs outside the lock.
+/// be created. Disposal runs outside the lock. A subscription that registers while the channel's
+/// executor is retiring detaches it (see <see cref="OnSubscriptionRegistered"/>): the retiring
+/// executor finishes draining on its own, alongside a fresh one for the new subscription.
 /// </para>
 /// <para>
 /// This replaces an earlier <c>ConcurrentDictionary</c> + fire-and-forget <c>Task.Run(remove)</c>
@@ -82,6 +84,16 @@ internal sealed class SerialExecutorRegistry(
     /// registered, retirement tombstones do not drop work — a retired executor is legitimately
     /// recreated, and the remaining subscription's own cleanup retires it again (no leak) — and a
     /// sibling's cleanup does not retire the executor at all (see <see cref="RetireIfUnreferencedAsync"/>).
+    /// <para>
+    /// A subscription arriving while the channel's executor is already retiring — a re-attached
+    /// waiter on the id a departed waiter's cleanup is still draining — detaches that executor
+    /// from the map, so its first delivery creates a successor. Left in place, the retiring entry
+    /// read as <see cref="TryEnqueueOutcome.Full"/> for the whole drain (up to the dispose budget
+    /// behind a wedged predicate): the Redis channel faulted the new wait as overloaded and the DB
+    /// channels routed its response to recovery. The detached executor stopped admitting when it
+    /// began retiring, so it holds only departed subscriptions' work (which no longer touches the
+    /// new one), and its retirement removes the map entry only by reference.
+    /// </para>
     /// </summary>
     public void OnSubscriptionRegistered(string channel)
     {
@@ -91,6 +103,9 @@ internal sealed class SerialExecutorRegistry(
         {
             _registrations[channel] = _registrations.TryGetValue(channel, out var count) ? count + 1 : 1;
             _tombstones.Remove(channel);
+
+            if (_executors.TryGetValue(channel, out var current) && current.Retiring)
+                _executors.Remove(channel);
         }
     }
 
@@ -141,9 +156,10 @@ internal sealed class SerialExecutorRegistry(
                     {
                         // Deliberate, but never silent: if this fires for a live waiter, its channel
                         // registered the subscription only after the transport began delivering.
-                        _logger.LogWarning(
+                        // A throwing logging provider must not turn the suppression into a fault.
+                        SafeLog.Try((Logger: _logger, Channel: channel), static state => state.Logger.LogWarning(
                             "Suppressed a delivery for channel {Channel}: the channel is tombstoned and has no registered subscription.",
-                            channel);
+                            state.Channel));
                         return false;
                     }
 
@@ -234,9 +250,9 @@ internal sealed class SerialExecutorRegistry(
                 // the work would run against no subscription; recreating an executor would leak it.
                 if (!_registrations.ContainsKey(channel) && IsTombstonedUnderLock(channel))
                 {
-                    _logger.LogWarning(
+                    SafeLog.Try((Logger: _logger, Channel: channel), static state => state.Logger.LogWarning(
                         "Suppressed a delivery for channel {Channel}: the channel is tombstoned and has no registered subscription.",
-                        channel);
+                        state.Channel));
                     return TryEnqueueOutcome.Suppressed;
                 }
 
@@ -245,7 +261,8 @@ internal sealed class SerialExecutorRegistry(
             }
 
             // Mid-retirement: EnqueueAsync would wait for the drain and then recreate; a
-            // non-blocking caller simply comes back after it.
+            // non-blocking caller simply comes back after it. Reached only for a retirement with
+            // no subscription registered since it began (a registration detaches the entry).
             if (current.Retiring)
                 return TryEnqueueOutcome.Full;
 
@@ -332,10 +349,12 @@ internal sealed class SerialExecutorRegistry(
             }
             catch (TimeoutException)
             {
-                _logger.LogWarning(
+                // Guarded: a throwing logging provider escaping here skipped the disposal below,
+                // so the executor's writer was never completed and its reader loop parked forever.
+                SafeLog.Try((Logger: _logger, Limit: _enqueueDrainLimit, Channel: channel), static state => state.Logger.LogWarning(
                     "Timed out after {DrainLimit} waiting for in-flight enqueues on channel {Channel} to drain; disposing the executor anyway.",
-                    _enqueueDrainLimit,
-                    channel);
+                    state.Limit,
+                    state.Channel));
             }
 
             try
@@ -349,10 +368,10 @@ internal sealed class SerialExecutorRegistry(
             }
             catch (TimeoutException)
             {
-                _logger.LogWarning(
+                SafeLog.Try((Logger: _logger, Limit: _disposeDrainLimit, Channel: channel), static state => state.Logger.LogWarning(
                     "Timed out after {DrainLimit} waiting for in-flight work on channel {Channel} to finish; abandoning the hung work item and retiring the executor.",
-                    _disposeDrainLimit,
-                    channel);
+                    state.Limit,
+                    state.Channel));
             }
         }
         finally

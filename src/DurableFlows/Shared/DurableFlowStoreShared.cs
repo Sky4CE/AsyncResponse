@@ -64,9 +64,14 @@ internal static class DurableFlowStoreShared
                 if (Stopwatch.GetElapsedTime(started) >= budget)
                 {
                     AsyncResponseDiagnostics.RecordFlowStatePruneBudgetExhausted(providerName);
-                    logger?.LogWarning(
+
+                    // SafeLog, here and in the catch below: a logging provider that throws (MEL
+                    // rethrows a provider's failure) escaped a helper whose failure must never fail
+                    // the create it rides on — and this line, inside the try, was also counted as a
+                    // prune failure on its way out.
+                    SafeLog.Try((Logger: logger, Provider: providerName, Deleted: deleted, Batches: batches, Budget: budget), static state => state.Logger?.LogWarning(
                         "{Provider} durable-flow prune deleted {Deleted} expired rows in {Batches} batches and stopped at its {Budget} PruneBudget with expired rows remaining; the backlog is outgrowing the prune — raise PruneBudget or shorten PruneInterval.",
-                        providerName, deleted, batches, budget);
+                        state.Provider, state.Deleted, state.Batches, state.Budget));
                     break;
                 }
             }
@@ -88,10 +93,10 @@ internal static class DurableFlowStoreShared
             // Opportunistic maintenance; the next interval retries — but never silently.
             AsyncResponseDiagnostics.RecordFlowStatePruned(providerName, deleted);
             AsyncResponseDiagnostics.RecordFlowStatePruneFailure(providerName);
-            logger?.LogWarning(
-                ex,
+            SafeLog.Try((Logger: logger, Error: ex, Provider: providerName, Deleted: deleted, Batches: batches), static state => state.Logger?.LogWarning(
+                state.Error,
                 "{Provider} durable-flow prune failed after deleting {Deleted} expired rows in {Batches} batches; the flow creation it rode on is unaffected and the next PruneInterval retries.",
-                providerName, deleted, batches);
+                state.Provider, state.Deleted, state.Batches));
         }
     }
 

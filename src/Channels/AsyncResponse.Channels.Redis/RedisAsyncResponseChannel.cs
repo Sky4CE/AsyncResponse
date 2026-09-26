@@ -6,6 +6,8 @@ using System.Buffers;
 using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Net;
+using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Json;
 
@@ -61,6 +63,19 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
         _logger = logger;
         _lostSubscriberDispatcher = new LostSubscriberCallbackDispatcher(scopeFactory, propagation, logger, _timeProvider);
         _executors = new SerialExecutorRegistry(logger, timeProvider: _timeProvider);
+
+        // The liveness probe's failover grace follows the multiplexer's own connection events.
+        // Hooked before the snapshot, so an endpoint that connects in between is still recorded
+        // (StackExchange.Redis raises ConnectionRestored on every established connection, the first
+        // included). Null-safe: a stand-in multiplexer (the JIT probe's no-op proxy) answers null
+        // for the endpoint list and for each server.
+        multiplexer.ConnectionFailed += OnConnectionFailed;
+        multiplexer.ConnectionRestored += OnConnectionRestored;
+        foreach (var endPoint in multiplexer.GetEndPoints() ?? [])
+        {
+            if (endPoint is not null && multiplexer.GetServer(endPoint) is { IsConnected: true })
+                _endPointDownSince.TryAdd(endPoint, EndPointConnected);
+        }
     }
 
     // Executor retirements scheduled off the cleanup path (see CleanupCoreAsync). TRACKED, as
@@ -81,13 +96,64 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
             TaskScheduler.Default);
     }
 
+    // Per channel name: how many waiters in this process hold its pub/sub subscription (counted
+    // from just before SubscribeAsync to their cleanup), and whether a failed subscribe may have
+    // left an unread queue registered in the multiplexer meanwhile. Locked, because the last
+    // holder's channel-wide unsubscribe must not interleave with a sibling's subscribe.
+    private readonly Dictionary<string, (int Holders, bool Orphaned)> _pubSubHolders = new(StringComparer.Ordinal);
+
+    private void AcquirePubSub(string channelName)
+    {
+        lock (_pubSubHolders)
+            CollectionsMarshal.GetValueRefOrAddDefault(_pubSubHolders, channelName, out _).Holders++;
+    }
+
+    /// <summary>
+    /// Releases one waiter's hold on <paramref name="channelName"/>. A waiter whose SubscribeAsync
+    /// failed has no subscription to hand back — StackExchange.Redis nevertheless left its queue
+    /// registered — so the last holder out removes every local registration for the channel with
+    /// the channel-wide unsubscribe, whose local part runs under the lock: a sibling that
+    /// subscribes after it starts from a clean slate, and one that subscribed before it keeps the
+    /// channel held, so the queue it is adding is never swept away. Until then an orphan is
+    /// remembered for that last holder. Every other release disposes the waiter's own queue, as
+    /// before.
+    /// </summary>
+    private Task ReleasePubSubAsync(RedisChannel channel, string channelName, IRedisChannelSubscription? own)
+    {
+        lock (_pubSubHolders)
+        {
+            ref var state = ref CollectionsMarshal.GetValueRefOrNullRef(_pubSubHolders, channelName);
+            if (!Unsafe.IsNullRef(ref state))
+            {
+                var orphaned = state.Orphaned || own is null;
+                if (--state.Holders <= 0)
+                {
+                    _pubSubHolders.Remove(channelName);
+                    if (orphaned)
+                        return _channelSubscriber.UnsubscribeAllAsync(channel);
+                }
+                else if (own is null)
+                {
+                    state.Orphaned = true;
+                    return Task.CompletedTask;
+                }
+            }
+        }
+
+        return own is null ? Task.CompletedTask : own.DisposeAsync().AsTask();
+    }
+
     /// <summary>
     /// Joins every executor retirement still in flight, so container disposal at host shutdown
     /// means "every executor is retired" rather than "every retirement was started". The bodies
     /// swallow, so this cannot throw; the drain budgets inside RemoveAsync bound how long it takes.
+    /// Also unhooks the liveness probe's connection events from the (application-owned) multiplexer.
     /// </summary>
     public async ValueTask DisposeAsync()
     {
+        _multiplexer.ConnectionFailed -= OnConnectionFailed;
+        _multiplexer.ConnectionRestored -= OnConnectionRestored;
+
         var retirements = _pendingRetirements.Keys.ToArray();
         if (retirements.Length > 0)
             await Task.WhenAll(retirements).ConfigureAwait(false);
@@ -198,6 +264,10 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
             // is visible. The subscribe-failure path below retires it again.
             _executors.OnSubscriptionRegistered(channelName);
             subscription.ExecutorRegistered = true;
+            // Held from BEFORE the subscribe: a failed SubscribeAsync still leaves its queue
+            // registered in the multiplexer, and only the release in cleanup can remove it.
+            AcquirePubSub(channelName);
+            subscription.PubSubHeld = true;
             subscription.Subscription = await _channelSubscriber.SubscribeAsync(channel, subscription.HandleMessageAsync).ConfigureAwait(false);
             if (subscription.CleanupStarted)
             {
@@ -214,7 +284,9 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
                 }
                 catch (Exception ex)
                 {
-                    _logger.LogError(ex, "Post-registration unsubscribe for channel {Channel} failed; the subscription may linger until process exit.", channelName);
+                    SafeLog.Try(
+                        (_logger, ex, channelName),
+                        static s => s._logger.LogError(s.ex, "Post-registration unsubscribe for channel {Channel} failed; the subscription may linger until process exit.", s.channelName));
                 }
             }
 
@@ -251,7 +323,9 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
                 }
                 catch (Exception ex)
                 {
-                    _logger.LogError(ex, "Post-save recovery-state compensation delete failed for correlationId {CorrelationId}; the registration remains until TTL.", correlationId);
+                    SafeLog.Try(
+                        (_logger, ex, correlationId),
+                        static s => s._logger.LogError(s.ex, "Post-save recovery-state compensation delete failed for correlationId {CorrelationId}; the registration remains until TTL.", s.correlationId));
                 }
             }
 
@@ -270,16 +344,48 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
             // the recovery watchdog behind it. The filter demands an actual settlement (result
             // or fault): a canceled task means NO response was delivered — e.g. a future
             // channel-wide teardown canceling in-flight registrations — and takes the rethrow
-            // path below.
-            _logger.LogWarning(ex,
-                "Registration step failed after a delivery settled correlationId {CorrelationId}; returning the completed waiter.",
-                correlationId);
+            // path below. The log is guarded for the same reason: a throwing logging provider must
+            // not turn the delivered response into a create failure after all.
+            SafeLog.Try(
+                (_logger, ex, correlationId),
+                static s => s._logger.LogWarning(
+                    s.ex,
+                    "Registration step failed after a delivery settled correlationId {CorrelationId}; returning the completed waiter.",
+                    s.correlationId));
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Failed to subscribe to channel {Channel} for correlationId {CorrelationId}.", channelName, correlationId);
+            // Clean up first, report second (in-memory parity): the log call is the part that can
+            // throw, and logging first left a zombie behind a throwing logger — the SUBSCRIBE and
+            // the executor registration survived with no timer, so publish and NUMSUB kept counting
+            // a live waiter and the next response for the id was read as delivered.
             AsyncResponseDiagnostics.SetError(activity, "subscribe_failure", ex.Message);
             await subscription.DrainThenCleanupAsync().ConfigureAwait(false);
+
+            // The drain waits for a delivery that was still inside the executor — mid Until
+            // predicate — when the step failed, and that delivery may have settled the wait just
+            // now: the filter above ran before it could. Rethrowing would discard a response the
+            // publisher was told was delivered, so the first catch's rule applies here too. The
+            // drain's own lapse faults the wait as indeterminate, which proves no delivery and
+            // takes the rethrow.
+            if (SettledByADelivery(subscription.ResponseTask))
+            {
+                SafeLog.Try(
+                    (_logger, ex, correlationId),
+                    static s => s._logger.LogWarning(
+                        s.ex,
+                        "Registration step failed while a delivery was settling correlationId {CorrelationId}; returning the completed waiter.",
+                        s.correlationId));
+                return new RedisAsyncResponseWaiter<T>(subscription.ResponseTask, () => subscription.DrainThenCleanupAsync());
+            }
+
+            SafeLog.Try(
+                (_logger, ex, channelName, correlationId),
+                static s => s._logger.LogError(
+                    s.ex,
+                    "Failed to subscribe to channel {Channel} for correlationId {CorrelationId}.",
+                    s.channelName,
+                    s.correlationId));
 
             // Rethrow instead of returning a pre-faulted waiter: the builder's contract is that
             // the trigger runs only once the subscription AND recovery state exist. A returned
@@ -293,6 +399,15 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
 
         return new RedisAsyncResponseWaiter<T>(subscription.ResponseTask, () => subscription.DrainThenCleanupAsync());
     }
+
+    /// <summary>
+    /// Whether a delivery settled the wait: a result, or a fault other than the indeterminate one a
+    /// lapsed disposal drain applies (which proves nothing was delivered in time). A cancellation is
+    /// cleanup's "nothing delivered".
+    /// </summary>
+    private static bool SettledByADelivery(Task task)
+        => task.IsCompletedSuccessfully
+            || (task.IsFaulted && task.Exception!.InnerException is not AsyncResponseIndeterminateDeliveryException);
 
     /// <summary>
     /// How much of a remote failure's message (UTF-16 code units, before escaping) the wait's
@@ -312,6 +427,7 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
     {
         private readonly RedisAsyncResponseChannel _owner;
         private readonly string _correlationId;
+        private readonly RedisChannel _channel;
         private readonly Func<T, ValueTask<bool>> _completionPredicate;
         private readonly ExecutionContext? _capturedContext;
         private readonly Activity? _activity;
@@ -344,6 +460,7 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
             _owner = owner;
             _cancellationTokenSource = new CancellationTokenSource(Timeout.InfiniteTimeSpan, owner._timeProvider);
             _correlationId = correlationId;
+            _channel = channel;
             ChannelName = channel.ToString()!;
             Id = registrationId;
             _completionPredicate = completionPredicate;
@@ -358,6 +475,9 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
         public bool CleanupStarted => Volatile.Read(ref _cleanupStarted) != 0;
         public IRedisChannelSubscription? Subscription { get; set; }
         public bool ExecutorRegistered { get; set; }
+
+        /// <summary>Whether this waiter counts as a holder of the channel's pub/sub subscription (see <see cref="ReleasePubSubAsync"/>).</summary>
+        public bool PubSubHeld { get; set; }
 
         /// <summary>
         /// Registers the timeout callback on the (not yet armed) token; the creator registers it
@@ -694,9 +814,11 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
                     // would let a wedged client library hold DisposeAsync hostage past
                     // DisposalDrainTimeout. The quiet wrapper logs its own failure — including
                     // one that completes AFTER this wait was abandoned, which previously died as
-                    // a TaskScheduler.UnobservedTaskException nobody logged.
-                    if (Subscription is not null)
-                        await UnsubscribeQuietlyAsync(Subscription).WaitAsync(_owner._options.DisposalDrainTimeout).ConfigureAwait(false);
+                    // a TaskScheduler.UnobservedTaskException nobody logged. Keyed on the hold,
+                    // not on a subscription in hand: a failed SubscribeAsync hands none back yet
+                    // leaves its queue registered, and the release is what removes it.
+                    if (PubSubHeld)
+                        await ReleasePubSubQuietlyAsync().WaitAsync(_owner._options.DisposalDrainTimeout).ConfigureAwait(false);
                 }
                 catch (TimeoutException)
                 {
@@ -733,6 +855,29 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
                 await _timeoutRegistration.DisposeAsync().ConfigureAwait(false);
                 _cancellationTokenSource.Dispose();
                 _activity?.Dispose();
+            }
+        }
+
+        /// <summary>
+        /// Releases this waiter's hold on the channel's pub/sub subscription (its own queue, or —
+        /// for the last holder after a failed subscribe — every local registration for the
+        /// channel; see <see cref="ReleasePubSubAsync"/>). Never faults, like
+        /// <see cref="UnsubscribeQuietlyAsync"/>.
+        /// </summary>
+        private async Task ReleasePubSubQuietlyAsync()
+        {
+            try
+            {
+                await _owner.ReleasePubSubAsync(_channel, ChannelName, Subscription).ConfigureAwait(false);
+                SafeLog.Try(
+                    (_owner._logger, ChannelName),
+                    static s => s._logger.LogDebug("Released the pub/sub subscription for channel {Channel}.", s.ChannelName));
+            }
+            catch (Exception ex)
+            {
+                SafeLog.Try(
+                    (_owner._logger, ex, ChannelName),
+                    static s => s._logger.LogError(s.ex, "Error during unsubscribe-once for channel {Channel}.", s.ChannelName));
             }
         }
 
@@ -1086,39 +1231,89 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
     // IActiveSubscriberProbe
 
     /// <summary>
-    /// How long an endpoint must have been seen disconnected before the liveness probe excuses it
-    /// — outside a cluster as the old primary of a failover, in a cluster through the node table. A just-disconnected node IS the failover window: this process already
-    /// routes to the promoted node while the waiter's multiplexer, in another process, has not
-    /// moved its subscription there yet, so the promoted node's zero says nothing about the
-    /// waiter — and excusing the old node at once consumed a live waiter's recovery registration
-    /// (a double resume once the waiter re-subscribed a moment later). StackExchange.Redis
-    /// re-issues a subscription on the new owner only once it learns the new topology: on a
-    /// reconnect attempt after the failover has completed, or at the latest on its periodic
-    /// configuration check (<c>ConfigCheckSeconds</c>, 60 s by default) — and the failover itself
-    /// completes only after the node has been unreachable for the cluster node timeout (15 s by
-    /// default; Sentinel's <c>down-after-milliseconds</c>, 30 s). 90 s covers both, counted from
-    /// the moment a probe in this process first saw the node down. The record is cleared when a
-    /// probe sees the node connected again, but a reconnection no probe observed, or one observed
-    /// while an older probe was still in flight, goes unnoticed, so an earlier outage can shorten a
-    /// later failover's grace. Inside the grace a zero is unknown:
-    /// the lost-subscriber publish throws and is redelivered, and the watchdog leaves the
-    /// registration alone.
+    /// How long an endpoint this process saw go from connected to disconnected must stay down
+    /// before the liveness probe excuses it — outside a cluster as the old primary of a failover,
+    /// in a cluster through the node table. A just-disconnected node IS the failover window: this
+    /// process already routes to the promoted node while the waiter's multiplexer, in another
+    /// process, has not moved its subscription there yet, so the promoted node's zero says nothing
+    /// about the waiter — and excusing the old node at once consumed a live waiter's recovery
+    /// registration (a double resume once the waiter re-subscribed a moment later).
+    /// StackExchange.Redis re-issues a subscription on the new owner only once it learns the new
+    /// topology: on a reconnect attempt after the failover has completed, or at the latest on its
+    /// periodic configuration check (<c>ConfigCheckSeconds</c>, 60 s by default) — and the failover
+    /// itself completes only after the node has been unreachable for the cluster node timeout (15 s
+    /// by default; Sentinel's <c>down-after-milliseconds</c>, 30 s). 90 s covers both, counted from
+    /// the multiplexer's <c>ConnectionFailed</c> for the endpoint (never earlier than the real
+    /// disconnection) and reset by its <c>ConnectionRestored</c>. An endpoint this process never
+    /// saw connected — a replica that never connected, a node already down when the channel was
+    /// created — is no failover in progress here and gets no grace. Inside the grace a zero is
+    /// unknown: the lost-subscriber publish throws, and the watchdog leaves the registration alone.
+    /// The response then survives only through redelivery, so the response transport's
+    /// redelivery budget (<c>MaxDeliveryAttempts</c> × redelivery delay) should exceed the grace
+    /// during a failover; a response still unrecovered when that budget runs out is dead-lettered.
     /// </summary>
     internal static readonly TimeSpan DisconnectedEndPointGrace = TimeSpan.FromSeconds(90);
 
-    // When a probe first saw each endpoint disconnected (a timestamp on the injected clock); a
-    // probe that sees the endpoint connected again clears it, but a reconnection no probe saw
-    // does not.
-    private readonly ConcurrentDictionary<EndPoint, long> _disconnectedSince = new();
+    // Per endpoint this process has seen connected: EndPointConnected while it is up, or the
+    // timestamp (injected clock) of the ConnectionFailed that took it down, kept until its
+    // ConnectionRestored — one continuous disconnection. Maintained by the multiplexer's events: a
+    // probe's own observation could land after a newer one, and a node no probe happened to see
+    // reconnect kept a days-old "down since" that excused the next real failover at once. A probe
+    // only ever clears a stale timestamp, by compare-and-swap from the value it read before it saw
+    // the endpoint connected. Absent = never seen connected.
+    private readonly ConcurrentDictionary<EndPoint, long> _endPointDownSince = new();
+    private const long EndPointConnected = long.MinValue;
+
+    private void OnConnectionFailed(object? sender, ConnectionFailedEventArgs e)
+    {
+        // IServer.IsConnected reports the interactive connection (the only one under RESP3). Only a
+        // connected → failed transition starts a grace; a second failure before a restore keeps
+        // the first time.
+        if (e.ConnectionType != ConnectionType.Interactive || e.EndPoint is not { } endPoint)
+            return;
+
+        var failedAt = _timeProvider.GetTimestamp();
+        if (!_endPointDownSince.TryUpdate(endPoint, failedAt, EndPointConnected))
+            return;
+
+        // StackExchange.Redis raises ConnectionFailed and ConnectionRestored on separate work
+        // items, so a blip's failure can be handled AFTER its restore: the node recorded "down
+        // since" while connected, the next real failure's transition from Connected never
+        // recorded, and that failover's grace measured from the blip — long expired, so excused at
+        // once. A node connected by now is up: undo the record (from the value just written, so a
+        // restore and a newer failure in between are never overwritten).
+        if (IsConnectedNow(endPoint))
+            _endPointDownSince.TryUpdate(endPoint, EndPointConnected, failedAt);
+    }
+
+    /// <summary>Whether the multiplexer reports the endpoint connected now. Never throws; null-safe for a stand-in multiplexer.</summary>
+    private bool IsConnectedNow(EndPoint endPoint)
+    {
+        try
+        {
+            return _multiplexer.GetServer(endPoint)?.IsConnected == true;
+        }
+        catch (Exception)
+        {
+            return false;
+        }
+    }
+
+    private void OnConnectionRestored(object? sender, ConnectionFailedEventArgs e)
+    {
+        if (e.ConnectionType == ConnectionType.Interactive && e.EndPoint is { } endPoint)
+            _endPointDownSince[endPoint] = EndPointConnected;
+    }
 
     /// <inheritdoc/>
     /// <remarks>
     /// Returns the live subscriber count, or a negative value when liveness could not be
     /// established. A primary that answered with a failure keeps a zero unknown, and so does one
-    /// that has been disconnected for less than <see cref="DisconnectedEndPointGrace"/>. Past the
-    /// grace the recovery scan's completeness rules decide: outside a cluster one answering
-    /// primary is the whole answer (a failed-over deployment lists the old primary, disconnected,
-    /// until it rejoins); in a cluster — where the channels are key-routed and the subscription
+    /// this process saw disconnect less than <see cref="DisconnectedEndPointGrace"/> ago. Past the
+    /// grace, or for an endpoint this process never saw connected, the recovery scan's
+    /// completeness rules decide: outside a cluster one answering primary is the whole answer (a
+    /// failed-over deployment lists the old primary, disconnected, until it rejoins); in a
+    /// cluster — where the channels are key-routed and the subscription
     /// lives on the channel's slot owner — the node table is read, and the disconnected
     /// primary-flagged endpoints are excused only when every slot owner it lists answered. The
     /// table is consulted only for disconnected endpoints flagged as primaries: a disconnected or
@@ -1141,18 +1336,33 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
         var endPoints = _multiplexer.GetEndPoints();
         var servers = new IServer[endPoints.Length];
         var counts = new Task<long?>?[endPoints.Length];
+        // A disconnected endpoint's "down since" is read with the observation, and the grace
+        // measured to it: a reconnect landing during the awaits below must not erase the grace of
+        // an endpoint this probe did not ask.
+        var downSince = new long[endPoints.Length];
         var now = _timeProvider.GetTimestamp();
         for (var i = 0; i < endPoints.Length; i++)
         {
+            // Read BEFORE IsConnected, so a connected answer below postdates it.
+            var recorded = _endPointDownSince.TryGetValue(endPoints[i], out var tracked) ? tracked : EndPointConnected;
             servers[i] = _multiplexer.GetServer(endPoints[i]);
             if (servers[i].IsConnected)
             {
+                // A "down since" left on an endpoint that is connected now is stale (a failure
+                // handled after its restore, see OnConnectionFailed). Cleared only from the value
+                // read before this answer: a newer failure is recorded only from EndPointConnected,
+                // so it is never overwritten here.
+                if (recorded != EndPointConnected)
+                    _endPointDownSince.TryUpdate(endPoints[i], EndPointConnected, recorded);
                 counts[i] = ReadSubscriberCountAsync(servers[i], channel);
-                _disconnectedSince.TryRemove(endPoints[i], out _);
+            }
+            else
+            {
+                downSince[i] = _endPointDownSince.TryGetValue(endPoints[i], out var since) ? since : EndPointConnected;
             }
         }
 
-        if (_disconnectedSince.Count > endPoints.Length)
+        if (_endPointDownSince.Count > endPoints.Length)
             ForgetEndPointsNoLongerListed(endPoints);
 
         await Task.WhenAll(counts.OfType<Task<long?>>()).WaitAsync(cancellationToken).ConfigureAwait(false);
@@ -1178,8 +1388,7 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
                 if (isPrimary)
                 {
                     (disconnectedPrimaries ??= []).Add(server);
-                    var since = _disconnectedSince.GetOrAdd(endPoints[i], now);
-                    if (_timeProvider.GetElapsedTime(since, now) < DisconnectedEndPointGrace)
+                    if (downSince[i] != EndPointConnected && _timeProvider.GetElapsedTime(downSince[i], now) < DisconnectedEndPointGrace)
                         withinGrace ??= endPoints[i];
                 }
             }
@@ -1210,9 +1419,9 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
         if (!primaryAnswered || primaryFailed)
             return -1L;
 
-        // A primary that went down moments ago may be the old owner of a failover the waiter has
-        // not followed yet (see DisconnectedEndPointGrace): nothing below may excuse it until it
-        // has stayed down for the grace.
+        // A primary this process saw go down moments ago may be the old owner of a failover the
+        // waiter has not followed yet (see DisconnectedEndPointGrace): nothing below may excuse it
+        // until it has stayed down for the grace.
         if (withinGrace is not null)
         {
             _logger.LogDebug(
@@ -1250,10 +1459,10 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
 
     private void ForgetEndPointsNoLongerListed(EndPoint[] endPoints)
     {
-        foreach (var tracked in _disconnectedSince.Keys)
+        foreach (var tracked in _endPointDownSince.Keys)
         {
             if (Array.IndexOf(endPoints, tracked) < 0)
-                _disconnectedSince.TryRemove(tracked, out _);
+                _endPointDownSince.TryRemove(tracked, out _);
         }
     }
 

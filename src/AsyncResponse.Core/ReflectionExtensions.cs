@@ -326,6 +326,9 @@ internal static class ReflectionExtensions
         }
 
         // Opt-in fallback for callback targets loaded into a non-default AssemblyLoadContext (plugins).
+        // A resolver RegisterAssembly installed may load an assembly a generic argument names through
+        // that assembly's load context (see RegisterAssembly) — the confinement above is the default
+        // scan's, not the registered resolvers'.
         var custom = AsyncResponseTypeResolution.Resolve(serviceInterfaceFullName);
         if (custom is not null)
         {

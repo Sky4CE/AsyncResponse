@@ -21,6 +21,12 @@ internal sealed class FakeKafkaProducerClient : IKafkaProducerClient
     /// <summary>When set, every publish attempt throws this exception.</summary>
     public Exception? PublishException { get; set; }
 
+    /// <summary>
+    /// When set, every publish awaits it before it is recorded — a slow or wedged broker the test
+    /// releases.
+    /// </summary>
+    public Func<CancellationToken, Task>? PublishDelay { get; set; }
+
     public bool Disposed { get; private set; }
 
     public Task<KafkaPublishResult> PublishAsync(
@@ -29,6 +35,30 @@ internal sealed class FakeKafkaProducerClient : IKafkaProducerClient
         byte[] payload,
         IReadOnlyList<KafkaTransportHeader> headers,
         CancellationToken cancellationToken)
+    {
+        if (PublishDelay is { } delay)
+            return DelayedPublishAsync(delay, topic, key, payload, headers, cancellationToken);
+
+        return Record(topic, key, payload, headers);
+    }
+
+    private async Task<KafkaPublishResult> DelayedPublishAsync(
+        Func<CancellationToken, Task> delay,
+        string topic,
+        string? key,
+        byte[] payload,
+        IReadOnlyList<KafkaTransportHeader> headers,
+        CancellationToken cancellationToken)
+    {
+        await delay(cancellationToken);
+        return await Record(topic, key, payload, headers);
+    }
+
+    private Task<KafkaPublishResult> Record(
+        string topic,
+        string? key,
+        byte[] payload,
+        IReadOnlyList<KafkaTransportHeader> headers)
     {
         lock (_gate)
         {
@@ -92,6 +122,24 @@ internal sealed class FakeKafkaConsumerClient : IKafkaConsumerClient
     /// </summary>
     public bool IgnorePartitionPause { get; set; }
 
+    /// <summary>
+    /// When set, a paused assignment still delivers — a client handing out a record it had already
+    /// fetched before the pause took hold.
+    /// </summary>
+    public bool IgnoreAssignmentPause { get; set; }
+
+    /// <summary>Messages enqueued and not consumed yet.</summary>
+    public int PendingMessages
+    {
+        get
+        {
+            lock (_gate)
+            {
+                return _messages.Count;
+            }
+        }
+    }
+
     /// <summary>When set, PausePartition/ResumePartition throw it (the partition is no longer assigned).</summary>
     public Exception? PartitionPauseException { get; set; }
 
@@ -133,7 +181,7 @@ internal sealed class FakeKafkaConsumerClient : IKafkaConsumerClient
 
             // Paused partitions deliver nothing, mirroring librdkafka semantics; the rest deliver
             // in the order they were enqueued.
-            if (!Paused)
+            if (!Paused || IgnoreAssignmentPause)
             {
                 for (var i = 0; i < _messages.Count; i++)
                 {
@@ -246,13 +294,186 @@ internal sealed class FakeKafkaConsumerClient : IKafkaConsumerClient
     internal sealed record StoredOffset(string Topic, int Partition, long Offset);
 }
 
+/// <summary>
+/// A scripted stand-in for librdkafka under the REAL <see cref="KafkaConsumerClientAdapter"/>: an
+/// assignment that a rebalance empties and refills, and an application pause per partition that —
+/// as in librdkafka (verified against a real broker, r1) — survives the partition leaving and
+/// rejoining the assignment. Rebalances are queued by the test and run inside the next Consume, on
+/// the poll thread, through the adapter's own callbacks: exactly where the real client runs them.
+/// </summary>
+internal sealed class RebalancingKafkaConsumer
+{
+    private readonly object _gate = new();
+    private readonly string _topic;
+    private readonly List<Confluent.Kafka.TopicPartition> _assignment = [];
+    private readonly HashSet<Confluent.Kafka.TopicPartition> _paused = [];
+    private readonly List<Confluent.Kafka.ConsumeResult<string?, byte[]>> _messages = [];
+    private readonly System.Collections.Concurrent.ConcurrentQueue<Action> _rebalances = new();
+    private int _resumesWhileUnassigned;
+
+    public RebalancingKafkaConsumer(string topic, params int[] partitions)
+    {
+        _topic = topic;
+        _assignment.AddRange(partitions.Select(Partition));
+
+        var consumer = new Moq.Mock<Confluent.Kafka.IConsumer<string?, byte[]>>();
+        consumer.SetupGet(c => c.Assignment).Returns(() =>
+        {
+            lock (_gate)
+            {
+                return [.. _assignment];
+            }
+        });
+        consumer.Setup(c => c.Pause(Moq.It.IsAny<IEnumerable<Confluent.Kafka.TopicPartition>>()))
+            .Callback<IEnumerable<Confluent.Kafka.TopicPartition>>(pausing =>
+            {
+                lock (_gate)
+                {
+                    _paused.UnionWith(pausing);
+                }
+            });
+        consumer.Setup(c => c.Resume(Moq.It.IsAny<IEnumerable<Confluent.Kafka.TopicPartition>>()))
+            .Callback<IEnumerable<Confluent.Kafka.TopicPartition>>(resuming =>
+            {
+                lock (_gate)
+                {
+                    if (_assignment.Count == 0)
+                        _resumesWhileUnassigned++;
+
+                    _paused.ExceptWith(resuming);
+                }
+            });
+        consumer.Setup(c => c.Consume(Moq.It.IsAny<TimeSpan>())).Returns((TimeSpan maxWait) => Consume(maxWait)!); // null: nothing arrived in time
+        Adapter = new KafkaConsumerClientAdapter(consumer.Object);
+    }
+
+    /// <summary>The real adapter over this scripted client — what the subscriber polls.</summary>
+    public KafkaConsumerClientAdapter Adapter { get; }
+
+    public int AssignedCount
+    {
+        get
+        {
+            lock (_gate)
+            {
+                return _assignment.Count;
+            }
+        }
+    }
+
+    /// <summary>Messages enqueued and not consumed yet.</summary>
+    public int PendingMessages
+    {
+        get
+        {
+            lock (_gate)
+            {
+                return _messages.Count;
+            }
+        }
+    }
+
+    /// <summary>Resume calls made while nothing was assigned (between an eager revoke and the re-assignment).</summary>
+    public int ResumesWhileUnassigned
+    {
+        get
+        {
+            lock (_gate)
+            {
+                return _resumesWhileUnassigned;
+            }
+        }
+    }
+
+    public bool IsPaused(int partition)
+    {
+        lock (_gate)
+        {
+            return _paused.Contains(Partition(partition));
+        }
+    }
+
+    public void Enqueue(int partition, long offset, string payload)
+    {
+        lock (_gate)
+        {
+            _messages.Add(new Confluent.Kafka.ConsumeResult<string?, byte[]>
+            {
+                Topic = _topic,
+                Partition = new Confluent.Kafka.Partition(partition),
+                Offset = new Confluent.Kafka.Offset(offset),
+                Message = new Confluent.Kafka.Message<string?, byte[]> { Value = Encoding.UTF8.GetBytes(payload) }
+            });
+        }
+    }
+
+    /// <summary>An eager rebalance revoking the whole assignment, run inside the next Consume.</summary>
+    public void RevokeAll()
+        => _rebalances.Enqueue(() =>
+        {
+            List<Confluent.Kafka.TopicPartitionOffset> revoked;
+            lock (_gate)
+            {
+                revoked = [.. _assignment.Select(partition => new Confluent.Kafka.TopicPartitionOffset(partition, Confluent.Kafka.Offset.Unset))];
+            }
+
+            Adapter.OnPartitionsRemoved(revoked); // while still assigned, as the client calls it
+            lock (_gate)
+            {
+                _assignment.Clear();
+            }
+        });
+
+    /// <summary>The group handing <paramref name="partitions"/> (back) to this member, run inside the next Consume.</summary>
+    public void Assign(params int[] partitions)
+        => _rebalances.Enqueue(() =>
+        {
+            var assigned = partitions.Select(Partition).ToList();
+            Adapter.OnPartitionsAssigned(assigned); // before the client assigns them, as it calls it
+            lock (_gate)
+            {
+                _assignment.AddRange(assigned);
+            }
+        });
+
+    private Confluent.Kafka.TopicPartition Partition(int partition) => new(_topic, new Confluent.Kafka.Partition(partition));
+
+    private Confluent.Kafka.ConsumeResult<string?, byte[]>? Consume(TimeSpan maxWait)
+    {
+        while (_rebalances.TryDequeue(out var rebalance))
+            rebalance();
+
+        lock (_gate)
+        {
+            for (var i = 0; i < _messages.Count; i++)
+            {
+                var candidate = _messages[i];
+                if (!_assignment.Contains(candidate.TopicPartition) || _paused.Contains(candidate.TopicPartition))
+                    continue;
+
+                _messages.RemoveAt(i);
+                return candidate;
+            }
+        }
+
+        Thread.Sleep(TimeSpan.FromMilliseconds(Math.Clamp(maxWait.TotalMilliseconds, 1, 5)));
+        return null;
+    }
+}
+
 internal sealed class FakeKafkaConsumerClientFactory : IKafkaConsumerClientFactory
 {
-    private readonly Queue<FakeKafkaConsumerClient> _consumers = new();
+    private readonly Queue<IKafkaConsumerClient> _consumers = new();
 
     public List<KafkaSubscriberRole> CreatedRoles { get; } = [];
 
     public FakeKafkaConsumerClientFactory(params FakeKafkaConsumerClient[] consumers)
+        : this(consumers.Cast<IKafkaConsumerClient>().ToArray())
+    {
+    }
+
+    /// <summary>Hands out any consumer client — e.g. the real adapter over a scripted librdkafka.</summary>
+    public FakeKafkaConsumerClientFactory(params IKafkaConsumerClient[] consumers)
     {
         foreach (var consumer in consumers)
             _consumers.Enqueue(consumer);

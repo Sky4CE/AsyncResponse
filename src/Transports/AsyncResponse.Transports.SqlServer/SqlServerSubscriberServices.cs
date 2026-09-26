@@ -12,6 +12,7 @@ namespace AsyncResponse.Transports.SqlServer;
 internal abstract class SqlServerSubscriberService : BackgroundService
 {
     private readonly SqlServerTransportStore _store;
+    private readonly WorkerIntakeGate? _intakeGate;
     private readonly Channel<bool> _signals = Channel.CreateBounded<bool>(new BoundedChannelOptions(1)
     {
         SingleReader = true,
@@ -19,15 +20,22 @@ internal abstract class SqlServerSubscriberService : BackgroundService
         FullMode = BoundedChannelFullMode.DropWrite
     });
 
+    /// <param name="options">The transport options.</param>
+    /// <param name="store">The queue store.</param>
+    /// <param name="logger">The subscriber's logger.</param>
+    /// <param name="intakeGate">The worker subscriber's host-stop intake gate; <c>null</c> for the
+    /// response subscriber, which keeps delivering to waiters through host stop.</param>
     protected SqlServerSubscriberService(
         IOptions<SqlServerAsyncResponseTransportOptions> options,
         SqlServerTransportStore store,
-        ILogger logger)
+        ILogger logger,
+        WorkerIntakeGate? intakeGate = null)
     {
         Options = options.Value;
         SqlServerTransportOptionsValidator.ValidateCommon(Options);
         _store = store;
         Logger = logger;
+        _intakeGate = intakeGate;
     }
 
     protected SqlServerAsyncResponseTransportOptions Options { get; }
@@ -68,14 +76,15 @@ internal abstract class SqlServerSubscriberService : BackgroundService
             Options,
             SubscriberOptions,
             Logger,
-            Role);
+            Role,
+            hostStopping: _intakeGate?.HostStopping ?? CancellationToken.None);
 
         await SubscriberSupervisor.RunAsync(
             attemptToken => RunSubscriberAsync(dispatcher, attemptToken),
             stoppingToken,
             failures => AsyncResponseRetry.Backoff(failures, Options.SubscriberRetryBaseDelay, Options.SubscriberRetryMaxDelay),
             (ex, delay) => Logger.LogWarning(ex, "SQL Server subscriber failed for queue {Queue} ({Role}); retrying in {RetryDelay}.", Queue, Role, delay),
-            healthyRunThreshold: Options.SubscriberRetryMaxDelay).ConfigureAwait(false);
+            healthyRunThreshold: AsyncResponseRetry.MaxAttainableDelay(Options.SubscriberRetryBaseDelay, Options.SubscriberRetryMaxDelay)).ConfigureAwait(false);
     }
 
     private async Task RunSubscriberAsync(SqlServerMessageDispatcher dispatcher, CancellationToken stoppingToken)
@@ -108,11 +117,29 @@ internal abstract class SqlServerSubscriberService : BackgroundService
 
             while (!stoppingToken.IsCancellationRequested)
             {
+                // Worker intake stops at host stop (WorkerIntakeGate): once ApplicationStopping has
+                // fired, claim nothing more — the rows stay in the table for a live replica — and
+                // wait for this subscriber's own stop. Claiming on through the stop window took the
+                // very wake-ups this host's own flow hand-overs had just published (the same-process
+                // wake above claims them before any peer has polled) and handed them back: an
+                // attempt spent and the row locked until its lease lapsed (or, under early ACK, a
+                // settled wake-up turned into a dead-letter copy), where a live peer would have run
+                // it at once.
+                if (_intakeGate?.IsClosed == true)
+                {
+                    await ParkAtHostStopAsync(stoppingToken).ConfigureAwait(false);
+                    break;
+                }
+
                 var claimed = 0;
                 await foreach (var delivery in _store.ClaimBatchAsync(Queue, SubscriberOptions.BatchSize, Options.LockTimeout, stoppingToken).ConfigureAwait(false))
                 {
                     claimed++;
                     await dispatcher.HandleAsync(delivery, stoppingToken).ConfigureAwait(false);
+
+                    // The batch claims lazily, one row per step, so leaving it here claims nothing more.
+                    if (_intakeGate?.IsClosed == true)
+                        break;
                 }
 
                 if (claimed > 0)
@@ -146,6 +173,17 @@ internal abstract class SqlServerSubscriberService : BackgroundService
             }
         }
     }
+
+    // The worker loop's host-stop park: no claim until this subscriber's own stop (in-process
+    // publish wakes keep signalling into the one-slot, drop-on-full channel, which nothing reads
+    // any more).
+    private async Task ParkAtHostStopAsync(CancellationToken stoppingToken)
+    {
+        SafeLog.Try((Logger, Queue), static s => s.Logger.LogDebug(
+            "SQL Server worker subscriber for queue {Queue} stopped claiming: the host is stopping, so the rows are left for a live replica.",
+            s.Queue));
+        await Task.Delay(Timeout.InfiniteTimeSpan, stoppingToken).ConfigureAwait(ConfigureAwaitOptions.SuppressThrowing);
+    }
 }
 
 /// <summary>Consumes worker-job rows and executes them through the AsyncResponse ingress.</summary>
@@ -153,12 +191,19 @@ internal sealed class SqlServerWorkerSubscriber : SqlServerSubscriberService
 {
     private readonly IAsyncResponseIngress _ingress;
 
+    /// <param name="options">The transport options.</param>
+    /// <param name="store">The queue store.</param>
+    /// <param name="ingress">The ingress the worker jobs run through.</param>
+    /// <param name="logger">The subscriber's logger.</param>
+    /// <param name="hostLifetime">The host lifetime whose <c>ApplicationStopping</c> stops worker
+    /// intake (see <see cref="WorkerIntakeGate"/>); without one the gate never closes.</param>
     public SqlServerWorkerSubscriber(
         IOptions<SqlServerAsyncResponseTransportOptions> options,
         SqlServerTransportStore store,
         IAsyncResponseIngress ingress,
-        ILogger<SqlServerWorkerSubscriber> logger)
-        : base(options, store, logger)
+        ILogger<SqlServerWorkerSubscriber> logger,
+        IHostApplicationLifetime? hostLifetime = null)
+        : base(options, store, logger, new WorkerIntakeGate(hostLifetime))
         => _ingress = ingress;
 
     protected override string Queue => Options.WorkerQueue;

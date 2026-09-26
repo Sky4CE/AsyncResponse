@@ -190,19 +190,21 @@ incarnation's execution leases, but there is no process to kill: a step body tha
 graceful stop (bounded by `options.RealTimeGuard`) — it ignored its cancellation and is blocked
 on something the test controls — keeps running beside the new incarnation and performs its side
 effects *after* the restart returned, which is less than a "restart" claims. An engine-owned wait
-does not cost that wait: an awaited step, an in-process timer, or a crashed attempt asleep in a
-redelivery backoff taken during the drain can only end when the test replies or moves the virtual
-clock, and neither can happen while the test is awaiting the restart, so the stop ends as soon as
-such waits are all that is left — together with any jobs still queued behind them, which never
-started and run no user code (the leases are broken immediately after, so nothing blocks the new
-incarnation from taking the execution over). A backoff taken *before* the stop is not such a
-wait: the stop ends it — dropping its job, as the transport always does at shutdown — and drains
-the jobs queued behind it. Only user code that is genuinely still running waits out the
-guard. `SimulateRestartAsync`
-therefore refuses with `InvalidOperationException` when user code is still executing after the
-stop lapsed (engine-owned waits — an awaited step or an in-process timer holding its worker slot,
-a redelivery backoff, all on the virtual clock — and queued jobs are expected and never trip
-this). Let the step observe its cancellation
+does not cost that wait: an awaited step, an in-process timer, a crashed attempt asleep in a
+redelivery backoff taken during the drain, or a duplicate wake-up polling for another execution's
+lease can only end when the test replies or moves the virtual clock, and neither can happen while
+the test is awaiting the restart, so the stop ends as soon as such waits are all that is left —
+together with any jobs still queued behind them, which never started and run no user code (the
+leases are broken immediately after, so nothing blocks the new incarnation from taking the
+execution over). A backoff taken *before* the stop is not such a wait: the stop ends it and drops
+its job — the crashed attempt dies with the old incarnation, whatever `MaxDeliveryAttempts` says
+(a production host stop retries a job with attempts left during the drain instead; the restart
+keeps crash semantics) — and drains the jobs queued behind it. Only user code that is genuinely
+still running waits out the guard.
+`SimulateRestartAsync` therefore refuses with `InvalidOperationException` when user code is still
+executing after the stop lapsed (engine-owned waits — an awaited step or an in-process timer
+holding its worker slot, a redelivery backoff, a lease-contention poll, all on the virtual clock —
+and queued jobs are expected and never trip this). Let the step observe its cancellation
 token or finish before restarting; for crash-*at-a-checkpoint* semantics use
 `FlowTestHarness.CrashBeforeStep` / `CrashAfterStep`, which fail the attempt at the exact
 boundary with nothing left running. A test that deliberately wants the overlap sets
@@ -214,13 +216,20 @@ that must hold against abrupt termination needs a real process and a real broker
 A job still queued behind a park the stop could not wait for never started, so nothing can run it
 twice: the new incarnation runs it, as a broker would deliver a message it still holds — a queued
 flow *start* included — under the ambient context (`AsyncLocal` state) it was published under, as
-the in-memory transport runs every job. Breaking a lease does not redeliver the execution that
-held it, though: the wake-up of every execution the stop abandoned — one parked on an awaited
-step or an in-process timer, or a crashed attempt asleep in the redelivery backoff (after
-`CrashAfterStep`, say, when the restart comes before the clock has moved) — dies with the old
-incarnation, and the new one does not deliver it again. Resume those runs explicitly after the
-restart (`run.ResumeAsync()`, `IDurableFlows.ResumeAsync`), or, for an awaited step, publish its
-response — lost-subscriber recovery routes it into the run.
+the in-memory transport runs every job. Scheduled (delayed) jobs keep their publisher's ambient
+context across the restart too, and once the old incarnation has stopped, none of its workers
+starts another job — a job one reads is carried over instead. Breaking a lease does not
+redeliver the execution that held it, though: the wake-up of every execution the stop abandoned —
+one parked on an awaited step or an in-process timer, or a crashed attempt asleep in the
+redelivery backoff (after `CrashAfterStep`, say, when the restart comes before the clock has
+moved) — dies with the old incarnation, and the new one does not deliver it again. Resume those
+runs explicitly after the restart (`run.ResumeAsync()`, `IDurableFlows.ResumeAsync`), or, for an
+awaited step, publish its response — lost-subscriber recovery routes it into the run. With
+`WorkerCount` ≥ 2, a duplicate delivery that was polling for another execution's lease at the
+restart keeps polling on the shared virtual clock: if the test advances the clock before the new
+incarnation retakes the flow, that poll can take the lease once and write one extra attempt (and
+its failure message) to the run's ledger — resume or reply before advancing when a test asserts
+`Attempts` or `LastMessage`.
 
 The flow probe's step barriers skip a park the dead incarnation held in process: after a restart,
 `WaitForAwaitingStepAsync` — and `WaitForTimerStepAsync` for a timer at or below
@@ -231,7 +240,11 @@ for a checkpoint persisted before the restart (by the old incarnation's graceful
 `WaitForTimerStepAsync` for a suspended timer, whose wake-up the restart carried over.
 `ReplyAsync` answers the new incarnation's wait once the run has recorded anything in it; until
 then it answers the wait that survived the restart, which is exactly a response arriving while the
-process is down. `Events` and `StepExecutions` keep the whole history across restarts.
+process is down. A wait a failed attempt released — an awaited step that timed out or received a
+failure the flow does not treat as terminal — is not live either: `ReplyAsync` and
+`WaitForAwaitingStepAsync` wait for the retry to park the step again (a faulted step restarts under
+a fresh correlation id), so advance the clock past the redelivery backoff. `Events` and
+`StepExecutions` keep the whole history across restarts.
 
 It also breaks the dead incarnation's leases *for* the new one. A process that really dies leaves
 its execution lease persisted and unexpired, and whatever redelivers the run's wake-up has to get
@@ -292,6 +305,15 @@ dead incarnation's task.
 - Every harness wait (`WaitFor*`, `WaitForWorkerIdleAsync`) is bounded by
   `options.RealTimeGuard` (default 10 s of *real* time) and fails with a diagnosis — a hung test
   tells you it hung and why, usually "advance the clock first".
+- A publish (`PublishAsync`, `PublishExceptionAsync`, `ReplyAsync`) runs a lost subscriber's
+  recovery callbacks inline, and a callback that throws is retried with backoff on the virtual
+  clock: while the publish is pending, the harness advances the clock to the timers the publish
+  itself armed and due within a few seconds (a ladder step is at most two), and nothing else —
+  not the timers of work a callback enqueues (a flow run it starts or resumes, a delayed job it
+  schedules), nor a longer wait the callback armed. A publish still pending after
+  `RealTimeGuard` — a callback blocked on something the test controls, waiting on a longer
+  virtual timer, or sleeping on the system clock — fails with a `TimeoutException` naming the
+  cause.
 - Advancing walks every armed timer, and every step costs a few real milliseconds of settle
   (three 1 ms delays at least — about 15 ms each on Windows' default timer resolution). Anything
   that holds its execution lease while the clock crosses days renews that lease every

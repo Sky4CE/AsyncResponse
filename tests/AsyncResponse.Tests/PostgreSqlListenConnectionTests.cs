@@ -58,9 +58,9 @@ public sealed class PostgreSqlListenConnectionTests
     }
 
     /// <summary>
-    /// The other half of D5: a connection whose <c>UNLISTEN</c> did not succeed but which is still
-    /// open (the server answered with an error, or honoured the cancel of a timed-out one) is still
-    /// listening, and must not go back to the pool — it is closed instead (the client sends
+    /// The other half of D5: a connection whose <c>UNLISTEN</c> did not succeed (nor its one retry)
+    /// but which is still open (the server answered with an error, or honoured the cancel of a
+    /// timed-out one) is still listening, and must not go back to the pool — it is closed instead (the client sends
     /// Terminate). Red on the round's code: it was disposed back into the pool, still listening;
     /// and with <c>NpgsqlConnection.ClearPool</c> in place of the data source's own clear, which
     /// never reaches a data source's pool.
@@ -131,20 +131,85 @@ public sealed class PostgreSqlListenConnectionTests
         Assert.False(server.Terminated(1).IsCompleted);
     }
 
+    /// <summary>
+    /// Fixpoint r2 S5#8 (i): an overloaded server that timed out the listener's liveness probe
+    /// (honouring its cancel, so the connection stayed open) usually timed out the UNLISTEN as
+    /// well, and every such listen cycle — about every 15 s while the overload lasted — cleared the
+    /// application's whole pool. A failed UNLISTEN on a still-open connection after an established
+    /// LISTEN is now retried once, with a longer timeout, before the pool is cleared; here the
+    /// retry succeeds and the connection goes back to the pool. Red on the old code: the first
+    /// failure cleared the pool, so the connection was closed and the next open started a second
+    /// session.
+    /// </summary>
+    [Theory]
+    [InlineData(Package.Channel)]
+    [InlineData(Package.Transport)]
+    public async Task Release_AFailedUnlistenThatSucceedsOnItsRetry_ReturnsTheConnectionToThePool(Package package)
+    {
+        await using var server = new FakePostgresWireServer();
+        var unlistens = 0;
+        server.Respond = (_, sql) => Task.FromResult(!sql.StartsWith("UNLISTEN", StringComparison.Ordinal)
+            ? FakePostgresWireServer.Reply.Complete(sql)
+            : Interlocked.Increment(ref unlistens) == 1
+                ? FakePostgresWireServer.Reply.Error("canceling statement due to statement timeout")
+                : FakePostgresWireServer.Reply.Complete(sql));
+        await using var dataSource = NpgsqlDataSource.Create(server.ConnectionString());
+        var connection = await dataSource.OpenConnectionAsync();
+
+        await Release(package, dataSource, connection, listening: true, budget: TimeSpan.FromSeconds(30), commandTimeoutSeconds: 0);
+
+        await using var reused = await dataSource.OpenConnectionAsync();
+        Assert.Equal(1, server.Sessions);
+        Assert.False(server.Terminated(1).IsCompleted);
+        Assert.Equal(2, Volatile.Read(ref unlistens));
+    }
+
+    /// <summary>
+    /// Fixpoint r2 (the round-1 pre-commit B-p2 #2 redo): the pool clear is now reported — but
+    /// only once the connection is disposed, and a logging provider that throws cannot skip that
+    /// disposal. Round 1's version logged inside the dispose <c>try</c>, so a throwing provider
+    /// (Microsoft.Extensions.Logging rethrows a provider's failure) leaked the still-listening
+    /// connection: its pool slot was never returned and its backend kept receiving every NOTIFY.
+    /// Both UNLISTEN attempts fail here. Red with the log moved back inside the dispose try: the
+    /// connection was never closed.
+    /// </summary>
+    [Theory]
+    [InlineData(Package.Channel)]
+    [InlineData(Package.Transport)]
+    public async Task Release_ClearingThePool_IsLogged_AndALoggerThatThrowsStillClosesTheConnection(Package package)
+    {
+        await using var server = new FakePostgresWireServer();
+        server.Respond = (_, sql) => Task.FromResult(sql.StartsWith("UNLISTEN", StringComparison.Ordinal)
+            ? FakePostgresWireServer.Reply.Error("unlisten refused")
+            : FakePostgresWireServer.Reply.Complete(sql));
+        await using var dataSource = NpgsqlDataSource.Create(server.ConnectionString());
+        var connection = await dataSource.OpenConnectionAsync();
+        const string clearFragment = "cleared the NpgsqlDataSource's connection pool";
+        var logger = new CollectingLogger { ThrowOnMessageContaining = clearFragment };
+
+        await Release(package, dataSource, connection, listening: true, budget: TimeSpan.FromSeconds(30), commandTimeoutSeconds: 0, logger: logger);
+
+        await server.Terminated(1).WaitAsync(TimeSpan.FromSeconds(30));
+        var cleared = Assert.Single(logger.Entries, entry => entry.Message.Contains(clearFragment, StringComparison.Ordinal));
+        Assert.Contains("unlisten refused", cleared.Exception?.Message, StringComparison.Ordinal);
+        Assert.Equal(2, server.Statements.Count(statement => statement.Sql.StartsWith("UNLISTEN", StringComparison.Ordinal)));
+    }
+
     private static Task Release(
         Package package,
         NpgsqlDataSource dataSource,
         NpgsqlConnection connection,
         bool listening,
         TimeSpan budget,
-        int commandTimeoutSeconds)
+        int commandTimeoutSeconds,
+        Microsoft.Extensions.Logging.ILogger? logger = null)
     {
         var release = ListenConnectionType(package)
             .GetMethod(
                 "ReleaseAsync",
                 BindingFlags.Static | BindingFlags.NonPublic | BindingFlags.Public,
-                [typeof(NpgsqlDataSource), typeof(NpgsqlConnection), typeof(bool), typeof(TimeSpan), typeof(int)])!;
-        return (Task)release.Invoke(null, [dataSource, connection, listening, budget, commandTimeoutSeconds])!;
+                [typeof(NpgsqlDataSource), typeof(NpgsqlConnection), typeof(bool), typeof(Microsoft.Extensions.Logging.ILogger), typeof(TimeSpan), typeof(int), typeof(int)])!;
+        return (Task)release.Invoke(null, [dataSource, connection, listening, logger, budget, commandTimeoutSeconds, commandTimeoutSeconds])!;
     }
 
     private static Type ListenConnectionType(Package package)

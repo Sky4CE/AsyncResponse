@@ -161,6 +161,9 @@ internal static class PayloadRecoveryClassifier
         var resolved = AsyncResponseTypeResolution.ResolveLoaded(payloadTypeFullName);
 
         // Opt-in fallback for payload types loaded into a non-default AssemblyLoadContext (plugins).
+        // A resolver RegisterAssembly installed may load an assembly a generic argument names through
+        // that assembly's load context (see RegisterAssembly) — the confinement above is the default
+        // scan's, not the registered resolvers'.
         resolved ??= AsyncResponseTypeResolution.Resolve(payloadTypeFullName);
 
         if (resolved is not null)

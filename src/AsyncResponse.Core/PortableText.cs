@@ -75,15 +75,6 @@ internal static class PortableText
             "everywhere. Use a printable id.";
 
     /// <summary>
-    /// The shared 40-character excerpt used when quoting an offending id back to the caller. Cut
-    /// through <see cref="TruncateWellFormed"/>: a fixed-index slice used to split a surrogate pair
-    /// that straddled the cut, so the helper that quotes an id in the "unpaired surrogate"
-    /// rejection could mint an unpaired surrogate of its own.
-    /// </summary>
-    internal static string Excerpt(string value)
-        => value.Length <= 40 ? value : string.Concat(TruncateWellFormed(value, 40), "…");
-
-    /// <summary>
     /// The longest prefix of <paramref name="value"/> that fits <paramref name="maxLength"/> UTF-16
     /// code units WITHOUT ending inside a surrogate pair — one unit shorter than the budget when
     /// the pair straddles it. <c>value[..maxLength]</c> keeps the high surrogate and drops its low

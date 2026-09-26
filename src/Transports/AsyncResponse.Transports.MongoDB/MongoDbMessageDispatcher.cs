@@ -21,7 +21,8 @@ internal sealed class MongoDbMessageDispatcher(
     MongoDbSubscriberOptions subscriberOptions,
     ILogger logger,
     MongoDbSubscriberRole role,
-    TimeProvider? timeProvider = null)
+    TimeProvider? timeProvider = null,
+    CancellationToken hostStopping = default)
     : DbMessageDispatcherBase(
         handler,
         options,
@@ -31,4 +32,5 @@ internal sealed class MongoDbMessageDispatcher(
         providerName: "MongoDB",
         unitNoun: "document",
         telemetryName: "mongodb",
-        timeProvider: timeProvider);
+        timeProvider: timeProvider,
+        hostStopping: hostStopping);

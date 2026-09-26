@@ -371,11 +371,16 @@ public sealed class DurableFlowStateStorePackageIntegrationTests(DataBatchFixtur
 
             // Any create prunes first (PruneInterval zero). Its batch reads the expired version; its
             // delete then blocks on the replacer's lock — or finishes without touching the row.
+            // Asserted, not merely awaited: a prune that neither blocked nor finished inside the
+            // window would let the replacer commit first, and the old statement then read the
+            // committed, live row, deleted nothing, and passed without ever racing the replace.
             var pruning = store.TryCreateAsync("trigger-flow", CreateState("trigger-flow"), TimeSpan.FromMinutes(5));
-            await PollAsync(
-                async () => pruning.IsCompleted || await IsBlockedByAsync(master, replacerSession),
-                done => done,
-                TimeSpan.FromSeconds(20));
+            Assert.True(
+                await PollAsync(
+                    async () => pruning.IsCompleted || await IsBlockedByAsync(master, replacerSession),
+                    done => done,
+                    TimeSpan.FromSeconds(20)),
+                "the prune never reached the replaced row within 20 s");
 
             await replace.CommitAsync();
             Assert.True(await pruning);

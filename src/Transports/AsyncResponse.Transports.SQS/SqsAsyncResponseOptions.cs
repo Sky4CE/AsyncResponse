@@ -30,7 +30,8 @@ public sealed class SqsAsyncResponseOptions
 
     /// <summary>
     /// SQS queue used by <see cref="SqsWorkerTransport"/> to publish worker jobs. Accepts a queue
-    /// name (resolved once via <c>GetQueueUrl</c>) or a full queue URL. A name or URL ending in
+    /// name (resolved once via <c>GetQueueUrl</c>) or a full queue URL — not an ARN; a name that
+    /// breaks the SQS naming rule fails startup. A name or URL ending in
     /// <c>.fifo</c> opts the worker path into FIFO publishing: the correlation id becomes the
     /// <c>MessageGroupId</c>, so jobs sharing a correlation id stay ordered, while every job without
     /// one — durable-flow jobs among them — shares <see cref="FifoMessageGroupIdFallback"/>, a single
@@ -42,8 +43,9 @@ public sealed class SqsAsyncResponseOptions
     public SqsSubscriberOptions WorkerSubscriber { get; } = new();
 
     /// <summary>
-    /// SQS queue consumed by the hosted response-ingress subscriber. Accepts a queue name or URL and
-    /// must be distinct from <see cref="WorkerQueue"/>.
+    /// SQS queue consumed by the hosted response-ingress subscriber. Accepts a queue name or URL (not
+    /// an ARN; a name that breaks the SQS naming rule fails startup) and must be distinct from
+    /// <see cref="WorkerQueue"/>.
     /// </summary>
     public string ResponseQueue { get; set; } = "asyncresponse-response";
 
@@ -60,8 +62,10 @@ public sealed class SqsAsyncResponseOptions
     public Dictionary<string, SqsReplyTargetOptions> ReplyTargets { get; } = new(StringComparer.Ordinal);
 
     /// <summary>
-    /// SQS message attribute that carries the AsyncResponse correlation id. Default:
-    /// <c>correlationId</c>.
+    /// SQS message attribute that carries the AsyncResponse correlation id. Must be a valid SQS
+    /// message-attribute name (at most 256 ASCII letters, digits, <c>_</c>, <c>-</c> and <c>.</c>;
+    /// no leading, trailing or consecutive periods; no <c>AWS.</c>/<c>Amazon.</c> prefix), checked
+    /// at startup. Default: <c>correlationId</c>.
     /// </summary>
     public string CorrelationIdAttribute { get; set; } = "correlationId";
 
@@ -87,7 +91,13 @@ public sealed class SqsAsyncResponseOptions
     /// <see cref="SqsAckMode.AckAfterHandlerCompletes"/> receives one message at a time: it runs
     /// handlers serially, and SQS counts every received message toward the redrive policy — and
     /// starts its visibility clock — whether or not its handler ever starts. The response
-    /// subscriber keeps the batch in both modes (its handler is the library's own).
+    /// subscriber keeps the batch in both modes, although its handler is not always short: a
+    /// response whose waiter is gone runs that correlation's recovery callbacks inline, retries
+    /// included, so slow or failing callbacks can outlast the visibility of the batch-mates queued
+    /// behind them, which a peer then receives (and counts) as well. Where callbacks can be slow,
+    /// set <see cref="SqsSubscriberOptions.VisibilityTimeout"/> and
+    /// <see cref="SqsSubscriberOptions.VisibilityRenewalInterval"/> on
+    /// <see cref="ResponseSubscriber"/>.
     /// </summary>
     public int MaxMessagesPerReceive { get; set; } = 10;
 
@@ -147,18 +157,28 @@ public sealed class SqsAsyncResponseOptions
     public TimeSpan SubscriberRetryMaxDelay { get; set; } = TimeSpan.FromSeconds(5);
 
     /// <summary>
-    /// Bounds the visibility-renewal task join after each batch (including the final batch while a
-    /// hosted subscriber stops). The join completes immediately when healthy; when it does not, the
-    /// renewal task is abandoned anyway, so keep this short — at shutdown it counts against the
-    /// host's budget. Default: <c>5s</c>.
+    /// Bounds the subscriber's settlement steps that can stall against a degraded endpoint: the
+    /// visibility-renewal task join after each batch (including the final batch while a hosted
+    /// subscriber stops); handing a batch's never-started messages back (visibility released to
+    /// zero), which runs alongside that join — and on the renewal-free path too, so it is spent at
+    /// stop with renewal off as well; and a failed message's retry-delay update waiting out a
+    /// renewal still in flight. Each completes in milliseconds when healthy; when one does not, it
+    /// is abandoned anyway, so keep this short — at shutdown one <c>ShutdownTimeout</c> counts
+    /// against the host's budget in either ack mode (see <see cref="HostShutdownTimeout"/>).
+    /// Default: <c>5s</c>.
     /// </summary>
     public TimeSpan ShutdownTimeout { get; set; } = TimeSpan.FromSeconds(5);
 
     /// <summary>
-    /// The hosting shutdown budget that must contain
-    /// <see cref="SqsSubscriberOptions.BackgroundDrainTimeout"/> when a subscriber uses
-    /// <see cref="SqsAckMode.AckAfterEnqueue"/>. Defaults to the Generic Host default of 30 seconds.
-    /// Set to <c>null</c> only when this budget is validated externally.
+    /// The hosting shutdown budget the SQS stop path must fit, validated at startup for each
+    /// subscriber: one <see cref="ShutdownTimeout"/> in
+    /// <see cref="SqsAckMode.AckAfterHandlerCompletes"/>, and
+    /// <see cref="SqsSubscriberOptions.BackgroundDrainTimeout"/> plus one
+    /// <see cref="ShutdownTimeout"/> in <see cref="SqsAckMode.AckAfterEnqueue"/>. It also bounds how
+    /// long a delivery the durable-flow engine hands back at host stop stays invisible when its
+    /// <see cref="SqsSubscriberOptions.VisibilityTimeout"/> is longer. Defaults to the Generic Host
+    /// default of 30 seconds. Set to <c>null</c> only when this budget is validated externally (the
+    /// hand-back bound then assumes the 30-second default).
     /// </summary>
     public TimeSpan? HostShutdownTimeout { get; set; } = TimeSpan.FromSeconds(30);
 

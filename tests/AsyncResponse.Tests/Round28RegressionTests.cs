@@ -115,10 +115,12 @@ public sealed class Round28RegressionTests
         }
     }
 
-    private static ServiceProvider BuildStartProvider(IWorkerTransport transport, VirtualTimeProvider clock)
+    private static ServiceProvider BuildStartProvider(IWorkerTransport transport, VirtualTimeProvider clock, CollectingLogger? starterLogger = null)
     {
         var services = new ServiceCollection();
         services.AddSingleton(typeof(ILogger<>), typeof(NullLogger<>));
+        if (starterLogger is not null)
+            services.AddSingleton(starterLogger.For<DurableFlowService>());
         services.AddSingleton<TimeProvider>(clock);
         services
             .AddAsyncResponse()
@@ -167,6 +169,54 @@ public sealed class Round28RegressionTests
 
         // Cancelled before the ladder could spend a single retry on it.
         Assert.True(Volatile.Read(ref transport.PublishAttempts) <= 1);
+    }
+
+    [Fact]
+    public async Task CallerCancellationDuringTheStartPublish_SurfacesAsACancellation_NotAsNotDispatched()
+    {
+        // Fixpoint r2 (GS1#4): the ladder stops on the caller's token by design, but the
+        // cancellation that stopped it — here, one that lands while the publish is in flight — was
+        // wrapped as DurableFlowNotDispatchedException: "the transport stayed unavailable", logged
+        // as an Error, for a caller that had simply cancelled.
+        var clock = new VirtualTimeProvider();
+        using var caller = new CancellationTokenSource();
+        var transport = new CancelledMidPublishWorkerTransport(caller);
+        var logger = new CollectingLogger();
+        await using var provider = BuildStartProvider(transport, clock, logger);
+        var flows = provider.GetRequiredService<IDurableFlows>();
+
+        var cancelled = await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            () => flows.StartAsync<R28Flow, R28Input>(new R28Input("acme"), flowId: null, caller.Token));
+
+        Assert.Equal(1, Volatile.Read(ref transport.PublishAttempts));
+        Assert.DoesNotContain(logger.Messages, message => message.Contains("could not be started", StringComparison.Ordinal));
+
+        // Pre-commit r2 (A1): the job may have landed, and the GENERATED id — which the
+        // not-dispatched exception used to carry — is the caller's only handle to retry without
+        // starting a second, independent run. The cancellation carries it: message and Data.
+        Assert.Equal(caller.Token, cancelled.CancellationToken);
+        var flowId = Assert.IsType<string>(cancelled.Data["FlowId"]);
+        Assert.StartsWith("flow-", flowId, StringComparison.Ordinal);
+        Assert.Contains($"'{flowId}'", cancelled.Message, StringComparison.Ordinal);
+        Assert.Equal(flowId, Assert.Single(transport.PublishedFlowIds));
+    }
+
+    /// <summary>Cancels the caller's token while its publish is in flight, and reports the cancellation.</summary>
+    private sealed class CancelledMidPublishWorkerTransport(CancellationTokenSource _caller) : IWorkerTransport
+    {
+        public int PublishAttempts;
+
+        /// <summary>The flow id each attempted start job carried (its first argument).</summary>
+        public List<string> PublishedFlowIds { get; } = [];
+
+        public Task PublishAsync(WorkerJobEnvelope job, CancellationToken cancellationToken = default)
+        {
+            Interlocked.Increment(ref PublishAttempts);
+            lock (PublishedFlowIds)
+                PublishedFlowIds.Add(job.Call.Params[0].Value?.ToString() ?? string.Empty);
+            _caller.Cancel();
+            return Task.FromException(new OperationCanceledException(_caller.Token));
+        }
     }
 
     // -----------------------------------------------------------------------------------------

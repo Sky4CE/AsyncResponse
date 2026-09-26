@@ -621,9 +621,14 @@ public sealed class OracleFlowStateStore : IFlowStateStore
     /// every comparison through NLS_SORT instead, where anything but BINARY — BINARY_CI,
     /// BINARY_AI, a language sort — folds case or accents. Sessions inherit these from instance
     /// parameters, client NLS configuration, and logon triggers, uniformly for every connection
-    /// this store opens, so one check on one pooled session stands for all of them. Internal (not
-    /// private) so the integration suite can run it against a deliberately mis-set session without
-    /// installing a logon trigger.
+    /// this store opens — which is what lets one check on one pooled session stand for the rest.
+    /// It does NOT cover a per-session <c>ALTER SESSION</c>: ODP.NET hands pooled sessions back
+    /// with their altered NLS state intact, so another component sharing this store's connection
+    /// string (and therefore its pool) that alters the sessions it opens can later lend this store
+    /// a linguistic one, and the check, already passed, is not repeated. Give the store a
+    /// connection string no other component alters sessions on (any distinct string gets its own
+    /// pool). Internal (not private) so the integration suite can run it against a deliberately
+    /// mis-set session without installing a logon trigger.
     /// </summary>
     internal static async Task VerifyComparisonSemanticsAsync(OracleConnection connection, CancellationToken cancellationToken)
     {

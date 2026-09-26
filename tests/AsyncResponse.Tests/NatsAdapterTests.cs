@@ -189,6 +189,29 @@ public class NatsResponseChannelClientTests
     }
 
     [Fact]
+    public void RawRequester_RoutesTheConnectionsMessageDroppedToTheWatchedSubscription_UntilTheWatchEnds()
+    {
+        // NATS.Net reports a message a subscription's bounded buffer could not admit only through
+        // the connection-wide MessageDropped event, and nothing listened to it: a flooded waiter
+        // lost messages silently. The requester routes each drop to the subscription it belongs to.
+        var connection = new Mock<INatsConnection>();
+        connection.SetupGet(c => c.Opts).Returns(NatsOpts.Default);
+        connection.Setup(c => c.GetBoundedChannelOpts(It.IsAny<NatsSubChannelOpts?>())).Returns(new BoundedChannelOptions(4));
+        var watched = new NatsSub<string>(connection.Object, Mock.Of<INatsSubscriptionManager>(), "subj", queueGroup: null, opts: null, NatsDefaultSerializer<string>.Default);
+        var other = new NatsSub<string>(connection.Object, Mock.Of<INatsSubscriptionManager>(), "other", queueGroup: null, opts: null, NatsDefaultSerializer<string>.Default);
+        var requester = new NatsRawRequester(connection.Object);
+        var dropped = new List<int>();
+
+        var watch = requester.WatchDrops(watched, dropped.Add);
+        connection.Raise(c => c.MessageDropped += null, connection.Object, new NatsMessageDroppedEventArgs(watched, 4, "subj", null, null, null));
+        connection.Raise(c => c.MessageDropped += null, connection.Object, new NatsMessageDroppedEventArgs(other, 9, "other", null, null, null));
+        watch.Dispose();
+        connection.Raise(c => c.MessageDropped += null, connection.Object, new NatsMessageDroppedEventArgs(watched, 5, "subj", null, null, null));
+
+        Assert.Equal([4], dropped);
+    }
+
+    [Fact]
     public async Task Subscription_MapsMessages_DetectsProbe_AndRepliesWhenReplyToPresent()
     {
         var channel = Channel.CreateUnbounded<NatsMsg<string>>();
@@ -203,7 +226,7 @@ public class NatsResponseChannelClientTests
         _raw.Setup(r => r.PublishReplyAsync(It.IsAny<string>(), It.IsAny<CancellationToken>())).Returns(ValueTask.CompletedTask);
         var client = new NatsResponseChannelClient(_raw.Object);
 
-        await using var subscription = await client.SubscribeAsync("subj", CancellationToken.None);
+        await using var subscription = await client.SubscribeAsync("subj", _ => { }, CancellationToken.None);
         var received = new List<NatsInboundResponse>();
         await foreach (var message in subscription.ReadAsync(CancellationToken.None))
         {
@@ -258,7 +281,7 @@ public class NatsKvStoreAdapterTests
         _context.Setup(c => c.GetStoreAsync("asyncresponse-recovery", It.IsAny<CancellationToken>())).ReturnsAsync(_store.Object);
         _context.Setup(c => c.CreateStoreAsync(It.IsAny<NatsKVConfig>(), It.IsAny<CancellationToken>()))
             .ThrowsAsync(new NatsJSApiException(new ApiError { Code = 400, ErrCode = 10058, Description = "stream name already in use with a different configuration" }));
-        _store.Setup(s => s.TryCreateAsync("k", "v", It.IsAny<INatsSerialize<string>>(), It.IsAny<CancellationToken>()))
+        _store.Setup(s => s.TryUpdateAsync("k", "v", 0UL, It.IsAny<INatsSerialize<string>>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync(new NatsResult<ulong>(1UL));
         var adapter = new NatsKvStoreAdapter(_context.Object, new NatsAsyncResponseChannelOptions { RecoveryBucketReplicas = 3 });
 
@@ -274,7 +297,7 @@ public class NatsKvStoreAdapterTests
             .ReturnsAsync(_store.Object);
         _context.Setup(c => c.CreateStoreAsync(It.IsAny<NatsKVConfig>(), It.IsAny<CancellationToken>()))
             .ThrowsAsync(new NatsJSApiException(new ApiError { Code = 400, ErrCode = 10058, Description = "stream name already in use with a different configuration" }));
-        _store.Setup(s => s.TryCreateAsync("k", "v", It.IsAny<INatsSerialize<string>>(), It.IsAny<CancellationToken>()))
+        _store.Setup(s => s.TryUpdateAsync("k", "v", 0UL, It.IsAny<INatsSerialize<string>>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync(new NatsResult<ulong>(1UL));
         var adapter = new NatsKvStoreAdapter(_context.Object, new NatsAsyncResponseChannelOptions());
 
@@ -287,7 +310,7 @@ public class NatsKvStoreAdapterTests
     {
         BucketNotFound();
         _context.Setup(c => c.CreateStoreAsync(It.IsAny<NatsKVConfig>(), It.IsAny<CancellationToken>())).ReturnsAsync(_store.Object);
-        _store.Setup(s => s.TryCreateAsync("k", "v", It.IsAny<INatsSerialize<string>>(), It.IsAny<CancellationToken>()))
+        _store.Setup(s => s.TryUpdateAsync("k", "v", 0UL, It.IsAny<INatsSerialize<string>>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync(new NatsResult<ulong>(1UL));
         var adapter = new NatsKvStoreAdapter(
             _context.Object,
@@ -335,7 +358,7 @@ public class NatsKvStoreAdapterTests
     {
         _context.Setup(c => c.GetStoreAsync("asyncresponse-recovery", It.IsAny<CancellationToken>())).ReturnsAsync(_store.Object);
         StoreStatus(maxAge: TimeSpan.FromHours(1), replicas: 3);
-        _store.Setup(s => s.TryCreateAsync("k", "v", It.IsAny<INatsSerialize<string>>(), It.IsAny<CancellationToken>()))
+        _store.Setup(s => s.TryUpdateAsync("k", "v", 0UL, It.IsAny<INatsSerialize<string>>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync(new NatsResult<ulong>(1UL));
         var logger = new RecordingThrowingLogger<NatsKvStoreAdapter>();
         var adapter = new NatsKvStoreAdapter(
@@ -353,16 +376,16 @@ public class NatsKvStoreAdapterTests
     }
 
     [Fact]
-    public async Task TryCreateAsync_ForwardsToStore_AndCreatesBucketLazilyOnce()
+    public async Task TryCreateAsync_WritesAtRevisionZero_AndCreatesBucketLazilyOnce()
     {
-        _store.Setup(s => s.TryCreateAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<INatsSerialize<string>>(), It.IsAny<CancellationToken>()))
+        _store.Setup(s => s.TryUpdateAsync(It.IsAny<string>(), It.IsAny<string>(), 0UL, It.IsAny<INatsSerialize<string>>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync(new NatsResult<ulong>(1UL));
         var adapter = CreateAdapter();
 
         await adapter.TryCreateAsync("k", "v", CancellationToken.None);
         await adapter.TryCreateAsync("k2", "v2", CancellationToken.None);
 
-        _store.Verify(s => s.TryCreateAsync("k", "v", It.IsAny<INatsSerialize<string>>(), It.IsAny<CancellationToken>()), Times.Once);
+        _store.Verify(s => s.TryUpdateAsync("k", "v", 0UL, It.IsAny<INatsSerialize<string>>(), It.IsAny<CancellationToken>()), Times.Once);
         _context.Verify(c => c.CreateStoreAsync(It.IsAny<NatsKVConfig>(), It.IsAny<CancellationToken>()), Times.Once);
     }
 
@@ -394,23 +417,64 @@ public class NatsKvStoreAdapterTests
         Assert.Null(await adapter.GetAsync("null", CancellationToken.None));
     }
 
+    private static NatsResult<ulong> WrongLastRevision()
+        => new(new NatsKVWrongLastRevisionException(new ApiError { Code = 400, ErrCode = 10071, Description = "wrong last sequence: 3" }));
+
     [Fact]
-    public async Task TryCreateAndTryUpdate_ReturnStoreSuccess()
+    public async Task TryCreateAndTryUpdate_ReturnStoreSuccess_AndFalseOnlyForARevisionConflict()
     {
-        _store.Setup(s => s.TryCreateAsync("new", "v", It.IsAny<INatsSerialize<string>>(), It.IsAny<CancellationToken>()))
+        _store.Setup(s => s.TryUpdateAsync("new", "v", 0UL, It.IsAny<INatsSerialize<string>>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync(new NatsResult<ulong>(1UL));
-        _store.Setup(s => s.TryCreateAsync("existing", "v", It.IsAny<INatsSerialize<string>>(), It.IsAny<CancellationToken>()))
-            .ReturnsAsync(new NatsResult<ulong>(new InvalidOperationException("exists")));
+        _store.Setup(s => s.TryUpdateAsync("existing", "v", 0UL, It.IsAny<INatsSerialize<string>>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(WrongLastRevision());
+        _store.Setup(s => s.TryGetEntryAsync<string>("existing", It.IsAny<ulong>(), It.IsAny<INatsDeserialize<string>>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new NatsResult<NatsKVEntry<string>>(new NatsKVEntry<string>("bucket", "existing") { Value = "live", Revision = 3 }));
         _store.Setup(s => s.TryUpdateAsync("hit", "v2", 3UL, It.IsAny<INatsSerialize<string>>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync(new NatsResult<ulong>(2UL));
         _store.Setup(s => s.TryUpdateAsync("stale", "v2", 3UL, It.IsAny<INatsSerialize<string>>(), It.IsAny<CancellationToken>()))
-            .ReturnsAsync(new NatsResult<ulong>(new InvalidOperationException("stale")));
+            .ReturnsAsync(WrongLastRevision());
         var adapter = CreateAdapter();
 
         Assert.True(await adapter.TryCreateAsync("new", "v", CancellationToken.None));
         Assert.False(await adapter.TryCreateAsync("existing", "v", CancellationToken.None));
         Assert.True(await adapter.TryUpdateAsync("hit", "v2", 3UL, CancellationToken.None));
         Assert.False(await adapter.TryUpdateAsync("stale", "v2", 3UL, CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task TryCreateAsync_OverADeleteMarker_WritesAtTheMarkersRevision()
+    {
+        // A removal leaves a delete marker (History = 1), so the revision-0 write conflicts with
+        // it; like the SDK's own create, the value is written over the marker at its revision.
+        _store.Setup(s => s.TryUpdateAsync("reused", "v", 0UL, It.IsAny<INatsSerialize<string>>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(WrongLastRevision());
+        _store.Setup(s => s.TryGetEntryAsync<string>("reused", It.IsAny<ulong>(), It.IsAny<INatsDeserialize<string>>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new NatsResult<NatsKVEntry<string>>(new NatsKVKeyDeletedException(revision: 7)));
+        _store.Setup(s => s.TryUpdateAsync("reused", "v", 7UL, It.IsAny<INatsSerialize<string>>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new NatsResult<ulong>(8UL));
+        var adapter = CreateAdapter();
+
+        Assert.True(await adapter.TryCreateAsync("reused", "v", CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task ConditionalWrites_SurfaceARealJetStreamErrorInsteadOfReportingAConflict()
+    {
+        // NATS.Net returns every failure of a conditional KV write inside the result, and the
+        // adapter collapsed them all to "false" — a CAS conflict — so a real rejection (here a
+        // value over the bucket's max value size, on an operator-provisioned bucket) made the
+        // save re-read and retry four times and then fail with no cause. Worse, the SDK's own
+        // create re-reads after ANY failed write and returns the read's "key not found", so the
+        // real error never even reached the adapter. Only a revision mismatch is a conflict.
+        var rejection = new NatsJSApiException(new ApiError { Code = 400, ErrCode = 10054, Description = "message size exceeds maximum allowed" });
+        _store.Setup(s => s.TryUpdateAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<ulong>(), It.IsAny<INatsSerialize<string>>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new NatsResult<ulong>(rejection));
+        _store.Setup(s => s.TryCreateAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<INatsSerialize<string>>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new NatsResult<ulong>(new NatsKVKeyNotFoundException()));
+        var adapter = CreateAdapter();
+
+        Assert.Same(rejection, await Assert.ThrowsAsync<NatsJSApiException>(() => adapter.TryCreateAsync("big", "v", CancellationToken.None)));
+        Assert.Same(rejection, await Assert.ThrowsAsync<NatsJSApiException>(() => adapter.TryUpdateAsync("big", "v", 3UL, CancellationToken.None)));
     }
 
     [Fact]
@@ -585,7 +649,7 @@ public class NatsJetStreamTransportAdapterTests
         _jetStream.Setup(c => c.CreateConsumerAsync("stream", It.IsAny<ConsumerConfig>(), It.IsAny<CancellationToken>())).ReturnsAsync(Mock.Of<INatsJSConsumer>());
         var adapter = new NatsJetStreamTransportAdapter(_jetStream.Object);
 
-        await adapter.EnsureConsumerAsync("stream", "durable", TimeSpan.FromSeconds(30), 5, CancellationToken.None);
+        await adapter.EnsureConsumerAsync("stream", "subj", "durable", TimeSpan.FromSeconds(30), 5, CancellationToken.None);
 
         _jetStream.Verify(c => c.CreateConsumerAsync(
             "stream",
@@ -604,7 +668,7 @@ public class NatsJetStreamTransportAdapterTests
         ExistingConsumer("stream", "durable", OperatorConsumer("durable"));
         var adapter = new NatsJetStreamTransportAdapter(_jetStream.Object);
 
-        await adapter.EnsureConsumerAsync("stream", "durable", TimeSpan.FromSeconds(30), 5, CancellationToken.None);
+        await adapter.EnsureConsumerAsync("stream", "subj", "durable", TimeSpan.FromSeconds(30), 5, CancellationToken.None);
 
         _jetStream.Verify(c => c.CreateOrUpdateConsumerAsync(It.IsAny<string>(), It.IsAny<ConsumerConfig>(), It.IsAny<CancellationToken>()), Times.Never);
         _jetStream.Verify(c => c.CreateConsumerAsync(It.IsAny<string>(), It.IsAny<ConsumerConfig>(), It.IsAny<CancellationToken>()), Times.Never);
@@ -623,7 +687,7 @@ public class NatsJetStreamTransportAdapterTests
             .ThrowsAsync(new NatsJSApiException(new ApiError { Code = 400, ErrCode = 10148, Description = "consumer already exists" }));
         var adapter = new NatsJetStreamTransportAdapter(_jetStream.Object);
 
-        await adapter.EnsureConsumerAsync("stream", "durable", TimeSpan.FromSeconds(30), 5, CancellationToken.None);
+        await adapter.EnsureConsumerAsync("stream", "subj", "durable", TimeSpan.FromSeconds(30), 5, CancellationToken.None);
 
         _jetStream.Verify(c => c.GetConsumerAsync("stream", "durable", It.IsAny<CancellationToken>()), Times.Exactly(2));
     }
@@ -632,7 +696,14 @@ public class NatsJetStreamTransportAdapterTests
     {
         { "push consumer", config => config.DeliverSubject = "_INBOX.push" },
         { "ack policy", config => config.AckPolicy = ConsumerConfigAckPolicy.None },
-        { "max deliver", config => config.MaxDeliver = 5 }
+        { "max deliver", config => config.MaxDeliver = 5 },
+        // Round 43 made the consumer create-only (the old update reset these fields), so an
+        // operator's headers-only consumer — every job's body empty, acknowledged without dispatch
+        // by the ingress, gone from the work-queue stream — and one filtered to other subjects —
+        // every long poll expiring empty — were both accepted without a check.
+        { "headers-only", config => config.HeadersOnly = true },
+        { "filtered to other.subject", config => config.FilterSubject = "other.subject" },
+        { "filtered to other.a, other.*", config => config.FilterSubjects = ["other.a", "other.*"] }
     };
 
     [Theory]
@@ -645,7 +716,7 @@ public class NatsJetStreamTransportAdapterTests
         var adapter = new NatsJetStreamTransportAdapter(_jetStream.Object);
 
         var ex = await Assert.ThrowsAsync<InvalidOperationException>(
-            () => adapter.EnsureConsumerAsync("stream", "durable", TimeSpan.FromSeconds(30), 5, CancellationToken.None));
+            () => adapter.EnsureConsumerAsync("stream", "subj", "durable", TimeSpan.FromSeconds(30), 5, CancellationToken.None));
 
         Assert.Contains("'durable'", ex.Message, StringComparison.Ordinal);
         Assert.Contains(fragment, ex.Message, StringComparison.Ordinal);
@@ -668,8 +739,8 @@ public class NatsJetStreamTransportAdapterTests
         var logger = new RecordingThrowingLogger<NatsJetStreamTransportAdapter>();
         var adapter = new NatsJetStreamTransportAdapter(_jetStream.Object, logger);
 
-        var first = await adapter.EnsureConsumerAsync("stream", "durable", TimeSpan.FromSeconds(configuredSeconds), 5, CancellationToken.None);
-        var second = await adapter.EnsureConsumerAsync("stream", "durable", TimeSpan.FromSeconds(configuredSeconds), 5, CancellationToken.None);
+        var first = await adapter.EnsureConsumerAsync("stream", "subj", "durable", TimeSpan.FromSeconds(configuredSeconds), 5, CancellationToken.None);
+        var second = await adapter.EnsureConsumerAsync("stream", "subj", "durable", TimeSpan.FromSeconds(configuredSeconds), 5, CancellationToken.None);
 
         Assert.Equal(TimeSpan.FromSeconds(liveSeconds), first);
         Assert.Equal(TimeSpan.FromSeconds(liveSeconds), second);
@@ -685,9 +756,44 @@ public class NatsJetStreamTransportAdapterTests
         _jetStream.Setup(c => c.CreateConsumerAsync("stream", It.IsAny<ConsumerConfig>(), It.IsAny<CancellationToken>())).ReturnsAsync(Mock.Of<INatsJSConsumer>());
         var adapter = new NatsJetStreamTransportAdapter(_jetStream.Object);
 
-        var liveAckWait = await adapter.EnsureConsumerAsync("stream", "durable", TimeSpan.FromSeconds(45), 5, CancellationToken.None);
+        var liveAckWait = await adapter.EnsureConsumerAsync("stream", "subj", "durable", TimeSpan.FromSeconds(45), 5, CancellationToken.None);
 
         Assert.Equal(TimeSpan.FromSeconds(45), liveAckWait);
+    }
+
+    [Fact]
+    public async Task EnsureConsumerAsync_ExistingConsumerFilteredToTheTransportSubject_IsAccepted()
+    {
+        // The filter check refuses only a consumer that cannot deliver the subject: one filter
+        // (exact or wildcard) capturing it is enough.
+        var single = OperatorConsumer("durable");
+        single.FilterSubject = "subj";
+        ExistingConsumer("stream", "durable", single);
+        var adapter = new NatsJetStreamTransportAdapter(_jetStream.Object);
+        await adapter.EnsureConsumerAsync("stream", "subj", "durable", TimeSpan.FromSeconds(30), 5, CancellationToken.None);
+
+        var multiple = OperatorConsumer("durable");
+        multiple.FilterSubjects = ["other.a", "*"];
+        ExistingConsumer("stream", "durable", multiple);
+        await adapter.EnsureConsumerAsync("stream", "subj", "durable", TimeSpan.FromSeconds(30), 5, CancellationToken.None);
+    }
+
+    [Fact]
+    public async Task EnsureConsumerAsync_ExistingBackOffConsumer_ReturnsItsShortestBackOffStep()
+    {
+        // A BackOff consumer reports only BackOff[0] as its ack wait but enforces BackOff[n] on the
+        // n-th redelivery. With a non-ascending [30s, 5s] the heartbeat renewed every 10 s from the
+        // reported 30 s while a redelivered message's window was 5 s — it lapsed under a live
+        // handler and redelivered to a peer. The heartbeat must follow the shortest step.
+        var config = OperatorConsumer("durable");
+        config.AckWait = TimeSpan.FromSeconds(30);
+        config.Backoff = [TimeSpan.FromSeconds(30), TimeSpan.FromSeconds(5)];
+        ExistingConsumer("stream", "durable", config);
+        var adapter = new NatsJetStreamTransportAdapter(_jetStream.Object);
+
+        var liveAckWait = await adapter.EnsureConsumerAsync("stream", "subj", "durable", TimeSpan.FromSeconds(30), 5, CancellationToken.None);
+
+        Assert.Equal(TimeSpan.FromSeconds(5), liveAckWait);
     }
 
     [Fact]

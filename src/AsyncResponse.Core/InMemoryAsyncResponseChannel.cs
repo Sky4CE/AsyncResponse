@@ -202,6 +202,23 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
             // a live waiter by the probe forever, silently consuming the next response for the id.
             AsyncResponseDiagnostics.SetError(activity, ex);
             await subscription.DisposeCleanupAsync().ConfigureAwait(false);
+
+            // The filter above ran BEFORE this drain: a delivery still inside the Until predicate
+            // (holding the dispatch gate) when the save failed had not settled the wait yet, and
+            // the drain is exactly what let it finish. Rethrowing then discarded a response the
+            // publisher had already counted as delivered — nothing could recover it. Same answer
+            // as the filter: the response in hand wins. Excluded: the drain's OWN lapse, which
+            // faults the wait as indeterminate — no delivery settled it, and returning that waiter
+            // would let the trigger fire with nothing registered.
+            if (SettledByDelivery(subscription.ResponseTask))
+            {
+                SafeLog.Try((Logger: _logger, Error: ex, CorrelationId: correlationId), static state => state.Logger.LogWarning(
+                    state.Error,
+                    "Registration step failed while a delivery was settling correlationId {CorrelationId}; returning the completed waiter.",
+                    state.CorrelationId));
+                return new InMemoryAsyncResponseWaiter<T>(subscription.ResponseTask, subscription.DisposeCleanupAsync);
+            }
+
             try
             {
                 _logger.LogError(ex, "Failed to create in-memory waiter for correlationId {CorrelationId}.", correlationId);
@@ -221,6 +238,12 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
 
         return new InMemoryAsyncResponseWaiter<T>(subscription.ResponseTask, subscription.DisposeCleanupAsync);
     }
+
+    // Settled by a published signal — a result, or a published failure — as opposed to the
+    // disposal drain's own indeterminate lapse or the cleanup's cancel.
+    private static bool SettledByDelivery(Task responseTask)
+        => responseTask.IsCompletedSuccessfully
+           || (responseTask.IsFaulted && responseTask.Exception?.InnerException is not AsyncResponseIndeterminateDeliveryException);
 
     /// <inheritdoc />
     public Task SetResponse<T>(T response, string correlationId, CancellationToken cancellationToken = default) where T : IAsyncResponsePayload
@@ -307,7 +330,7 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
                 }
             }
 
-            await DispatchResponsesAsync(subscribers, response, wireBytes).ConfigureAwait(false);
+            await DispatchResponsesAsync(subscribers, response, wireBytes, cancellationToken).ConfigureAwait(false);
 
             if (_logger.IsEnabled(LogLevel.Debug))
                 _logger.LogDebug("Published response for correlationId {CorrelationId}. PayloadType: {PayloadType}. Subscribers: {SubscriberCount}.", correlationId, typeof(T), subscribers.Count);
@@ -380,7 +403,7 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
                 }
             }
 
-            await DispatchRawJsonResponsesAsync(subscribers, response).ConfigureAwait(false);
+            await DispatchRawJsonResponsesAsync(subscribers, response, cancellationToken).ConfigureAwait(false);
 
             if (_logger.IsEnabled(LogLevel.Debug))
                 _logger.LogDebug("Published raw response for correlationId {CorrelationId}. Subscribers: {SubscriberCount}.", correlationId, subscribers.Count);
@@ -454,7 +477,7 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
                 }
             }
 
-            await DispatchExceptionsAsync(subscribers, exception).ConfigureAwait(false);
+            await DispatchExceptionsAsync(subscribers, exception, cancellationToken).ConfigureAwait(false);
 
             if (_logger.IsEnabled(LogLevel.Debug))
                 _logger.LogDebug("Published exception for correlationId {CorrelationId}. Subscribers: {SubscriberCount}.", correlationId, subscribers.Count);
@@ -494,34 +517,45 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
             ? subscribers.Snapshot()
             : default;
 
+    // The publish token reaches every waiter's dispatch gate: a publisher queued behind a slow
+    // (or wedged) Until predicate — or awaiting the predicate its own delivery is running — stops
+    // waiting when its token fires, as IAsyncResponsePublisher promises ("propagates cancellation
+    // of the publish"). Pre-fix nothing was bounded: a predicate that publishes to its own
+    // correlation id parked the nested publish on the gate it held, and both publishers hung.
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static Task DispatchResponsesAsync(SubscriptionSnapshot subscribers, object? response, byte[]? wireBytes)
+    private static Task DispatchResponsesAsync(SubscriptionSnapshot subscribers, object? response, byte[]? wireBytes, CancellationToken cancellationToken)
     {
         if (subscribers.Single is { } single)
-            return single.DispatchResponseAsync(response, wireBytes);
+            return single.DispatchResponseAsync(response, wireBytes, cancellationToken);
 
         return DispatchManyAsync(
             subscribers.Many,
-            static (subscriber, state) => subscriber.DispatchResponseAsync(state.Response, state.WireBytes),
-            (Response: response, WireBytes: wireBytes));
+            static (subscriber, state) => subscriber.DispatchResponseAsync(state.Response, state.WireBytes, state.CancellationToken),
+            (Response: response, WireBytes: wireBytes, CancellationToken: cancellationToken));
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static Task DispatchRawJsonResponsesAsync(SubscriptionSnapshot subscribers, RawJsonResponse response)
+    private static Task DispatchRawJsonResponsesAsync(SubscriptionSnapshot subscribers, RawJsonResponse response, CancellationToken cancellationToken)
     {
         if (subscribers.Single is { } single)
-            return single.DispatchRawJsonResponseAsync(response);
+            return single.DispatchRawJsonResponseAsync(response, cancellationToken);
 
-        return DispatchManyAsync(subscribers.Many, static (subscriber, state) => subscriber.DispatchRawJsonResponseAsync(state), response);
+        return DispatchManyAsync(
+            subscribers.Many,
+            static (subscriber, state) => subscriber.DispatchRawJsonResponseAsync(state.Response, state.CancellationToken),
+            (Response: response, CancellationToken: cancellationToken));
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static Task DispatchExceptionsAsync(SubscriptionSnapshot subscribers, Exception exception)
+    private static Task DispatchExceptionsAsync(SubscriptionSnapshot subscribers, Exception exception, CancellationToken cancellationToken)
     {
         if (subscribers.Single is { } single)
-            return single.DispatchExceptionAsync(exception);
+            return single.DispatchExceptionAsync(exception, cancellationToken);
 
-        return DispatchManyAsync(subscribers.Many, static (subscriber, state) => subscriber.DispatchExceptionAsync(state), exception);
+        return DispatchManyAsync(
+            subscribers.Many,
+            static (subscriber, state) => subscriber.DispatchExceptionAsync(state.Exception, state.CancellationToken),
+            (Exception: exception, CancellationToken: cancellationToken));
     }
 
     private static Task DispatchManyAsync<TState>(
@@ -813,17 +847,20 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
         /// serialization (UTF-8 JSON) — what a broker envelope would carry — from which each
         /// waiter materializes its own instance; <c>null</c> for a published null, which
         /// materializes through the conversion path (and faults the waiter).
+        /// <paramref name="cancellationToken"/> is the publisher's: it bounds only the publisher's
+        /// wait (see <see cref="DispatchSerialAsync"/>).
         /// </summary>
-        public abstract Task DispatchResponseAsync(object? response, byte[]? wireBytes);
+        public abstract Task DispatchResponseAsync(object? response, byte[]? wireBytes, CancellationToken cancellationToken);
 
         /// <summary>Dispatches a raw JSON response to this subscription.</summary>
-        public abstract Task DispatchRawJsonResponseAsync(RawJsonResponse response);
+        public abstract Task DispatchRawJsonResponseAsync(RawJsonResponse response, CancellationToken cancellationToken);
 
         /// <summary>Faults this subscription with a published exception.</summary>
-        public Task DispatchExceptionAsync(Exception exception)
+        public Task DispatchExceptionAsync(Exception exception, CancellationToken cancellationToken)
             => DispatchSerialAsync(
                 exception,
-                static (subscription, state) => subscription.DispatchExceptionCoreAsync(state));
+                static (subscription, state) => subscription.DispatchExceptionCoreAsync(state),
+                cancellationToken);
 
         private Task DispatchExceptionCoreAsync(Exception exception)
         {
@@ -857,14 +894,34 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
         /// <summary>
         /// Serializes every signal for one waiter. The uncontended path uses only an interlocked
         /// owner bit; the semaphore is created lazily if concurrent publishers actually contend.
+        /// <para>
+        /// <paramref name="cancellationToken"/> bounds the CALLER's wait, never the gate: a
+        /// publisher still queued for the gate leaves the queue (its signal is not dispatched),
+        /// and one whose signal is already running stops awaiting it while the gate stays held
+        /// until that dispatch finishes. The permit loop tolerates a waiter that leaves: its
+        /// count is decremented in the finally, and a permit released for it is consumed by the
+        /// next waiter's CAS retry.
+        /// </para>
         /// </summary>
         protected Task DispatchSerialAsync<TState>(
             TState state,
-            Func<SubscriptionBase, TState, Task> dispatch)
+            Func<SubscriptionBase, TState, Task> dispatch,
+            CancellationToken cancellationToken = default)
         {
             if (Interlocked.CompareExchange(ref _dispatching, 1, 0) != 0)
-                return WaitAndDispatchAsync(this, state, dispatch);
+                return WaitAndDispatchAsync(this, state, dispatch, cancellationToken);
 
+            return DispatchHoldingGate(state, dispatch, cancellationToken);
+        }
+
+        // Runs the dispatch under the already-acquired gate and releases the gate when the
+        // dispatch finishes, whoever is still awaiting it.
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private Task DispatchHoldingGate<TState>(
+            TState state,
+            Func<SubscriptionBase, TState, Task> dispatch,
+            CancellationToken cancellationToken)
+        {
             Task task;
             try
             {
@@ -882,13 +939,15 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
                 return task;
             }
 
-            return ReleaseAfterDispatchAsync(this, task);
+            var released = ReleaseAfterDispatchAsync(this, task);
+            return cancellationToken.CanBeCanceled ? released.WaitAsync(cancellationToken) : released;
         }
 
         private static async Task WaitAndDispatchAsync<TState>(
             SubscriptionBase subscription,
             TState state,
-            Func<SubscriptionBase, TState, Task> dispatch)
+            Func<SubscriptionBase, TState, Task> dispatch,
+            CancellationToken cancellationToken)
         {
             Interlocked.Increment(ref subscription._dispatchWaiterCount);
             try
@@ -897,21 +956,14 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
                     ref subscription._dispatchWaiters,
                     static () => new SemaphoreSlim(0));
                 while (Interlocked.CompareExchange(ref subscription._dispatching, 1, 0) != 0)
-                    await waiters.WaitAsync().ConfigureAwait(false);
+                    await waiters.WaitAsync(cancellationToken).ConfigureAwait(false);
             }
             finally
             {
                 Interlocked.Decrement(ref subscription._dispatchWaiterCount);
             }
 
-            try
-            {
-                await dispatch(subscription, state).ConfigureAwait(false);
-            }
-            finally
-            {
-                subscription.ReleaseDispatch();
-            }
+            await subscription.DispatchHoldingGate(state, dispatch, cancellationToken).ConfigureAwait(false);
         }
 
         private static async Task ReleaseAfterDispatchAsync(SubscriptionBase subscription, Task task)
@@ -1217,10 +1269,11 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
         public Task<T> ResponseTask => _tcs.Task;
 
         /// <inheritdoc />
-        public override Task DispatchResponseAsync(object? response, byte[]? wireBytes)
+        public override Task DispatchResponseAsync(object? response, byte[]? wireBytes, CancellationToken cancellationToken)
             => DispatchSerialAsync(
                 (Response: response, WireBytes: wireBytes),
-                static (subscription, state) => ((Subscription<T>)subscription).DispatchResponseUnserializedAsync(state.Response, state.WireBytes));
+                static (subscription, state) => ((Subscription<T>)subscription).DispatchResponseUnserializedAsync(state.Response, state.WireBytes),
+                cancellationToken);
 
         private Task DispatchResponseUnserializedAsync(object? response, byte[]? wireBytes)
         {
@@ -1239,10 +1292,11 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
         }
 
         /// <inheritdoc />
-        public override Task DispatchRawJsonResponseAsync(RawJsonResponse response)
+        public override Task DispatchRawJsonResponseAsync(RawJsonResponse response, CancellationToken cancellationToken)
             => DispatchSerialAsync(
                 response,
-                static (subscription, state) => ((Subscription<T>)subscription).DispatchRawJsonResponseUnserializedAsync(state));
+                static (subscription, state) => ((Subscription<T>)subscription).DispatchRawJsonResponseUnserializedAsync(state),
+                cancellationToken);
 
         private Task DispatchRawJsonResponseUnserializedAsync(RawJsonResponse response)
         {

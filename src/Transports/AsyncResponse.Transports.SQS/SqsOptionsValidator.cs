@@ -12,6 +12,36 @@ internal static class SqsOptionsValidator
         Required(options.CorrelationIdAttribute, nameof(options.CorrelationIdAttribute));
         Required(options.DefaultReplyTargetName, nameof(options.DefaultReplyTargetName));
 
+        // Every correlated publish writes this attribute name, and SQS rejects a SendMessage with
+        // an invalid one — non-retryably — so a name it can never accept failed every correlated
+        // publish (and every external responder told to use it) after a clean startup.
+        if (!SqsWorkerTransport.IsValidMessageAttributeName(options.CorrelationIdAttribute))
+        {
+            throw new InvalidOperationException(
+                $"{nameof(SqsAsyncResponseOptions)}.{nameof(options.CorrelationIdAttribute)} '{options.CorrelationIdAttribute}' is not a valid SQS " +
+                "message-attribute name: use at most 256 ASCII letters, digits, '_', '-' and '.', with no leading, trailing or consecutive " +
+                "periods, and no 'AWS.' or 'Amazon.' prefix (reserved in any casing).");
+        }
+
+        // A queue string that is not a URL goes to GetQueueUrl as a NAME. Without CreateQueues
+        // nothing checked it against the SQS name rule, so a string that can never resolve — an
+        // ARN, a dotted name, a stray space — passed startup: the subscriber then retried
+        // GetQueueUrl forever and every publish failed.
+        foreach (var (queue, optionName) in new[]
+                 {
+                     (options.WorkerQueue!, nameof(options.WorkerQueue)),
+                     (options.ResponseQueue!, nameof(options.ResponseQueue))
+                 })
+        {
+            if (!SqsQueueAddress.IsUrl(queue) && !SqsQueueAddress.IsValidQueueName(queue))
+            {
+                throw new InvalidOperationException(
+                    $"{nameof(SqsAsyncResponseOptions)}.{optionName} '{queue}' is neither a queue URL nor a valid SQS queue name: " +
+                    "configure the queue URL (https://…) or its name — at most 80 characters of ASCII letters, digits, '-' and '_' " +
+                    "(a FIFO queue's '.fifo' suffix included in the 80). Queue ARNs are not accepted.");
+            }
+        }
+
         // Either side may be a name or a URL: two URLs compare normalized. A name against a URL
         // naming it may be another account's queue, so that only warns (PossibleQueueCollisions).
         if (SqsQueueAddress.SameQueue(options.WorkerQueue, options.ResponseQueue))
@@ -65,19 +95,17 @@ internal static class SqsOptionsValidator
                         "which collides with a live worker/response queue. Rename the queues or change the suffix.");
                 }
 
-                // Provisioning creates both names, and SQS rejects a bad one with a deterministic
-                // 400 — a 77-character name plus "-dlq" (81), or a suffix with a '.' in it —
-                // which surfaced only after the whole provisioning retry budget, minutes into
-                // host startup.
-                foreach (var provisioned in new[] { queue, deadLetterQueue })
+                // Provisioning also creates the derived name (the queue's own name is checked
+                // above for every mode), and SQS rejects a bad one with a deterministic 400 — a
+                // 77-character name plus "-dlq" (81), or a suffix with a '.' in it — which
+                // surfaced only after the whole provisioning retry budget, minutes into host
+                // startup.
+                if (!SqsQueueAddress.IsValidQueueName(deadLetterQueue))
                 {
-                    if (!SqsQueueAddress.IsValidQueueName(provisioned))
-                    {
-                        throw new InvalidOperationException(
-                            $"{nameof(SqsAsyncResponseOptions)}: {nameof(options.CreateQueues)} would create the queue '{provisioned}'" +
-                            (ReferenceEquals(provisioned, queue) ? string.Empty : $" (the dead-letter queue derived for '{queue}' with {nameof(options.DeadLetterQueueSuffix)} '{options.DeadLetterQueueSuffix}')") +
-                            ", which SQS rejects: a queue name is at most 80 characters of ASCII letters, digits, '-' and '_' (a FIFO queue's '.fifo' suffix included in the 80).");
-                    }
+                    throw new InvalidOperationException(
+                        $"{nameof(SqsAsyncResponseOptions)}: {nameof(options.CreateQueues)} would create the queue '{deadLetterQueue}'" +
+                        $" (the dead-letter queue derived for '{queue}' with {nameof(options.DeadLetterQueueSuffix)} '{options.DeadLetterQueueSuffix}')" +
+                        ", which SQS rejects: a queue name is at most 80 characters of ASCII letters, digits, '-' and '_' (a FIFO queue's '.fifo' suffix included in the 80).");
                 }
             }
         }

@@ -77,6 +77,16 @@ public sealed class AsyncResponsePackageVersionsTests
 
             Assert.Single(packages, package => package.Name == "AsyncResponse.Core");
             Assert.Contains(packages, package => package.Name == "AsyncResponse.Abstractions");
+
+            // Fixpoint r2 (GS2#5): the plugin Core's own view. The context loaded only Core, so
+            // its Abstractions reference falls back to the default context — the host's copy,
+            // which the plugin Core runs on. From this side the default context "holds another
+            // Core", and skipping all of it dropped that Abstractions too, so neither gate ever
+            // compared the plugin Core with the Abstractions it binds to.
+            var pluginView = Loaded(pluginCore, AppDomain.CurrentDomain.GetAssemblies());
+
+            Assert.Single(pluginView, package => package.Name == "AsyncResponse.Core");
+            Assert.Single(pluginView, package => package.Name == "AsyncResponse.Abstractions");
         }
         finally
         {

@@ -116,6 +116,54 @@ public class ChannelSerialExecutorTests
         Assert.Equal([1, 2, 3], calls);
     }
 
+    [Fact]
+    public async Task ThrowingLoggingProvider_DoesNotEndTheReaderLoop()
+    {
+        // Microsoft.Extensions.Logging rethrows a provider's failure. Pre-fix the loop's error log
+        // (and its Debug lines) sat outside any guard: one failing item plus a provider that throws
+        // on Error ended the reader loop, and every item queued behind it — the correlation id's
+        // later deliveries, its waiter's drain marker — was accepted into a queue nothing read.
+        var logger = new CollectingLogger { ThrowOnMessageContaining = "Channel executor error" };
+        var executor = new ChannelSerialExecutor(logger, "responses");
+        var secondRan = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        Assert.True(executor.TryEnqueue(() => throw new InvalidOperationException("work failed")));
+        Assert.True(executor.TryEnqueue(() =>
+        {
+            secondRan.TrySetResult();
+            return Task.CompletedTask;
+        }));
+
+        await secondRan.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        await executor.DisposeAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(10));
+    }
+
+    [Fact]
+    public async Task ThrowingLoggingProvider_AtDebug_NeitherFailsAnAcceptedEnqueueNorSkipsTheDrain()
+    {
+        // Every Debug line throws: an accepted item must still read as accepted (not a failed
+        // enqueue the caller retries or faults), and disposal must still complete the writer —
+        // pre-fix its opening Debug line ran first, and throwing there left the loop parked.
+        var logger = new CollectingLogger { ThrowOnMessageContaining = "channel executor" };
+        var executor = new ChannelSerialExecutor(logger, "responses");
+        var ran = 0;
+
+        Assert.True(await executor.Enqueue(() =>
+        {
+            Interlocked.Increment(ref ran);
+            return Task.CompletedTask;
+        }));
+        Assert.True(executor.TryEnqueue(() =>
+        {
+            Interlocked.Increment(ref ran);
+            return Task.CompletedTask;
+        }));
+
+        await executor.DisposeAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(10));
+        Assert.Equal(2, Volatile.Read(ref ran));
+        Assert.False(executor.TryEnqueue(() => Task.CompletedTask));
+    }
+
     private static async Task Eventually(Func<bool> condition)
     {
         var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(2);

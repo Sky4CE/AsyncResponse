@@ -31,7 +31,13 @@ internal static class MongoOwnershipLedger
         IReadOnlyList<(string Collection, string Purpose)> claims,
         CancellationToken cancellationToken)
     {
-        var ledger = database.GetCollection<BsonDocument>(CollectionName);
+        // The bounded majority every store handle pins (see MongoWriteConcerns): under an
+        // inherited w=1 a failover could roll back an acknowledged claim, and a component
+        // misconfigured onto the same collection on another host then claimed it without error.
+        // Primary reads for the replication-timeout read-back below.
+        var ledger = database.GetCollection<BsonDocument>(CollectionName)
+            .WithReadPreference(ReadPreference.Primary)
+            .WithWriteConcern(MongoWriteConcerns.BoundedMajority(database));
         foreach (var (collection, purpose) in claims)
         {
             // Atomic claim: the upsert inserts our ownership document only when no document
@@ -41,19 +47,38 @@ internal static class MongoOwnershipLedger
             // stored an enum) — are foreign writes: tolerated rather than guessed about, and the
             // BsonString pattern matches below keep the guard itself from throwing
             // InvalidCastException while evaluating them.
-            Task<BsonDocument?> UpsertClaimAsync() => ledger.FindOneAndUpdateAsync<BsonDocument?>(
-                new BsonDocument("_id", collection),
-                new BsonDocument("$setOnInsert", new BsonDocument
+            async Task<BsonDocument?> UpsertClaimAsync()
+            {
+                try
                 {
-                    { "component", componentName },
-                    { "purpose", purpose }
-                }),
-                new FindOneAndUpdateOptions<BsonDocument, BsonDocument?>
+                    return await ledger.FindOneAndUpdateAsync<BsonDocument?>(
+                        new BsonDocument("_id", collection),
+                        new BsonDocument("$setOnInsert", new BsonDocument
+                        {
+                            { "component", componentName },
+                            { "purpose", purpose }
+                        }),
+                        new FindOneAndUpdateOptions<BsonDocument, BsonDocument?>
+                        {
+                            IsUpsert = true,
+                            ReturnDocument = ReturnDocument.Before
+                        },
+                        cancellationToken).ConfigureAwait(false);
+                }
+                catch (MongoException ex) when (MongoWriteConcerns.IsReplicationTimeout(ex))
                 {
-                    IsUpsert = true,
-                    ReturnDocument = ReturnDocument.Before
-                },
-                cancellationToken);
+                    // The upsert ran on the primary; only its majority acknowledgement timed out,
+                    // and the reply with it. $setOnInsert never changes a claim that exists, so
+                    // the claim the primary holds now is either the one that was already there or
+                    // ours: the ownership check below reads it exactly as it reads the
+                    // before-image. Failing instead would fail every operation of the store (each
+                    // one runs EnsureCreated first) for as long as the set stays degraded. Read at
+                    // LOCAL concern: the claim is not majority-committed, so an inherited
+                    // readConcernLevel=majority would not see it.
+                    return await ledger.WithReadConcern(ReadConcern.Local).Find(new BsonDocument("_id", collection))
+                        .FirstOrDefaultAsync(cancellationToken).ConfigureAwait(false);
+                }
+            }
 
             BsonDocument? existing;
             try

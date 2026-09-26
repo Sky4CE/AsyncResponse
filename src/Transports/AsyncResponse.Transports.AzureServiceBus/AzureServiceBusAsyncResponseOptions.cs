@@ -61,7 +61,11 @@ public sealed class AzureServiceBusAsyncResponseOptions
     /// <see cref="AzureServiceBusAckMode.AckAfterHandlerCompletes"/> receives one message at a time:
     /// it runs handlers serially, and every message a receive hands over is locked — and counted
     /// when its lock lapses — whether or not its handler ever starts. The response subscriber keeps
-    /// the batch in both modes (its handler is the library's own). Default: <c>16</c>.
+    /// the batch in both modes, although its handler is not always short: a response whose waiter
+    /// is gone runs that correlation's recovery callbacks inline, retries included, so keep
+    /// <see cref="AzureServiceBusSubscriberOptions.LockRenewalInterval"/> set on
+    /// <see cref="ResponseSubscriber"/> (the default) where callbacks can be slow, or the locks of
+    /// the batch-mates queued behind them lapse and a peer runs them as well. Default: <c>16</c>.
     /// </summary>
     public int MaxMessagesPerReceive { get; set; } = 16;
 
@@ -93,9 +97,15 @@ public sealed class AzureServiceBusAsyncResponseOptions
     public TimeSpan ShutdownTimeout { get; set; } = TimeSpan.FromSeconds(5);
 
     /// <summary>
-    /// The hosting shutdown budget that must contain Service Bus receiver/sender shutdown plus
-    /// <see cref="AzureServiceBusSubscriberOptions.BackgroundDrainTimeout"/> when a subscriber uses
-    /// <see cref="AzureServiceBusAckMode.AckAfterEnqueue"/>.
+    /// The hosting shutdown budget each subscriber's stop path must fit, validated at startup: in
+    /// <see cref="AzureServiceBusAckMode.AckAfterHandlerCompletes"/>, two
+    /// <see cref="ShutdownTimeout"/>s with
+    /// <see cref="AzureServiceBusSubscriberOptions.LockRenewalInterval"/> set (the lock-renewal
+    /// join, then the receiver close) or one without; in
+    /// <see cref="AzureServiceBusAckMode.AckAfterEnqueue"/>,
+    /// <see cref="AzureServiceBusSubscriberOptions.BackgroundDrainTimeout"/> plus one
+    /// <see cref="ShutdownTimeout"/>. Defaults to the Generic Host default of 30 seconds; set it to
+    /// <c>null</c> only when this budget is validated externally.
     /// </summary>
     public TimeSpan? HostShutdownTimeout { get; set; } = TimeSpan.FromSeconds(30);
 
@@ -198,7 +208,11 @@ public sealed class AzureServiceBusSubscriberOptions
     /// keep <c>PrefetchCount × handler latency</c> well under the queue's <c>LockDuration</c>, or
     /// leave this at <c>0</c>; otherwise buffered messages are handed out after their locks
     /// expired, run a second time on a peer, and inflate <c>DeliveryCount</c> toward
-    /// <see cref="MaxDeliveryAttempts"/>. Startup logs a warning when it is positive in that mode.
+    /// <see cref="MaxDeliveryAttempts"/>. In <see cref="AzureServiceBusAckMode.AckAfterEnqueue"/> the
+    /// same happens whenever the background queue stays saturated for longer than the
+    /// <c>LockDuration</c>: the receive loop waits for capacity while the buffer keeps its
+    /// messages locked, so keep this at <c>0</c>, or well under what the background workers drain
+    /// within one <c>LockDuration</c>. Startup logs a warning when it is positive in either mode.
     /// </summary>
     public int PrefetchCount { get; set; }
 

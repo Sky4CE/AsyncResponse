@@ -418,6 +418,117 @@ public class SerialExecutorRegistryTests
     }
 
     [Fact]
+    public async Task Registration_DuringADepartedWaitersRetirement_GetsASuccessorExecutor()
+    {
+        // A re-attached waiter registering on the id a departed waiter's cleanup is still
+        // draining. Pre-fix the retiring entry stayed in the map for the whole drain — up to the
+        // dispose budget behind a wedged predicate — and every non-blocking TryEnqueue for the new
+        // waiter read "Full": the Redis channel faulted its wait as overloaded, and the DB
+        // channels routed its response to recovery. Registering now detaches the retiring
+        // executor, so the new waiter's first delivery creates a successor and runs at once.
+        // On a virtual clock nobody advances: the departed drain's 30 s budget can never lapse in
+        // real time and flip the "still draining" assertions below on a stalled runner.
+        var registry = new SerialExecutorRegistry(NullLogger.Instance, timeProvider: new AsyncResponse.Testing.VirtualTimeProvider());
+        registry.OnSubscriptionRegistered("cid");
+        var departedStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseDeparted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        Assert.Equal(SerialExecutorRegistry.TryEnqueueOutcome.Accepted, registry.TryEnqueue("cid", async () =>
+        {
+            departedStarted.TrySetResult();
+            await releaseDeparted.Task;
+        }));
+        await departedStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        registry.OnSubscriptionRetired("cid");
+        var departedRetirement = registry.RetireIfUnreferencedAsync("cid").AsTask();
+        Assert.False(departedRetirement.IsCompleted); // draining the wedged item
+
+        registry.OnSubscriptionRegistered("cid");
+        try
+        {
+            var ran = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            Assert.Equal(SerialExecutorRegistry.TryEnqueueOutcome.Accepted, registry.TryEnqueue("cid", () =>
+            {
+                ran.TrySetResult();
+                return Task.CompletedTask;
+            }));
+            await ran.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+            // The blocking path (a waiter's drain marker) no longer waits out the departed drain either.
+            var markerRan = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            Assert.True(await registry.EnqueueAsync("cid", () =>
+            {
+                markerRan.TrySetResult();
+                return Task.CompletedTask;
+            }).AsTask().WaitAsync(TimeSpan.FromSeconds(5)));
+            await markerRan.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            Assert.False(departedRetirement.IsCompleted);
+        }
+        finally
+        {
+            releaseDeparted.TrySetResult();
+        }
+
+        await departedRetirement.WaitAsync(TimeSpan.FromSeconds(5));
+
+        // The departed retirement removed only its own entry: the successor still admits for the
+        // live waiter, and the waiter's own cleanup retires it and lays the tombstone.
+        var ranAfter = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        Assert.Equal(SerialExecutorRegistry.TryEnqueueOutcome.Accepted, registry.TryEnqueue("cid", () =>
+        {
+            ranAfter.TrySetResult();
+            return Task.CompletedTask;
+        }));
+        await ranAfter.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        registry.OnSubscriptionRetired("cid");
+        await registry.RetireIfUnreferencedAsync("cid").AsTask().WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal(SerialExecutorRegistry.TryEnqueueOutcome.Suppressed, registry.TryEnqueue("cid", () => Task.CompletedTask));
+    }
+
+    [Fact]
+    public async Task EnqueueDrainTimeout_UnderAThrowingLoggingProvider_StillDisposesTheExecutor()
+    {
+        // Retirement's bounded wait for a parked producer lapses and logs a warning. Pre-fix a
+        // provider that throws there (MEL rethrows provider failures) escaped before the disposal:
+        // the retirement faulted, and the executor's writer was never completed — its reader loop
+        // (and the producer parked on its full queue) outlived the retirement forever.
+        var time = new AsyncResponse.Testing.VirtualTimeProvider();
+        var logger = new CollectingLogger { ThrowOnMessageContaining = "Timed out after" };
+        var registry = new SerialExecutorRegistry(
+            logger, disposeDrainLimit: TimeSpan.FromSeconds(1), enqueueDrainLimit: TimeSpan.FromSeconds(1), timeProvider: time);
+        registry.OnSubscriptionRegistered("cid");
+        var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        Assert.True(await registry.EnqueueAsync("cid", async () =>
+        {
+            started.TrySetResult();
+            await release.Task;
+        }));
+        await started.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        for (var i = 0; i < ChannelSerialExecutor.DefaultCapacity; i++)
+            Assert.Equal(SerialExecutorRegistry.TryEnqueueOutcome.Accepted, registry.TryEnqueue("cid", () => Task.CompletedTask));
+
+        var markerRan = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var parked = registry.EnqueueAsync("cid", () =>
+        {
+            markerRan.TrySetResult();
+            return Task.CompletedTask;
+        }).AsTask();
+        Assert.False(parked.IsCompleted); // the queue is full behind the wedged item
+
+        var removal = registry.RemoveAsync("cid").AsTask();
+        Assert.False(removal.IsCompleted);
+        time.Advance(TimeSpan.FromSeconds(1)); // the in-flight-enqueue wait lapses and logs
+        release.TrySetResult();
+
+        await removal.WaitAsync(TimeSpan.FromSeconds(10));
+        Assert.True(await parked.WaitAsync(TimeSpan.FromSeconds(10)));
+        await markerRan.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        registry.OnSubscriptionRetired("cid");
+        await registry.RemoveAsync("cid").AsTask().WaitAsync(TimeSpan.FromSeconds(10));
+    }
+
+    [Fact]
     public async Task Tombstone_OutlivesAForwardWallClockStep()
     {
         // A tombstone bounds how long an in-flight enqueue may still arrive — elapsed time. Pre-fix

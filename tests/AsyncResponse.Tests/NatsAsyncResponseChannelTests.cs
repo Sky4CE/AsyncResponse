@@ -288,6 +288,233 @@ public class NatsAsyncResponseChannelTests
     }
 
     [Fact]
+    public async Task CreateResponseWaiter_SaveFailureWhileADeliveryIsStillInsideUntil_ReturnsTheWaiterTheDrainLetSettle()
+    {
+        // The settled-waiter filter ran BEFORE the generic catch's drain, and the drain JOINS the
+        // consume loop: a terminal delivery still inside the Until predicate when the save failed
+        // settled the wait during that drain, and the unconditional rethrow then discarded a
+        // response the publisher had been told was delivered. The create now re-checks after the
+        // drain. Deterministic: the predicate is released only from inside the drain's
+        // registration delete — strictly after the filter was evaluated.
+        var insidePredicate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releasePredicate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var saveStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        _store
+            .Setup(s => s.SaveAsync(It.IsAny<string>(), It.IsAny<RecoveryState>(), It.IsAny<TimeSpan>(), It.IsAny<CancellationToken>()))
+            .Returns(async () =>
+            {
+                saveStarted.TrySetResult();
+                await insidePredicate.Task;
+                throw new InvalidOperationException("recovery save failed");
+            });
+        _store
+            .Setup(s => s.TryDeleteAsync(It.IsAny<string>(), It.IsAny<Guid>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(true)
+            .Callback(() => releasePredicate.TrySetResult());
+        var channel = CreateChannel();
+
+        var waiterTask = channel.CreateResponseWaiter<OperationResult>(
+            "corr-save-fail-mid-until",
+            completionPredicate: async _ =>
+            {
+                insidePredicate.TrySetResult();
+                await releasePredicate.Task;
+                return true;
+            });
+        await saveStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        _client.Push(JsonSerializer.Serialize(new AsyncResponseEnvelope<OperationResult>
+        {
+            Success = true,
+            Payload = new OperationResult { Status = OperationStatus.Completed, Message = "in-flight" }
+        }, AsyncResponseEnvelopeOptions<OperationResult>.Instance));
+
+        await using var waiter = await waiterTask.WaitAsync(TimeSpan.FromSeconds(10));
+        Assert.Equal("in-flight", (await waiter.ResponseTask).Message);
+    }
+
+    [Fact]
+    public async Task CreateResponseWaiter_RegistrationFailureBehindAThrowingLogger_StillCleansUpAndThrowsTheFailure()
+    {
+        // The generic catch logged BEFORE cleaning up, so a throwing logging provider (MEL rethrows
+        // provider failures) skipped the cleanup: the subscription and registration stayed behind
+        // with no timer — read as a live waiter by the probe, consuming the next response for the
+        // id — and the caller got the logger's exception instead of the registration failure.
+        var failure = new InvalidOperationException("save failed");
+        _store.Setup(s => s.SaveAsync(It.IsAny<string>(), It.IsAny<RecoveryState>(), It.IsAny<TimeSpan>(), It.IsAny<CancellationToken>()))
+            .ThrowsAsync(failure);
+        var logger = new RecordingThrowingLogger<NatsAsyncResponseChannel> { ThrowOnMessageContaining = "Failed to subscribe" };
+        var channel = CreateChannel(logger: logger);
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => channel.CreateResponseWaiter<OperationResult>("corr-throwing-logger", timeout: TimeSpan.FromSeconds(5)));
+
+        Assert.Same(failure, ex);
+        Assert.Equal(1, _client.SubscriptionDisposeCount);
+        _store.Verify(s => s.TryDeleteAsync("corr-throwing-logger", It.IsAny<Guid>(), It.IsAny<CancellationToken>()), Times.Once);
+    }
+
+    [Fact]
+    public async Task CreateResponseWaiter_RegistrationBudgetLapseBehindAThrowingLogger_StillCancelsTheAbandonedSubscribe()
+    {
+        // The budget-lapse catch logged BEFORE cancelling the abandoned subscribe's lifetime token:
+        // behind a throwing logging provider the pending subscribe later installed orphan interest
+        // after the reconnect — the leak that catch exists to prevent.
+        var clock = new VirtualTimeProvider();
+        var subscribeEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        _client.SubscribeBehavior = async token =>
+        {
+            subscribeEntered.TrySetResult();
+            await Task.Delay(Timeout.Infinite, token);
+        };
+        var logger = new RecordingThrowingLogger<NatsAsyncResponseChannel> { ThrowOnMessageContaining = "did not complete within" };
+        var channel = CreateChannel(timeProvider: clock, logger: logger);
+
+        var waiterTask = channel.CreateResponseWaiter<OperationResult>("corr-lapse-throwing-logger", timeout: TimeSpan.FromSeconds(30));
+        await subscribeEntered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        clock.Advance(TimeSpan.FromSeconds(31));
+
+        await Assert.ThrowsAsync<TimeoutException>(() => waiterTask.WaitAsync(TimeSpan.FromSeconds(10)));
+        Assert.True(_client.SubscriptionLifetime.IsCancellationRequested);
+    }
+
+    [Fact]
+    public async Task CreateResponseWaiter_SettledWaiterWarningBehindAThrowingLogger_StillReturnsTheDeliveredResponse()
+    {
+        // The settled-waiter Warning was unguarded: a throwing logging provider turned a delivered
+        // response into a create failure after all — the loss that branch exists to prevent.
+        var saveStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var cleanupDeleteIssued = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        _store
+            .Setup(s => s.SaveAsync(It.IsAny<string>(), It.IsAny<RecoveryState>(), It.IsAny<TimeSpan>(), It.IsAny<CancellationToken>()))
+            .Returns(async () =>
+            {
+                saveStarted.TrySetResult();
+                await cleanupDeleteIssued.Task;
+                throw new InvalidOperationException("recovery save failed");
+            });
+        _store
+            .Setup(s => s.TryDeleteAsync(It.IsAny<string>(), It.IsAny<Guid>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(true)
+            .Callback(() => cleanupDeleteIssued.TrySetResult());
+        var logger = new RecordingThrowingLogger<NatsAsyncResponseChannel> { ThrowOnMessageContaining = "Registration step failed after a delivery settled" };
+        var channel = CreateChannel(logger: logger);
+
+        var waiterTask = channel.CreateResponseWaiter<OperationResult>("corr-settled-throwing-logger");
+        await saveStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        _client.Push(JsonSerializer.Serialize(new AsyncResponseEnvelope<OperationResult>
+        {
+            Success = true,
+            Payload = new OperationResult { Status = OperationStatus.Completed, Message = "settled" }
+        }, AsyncResponseEnvelopeOptions<OperationResult>.Instance));
+
+        await using var waiter = await waiterTask.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal("settled", (await waiter.ResponseTask).Message);
+    }
+
+    [Fact]
+    public async Task ConsumeLoop_AnAcknowledgementStuckBehindADisconnect_DoesNotHoldBackTheResponse()
+    {
+        // The consume loop awaited the reply (ack) publish before processing the message, and while
+        // the connection reconnects that publish waits for the reconnect. A response already
+        // received sat behind the outage until the waiter timed out, and was then processed into a
+        // settled wait and dropped — a durable step restarted and re-triggered the remote operation.
+        var channel = CreateChannel();
+        await using var waiter = await channel.CreateResponseWaiter<OperationResult>("corr-stuck-ack", timeout: TimeSpan.FromMinutes(1));
+        var reconnected = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        _client.PushWithReply(
+            JsonSerializer.Serialize(new AsyncResponseEnvelope<OperationResult>
+            {
+                Success = true,
+                Payload = new OperationResult { Status = OperationStatus.Completed, Message = "received" }
+            }, AsyncResponseEnvelopeOptions<OperationResult>.Instance),
+            () => new ValueTask(reconnected.Task));
+
+        try
+        {
+            Assert.Equal("received", (await waiter.ResponseTask.WaitAsync(TimeSpan.FromSeconds(5))).Message);
+        }
+        finally
+        {
+            reconnected.TrySetResult();
+        }
+    }
+
+    [Fact]
+    public async Task ConsumeLoop_AMessageTheClientDropped_FaultsTheWaitAsOverloaded_AndCountsIt()
+    {
+        // NATS.Net buffers a subscription's inbound messages in a bounded channel (16,384 by
+        // default) and DROPS the newest once it is full — behind a slow Until predicate under a
+        // flood of responses. The dropped message may have been the terminal one, and its publisher
+        // saw no reply and counted it delivered: a silent loss on both sides. Redis parity: the
+        // wait is faulted with the overload form of the indeterminate contract, ended, and counted.
+        var measurements = new List<string?>();
+        using var listener = new System.Diagnostics.Metrics.MeterListener
+        {
+            InstrumentPublished = (instrument, l) =>
+            {
+                if (instrument.Meter.Name == AsyncResponseDiagnostics.MeterName && instrument.Name == "asyncresponse.channel.overloaded_waits")
+                    l.EnableMeasurementEvents(instrument);
+            }
+        };
+        listener.SetMeasurementEventCallback<long>((_, _, tags, _) =>
+        {
+            foreach (var tag in tags)
+            {
+                if (tag.Key == "channel")
+                {
+                    lock (measurements)
+                        measurements.Add(tag.Value?.ToString());
+                }
+            }
+        });
+        listener.Start();
+
+        using var activities = new AsyncResponseActivityCollector();
+        var channel = CreateChannel();
+        var waiter = await channel.CreateResponseWaiter<OperationResult>("corr-overloaded", timeout: TimeSpan.FromMinutes(1));
+
+        _client.DropMessage(buffered: 16_384);
+        _client.DropMessage(buffered: 16_384); // every further drop reports again; the wait is faulted once
+
+        var overload = await Assert.ThrowsAsync<AsyncResponseIndeterminateDeliveryException>(() => waiter.ResponseTask.WaitAsync(TimeSpan.FromSeconds(5)));
+        Assert.Equal("corr-overloaded", overload.CorrelationId);
+        Assert.Equal(16_384, overload.BufferedMessages);
+        await Eventually(() => _client.SubscriptionDisposeCount == 1); // ended: registration deleted, stream unsubscribed
+        _store.Verify(s => s.TryDeleteAsync("corr-overloaded", It.IsAny<Guid>(), It.IsAny<CancellationToken>()), Times.Once);
+        lock (measurements)
+            Assert.Single(measurements, channelTag => channelTag == "nats");
+        await waiter.DisposeAsync();
+        Assert.Equal("overloaded", AsyncResponseActivityCollector.Tag(activities.Single("asyncresponse.wait", "asyncresponse.channel", "nats"), "error.type"));
+    }
+
+    [Fact]
+    public async Task DuplicateErrorEnvelope_AfterTheWaitSettled_IsNotLoggedWithTheRemoteMessage()
+    {
+        // The "already completed" branch still attached the remote failure to its Warning — the
+        // remote-chosen message (uncapped, with CR/LF that forge log entries) that the first
+        // error's log line deliberately leaves out. Redis parity: the drop is logged without it.
+        var logger = new CollectingLogger();
+        var channel = CreateChannel(logger: logger.For<NatsAsyncResponseChannel>());
+        await using var waiter = await channel.CreateResponseWaiter<OperationResult>("corr-dup-error", timeout: TimeSpan.FromSeconds(5));
+        var hostile = JsonSerializer.Serialize(
+            new AsyncResponseEnvelope<OperationResult> { Success = false, ExceptionMessage = "boom\r\nFORGED entry" },
+            AsyncResponseEnvelopeOptions<OperationResult>.Instance);
+
+        _client.Push(hostile);
+        _client.Push(hostile);
+
+        await Assert.ThrowsAsync<Exception>(() => waiter.ResponseTask.WaitAsync(TimeSpan.FromSeconds(5)));
+        await logger.WaitForAsync("the error response was dropped");
+        Assert.All(logger.Entries, entry =>
+        {
+            Assert.DoesNotContain("FORGED", entry.Message, StringComparison.Ordinal);
+            Assert.DoesNotContain("FORGED", entry.Exception?.Message ?? string.Empty, StringComparison.Ordinal);
+        });
+    }
+
+    [Fact]
     public async Task CreateResponseWaiter_ConsumeLoopFailureDuringRegistration_ThrowsInsteadOfReturningAFaultedWaiter()
     {
         // A consume-loop death faults the response task with a TRANSPORT error — nothing was
@@ -678,13 +905,21 @@ public class NatsAsyncResponseChannelTests
         // delete — a KV round trip with no token — before anything else, so during a NATS outage a
         // timed-out waiter's ResponseTask stayed pending until the connection came back ("waits are
         // never infinite"). The delete now runs inside the drain budget. Its lapse proves nothing
-        // about a delivery the live subscription may hold, so the waiter faults as indeterminate;
-        // the subscription stays up until the cleanup core's retried delete has landed.
+        // about a delivery the live subscription may hold, so the waiter faults as indeterminate.
+        //
+        // Fixpoint round 2: the cleanup core then RETRIED that delete with no bound, so disposing
+        // the timed-out waiter still blocked until the reconnect. It now waits on the drain's own
+        // attempt — never a second delete beside it — for at most one more DisposalDrainTimeout,
+        // then tears the subscription down (the ordering is moot while disconnected).
         var clock = new VirtualTimeProvider();
         var reconnected = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
-        (int Disposed, bool LifetimeCancelled)? atReconnect = null;
+        var deletes = 0;
         _store.Setup(s => s.TryDeleteAsync(It.IsAny<string>(), It.IsAny<Guid>(), It.IsAny<CancellationToken>()))
-            .Returns(() => reconnected.Task);
+            .Returns(() =>
+            {
+                Interlocked.Increment(ref deletes);
+                return reconnected.Task;
+            });
         var channel = CreateChannel(drainTimeout: TimeSpan.FromMilliseconds(200), timeProvider: clock);
         var waiter = await channel.CreateResponseWaiter<OperationResult>("corr-timeout-outage", timeout: TimeSpan.FromMinutes(10));
 
@@ -693,14 +928,92 @@ public class NatsAsyncResponseChannelTests
         var fault = await Assert.ThrowsAsync<AsyncResponseIndeterminateDeliveryException>(
             () => waiter.ResponseTask.WaitAsync(TimeSpan.FromSeconds(10)));
         Assert.Equal("corr-timeout-outage", fault.CorrelationId);
-        atReconnect = (_client.SubscriptionDisposeCount, _client.SubscriptionLifetime.IsCancellationRequested);
 
-        // The connection comes back: the retried delete lands, and only then does the stream end.
-        reconnected.TrySetResult(true);
-        await waiter.DisposeAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(10));
+        try
+        {
+            // Still inside the outage: disposal completes without the reconnect.
+            await waiter.DisposeAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(10));
 
-        Assert.Equal<(int, bool)?>((0, false), atReconnect);
-        Assert.Equal(1, _client.SubscriptionDisposeCount);
+            Assert.Equal(1, Volatile.Read(ref deletes));
+            Assert.Equal(1, _client.SubscriptionDisposeCount);
+        }
+        finally
+        {
+            reconnected.TrySetResult(true);
+        }
+    }
+
+    [Fact]
+    public async Task WaiterDispose_DuringANatsOutage_CompletesWithoutWaitingForTheReconnect()
+    {
+        // Fixpoint round 2: disposing an ordinary waiter during an outage blocked until the
+        // connection came back — the drain's delete lapsed its budget as intended, but the latched
+        // cleanup core then retried the KV delete with no bound (NATS.Net waits for the reconnect).
+        // Every `await using` waiter and every flow step disposing its waiter (holding its delivery
+        // and lease) hung for the whole outage. Disposal is now bounded by the drain budget plus
+        // one more for the core, with a single delete attempt.
+        var channel = CreateChannel(drainTimeout: TimeSpan.FromMilliseconds(200));
+        var waiter = await channel.CreateResponseWaiter<OperationResult>("corr-dispose-outage", timeout: TimeSpan.FromMinutes(10));
+
+        // The outage begins: every KV round trip now waits for a reconnect that has not happened.
+        var reconnected = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var deletes = 0;
+        _store.Setup(s => s.TryDeleteAsync(It.IsAny<string>(), It.IsAny<Guid>(), It.IsAny<CancellationToken>()))
+            .Returns(() =>
+            {
+                Interlocked.Increment(ref deletes);
+                return reconnected.Task;
+            });
+
+        try
+        {
+            await waiter.DisposeAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(10));
+
+            // The drain's lapse proves nothing about a delivery the live subscription may hold.
+            await Assert.ThrowsAsync<AsyncResponseIndeterminateDeliveryException>(() => waiter.ResponseTask.WaitAsync(TimeSpan.FromSeconds(5)));
+            Assert.Equal(1, Volatile.Read(ref deletes));
+            Assert.Equal(1, _client.SubscriptionDisposeCount);
+        }
+        finally
+        {
+            reconnected.TrySetResult(true);
+        }
+    }
+
+    [Fact]
+    public async Task CreateResponseWaiter_RegistrationFailureDuringAnOutage_IsNotReportedAsAnIndeterminateDelivery()
+    {
+        // A registration that fails (here the save) while the NATS connection is down: the drain's
+        // delete lapses too, the drain's generic catch faulted the never-returned task as
+        // indeterminate — an UnobservedTaskException, a false "faulting the waiter as
+        // indeterminate" Warning, and the span's subscribe_failure status overwritten — and the
+        // unbounded core retry then held CreateResponseWaiter itself until the reconnect. No
+        // waiter was handed out: the create now throws the registration failure, bounded.
+        using var activities = new AsyncResponseActivityCollector();
+        var failure = new InvalidOperationException("save failed");
+        var reconnected = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        _store.Setup(s => s.SaveAsync(It.IsAny<string>(), It.IsAny<RecoveryState>(), It.IsAny<TimeSpan>(), It.IsAny<CancellationToken>()))
+            .ThrowsAsync(failure);
+        _store.Setup(s => s.TryDeleteAsync(It.IsAny<string>(), It.IsAny<Guid>(), It.IsAny<CancellationToken>()))
+            .Returns(() => reconnected.Task);
+        var logger = new RecordingThrowingLogger<NatsAsyncResponseChannel>();
+        var channel = CreateChannel(drainTimeout: TimeSpan.FromMilliseconds(200), logger: logger);
+
+        try
+        {
+            var ex = await Assert.ThrowsAsync<InvalidOperationException>(
+                () => channel.CreateResponseWaiter<OperationResult>("corr-reg-fail-outage", timeout: TimeSpan.FromSeconds(5)).WaitAsync(TimeSpan.FromSeconds(10)));
+
+            Assert.Same(failure, ex);
+            Assert.False(logger.HasEntry(LogLevel.Warning, "faulting the waiter as indeterminate"));
+            var span = activities.Single("asyncresponse.wait", "asyncresponse.channel", "nats");
+            Assert.Equal("subscribe_failure", AsyncResponseActivityCollector.Tag(span, "error.type"));
+            Assert.Equal(1, _client.SubscriptionDisposeCount);
+        }
+        finally
+        {
+            reconnected.TrySetResult(true);
+        }
     }
 
     [Fact]
@@ -1125,8 +1438,8 @@ public class NatsAsyncResponseChannelTests
         };
         var json = JsonSerializer.Serialize(validEnvelope, AsyncResponseEnvelopeOptions<OperationResult>.Instance);
 
-        mockClient.Setup(c => c.SubscribeAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()))
-            .Callback<string, CancellationToken>((sub, token) =>
+        mockClient.Setup(c => c.SubscribeAsync(It.IsAny<string>(), It.IsAny<Action<int>>(), It.IsAny<CancellationToken>()))
+            .Callback<string, Action<int>, CancellationToken>((sub, _, token) =>
             {
                 messageChannel.Writer.TryWrite(new NatsInboundResponse(json, false, () => ValueTask.CompletedTask));
             })

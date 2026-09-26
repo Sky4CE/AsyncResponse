@@ -227,6 +227,127 @@ public sealed class MongoDbFlowStateStoreTests
             () => conflicting.Store.TryCreateAsync("flow", CreateState("flow"), TimeSpan.FromMinutes(5)))).Code);
     }
 
+    /// <summary>
+    /// Regression (r2 S10#5): <c>LoadCurrentAsync</c> fell back to <c>LoadAsync</c> with the
+    /// inherited read concern. A partitioned primary that has not yet noticed it was deposed still
+    /// serves reads, and a process that can reach only it missed a majority-acknowledged write the
+    /// new primary took — a breadcrumb, a status set back to Running — on exactly the paths that
+    /// act on the answer with no fence behind it. It reads with linearizable read concern now,
+    /// bounded like the store's writes (maxTimeMS = the 10 s default majority bound), and only
+    /// the no-write paths pay for it.
+    /// </summary>
+    [Fact]
+    public async Task LoadCurrent_ReadsLinearizably_WithTheMajorityBound()
+    {
+        using var harness = new MongoHarness(new BsonDocument { ["ok"] = 1 });
+        harness.FindsNothing();
+        FindOptions<MongoFlowStateDocument, MongoFlowStateDocument>? currentOptions = null;
+        harness.Current
+            .Setup(item => item.FindAsync(
+                It.IsAny<FilterDefinition<MongoFlowStateDocument>>(),
+                It.IsAny<FindOptions<MongoFlowStateDocument, MongoFlowStateDocument>>(),
+                It.IsAny<CancellationToken>()))
+            .Callback((FilterDefinition<MongoFlowStateDocument> _, FindOptions<MongoFlowStateDocument, MongoFlowStateDocument> options, CancellationToken _) => currentOptions = options)
+            .ReturnsAsync(() => new MongoListCursor<MongoFlowStateDocument>([]));
+
+        Assert.Null(await ((IFlowStateStore)harness.Store).LoadCurrentAsync("flow"));
+
+        harness.Collection.Verify(item => item.WithReadConcern(ReadConcern.Linearizable), Times.Once);
+        Assert.NotNull(currentOptions);
+        Assert.Equal(TimeSpan.FromSeconds(10), currentOptions!.MaxTime);
+        harness.Collection.Verify(
+            item => item.FindAsync(
+                It.IsAny<FilterDefinition<MongoFlowStateDocument>>(),
+                It.IsAny<FindOptions<MongoFlowStateDocument, MongoFlowStateDocument>>(),
+                It.IsAny<CancellationToken>()),
+            Times.Never);
+
+        // The plain load keeps the inherited read concern: it is revision- or lease-fenced downstream.
+        Assert.Null(await harness.Store.LoadAsync("flow"));
+        harness.Current.Verify(
+            item => item.FindAsync(
+                It.IsAny<FilterDefinition<MongoFlowStateDocument>>(),
+                It.IsAny<FindOptions<MongoFlowStateDocument, MongoFlowStateDocument>>(),
+                It.IsAny<CancellationToken>()),
+            Times.Once);
+    }
+
+    /// <summary>
+    /// A standalone server — supported, and with no second primary to be stale against — rejects
+    /// the read concern with <c>NotAReplicaSet</c> (123). The store then reads plainly, and keeps
+    /// doing so without asking again.
+    /// </summary>
+    [Fact]
+    public async Task LoadCurrent_OnAStandalone_FallsBackToThePlainRead_AndRemembers()
+    {
+        using var harness = new MongoHarness(new BsonDocument { ["ok"] = 1 });
+        harness.FindsNothing();
+        harness.Current
+            .Setup(item => item.FindAsync(
+                It.IsAny<FilterDefinition<MongoFlowStateDocument>>(),
+                It.IsAny<FindOptions<MongoFlowStateDocument, MongoFlowStateDocument>>(),
+                It.IsAny<CancellationToken>()))
+            .ThrowsAsync(new MongoCommandException(
+                new ConnectionId(new ServerId(new ClusterId(), new DnsEndPoint("localhost", 27017))),
+                "find failed",
+                new BsonDocument("find", "flows"),
+                new BsonDocument { ["ok"] = 0, ["code"] = 123, ["errmsg"] = "node needs to be a replica set member to use read concern" }));
+
+        Assert.Null(await ((IFlowStateStore)harness.Store).LoadCurrentAsync("flow"));
+        Assert.Null(await ((IFlowStateStore)harness.Store).LoadCurrentAsync("flow"));
+
+        harness.Current.Verify(
+            item => item.FindAsync(
+                It.IsAny<FilterDefinition<MongoFlowStateDocument>>(),
+                It.IsAny<FindOptions<MongoFlowStateDocument, MongoFlowStateDocument>>(),
+                It.IsAny<CancellationToken>()),
+            Times.Once);
+        harness.Collection.Verify(
+            item => item.FindAsync(
+                It.IsAny<FilterDefinition<MongoFlowStateDocument>>(),
+                It.IsAny<FindOptions<MongoFlowStateDocument, MongoFlowStateDocument>>(),
+                It.IsAny<CancellationToken>()),
+            Times.Exactly(2));
+    }
+
+    /// <summary>
+    /// Regression (r2 GS6#2): nothing checked the collection's collation, while the docs promise
+    /// the built-in stores refuse a folding one. A collection created with a default collation
+    /// builds its <c>_id_</c> index — the flow id — under it, so two case-variant ids collide: the
+    /// second run's create sees the first run's ledger, its start job dead-letters on the
+    /// unreadable load, and a delete removes the other run. Startup refuses it now, on both index
+    /// branches, from the index listing (no listCollections privilege needed); a simple collation
+    /// passes.
+    /// </summary>
+    [Theory]
+    [InlineData(false, "en", true)]
+    [InlineData(true, "en", true)]
+    [InlineData(false, "simple", false)]
+    [InlineData(true, null, false)]
+    public async Task EnsureCreated_RefusesAFoldingIdCollation(bool autoCreateIndexes, string? locale, bool refused)
+    {
+        using var harness = new MongoHarness(new BsonDocument { ["ok"] = 1 }, autoCreateIndexes);
+        var idIndex = new BsonDocument { ["v"] = 2, ["key"] = new BsonDocument("_id", 1), ["name"] = "_id_" };
+        if (locale is not null)
+            idIndex["collation"] = new BsonDocument { ["locale"] = locale, ["strength"] = 2 };
+        harness.Collection.WithListedIndexes(
+            idIndex,
+            new BsonDocument { ["name"] = "flows_expires_idx", ["key"] = new BsonDocument("expires_at_utc", 1), ["expireAfterSeconds"] = 0 });
+
+        var create = harness.Store.TryCreateAsync("flow", CreateState("flow"), TimeSpan.FromMinutes(5));
+
+        if (!refused)
+        {
+            Assert.True(await create);
+            return;
+        }
+
+        var error = await Assert.ThrowsAsync<InvalidOperationException>(() => create);
+        Assert.Contains("collation", error.Message, StringComparison.Ordinal);
+        Assert.Contains("'flows'", error.Message, StringComparison.Ordinal);
+        Assert.Null(harness.Inserted);
+    }
+
     [Fact]
     public async Task Load_ADocumentWhoseExpiryIsMissingOrNotADate_IsUnreadable_NotAbsent()
     {
@@ -401,6 +522,10 @@ public sealed class MongoDbFlowStateStoreTests
             Collection
                 .Setup(item => item.WithWriteConcern(It.IsAny<WriteConcern>()))
                 .Returns(Collection.Object);
+            // LoadCurrentAsync's linearizable-read handle.
+            Collection
+                .Setup(item => item.WithReadConcern(It.IsAny<ReadConcern>()))
+                .Returns(Current.Object);
             Collection.WithProvisionedTtlIndex();
             Database
                 .Setup(item => item.RunCommandAsync(
@@ -470,6 +595,7 @@ public sealed class MongoDbFlowStateStoreTests
 
         public Mock<IMongoDatabase> Database { get; } = new();
         public Mock<IMongoCollection<MongoFlowStateDocument>> Collection { get; } = new();
+        public Mock<IMongoCollection<MongoFlowStateDocument>> Current { get; } = new();
         public MongoDbFlowStateStore Store { get; }
         public MongoFlowStateDocument? Inserted { get; private set; }
 

@@ -56,11 +56,13 @@ internal static class NatsTransportOptionsValidator
     /// no '.', '*' or '>' (subject syntax), and no '/' or '\' (nats-server stores each one as a
     /// directory). NATS.Net or the server rejects such a name only at first use, inside the
     /// subscriber retry loop, where it is retried forever as an opaque failure. Derived stream
-    /// names are sanitized already; this guards the explicitly configured ones.
+    /// names are sanitized already; this guards the explicitly configured ones. A blank value is
+    /// not configured: the schema derives the stream name from the subject instead (the same
+    /// IsNullOrWhiteSpace test <see cref="NatsTransportSubjectSchema"/> applies).
     /// </summary>
     private static void EnsureJetStreamName(string? value, string name)
     {
-        if (string.IsNullOrEmpty(value))
+        if (string.IsNullOrWhiteSpace(value))
             return;
 
         foreach (var c in value)

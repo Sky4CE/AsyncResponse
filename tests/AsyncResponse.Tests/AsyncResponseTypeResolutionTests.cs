@@ -8,6 +8,52 @@ using Xunit;
 namespace AsyncResponse.Tests;
 
 /// <summary>
+/// Serialized against the WHOLE suite, not only the resolver-registry collection: the bound is
+/// asserted from the caches' entry counts, and any resolver unregistration anywhere in the process
+/// — <c>Round27RegressionTests</c>' plugin registration disposing, a <c>Reset()</c> — clears both
+/// positive caches. One such clear late in the loop brought an unbounded cache's count under the
+/// bound and masked exactly the regression the test pins (fixpoint r2 S11#16 i).
+/// </summary>
+[CollectionDefinition(nameof(ResolvedTypeCacheBoundTests), DisableParallelization = true)]
+public sealed class ResolvedTypeCacheBoundCollection;
+
+[Collection(nameof(ResolvedTypeCacheBoundTests))]
+public sealed class ResolvedTypeCacheBoundTests
+{
+    [Fact]
+    public void PositiveCaches_StayBounded_UnderEndlessSpellingsOfOneResolvableType()
+    {
+        // The positive caches are keyed by the persisted SPELLING, and every Version variant of a
+        // loaded assembly's name resolves to the same type. Pre-fix each novel spelling a store or
+        // stream writer chose became a new permanent entry — before the payload or flow gate even
+        // looked at the type — so memory grew with every hostile row. Both caches are bounded now.
+        var assemblyName = typeof(OperationResult).Assembly.GetName().Name;
+        var capacity = ReflectionExtensions.ResolvedTypeCacheCapacity;
+        for (var i = 0; i < capacity + 100; i++)
+        {
+            var spelling = $"{typeof(OperationResult).FullName}, {assemblyName}, Version=7.{i / 1000}.{i % 1000}.0";
+            Assert.Equal(typeof(OperationResult), PayloadRecoveryClassifier.ResolvePayloadType(spelling));
+            Assert.Equal(typeof(OperationResult), ReflectionExtensions.ResolveServiceType(spelling));
+        }
+
+        // A small slack only for background work an earlier test left behind resolving a name at
+        // the exact instant the count crosses the bound; unbounded, both counts sit past
+        // capacity + 100.
+        Assert.InRange(CacheCount(typeof(PayloadRecoveryClassifier), "PayloadTypes"), 0, capacity + 8);
+        Assert.InRange(CacheCount(typeof(ReflectionExtensions), "ServiceTypes"), 0, capacity + 8);
+
+        // Names in real use keep resolving (and re-enter the cache after a clear).
+        Assert.Equal(typeof(OperationResult), PayloadRecoveryClassifier.ResolvePayloadType(typeof(OperationResult).FullName!));
+        Assert.Equal(typeof(OperationResult), ReflectionExtensions.ResolveServiceType(typeof(OperationResult).FullName!));
+    }
+
+    private static int CacheCount(Type owner, string field)
+        => ((System.Collections.ICollection)owner
+            .GetField(field, BindingFlags.Static | BindingFlags.NonPublic)!
+            .GetValue(null)!).Count;
+}
+
+/// <summary>
 /// Collection-serialized with <c>TypeResolutionTests</c> (CallbackSecurityTests.cs): both classes
 /// mutate the process-global resolver registry, and this class's per-test <c>Reset()</c> wiped the
 /// other's just-registered resolver under parallel execution.
@@ -41,37 +87,6 @@ public class AsyncResponseTypeResolutionTests : IDisposable
         Assert.Throws<ArgumentNullException>(() => AsyncResponseTypeResolution.RegisterResolver(null!));
         Assert.Throws<ArgumentNullException>(() => AsyncResponseTypeResolution.RegisterAssembly(null!));
     }
-
-    [Fact]
-    public void PositiveCaches_StayBounded_UnderEndlessSpellingsOfOneResolvableType()
-    {
-        // The positive caches are keyed by the persisted SPELLING, and every Version variant of a
-        // loaded assembly's name resolves to the same type. Pre-fix each novel spelling a store or
-        // stream writer chose became a new permanent entry — before the payload or flow gate even
-        // looked at the type — so memory grew with every hostile row. Both caches are bounded now.
-        var assemblyName = typeof(OperationResult).Assembly.GetName().Name;
-        var capacity = ReflectionExtensions.ResolvedTypeCacheCapacity;
-        for (var i = 0; i < capacity + 100; i++)
-        {
-            var spelling = $"{typeof(OperationResult).FullName}, {assemblyName}, Version=7.{i / 1000}.{i % 1000}.0";
-            Assert.Equal(typeof(OperationResult), PayloadRecoveryClassifier.ResolvePayloadType(spelling));
-            Assert.Equal(typeof(OperationResult), ReflectionExtensions.ResolveServiceType(spelling));
-        }
-
-        // A small slack only for a parallel test resolving its own names at the exact instant the
-        // count crosses the bound; unbounded, both counts sit past capacity + 100.
-        Assert.InRange(CacheCount(typeof(PayloadRecoveryClassifier), "PayloadTypes"), 0, capacity + 8);
-        Assert.InRange(CacheCount(typeof(ReflectionExtensions), "ServiceTypes"), 0, capacity + 8);
-
-        // Names in real use keep resolving (and re-enter the cache after a clear).
-        Assert.Equal(typeof(OperationResult), PayloadRecoveryClassifier.ResolvePayloadType(typeof(OperationResult).FullName!));
-        Assert.Equal(typeof(OperationResult), ReflectionExtensions.ResolveServiceType(typeof(OperationResult).FullName!));
-    }
-
-    private static int CacheCount(Type owner, string field)
-        => ((System.Collections.ICollection)owner
-            .GetField(field, BindingFlags.Static | BindingFlags.NonPublic)!
-            .GetValue(null)!).Count;
 
     [Fact]
     public void ResolveServiceType_CachesUnresolvableNames_ConsultsResolversOnce()
@@ -205,6 +220,50 @@ public class AsyncResponseTypeResolutionTests : IDisposable
 
             Assert.True(attempt < 4, $"Negative cache never held across two lookups ({probes} probes on final attempt).");
         }
+    }
+
+    /// <summary>
+    /// Names the runtime parses and finds the parts of, then refuses to BUILD — each one threw out
+    /// of <c>Type.GetType(…, throwOnError: false)</c> rather than answering <c>null</c>.
+    /// </summary>
+    public static TheoryData<string> NamesTheRuntimeRefusesToBuild => new()
+    {
+        // A constraint violation: Nullable<T> requires a value type.
+        "System.Nullable`1[[System.String, System.Private.CoreLib]]",
+        // Arity: List<T> given two arguments.
+        "System.Collections.Generic.List`1[[System.Int32, System.Private.CoreLib],[System.Int32, System.Private.CoreLib]]",
+        // A type that is never a valid generic argument.
+        "System.Collections.Generic.List`1[[System.Void, System.Private.CoreLib]]",
+        // Arguments given to a non-generic definition.
+        "System.String[[System.Int32, System.Private.CoreLib]]",
+        // A malformed assembly name inside the brackets (FileLoadException from AssemblyName, on .NET 8 and 10).
+        "System.Collections.Generic.List`1[[System.Int32, System.Private.CoreLib, Version=x]]",
+    };
+
+    [Theory]
+    [MemberData(nameof(NamesTheRuntimeRefusesToBuild))]
+    public void ANameTheRuntimeRefusesToBuild_IsUnresolved_AndRecordedAsAMiss(string name)
+    {
+        // Fixpoint r2 (S3#4): the exception escaped the default scan, so the resolvers threw
+        // instead of answering null, the miss was never cached (every redelivery re-parsed the
+        // name), and the lost-subscriber dispatcher read the escaped exception as a TRANSIENT
+        // callback fault. Each attempt starts from an empty negative cache so the parser runs; an
+        // ambient assembly load between the lookup and the check may clear the recorded miss, so
+        // the check gets a few attempts (as the negative-cache tests above do).
+        for (var attempt = 0; ; attempt++)
+        {
+            ReflectionExtensions.InvalidateUnresolvableServiceTypes();
+
+            Assert.Null(ReflectionExtensions.ResolveServiceType(name));
+
+            if (UnresolvableTypeNames.IsKnownMiss(name))
+                break;
+
+            Assert.True(attempt < 4, "The unresolvable name was never recorded as a miss.");
+        }
+
+        ReflectionExtensions.InvalidateUnresolvableServiceTypes();
+        Assert.Null(PayloadRecoveryClassifier.ResolvePayloadType(name));
     }
 
     [Fact]

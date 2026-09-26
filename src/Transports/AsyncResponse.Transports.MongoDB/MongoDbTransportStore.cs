@@ -41,7 +41,6 @@ internal sealed class MongoDbTransportStore : IDisposable
 {
     private readonly IMongoCollection<MongoTransportMessageDocument> _messages;
     private readonly IMongoCollection<MongoTransportMessageDocument> _leaseMessages;
-    private readonly IMongoCollection<BsonDocument> _rawMessages;
     private readonly IMongoCollection<BsonDocument> _rawLeaseMessages;
     private readonly MongoDbAsyncResponseTransportOptions _options;
     private readonly ILogger<MongoDbTransportStore>? _logger;
@@ -79,29 +78,37 @@ internal sealed class MongoDbTransportStore : IDisposable
         // route the change-stream wake to a lagging secondary, so worker jobs woke at replication
         // lag and delivery quietly degraded to EmptyPollDelay polling.
         //
-        // Two write concerns on the one namespace. The publish upsert, the dead-letter insert, and
-        // every delete (ack, burial, prune) pin a bounded majority (flow-store / channel parity,
-        // see MongoWriteConcerns): under an inherited w=1 the primary acknowledged a job — or a
+        // Two write concerns on the one namespace. The INSERTS — the publish upsert and the
+        // dead-letter insert — pin a bounded majority (flow-store / channel parity, see
+        // MongoWriteConcerns): under an inherited w=1 the primary acknowledged a job — or a
         // durable flow's wake-up — that a failover then rolled back, so a publish the caller saw
-        // succeed was simply gone. The LEASE writes — claim, renew, NAK — keep the inherited
-        // concern: a rolled-back lease write only returns the document to claimable, exactly as a
-        // lapsed lease does, so majority buys them nothing, and it cost two things. A claim whose
-        // wtimeout lapsed had still stamped attempts+1 on the primary but threw before any
-        // delivery existed, so a replication stall of a few LockTimeouts dead-lettered (or, with
-        // the DLQ off, deleted) a job that never ran; and a claim acknowledged only after the
-        // replication wait could return after its own server-stamped lease had expired, with a
-        // peer already running the same document.
-        var leaseMessages = database.GetCollection<MongoTransportMessageDocument>(_options.MessageCollection)
+        // succeed was simply gone. Everything else — the LEASE writes (claim, renew, NAK) and the
+        // DELETES (ack, burial, prune) — pins w=1, keeping the inherited journal: rolling one of
+        // them back only returns a document to claimable, exactly as a lapsed lease does (a
+        // rolled-back ack reruns the job under the at-least-once contract, a rolled-back burial
+        // re-buries onto the same deterministic dead-letter id, whose insert — majority, and
+        // written first — cannot be rolled back without the delete after it), so majority buys
+        // them nothing, and it cost three things. A claim whose wtimeout lapsed had still
+        // stamped attempts+1 on the primary but threw before any delivery existed, so a
+        // replication stall of a few LockTimeouts dead-lettered (or, with the DLQ off, deleted)
+        // a job that never ran; a claim acknowledged only after the replication wait could return
+        // after its own server-stamped lease had expired, with a peer already running the same
+        // document; and every settlement held the claim loop for the whole wtimeout, then
+        // reported a delete the primary had applied as failed. Pinned, not inherited: the
+        // inherited concern is itself majority on most deployments (an Atlas-style w=majority
+        // string, or no w at all against a 5.0+ primary-secondary-secondary set), which kept
+        // those hazards there.
+        var primaryMessages = database.GetCollection<MongoTransportMessageDocument>(_options.MessageCollection)
             .WithReadPreference(ReadPreference.Primary);
-        _leaseMessages = leaseMessages;
-        _messages = leaseMessages.WithWriteConcern(MongoWriteConcerns.BoundedMajority(database));
-        // The same namespace, untyped: the claim reads the stamped document as raw BSON and maps it
-        // inside a try (see TryClaimAsync), so a document no class map can read is buried instead of
-        // throwing from inside findOneAndUpdate.
-        var rawLeaseMessages = database.GetCollection<BsonDocument>(_options.MessageCollection)
-            .WithReadPreference(ReadPreference.Primary);
-        _rawLeaseMessages = rawLeaseMessages;
-        _rawMessages = rawLeaseMessages.WithWriteConcern(MongoWriteConcerns.BoundedMajority(database));
+        _leaseMessages = primaryMessages.WithWriteConcern(MongoWriteConcerns.PrimaryAcknowledged(database));
+        _messages = primaryMessages.WithWriteConcern(MongoWriteConcerns.BoundedMajority(database));
+        // The same namespace, untyped, for the claim and the unreadable-document delete only: the
+        // claim reads the stamped document as raw BSON and maps it inside a try (see
+        // TryClaimAsync), so a document no class map can read is buried instead of throwing from
+        // inside findOneAndUpdate.
+        _rawLeaseMessages = database.GetCollection<BsonDocument>(_options.MessageCollection)
+            .WithReadPreference(ReadPreference.Primary)
+            .WithWriteConcern(MongoWriteConcerns.PrimaryAcknowledged(database));
         _ownedClient = ownedClient;
     }
 
@@ -139,24 +146,30 @@ internal sealed class MongoDbTransportStore : IDisposable
                 return;
             }
 
-            // Through the lease handle's inherited concern, like the claim itself: createIndexes
-            // carries the handle's write concern, so under the bounded majority a host that started
+            // Through the lease handle's w=1, like the claim itself: createIndexes carries the
+            // handle's write concern, so under the bounded majority a host that started
             // during a replication stall could fail EnsureCreated — which every claim runs first —
             // and could not claim through the very stall the lease handle exists to ride out. Index
             // DDL is idempotent, and a build a failover rolled back simply reruns on the next start.
-            await _leaseMessages.Indexes.CreateOneAsync(
+            // An equivalent index under another name — the default-named one the
+            // AutoCreateIndexes = false warning prescribes — is accepted (see MongoIndexes).
+            await MongoIndexes.CreateOrAcceptEquivalentAsync(
+                _leaseMessages,
                 new CreateIndexModel<MongoTransportMessageDocument>(
                     Builders<MongoTransportMessageDocument>.IndexKeys
                         .Ascending(item => item.Queue)
                         .Ascending(item => item.AvailableAtUtc)
                         .Ascending(item => item.CreatedAtUtc),
                     new CreateIndexOptions { Name = $"{_options.MessageCollection}_claim_idx" }),
-                cancellationToken: cancellationToken).ConfigureAwait(false);
-            await _leaseMessages.Indexes.CreateOneAsync(
+                replaceConflicting: false,
+                cancellationToken).ConfigureAwait(false);
+            await MongoIndexes.CreateOrAcceptEquivalentAsync(
+                _leaseMessages,
                 new CreateIndexModel<MongoTransportMessageDocument>(
                     Builders<MongoTransportMessageDocument>.IndexKeys.Ascending(item => item.CreatedAtUtc),
                     new CreateIndexOptions { Name = $"{_options.MessageCollection}_created_idx" }),
-                cancellationToken: cancellationToken).ConfigureAwait(false);
+                replaceConflicting: false,
+                cancellationToken).ConfigureAwait(false);
             _created = true;
         }
         finally
@@ -259,7 +272,7 @@ internal sealed class MongoDbTransportStore : IDisposable
                 BuildClaimUpdate(lockId, lockTimeout),
                 new FindOneAndUpdateOptions<BsonDocument>
                 {
-                    Sort = Builders<BsonDocument>.Sort.Ascending("created_at"),
+                    Sort = ClaimSort,
                     ReturnDocument = ReturnDocument.After,
                     Collation = Collation.Simple
                 },
@@ -320,6 +333,19 @@ internal sealed class MongoDbTransportStore : IDisposable
     }
 
     /// <summary>
+    /// Claim order: due time first, then arrival — the claim index's own key order
+    /// (<c>queue, available_at, created_at</c>), so the index walks the queue's due documents in
+    /// order and the first unlocked one ends the scan (PostgreSQL / SQL Server parity). The
+    /// former <c>created_at</c> sort sat behind a range on <c>available_at</c>, which breaks the
+    /// index order: every claim sorted all of the queue's due documents in memory to take one —
+    /// draining a backlog was quadratic — and a NAKed or delayed document jumped ahead of
+    /// everything published while it waited. Documents written by earlier builds carry an epoch
+    /// <c>available_at</c> and simply sort first.
+    /// </summary>
+    internal static readonly SortDefinition<BsonDocument> ClaimSort =
+        Builders<BsonDocument>.Sort.Ascending("available_at").Ascending("created_at");
+
+    /// <summary>
     /// Claim filter: available and not (still) locked, evaluated against the server clock
     /// (<c>$$NOW</c>) so publisher/consumer clock skew never fences messages in or out.
     /// A missing <c>locked_until</c> compares as null and therefore as expired.
@@ -374,17 +400,35 @@ internal sealed class MongoDbTransportStore : IDisposable
     /// (the same insert-first idempotency as <see cref="DeadLetterAsync"/>). Settlement runs on
     /// <see cref="CancellationToken.None"/>: burying a poison document must not be abandoned
     /// half-done by a shutdown. A failure propagates like any claim failure; the lease lapses and
-    /// the next claim buries it again.
+    /// the next claim buries it again. The Error is logged after the burial, through a guard: a
+    /// throwing logging provider must not abort a burial half-done. A burial that fails logs the
+    /// document and why it could not be read before the failure propagates, so a burial that
+    /// fails on every claim (a dead-letter copy over the document size limit) still names it.
     /// </summary>
     private async Task BuryUnreadableAsync(BsonDocument raw, Guid lockId, string queue, Exception error)
     {
         var rawId = raw.GetValue("_id", BsonNull.Value);
+        try
+        {
+            await BuryUnreadableCoreAsync(raw, rawId, lockId, queue, error).ConfigureAwait(false);
+        }
+        catch (Exception buryFailure)
+        {
+            SafeLog.Try(
+                (Logger: _logger, ReadError: error.Message, Failure: buryFailure, DocumentId: rawId.ToString(), Queue: queue),
+                static state => state.Logger?.LogError(
+                    state.Failure,
+                    "MongoDB transport document {DocumentId} on queue {Queue} could not be read as a transport message ({ReadError}), and burying it failed; it stays claimed until its lease lapses and the next claim buries it again.",
+                    state.DocumentId,
+                    state.Queue,
+                    state.ReadError));
+            throw;
+        }
+    }
+
+    private async Task BuryUnreadableCoreAsync(BsonDocument raw, BsonValue rawId, Guid lockId, string queue, Exception error)
+    {
         var reason = $"The document could not be read as a transport message: {error.Message}";
-        _logger?.LogError(
-            error,
-            "MongoDB transport document {DocumentId} on queue {Queue} could not be read as a transport message; dead-lettering it without executing it.",
-            rawId.ToString(),
-            queue);
 
         if (_options.DeadLetterEnabled)
         {
@@ -409,9 +453,29 @@ internal sealed class MongoDbTransportStore : IDisposable
             await InsertAsync(UnreadableDeadLetterId(rawId), _options.DeadLetterQueue, payload, deadHeaders, reason, CancellationToken.None).ConfigureAwait(false);
         }
 
-        await _rawMessages.DeleteOneAsync(
+        await _rawLeaseMessages.DeleteOneAsync(
             new BsonDocument("lock_id", new BsonBinaryData(lockId, GuidRepresentation.Standard)),
             CancellationToken.None).ConfigureAwait(false);
+
+        SafeLog.Try(() =>
+        {
+            if (_options.DeadLetterEnabled)
+            {
+                _logger?.LogError(
+                    error,
+                    "MongoDB transport document {DocumentId} on queue {Queue} could not be read as a transport message; dead-lettered it without executing it.",
+                    rawId.ToString(),
+                    queue);
+            }
+            else
+            {
+                _logger?.LogError(
+                    error,
+                    "MongoDB transport document {DocumentId} on queue {Queue} could not be read as a transport message; removed it without executing it (DeadLetterEnabled is false, so no dead-letter copy was written).",
+                    rawId.ToString(),
+                    queue);
+            }
+        });
     }
 
     /// <summary>
@@ -467,24 +531,47 @@ internal sealed class MongoDbTransportStore : IDisposable
             // duplicate-key error is the outcome the caller asked for (a retried publish found the
             // document already present): idempotent success.
         }
+        catch (Exception ex) when (MongoWriteConcerns.IsReplicationTimeout(ex))
+        {
+            // The upsert applied on the primary — subscribers claim from there, so the job will
+            // run — and only its majority acknowledgement timed out. Reporting it failed made the
+            // caller re-publish under a new id (the flow engine re-parks the same way): the job ran
+            // twice, and a burial logged "no dead-letter copy" for a copy that exists. A same-id
+            // retry is no safer: a subscriber can claim, run and ack (delete) the document inside
+            // the retry window, and the upsert's $ifNull defaults then re-create it. So it counts
+            // as written; what it gives up is the majority guarantee, which the warning says. (Static
+            // state form: a capturing lambda would allocate its closure on every publish — the
+            // parameters it captures are in scope from method entry.)
+            SafeLog.Try((Logger: _logger, Error: ex, Id: id, Queue: queue), static state => state.Logger?.LogWarning(
+                state.Error,
+                "MongoDB transport document {MessageId} on queue {Queue} was written on the primary, but its majority acknowledgement " +
+                "timed out; treating it as written rather than risking a duplicate. A failover before it replicates can still roll it " +
+                "back — restore the replica set's secondaries (or remove the arbiter) rather than lowering the write concern.",
+                state.Id,
+                state.Queue));
+        }
     }
 
     /// <summary>
-    /// Upsert pipeline for a queue document. <c>created_at</c> — the claim <c>Sort</c> key and the
-    /// dead-letter prune cutoff — is stamped from the SERVER clock (<c>$$NOW</c>), matching the
-    /// claim/renew/NAK updates: a behind-clock publisher's client stamp would otherwise sort its
-    /// rows permanently to the queue head and shift them across the prune boundary. <c>$ifNull</c>
-    /// keeps the first (server-stamped) values when a publish retry finds the document already
-    /// present, and a retry must not reset a claimed document's attempts or lease either — those
-    /// fields are left alone entirely.
+    /// Upsert pipeline for a queue document. <c>available_at</c> and <c>created_at</c> — the claim
+    /// <see cref="ClaimSort"/> keys, and <c>created_at</c> the dead-letter prune cutoff — are
+    /// stamped from the SERVER clock (<c>$$NOW</c>), matching the claim/renew/NAK updates: a
+    /// behind-clock publisher's client stamp would otherwise sort its rows permanently to the
+    /// queue head and shift them across the prune boundary. <c>$ifNull</c> keeps the first
+    /// (server-stamped) values when a publish retry finds the document already present, and a
+    /// retry must not reset a claimed document's attempts or lease either — those fields are left
+    /// alone entirely.
     /// </summary>
     /// <remarks>
-    /// "Available immediately on arrival" still stamps epoch: it expresses what the SQL stores'
-    /// <c>available_at DEFAULT now()</c> expresses without even a same-millisecond tie against the
-    /// claim filter's <c>$$NOW</c>. A DELAYED publish computes its due time server-relative
-    /// (<c>$$NOW + delay</c>), mirroring the NAK update, so client clock skew cannot shift it.
-    /// User-supplied strings ride inside <c>$literal</c>: in a pipeline expression a plain string
-    /// beginning with <c>$</c> would otherwise be read as a field path or variable.
+    /// "Available immediately on arrival" stamps <c>$$NOW</c>, the SQL stores'
+    /// <c>available_at DEFAULT now()</c>: the claim filter's <c>$lte</c> against its own
+    /// <c>$$NOW</c> admits it at once, and it takes its arrival place in the claim order. (It
+    /// stamped epoch before, which under an <c>available_at</c>-first order would starve every
+    /// due NAKed or delayed document behind a steady stream of immediate ones.) A DELAYED
+    /// publish computes its due time server-relative (<c>$$NOW + delay</c>), mirroring the NAK
+    /// update, so client clock skew cannot shift it. User-supplied strings ride inside
+    /// <c>$literal</c>: in a pipeline expression a plain string beginning with <c>$</c> would
+    /// otherwise be read as a field path or variable.
     /// </remarks>
     internal static UpdateDefinition<MongoTransportMessageDocument> BuildInsertPipeline(
         string queue,
@@ -513,7 +600,7 @@ internal sealed class MongoDbTransportStore : IDisposable
                     "$available_at",
                     delay is { } pending
                         ? new BsonDocument("$add", new BsonArray { "$$NOW", pending.TotalMilliseconds })
-                        : (BsonValue)new BsonDateTime(DateTime.UnixEpoch)
+                        : (BsonValue)"$$NOW"
                 }),
                 ["attempts"] = new BsonDocument("$ifNull", new BsonArray { "$attempts", 0 }),
                 ["dead_letter_reason"] = new BsonDocument("$ifNull", new BsonArray
@@ -527,7 +614,7 @@ internal sealed class MongoDbTransportStore : IDisposable
 
     private async ValueTask AckAsync(Guid id, Guid lockId)
     {
-        await _messages.DeleteOneAsync(
+        await _leaseMessages.DeleteOneAsync(
             Builders<MongoTransportMessageDocument>.Filter.Eq(item => item.Id, id)
             & Builders<MongoTransportMessageDocument>.Filter.Eq(item => item.LockId, lockId),
             CancellationToken.None).ConfigureAwait(false);
@@ -631,17 +718,17 @@ internal sealed class MongoDbTransportStore : IDisposable
             // by dead-letter retention, and strictly better than losing the only record. (The SQL
             // siblings avoid the dilemma by making delete+insert one atomic statement; standalone
             // MongoDB has no equivalent.)
-            var removed = await _messages.DeleteOneAsync(
+            var removed = await _leaseMessages.DeleteOneAsync(
                 Builders<MongoTransportMessageDocument>.Filter.Eq(item => item.Id, id)
                 & Builders<MongoTransportMessageDocument>.Filter.Eq(item => item.LockId, lockId),
                 CancellationToken.None).ConfigureAwait(false);
 
             if (removed.DeletedCount == 0)
             {
-                _logger?.LogWarning(
+                SafeLog.Try(() => _logger?.LogWarning(
                     "MongoDB dead-letter for message {MessageId} from queue {SourceQueue} no-opped: the claim's lease had lapsed and the document was re-claimed. The dead-letter copy is kept in case the burial raced a peer's.",
                     id,
-                    sourceQueue);
+                    sourceQueue));
                 return false;
             }
 
@@ -650,12 +737,13 @@ internal sealed class MongoDbTransportStore : IDisposable
         catch (Exception ex)
         {
             // Callers decide the redelivery consequence from the false return; log the cause here so
-            // a failing dead-letter write is never silent.
-            _logger?.LogError(
+            // a failing dead-letter write is never silent (guarded: a throwing logging provider
+            // must not turn that false into an exception).
+            SafeLog.Try(() => _logger?.LogError(
                 ex,
                 "Failed to write MongoDB dead-letter document for message {MessageId} from queue {SourceQueue}.",
                 id,
-                sourceQueue);
+                sourceQueue));
             return false;
         }
     }
@@ -674,10 +762,38 @@ internal sealed class MongoDbTransportStore : IDisposable
             cancellationToken: cancellationToken).ConfigureAwait(false);
         while (await cursor.MoveNextAsync(cancellationToken).ConfigureAwait(false))
         {
-            foreach (var _ in cursor.Current)
-                await onNotification().ConfigureAwait(false);
+            foreach (var change in cursor.Current)
+            {
+                if (IsClaimableOnArrival(change?.BackingDocument))
+                    await onNotification().ConfigureAwait(false);
+            }
         }
     }
+
+    /// <summary>
+    /// Whether an insert event's document was claimable when it was written — whether waking the
+    /// queue's subscribers for it can find anything. A DELAYED publish (a durable-flow timer, a
+    /// redelay hop, a user's delayed enqueue) woke every subscriber of the queue on every process
+    /// for a document none of them could claim yet; the claim poll picks it up once it is due
+    /// (as it picks up a NAKed document, whose update is no insert and never woke anyone). The event's
+    /// <c>clusterTime</c> is the server's write time at second resolution, hence the slack: an
+    /// immediate publish stamps <c>available_at</c> with its own <c>$$NOW</c>, within that second.
+    /// Read from the raw event, never through the typed full document: a foreign producer's
+    /// document the class map cannot read must not tear the watch down. Anything missing or
+    /// mistyped reads as claimable — an extra wake costs one empty claim, a skipped one a poll.
+    /// </summary>
+    internal static bool IsClaimableOnArrival(BsonDocument? change)
+        => !(change is not null
+             && change.TryGetValue("clusterTime", out var clusterTime)
+             && clusterTime is BsonTimestamp writtenAt
+             && change.TryGetValue("fullDocument", out var fullDocument)
+             && fullDocument is BsonDocument document
+             && document.TryGetValue("available_at", out var availableAt)
+             && availableAt is BsonDateTime due
+             && due.MillisecondsSinceEpoch > (writtenAt.Timestamp * 1000L) + (long)WakeSlack.TotalMilliseconds);
+
+    /// <summary>One second, the resolution of an event's <c>clusterTime</c> (see <see cref="IsClaimableOnArrival"/>).</summary>
+    private static readonly TimeSpan WakeSlack = TimeSpan.FromSeconds(1);
 
     /// <summary>Change-stream pipeline for queue wakes: a <c>$match</c> on inserts into one logical queue.</summary>
     internal static PipelineDefinition<ChangeStreamDocument<MongoTransportMessageDocument>, ChangeStreamDocument<MongoTransportMessageDocument>> BuildQueueWatchPipeline(string queue)
@@ -695,20 +811,33 @@ internal sealed class MongoDbTransportStore : IDisposable
                || commandException.Message.Contains("only supported on replica sets", StringComparison.OrdinalIgnoreCase));
 
     /// <summary>
-    /// The dead-letter retention prune's delete (<see cref="DbDeadLetterPrune"/> throttles and
-    /// guards it). One <c>deleteMany</c> removes the whole eligible set — MongoDB deletes document
-    /// by document, so it makes progress however large the backlog — and a count at or past the
-    /// batch size merely costs the drain one more (empty) pass.
+    /// One batch of the dead-letter retention prune (<see cref="DbDeadLetterPrune"/> throttles,
+    /// budgets and guards the drain): the ids of at most <see cref="OpportunisticPrune.BatchSize"/>
+    /// eligible documents, then one <c>deleteMany</c> of those ids — the PostgreSQL
+    /// (<c>ctid … LIMIT</c>) and SQL Server (<c>DELETE TOP</c>) shape. A single unbounded
+    /// <c>deleteMany</c> was the whole drain in one statement: the first publish after
+    /// <c>DeadLetterRetention</c> was enabled over a large retained backlog waited for all of it
+    /// (with no socket timeout by default), and the drain's budget, checked between batches,
+    /// never applied.
     /// </summary>
     private async Task<int> PruneDeadLetterBatchAsync(TimeSpan retention, CancellationToken cancellationToken)
     {
-        // Same binary collation as the claim: under a folding collection collation this prune
-        // matched live-queue documents whose name differed only by case.
-        var result = await _messages.DeleteManyAsync(
-            BuildDeadLetterPruneFilter(_options.DeadLetterQueue, retention),
+        // Same binary collation as the claim, on the lookup and the delete alike: under a folding
+        // collection collation this prune matched live-queue documents whose name differed only
+        // by case. The delete re-applies the eligibility filter to the ids it was handed.
+        var eligible = BuildDeadLetterPruneFilter(_options.DeadLetterQueue, retention);
+        var ids = await _leaseMessages.Find(eligible, new FindOptions { Collation = Collation.Simple })
+            .Project(item => item.Id)
+            .Limit(OpportunisticPrune.BatchSize)
+            .ToListAsync(cancellationToken).ConfigureAwait(false);
+        if (ids.Count == 0)
+            return 0;
+
+        var result = await _leaseMessages.DeleteManyAsync(
+            Builders<MongoTransportMessageDocument>.Filter.In(item => item.Id, ids) & eligible,
             new DeleteOptions { Collation = Collation.Simple },
             cancellationToken).ConfigureAwait(false);
-        return result.IsAcknowledged ? (int)Math.Min(result.DeletedCount, int.MaxValue) : 0;
+        return result.IsAcknowledged ? (int)result.DeletedCount : 0;
     }
 
     /// <summary>

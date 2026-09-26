@@ -175,13 +175,21 @@ public static class AsyncResponseDiagnostics
         return activity;
     }
 
+    /// <summary>
+    /// Tags the correlation id. On the consuming side it is stream-written text tagged before any
+    /// validation (the response ingress tags the id as extracted, ahead of its routability check;
+    /// the worker ingress tags the envelope's id, which only the executor checks later), so it is
+    /// bounded and escaped like the worker names below: never megabytes of raw text or its line
+    /// breaks copied into a trace backend. A portable id without backslashes or bidi controls is
+    /// tagged unchanged, without allocating.
+    /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal static void SetCorrelationId(Activity? activity, string? correlationId)
     {
         if (activity is null || string.IsNullOrWhiteSpace(correlationId))
             return;
 
-        activity.SetTag("asyncresponse.correlation_id", correlationId);
+        activity.SetTag("asyncresponse.correlation_id", DiagnosticText.EscapedExcerpt(correlationId, AsyncResponseChannelOptions.MaxCorrelationIdLength));
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -193,14 +201,26 @@ public static class AsyncResponseDiagnostics
         activity.SetTag("asyncresponse.payload_type", payloadType.FullName ?? payloadType.Name);
     }
 
+    /// <summary>
+    /// Tags the reply target. Its members come off the worker stream (and ride ambiently into
+    /// every enqueue a job makes), checked only for blankness: bounded and escaped like the
+    /// worker names below. An ordinary name is tagged unchanged.
+    /// </summary>
     internal static void SetReplyTarget(Activity? activity, AsyncResponseReplyTarget? replyTarget)
     {
-        if (replyTarget is null)
+        if (activity is null || replyTarget is null)
             return;
 
-        activity?.SetTag("asyncresponse.reply_target.name", replyTarget.Name);
-        activity?.SetTag("asyncresponse.reply_target.transport", replyTarget.Transport);
+        activity.SetTag("asyncresponse.reply_target.name", replyTarget.Name is { } name
+            ? DiagnosticText.EscapedExcerpt(name, MaxTaggedReplyTargetMemberLength)
+            : null);
+        activity.SetTag("asyncresponse.reply_target.transport", replyTarget.Transport is { } transport
+            ? DiagnosticText.EscapedExcerpt(transport, MaxTaggedReplyTargetMemberLength)
+            : null);
     }
+
+    /// <summary>Longest reply-target member tagged whole.</summary>
+    private const int MaxTaggedReplyTargetMemberLength = 256;
 
     /// <summary>
     /// Tags the worker target. On the consuming side these names come off the worker stream,

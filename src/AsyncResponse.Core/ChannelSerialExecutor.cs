@@ -54,7 +54,10 @@ internal sealed class ChannelSerialExecutor : IAsyncDisposable
     /// <summary>
     /// The single consumer: pulls work items in FIFO order and runs them one at a time. A work item
     /// that throws is logged and swallowed so the loop stays alive for the rest of the queue —
-    /// exactly the resilience the old ActionBlock body provided.
+    /// exactly the resilience the old ActionBlock body provided. The loop's own log lines go
+    /// through <see cref="SafeLog"/>: a throwing logging provider escaping here ended the loop,
+    /// and every item queued behind it — the correlation id's later deliveries and its waiter's
+    /// drain marker — sat accepted in a queue nothing read again.
     /// </summary>
     private async Task DrainAsync()
     {
@@ -65,8 +68,11 @@ internal sealed class ChannelSerialExecutor : IAsyncDisposable
             {
                 Interlocked.Decrement(ref _pending);
 
-                if (_logger.IsEnabled(LogLevel.Debug))
-                    _logger.LogDebug("Channel executor starting work for {Channel} (pending {PendingCount}).", _channel, PendingCount);
+                SafeLog.Try(this, static self =>
+                {
+                    if (self._logger.IsEnabled(LogLevel.Debug))
+                        self._logger.LogDebug("Channel executor starting work for {Channel} (pending {PendingCount}).", self._channel, self.PendingCount);
+                });
 
                 try
                 {
@@ -74,19 +80,26 @@ internal sealed class ChannelSerialExecutor : IAsyncDisposable
                 }
                 catch (Exception ex)
                 {
-                    _logger.LogError(ex, "Channel executor error for {Channel} (pending {PendingCount}).", _channel, PendingCount);
                     // swallow, so the loop stays alive
+                    SafeLog.Try((Self: this, Error: ex), static state => state.Self._logger.LogError(
+                        state.Error, "Channel executor error for {Channel} (pending {PendingCount}).", state.Self._channel, state.Self.PendingCount));
                 }
                 finally
                 {
-                    if (_logger.IsEnabled(LogLevel.Debug))
-                        _logger.LogDebug("Channel executor completed work for {Channel} (pending {PendingCount}).", _channel, PendingCount);
+                    SafeLog.Try(this, static self =>
+                    {
+                        if (self._logger.IsEnabled(LogLevel.Debug))
+                            self._logger.LogDebug("Channel executor completed work for {Channel} (pending {PendingCount}).", self._channel, self.PendingCount);
+                    });
                 }
             }
         }
 
-        if (_logger.IsEnabled(LogLevel.Debug))
-            _logger.LogDebug("Channel {Channel} executor completed (pending {PendingCount}).", _channel, PendingCount);
+        SafeLog.Try(this, static self =>
+        {
+            if (self._logger.IsEnabled(LogLevel.Debug))
+                self._logger.LogDebug("Channel {Channel} executor completed (pending {PendingCount}).", self._channel, self.PendingCount);
+        });
     }
 
     /// <summary>
@@ -109,8 +122,7 @@ internal sealed class ChannelSerialExecutor : IAsyncDisposable
         try
         {
             await _queue.Writer.WriteAsync(work, cancellationToken).ConfigureAwait(false);
-            if (_logger.IsEnabled(LogLevel.Debug))
-                _logger.LogDebug("Channel executor enqueued work for {Channel} (pending {PendingCount}).", _channel, PendingCount);
+            LogEnqueued();
             return true;
         }
         catch (ChannelClosedException)
@@ -138,33 +150,51 @@ internal sealed class ChannelSerialExecutor : IAsyncDisposable
         Interlocked.Increment(ref _pending);
         if (_queue.Writer.TryWrite(work))
         {
-            if (_logger.IsEnabled(LogLevel.Debug))
-                _logger.LogDebug("Channel executor enqueued work for {Channel} (pending {PendingCount}).", _channel, PendingCount);
+            LogEnqueued();
             return true;
         }
 
         Interlocked.Decrement(ref _pending);
-        if (logIfFull)
-            _logger.LogWarning("Channel executor could not enqueue work for {Channel}; queue is full or completed (pending {PendingCount}).", _channel, PendingCount);
-        else if (_logger.IsEnabled(LogLevel.Debug))
-            _logger.LogDebug("Channel executor for {Channel} is at capacity (pending {PendingCount}); the producer will retry later.", _channel, PendingCount);
+        SafeLog.Try((Self: this, LogIfFull: logIfFull), static state =>
+        {
+            if (state.LogIfFull)
+                state.Self._logger.LogWarning("Channel executor could not enqueue work for {Channel}; queue is full or completed (pending {PendingCount}).", state.Self._channel, state.Self.PendingCount);
+            else if (state.Self._logger.IsEnabled(LogLevel.Debug))
+                state.Self._logger.LogDebug("Channel executor for {Channel} is at capacity (pending {PendingCount}); the producer will retry later.", state.Self._channel, state.Self.PendingCount);
+        });
         return false;
     }
+
+    // The item is already queued when this runs: a throwing logging provider must not report the
+    // accepted item as a failed enqueue (the caller would retry or fault a delivery that will run).
+    private void LogEnqueued() => SafeLog.Try(this, static self =>
+    {
+        if (self._logger.IsEnabled(LogLevel.Debug))
+            self._logger.LogDebug("Channel executor enqueued work for {Channel} (pending {PendingCount}).", self._channel, self.PendingCount);
+    });
 
     /// <summary>
     /// Signals that no more work items will be posted and waits for queued work to complete.
     /// </summary>
     public async ValueTask DisposeAsync()
     {
-        if (_logger.IsEnabled(LogLevel.Debug))
-            _logger.LogDebug("Disposing channel executor for {Channel} (pending {PendingCount}).", _channel, PendingCount);
-
         // Complete the writer so the reader drains the remaining items and the loop exits; then wait
-        // for the loop to finish so callers can rely on all queued work having run.
+        // for the loop to finish so callers can rely on all queued work having run. The writer is
+        // completed before anything is logged: a throwing provider must not skip it and leave the
+        // reader loop parked forever.
         _queue.Writer.TryComplete();
+        SafeLog.Try(this, static self =>
+        {
+            if (self._logger.IsEnabled(LogLevel.Debug))
+                self._logger.LogDebug("Disposing channel executor for {Channel} (pending {PendingCount}).", self._channel, self.PendingCount);
+        });
+
         await _readerLoop.ConfigureAwait(false);
 
-        if (_logger.IsEnabled(LogLevel.Debug))
-            _logger.LogDebug("Disposed channel executor for {Channel} (pending {PendingCount}).", _channel, PendingCount);
+        SafeLog.Try(this, static self =>
+        {
+            if (self._logger.IsEnabled(LogLevel.Debug))
+                self._logger.LogDebug("Disposed channel executor for {Channel} (pending {PendingCount}).", self._channel, self.PendingCount);
+        });
     }
 }

@@ -135,20 +135,89 @@ public sealed class InMemoryWorkerTransport : IWorkerTransport, IDelayedWorkerTr
     /// parked meanwhile, which is the backpressure the capacity exists to apply.
     /// <para>
     /// Under the pump gate: an unguarded dequeue between a pumper's peek and its dequeue would run
-    /// one job twice and drop the next.
+    /// one job twice and drop the next. The job is counted as started under the same gate, and
+    /// none is handed out once a simulated restart has closed starts (<see cref="StopStartingJobs"/>).
     /// </para>
     /// </summary>
     internal bool TryTakeOverflow(out QueuedJob queued)
     {
         lock (_overflowPumpGate)
         {
-            if (!_overflow.TryDequeue(out queued))
+            queued = default;
+            if (_startsClosed || !_overflow.TryDequeue(out queued))
                 return false;
 
             Interlocked.Decrement(ref _overflowDepth);
+            OnJobStarted();
             return true;
         }
     }
+
+    /// <summary>
+    /// Starts a job a worker just read from the queue — counted in <see cref="ExecutingJobs"/> —
+    /// unless a simulated restart has closed starts (<see cref="StopStartingJobs"/>): the job is
+    /// then held back, still outstanding, for <see cref="TakeUnstartedJobs"/> to carry over. Under
+    /// the pump gate, so a read racing the restart's take either started before the starts closed
+    /// (and the restart's quiescence check counts it) or is held back — never started behind it.
+    /// </summary>
+    internal bool TryStartJob(QueuedJob queued)
+    {
+        lock (_overflowPumpGate)
+        {
+            if (_startsClosed)
+            {
+                (_heldBack ??= []).Add(queued);
+                return false;
+            }
+
+            OnJobStarted();
+            return true;
+        }
+    }
+
+    /// <summary>
+    /// AsyncResponse.Testing only: set once a simulated restart has stopped this incarnation. From
+    /// then on no worker starts another job — not one read from the queue (held back instead, see
+    /// <see cref="TryStartJob"/>), not one from the overflow — until the restart's final
+    /// <see cref="TakeUnstartedJobs"/> reopens starts. Without it a worker freed after the stop (a
+    /// lingering execution ending, a park ended by a background reply) read a job beside the
+    /// restart's take and ran it in the dying incarnation, against a provider disposed a moment
+    /// later — failing on every attempt and dropped, never carried over. Under the pump gate.
+    /// </summary>
+    private bool _startsClosed;
+    private List<QueuedJob>? _heldBack;
+
+    /// <summary>Jobs a worker read after a simulated restart closed starts (test inspection).</summary>
+    internal int HeldBackJobs
+    {
+        get { lock (_overflowPumpGate) return _heldBack?.Count ?? 0; }
+    }
+
+    /// <summary>
+    /// AsyncResponse.Testing only: closes starts (see <see cref="_startsClosed"/>). Called before
+    /// the restart's quiescence check, so every execution that could still run user code in this
+    /// incarnation is one the check counts.
+    /// </summary>
+    internal void StopStartingJobs()
+    {
+        lock (_overflowPumpGate)
+            _startsClosed = true;
+    }
+
+    /// <summary>
+    /// AsyncResponse.Testing only: set by a simulated restart before it stops this incarnation,
+    /// whose stop models a crash. A job whose retry backoff the stop interrupts is then dropped —
+    /// its crashed attempt dies with the incarnation — instead of retrying during the drain, as a
+    /// production host stop lets a job with attempts left do. Retried there, the flow's next steps
+    /// ran in the dying incarnation, inside the restart, and a crash-then-restart test could no
+    /// longer assert that nothing ran before its explicit resume.
+    /// </summary>
+    internal bool DropsInterruptedBackoffs => _dropInterruptedBackoffs;
+
+    private volatile bool _dropInterruptedBackoffs;
+
+    /// <summary>AsyncResponse.Testing only: see <see cref="DropsInterruptedBackoffs"/>.</summary>
+    internal void DropInterruptedBackoffs() => _dropInterruptedBackoffs = true;
 
     /// <summary>
     /// Admits a follow-up job to the overflow if it is under its capacity. The depth is reserved
@@ -187,9 +256,36 @@ public sealed class InMemoryWorkerTransport : IWorkerTransport, IDelayedWorkerTr
         /// call). Run replaces ambient AsyncLocal state wholesale with the captured snapshot, so a
         /// flag raised outside it never reaches the handler at all. Nothing clears it: Run restores
         /// the caller's context when it returns, and the no-context path raises it on a flow that
-        /// ends with the job.
+        /// ends with the job. It also clears <see cref="TimerAttribution"/>, scoped the same way:
+        /// a job is never part of the operation that enqueued it.
         /// </summary>
-        public static void MarkActive() => _active.Value = true;
+        public static void MarkActive()
+        {
+            _active.Value = true;
+            TimerAttribution.Current = null;
+        }
+    }
+
+    /// <summary>
+    /// AsyncResponse.Testing only: the operation that virtual timers created on the ambient flow
+    /// are attributed to — a pending harness publish, which drives the clock to the timers it armed
+    /// itself (its callbacks' retry backoffs). Always <c>null</c> in production. Kept here rather
+    /// than in the testing kit because this transport is what must clear it: every job captures its
+    /// enqueuer's ExecutionContext, so a job a recovery callback enqueued inside the publish — a
+    /// flow run, a delayed job — inherited the attribution, and the publish drove the clock to that
+    /// job's lease renewals, step timeouts or due time, firing every unrelated timer in between.
+    /// Cleared when a job starts (<see cref="InJobScope.MarkActive"/>) and suspended while a delayed
+    /// job's due-time timer is armed.
+    /// </summary>
+    internal static class TimerAttribution
+    {
+        private static readonly AsyncLocal<object?> _owner = new();
+
+        public static object? Current
+        {
+            get => _owner.Value;
+            set => _owner.Value = value;
+        }
     }
     internal ILogger? DrainLogger { get; set; }
 
@@ -214,8 +310,10 @@ public sealed class InMemoryWorkerTransport : IWorkerTransport, IDelayedWorkerTr
     /// The part of <see cref="BackingOffJobs"/> asleep in a backoff taken DURING the shutdown
     /// drain — the only backoff that is a wait on the transport's clock through a stop, rather
     /// than user code (test-harness quiescence probe). A backoff taken before the stop is bound to
-    /// the host's stopping token: it ends the moment the host's stop begins and drops its job, so
-    /// the stop still makes progress past it.
+    /// the host's stopping token: it ends the moment the host's stop begins — its job then retries
+    /// at once when attempts are bounded (and a failure there is a drain backoff), or is dropped
+    /// when they are not or a simulated restart stops the host (<see cref="DropsInterruptedBackoffs"/>)
+    /// — so the stop still makes progress past it.
     /// </summary>
     internal int DrainBackingOffJobs => Volatile.Read(ref _drainBackingOff);
 
@@ -281,15 +379,19 @@ public sealed class InMemoryWorkerTransport : IWorkerTransport, IDelayedWorkerTr
     /// transport is draining (a flow suspending mid-drain) is retained instead of rejected —
     /// modeling the broker that keeps scheduled messages across a redeploy. A snapshot taken
     /// before the stop cannot do this: it misses both the drain-time publishes and any job armed
-    /// between the snapshot and the drain. Read the list only after the stop has completed.
+    /// between the snapshot and the drain. Read the list only after the stop has completed. Each
+    /// entry keeps the <see cref="ExecutionContext"/> its publisher captured, so a retained job
+    /// still runs under the ambient state it was scheduled under after the restart re-schedules
+    /// it — like a job that never started (<see cref="TakeUnstartedJobs"/>), and unlike an
+    /// envelope alone, which re-scheduling captured under the restart caller's context instead.
     /// </summary>
-    internal List<WorkerJobEnvelope> BeginRetainingDelayedJobs()
+    internal List<QueuedJob> BeginRetainingDelayedJobs()
     {
         lock (_delayedGate)
             return _drainRetention ??= [];
     }
 
-    private List<WorkerJobEnvelope>? _drainRetention;
+    private List<QueuedJob>? _drainRetention;
 
     /// <summary>
     /// AsyncResponse.Testing only: takes what the drain retained so far (see
@@ -297,14 +399,14 @@ public sealed class InMemoryWorkerTransport : IWorkerTransport, IDelayedWorkerTr
     /// under — an execution the restart abandoned can still suspend and append after the stop, and
     /// enumerating the live list beside that append could throw or lose an entry.
     /// </summary>
-    internal WorkerJobEnvelope[] TakeRetainedDelayedJobs()
+    internal QueuedJob[] TakeRetainedDelayedJobs()
     {
         lock (_delayedGate)
         {
             if (_drainRetention is not { Count: > 0 } retained)
                 return [];
 
-            WorkerJobEnvelope[] taken = [.. retained];
+            QueuedJob[] taken = [.. retained];
             retained.Clear();
             return taken;
         }
@@ -319,34 +421,47 @@ public sealed class InMemoryWorkerTransport : IWorkerTransport, IDelayedWorkerTr
     /// waiting for a slot here meant waiting for a timer to fire on a virtual clock that cannot
     /// move while the test is inside the restart — a hang with no guard. A broker keeps every
     /// scheduled message regardless of a consumer's in-process bound, which is what this models.
+    /// The job keeps the <see cref="ExecutionContext"/> its publisher captured
+    /// (<see cref="BeginRetainingDelayedJobs"/>).
     /// </summary>
-    internal void ScheduleRetained(WorkerJobEnvelope job, TimeSpan delay)
+    internal void ScheduleRetained(QueuedJob queued, TimeSpan delay)
     {
-        ArgumentNullException.ThrowIfNull(job);
+        ArgumentNullException.ThrowIfNull(queued.Job);
         if (delay <= TimeSpan.Zero || delay > MaxPublishDelay)
             throw new ArgumentOutOfRangeException(nameof(delay), delay, $"Delay must be positive and at most {MaxPublishDelay.TotalDays:0.#} days (the .NET timer ceiling).");
 
-        ScheduleDelayed(job, delay, holdsSlot: _delayedSlots.Wait(0));
+        ScheduleDelayed(queued, delay, holdsSlot: _delayedSlots.Wait(0));
     }
 
     /// <summary>
-    /// AsyncResponse.Testing only: takes every job still waiting for a worker — queued, or held
-    /// in the overflow — out of this transport, for a simulated restart to carry over (a stop cut
-    /// short behind a park leaves them there). None of them ever started, so re-admitting them
-    /// into the next incarnation cannot run anything twice; taking them OUT keeps a worker of this
-    /// incarnation that frees up later (an abandoned park ending) from running them as well. Each
-    /// is finished here, so the outstanding count — and the drain's writer completion — stays exact.
-    /// Each keeps its enqueuer's captured <see cref="ExecutionContext"/>, so a carried-over job
-    /// still sees the ambient state it was published under.
+    /// AsyncResponse.Testing only: takes every job still waiting for a worker — held back by a
+    /// worker after starts closed, queued, or held in the overflow — out of this transport, for a
+    /// simulated restart to carry over (a stop cut short behind a park leaves them there). None of
+    /// them ever started, so re-admitting them into the next incarnation cannot run anything twice;
+    /// taking them OUT keeps a worker of this incarnation that frees up later (an abandoned park
+    /// ending) from running them as well. Each is finished here, so the outstanding count — and the
+    /// drain's writer completion — stays exact. Each keeps its enqueuer's captured
+    /// <see cref="ExecutionContext"/>, so a carried-over job still sees the ambient state it was
+    /// published under. Starts stay closed (<see cref="StopStartingJobs"/>) unless
+    /// <paramref name="reopen"/> — the restart's final take, once the provider is gone: whatever a
+    /// zombie publishes after that runs here as before and fails loudly against the disposed
+    /// provider, instead of waiting unseen for a take that never comes.
     /// </summary>
-    internal QueuedJob[] TakeUnstartedJobs()
+    internal QueuedJob[] TakeUnstartedJobs(bool reopen = false)
     {
         List<QueuedJob>? taken = null;
 
         // Under the pump gate: a finishing worker pumping the overflow into the queue between the
-        // two loops would otherwise move a job past both.
+        // two loops would otherwise move a job past both — and a worker reading the queue starts
+        // (or holds back) its job under the same gate.
         lock (_overflowPumpGate)
         {
+            if (_heldBack is { Count: > 0 } heldBack)
+            {
+                (taken ??= []).AddRange(heldBack);
+                heldBack.Clear();
+            }
+
             while (_queue.Reader.TryRead(out var queued))
                 (taken ??= []).Add(queued);
 
@@ -355,6 +470,8 @@ public sealed class InMemoryWorkerTransport : IWorkerTransport, IDelayedWorkerTr
                 Interlocked.Decrement(ref _overflowDepth);
                 (taken ??= []).Add(followUp);
             }
+
+            _startsClosed = !reopen;
         }
 
         if (taken is null)
@@ -372,17 +489,8 @@ public sealed class InMemoryWorkerTransport : IWorkerTransport, IDelayedWorkerTr
     /// for queue room: past the capacity it joins the overflow, whatever that holds. A publish
     /// waiting for room hangs the restart whenever this incarnation's workers are all parked on
     /// waits only the test can end; the previous incarnation held these jobs already, and a
-    /// broker keeps every message it holds.
-    /// </summary>
-    internal void Readmit(WorkerJobEnvelope job)
-    {
-        ArgumentNullException.ThrowIfNull(job);
-        Readmit(new QueuedJob(job, ExecutionContext.Capture()));
-    }
-
-    /// <summary>
-    /// <see cref="Readmit(WorkerJobEnvelope)"/> for a job taken with <see cref="TakeUnstartedJobs"/>,
-    /// under the <see cref="ExecutionContext"/> its enqueuer captured.
+    /// broker keeps every message it holds. The job runs under the <see cref="ExecutionContext"/>
+    /// its enqueuer captured (<see cref="TakeUnstartedJobs"/>, <see cref="BeginRetainingDelayedJobs"/>).
     /// </summary>
     internal void Readmit(QueuedJob queued)
     {
@@ -410,9 +518,10 @@ public sealed class InMemoryWorkerTransport : IWorkerTransport, IDelayedWorkerTr
     /// <para>
     /// Pending DELAYED jobs are different: their due time may be days away, and holding shutdown
     /// for them would hang the host. They are dropped with a warning — the in-memory transport is
-    /// process-local by contract, so delayed jobs share the process's lifetime. A durable flow
-    /// sleeping on such a wake-up must be resumed explicitly after restart (or use a broker
-    /// transport, whose delayed messages survive). The test harness opts out of the drop via
+    /// process-local by contract, so delayed jobs share the process's lifetime — and so is one a
+    /// job the drain runs publishes (a flow suspending on a timer mid-drain), whose park then
+    /// commits. A durable flow sleeping on such a wake-up must be resumed explicitly after restart
+    /// (or use a broker transport, whose delayed messages survive). The test harness opts out of the drop via
     /// <see cref="BeginRetainingDelayedJobs"/> and re-publishes the retained jobs into the next
     /// incarnation.
     /// </para>
@@ -422,7 +531,7 @@ public sealed class InMemoryWorkerTransport : IWorkerTransport, IDelayedWorkerTr
         _draining = true;
 
         KeyValuePair<DelayedJob, ITimer>[] pending;
-        List<WorkerJobEnvelope>? retention;
+        List<QueuedJob>? retention;
         lock (_delayedGate)
         {
             pending = [.. _delayedJobs];
@@ -435,7 +544,7 @@ public sealed class InMemoryWorkerTransport : IWorkerTransport, IDelayedWorkerTr
             if (retention is not null)
             {
                 foreach (var (job, _) in pending)
-                    retention.Add(job.Envelope);
+                    retention.Add(job.Queued);
             }
         }
 
@@ -583,7 +692,7 @@ public sealed class InMemoryWorkerTransport : IWorkerTransport, IDelayedWorkerTr
                     "make its publishes idempotent, or raise the capacity.");
             }
 
-            ScheduleDelayed(job, delay);
+            ScheduleDelayed(new QueuedJob(job, ExecutionContext.Capture()), delay);
             return Task.CompletedTask;
         }
 
@@ -596,16 +705,18 @@ public sealed class InMemoryWorkerTransport : IWorkerTransport, IDelayedWorkerTr
         // publishes: the wait ends when a scheduled job fires and enters the queue, a drain drops
         // the scheduled set, or the caller's token cancels.
         await _delayedSlots.WaitAsync(cancellationToken).ConfigureAwait(false);
-        ScheduleDelayed(job, delay);
+        ScheduleDelayed(new QueuedJob(job, ExecutionContext.Capture()), delay);
     }
 
     /// <summary>
     /// Arms the timer for a job whose slot is already reserved (or, for
     /// <see cref="ScheduleRetained"/> only, one scheduled without a slot:
     /// <paramref name="holdsSlot"/> <c>false</c>); releases the slot when the job cannot be armed.
+    /// The job runs under <paramref name="queued"/>'s captured context when it fires.
     /// </summary>
-    private void ScheduleDelayed(WorkerJobEnvelope job, TimeSpan delay, bool holdsSlot = true)
+    private void ScheduleDelayed(QueuedJob queued, TimeSpan delay, bool holdsSlot = true)
     {
+        var job = queued.Job;
         using var activity = AsyncResponseDiagnostics.StartActivity(
             "asyncresponse.worker.publish",
             ActivityKind.Producer,
@@ -615,7 +726,7 @@ public sealed class InMemoryWorkerTransport : IWorkerTransport, IDelayedWorkerTr
         AsyncResponseDiagnostics.SetReplyTarget(activity, job.ReplyTarget);
         AsyncResponseDiagnostics.SetWorker(activity, job.Call);
 
-        var delayed = new DelayedJob(this, new QueuedJob(job, ExecutionContext.Capture()), holdsSlot);
+        var delayed = new DelayedJob(this, queued, holdsSlot);
         lock (_delayedGate)
         {
             if (_draining)
@@ -625,16 +736,34 @@ public sealed class InMemoryWorkerTransport : IWorkerTransport, IDelayedWorkerTr
 
                 // Harness restart: a flow suspending mid-drain parks its wake-up with "the
                 // broker" instead of faulting the draining job (and stalling the stop on the
-                // redelivery backoff).
+                // redelivery backoff) — with its publisher's captured context, which the restart
+                // re-schedules it under.
                 if (_drainRetention is { } retained)
                 {
-                    retained.Add(job);
+                    retained.Add(delayed.Queued);
                     return;
                 }
 
                 // Same contract as the shutdown drain below: delayed in-memory jobs share the
                 // process lifetime, and a publish racing shutdown is dropped loudly, not queued
                 // onto a channel that will complete underneath it.
+                if (InJobScope.IsActive)
+                {
+                    // Published by a job the drain is running — a durable flow suspending on a
+                    // timer. A throw here failed that job: its park became a failed attempt, the
+                    // drain's retry ladder replayed the flow up to MaxDeliveryAttempts times (each
+                    // failing the same way, re-running whatever followed its last checkpoint) and
+                    // then dropped it with an Error. The wake-up is dropped exactly as if it had
+                    // been armed a moment before the drain began, and the park it belongs to
+                    // commits: the flow is left sleeping, to be resumed explicitly after restart.
+                    // SafeLog: this arm returns, so a logging provider that throws must not turn
+                    // it back into a failure.
+                    SafeLog.Try((Logger: DrainLogger, job.Call), static state => state.Logger?.LogWarning(
+                        "Dropping delayed in-memory worker job {Target}.{Method} published by a job during the shutdown drain; in-memory delayed jobs do not survive the process. A durable flow waiting on this wake-up must be resumed explicitly after restart.",
+                        state.Call.ServiceInterfaceFullName, state.Call.MethodName));
+                    return;
+                }
+
                 DrainLogger?.LogWarning(
                     "Rejecting delayed in-memory worker job {Target}.{Method} published during shutdown; in-memory delayed jobs do not survive the process.",
                     job.Call.ServiceInterfaceFullName, job.Call.MethodName);
@@ -643,7 +772,11 @@ public sealed class InMemoryWorkerTransport : IWorkerTransport, IDelayedWorkerTr
 
             // The timer is created inside the gate so a concurrent drain either sees it in the map
             // (and disposes it) or the publish observed _draining above. One-shot; Fire removes it.
+            // Never attributed to a harness publish that scheduled it (TimerAttribution): its due
+            // time may be hours away.
             ITimer timer;
+            var attribution = TimerAttribution.Current;
+            TimerAttribution.Current = null;
             try
             {
                 timer = _timeProvider.CreateTimer(static state => ((DelayedJob)state!).Fire(), delayed, delay, Timeout.InfiniteTimeSpan);
@@ -657,6 +790,10 @@ public sealed class InMemoryWorkerTransport : IWorkerTransport, IDelayedWorkerTr
                 // once they were gone every delayed publish was rejected or blocked forever.
                 delayed.ReleaseSlot();
                 throw;
+            }
+            finally
+            {
+                TimerAttribution.Current = attribution;
             }
 
             _delayedJobs.Add(delayed, timer);
@@ -944,6 +1081,10 @@ internal sealed class InMemoryWorkerHost(
         // is empty, never by abandoning accepted jobs mid-queue.
         await foreach (var queued in _transport.Reader.ReadAllAsync().ConfigureAwait(false))
         {
+            // Counted as started under the pump gate — or held back for a simulated restart.
+            if (!_transport.TryStartJob(queued))
+                continue;
+
             await RunJobAsync(queued, stoppingToken).ConfigureAwait(false);
 
             // Follow-up work first: whatever the pump could not place in the queue is run here,
@@ -965,9 +1106,9 @@ internal sealed class InMemoryWorkerHost(
         }
     }
 
+    /// <summary>Runs a job the transport already counted as started (TryStartJob / TryTakeOverflow).</summary>
     private async Task RunJobAsync(InMemoryWorkerTransport.QueuedJob queued, CancellationToken stoppingToken)
     {
-        _transport.OnJobStarted();
         try
         {
             // Every log call on this path goes through SafeLog: a logging provider that throws
@@ -1013,9 +1154,11 @@ internal sealed class InMemoryWorkerHost(
     /// strand a flow that a broker-backed transport would have recovered. Retries deliberately
     /// run during the shutdown drain too: accepted jobs were promised in-process execution, and
     /// the retry budget is bounded when attempts are. The backoff SLEEP is not: a stop request
-    /// during it drops the failing job (loudly) so the jobs queued behind it still drain. A
-    /// delivery the flow engine hands back at host stop (<see cref="DurableFlowInterruptedException"/>)
-    /// is not a failure at all and is never retried.
+    /// ends it — a bounded job then retries at once, riding the drain's capped backoff from there,
+    /// while an unlimited one (<c>0</c>) is dropped (loudly) so the jobs queued behind it still
+    /// drain; a simulated restart's stop drops a bounded one too
+    /// (<see cref="InMemoryWorkerTransport.DropsInterruptedBackoffs"/>). A delivery the flow engine hands back at host stop
+    /// (<see cref="DurableFlowInterruptedException"/>) is not a failure at all and is never retried.
     /// </summary>
     private async Task ExecuteWithRedeliveryAsync(InMemoryWorkerTransport.QueuedJob queued, CancellationToken stoppingToken)
     {
@@ -1089,6 +1232,24 @@ internal sealed class InMemoryWorkerHost(
                     // Without the token this sleep parked the (single, by default) worker for up to
                     // RetryMaxDelay per attempt through the whole shutdown drain, and every job
                     // queued behind the failing one was lost when the bounded stop returned.
+                    // A simulated restart's stop models a crash and drops it like an unlimited
+                    // job (DropsInterruptedBackoffs).
+                    if (options.MaxDeliveryAttempts > 0 && !_transport.DropsInterruptedBackoffs)
+                    {
+                        // Bounded attempts keep what is left of their budget, exactly as a failure
+                        // one moment later — during the drain — would: the next attempt runs now,
+                        // and a failure there takes the drain's capped backoff above. Dropping here
+                        // lost the remaining attempts of a job the drain promised to run, and
+                        // stranded the durable flow behind it, for a failure that merely happened
+                        // just before the stop instead of just after it.
+                        SafeLog.Try((Logger: _logger, Error: ex, queued.Job.Call, Attempt: attempt), static state => state.Logger.LogWarning(state.Error,
+                            "In-memory worker job {Target}.{Method} failed on attempt {Attempt} and host shutdown interrupted its retry backoff; retrying it now, during the shutdown drain.",
+                            state.Call.ServiceInterfaceFullName, state.Call.MethodName, state.Attempt));
+                        continue;
+                    }
+
+                    // Unlimited retries (or a simulated crash): nothing bounds the ladder, so the
+                    // stop drops the job to let the jobs queued behind it drain.
                     SafeLog.Try((Logger: _logger, Error: ex, queued.Job.Call, Attempt: attempt), static state => state.Logger.LogError(state.Error,
                         "In-memory worker job {Target}.{Method} failed on attempt {Attempt} and host shutdown interrupted its retry backoff; dropping it so the jobs queued behind it can drain. A durable flow waiting on this job must be recovered or resumed explicitly.",
                         state.Call.ServiceInterfaceFullName, state.Call.MethodName, state.Attempt));

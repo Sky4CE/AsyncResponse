@@ -1018,6 +1018,346 @@ public class RedisDispatcherTests
         Assert.Equal(defaultDrain, options.BackgroundDrainTimeout);
     }
 
+    /// <summary>
+    /// Fixpoint round 2 (GS4#1). The early-ACK dispatcher spent its whole drain budget joining the
+    /// workers and then returned: an entry still queued behind a slow handler — ACKed at enqueue,
+    /// so Redis never redelivers it — was dead-lettered and reported only once some worker came
+    /// free, after the stop had already moved on to tearing the multiplexer down or exiting. The
+    /// budget is now split (NATS/DB parity): three quarters drain, and the reserved quarter buries
+    /// and reports what is still queued before DisposeAsync returns. Pre-fix: nothing for 2-0
+    /// until the first handler is released.
+    /// </summary>
+    [Fact]
+    public async Task Queued_DrainLapse_DeadLettersAndReportsTheStillQueuedEntry_BeforeDisposeReturns()
+    {
+        var database = new RedisTransportTests.FakeRedisStreamDatabase();
+        var firstStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseFirst = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var failures = new List<RedisBackgroundFailureContext>();
+        var logger = new RecordingThrowingLogger<RedisDispatcherTests>();
+        // A 4 s drain leaves a 1 s reserve for the burial and its report (the fakes complete
+        // synchronously; a 250 ms reserve failed only on a GC pause or preemption).
+        var options = new RedisSubscriberOptions().UseAckAfterEnqueue(1, 8, TimeSpan.FromSeconds(4));
+        options.OnBackgroundFailure = context =>
+        {
+            lock (failures)
+            {
+                failures.Add(context);
+            }
+
+            return ValueTask.CompletedTask;
+        };
+        var dispatcher = RedisMessageDispatcher.Create(
+            async (_, _) =>
+            {
+                // Ignores the token, like the ingress handler in production.
+                firstStarted.TrySetResult();
+                await releaseFirst.Task.ConfigureAwait(false);
+            },
+            database,
+            new RedisAsyncResponseTransportOptions { DeadLetterStream = "dead" },
+            options,
+            logger,
+            "worker-stream",
+            "worker-group",
+            RedisSubscriberRole.Worker);
+
+        try
+        {
+            await dispatcher.HandleAsync(Delivery("1-0", attempt: 1), CancellationToken.None);
+            await firstStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            await dispatcher.HandleAsync(Delivery("2-0", attempt: 1), CancellationToken.None); // ACKed, queued
+
+            await dispatcher.DisposeAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(10));
+
+            // Before the blocked handler lets go: the reserve did it.
+            var dead = Assert.Single(database.Adds);
+            Assert.Equal("drain_budget_lapsed_after_ack", RedisTransportTests.Field(dead.Values, "reason"));
+            Assert.Equal("2-0", RedisTransportTests.Field(dead.Values, "messageId"));
+            lock (failures)
+            {
+                var reported = Assert.Single(failures);
+                Assert.Equal("2-0", reported.MessageId);
+                Assert.IsAssignableFrom<OperationCanceledException>(reported.Exception);
+            }
+
+            Assert.True(logger.HasEntry(LogLevel.Warning, "Dead-lettered a copy (drain_budget_lapsed_after_ack)"));
+        }
+        finally
+        {
+            releaseFirst.TrySetResult();
+        }
+    }
+
+    /// <summary>
+    /// Fixpoint round 2 (GS4#1): with dead-lettering disabled the reserve still reports the entry,
+    /// and says at Error that no copy exists — never a Warning claiming one.
+    /// </summary>
+    [Fact]
+    public async Task Queued_DrainLapse_WithDeadLetteringDisabled_ReportsTheLossAtError()
+    {
+        var database = new RedisTransportTests.FakeRedisStreamDatabase();
+        var firstStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseFirst = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var reported = new TaskCompletionSource<RedisBackgroundFailureContext>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var logger = new RecordingThrowingLogger<RedisDispatcherTests>();
+        var options = new RedisSubscriberOptions().UseAckAfterEnqueue(1, 8, TimeSpan.FromSeconds(1));
+        options.OnBackgroundFailure = context =>
+        {
+            reported.TrySetResult(context);
+            return ValueTask.CompletedTask;
+        };
+        var dispatcher = RedisMessageDispatcher.Create(
+            async (_, _) =>
+            {
+                firstStarted.TrySetResult();
+                await releaseFirst.Task.ConfigureAwait(false);
+            },
+            database,
+            new RedisAsyncResponseTransportOptions { DeadLetterEnabled = false },
+            options,
+            logger,
+            "worker-stream",
+            "worker-group",
+            RedisSubscriberRole.Worker);
+
+        try
+        {
+            await dispatcher.HandleAsync(Delivery("1-0", attempt: 1), CancellationToken.None);
+            await firstStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            await dispatcher.HandleAsync(Delivery("2-0", attempt: 1), CancellationToken.None);
+
+            await dispatcher.DisposeAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(10));
+
+            Assert.True(reported.Task.IsCompletedSuccessfully);
+            Assert.Equal("2-0", (await reported.Task).MessageId);
+            Assert.Empty(database.Adds);
+            Assert.True(logger.HasEntry(LogLevel.Error, "no dead-letter destination is configured"));
+            Assert.False(logger.HasEntry(LogLevel.Warning, "Dead-lettered a copy"));
+        }
+        finally
+        {
+            releaseFirst.TrySetResult();
+        }
+    }
+
+    /// <summary>
+    /// Fixpoint round 2 (GS4#1): the reserve waits for the user's OnBackgroundFailure callback only
+    /// within itself — a callback that never finishes (an alert stuck on an HTTP timeout) must not
+    /// hold the host's stop past the drain budget. The dead-letter copy is written first either way.
+    /// Red-on-old (fixpoint r2 pre-commit, H1): the reserve buried and reported one entry at a
+    /// time, so the first entry's stuck callback spent the whole reserve and the second entry got
+    /// no dead-letter copy (one XADD, not two). Every entry is now buried before any is reported.
+    /// </summary>
+    [Fact]
+    public async Task Queued_DrainLapse_AStuckCallbackDoesNotHoldDisposePastTheReserve()
+    {
+        var database = new RedisTransportTests.FakeRedisStreamDatabase();
+        var firstStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseFirst = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseCallback = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var callbacks = 0;
+        // A 4 s drain leaves a 1 s reserve: ample for two synchronous burials, spent by the stuck callback.
+        var options = new RedisSubscriberOptions().UseAckAfterEnqueue(1, 8, TimeSpan.FromSeconds(4));
+        options.OnBackgroundFailure = _ =>
+        {
+            Interlocked.Increment(ref callbacks);
+            return new ValueTask(releaseCallback.Task);
+        };
+        var dispatcher = RedisMessageDispatcher.Create(
+            async (_, _) =>
+            {
+                firstStarted.TrySetResult();
+                await releaseFirst.Task.ConfigureAwait(false);
+            },
+            database,
+            new RedisAsyncResponseTransportOptions { DeadLetterStream = "dead" },
+            options,
+            NullLogger.Instance,
+            "worker-stream",
+            "worker-group",
+            RedisSubscriberRole.Worker);
+
+        try
+        {
+            await dispatcher.HandleAsync(Delivery("1-0", attempt: 1), CancellationToken.None);
+            await firstStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            await dispatcher.HandleAsync(Delivery("2-0", attempt: 1), CancellationToken.None);
+            await dispatcher.HandleAsync(Delivery("3-0", attempt: 1), CancellationToken.None);
+
+            // Hang guard only: the bound under test is the 1 s reserve.
+            await dispatcher.DisposeAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(10));
+
+            Assert.Equal(2, database.Adds.Count);
+            Assert.All(database.Adds, add => Assert.Equal("drain_budget_lapsed_after_ack", RedisTransportTests.Field(add.Values, "reason")));
+            Assert.Equal(["2-0", "3-0"], database.Adds.Select(add => RedisTransportTests.Field(add.Values, "messageId")));
+            // Both reports were made; only the reserve bounded how long they were awaited.
+            Assert.Equal(2, Volatile.Read(ref callbacks));
+        }
+        finally
+        {
+            releaseCallback.TrySetResult();
+            releaseFirst.TrySetResult();
+        }
+    }
+
+    public static TheoryData<string, string> EarlyAckFailureArms() => new()
+    {
+        { "hand-back", "handed_back_after_commit" },
+        { "handler failure", "background_handler_failed_after_ack" }
+    };
+
+    /// <summary>
+    /// Fixpoint round 2 (S6a#5). The early-ACK arms awaited the user's OnBackgroundFailure callback
+    /// BEFORE writing the dead-letter copy — the only durable record of an entry Redis will never
+    /// redeliver. A slow callback outlived the drain, the stop tore the multiplexer down, and the
+    /// copy was never written (after a Warning had already claimed it). The copy now comes first
+    /// (NATS/DB parity). Pre-fix: no XADD while the callback is still running.
+    /// </summary>
+    [Theory]
+    [MemberData(nameof(EarlyAckFailureArms))]
+    public async Task Queued_EarlyAckFailureArms_WriteTheDeadLetterCopyBeforeAwaitingTheCallback(string arm, string reason)
+    {
+        var database = new RedisTransportTests.FakeRedisStreamDatabase();
+        var callbackEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseCallback = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var addsSeenByTheCallback = -1;
+        var options = new RedisSubscriberOptions().UseAckAfterEnqueue(1, 8, TimeSpan.FromSeconds(5));
+        options.OnBackgroundFailure = async _ =>
+        {
+            addsSeenByTheCallback = database.Adds.Count;
+            callbackEntered.TrySetResult();
+            await releaseCallback.Task.ConfigureAwait(false);
+        };
+        Exception failure = arm == "hand-back"
+            ? new DurableFlowInterruptedException("Host is stopping; durable flow 'flow-1' wake-up is abandoned for redelivery.")
+            : new InvalidOperationException("background boom");
+        var dispatcher = RedisMessageDispatcher.Create(
+            (_, _) => throw failure,
+            database,
+            new RedisAsyncResponseTransportOptions { DeadLetterStream = "dead" },
+            options,
+            NullLogger.Instance,
+            "worker-stream",
+            "worker-group",
+            RedisSubscriberRole.Worker);
+
+        try
+        {
+            await dispatcher.HandleAsync(Delivery("1-0", attempt: 1), CancellationToken.None);
+            await callbackEntered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+            Assert.Equal(1, addsSeenByTheCallback);
+            Assert.Equal(reason, RedisTransportTests.Field(Assert.Single(database.Adds).Values, "reason"));
+        }
+        finally
+        {
+            releaseCallback.TrySetResult();
+            await dispatcher.DisposeAsync();
+        }
+    }
+
+    /// <summary>
+    /// Fixpoint round 2 (S6a#5): a hand-back whose dead-letter write fails is logged by outcome —
+    /// an Error that the wake-up is lost unless OnBackgroundFailure records it, never the Warning
+    /// that claims a copy.
+    /// </summary>
+    [Fact]
+    public async Task Queued_HostStopHandBack_WhoseDeadLetterWriteFails_LogsTheLossAtError()
+    {
+        var database = new RedisTransportTests.FakeRedisStreamDatabase
+        {
+            AddException = new RedisConnectionException(
+                ConnectionFailureType.UnableToConnect, CommandFlags.None, "deadletter failed", null, CommandStatus.Unknown)
+        };
+        var logger = new RecordingThrowingLogger<RedisDispatcherTests>();
+        var reported = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var options = new RedisSubscriberOptions().UseAckAfterEnqueue(1, 8, TimeSpan.FromSeconds(5));
+        options.OnBackgroundFailure = _ =>
+        {
+            reported.TrySetResult();
+            return ValueTask.CompletedTask;
+        };
+        var dispatcher = RedisMessageDispatcher.Create(
+            (_, _) => throw new DurableFlowInterruptedException("Host is stopping; durable flow 'flow-1' wake-up is abandoned for redelivery."),
+            database,
+            new RedisAsyncResponseTransportOptions { DeadLetterStream = "dead" },
+            options,
+            logger,
+            "worker-stream",
+            "worker-group",
+            RedisSubscriberRole.Worker);
+
+        await dispatcher.HandleAsync(Delivery("1-0", attempt: 1), CancellationToken.None);
+        await reported.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await dispatcher.DisposeAsync();
+
+        Assert.True(logger.HasEntry(LogLevel.Error, "the dead-letter write failed, so the wake-up is lost"));
+        Assert.False(logger.HasEntry(LogLevel.Warning, "Dead-lettered a copy"));
+        Assert.Single(database.Acks); // the enqueue-time ACK only: no copy, so no second XACK
+    }
+
+    /// <summary>
+    /// Fixpoint round 2 (GS4#8). With <c>DeadLetterEnabled = false</c> a poison entry past the
+    /// attempt cap was XACKed with nothing logged at all — gone without a trace — and the at-cap
+    /// and unparsable paths claimed a dead-letter write that never happened. The drop is now an
+    /// Error (NATS parity) and nothing claims a copy. Pre-fix: no drop Error on any path, and the
+    /// at-cap Warning / unparsable Error claim a dead-letter write.
+    /// </summary>
+    [Fact]
+    public async Task DeadLetteringDisabled_EveryBurialPath_LogsTheDrop_AndNeverClaimsACopy()
+    {
+        var database = new RedisTransportTests.FakeRedisStreamDatabase();
+        var logger = new RecordingThrowingLogger<RedisDispatcherTests>();
+        var transportOptions = new RedisAsyncResponseTransportOptions { DeadLetterEnabled = false };
+        await using var awaiting = RedisMessageDispatcher.Create(
+            (_, _) => throw new InvalidOperationException("handler boom"),
+            database,
+            transportOptions,
+            new RedisSubscriberOptions { MaxDeliveryAttempts = 2 },
+            logger,
+            "worker-stream",
+            "worker-group",
+            RedisSubscriberRole.Worker);
+        await using var queued = RedisMessageDispatcher.Create(
+            (_, _) => Task.CompletedTask,
+            database,
+            transportOptions,
+            new RedisSubscriberOptions { MaxDeliveryAttempts = 2 }.UseAckAfterEnqueue(1, 8, TimeSpan.FromSeconds(5)),
+            logger,
+            "worker-stream",
+            "worker-group",
+            RedisSubscriberRole.Worker);
+
+        await awaiting.HandleAsync(Delivery("1-0", attempt: 3), CancellationToken.None); // pre-execution cap
+        await awaiting.HandleAsync(Delivery("2-0", attempt: 2), CancellationToken.None); // fails at the cap
+        await queued.HandleAsync(Delivery("3-0", attempt: 3), CancellationToken.None);   // pre-execution cap
+        await awaiting.DiscardUnprocessableAsync(
+            "worker-stream",
+            "worker-group",
+            RedisTransportTests.Entry("4-0", ("correlationId", "c4")), // no payload field
+            new InvalidDataException("no payload field"),
+            CancellationToken.None);
+
+        Assert.Empty(database.Adds);
+        Assert.Equal(["1-0", "2-0", "3-0", "4-0"], database.Acks.Select(ack => ack.MessageId));
+        foreach (var (id, reason) in new[]
+                 {
+                     ("1-0", "max_delivery_attempts_exceeded"),
+                     ("2-0", "handler_failed_max_attempts"),
+                     ("3-0", "max_delivery_attempts_exceeded"),
+                     ("4-0", "unparsable_entry")
+                 })
+        {
+            Assert.True(
+                logger.HasEntry(LogLevel.Error, $"Redis message {id} on worker-stream was dropped ({reason}): dead-lettering is disabled"),
+                $"no drop Error for {id}");
+        }
+
+        Assert.False(logger.HasEntry(LogLevel.Warning, "writing to dead-letter stream"));
+        Assert.False(logger.HasEntry(LogLevel.Error, "dead-lettering and ACKing it"));
+    }
+
     private static RedisStreamDelivery Delivery(string id, int attempt, string? correlationId = "corr")
         => new(
             "worker-stream",

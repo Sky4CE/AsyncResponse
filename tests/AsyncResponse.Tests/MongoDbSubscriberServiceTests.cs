@@ -49,6 +49,62 @@ public sealed class MongoDbSubscriberServiceTests
             Times.AtLeastOnce);
     }
 
+    /// <summary>
+    /// Regression (fixpoint round 2, S9#1): the worker subscriber kept claiming after host stop
+    /// began — ApplicationStopping fires before any hosted service stops, and the worker subscriber
+    /// stops last — so it claimed the very wake-ups its own flow hand-overs had just published and
+    /// handed them back (an attempt spent, the document locked until its lease lapsed). From
+    /// ApplicationStopping on it claims nothing more, not even the rest of the batch in hand, and
+    /// parks until its own stop.
+    /// </summary>
+    [Fact]
+    public async Task WorkerSubscriber_StopsClaimingAtHostStop_EvenMidBatch()
+    {
+        var fixture = new Fixture();
+        using var host = new DurableFlowContextTestSupport.StoppingHost();
+
+        // The first document's handler is where host stop begins; the second is the rest of the
+        // (two-document) batch.
+        var handled = 0;
+        fixture.Ingress
+            .Setup(ingress => ingress.HandleWorkerMessageAsync(It.IsAny<string>()))
+            .Returns(() =>
+            {
+                if (Interlocked.Increment(ref handled) == 1)
+                    host.StopApplication();
+                return Task.CompletedTask;
+            });
+        fixture.QueueDocuments(
+            new MongoTransportMessageDocument { Id = Guid.NewGuid(), Queue = "workers", Payload = """{"JobId":"1"}""", Attempts = 1 },
+            new MongoTransportMessageDocument { Id = Guid.NewGuid(), Queue = "workers", Payload = """{"JobId":"2"}""", Attempts = 1 });
+
+        var subscriber = fixture.WorkerSubscriber(host);
+        await subscriber.StartAsync(CancellationToken.None);
+        try
+        {
+            // Either the park (new) or a second dispatch (old) — whichever comes first decides.
+            var deadline = DateTime.UtcNow.AddSeconds(30);
+            while (Volatile.Read(ref handled) < 2
+                && !fixture.Logger.Messages.Any(message => message.Contains("stopped claiming", StringComparison.Ordinal))
+                && DateTime.UtcNow < deadline)
+            {
+                await Task.Delay(15);
+            }
+
+            Assert.Equal(1, Volatile.Read(ref handled));
+            Assert.Equal(1, fixture.Claims);
+            Assert.Equal(1, fixture.Pending);
+            Assert.Contains(fixture.Logger.Messages, message => message.Contains("stopped claiming", StringComparison.Ordinal));
+        }
+        finally
+        {
+            await subscriber.StopAsync(CancellationToken.None);
+        }
+
+        // The park ends with the subscriber's own stop, and still claims nothing on the way out.
+        Assert.Equal(1, fixture.Claims);
+    }
+
     /// <summary>The response subscriber routes on the extracted correlation id rather than the raw payload.</summary>
     [Fact]
     public async Task ResponseSubscriber_RoutesOnTheExtractedCorrelationId()
@@ -134,6 +190,36 @@ public sealed class MongoDbSubscriberServiceTests
         var subscriber = fixture.WorkerSubscriber();
         await subscriber.StartAsync(CancellationToken.None);
         await fixture.Logger.WaitForAsync("change-stream wake for queue");
+        await subscriber.StopAsync(CancellationToken.None);
+    }
+
+    /// <summary>
+    /// Fixpoint r2 precommit J7: the wake loop's retry warning ran unguarded, so a logging provider
+    /// that throws ended the loop at its first fault — the subscriber stayed poll-only for the rest
+    /// of the process's uptime. Red on the old code: the change stream was never re-opened.
+    /// </summary>
+    [Fact]
+    public async Task ChangeStreamWake_ALoggerThatThrowsOnTheRetryWarning_KeepsReopeningTheStream()
+    {
+        var fixture = new Fixture(useChangeStreamWake: true);
+        fixture.Logger.ThrowOnMessageContaining = "change-stream wake for queue";
+        var watches = 0;
+        var reopened = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        fixture.Messages
+            .Setup(collection => collection.WatchAsync(
+                It.IsAny<PipelineDefinition<ChangeStreamDocument<MongoTransportMessageDocument>, ChangeStreamDocument<MongoTransportMessageDocument>>>(),
+                It.IsAny<ChangeStreamOptions>(),
+                It.IsAny<CancellationToken>()))
+            .Returns(() =>
+            {
+                if (Interlocked.Increment(ref watches) >= 2)
+                    reopened.TrySetResult();
+                return Task.FromException<IChangeStreamCursor<ChangeStreamDocument<MongoTransportMessageDocument>>>(new InvalidOperationException("cursor died"));
+            });
+
+        var subscriber = fixture.WorkerSubscriber();
+        await subscriber.StartAsync(CancellationToken.None);
+        await reopened.Task.WaitAsync(TimeSpan.FromSeconds(10));
         await subscriber.StopAsync(CancellationToken.None);
     }
 
@@ -307,6 +393,7 @@ public sealed class MongoDbSubscriberServiceTests
                     FindOneAndUpdateOptions<BsonDocument, BsonDocument> ___,
                     CancellationToken cancellationToken) =>
                 {
+                    Interlocked.Increment(ref _claims);
                     ClaimAttempted.TrySetResult();
                     if (honourClaimCancellation)
                     {
@@ -347,6 +434,17 @@ public sealed class MongoDbSubscriberServiceTests
         /// <summary>Completes once the loop has reached the store, so a test can act after the first sweep.</summary>
         public TaskCompletionSource ClaimAttempted { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
+        private int _claims;
+
+        /// <summary>How many claims (<c>findOneAndUpdate</c> calls) the loop has issued.</summary>
+        public int Claims => Volatile.Read(ref _claims);
+
+        /// <summary>How many queued documents no claim has taken yet.</summary>
+        public int Pending
+        {
+            get { lock (_gate) return _pending.Count; }
+        }
+
         public void QueueDocuments(params MongoTransportMessageDocument[] documents)
         {
             lock (_gate)
@@ -356,8 +454,8 @@ public sealed class MongoDbSubscriberServiceTests
             }
         }
 
-        public MongoDbWorkerSubscriber WorkerSubscriber()
-            => new(_options, _store, Ingress.Object, Logger.For<MongoDbWorkerSubscriber>());
+        public MongoDbWorkerSubscriber WorkerSubscriber(Microsoft.Extensions.Hosting.IHostApplicationLifetime? hostLifetime = null)
+            => new(_options, _store, Ingress.Object, Logger.For<MongoDbWorkerSubscriber>(), hostLifetime);
 
         public MongoDbResponseIngressSubscriber ResponseSubscriber()
             => new(_options, _store, Ingress.Object, Logger.For<MongoDbResponseIngressSubscriber>());
@@ -395,8 +493,12 @@ public sealed class MongoDbSubscriberServiceTests
             if (_disposed || _ended)
                 return false;
 
-            // One notification per batch is all the wake loop needs; the document itself is unread.
-            Current = [null!];
+            // One insert event per batch is all the wake loop needs. The wake reads the raw event
+            // (r2 GS3#4: a delayed insert's available_at against its clusterTime); one carrying
+            // neither is claimable on arrival, so it wakes.
+            Current = [new ChangeStreamDocument<MongoTransportMessageDocument>(
+                new BsonDocument("operationType", "insert"),
+                MongoDB.Bson.Serialization.BsonSerializer.LookupSerializer<MongoTransportMessageDocument>())];
             return true;
         }
 

@@ -49,6 +49,58 @@ internal static class SqlServerTransientFaults
            && (exception is SqlException sqlException && IsTransient(sqlException)
                || exception is TimeoutException);
 
+    /// <summary>
+    /// Opens <paramref name="connection"/>, rethrowing SqlClient's pool-exhaustion failure as a
+    /// (transient) <see cref="TimeoutException"/>. SqlClient reports "Timeout expired … obtaining a
+    /// connection from the pool" as a plain <see cref="InvalidOperationException"/> — the same type
+    /// as every usage error, so <see cref="IsTransient(Exception)"/> cannot accept it — and a
+    /// sustained exhaustion then never counted toward the retry policies or the database channel's
+    /// outage breaker: each sweep waited out the connect timeout once per correlation id, adding
+    /// eight more contenders to the exhausted pool each time. Npgsql raises the same condition as a
+    /// transient <c>NpgsqlException</c> over a <see cref="TimeoutException"/>.
+    /// </summary>
+    public static async Task OpenAsync(SqlConnection connection, CancellationToken cancellationToken)
+    {
+        var startedAt = System.Diagnostics.Stopwatch.GetTimestamp();
+        try
+        {
+            await connection.OpenAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch (InvalidOperationException ex) when (IsPoolTimeout(ex, connection.ConnectionString, System.Diagnostics.Stopwatch.GetElapsedTime(startedAt)))
+        {
+            throw new TimeoutException(ex.Message, ex);
+        }
+    }
+
+    /// <summary>
+    /// Whether <paramref name="exception"/>, thrown by an open that took <paramref name="elapsed"/>,
+    /// is SqlClient's pool-wait timeout. Judged by the open having waited out the whole connect
+    /// timeout with pooling on, never by the message: SqlClient's resource text is localized. Every
+    /// other <see cref="InvalidOperationException"/> an open throws (a missing connection string, a
+    /// connection already open, a disposed one) is immediate.
+    /// </summary>
+    internal static bool IsPoolTimeout(InvalidOperationException exception, string connectionString, TimeSpan elapsed)
+    {
+        if (exception is ObjectDisposedException)
+            return false;
+
+        try
+        {
+            var builder = new SqlConnectionStringBuilder(connectionString);
+            // Connect Timeout = 0 waits for good, so nothing times out; the timers behind the pool
+            // wait can fire a hair before a stopwatch started just ahead of the open agrees.
+            return builder.Pooling
+                   && builder.ConnectTimeout > 0
+                   && elapsed + PoolTimeoutTolerance >= TimeSpan.FromSeconds(builder.ConnectTimeout);
+        }
+        catch (ArgumentException)
+        {
+            return false;
+        }
+    }
+
+    private static readonly TimeSpan PoolTimeoutTolerance = TimeSpan.FromMilliseconds(100);
+
     public static bool IsTransient(SqlException exception)
     {
         if (exception.Class >= 20)

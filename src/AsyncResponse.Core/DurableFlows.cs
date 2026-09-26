@@ -165,9 +165,17 @@ internal sealed class DurableFlowService : IDurableFlows
     }
 
     /// <summary>
+    /// The <see cref="Exception.Data"/> key under which a start cancelled by its caller during the
+    /// publish carries the flow id (see <see cref="IDurableFlows.StartAsync{TFlow, TInput}"/>).
+    /// </summary>
+    internal const string StartCancelledFlowIdKey = "FlowId";
+
+    /// <summary>
     /// Publishes a start job through the ingress's retry ladder. A publish that still fails
     /// surfaces as <see cref="DurableFlowNotDispatchedException"/> carrying the id: nothing was
-    /// persisted, so the caller simply retries the start (idempotent with the same id).
+    /// persisted, so the caller simply retries the start (idempotent with the same id). The
+    /// caller's own cancellation surfaces as an <see cref="OperationCanceledException"/> that
+    /// carries the id too (message and <c>Data["FlowId"]</c>).
     /// </summary>
     private async Task PublishStartAsync(
         System.Linq.Expressions.Expression<Func<IDurableFlowExecutor, Task>> job,
@@ -211,6 +219,26 @@ internal sealed class DurableFlowService : IDurableFlows
                 ex.Limit);
             throw;
         }
+        catch (OperationCanceledException ex) when (cancellationToken.IsCancellationRequested)
+        {
+            // The CALLER cancelled — the ladder stops on its token by design — which says nothing
+            // about the transport: wrapped as DurableFlowNotDispatchedException it logged a false
+            // Error here, and the scheduler, whose stop-token filter it slipped past, logged a
+            // second one and queued a re-drive for a loop that was stopping. The documented
+            // reading is a cancellation.
+            //
+            // It still carries the id: a publish the cancellation interrupted (or an earlier
+            // attempt whose failure was ambiguous) may have landed — the case the not-dispatched
+            // exception's FlowId exists for — and a GENERATED id the caller never saw is its only
+            // handle to dedupe a retry against that run instead of starting a second one.
+            var cancelled = new OperationCanceledException(
+                $"Durable flow '{flowId}' start was cancelled by its caller while its worker job was being published; the job may have been published. " +
+                "Retry the start with this same flow id — an identical start is idempotent, so a job that did land is not duplicated.",
+                ex,
+                cancellationToken);
+            cancelled.Data[StartCancelledFlowIdKey] = flowId;
+            throw cancelled;
+        }
         catch (Exception ex)
         {
             _logger.LogError(
@@ -229,8 +257,21 @@ internal sealed class DurableFlowService : IDurableFlows
         await using var scope = _scopeFactory.CreateAsyncScope();
         var store = scope.ServiceProvider.GetRequiredService<IFlowStateStore>();
 
-        var state = await store.LoadAsync(flowId, cancellationToken).ConfigureAwait(false)
-            ?? throw new InvalidOperationException($"No flow state found for '{flowId}' (unknown, expired, or unreadable).");
+        var state = await store.LoadAsync(flowId, cancellationToken).ConfigureAwait(false);
+
+        // Ignoring the resume writes nothing, so no fence corrects a stale read behind it (the
+        // executor's ResumeAsync does the same): a store whose loads can serve an older copy of a
+        // present ledger (Cosmos session reads from another process) may still show the Suspended
+        // run an operator has just set back to Running — the documented un-park is exactly this
+        // call — and the resume was dropped with the run left Running and nothing queued. A null
+        // look falls back to the first read: a ledger that vanished in between makes ignoring the
+        // resume harmless, and a test double mocking the store (Moq answers the default interface
+        // member with null) keeps ignoring a finished run instead of reporting it unknown.
+        if (state is not null && state.Status != FlowRunStatus.Running)
+            state = await store.LoadCurrentAsync(flowId, cancellationToken).ConfigureAwait(false) ?? state;
+
+        if (state is null)
+            throw new InvalidOperationException($"No flow state found for '{flowId}' (unknown, expired, or unreadable).");
 
         if (state.Status != FlowRunStatus.Running)
         {

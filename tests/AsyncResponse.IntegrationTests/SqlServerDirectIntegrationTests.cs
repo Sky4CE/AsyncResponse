@@ -72,6 +72,36 @@ public sealed class SqlServerDirectIntegrationTests(DataBatchFixture fixture) : 
     }
 
     [Fact]
+    public async Task ChannelStore_AnExhaustedPool_FailsWithATransientTimeout()
+    {
+        // Fixpoint r2 S5#7: SqlClient reports an exhausted pool as a plain InvalidOperationException
+        // after the connect timeout — not transient, so a sustained exhaustion never counted toward
+        // the retry policies or the sweep's outage breaker. The channel's open now rethrows it as a
+        // transient TimeoutException. A pool of one connection of its own (the application name
+        // keys it), held open by the test. ConnectTimeout also bounds the real logins (the schema
+        // setup, the holder's open), so it is not cut to 1 s: a loaded runner's login can take longer.
+        await WithSchemaAsync("pool_exhausted", async schema =>
+        {
+            var options = ChannelOptions(schema);
+            options.ConnectionString = new SqlConnectionStringBuilder(Fixture.SqlServerConnectionString)
+            {
+                MaxPoolSize = 1,
+                ConnectTimeout = 5,
+                ApplicationName = $"asyncresponse-pool-exhaustion-{Guid.NewGuid():N}"
+            }.ConnectionString;
+            var channel = new SqlServerChannelSql(Options.Create(options));
+            await channel.EnsureCreatedAsync();
+
+            await using var holder = new SqlConnection(options.ConnectionString);
+            await holder.OpenAsync();
+
+            var failure = await Assert.ThrowsAsync<TimeoutException>(() => channel.CountActiveSubscribersAsync("corr", CancellationToken.None));
+            Assert.IsType<InvalidOperationException>(failure.InnerException);
+            Assert.True(SqlServerChannelSql.IsTransient(failure));
+        });
+    }
+
+    [Fact]
     public async Task SharedSchema_CrossComponentNameCollisions_FailActionablyInBothOrders()
     {
         // IF OBJECT_ID(N'…', N'U') answers only "is there a USER TABLE with this name", so the
@@ -1831,8 +1861,217 @@ public sealed class SqlServerDirectIntegrationTests(DataBatchFixture fixture) : 
             var logger = new RecordingLogger<SqlServerTransportStore>();
             await new SqlServerTransportStore(Options.Create(options), logger).EnsureCreatedAsync();
 
-            Assert.Contains(logger.Warnings, warning => warning.Contains("no index leading on 'queue'", StringComparison.Ordinal));
+            Assert.Contains(logger.Warnings, warning => warning.Contains("no usable index keyed (queue, available_at, created_at)", StringComparison.Ordinal));
         });
+    }
+
+    [Fact]
+    public async Task Transport_OperatorSchema_WithOnlyThePreviousBuildsClaimIndex_Warns()
+    {
+        // Regression (fixpoint r2 S9#10): the warning was satisfied by ANY index leading on queue —
+        // including the previous build's _claim_idx over (queue, available_at, locked_until,
+        // created_at), which cannot serve the claim's ORDER BY available_at, created_at (a Top-N sort
+        // that U-locks the whole ready set per claim). A migration written for that build leaves
+        // exactly this table, and it got no warning. The check matches the claim's key now.
+        await WithSchemaAsync("sql_old_claim", async schema =>
+        {
+            var options = TransportOptions(schema);
+            await new SqlServerTransportStore(Options.Create(options)).EnsureCreatedAsync();
+            await ExecuteAsync($"""
+                DROP INDEX [{SqlServerTransportStore.IndexName(options.MessageTable, "ready")}] ON [{schema}].[{options.MessageTable}];
+                CREATE INDEX [{SqlServerTransportStore.IndexName(options.MessageTable, "claim")}]
+                    ON [{schema}].[{options.MessageTable}] (queue, available_at, locked_until, created_at);
+                """);
+
+            options.AutoCreateSchema = false;
+            var logger = new RecordingLogger<SqlServerTransportStore>();
+            await new SqlServerTransportStore(Options.Create(options), logger).EnsureCreatedAsync();
+            Assert.Contains(logger.Warnings, warning => warning.Contains("no usable index keyed (queue, available_at, created_at)", StringComparison.Ordinal));
+
+            // The claim's key under the operator's own name satisfies it.
+            await ExecuteAsync($"""
+                CREATE INDEX [operator_named_dequeue] ON [{schema}].[{options.MessageTable}] (queue, available_at, created_at);
+                """);
+            var quiet = new RecordingLogger<SqlServerTransportStore>();
+            await new SqlServerTransportStore(Options.Create(options), quiet).EnsureCreatedAsync();
+            Assert.DoesNotContain(quiet.Warnings, warning => warning.Contains("no usable index", StringComparison.Ordinal));
+        });
+    }
+
+    [Fact]
+    public async Task Transport_IndexBuild_HoldsTheTableLock_NotTheSchemaLock()
+    {
+        // Regression (fixpoint r2 GS3#2): the hour-bounded dequeue-index build ran inside the
+        // transaction holding the schema-wide application lock the SQL Server channel and flow store
+        // also take, so for the whole build no host starting meanwhile could initialize either. The
+        // schema DDL now commits first and the build runs under a lock scoped to the table: while it
+        // waits for its table lock here, the schema resource is free and the table resource is held.
+        await WithSchemaAsync("sql_table_lock", async schema =>
+        {
+            var options = TransportOptions(schema);
+            var creator = new SqlServerTransportStore(Options.Create(options));
+            var id = Guid.NewGuid();
+            await creator.PublishAsync(id, options.WorkerQueue, EmptyJson, null, CancellationToken.None);
+            await ExecuteAsync($"""DROP INDEX [{SqlServerTransportStore.IndexName(options.MessageTable, "ready")}] ON [{schema}].[{options.MessageTable}];""");
+
+            await using var holder = new SqlConnection(Fixture.SqlServerConnectionString);
+            await holder.OpenAsync();
+            await using var transaction = (SqlTransaction)await holder.BeginTransactionAsync();
+            await using (var write = holder.CreateCommand())
+            {
+                write.Transaction = transaction;
+                write.CommandText = $"UPDATE [{schema}].[{options.MessageTable}] SET attempts = attempts WHERE id = '{id}';";
+                await write.ExecuteNonQueryAsync();
+            }
+
+            var ensure = new SqlServerTransportStore(Options.Create(options)).EnsureCreatedAsync();
+            await EventuallyAsync(async () => await ScalarIntAsync($"""
+                SELECT COUNT(*) FROM sys.dm_tran_locks
+                WHERE request_status = 'WAIT' AND resource_type = 'OBJECT' AND resource_associated_entity_id = OBJECT_ID(N'[{schema}].[{options.MessageTable}]');
+                """) > 0);
+
+            Assert.Equal(1, await AppLockFreeAsync(SqlServerTransportStore.SchemaLockResource(schema)));
+            Assert.Equal(0, await AppLockFreeAsync(SqlServerTransportStore.TableLockResource(schema, options.MessageTable)));
+
+            await transaction.RollbackAsync();
+            try
+            {
+                await ensure;
+            }
+            catch (SqlException ex) when (ex.Number == 1222)
+            {
+                // A slow runner outwaited the 5 s LOCK_TIMEOUT; the locks were the assertion.
+            }
+        });
+    }
+
+    [Fact]
+    public async Task Transport_AutoCreate_AMissingCreatedIndexOnABusyTable_FailsFastAndBacksOff()
+    {
+        // Regression (fixpoint r2 S9#11): the _created_idx build sat in the first DDL batch, under
+        // SqlClient's 30 s default command timeout and with no LOCK_TIMEOUT: behind an open writer it
+        // queued every write to the table for 30 s, timed out with -2 (which latched nothing), and was
+        // retried by every operation. It is now part of the lock-bounded build batch: it fails fast
+        // with 1222, changing nothing, and the retry-after window latches.
+        await WithSchemaAsync("sql_created_busy", async schema =>
+        {
+            var options = TransportOptions(schema);
+            var creator = new SqlServerTransportStore(Options.Create(options));
+            var id = Guid.NewGuid();
+            await creator.PublishAsync(id, options.WorkerQueue, EmptyJson, null, CancellationToken.None);
+            await ExecuteAsync($"""DROP INDEX [{SqlServerTransportStore.IndexName(options.MessageTable, "created")}] ON [{schema}].[{options.MessageTable}];""");
+
+            await using var holder = new SqlConnection(Fixture.SqlServerConnectionString);
+            await holder.OpenAsync();
+            await using var transaction = (SqlTransaction)await holder.BeginTransactionAsync();
+            await using (var write = holder.CreateCommand())
+            {
+                write.Transaction = transaction;
+                write.CommandText = $"UPDATE [{schema}].[{options.MessageTable}] SET attempts = attempts WHERE id = '{id}';";
+                await write.ExecuteNonQueryAsync();
+            }
+
+            var store = new SqlServerTransportStore(Options.Create(options));
+            var busy = await Assert.ThrowsAsync<SqlException>(() => store.EnsureCreatedAsync().WaitAsync(TimeSpan.FromSeconds(20)));
+            Assert.Equal(1222, busy.Number);
+            Assert.Same(busy, (await Assert.ThrowsAsync<InvalidOperationException>(() => store.EnsureCreatedAsync())).InnerException);
+            await transaction.RollbackAsync();
+        });
+    }
+
+    [Fact]
+    public async Task Transport_AutoCreate_ACancelledCaller_DoesNotRollBackTheIndexBuild()
+    {
+        // Regression (fixpoint r2 S9#9): the startup DDL ran under the first caller's token, so a
+        // publish whose request token fired partway cancelled the hour-bounded index build and rolled
+        // it back, after the table's writes had been blocked all that time. The attempt now runs under
+        // the store's lifetime: the cancelled caller leaves, and the build finishes once its lock is free.
+        await WithSchemaAsync("sql_build_cancel", async schema =>
+        {
+            var options = TransportOptions(schema);
+            var creator = new SqlServerTransportStore(Options.Create(options));
+            var id = Guid.NewGuid();
+            await creator.PublishAsync(id, options.WorkerQueue, EmptyJson, null, CancellationToken.None);
+            var readyIndex = SqlServerTransportStore.IndexName(options.MessageTable, "ready");
+            await ExecuteAsync($"""DROP INDEX [{readyIndex}] ON [{schema}].[{options.MessageTable}];""");
+            var store = new SqlServerTransportStore(Options.Create(options));
+            using var caller = new CancellationTokenSource();
+
+            await using (var holder = new SqlConnection(Fixture.SqlServerConnectionString))
+            {
+                await holder.OpenAsync();
+                await using var transaction = (SqlTransaction)await holder.BeginTransactionAsync();
+                await using (var write = holder.CreateCommand())
+                {
+                    write.Transaction = transaction;
+                    write.CommandText = $"UPDATE [{schema}].[{options.MessageTable}] SET attempts = attempts WHERE id = '{id}';";
+                    await write.ExecuteNonQueryAsync();
+                }
+
+                var publish = store.PublishAsync(Guid.NewGuid(), options.WorkerQueue, EmptyJson, null, caller.Token);
+                await EventuallyAsync(async () => await ScalarIntAsync($"""
+                    SELECT COUNT(*) FROM sys.dm_tran_locks
+                    WHERE request_status = 'WAIT' AND resource_type = 'OBJECT' AND resource_associated_entity_id = OBJECT_ID(N'[{schema}].[{options.MessageTable}]');
+                    """) > 0);
+                await caller.CancelAsync();
+                await Assert.ThrowsAnyAsync<OperationCanceledException>(() => publish);
+                await transaction.RollbackAsync();
+            }
+
+            await EventuallyAsync(async () => await ScalarIntAsync(
+                $"SELECT COUNT(*) FROM sys.indexes WHERE object_id = OBJECT_ID(N'[{schema}].[{options.MessageTable}]') AND name = N'{readyIndex}';") == 1);
+        });
+    }
+
+    [Fact]
+    public async Task Transport_ADelayedPublish_RaisesNoInProcessWake()
+    {
+        // Regression (fixpoint r2 GS3#4): a delayed publish raised MessagePublished for a row nobody
+        // can claim until its delay has passed, sending every same-process subscriber of the queue into
+        // a claim that found nothing (the NAK stopped doing the same in round 43).
+        await WithSchemaAsync("sql_delay_wake", async schema =>
+        {
+            var options = TransportOptions(schema);
+            var store = new SqlServerTransportStore(Options.Create(options));
+            var woken = new ConcurrentQueue<string?>();
+            store.MessagePublished += woken.Enqueue;
+
+            await store.PublishAsync(Guid.NewGuid(), options.WorkerQueue, EmptyJson, null, CancellationToken.None, delay: TimeSpan.FromMinutes(5));
+            await store.PublishAsync(Guid.NewGuid(), options.ResponseQueue, EmptyJson, null, CancellationToken.None);
+
+            Assert.Equal([options.ResponseQueue], woken.ToArray());
+        });
+    }
+
+    [Fact]
+    public async Task Channel_ASameNameDecimalSequence_IsReportedByItsType()
+    {
+        // Pins the round-43 fix (fixpoint r2 S11#7): the sequence catalog read CAST a same-name
+        // sequence's increment and MAXVALUE to bigint unconditionally, and a decimal sequence keeps
+        // its default MAXVALUE of 10^38-1 — arithmetic overflow 8115 pre-empted the verifier's
+        // actionable "found decimal" message. The unit test feeds the evaluator directly; this one runs
+        // the catalog SQL itself.
+        await WithSchemaAsync("sql_dec_seq", async schema =>
+        {
+            var options = ChannelOptions(schema);
+            await ExecuteAsync($"""
+                EXEC(N'CREATE SCHEMA [{schema}]');
+                CREATE SEQUENCE [{schema}].[{options.MessageTable}_ack_seq] AS decimal(38, 0) START WITH 1;
+                """);
+
+            var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => new SqlServerChannelSql(Options.Create(options)).EnsureCreatedAsync());
+            Assert.Contains("found decimal", ex.Message, StringComparison.Ordinal);
+        });
+    }
+
+    private async Task<int> AppLockFreeAsync(string resource)
+    {
+        await using var connection = new SqlConnection(Fixture.SqlServerConnectionString);
+        await connection.OpenAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText = "SELECT APPLOCK_TEST('public', @resource, 'Exclusive', 'Session');";
+        command.Parameters.AddWithValue("@resource", resource);
+        return (int)(await command.ExecuteScalarAsync())!;
     }
 
     [Fact]

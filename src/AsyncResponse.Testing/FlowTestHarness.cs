@@ -286,11 +286,34 @@ public sealed class FlowProbe : IDurableFlowExecutionObserver
     private TimeProvider _clock = TimeProvider.System;
     private TimeSpan _timerInProcessThreshold;
 
+    /// <summary>
+    /// Per run, where its latest failed execution attempt ended: the incarnation it ran in and the
+    /// length of the run's event list at that moment. An awaited step's Waiting recorded before
+    /// it is no longer a live wait — the attempt released it, and a faulted step (a waiter
+    /// timeout, a published failure the flow does not treat as terminal) re-executes under a
+    /// fresh correlation id, so the old one is dead (<see cref="IsDeadAwaitedPark"/>). Only the
+    /// current incarnation's marker counts. Under <c>_gate</c>.
+    /// </summary>
+    private readonly Dictionary<string, (int Incarnation, int EventCount)> _attemptEnded = new(StringComparer.Ordinal);
+
     /// <summary>Starts a new incarnation (<see cref="AsyncResponseTestHarness.SimulateRestartAsync"/>).</summary>
     internal void BeginIncarnation()
     {
         lock (_gate)
             _incarnation++;
+    }
+
+    /// <summary>
+    /// The observer the incarnation being built registers: this probe, with failed attempts
+    /// stamped by the incarnation they ran in. An execution a simulated restart abandoned keeps
+    /// its executor, and its attempt then fails AFTER the restart (its waiter was abandoned).
+    /// Counted as a failure of the live run, it would mark the wait that survived the restart
+    /// dead, and a reply meant for that wait would park for a park that never comes.
+    /// </summary>
+    internal IDurableFlowExecutionObserver ForCurrentIncarnation()
+    {
+        lock (_gate)
+            return new IncarnationView(this, _incarnation);
     }
 
     /// <summary>Binds the engine clock and the current incarnation's in-process timer threshold.</summary>
@@ -338,6 +361,39 @@ public sealed class FlowProbe : IDurableFlowExecutionObserver
         MaybeCrash(step.StepName, beforeStep: false, step.FlowId);
         return default;
     }
+
+    ValueTask IDurableFlowExecutionObserver.OnRunAttemptFailedAsync(DurableFlowRunEvent run)
+    {
+        int incarnation;
+        lock (_gate)
+            incarnation = _incarnation;
+
+        RecordAttemptEnded(run.FlowId, incarnation);
+        return default;
+    }
+
+    /// <summary>Marks where <paramref name="flowId"/>'s latest failed attempt ended (see <see cref="_attemptEnded"/>).</summary>
+    private void RecordAttemptEnded(string flowId, int incarnation)
+    {
+        var list = _events.GetOrAdd(flowId, static _ => []);
+        lock (_gate)
+        {
+            // A stale incarnation's attempt — a zombie a restart abandoned — says nothing about
+            // the waits of the live run.
+            if (incarnation == _incarnation)
+                _attemptEnded[flowId] = (incarnation, list.Count);
+        }
+    }
+
+    /// <summary>
+    /// Whether <paramref name="list"/>[<paramref name="index"/>] is an awaited step's Waiting that
+    /// a later failed attempt of the current incarnation released. Caller holds <c>_gate</c>.
+    /// </summary>
+    private bool IsDeadAwaitedPark(string flowId, List<Recorded> list, int index)
+        => list[index].Event is { Kind: EventKind.Waiting, Step.Kind: DurableFlowStepKind.Awaited }
+            && _attemptEnded.TryGetValue(flowId, out var ended)
+            && ended.Incarnation == _incarnation
+            && index < ended.EventCount;
 
     ValueTask IDurableFlowExecutionObserver.OnRunFinishedAsync(DurableFlowRunEvent run)
     {
@@ -471,7 +527,10 @@ public sealed class FlowProbe : IDurableFlowExecutionObserver
         // replies to the same live correlation id still resolve here. Only the NEWEST Waiting
         // of each step is considered live at all: a faulted attempt leaves no Completed event
         // behind, and returning its abandoned correlation id (an older Waiting of a step the
-        // run has since restarted with a fresh id) would park the caller's reply forever.
+        // run has since restarted with a fresh id) would park the caller's reply forever. Nor is
+        // a Waiting the run's latest failed attempt released, before any retry has parked again:
+        // the reply went to a correlation id whose waiter and registration the fault deleted,
+        // and was silently dropped (see IsDeadAwaitedPark).
         //
         // Across a simulated restart: once the run has recorded anything in the new incarnation,
         // only that incarnation counts (its wait may carry a fresh id). Before that — nothing has
@@ -500,6 +559,9 @@ public sealed class FlowProbe : IDurableFlowExecutionObserver
                 && candidate.Step.Kind == DurableFlowStepKind.Awaited
                 && candidate.Step.CorrelationId is { } correlationId)
             {
+                if (IsDeadAwaitedPark(flowId, list, index))
+                    continue;
+
                 var newestForStep = (seenWaitingSteps ??= new HashSet<string>(StringComparer.Ordinal)).Add(candidate.Step.StepName);
                 if (!newestForStep || answered?.Contains(correlationId) == true)
                     continue;
@@ -574,10 +636,12 @@ public sealed class FlowProbe : IDurableFlowExecutionObserver
                 // after a simulated restart it came straight back, before the new incarnation had
                 // parked at all (and with the old id, when the re-executed step arms a fresh one).
                 // Only the park: a checkpoint or a suspended timer recorded before the restart is
-                // still true, and the replay records neither again.
+                // still true, and the replay records neither again. Nor is an awaited park the
+                // run's latest failed attempt released: the retry parks again, possibly under a
+                // fresh correlation id.
                 for (var index = list.Count - 1; index >= 0; index--)
                 {
-                    if (list[index].InProcessPark && list[index].Incarnation != _incarnation)
+                    if ((list[index].InProcessPark && list[index].Incarnation != _incarnation) || IsDeadAwaitedPark(flowId, list, index))
                         continue;
 
                     if (predicate(list[index].Event))
@@ -661,4 +725,24 @@ public sealed class FlowProbe : IDurableFlowExecutionObserver
     private sealed record Waiter(string FlowId, Func<FlowProbeEvent, bool> Predicate, TaskCompletionSource<FlowProbeEvent> Completion);
 
     private sealed record RunWaiter(string FlowId, TaskCompletionSource<DurableFlowRunEvent> Completion);
+
+    /// <summary>One incarnation's view of the probe (see <see cref="ForCurrentIncarnation"/>).</summary>
+    private sealed class IncarnationView(FlowProbe probe, int incarnation) : IDurableFlowExecutionObserver
+    {
+        private IDurableFlowExecutionObserver Probe => probe;
+
+        public ValueTask OnStepStartingAsync(DurableFlowStepEvent step) => Probe.OnStepStartingAsync(step);
+
+        public ValueTask OnStepWaitingAsync(DurableFlowStepEvent step) => Probe.OnStepWaitingAsync(step);
+
+        public ValueTask OnStepCompletedAsync(DurableFlowStepEvent step) => Probe.OnStepCompletedAsync(step);
+
+        public ValueTask OnRunFinishedAsync(DurableFlowRunEvent run) => Probe.OnRunFinishedAsync(run);
+
+        public ValueTask OnRunAttemptFailedAsync(DurableFlowRunEvent run)
+        {
+            probe.RecordAttemptEnded(run.FlowId, incarnation);
+            return default;
+        }
+    }
 }

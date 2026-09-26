@@ -152,6 +152,12 @@ public class DurableFlowOptions
     /// ride the worker queue and rely on broker redelivery for crash recovery; with early ACK, a
     /// process crash after the ACK but before execution strands the run as <c>Running</c> with no
     /// lease and no queued job, and only an operator <c>ResumeAsync(flowId)</c> can revive it.
+    /// A host stop adds a second loss mode: a wake-up already ACKed that the engine hands back on
+    /// the stopping host cannot be redelivered. Worker subscribers take no new delivery from
+    /// <c>ApplicationStopping</c> on, but a job queued before the stop can still reach such a wait;
+    /// transports that can dead-letter write a <c>handed_back_after_commit</c> copy, while Azure
+    /// Service Bus, SQS and Google Pub/Sub only report it through <c>OnBackgroundFailure</c>
+    /// (logged at Error) — resume the flow explicitly.
     /// Leave <c>false</c> (the default) unless that loss mode is acceptable. Default: false.
     /// </summary>
     public bool AllowEarlyAckWorkerSubscriber { get; set; }

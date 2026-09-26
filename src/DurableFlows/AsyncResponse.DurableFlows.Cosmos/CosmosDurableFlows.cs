@@ -3,6 +3,7 @@ using AsyncResponse.DurableFlows.Internal;
 using AsyncResponse.DurableFlows.Cosmos;
 using Microsoft.Azure.Cosmos;
 using Microsoft.Extensions.DependencyInjection.Extensions;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using Newtonsoft.Json;
 using System.Buffers;
@@ -31,14 +32,15 @@ namespace Microsoft.Extensions.DependencyInjection
             builder.Services.TryAddSingleton(provider =>
             {
                 var options = provider.GetRequiredService<IOptions<CosmosDurableFlowOptions>>();
+                var logger = provider.GetService<ILogger<CosmosFlowStateStore>>();
 
                 var shared = provider.GetService<CosmosClient>();
                 if (shared is not null)
-                    return new CosmosFlowStateStore(shared, options);
+                    return new CosmosFlowStateStore(shared, options, logger: logger);
 
                 if (string.IsNullOrWhiteSpace(options.Value.ConnectionString))
                     throw new InvalidOperationException($"{nameof(CosmosDurableFlowOptions)}.{nameof(CosmosDurableFlowOptions.ConnectionString)} must be configured when no CosmosClient is registered.");
-                return new CosmosFlowStateStore(new CosmosClient(options.Value.ConnectionString), options, ownsClient: true);
+                return new CosmosFlowStateStore(new CosmosClient(options.Value.ConnectionString), options, ownsClient: true, logger: logger);
             });
             return builder.WithDurableFlows<CosmosFlowStateStore, CosmosDurableFlowOptions>(configure);
         }
@@ -120,15 +122,24 @@ public sealed class CosmosFlowStateStore : IFlowStateStore, IDisposable
     private readonly CosmosDurableFlowOptions _options;
     private readonly SemaphoreSlim _ensureGate = new(1, 1);
     private readonly bool _ownsClient;
+    private readonly ILogger<CosmosFlowStateStore>? _logger;
     private volatile bool _created;
     private int _sessionConsistentReads; // 0 = not yet known, 1 = yes, 2 = no
 
-    public CosmosFlowStateStore(CosmosClient client, IOptions<CosmosDurableFlowOptions> options, bool ownsClient = false)
+    /// <param name="client">The Cosmos client the store runs on.</param>
+    /// <param name="options">Store options; validated here.</param>
+    /// <param name="ownsClient">Whether <see cref="Dispose"/> disposes <paramref name="client"/>.</param>
+    /// <param name="logger">
+    /// Optional. With one, provisioning resolves the client's effective consistency level and warns
+    /// once when it is weaker than the Session or Strong level the store needs.
+    /// </param>
+    public CosmosFlowStateStore(CosmosClient client, IOptions<CosmosDurableFlowOptions> options, bool ownsClient = false, ILogger<CosmosFlowStateStore>? logger = null)
     {
         _client = client;
         _options = options.Value;
         _options.Validate();
         _ownsClient = ownsClient;
+        _logger = logger;
     }
 
     public Task<FlowState?> LoadAsync(string flowId, CancellationToken cancellationToken = default)
@@ -221,8 +232,9 @@ public sealed class CosmosFlowStateStore : IFlowStateStore, IDisposable
 
     /// <summary>
     /// Whether a read that follows a write-path round trip is current: the client's own consistency
-    /// override, else the account default, is Session or Strong. Asked once, and only on the rare
-    /// "present for writes, absent for reads" path.
+    /// override, else the account default, is Session or Strong. Asked once: at provisioning when
+    /// the store has a logger to warn on (<see cref="WarnUnlessReadsAreSessionConsistentAsync"/>),
+    /// otherwise on the rare "present for writes, absent for reads" path.
     /// </summary>
     private async Task<bool> ReadsAreSessionConsistentAsync(CancellationToken cancellationToken)
     {
@@ -230,6 +242,12 @@ public sealed class CosmosFlowStateStore : IFlowStateStore, IDisposable
         if (known != 0)
             return known == 1;
 
+        return RecordReadConsistency(await ResolveConsistencyLevelAsync(cancellationToken).ConfigureAwait(false));
+    }
+
+    /// <summary>The client's own consistency override, else the account default.</summary>
+    private async Task<ConsistencyLevel?> ResolveConsistencyLevelAsync(CancellationToken cancellationToken)
+    {
         var level = _client.ClientOptions?.ConsistencyLevel;
         if (level is null)
         {
@@ -238,9 +256,67 @@ public sealed class CosmosFlowStateStore : IFlowStateStore, IDisposable
             level = account?.Consistency?.DefaultConsistencyLevel;
         }
 
+        return level;
+    }
+
+    private bool RecordReadConsistency(ConsistencyLevel? level)
+    {
         var consistent = level is ConsistencyLevel.Session or ConsistencyLevel.Strong;
         Volatile.Write(ref _sessionConsistentReads, consistent ? 1 : 2);
         return consistent;
+    }
+
+    /// <summary>
+    /// Provisioning's one-time check of the level <see cref="ReadsAreSessionConsistentAsync"/>
+    /// decides on, surfaced as a warning instead of left to the rare path that needs it. Below
+    /// Session a read carries no session token, so after the write-path round trip only ABSENCE is
+    /// authoritative: <see cref="LoadCurrentAsync"/> can hand recovery, a failure signal or a resume
+    /// a ledger older than the last acknowledged write (missing the breadcrumb a response matches,
+    /// or still Suspended), and a ledger its server ttl hides fails as unreadable instead of reading
+    /// as absent. Warned, not refused: a client override can only weaken the account level, the
+    /// emulator defaults to Eventual, and refusing would make the store unusable on such accounts.
+    /// Best effort — failing to resolve the level never fails provisioning (the rare path asks
+    /// again).
+    /// </summary>
+    private async Task WarnUnlessReadsAreSessionConsistentAsync(CancellationToken cancellationToken)
+    {
+        if (_logger is not { } logger)
+            return;
+
+        // No account round trip for a warning nobody would see. A provider that throws from
+        // IsEnabled must not fail provisioning either.
+        try
+        {
+            if (!logger.IsEnabled(LogLevel.Warning))
+                return;
+        }
+        catch
+        {
+            return;
+        }
+
+        ConsistencyLevel? level;
+        try
+        {
+            level = await ResolveConsistencyLevelAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (!cancellationToken.IsCancellationRequested)
+        {
+            SafeLog.Try(() => logger.LogDebug(
+                ex,
+                "Could not resolve the consistency level the Cosmos DB durable-flow store's reads run at; it is resolved again when a read needs it."));
+            return;
+        }
+
+        if (RecordReadConsistency(level))
+            return;
+
+        SafeLog.Try(() => logger.LogWarning(
+            "The Cosmos DB durable-flow store's reads run at {ConsistencyLevel} consistency, but the store needs Session or Strong. " +
+            "Below Session a read can lag the store's own acknowledged writes: recovery, failure signals and resumes may act on an " +
+            "older copy of a flow's ledger, and a ledger hidden by its server TTL fails as unreadable instead of reading as absent. " +
+            "Run the account, or the CosmosClient's ConsistencyLevel, at Session or Strong.",
+            level?.ToString() ?? "an unknown"));
     }
 
     private static async Task<CosmosFlowStateDocument?> ReadDocumentAsync(Container container, string flowId, CancellationToken cancellationToken)
@@ -727,6 +803,7 @@ public sealed class CosmosFlowStateStore : IFlowStateStore, IDisposable
                     "Enable container TTL (DefaultTimeToLive = -1) before using it for durable flows.");
 
             ValidateHostSerializer();
+            await WarnUnlessReadsAreSessionConsistentAsync(cancellationToken).ConfigureAwait(false);
             _created = true;
         }
         finally
@@ -784,8 +861,14 @@ public sealed class CosmosFlowStateStore : IFlowStateStore, IDisposable
         DurableFlowStoreShared.ValidateLeaseArgs(flowId, leaseId, leaseDuration);
 
         var container = await GetContainerAsync(cancellationToken).ConfigureAwait(false);
-        for (var attempt = 0; attempt < 4; attempt++)
+        CosmosException? lostRace = null;
+        for (var attempt = 0; attempt < MaxLeaseWriteAttempts; attempt++)
         {
+            // A short jittered pause after a lost ETag race, so the retry does not land in the same
+            // phase of whatever write keeps winning (the holder's own checkpoint loop, typically).
+            if (attempt > 0)
+                await Task.Delay(TimeSpan.FromMilliseconds(Random.Shared.Next(5, 25) * attempt), cancellationToken).ConfigureAwait(false);
+
             var now = DateTime.UtcNow;
             try
             {
@@ -825,11 +908,36 @@ public sealed class CosmosFlowStateStore : IFlowStateStore, IDisposable
             }
             catch (CosmosException ex) when (ex.StatusCode == HttpStatusCode.PreconditionFailed)
             {
+                lostRace = ex;
             }
+        }
+
+        // Every attempt got past the checks above, so every read showed the document live and —
+        // for a renewal — the lease ours and live; each patch just lost its ETag race. The lease
+        // paths are read-then-patch, so any write to the document moves the ETag between them,
+        // and the most frequent writer is the holder itself: its checkpoints (per step, per
+        // SetValueAsync, per progress report) are replaces of the same document. `false` is final
+        // to the engine — the execution is abandoned as having lost its lease — while an exception
+        // is retried on its short backoff until the lease deadline, which also breaks a phase
+        // lock between the two loops. So a renewal reports contention, not loss. An acquire keeps
+        // `false`: it holds nothing yet, and the delivery retries anyway.
+        if (!acquire)
+        {
+            throw new InvalidOperationException(
+                $"The Cosmos DB durable-flow store could not renew the execution lease of '{flowId}': the lease was held by " +
+                $"'{leaseId}' and live on every read, but each of {MaxLeaseWriteAttempts} conditional patches lost its ETag race " +
+                "to a concurrent write of the ledger document (typically the holder's own checkpoints). Retry the renewal.",
+                lostRace);
         }
 
         return false;
     }
+
+    /// <summary>
+    /// Read-then-patch attempts one lease acquire or renewal makes before a run of lost ETag races
+    /// ends it (see <see cref="UpdateLeaseAsync"/> for how each ends).
+    /// </summary>
+    private const int MaxLeaseWriteAttempts = 4;
 
     /// <summary>
     /// Enforces <see cref="CosmosDurableFlowOptions.MaxStateBytes"/> on the document as Cosmos

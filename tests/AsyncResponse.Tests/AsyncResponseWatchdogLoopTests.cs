@@ -130,6 +130,39 @@ public class AsyncResponseWatchdogLoopTests
     }
 
     [Fact]
+    public async Task StaleEntryWarning_QuotesStoreWrittenTextBoundedAndEscaped()
+    {
+        // The store is a trust boundary (docs/security.md): the stale-entry warning quoted the
+        // persisted correlation id and payload type raw — the one log site left that did — so a
+        // CR/LF inside either forged a log line in every line-oriented sink, and megabytes of it
+        // flooded the sink on every scan.
+        var logger = new CollectingLogger();
+        var entry = new RecoveryState
+        {
+            CorrelationId = "stuck\r\n[Error] forged id line",
+            PayloadTypeFullName = "Contoso.Result\r\n[Error] forged type line" + new string('t', 100_000),
+            RegisteredAtUtc = DateTime.UtcNow.AddHours(-1)
+        };
+        var state = new AsyncResponseWatchdogState();
+        var watchdog = new AsyncResponseWatchdog(
+            [new FakeScanner(entry)],
+            [new FakeProbe(0)],
+            state,
+            Options(enabled: true),
+            logger.For<AsyncResponseWatchdog>());
+
+        var snapshot = await RunUntilPublishedAsync(watchdog, state);
+
+        Assert.Single(snapshot.Report!.StaleEntries);
+        var warning = Assert.Single(logger.Messages, message => message.StartsWith("Stale async-response recovery state", StringComparison.Ordinal));
+        Assert.DoesNotContain('\r', warning);
+        Assert.DoesNotContain('\n', warning);
+        Assert.Contains("stuck", warning, StringComparison.Ordinal);
+        Assert.Contains("Contoso.Result", warning, StringComparison.Ordinal);
+        Assert.True(warning.Length < 2_000, $"the warning is {warning.Length} characters");
+    }
+
+    [Fact]
     public async Task AgedEntryWithLiveWaiter_IsNotStale()
     {
         var state = new AsyncResponseWatchdogState();

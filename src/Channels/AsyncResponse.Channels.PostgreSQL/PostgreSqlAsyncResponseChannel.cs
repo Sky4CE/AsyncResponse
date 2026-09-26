@@ -48,9 +48,11 @@ internal sealed class PostgreSqlAsyncResponseChannel : DbAsyncResponseChannelBas
     /// <inheritdoc />
     protected override TimeSpan CurrentPollInterval() => _options.ListenerPollInterval;
 
-    // True only while a LISTEN is established: set once LISTEN succeeds on the listen connection,
-    // cleared as soon as that connection fails, until the next successful LISTEN. Read on every
-    // poll tick, so volatile.
+    // True only while a LISTEN is established AND carrying notifications: set once a delivery
+    // probe (a NOTIFY the listen connection sends itself) has come back through it — a LISTEN that
+    // merely succeeded proves nothing behind a transaction-mode pooler — and cleared as soon as
+    // that connection or a later probe fails, until the next proven LISTEN. Read on every poll
+    // tick, so volatile.
     private volatile bool _listening;
 
     /// <summary>
@@ -69,9 +71,9 @@ internal sealed class PostgreSqlAsyncResponseChannel : DbAsyncResponseChannelBas
         => Task.Run(() => ListenLoopAsync(cancellationToken));
 
     /// <summary>
-    /// A LISTEN (re)established: NOTIFY carries delivery again, and the NOTIFYs published while
-    /// none was up are gone, so sweep every waiter once now instead of leaving the responses they
-    /// announced to the next throttled sweep.
+    /// A LISTEN (re)established and its delivery probe answered: NOTIFY carries delivery again,
+    /// and the NOTIFYs published while none was up are gone, so sweep every waiter once now
+    /// instead of leaving the responses they announced to the next throttled sweep.
     /// </summary>
     private void OnWakeListenerEstablished()
     {
@@ -120,7 +122,11 @@ internal sealed class PostgreSqlAsyncResponseChannel : DbAsyncResponseChannelBas
                     failures = 0;
                 failures++;
                 var delay = AsyncResponseRetry.Backoff(failures, TimeSpan.FromMilliseconds(100), WakeListenerMaxRetryDelay);
-                _logger.LogWarning(ex, "PostgreSQL LISTEN loop failed; retrying in {Delay}.", delay);
+                // SafeLog: a logging provider that throws ended the loop here for good, and the
+                // channel lost its push wake until the process restarted.
+                SafeLog.Try(
+                    (Logger: _logger, Error: ex, Delay: delay),
+                    static state => state.Logger.LogWarning(state.Error, "PostgreSQL LISTEN loop failed; retrying in {Delay}.", state.Delay));
                 await Task.Delay(delay, cancellationToken).ConfigureAwait(false);
             }
         }

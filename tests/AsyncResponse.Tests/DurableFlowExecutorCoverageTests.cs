@@ -240,6 +240,53 @@ public sealed class DurableFlowExecutorCoverageTests
         }
     }
 
+    [Fact]
+    public async Task TheOperatorsResume_ReadingALaggingSuspendedCopy_LooksAgainAuthoritatively_BeforeIgnoringIt()
+    {
+        // Fixpoint r2 (S1#2): round 43 gave the executor's ResumeAsync a current re-read, but not
+        // IDurableFlows.ResumeAsync — the documented un-park ("set it back to Running and call
+        // ResumeAsync"). An operator script that set the run back to Running through one process
+        // and resumed it through another, whose replica still showed Suspended, had the resume
+        // ignored: nothing written, so no fence corrected the read, and the run stayed Running with
+        // nothing queued while the operator believed it resumed.
+        var current = new InMemoryFlowStateStore();
+        await CreateAsync(current, State("operator-resume-lag"));
+        await CreateAsync(current, State("operator-resume-suspended", FlowRunStatus.Suspended));
+        var store = new LaggingReadStore(current)
+        {
+            Stale = { ["operator-resume-lag"] = () => State("operator-resume-lag", FlowRunStatus.Suspended) }
+        };
+        var services = new ServiceCollection();
+        services.AddSingleton<IFlowStateStore>(store);
+        await using var provider = services.BuildServiceProvider();
+        var builder = new Mock<IAsyncResponseBuilder>();
+        builder.Setup(instance => instance.EnqueueWorkerAsync(
+                It.IsAny<Expression<Func<IDurableFlowExecutor, Task>>>(),
+                It.IsAny<CancellationToken>()))
+            .Returns(Task.CompletedTask);
+        var flows = new DurableFlowService(
+            provider.GetRequiredService<IServiceScopeFactory>(),
+            builder.Object,
+            new AsyncResponseContextPropagation([]),
+            new DurableFlowOptions(),
+            NullLogger<DurableFlowService>.Instance);
+
+        await flows.ResumeAsync("operator-resume-lag");
+
+        builder.Verify(instance => instance.EnqueueWorkerAsync(
+            It.IsAny<Expression<Func<IDurableFlowExecutor, Task>>>(),
+            It.IsAny<CancellationToken>()), Times.Once);
+        Assert.Equal(1, store.CurrentLoads);
+
+        // A run that really is Suspended is still left alone — after the one current look.
+        await flows.ResumeAsync("operator-resume-suspended");
+
+        builder.Verify(instance => instance.EnqueueWorkerAsync(
+            It.IsAny<Expression<Func<IDurableFlowExecutor, Task>>>(),
+            It.IsAny<CancellationToken>()), Times.Once);
+        Assert.Equal(2, store.CurrentLoads);
+    }
+
     /// <summary>
     /// Plain loads served by a replica that has not applied the holder's latest checkpoint for the
     /// ids in <see cref="Stale"/>; <see cref="LoadCurrentAsync"/> and every write go to the

@@ -148,7 +148,8 @@ public sealed class RabbitMqAsyncResponseOptions
     /// <summary>
     /// Bounds the connection close while hosted consumers/publishers stop. The close completes in
     /// milliseconds when healthy; when it does not, the connection is abandoned anyway, so keep
-    /// this short — it counts against the host's shutdown budget. Default: <c>5s</c>.
+    /// this short — it counts against the host's shutdown budget. Must be positive and at most the
+    /// .NET timer ceiling; the subscribers validate it at startup in both ack modes. Default: <c>5s</c>.
     /// </summary>
     public TimeSpan ShutdownTimeout { get; set; } = TimeSpan.FromSeconds(5);
 

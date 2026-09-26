@@ -90,12 +90,16 @@ internal static class OpportunisticPrune
 
                 if (Stopwatch.GetElapsedTime(started) >= limit)
                 {
-                    logger?.LogWarning(
+                    // SafeLog on all three lines: a logging provider that throws (MEL rethrows a
+                    // provider's failure) escaped this never-throw helper — from the catch below,
+                    // and from here via that catch's own log — failing a transport publish AFTER
+                    // its row committed, so the caller's retry ran the job twice.
+                    SafeLog.Try((Logger: logger, Description: description, Deleted: deleted, Batches: batches, Limit: limit), static state => state.Logger?.LogWarning(
                         "{Prune} deleted {Deleted} expired rows in {Batches} batches and stopped at its {Budget} budget with expired rows remaining; the rest drain in the next windows.",
-                        description,
-                        deleted,
-                        batches,
-                        limit);
+                        state.Description,
+                        state.Deleted,
+                        state.Batches,
+                        state.Limit));
                     return;
                 }
             }
@@ -103,16 +107,17 @@ internal static class OpportunisticPrune
         catch (OperationCanceledException ex) when (cancellationToken.IsCancellationRequested)
         {
             // The caller is going away; its own next statement observes the same token.
-            logger?.LogDebug(ex, "{Prune} was cancelled after deleting {Deleted} expired rows in {Batches} batches.", description, deleted, batches);
+            SafeLog.Try((Logger: logger, Error: ex, Description: description, Deleted: deleted, Batches: batches), static state => state.Logger?.LogDebug(
+                state.Error, "{Prune} was cancelled after deleting {Deleted} expired rows in {Batches} batches.", state.Description, state.Deleted, state.Batches));
         }
         catch (Exception ex)
         {
-            logger?.LogWarning(
-                ex,
+            SafeLog.Try((Logger: logger, Error: ex, Description: description, Deleted: deleted, Batches: batches), static state => state.Logger?.LogWarning(
+                state.Error,
                 "{Prune} failed after deleting {Deleted} expired rows in {Batches} batches; the operation it rode on is unaffected and the next window retries.",
-                description,
-                deleted,
-                batches);
+                state.Description,
+                state.Deleted,
+                state.Batches));
         }
     }
 }

@@ -41,6 +41,9 @@ internal sealed class FakeSqsClient : ISqsClient
     /// </summary>
     public bool ReturnAllAvailable { get; set; }
 
+    /// <summary>Runs just before a receive hands a non-empty batch over — e.g. the host stop beginning mid-poll.</summary>
+    public Action? OnBatchReceived { get; set; }
+
     public List<(string QueueName, IReadOnlyDictionary<string, string> Attributes)> CreatedQueues { get; } = [];
     public HashSet<string> ExistingQueues { get; } = new(StringComparer.Ordinal);
     public int CreateQueueFailuresBeforeSuccess { get; set; }
@@ -151,6 +154,8 @@ internal sealed class FakeSqsClient : ISqsClient
         var messages = new List<SqsTransportDelivery>(request.MaxMessages);
         while ((ReturnAllAvailable || messages.Count < request.MaxMessages) && _deliveries.Reader.TryRead(out var delivery))
             messages.Add(delivery);
+        if (messages.Count > 0)
+            OnBatchReceived?.Invoke();
         return messages;
     }
 

@@ -8,16 +8,24 @@ internal abstract class SqsSubscriberService : BackgroundService
 {
     private readonly ISqsClient _client;
 
+    /// <summary>The worker role's host-stop intake gate; <c>null</c> for the response role, which is never gated.</summary>
+    private readonly WorkerIntakeGate? _intakeGate;
+
     protected SqsSubscriberService(
         IOptions<SqsAsyncResponseOptions> options,
         ISqsClient client,
-        ILogger logger)
+        ILogger logger,
+        WorkerIntakeGate? intakeGate = null)
     {
         Options = options.Value;
         SqsOptionsValidator.ValidateCommon(Options);
         _client = client;
         Logger = logger;
+        _intakeGate = intakeGate;
     }
+
+    /// <summary>Host stop has begun and this is the worker subscriber: take no new delivery.</summary>
+    private bool IntakeClosed => _intakeGate?.IsClosed == true;
 
     protected SqsAsyncResponseOptions Options { get; }
     protected ILogger Logger { get; }
@@ -77,7 +85,7 @@ internal abstract class SqsSubscriberService : BackgroundService
                 queue,
                 SubscriberRole,
                 retryDelay),
-            healthyRunThreshold: Options.SubscriberRetryMaxDelay).ConfigureAwait(false);
+            healthyRunThreshold: AsyncResponseRetry.MaxAttainableDelay(Options.SubscriberRetryBaseDelay, Options.SubscriberRetryMaxDelay)).ConfigureAwait(false);
     }
 
     private async Task RunSubscriberAsync(string queue, SqsMessageDispatcher dispatcher, CancellationToken stoppingToken)
@@ -103,9 +111,12 @@ internal abstract class SqsSubscriberService : BackgroundService
         // started after it had already lapsed. On FIFO a failed message's later same-group
         // batch-mates also ran ahead of its redelivery. One message per receive leaves the rest on
         // the queue, where any peer can take it (NATS parity). Early ACK deletes each message as
-        // it is accepted, and the response ingress runs the library's own short handler, so both
-        // keep the batch — a billed ReceiveMessage per response would cost ten times the calls for
-        // no such risk.
+        // it is accepted, so it keeps the batch. The response subscriber keeps it too — a billed
+        // ReceiveMessage per response would cost ten times the calls — although its handler is not
+        // always short: a response whose waiter is gone runs that correlation's recovery callbacks
+        // inline, retries included, so slow callbacks can let batch-mates' visibility lapse (a
+        // peer then runs their callbacks too, each receive counted). Callbacks are at-least-once
+        // by contract; ResponseSubscriber visibility renewal closes the gap where they are slow.
         var receiveSize = SubscriberOptions.AckMode is SqsAckMode.AckAfterHandlerCompletes
             && SubscriberRole is SqsSubscriberRole.Worker
                 ? 1
@@ -117,6 +128,20 @@ internal abstract class SqsSubscriberService : BackgroundService
             // queue's redrive policy (SQS counts every receive), so wait for free capacity and never
             // request more messages than the dispatcher can accept.
             await dispatcher.WaitForCapacityAsync(stoppingToken).ConfigureAwait(false);
+
+            // Host stop has begun (ApplicationStopping), and the worker subscriber — registered
+            // first, so stopped last — would keep receiving until its own stop: every flow wake-up
+            // the engine's hand-overs had just published for a live replica, taken here, reached
+            // its first timer on this stopping host and was handed back again — under early ACK
+            // already deleted, so lost. Checked before every receive (and before every dispatch,
+            // in DispatchBatchAsync); the hand-back latch below stays as the fallback for a host
+            // that registers no lifetime.
+            if (IntakeClosed)
+            {
+                await StopReceivingUntilStoppedAsync(queue, "the host is stopping", stoppingToken).ConfigureAwait(false);
+                return;
+            }
+
             var maxMessages = Math.Min(receiveSize, dispatcher.FreeCapacity);
 
             // Stamped BEFORE the call: the 12-hour in-flight ceiling counts from the broker-side
@@ -153,17 +178,29 @@ internal abstract class SqsSubscriberService : BackgroundService
             {
                 // The flow engine handed a delivery back: ApplicationStopping has fired and this
                 // subscriber's own stop is next. Every job received from now on would be
-                // interrupted the same way and left invisible for a whole visibility timeout —
-                // among them the wake-ups the engine hands over for a replica still running to take
-                // at once. So stop receiving for the rest of the attempt (Redis/NATS rule) and wait
-                // for the stop.
-                Logger.LogInformation(
-                    "SQS {Role} subscriber for {Queue} stops receiving: the flow engine handed a delivery back because the host is stopping.",
-                    SubscriberRole,
-                    queue);
-                await Task.Delay(Timeout.InfiniteTimeSpan, stoppingToken).ConfigureAwait(false);
+                // interrupted the same way and left invisible — among them the wake-ups the engine
+                // hands over for a replica still running to take at once. So stop receiving for
+                // the rest of the attempt (Redis/NATS rule) and wait for the stop.
+                await StopReceivingUntilStoppedAsync(
+                    queue,
+                    "the flow engine handed a delivery back because the host is stopping",
+                    stoppingToken).ConfigureAwait(false);
+                return;
             }
         }
+    }
+
+    /// <summary>Parks the receive loop until this subscriber's own stop: nothing more is received.</summary>
+    private async Task StopReceivingUntilStoppedAsync(string queue, string reason, CancellationToken stoppingToken)
+    {
+        SafeLog.Try(
+            (Logger, SubscriberRole, queue, reason),
+            static state => state.Logger.LogInformation(
+                "SQS {Role} subscriber for {Queue} stops receiving: {Reason}.",
+                state.SubscriberRole,
+                state.queue,
+                state.reason));
+        await Task.Delay(Timeout.InfiniteTimeSpan, stoppingToken).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -193,8 +230,10 @@ internal abstract class SqsSubscriberService : BackgroundService
                 {
                     // The handler takes no token, so a stop cannot interrupt the message in hand —
                     // but it must not START the rest of the batch: every fresh handler runs against
-                    // the host's shutdown budget and is killed mid-flight when that lapses.
-                    if (stoppingToken.IsCancellationRequested)
+                    // the host's shutdown budget and is killed mid-flight when that lapses. From
+                    // ApplicationStopping on the worker takes nothing new either: a message not yet
+                    // dispatched is handed back below — under early ACK never deleted first.
+                    if (stoppingToken.IsCancellationRequested || IntakeClosed)
                         break;
 
                     try
@@ -213,10 +252,10 @@ internal abstract class SqsSubscriberService : BackgroundService
             }
             finally
             {
-                // Hand back whatever never started: a stop, a flow hand-back, or a handler that
-                // exited through the stop's cancellation — a parked flow's interruption unwinds
-                // past the stop check above — cut the batch short (NATS rule: a message whose
-                // handler ran is past `next`).
+                // Hand back whatever never started: a stop, the host-stop intake gate, a flow
+                // hand-back, or a handler that exited through the stop's cancellation — a parked
+                // flow's interruption unwinds past the stop check above — cut the batch short
+                // (NATS rule: a message whose handler ran is past `next`).
                 await HandBackUnstartedAsync(deliveries, Math.Max(next, settled), progress: null, queue).ConfigureAwait(false);
             }
 
@@ -245,10 +284,10 @@ internal abstract class SqsSubscriberService : BackgroundService
         {
             for (; next < deliveries.Count; next++)
             {
-                // Same stop rule as the renewal-free path above. Without it the loop kept
-                // starting the rest of the batch serially after the stop — with the heartbeat
+                // Same stop and intake rule as the renewal-free path above. Without it the loop
+                // kept starting the rest of the batch serially after the stop — with the heartbeat
                 // already cancelled, so those handlers outlived their visibility.
-                if (stoppingToken.IsCancellationRequested)
+                if (stoppingToken.IsCancellationRequested || IntakeClosed)
                     break;
 
                 var delivery = deliveries[next];
@@ -299,8 +338,8 @@ internal abstract class SqsSubscriberService : BackgroundService
         }
         finally
         {
-            // Hand back whatever never started — a stop, a flow hand-back, or a handler that
-            // exited through the stop's cancellation, cut the batch short (NATS rule) — while the
+            // Hand back whatever never started — a stop, the intake gate, a flow hand-back, or a
+            // handler that exited through the stop's cancellation, cut the batch short (NATS rule) — while the
             // suppression marks and per-message gates still order it after any renewal in flight.
             var handBack = HandBackUnstartedAsync(deliveries, Math.Max(next, progress.SettledCount), progress, queue);
             renewalCancellation.Cancel();
@@ -315,11 +354,13 @@ internal abstract class SqsSubscriberService : BackgroundService
             }
             catch (TimeoutException)
             {
-                Logger.LogWarning(
-                    "SQS visibility renewal for {Queue} ({Role}) did not stop within the shutdown budget ({ShutdownTimeout}); abandoning the renewal task.",
-                    queue,
-                    SubscriberRole,
-                    Options.ShutdownTimeout);
+                SafeLog.Try(
+                    (Logger, queue, SubscriberRole, Options.ShutdownTimeout),
+                    static state => state.Logger.LogWarning(
+                        "SQS visibility renewal for {Queue} ({Role}) did not stop within the shutdown budget ({ShutdownTimeout}); abandoning the renewal task.",
+                        state.queue,
+                        state.SubscriberRole,
+                        state.ShutdownTimeout));
             }
 
             // Started before the join above and bounded by the same ShutdownTimeout, so the two
@@ -361,11 +402,13 @@ internal abstract class SqsSubscriberService : BackgroundService
         {
             // An SDK call mid-retry ignored the budget token. The source stays undisposed: the
             // abandoned calls still hold its token.
-            Logger.LogWarning(
-                "Handing unstarted SQS messages back to {Queue} ({Role}) did not finish within the shutdown budget ({ShutdownTimeout}); they reappear when their visibility timeout lapses.",
-                queue,
-                SubscriberRole,
-                Options.ShutdownTimeout);
+            SafeLog.Try(
+                (Logger, queue, SubscriberRole, Options.ShutdownTimeout),
+                static state => state.Logger.LogWarning(
+                    "Handing unstarted SQS messages back to {Queue} ({Role}) did not finish within the shutdown budget ({ShutdownTimeout}); they reappear when their visibility timeout lapses.",
+                    state.queue,
+                    state.SubscriberRole,
+                    state.ShutdownTimeout));
         }
 
         async Task ReleaseAsync(int index)
@@ -387,11 +430,13 @@ internal abstract class SqsSubscriberService : BackgroundService
             }
             catch (Exception ex)
             {
-                Logger.LogWarning(
-                    ex,
-                    "Failed to hand unstarted SQS message {MessageId} back to {Queue} while stopping; it reappears when its visibility timeout lapses.",
-                    delivery.MessageId,
-                    queue);
+                SafeLog.Try(
+                    (Logger, ex, delivery.MessageId, queue),
+                    static state => state.Logger.LogWarning(
+                        state.ex,
+                        "Failed to hand unstarted SQS message {MessageId} back to {Queue} while stopping; it reappears when its visibility timeout lapses.",
+                        state.MessageId,
+                        state.queue));
             }
             finally
             {
@@ -472,10 +517,12 @@ internal abstract class SqsSubscriberService : BackgroundService
                                 // delivery any further, so say so once and stop asking instead of
                                 // logging a rejected renewal on every remaining beat.
                                 progress.SuppressRenewal(i);
-                                Logger.LogWarning(
-                                    "SQS message {MessageId} on {Queue} has reached the 12-hour SQS in-flight ceiling; its visibility cannot be extended further and SQS will redeliver it while its handler is still running.",
-                                    delivery.MessageId,
-                                    queue);
+                                SafeLog.Try(
+                                    (Logger, delivery.MessageId, queue),
+                                    static state => state.Logger.LogWarning(
+                                        "SQS message {MessageId} on {Queue} has reached the 12-hour SQS in-flight ceiling; its visibility cannot be extended further and SQS will redeliver it while its handler is still running.",
+                                        state.MessageId,
+                                        state.queue));
                             }
                         }
                         finally
@@ -492,11 +539,13 @@ internal abstract class SqsSubscriberService : BackgroundService
                         // the whole remaining batch. Messages 3..N then went visible mid-processing
                         // and a peer re-ran them: systematic duplicate execution with no log line.
                         // Same idiom the durable-flow start ladder and the DB channel already use.
-                        Logger.LogWarning(
-                            ex,
-                            "Failed to renew visibility of SQS message {MessageId} on {Queue}; it may redeliver while still being processed (at-least-once preserved).",
-                            delivery.MessageId,
-                            queue);
+                        SafeLog.Try(
+                            (Logger, ex, delivery.MessageId, queue),
+                            static state => state.Logger.LogWarning(
+                                state.ex,
+                                "Failed to renew visibility of SQS message {MessageId} on {Queue}; it may redeliver while still being processed (at-least-once preserved).",
+                                state.MessageId,
+                                state.queue));
                     }
                 }
             }
@@ -537,7 +586,6 @@ internal abstract class SqsSubscriberService : BackgroundService
 internal sealed class SqsWorkerSubscriber : SqsSubscriberService
 {
     private readonly IAsyncResponseIngress _ingress;
-    private readonly bool _durableFlowsRegistered;
 
     /// <summary>Creates a worker subscriber for the configured SQS worker queue.</summary>
     public SqsWorkerSubscriber(
@@ -545,18 +593,19 @@ internal sealed class SqsWorkerSubscriber : SqsSubscriberService
         ISqsClient client,
         IAsyncResponseIngress ingress,
         ILogger<SqsWorkerSubscriber> logger,
-        IEnumerable<DurableFlowOptions>? durableFlowOptions = null)
-        : base(options, client, logger)
+        IHostApplicationLifetime? hostLifetime = null)
+        : base(options, client, logger, new WorkerIntakeGate(hostLifetime))
     {
         _ingress = ingress;
-        _durableFlowsRegistered = durableFlowOptions?.Any() == true;
     }
 
     /// <summary>
     /// Validates like every subscriber, then warns about queue pairs that may be one queue (once
     /// per process — the worker subscriber speaks for the transport) and about the two SQS worker
     /// configurations in which durable flows run against limits the engine cannot see (interim
-    /// guidance; see docs/transport-semantics.md).
+    /// guidance; see docs/transport-semantics.md). Unconditionally: every host registers a
+    /// durable-flow store (Core's startup validator requires one), so durable-flow start, resume
+    /// and wake-up jobs can ride this queue in any app — a "flows registered" gate was always true.
     /// </summary>
     public override Task StartAsync(CancellationToken cancellationToken)
     {
@@ -568,8 +617,7 @@ internal sealed class SqsWorkerSubscriber : SqsSubscriberService
                 collision);
         }
 
-        if (_durableFlowsRegistered)
-            WarnAboutDurableFlowLimits();
+        WarnAboutDurableFlowLimits();
         return start;
     }
 
@@ -580,7 +628,7 @@ internal sealed class SqsWorkerSubscriber : SqsSubscriberService
             // Flow start, resume and wake-up jobs carry no correlation id unless the flow was
             // started inside a request scope, and FIFO keeps every flow timer in process.
             Logger.LogWarning(
-                "The SQS worker queue {Queue} is a FIFO queue and durable flows are registered: every job without a correlation id — durable-flow start, resume and wake-up jobs among them — shares the single MessageGroupId '{FallbackGroup}' ({FallbackOption}), which SQS delivers strictly one at a time across all consumers. FIFO also keeps flow timers in process, so one flow parked on a timer or an awaited step holds that group — and with it every other flow — for as long as it waits. Prefer a standard worker queue for durable flows.",
+                "The SQS worker queue {Queue} is a FIFO queue, and durable-flow jobs ride this queue: every job without a correlation id — durable-flow start, resume and wake-up jobs among them — shares the single MessageGroupId '{FallbackGroup}' ({FallbackOption}), which SQS delivers strictly one at a time across all consumers. FIFO also keeps flow timers in process, so one flow parked on a timer or an awaited step holds that group — and with it every other flow — for as long as it waits. Prefer a standard worker queue for durable flows.",
                 Options.WorkerQueue,
                 Options.FifoMessageGroupIdFallback,
                 $"{nameof(SqsAsyncResponseOptions)}.{nameof(SqsAsyncResponseOptions.FifoMessageGroupIdFallback)}");

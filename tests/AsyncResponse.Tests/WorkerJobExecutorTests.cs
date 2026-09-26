@@ -370,6 +370,129 @@ public class WorkerJobExecutorTests
         });
     }
 
+    [Fact]
+    public async Task ThrowingLogger_OnTheExecutorsLogLines_NeitherSkipsNorFailsASuccessfulJob()
+    {
+        // Regression (fixpoint r2): the "Executed worker job" Debug line ran inside the try, after
+        // the invocation — a logging provider that threw there (MEL rethrows a provider's failure)
+        // landed in the catch, recorded "failed" and rethrew, and the transport redelivered a job
+        // whose side effects had already run. The "Executing worker job" line before the
+        // invocation threw just as well, and the job then never ran at all.
+        var probe = new WorkerProbe();
+        var logger = new CollectingLogger { ThrowOnMessageContaining = "worker job" };
+        await using var provider = new ServiceCollection().AddSingleton<IWorkerProbe>(probe).BuildServiceProvider();
+        var executor = new WorkerJobExecutor(provider.GetRequiredService<IServiceScopeFactory>(), logger.For<WorkerJobExecutor>());
+        using var activities = new AsyncResponseActivityCollector();
+        using var outcomes = new WorkerOutcomeRecorder();
+
+        await executor.ExecuteAsync(CreateJob("cid-throwing-logger"));
+
+        Assert.Equal("cid-throwing-logger", probe.SeenCorrelationId);
+        Assert.Equal(new string?[] { "executed" }, outcomes.Snapshot());
+        Assert.Contains(logger.Messages, message => message.Contains("Executed worker job", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task ThrowingLogger_OnANonPortableCorrelationId_StillDropsTheJobWithoutThrowing()
+    {
+        // Regression (fixpoint r2): the documented "drop, never throw" logged its Error BEFORE it
+        // recorded the outcome and returned, so a logging provider that threw turned the drop into
+        // the poison message it exists to prevent (redelivered forever on a broker with no cap).
+        var logger = new CollectingLogger { ThrowOnMessageContaining = "portable contract" };
+        await using var provider = new ServiceCollection().BuildServiceProvider();
+        var executor = new WorkerJobExecutor(provider.GetRequiredService<IServiceScopeFactory>(), logger.For<WorkerJobExecutor>());
+        using var activities = new AsyncResponseActivityCollector();
+        using var outcomes = new WorkerOutcomeRecorder();
+
+        await executor.ExecuteAsync(CreateJob(" cid-with-a-leading-space"));
+
+        Assert.Equal(new string?[] { "rejected" }, outcomes.Snapshot());
+        Assert.Contains(logger.Messages, message => message.Contains("portable contract", StringComparison.Ordinal));
+    }
+
+    /// <summary>A delayed-capable transport whose delayed publishes all fail (capacity exhausted, host draining).</summary>
+    private sealed class RejectingDelayedTransport(bool reject) : IDelayedWorkerTransport
+    {
+        public TimeSpan MaxPublishDelay => TimeSpan.FromDays(1);
+
+        public Task PublishAsync(WorkerJobEnvelope job, CancellationToken cancellationToken = default) => Task.CompletedTask;
+
+        public Task PublishAsync(WorkerJobEnvelope job, TimeSpan delay, CancellationToken cancellationToken = default)
+            => reject ? Task.FromException(new InvalidOperationException("delayed publish rejected")) : Task.CompletedTask;
+    }
+
+    [Theory]
+    [InlineData(true, "failed")]
+    [InlineData(false, "redelayed")]
+    public async Task RedelayHop_RecordsItsOutcomeOnlyOnceTheHopIsOut(bool rejectHop, string expected)
+    {
+        // Regression (fixpoint r2): "redelayed" was recorded BEFORE the next hop was published, so
+        // a hop the transport rejected — and each retry of that delivery — counted as a successful
+        // re-delay, while no attempt ever counted as "failed".
+        var clock = new VirtualTimeProvider();
+        await using var provider = new ServiceCollection().BuildServiceProvider();
+        var executor = new WorkerJobExecutor(
+            provider.GetRequiredService<IServiceScopeFactory>(),
+            NullLogger<WorkerJobExecutor>.Instance,
+            new RejectingDelayedTransport(rejectHop),
+            clock);
+        using var activities = new AsyncResponseActivityCollector();
+        using var outcomes = new WorkerOutcomeRecorder();
+
+        var job = CreateJob("cid-early");
+        job.NotBeforeUtc = clock.GetUtcNow().UtcDateTime + TimeSpan.FromHours(1);
+        var execution = executor.ExecuteAsync(job);
+        if (rejectHop)
+            await Assert.ThrowsAsync<InvalidOperationException>(() => execution);
+        else
+            await execution;
+
+        Assert.Equal(new string?[] { expected }, outcomes.Snapshot());
+    }
+
+    /// <summary>
+    /// This test's own <c>asyncresponse.worker.jobs</c> outcomes: the meter is process-wide and other
+    /// tests run alongside, so only measurements under the ambient trace of the test's
+    /// <see cref="AsyncResponseActivityCollector"/> (created first) count.
+    /// </summary>
+    private sealed class WorkerOutcomeRecorder : IDisposable
+    {
+        private readonly List<string?> _outcomes = [];
+        private readonly System.Diagnostics.Metrics.MeterListener _listener;
+
+        public WorkerOutcomeRecorder()
+        {
+            var traceId = System.Diagnostics.Activity.Current!.TraceId;
+            _listener = new System.Diagnostics.Metrics.MeterListener
+            {
+                InstrumentPublished = (instrument, listener) =>
+                {
+                    if (instrument.Meter.Name == AsyncResponseDiagnostics.MeterName && instrument.Name == "asyncresponse.worker.jobs")
+                        listener.EnableMeasurementEvents(instrument);
+                }
+            };
+            _listener.SetMeasurementEventCallback<long>((_, _, tags, _) =>
+            {
+                if (System.Diagnostics.Activity.Current?.TraceId != traceId)
+                    return;
+
+                foreach (var tag in tags)
+                {
+                    if (tag.Key == "outcome")
+                        lock (_outcomes) _outcomes.Add(tag.Value as string);
+                }
+            });
+            _listener.Start();
+        }
+
+        public string?[] Snapshot()
+        {
+            lock (_outcomes) return [.. _outcomes];
+        }
+
+        public void Dispose() => _listener.Dispose();
+    }
+
     private static WorkerJobEnvelope CreateJob(string correlationId)
         => new()
         {

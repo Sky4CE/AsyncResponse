@@ -74,6 +74,12 @@ internal abstract class NatsSubscriberService : BackgroundService
     protected abstract string Consumer { get; }
     protected abstract NatsSubscriberOptions SubscriberOptions { get; }
     protected abstract NatsSubscriberRole Role { get; }
+
+    /// <summary>
+    /// The host-stop signal this subscriber stops taking deliveries at — the worker role only; a
+    /// response subscriber keeps serving the waiters host stop deliberately does not interrupt.
+    /// </summary>
+    protected virtual WorkerIntakeGate? IntakeGate => null;
     /// <summary>Handles the delivered message.</summary>
     protected abstract Task HandleMessageAsync(NatsJobDelivery delivery, CancellationToken cancellationToken);
 
@@ -111,14 +117,15 @@ internal abstract class NatsSubscriberService : BackgroundService
             Schema,
             Logger,
             Role,
-            Consumer);
+            Consumer,
+            IntakeGate);
 
         await SubscriberSupervisor.RunAsync(
             attemptToken => RunSubscriberAsync(dispatcher, attemptToken),
             stoppingToken,
             failures => AsyncResponseRetry.Backoff(failures, Options.SubscriberRetryBaseDelay, Options.SubscriberRetryMaxDelay),
             (ex, retryDelay) => Logger.LogWarning(ex, "NATS subscriber failed for subject {Subject} ({Role}); retrying in {RetryDelay}.", Subject, Role, retryDelay),
-            healthyRunThreshold: Options.SubscriberRetryMaxDelay).ConfigureAwait(false);
+            healthyRunThreshold: AsyncResponseRetry.MaxAttainableDelay(Options.SubscriberRetryBaseDelay, Options.SubscriberRetryMaxDelay)).ConfigureAwait(false);
     }
 
     private async Task RunSubscriberAsync(NatsMessageDispatcher dispatcher, CancellationToken stoppingToken)
@@ -130,7 +137,7 @@ internal abstract class NatsSubscriberService : BackgroundService
                 await _jetStream.EnsureDeadLetterStreamAsync(Schema.DeadLetterStream, Schema.DeadLetterSubject, Options.DeadLetterStreamMaxMessages, stoppingToken).ConfigureAwait(false);
         }
 
-        var liveAckWait = await _jetStream.EnsureConsumerAsync(Stream, Consumer, Options.AckWait, SubscriberOptions.MaxDeliveryAttempts, stoppingToken).ConfigureAwait(false);
+        var liveAckWait = await _jetStream.EnsureConsumerAsync(Stream, Subject, Consumer, Options.AckWait, SubscriberOptions.MaxDeliveryAttempts, stoppingToken).ConfigureAwait(false);
 
         // The heartbeat must land inside the window the server actually enforces: the consumer is
         // never modified, so after AckWait is raised (or on an operator-provisioned durable) the
@@ -153,46 +160,64 @@ internal abstract class NatsSubscriberService : BackgroundService
         var fetchSize = SubscriberOptions.AckMode is NatsAckMode.AckAfterEnqueue ? SubscriberOptions.BatchSize : 1;
         var batch = new List<NatsJobDelivery>(fetchSize);
         var fastEmptyPolls = 0;
+
+        // Fetching (the long poll, its backoff) also ends the moment host stop closes the worker's
+        // intake, rather than up to a whole long poll later; a handler is never handed this token.
+        using var intake = IntakeGate is { } gate
+            ? CancellationTokenSource.CreateLinkedTokenSource(stoppingToken, gate.HostStopping)
+            : null;
+        var fetchToken = intake?.Token ?? stoppingToken;
         while (!stoppingToken.IsCancellationRequested)
         {
-            // The flow engine handed a delivery back: the host IS stopping — the engine reacts to
-            // ApplicationStopping, which fires before this subscriber's token — so fetch nothing
-            // more; wait for the stop. Ending only the delivery kept the loop fetching through the
-            // whole stop window, and every flow wake-up fetched there was handed back too: an
-            // attempt spent on a stopping host (a live peer would have taken it at once) — or, in
-            // early ACK, already ACKed, so each one became a dead-letter copy.
-            if (dispatcher.HandBackSignalled)
+            // The flow engine handed a delivery back, or host stop closed the worker's intake:
+            // the host IS stopping — both fire on ApplicationStopping, before this subscriber's
+            // token — so fetch nothing more; wait for the stop. Ending only the delivery kept the
+            // loop fetching through the whole stop window, and every flow wake-up fetched there
+            // was handed back too: an attempt spent on a stopping host (a live peer would have
+            // taken it at once) — or, in early ACK, already ACKed, so each one became a
+            // dead-letter copy.
+            if (dispatcher.IntakeClosed)
             {
                 await Task.Delay(Timeout.InfiniteTimeSpan, stoppingToken).ConfigureAwait(false);
                 break;
             }
 
             batch.Clear();
-
-            // Drain whatever is already available, up to the fetch size. The batch is
-            // materialized out of the client buffer BEFORE dispatch so the in-progress heartbeat
-            // below can reach every waiting message: the server starts each message's AckWait
-            // clock at delivery, and an open-ended consume buffered the whole prefetch
-            // client-side — a serial batch whose handlers together outlast AckWait had its tail
-            // redelivered to a competing consumer (and NumDelivered climbed toward the Term cap)
-            // while it was still queued here.
-            await foreach (var delivery in _jetStream.FetchNoWaitAsync(Stream, Consumer, fetchSize, stoppingToken).ConfigureAwait(false))
-                batch.Add(delivery);
-
-            if (batch.Count == 0)
+            try
             {
-                // Nothing waiting: long-poll for a single message so idle delivery latency stays
-                // push-like. Siblings arriving behind the long-polled message stay ON the stream
-                // — where AckWait has not started — until the next no-wait drain.
-                var pollStarted = _timeProvider.GetTimestamp();
-                await foreach (var delivery in _jetStream.FetchAsync(Stream, Consumer, maxMessages: 1, LongPollExpires, stoppingToken).ConfigureAwait(false))
+                // Drain whatever is already available, up to the fetch size. The batch is
+                // materialized out of the client buffer BEFORE dispatch so the in-progress
+                // heartbeat below can reach every waiting message: the server starts each
+                // message's AckWait clock at delivery, and an open-ended consume buffered the
+                // whole prefetch client-side — a serial batch whose handlers together outlast
+                // AckWait had its tail redelivered to a competing consumer (and NumDelivered
+                // climbed toward the Term cap) while it was still queued here.
+                await foreach (var delivery in _jetStream.FetchNoWaitAsync(Stream, Consumer, fetchSize, fetchToken).ConfigureAwait(false))
                     batch.Add(delivery);
 
                 if (batch.Count == 0)
                 {
-                    fastEmptyPolls = await BackOffAfterEmptyLongPollAsync(_timeProvider.GetElapsedTime(pollStarted), fastEmptyPolls, stoppingToken).ConfigureAwait(false);
-                    continue;
+                    // Nothing waiting: long-poll for a single message so idle delivery latency
+                    // stays push-like. Siblings arriving behind the long-polled message stay ON
+                    // the stream — where AckWait has not started — until the next no-wait drain.
+                    var pollStarted = _timeProvider.GetTimestamp();
+                    await foreach (var delivery in _jetStream.FetchAsync(Stream, Consumer, maxMessages: 1, LongPollExpires, fetchToken).ConfigureAwait(false))
+                        batch.Add(delivery);
+
+                    if (batch.Count == 0)
+                    {
+                        fastEmptyPolls = await BackOffAfterEmptyLongPollAsync(_timeProvider.GetElapsedTime(pollStarted), fastEmptyPolls, fetchToken).ConfigureAwait(false);
+                        continue;
+                    }
                 }
+            }
+            catch (OperationCanceledException) when (!stoppingToken.IsCancellationRequested && dispatcher.IntakeClosed)
+            {
+                // Host stop closed the intake mid-fetch: hand back what the fetch had already
+                // delivered, unstarted, then park at the top of the loop.
+                foreach (var delivery in batch)
+                    await ReleaseUnstartedAsync(delivery).ConfigureAwait(false);
+                continue;
             }
 
             fastEmptyPolls = 0;
@@ -260,9 +285,10 @@ internal abstract class NatsSubscriberService : BackgroundService
             {
                 // Stopping: do not start what has not started. The rest of the batch used to run
                 // on, handler after handler, past the stop signal. A hand-back from the flow
-                // engine (inline, or in an early-ACK worker) is the same signal, arriving before
-                // the token.
-                if (stoppingToken.IsCancellationRequested || dispatcher.HandBackSignalled)
+                // engine (inline, or in an early-ACK worker) and host stop closing the worker's
+                // intake are the same signal, arriving before the token — and from them on
+                // nothing is settled first (early ACK) either.
+                if (stoppingToken.IsCancellationRequested || dispatcher.IntakeClosed)
                     break;
 
                 try
@@ -373,8 +399,13 @@ internal abstract class NatsSubscriberService : BackgroundService
                     {
                         await delivery.ProgressAsync(cancellationToken).ConfigureAwait(false);
                     }
-                    catch (Exception ex) when (ex is not OperationCanceledException)
+                    catch (Exception ex) when (ex is not OperationCanceledException || !cancellationToken.IsCancellationRequested)
                     {
+                        // Only THIS loop's token ends it. The SDK raises cancellations of its own
+                        // — a publish waiting out a disconnect under PublishTimeoutOnDisconnected
+                        // is cancelled by the connection's CommandTimeout — and treating any of
+                        // them as the batch ending stopped every renewal for the rest of the
+                        // batch, so AckWait lapsed under a live handler and redelivered to a peer.
                         Logger.LogWarning(
                             ex,
                             "Failed to signal in-progress for NATS message on subject {Subject} ({Role}); its AckWait may lapse and it may redeliver while still queued (at-least-once preserved).",
@@ -384,7 +415,7 @@ internal abstract class NatsSubscriberService : BackgroundService
                 }
             }
         }
-        catch (OperationCanceledException)
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
             // The batch finished or the subscriber is stopping.
         }
@@ -406,24 +437,35 @@ internal abstract class NatsSubscriberService : BackgroundService
 internal sealed class NatsWorkerSubscriber : NatsSubscriberService
 {
     private readonly IAsyncResponseIngress _ingress;
+    private readonly WorkerIntakeGate _intakeGate;
 
     /// <summary>Runs the NatsWorkerSubscriber operation.</summary>
     public NatsWorkerSubscriber(
         IOptions<NatsAsyncResponseTransportOptions> options,
         INatsConnection connection,
         IAsyncResponseIngress ingress,
-        ILogger<NatsWorkerSubscriber> logger)
+        ILogger<NatsWorkerSubscriber> logger,
+        IHostApplicationLifetime? hostLifetime = null)
         : base(options, connection, logger)
-        => _ingress = ingress;
+    {
+        _ingress = ingress;
+        _intakeGate = new WorkerIntakeGate(hostLifetime);
+    }
 
     internal NatsWorkerSubscriber(
         IOptions<NatsAsyncResponseTransportOptions> options,
         INatsJetStreamTransport jetStream,
         IAsyncResponseIngress ingress,
         ILogger<NatsWorkerSubscriber> logger,
-        TimeProvider? timeProvider = null)
+        TimeProvider? timeProvider = null,
+        IHostApplicationLifetime? hostLifetime = null)
         : base(options, jetStream, logger, timeProvider)
-        => _ingress = ingress;
+    {
+        _ingress = ingress;
+        _intakeGate = new WorkerIntakeGate(hostLifetime);
+    }
+
+    protected override WorkerIntakeGate? IntakeGate => _intakeGate;
 
     protected override string Subject => Schema.WorkerSubject;
     protected override string Stream => Schema.WorkerStream;

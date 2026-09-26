@@ -1,3 +1,4 @@
+using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using RabbitMQ.Client;
 using System.Collections;
@@ -19,6 +20,8 @@ internal abstract class RabbitMqMessageDispatcher : IAsyncDisposable
     private readonly RabbitMqSubscriberOptions _subscriberOptions;
     private readonly string _queue;
     private readonly RabbitMqSubscriberRole _role;
+    private readonly WorkerIntakeGate? _intakeGate;
+    private int _intakeClosedReported;
 
     /// <summary>Runs the RabbitMqMessageDispatcher operation.</summary>
     protected RabbitMqMessageDispatcher(
@@ -27,7 +30,8 @@ internal abstract class RabbitMqMessageDispatcher : IAsyncDisposable
         RabbitMqSubscriberOptions subscriberOptions,
         ILogger logger,
         string queue,
-        RabbitMqSubscriberRole role)
+        RabbitMqSubscriberRole role,
+        IHostApplicationLifetime? hostLifetime)
     {
         _handler = handler;
         TransportOptions = transportOptions;
@@ -35,11 +39,42 @@ internal abstract class RabbitMqMessageDispatcher : IAsyncDisposable
         Logger = logger;
         _queue = queue;
         _role = role;
+        _intakeGate = hostLifetime is null ? null : new WorkerIntakeGate(hostLifetime);
     }
 
     protected RabbitMqAsyncResponseOptions TransportOptions { get; }
     protected ILogger Logger { get; }
     protected string QueueName => _queue;
+
+    /// <summary>
+    /// True once host stop has begun on a WORKER dispatcher (<see cref="WorkerIntakeGate"/>): a
+    /// delivery arriving now is neither started nor settled. Left unacknowledged it holds one
+    /// prefetch credit — so the broker soon stops sending to this consumer at all, the push-consumer
+    /// form of "stop fetching" — until the channel close at this subscriber's own stop requeues it
+    /// for a live replica. (A requeue NACK instead could hand it straight back to this
+    /// still-registered consumer, a loop at network rate for the whole stop window.) Always false
+    /// for the response subscriber, which passes no lifetime: waiters keep being served.
+    /// </summary>
+    protected bool IntakeClosed
+    {
+        get
+        {
+            if (_intakeGate?.IsClosed != true)
+                return false;
+
+            if (Interlocked.Exchange(ref _intakeClosedReported, 1) == 0)
+            {
+                SafeLog.Try(() => Logger.LogInformation(
+                    "The host is stopping: the RabbitMQ worker subscriber for {Queue} takes no new deliveries. They stay unacknowledged, and the broker requeues them for a live replica when this subscriber closes its channel.",
+                    _queue));
+            }
+
+            return true;
+        }
+    }
+
+    /// <summary>Cancelled when host stop begins, for a WORKER dispatcher parked in a wait; never otherwise.</summary>
+    protected CancellationToken IntakeClosing => _intakeGate?.HostStopping ?? CancellationToken.None;
 
     /// <summary>
     /// Where a message that must leave the dead-letter cycle for good is parked:
@@ -182,14 +217,18 @@ internal abstract class RabbitMqMessageDispatcher : IAsyncDisposable
         };
     }
 
-    /// <summary>Creates the configured dispatcher.</summary>
+    /// <summary>
+    /// Creates the configured dispatcher. <paramref name="hostLifetime"/> — passed by the worker
+    /// subscriber only — closes its intake when host stop begins (see <see cref="IntakeClosed"/>).
+    /// </summary>
     public static RabbitMqMessageDispatcher Create(
         Func<RabbitMqDelivery, CancellationToken, Task> handler,
         RabbitMqAsyncResponseOptions transportOptions,
         RabbitMqSubscriberOptions subscriberOptions,
         ILogger logger,
         string queue,
-        RabbitMqSubscriberRole role)
+        RabbitMqSubscriberRole role,
+        IHostApplicationLifetime? hostLifetime = null)
     {
         ValidateOptions(transportOptions, subscriberOptions, role);
 
@@ -200,14 +239,16 @@ internal abstract class RabbitMqMessageDispatcher : IAsyncDisposable
                 subscriberOptions,
                 logger,
                 queue,
-                role)
+                role,
+                hostLifetime)
             : new QueuedRabbitMqMessageDispatcher(
                 handler,
                 transportOptions,
                 subscriberOptions,
                 logger,
                 queue,
-                role);
+                role,
+                hostLifetime);
     }
 
     /// <summary>Validates the supplied options.</summary>
@@ -317,6 +358,13 @@ internal abstract class RabbitMqMessageDispatcher : IAsyncDisposable
         if (subscriberOptions.MaxDeliveryAttempts < 0)
             throw new InvalidOperationException($"{optionPath}.{nameof(RabbitMqSubscriberOptions.MaxDeliveryAttempts)} cannot be negative (0 means unlimited).");
 
+        // Both ack modes arm it on the stop path (the consumer cancel, then the channel/connection
+        // close), and the ack-after-handler in-flight wait subtracts it twice from the host budget:
+        // validated for early ACK only, a negative value started and then threw at stop — skipping
+        // the in-flight wait, so the running handler's ACK was lost to the close — and
+        // TimeSpan.MaxValue overflowed in the dispatcher constructor.
+        AsyncResponseChannelOptions.EnsureTimerBacked(transportOptions.ShutdownTimeout, nameof(RabbitMqAsyncResponseOptions), nameof(RabbitMqAsyncResponseOptions.ShutdownTimeout));
+
         switch (subscriberOptions.AckMode)
         {
             case RabbitMqAckMode.AckAfterHandlerCompletes:
@@ -338,7 +386,6 @@ internal abstract class RabbitMqMessageDispatcher : IAsyncDisposable
                 }
 
                 AsyncResponseChannelOptions.EnsureTimerBacked(subscriberOptions.BackgroundDrainTimeout, optionPath, nameof(RabbitMqSubscriberOptions.BackgroundDrainTimeout));
-                AsyncResponseChannelOptions.EnsureTimerBacked(transportOptions.ShutdownTimeout, nameof(RabbitMqAsyncResponseOptions), nameof(RabbitMqAsyncResponseOptions.ShutdownTimeout));
 
                 // RabbitMQ arms ShutdownTimeout TWICE on the stop path — once for BasicCancel,
                 // then (after the background drain) a fresh budget for the channel and connection
@@ -422,8 +469,14 @@ internal abstract class RabbitMqMessageDispatcher : IAsyncDisposable
                 || (ex is OperationCanceledException && cancellationToken.IsCancellationRequested);
             if (!stopped)
             {
+                // A static state lambda: a capturing one allocates its closure on every delivery.
                 if (logFailures)
-                    Logger.LogError(ex, "RabbitMQ message handling failed for delivery {DeliveryTag}.", delivery.DeliveryTag);
+                {
+                    SafeLog.Try(
+                        (Logger, Error: ex, delivery.DeliveryTag),
+                        static state => state.Logger.LogError(state.Error, "RabbitMQ message handling failed for delivery {DeliveryTag}.", state.DeliveryTag));
+                }
+
                 AsyncResponseDiagnostics.SetError(activity, ex);
             }
 
@@ -431,34 +484,62 @@ internal abstract class RabbitMqMessageDispatcher : IAsyncDisposable
         }
     }
 
-    /// <summary>Runs the NotifyBackgroundFailureAsync operation.</summary>
+    /// <summary>
+    /// Invokes <see cref="RabbitMqSubscriberOptions.OnBackgroundFailure"/>, never throwing. Waits for
+    /// it at most until <paramref name="bound"/> fires — the shutdown reserve, where the callback is
+    /// user code (an alert, a database write) that must not hold the host's stop — and then stops
+    /// waiting, leaving the abandoned callback observed; unbounded otherwise.
+    /// </summary>
     protected async ValueTask NotifyBackgroundFailureAsync(
         RabbitMqDelivery delivery,
         Exception exception,
         string queue,
-        RabbitMqSubscriberRole role)
+        RabbitMqSubscriberRole role,
+        CancellationToken bound = default)
     {
         var callback = _subscriberOptions.OnBackgroundFailure;
         if (callback is null)
             return;
 
+        Task invocation;
         try
         {
-            await callback(new RabbitMqBackgroundFailureContext(
+            invocation = callback(new RabbitMqBackgroundFailureContext(
                 queue,
                 role.ToString(),
                 delivery.Exchange,
                 delivery.RoutingKey,
                 delivery.DeliveryTag,
-                exception)).ConfigureAwait(false);
+                exception)).AsTask();
         }
         catch (Exception callbackException)
         {
-            Logger.LogError(
+            invocation = Task.FromException(callbackException);
+        }
+
+        try
+        {
+            await invocation.WaitAsync(bound).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (bound.IsCancellationRequested && !invocation.IsCompleted)
+        {
+            _ = invocation.ContinueWith(
+                static abandoned => _ = abandoned.Exception,
+                CancellationToken.None,
+                TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously,
+                TaskScheduler.Default);
+            SafeLog.Try(() => Logger.LogWarning(
+                "RabbitMQ OnBackgroundFailure callback for already-ACKed delivery {DeliveryTag} on {Queue} did not complete within the shutdown reserve; no longer waiting for it.",
+                delivery.DeliveryTag,
+                queue));
+        }
+        catch (Exception callbackException)
+        {
+            SafeLog.Try(() => Logger.LogError(
                 callbackException,
                 "RabbitMQ background failure callback failed for already-ACKed delivery {DeliveryTag} on {Queue}.",
                 delivery.DeliveryTag,
-                queue);
+                queue));
         }
     }
 }
@@ -486,8 +567,9 @@ internal sealed class AwaitingRabbitMqMessageDispatcher : RabbitMqMessageDispatc
         RabbitMqSubscriberOptions subscriberOptions,
         ILogger logger,
         string queue,
-        RabbitMqSubscriberRole role)
-        : base(handler, transportOptions, subscriberOptions, logger, queue, role)
+        RabbitMqSubscriberRole role,
+        IHostApplicationLifetime? hostLifetime = null)
+        : base(handler, transportOptions, subscriberOptions, logger, queue, role, hostLifetime)
     {
         _inFlightDrainTimeout = ResolveInFlightDrainTimeout(transportOptions, subscriberOptions);
 
@@ -495,12 +577,12 @@ internal sealed class AwaitingRabbitMqMessageDispatcher : RabbitMqMessageDispatc
         // subscriber began stopping" warning on every stop that had a handler in flight.
         if (_inFlightDrainTimeout == TimeSpan.Zero && subscriberOptions.BackgroundDrainTimeout > TimeSpan.Zero)
         {
-            Logger.LogInformation(
+            SafeLog.Try(() => Logger.LogInformation(
                 "The RabbitMQ subscriber for {Queue} will not wait for a running handler when it stops: HostShutdownTimeout ({HostShutdownTimeout}) leaves nothing after the consumer cancel and the channel/connection close ({ShutdownTimeout} each), so the close cuts off a handler still running at stop and the broker redelivers its un-ACKed delivery. Raise HostShutdownTimeout (mirroring HostOptions.ShutdownTimeout) to let a stop wait up to BackgroundDrainTimeout ({BackgroundDrainTimeout}) for it.",
                 queue,
                 transportOptions.HostShutdownTimeout,
                 transportOptions.ShutdownTimeout,
-                subscriberOptions.BackgroundDrainTimeout);
+                subscriberOptions.BackgroundDrainTimeout));
         }
     }
 
@@ -520,7 +602,10 @@ internal sealed class AwaitingRabbitMqMessageDispatcher : RabbitMqMessageDispatc
         var wait = subscriberOptions.BackgroundDrainTimeout;
         if (transportOptions.HostShutdownTimeout is { } hostBudget)
         {
-            var left = hostBudget - transportOptions.ShutdownTimeout - transportOptions.ShutdownTimeout;
+            // Compared before subtracting: an unvalidated budget near TimeSpan.MinValue must clamp
+            // to zero, not overflow (ShutdownTimeout itself is validated timer-backed).
+            var closes = transportOptions.ShutdownTimeout + transportOptions.ShutdownTimeout;
+            var left = hostBudget <= closes ? TimeSpan.Zero : hostBudget - closes;
             if (left < wait)
                 wait = left;
         }
@@ -549,6 +634,12 @@ internal sealed class AwaitingRabbitMqMessageDispatcher : RabbitMqMessageDispatc
             // now would be cut off by the channel close anyway — its side effects run, the broker
             // requeues it, and a peer runs it again. Left un-ACKed, it is redelivered unstarted.
             if (subscriberCancellationToken.IsCancellationRequested || Volatile.Read(ref _stopping) != 0)
+                return;
+
+            // Host stop has begun (a worker subscriber only): the flow engine now hands back any
+            // timer wait that starts here, so a delivery started now would spend an attempt on a
+            // stopping host that a live replica could have used. Started nothing, settled nothing.
+            if (IntakeClosed)
                 return;
 
             await HandleCoreAsync(delivery, channel, subscriberCancellationToken).ConfigureAwait(false);
@@ -580,16 +671,16 @@ internal sealed class AwaitingRabbitMqMessageDispatcher : RabbitMqMessageDispatc
         if (_inFlightDrainTimeout <= TimeSpan.Zero)
         {
             // No budget to wait with (reported once at startup): not a timeout, so no warning.
-            Logger.LogDebug(
+            SafeLog.Try(() => Logger.LogDebug(
                 "Not waiting for the RabbitMQ handler still running on {Queue}: the shutdown budget leaves no in-flight wait; the broker redelivers its un-ACKed delivery once the channel closes.",
-                QueueName);
+                QueueName));
             return;
         }
 
-        Logger.LogInformation(
+        SafeLog.Try(() => Logger.LogInformation(
             "Waiting up to {DrainTimeout} for the RabbitMQ handler still running on {Queue} before the channel closes.",
             _inFlightDrainTimeout,
-            QueueName);
+            QueueName));
 
         try
         {
@@ -597,10 +688,10 @@ internal sealed class AwaitingRabbitMqMessageDispatcher : RabbitMqMessageDispatc
         }
         catch (TimeoutException)
         {
-            Logger.LogWarning(
+            SafeLog.Try(() => Logger.LogWarning(
                 "The RabbitMQ handler on {Queue} was still running {DrainTimeout} after the subscriber began stopping; closing the channel, so the broker redelivers its un-ACKed delivery.",
                 QueueName,
-                _inFlightDrainTimeout);
+                _inFlightDrainTimeout));
         }
     }
 
@@ -618,21 +709,25 @@ internal sealed class AwaitingRabbitMqMessageDispatcher : RabbitMqMessageDispatc
         {
             if (ReadDeathCount(delivery.BasicProperties) == 0)
             {
-                // Logged here because nothing else will: no exception was thrown (the previous
-                // attempt died without one), and without a dead-letter exchange the reject below is
-                // a silent drop. A broker policy may still supply one, so it is Error only when
-                // this package knows of none.
-                Logger.Log(
-                    string.IsNullOrWhiteSpace(TransportOptions.DeadLetterExchange) ? LogLevel.Error : LogLevel.Warning,
-                    "RabbitMQ delivery {DeliveryTag} on {Queue} is on attempt {Attempt}, past MaxDeliveryAttempts {MaxDeliveryAttempts}, before its handler ran; rejecting it without requeue — {Outcome}.",
-                    delivery.DeliveryTag,
-                    QueueName,
-                    ResolveDeliveryAttempt(delivery),
-                    MaxDeliveryAttempts,
-                    string.IsNullOrWhiteSpace(TransportOptions.DeadLetterExchange)
-                        ? "no DeadLetterExchange is configured, so the broker drops it unless a policy supplies one"
-                        : $"the broker dead-letters it to '{TransportOptions.DeadLetterExchange}'");
                 await TryNackAsync(delivery, channel, requeue: false).ConfigureAwait(false);
+
+                // Logged here because nothing else will: no exception was thrown (the previous
+                // attempt died without one), and without a dead-letter exchange the reject above is
+                // a silent drop. A broker policy may still supply one, so it is Error only when
+                // this package knows of none. After the reject, and guarded: a throwing logging
+                // provider must not leave the delivery unsettled.
+                SafeLog.Try(
+                    (Dispatcher: this, delivery.DeliveryTag, Attempt: ResolveDeliveryAttempt(delivery)),
+                    static state => state.Dispatcher.Logger.Log(
+                        string.IsNullOrWhiteSpace(state.Dispatcher.TransportOptions.DeadLetterExchange) ? LogLevel.Error : LogLevel.Warning,
+                        "RabbitMQ delivery {DeliveryTag} on {Queue} is on attempt {Attempt}, past MaxDeliveryAttempts {MaxDeliveryAttempts}, before its handler ran; rejected it without requeue — {Outcome}.",
+                        state.DeliveryTag,
+                        state.Dispatcher.QueueName,
+                        state.Attempt,
+                        state.Dispatcher.MaxDeliveryAttempts,
+                        string.IsNullOrWhiteSpace(state.Dispatcher.TransportOptions.DeadLetterExchange)
+                            ? "no DeadLetterExchange is configured, so the broker drops it unless a policy supplies one"
+                            : $"the broker dead-letters it to '{state.Dispatcher.TransportOptions.DeadLetterExchange}'"));
             }
             else
             {
@@ -661,10 +756,12 @@ internal sealed class AwaitingRabbitMqMessageDispatcher : RabbitMqMessageDispatc
             // subscriber's own token is still live — and NACKed as a failure, that one delivery
             // requeued straight into the same stop (or, at the cap, rejected: a flow's only
             // wake-up dropped on a routine deploy).
-            Logger.LogInformation(
-                "RabbitMQ delivery {DeliveryTag} on {Queue} was handed back because the host is stopping; it stays un-ACKed and is redelivered when the channel closes.",
-                delivery.DeliveryTag,
-                QueueName);
+            SafeLog.Try(
+                (Logger, delivery.DeliveryTag, QueueName),
+                static state => state.Logger.LogInformation(
+                    "RabbitMQ delivery {DeliveryTag} on {Queue} was handed back because the host is stopping; it stays un-ACKed and is redelivered when the channel closes.",
+                    state.DeliveryTag,
+                    state.QueueName));
             return;
         }
         catch (Exception ex)
@@ -701,11 +798,13 @@ internal sealed class AwaitingRabbitMqMessageDispatcher : RabbitMqMessageDispatc
         }
         catch (Exception ex)
         {
-            Logger.LogError(
-                ex,
-                "Failed to ACK RabbitMQ delivery {DeliveryTag} for {Queue} after a successful handler; the broker will redeliver it when the channel closes.",
-                delivery.DeliveryTag,
-                QueueName);
+            SafeLog.Try(
+                (Logger, Error: ex, delivery.DeliveryTag, QueueName),
+                static state => state.Logger.LogError(
+                    state.Error,
+                    "Failed to ACK RabbitMQ delivery {DeliveryTag} for {Queue} after a successful handler; the broker will redeliver it when the channel closes.",
+                    state.DeliveryTag,
+                    state.QueueName));
         }
     }
 
@@ -741,13 +840,16 @@ internal sealed class AwaitingRabbitMqMessageDispatcher : RabbitMqMessageDispatc
                     delivery.Body,
                     CancellationToken.None).ConfigureAwait(false);
                 Volatile.Write(ref _consecutiveParkFailures, 0);
-                Logger.LogWarning(
+
+                // Guarded: a throwing logging provider must not turn a park that landed into a
+                // "failed park" (requeued, then parked a second time).
+                SafeLog.Try(() => Logger.LogWarning(
                     exception,
                     "RabbitMQ delivery {DeliveryTag} on {Queue} reached {MaxDeliveryAttempts} delivery attempts after riding the dead-letter cycle; parked in {DeadLetterQueue}.",
                     delivery.DeliveryTag,
                     QueueName,
                     MaxDeliveryAttempts,
-                    parkQueue);
+                    parkQueue));
             }
             catch (Exception publishException)
             {
@@ -761,13 +863,13 @@ internal sealed class AwaitingRabbitMqMessageDispatcher : RabbitMqMessageDispatc
                     Interlocked.Increment(ref _consecutiveParkFailures),
                     TransportOptions.SubscriberRetryBaseDelay,
                     TransportOptions.SubscriberRetryMaxDelay);
-                Logger.LogError(
+                SafeLog.Try(() => Logger.LogError(
                     publishException,
                     "Failed to park capped RabbitMQ delivery {DeliveryTag} on {Queue} in {DeadLetterQueue}; requeueing it in {RetryDelay} so the broker redelivers it and the park is retried.",
                     delivery.DeliveryTag,
                     QueueName,
                     parkQueue,
-                    retryDelay);
+                    retryDelay));
 
                 try
                 {
@@ -784,12 +886,12 @@ internal sealed class AwaitingRabbitMqMessageDispatcher : RabbitMqMessageDispatc
         }
         else
         {
-            Logger.LogError(
+            SafeLog.Try(() => Logger.LogError(
                 exception,
                 "RabbitMQ delivery {DeliveryTag} on {Queue} reached {MaxDeliveryAttempts} delivery attempts after riding the dead-letter cycle and neither ParkQueue nor DeadLetterQueue is configured; ACKing it so the cycle ends — the message is dropped.",
                 delivery.DeliveryTag,
                 QueueName,
-                MaxDeliveryAttempts);
+                MaxDeliveryAttempts));
         }
 
         try
@@ -798,11 +900,11 @@ internal sealed class AwaitingRabbitMqMessageDispatcher : RabbitMqMessageDispatc
         }
         catch (Exception ackException)
         {
-            Logger.LogWarning(
+            SafeLog.Try(() => Logger.LogWarning(
                 ackException,
                 "Failed to ACK parked RabbitMQ delivery {DeliveryTag} on {Queue}; the broker redelivers it when the channel closes.",
                 delivery.DeliveryTag,
-                QueueName);
+                QueueName));
         }
     }
 
@@ -814,11 +916,11 @@ internal sealed class AwaitingRabbitMqMessageDispatcher : RabbitMqMessageDispatc
         // A closed channel already returned every un-ACKed delivery to the queue; NACKing it would throw.
         if (!channel.IsOpen)
         {
-            Logger.LogWarning(
+            SafeLog.Try(() => Logger.LogWarning(
                 "Skipping NACK ({NackDecision}) of RabbitMQ delivery {DeliveryTag} for {Queue}: the channel is closed, so the broker has already requeued it.",
                 requeue ? "requeue" : "reject",
                 delivery.DeliveryTag,
-                QueueName);
+                QueueName));
             return;
         }
 
@@ -828,12 +930,12 @@ internal sealed class AwaitingRabbitMqMessageDispatcher : RabbitMqMessageDispatc
         }
         catch (Exception ex)
         {
-            Logger.LogWarning(
+            SafeLog.Try(() => Logger.LogWarning(
                 ex,
                 "Failed to NACK ({NackDecision}) RabbitMQ delivery {DeliveryTag} for {Queue}; the broker redelivers it when the channel closes.",
                 requeue ? "requeue" : "reject",
                 delivery.DeliveryTag,
-                QueueName);
+                QueueName));
         }
     }
 }
@@ -882,8 +984,9 @@ internal sealed class QueuedRabbitMqMessageDispatcher : RabbitMqMessageDispatche
         RabbitMqSubscriberOptions subscriberOptions,
         ILogger logger,
         string queue,
-        RabbitMqSubscriberRole role)
-        : base(handler, transportOptions, subscriberOptions, logger, queue, role)
+        RabbitMqSubscriberRole role,
+        IHostApplicationLifetime? hostLifetime = null)
+        : base(handler, transportOptions, subscriberOptions, logger, queue, role, hostLifetime)
     {
         _drainTimeout = subscriberOptions.BackgroundDrainTimeout;
         _stoppingToken = _stopping.Token;
@@ -911,12 +1014,13 @@ internal sealed class QueuedRabbitMqMessageDispatcher : RabbitMqMessageDispatche
             .Select(workerIndex => Task.Run(() => RunWorkerAsync(workerIndex)))
             .ToArray();
 
-        Logger.LogInformation(
+        // Guarded: the workers are already running, so a throw here orphaned them.
+        SafeLog.Try(() => Logger.LogInformation(
             "Created RabbitMQ ACK-after-enqueue dispatcher for {Queue} with {WorkerCount} worker(s), queue capacity {QueueCapacity}, drain timeout {DrainTimeout}.",
             _queueName,
             subscriberOptions.BackgroundWorkerCount,
             subscriberOptions.BackgroundQueueCapacity,
-            _drainTimeout);
+            _drainTimeout));
     }
 
     internal int PendingCount => Volatile.Read(ref _pendingCount);
@@ -936,6 +1040,13 @@ internal sealed class QueuedRabbitMqMessageDispatcher : RabbitMqMessageDispatche
         if (Volatile.Read(ref _disposeStarted) != 0)
             return;
 
+        // Host stop has begun (a worker subscriber only): never settle-first a delivery taken now.
+        // The flow engine hands back every timer wait that starts on this host, so an already-ACKed
+        // wake-up enqueued here would only become a dead-letter copy (or be lost without a
+        // dead-letter exchange) instead of running on a live replica. Left un-ACKed, as above.
+        if (IntakeClosed)
+            return;
+
         // The client owns the delivery body's memory only until the consumer callback returns
         // ("Accessing the body at a later point is unsafe as its memory can be already
         // released" — RabbitMQ.Client v7). This dispatcher hands the delivery to background
@@ -952,28 +1063,33 @@ internal sealed class QueuedRabbitMqMessageDispatcher : RabbitMqMessageDispatche
             // broker would redeliver within ~1 RTT and spin at network rate. RabbitMQ.Client dispatches
             // a channel's deliveries sequentially, so blocking here pauses this channel's delivery
             // loop, which is the actual backpressure (mirrors the Kafka pause and the NATS wait).
-            Logger.LogDebug(
-                "RabbitMQ background queue for {Queue} is full; pausing the delivery loop until capacity frees. Pending={PendingCount}, Running={RunningCount}.",
-                _queueName,
-                PendingCount,
-                RunningCount);
+            SafeLog.Try(
+                this,
+                static dispatcher => dispatcher.Logger.LogDebug(
+                    "RabbitMQ background queue for {Queue} is full; pausing the delivery loop until capacity frees. Pending={PendingCount}, Running={RunningCount}.",
+                    dispatcher._queueName,
+                    dispatcher.PendingCount,
+                    dispatcher.RunningCount));
             // The park also ends with the attempt that delivered it. The queue outlives attempts,
             // so a write parked under a channel that has since died would otherwise land later —
             // after the broker already requeued that un-ACKed delivery for the next attempt — and
-            // the job would run twice.
+            // the job would run twice. And with host stop (a worker subscriber only): a delivery
+            // received but not yet enqueued is handed back, never settled first.
             using var parked = CancellationTokenSource.CreateLinkedTokenSource(
                 subscriberCancellationToken,
-                AttachmentEnded(channel));
+                AttachmentEnded(channel),
+                IntakeClosing);
             try
             {
                 await _queue.Writer.WriteAsync(delivery, parked.Token).ConfigureAwait(false);
             }
             catch (Exception ex) when (ex is OperationCanceledException or ChannelClosedException)
             {
-                // Subscriber stopping, its attempt ending, or dispatcher draining while parked: the
-                // delivery was never enqueued (and never ACKed), so hand it back to the broker — one
-                // NACK, not a spin. A closed channel requeues the un-ACKed delivery on its own;
-                // never throw from here, this runs inside the client's delivery callback.
+                // Subscriber stopping, its attempt ending, host stop, or dispatcher draining while
+                // parked: the delivery was never enqueued (and never ACKed), so hand it back to the
+                // broker — one NACK, not a spin (should the broker hand it straight back, the checks
+                // above leave it un-ACKed). A closed channel requeues the un-ACKed delivery on its
+                // own; never throw from here, this runs inside the client's delivery callback.
                 Interlocked.Decrement(ref _pendingCount);
                 await TryRequeueAsync(delivery, channel).ConfigureAwait(false);
                 return;
@@ -991,11 +1107,13 @@ internal sealed class QueuedRabbitMqMessageDispatcher : RabbitMqMessageDispatche
         }
         catch (Exception ex)
         {
-            Logger.LogError(
-                ex,
-                "Failed to ACK RabbitMQ delivery {DeliveryTag} for {Queue} after enqueue; it is being processed but the broker will redeliver it when the channel closes.",
-                delivery.DeliveryTag,
-                _queueName);
+            SafeLog.Try(
+                (Logger, Error: ex, delivery.DeliveryTag, Queue: _queueName),
+                static state => state.Logger.LogError(
+                    state.Error,
+                    "Failed to ACK RabbitMQ delivery {DeliveryTag} for {Queue} after enqueue; it is being processed but the broker will redeliver it when the channel closes.",
+                    state.DeliveryTag,
+                    state.Queue));
         }
     }
 
@@ -1009,42 +1127,49 @@ internal sealed class QueuedRabbitMqMessageDispatcher : RabbitMqMessageDispatche
     /// unless DeadLetterRoutingKey overrides it (the same rule the topology binds the
     /// dead-letter queue with).
     /// <para>
-    /// A delivery that already carries this queue's own dead-letter marker came back through the
-    /// dead-letter exchange — an operator's TTL-retry queue bound to it republishes into the live
-    /// exchange — so another copy there would only ride the same cycle again: a permanently
-    /// failing job re-executed, side effects included, once per TTL for ever (the ack-after-handler
-    /// path parks at the cap for the same reason; this path has no redeliveries to count). It is
-    /// parked instead, in <see cref="RabbitMqAsyncResponseOptions.ParkQueue"/> or
+    /// A <paramref name="handlerFailure"/> whose delivery already carries this queue's own
+    /// dead-letter marker came back through the dead-letter exchange — an operator's TTL-retry
+    /// queue bound to it republishes into the live exchange — so another copy there would only
+    /// ride the same cycle again: a permanently failing job re-executed, side effects included,
+    /// once per TTL for ever (the ack-after-handler path parks at the cap for the same reason; this
+    /// path has no redeliveries to count). It is parked instead, in
+    /// <see cref="RabbitMqAsyncResponseOptions.ParkQueue"/> or
     /// <see cref="RabbitMqAsyncResponseOptions.DeadLetterQueue"/> through the default exchange,
-    /// and dropped with an error when neither is set.
+    /// and dropped with an error when neither is set. A host-stop hand-back or a drain lapse is
+    /// not a failure of the job and always goes to the dead-letter exchange: dropped or parked, a
+    /// returned wake-up that merely landed on another stopping host lost the flow's only wake-up —
+    /// its cycle ends by itself once the hosts stop stopping.
     /// </para>
     /// <paramref name="cancellationToken"/> bounds the whole attempt (the shutdown reserve);
     /// unbounded otherwise, apart from the wait for a live channel. <paramref name="reasonCode"/>
-    /// leads the copy's reason header.
+    /// leads the copy's reason header. Returns whether a copy was written (dead-lettered or
+    /// parked); every other outcome is logged here, apart from "no dead-letter exchange
+    /// configured", which the caller reports in its own words.
     /// </summary>
-    private async Task TryDeadLetterAlreadyAckedAsync(
+    private async Task<bool> TryDeadLetterAlreadyAckedAsync(
         RabbitMqDelivery delivery,
         Exception exception,
+        bool handlerFailure,
         CancellationToken cancellationToken = default,
         string? reasonCode = null)
     {
         if (string.IsNullOrWhiteSpace(TransportOptions.DeadLetterExchange))
-            return;
+            return false;
 
         var properties = BuildDeadLetterProperties(delivery, exception, reasonCode);
 
         string exchange;
         string routingKey;
-        if (WasDeadLetteredFromThisQueue(delivery))
+        if (handlerFailure && WasDeadLetteredFromThisQueue(delivery))
         {
             if (ParkDestination is not { } parkQueue)
             {
-                Logger.LogError(
+                SafeLog.Try(() => Logger.LogError(
                     exception,
                     "Already-ACKed RabbitMQ delivery {DeliveryTag} on {Queue} failed after coming back through the dead-letter exchange it was already copied to once; neither ParkQueue nor DeadLetterQueue is configured, so it is dropped rather than copied into that cycle again.",
                     delivery.DeliveryTag,
-                    _queueName);
-                return;
+                    _queueName));
+                return false;
             }
 
             exchange = string.Empty;
@@ -1070,11 +1195,11 @@ internal sealed class QueuedRabbitMqMessageDispatcher : RabbitMqMessageDispatche
             var channel = await WaitForOpenChannelAsync(channelWait.Token).ConfigureAwait(false);
             if (channel is null)
             {
-                Logger.LogError(
+                SafeLog.Try(() => Logger.LogError(
                     "Cannot dead-letter already-ACKed RabbitMQ delivery {DeliveryTag} on {Queue}: the subscriber channel is closed and no new one was attached. The failure is only observable via logs and OnBackgroundFailure.",
                     delivery.DeliveryTag,
-                    _queueName);
-                return;
+                    _queueName));
+                return false;
             }
 
             // Serialized: multiple background workers can fail concurrently, and they share the
@@ -1085,11 +1210,11 @@ internal sealed class QueuedRabbitMqMessageDispatcher : RabbitMqMessageDispatche
             }
             catch (OperationCanceledException)
             {
-                Logger.LogError(
+                SafeLog.Try(() => Logger.LogError(
                     "Cannot dead-letter already-ACKed RabbitMQ delivery {DeliveryTag} on {Queue}: the shutdown budget ran out while other dead-letter copies were being published. The failure is only observable via logs and OnBackgroundFailure.",
                     delivery.DeliveryTag,
-                    _queueName);
-                return;
+                    _queueName));
+                return false;
             }
 
             try
@@ -1100,37 +1225,41 @@ internal sealed class QueuedRabbitMqMessageDispatcher : RabbitMqMessageDispatche
                     properties,
                     delivery.Body,
                     cancellationToken).ConfigureAwait(false);
-                Logger.LogInformation(
-                    "Dead-lettered already-ACKed RabbitMQ delivery {DeliveryTag} from {Queue} to exchange '{Exchange}' with routing key {RoutingKey}.",
-                    delivery.DeliveryTag,
-                    _queueName,
-                    exchange,
-                    routingKey);
-                return;
             }
             catch (Exception publishException) when (!channel.IsOpen && !channelWait.IsCancellationRequested)
             {
                 // The channel died under the publish (a broker nack or an unroutable return leaves
                 // it open): the next attempt's channel takes the copy.
-                Logger.LogDebug(
+                SafeLog.Try(() => Logger.LogDebug(
                     publishException,
                     "The subscriber channel closed while dead-lettering already-ACKed RabbitMQ delivery {DeliveryTag} on {Queue}; retrying on the next attempt's channel.",
                     delivery.DeliveryTag,
-                    _queueName);
+                    _queueName));
+                continue;
             }
             catch (Exception publishException)
             {
-                Logger.LogError(
+                SafeLog.Try(() => Logger.LogError(
                     publishException,
                     "Failed to dead-letter already-ACKed RabbitMQ delivery {DeliveryTag} on {Queue}; the failure is only observable via logs and OnBackgroundFailure.",
                     delivery.DeliveryTag,
-                    _queueName);
-                return;
+                    _queueName));
+                return false;
             }
             finally
             {
                 _deadLetterPublishGate.Release();
             }
+
+            // Logged outside the publish's try: a throwing logging provider there read as a failed
+            // publish, and the caller then reported a copy that exists as lost.
+            SafeLog.Try(() => Logger.LogInformation(
+                "Dead-lettered already-ACKed RabbitMQ delivery {DeliveryTag} from {Queue} to exchange '{Exchange}' with routing key {RoutingKey}.",
+                delivery.DeliveryTag,
+                _queueName,
+                exchange,
+                routingKey));
+            return true;
         }
     }
 
@@ -1241,11 +1370,11 @@ internal sealed class QueuedRabbitMqMessageDispatcher : RabbitMqMessageDispatche
         }
         catch (Exception ex)
         {
-            Logger.LogDebug(
+            SafeLog.Try(() => Logger.LogDebug(
                 ex,
                 "Failed to NACK delivery {DeliveryTag} for {Queue} during shutdown; the broker requeues it when the channel closes.",
                 delivery.DeliveryTag,
-                _queueName);
+                _queueName));
         }
     }
 
@@ -1255,11 +1384,13 @@ internal sealed class QueuedRabbitMqMessageDispatcher : RabbitMqMessageDispatche
         if (Interlocked.Exchange(ref _disposeStarted, 1) != 0)
             return;
 
-        Logger.LogInformation(
+        // Every log on this path is guarded: a throwing logging provider here left the queue
+        // uncompleted (the workers never ended) and threw out of the stop before the channel close.
+        SafeLog.Try(() => Logger.LogInformation(
             "Draining RabbitMQ ACK-after-enqueue dispatcher for {Queue}. Pending={PendingCount}, Running={RunningCount}.",
             _queueName,
             PendingCount,
-            RunningCount);
+            RunningCount));
         _queue.Writer.TryComplete();
 
         // Workers read the token captured at construction, never the source, so disposing it
@@ -1285,12 +1416,12 @@ internal sealed class QueuedRabbitMqMessageDispatcher : RabbitMqMessageDispatche
         catch (TimeoutException ex)
         {
             _drainCancellation.Cancel();
-            Logger.LogWarning(
+            SafeLog.Try(() => Logger.LogWarning(
                 ex,
-                "Timed out while draining RabbitMQ ACK-after-enqueue dispatcher for {Queue}. Pending={PendingCount}, Running={RunningCount}. Dead-lettering the deliveries still queued; already ACKed work that is running may be interrupted by host shutdown.",
+                "Timed out while draining RabbitMQ ACK-after-enqueue dispatcher for {Queue}. Pending={PendingCount}, Running={RunningCount}. Settling the deliveries still queued (a dead-letter copy when a DeadLetterExchange is configured, then OnBackgroundFailure); already ACKed work that is running may be interrupted by host shutdown.",
                 _queueName,
                 PendingCount,
-                RunningCount);
+                RunningCount));
 
             await RouteUndrainedAsync(routingReserve).ConfigureAwait(false);
 
@@ -1308,7 +1439,7 @@ internal sealed class QueuedRabbitMqMessageDispatcher : RabbitMqMessageDispatche
             // A worker faulted outside its own handler guard (DB/NATS dispatcher parity). WhenAll
             // only completes once every worker has finished, so the source is safe to dispose here
             // — and the fault must not escape DisposeAsync and mask the real shutdown path.
-            Logger.LogDebug(ex, "RabbitMQ ACK-after-enqueue dispatcher drain for {Queue} ended with an error.", _queueName);
+            SafeLog.Try(() => Logger.LogDebug(ex, "RabbitMQ ACK-after-enqueue dispatcher drain for {Queue} ended with an error.", _queueName));
             _drainCancellation.Dispose();
         }
     }
@@ -1318,16 +1449,43 @@ internal sealed class QueuedRabbitMqMessageDispatcher : RabbitMqMessageDispatche
     /// quarter of it and before the subscriber closes the channel: every delivery still queued is
     /// dead-lettered (on the still-open attached channel) and surfaced through
     /// <see cref="RabbitMqSubscriberOptions.OnBackgroundFailure"/> here, instead of waiting for a
-    /// worker that is still inside a long handler. Whatever the reserve cannot cover is counted in
+    /// worker that is still inside a long handler. Every copy is written BEFORE any callback runs,
+    /// and each callback gets only what the reserve has left: the callbacks are user code, and
+    /// awaited one by one ahead of the copies, a slow one (a write to a database that is down) held
+    /// the stop past <see cref="RabbitMqSubscriberOptions.BackgroundDrainTimeout"/> with the entries
+    /// behind it neither dead-lettered nor counted. Whatever the reserve cannot cover is counted in
     /// one error; workers that free up later keep routing it through their own lapse branch.
     /// </summary>
     private async Task RouteUndrainedAsync(TimeSpan reserve)
     {
         using var budget = new CancellationTokenSource(reserve);
+        List<(RabbitMqDelivery Delivery, OperationCanceledException Lapsed)>? settled = null;
         while (!budget.IsCancellationRequested && _queue.Reader.TryRead(out var delivery))
         {
             Interlocked.Decrement(ref _pendingCount);
-            await RouteLapsedAsync(delivery, budget.Token).ConfigureAwait(false);
+            (settled ??= []).Add((delivery, await BuryLapsedAsync(delivery, budget.Token).ConfigureAwait(false)));
+        }
+
+        if (settled is not null)
+        {
+            var notified = 0;
+            foreach (var (delivery, lapsed) in settled)
+            {
+                if (budget.IsCancellationRequested)
+                    break;
+
+                await NotifyBackgroundFailureAsync(delivery, lapsed, _queueName, _role, budget.Token).ConfigureAwait(false);
+                notified++;
+            }
+
+            if (notified < settled.Count)
+            {
+                SafeLog.Try(() => Logger.LogWarning(
+                    "OnBackgroundFailure was not invoked for {Count} lapsed already-ACKed RabbitMQ deliveries on {Queue}: the {Reserve} reserved after the drain budget lapsed ran out first. Their dead-letter outcome is logged per delivery above.",
+                    settled.Count - notified,
+                    _queueName,
+                    reserve));
+            }
         }
 
         // A worker the cancellation cut short (mid-handler, or mid-retry-backoff) settles its own
@@ -1346,28 +1504,99 @@ internal sealed class QueuedRabbitMqMessageDispatcher : RabbitMqMessageDispatche
         var remaining = _queue.Reader.Count;
         if (remaining > 0)
         {
-            Logger.LogError(
+            SafeLog.Try(() => Logger.LogError(
                 "{Remaining} already-ACKed RabbitMQ deliveries on {Queue} were neither handled nor dead-lettered within the {Reserve} reserved after the drain budget lapsed; any still queued at process exit are lost (the broker will not redeliver them).",
                 remaining,
                 _queueName,
-                reserve);
+                reserve));
         }
     }
 
     /// <summary>
-    /// Settlement of an already-ACKed delivery that will never be handled because the drain budget
-    /// lapsed: surfaced through the callback and dead-lettered, since the broker will not redeliver it.
+    /// Buries an already-ACKed delivery that will never be handled because the drain budget lapsed
+    /// — the broker will not redeliver it — and logs what became of it; the caller then surfaces it
+    /// through <see cref="RabbitMqSubscriberOptions.OnBackgroundFailure"/> with the returned
+    /// exception. A lapse is not a failure of the job, so a returned dead-letter copy goes to the
+    /// dead-letter exchange like any other.
     /// </summary>
-    private async Task RouteLapsedAsync(RabbitMqDelivery delivery, CancellationToken cancellationToken)
+    private async Task<OperationCanceledException> BuryLapsedAsync(RabbitMqDelivery delivery, CancellationToken cancellationToken)
     {
         var lapsed = new OperationCanceledException(
             "The ACK-after-enqueue drain budget lapsed before this already-ACKed message was handled.");
-        Logger.LogWarning(
-            "RabbitMQ background handler for already-ACKed delivery {DeliveryTag} on {Queue} was not started: the drain budget had lapsed. Dead-lettering and surfacing via OnBackgroundFailure.",
+        if (await TryDeadLetterAlreadyAckedAsync(delivery, lapsed, handlerFailure: false, cancellationToken).ConfigureAwait(false))
+        {
+            SafeLog.Try(() => Logger.LogWarning(
+                "RabbitMQ background handler for already-ACKed delivery {DeliveryTag} on {Queue} was not started: the drain budget had lapsed. Dead-lettered a copy; surfacing via OnBackgroundFailure.",
+                delivery.DeliveryTag,
+                _queueName));
+        }
+        else
+        {
+            SafeLog.Try(() => Logger.LogError(
+                "RabbitMQ background handler for already-ACKed delivery {DeliveryTag} on {Queue} was not started: the drain budget had lapsed, the broker will not redeliver it, and {Reason}, so the message is lost unless OnBackgroundFailure records it.",
+                delivery.DeliveryTag,
+                _queueName,
+                string.IsNullOrWhiteSpace(TransportOptions.DeadLetterExchange)
+                    ? "no dead-letter destination is configured"
+                    : "no dead-letter copy could be written"));
+        }
+
+        return lapsed;
+    }
+
+    /// <summary>
+    /// A durable flow the engine handed back because the host is stopping — a stop, not a handler
+    /// failure, so no Error when its record is kept (it would alert on every deploy). But the
+    /// delivery was ACKed at enqueue and the broker will never redeliver it, so the dead-letter copy
+    /// is the wake-up's only record; its reason says what it is, and replaying it is safe — the run
+    /// resumes from its checkpoint (Kafka/NATS/Redis parity). The copy is written first, then the
+    /// outcome logged — a Warning only when the copy exists; without one the wake-up is lost unless
+    /// OnBackgroundFailure records it, which is an Error — and the callback notified last, so a slow
+    /// callback during the stop cannot outlast the drain ahead of the only durable record.
+    /// </summary>
+    private async Task SettleHandedBackAsync(RabbitMqDelivery delivery, DurableFlowInterruptedException handedBack)
+    {
+        if (await TryDeadLetterAlreadyAckedAsync(delivery, handedBack, handlerFailure: false, reasonCode: HandedBackAfterCommitReason).ConfigureAwait(false))
+        {
+            SafeLog.Try(() => Logger.LogWarning(
+                handedBack,
+                "RabbitMQ background handler for already-ACKed delivery {DeliveryTag} on {Queue} was handed back because the host is stopping; the broker will not redeliver it. Dead-lettered a copy (handed_back_after_commit); surfacing via OnBackgroundFailure.",
+                delivery.DeliveryTag,
+                _queueName));
+        }
+        else if (string.IsNullOrWhiteSpace(TransportOptions.DeadLetterExchange))
+        {
+            SafeLog.Try(() => Logger.LogError(
+                handedBack,
+                "RabbitMQ background handler for already-ACKed delivery {DeliveryTag} on {Queue} was handed back because the host is stopping; the broker will not redeliver it and no dead-letter destination is configured, so the wake-up is lost unless OnBackgroundFailure records it (resume the flow explicitly).",
+                delivery.DeliveryTag,
+                _queueName));
+        }
+        else
+        {
+            SafeLog.Try(() => Logger.LogError(
+                handedBack,
+                "RabbitMQ background handler for already-ACKed delivery {DeliveryTag} on {Queue} was handed back because the host is stopping; the broker will not redeliver it and its dead-letter copy could not be written, so the wake-up is lost unless OnBackgroundFailure records it (resume the flow explicitly).",
+                delivery.DeliveryTag,
+                _queueName));
+        }
+
+        await NotifyBackgroundFailureAsync(delivery, handedBack, _queueName, _role).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// A background handler that failed after the early ACK: logged, dead-lettered (the copy's own
+    /// outcome is logged by the burial), and only then surfaced through OnBackgroundFailure.
+    /// </summary>
+    private async Task SettleFailedAsync(RabbitMqDelivery delivery, Exception exception)
+    {
+        SafeLog.Try(() => Logger.LogError(
+            exception,
+            "RabbitMQ background handler failed for already-ACKed delivery {DeliveryTag} on {Queue}.",
             delivery.DeliveryTag,
-            _queueName);
-        await NotifyBackgroundFailureAsync(delivery, lapsed, _queueName, _role).ConfigureAwait(false);
-        await TryDeadLetterAlreadyAckedAsync(delivery, lapsed, cancellationToken).ConfigureAwait(false);
+            _queueName));
+        await TryDeadLetterAlreadyAckedAsync(delivery, exception, handlerFailure: true).ConfigureAwait(false);
+        await NotifyBackgroundFailureAsync(delivery, exception, _queueName, _role).ConfigureAwait(false);
     }
 
     private async Task RunWorkerAsync(int workerIndex)
@@ -1384,12 +1613,16 @@ internal sealed class QueuedRabbitMqMessageDispatcher : RabbitMqMessageDispatche
             // no record (ACKed at enqueue, so the broker never redelivers it).
             if (_drainCancellation.IsCancellationRequested)
             {
-                await RouteLapsedAsync(delivery, CancellationToken.None).ConfigureAwait(false);
+                var lapsed = await BuryLapsedAsync(delivery, CancellationToken.None).ConfigureAwait(false);
+                await NotifyBackgroundFailureAsync(delivery, lapsed, _queueName, _role).ConfigureAwait(false);
                 continue;
             }
 
             Interlocked.Increment(ref _runningCount);
 
+            // Settlement lives in helpers that log through SafeLog: a throwing logging provider in
+            // these arms skipped the dead-letter copy and ended this loop, stranding every
+            // already-ACKed delivery queued behind it.
             try
             {
                 await ExecuteHandlerAsync(
@@ -1399,50 +1632,11 @@ internal sealed class QueuedRabbitMqMessageDispatcher : RabbitMqMessageDispatche
             }
             catch (DurableFlowInterruptedException ex)
             {
-                // The flow engine handed this run back because the host is stopping — a stop, not a
-                // handler failure, so no Error (it would alert on every deploy). But the delivery
-                // was ACKed at enqueue and the broker will never redeliver it, so the dead-letter
-                // copy is the wake-up's only record; its reason says what it is, and replaying it is
-                // safe — the run resumes from its checkpoint (Kafka/NATS/Redis parity). Without a
-                // DeadLetterExchange no copy is written and the wake-up is lost: that is an Error,
-                // and the log must not claim a copy.
-                if (!string.IsNullOrWhiteSpace(TransportOptions.DeadLetterExchange))
-                {
-                    Logger.LogWarning(
-                        ex,
-                        "RabbitMQ background handler for already-ACKed delivery {DeliveryTag} on {Queue} was handed back because the host is stopping; the broker will not redeliver it. Dead-lettering a copy (handed_back_after_commit) and surfacing via OnBackgroundFailure.",
-                        delivery.DeliveryTag,
-                        _queueName);
-                }
-                else
-                {
-                    Logger.LogError(
-                        ex,
-                        "RabbitMQ background handler for already-ACKed delivery {DeliveryTag} on {Queue} was handed back because the host is stopping; the broker will not redeliver it and no dead-letter destination is configured, so the wake-up is lost unless OnBackgroundFailure records it (resume the flow explicitly).",
-                        delivery.DeliveryTag,
-                        _queueName);
-                }
-
-                await NotifyBackgroundFailureAsync(
-                    delivery,
-                    ex,
-                    _queueName,
-                    _role).ConfigureAwait(false);
-                await TryDeadLetterAlreadyAckedAsync(delivery, ex, reasonCode: HandedBackAfterCommitReason).ConfigureAwait(false);
+                await SettleHandedBackAsync(delivery, ex).ConfigureAwait(false);
             }
             catch (Exception ex)
             {
-                Logger.LogError(
-                    ex,
-                    "RabbitMQ background handler failed for already-ACKed delivery {DeliveryTag} on {Queue}.",
-                    delivery.DeliveryTag,
-                    _queueName);
-                await NotifyBackgroundFailureAsync(
-                    delivery,
-                    ex,
-                    _queueName,
-                    _role).ConfigureAwait(false);
-                await TryDeadLetterAlreadyAckedAsync(delivery, ex).ConfigureAwait(false);
+                await SettleFailedAsync(delivery, ex).ConfigureAwait(false);
             }
             finally
             {

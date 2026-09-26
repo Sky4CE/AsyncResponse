@@ -20,8 +20,21 @@ public sealed class AsyncResponseReplyTarget
     /// </summary>
     public required string Address { get; init; }
 
-    /// <summary>Additional transport-specific values, for example <c>projectId</c> and <c>topicId</c>.</summary>
-    public Dictionary<string, string> Properties { get; init; } = new(StringComparer.Ordinal);
+    /// <summary>
+    /// Additional transport-specific values, for example <c>projectId</c> and <c>topicId</c>.
+    /// Never <c>null</c>: a <c>null</c> assignment — a foreign producer's <c>"Properties": null</c>
+    /// on the wire included — reads back as an empty map.
+    /// </summary>
+    public Dictionary<string, string> Properties
+    {
+        get => _properties;
+        // The deserializer assigns a wire null over the initializer (nullable annotations are not
+        // enforced on read), and the worker executor then pushed that target ambiently: a handler
+        // reading AsyncResponseContext.ReplyTarget.Properties threw on every delivery.
+        init => _properties = value ?? new(StringComparer.Ordinal);
+    }
+
+    private readonly Dictionary<string, string> _properties = new(StringComparer.Ordinal);
 }
 
 /// <summary>

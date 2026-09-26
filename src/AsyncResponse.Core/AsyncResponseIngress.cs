@@ -28,6 +28,12 @@ internal sealed class AsyncResponseIngress(
     /// the message was rejected, in which case the caller returns cleanly and the transport acks —
     /// see the option's remarks for why an oversized message is dropped rather than redelivered.
     /// Only the LENGTH is logged, never a prefix: an oversized body is still a body.
+    /// <para>
+    /// The drop is decided and recorded before it is logged, and the log line cannot escape (see
+    /// <see cref="SafeLog"/>): a logging provider that throws turned the deliberate acknowledge
+    /// into an exception, and the transport redelivered the message forever — the loop this
+    /// drop-and-ack exists to prevent. The same holds for every drop path below.
+    /// </para>
     /// </summary>
     private bool RejectIfOversized(string messageJson, string route, Activity? activity)
     {
@@ -36,16 +42,16 @@ internal sealed class AsyncResponseIngress(
 
         var limit = _options!.Value.MaxInboundMessageChars!.Value;
 
-        _logger.LogError(
-            "Ingress received an oversized {Route} message and acknowledged it without dispatch: {PayloadLength} UTF-16 code units exceeds the configured {Limit}.",
-            route,
-            messageJson.Length,
-            limit);
         AsyncResponseDiagnostics.SetError(
             activity,
             "oversized_message",
             $"Inbound {route} message exceeds the configured size budget of {limit} UTF-16 code units.");
         AsyncResponseDiagnostics.RecordOversizedInboundMessage(route);
+        SafeLog.Try((Logger: _logger, Route: route, messageJson.Length, Limit: limit), static state => state.Logger.LogError(
+            "Ingress received an oversized {Route} message and acknowledged it without dispatch: {PayloadLength} UTF-16 code units exceeds the configured {Limit}.",
+            state.Route,
+            state.Length,
+            state.Limit));
         return true;
     }
 
@@ -73,12 +79,12 @@ internal sealed class AsyncResponseIngress(
 
         if (CorrelationIdGuard.IsUnroutable(correlationId, out var unroutable))
         {
-            _logger.LogError(
-                "Ingress received a response message with an unusable correlation id ({UnroutableReason}); it cannot be routed and is acknowledged without dispatch. Payload: {PayloadLength} UTF-16 code units.",
-                unroutable.Description,
-                messageJson.Length);
             AsyncResponseDiagnostics.SetError(activity, unroutable.ErrorType, $"Inbound response message has an unusable correlation id: {unroutable.Description}.");
             AsyncResponseDiagnostics.RecordUnroutableResponse();
+            SafeLog.Try((Logger: _logger, Reason: unroutable.Description, messageJson.Length), static state => state.Logger.LogError(
+                "Ingress received a response message with an unusable correlation id ({UnroutableReason}); it cannot be routed and is acknowledged without dispatch. Payload: {PayloadLength} UTF-16 code units.",
+                state.Reason,
+                state.Length));
             return;
         }
 
@@ -89,10 +95,12 @@ internal sealed class AsyncResponseIngress(
             // equal payloads are visibly equal across messages and hosts, and a low-entropy payload
             // (a status enum, a small id, a boolean result) can be confirmed outright by hashing
             // the guesses. Trace and correlation ids already tie an entry to its conversation.
-            _logger.LogDebug(
+            // Guarded: inside this try a throwing provider was escalated as the RESPONSE's
+            // failure, faulting the waiter with the logger's exception.
+            SafeLog.Try((Logger: _logger, CorrelationId: correlationId, messageJson.Length), static state => state.Logger.LogDebug(
                 "Ingress received an inbound response message for {CorrelationId}. Payload: {PayloadLength} UTF-16 code units.",
-                correlationId,
-                messageJson.Length);
+                state.CorrelationId,
+                state.Length));
 
             // A transient infrastructure fault (channel store briefly unreachable, recovery-state
             // read hiccup, resume-callback dependency blip) must not finalize the waiter on the
@@ -115,6 +123,16 @@ internal sealed class AsyncResponseIngress(
             // malformed, or no longer binds) is excluded from the retry only: every attempt
             // re-dispatched and failed identically, so it paid the ~1.75 s ladder on the consumer
             // for nothing before escalating anyway. It escalates at once, like a parse failure.
+            //
+            // RecoveryStateUnreadableException is excluded from the escalation only: the store
+            // holds registrations this build cannot interpret, and the escalation's own dispatch
+            // reads them first and throws the same exception again. It propagates untouched so the
+            // transport redelivers or dead-letters it — its contract — for a build or operator
+            // that can. It still runs the ladder, pointless as a retry as that is: the ladder is
+            // what paces each redelivery, and a broker with no delivery cap (RabbitMQ's default)
+            // otherwise requeued it at broker speed, while capped ones (Service Bus, Pub/Sub) spent
+            // their attempts in milliseconds — dead-lettering it before the newer build a rolling
+            // deploy is bringing up could ever receive it.
             await AsyncResponseRetry.ExecuteAsync(
                 async _ =>
                 {
@@ -129,9 +147,11 @@ internal sealed class AsyncResponseIngress(
                 CancellationToken.None,
                 _timeProvider).ConfigureAwait(false);
         }
-        catch (Exception ex) when (ex is not (OperationCanceledException or RecoveryCallbackFailedException))
+        catch (Exception ex) when (ex is not (OperationCanceledException or RecoveryCallbackFailedException or RecoveryStateUnreadableException))
         {
-            _logger.LogError(ex, "Ingress failed to process the inbound response message.");
+            // Guarded: a throwing provider here skipped the escalation, so the waiter was never
+            // told and the delivery was redelivered instead.
+            SafeLog.Try((Logger: _logger, Error: ex), static state => state.Logger.LogError(state.Error, "Ingress failed to process the inbound response message."));
             AsyncResponseDiagnostics.SetError(activity, ex);
             try
             {
@@ -139,7 +159,8 @@ internal sealed class AsyncResponseIngress(
             }
             catch (Exception innerEx)
             {
-                _logger.LogError(innerEx, "Ingress failed to publish the exception for the inbound message (original error: {OriginalError}).", ex.Message);
+                SafeLog.Try((Logger: _logger, Error: innerEx, Original: ex.Message), static state => state.Logger.LogError(
+                    state.Error, "Ingress failed to publish the exception for the inbound message (original error: {OriginalError}).", state.Original));
 
                 // Both the publish and the SetException escalation failed, so returning normally
                 // would ack a response that now exists nowhere. Propagate instead: the transport's
@@ -167,8 +188,10 @@ internal sealed class AsyncResponseIngress(
             // The envelope is the WORST thing in the library to log whole: it carries the job's
             // arguments and whatever the context propagators captured (tenant, auth, trace baggage).
             // Size only, so a message that fails to even parse still leaves a trace, then the
-            // routing metadata once it has been read.
-            _logger.LogDebug("Ingress received a worker job. Payload: {PayloadLength} UTF-16 code units.", messageJson.Length);
+            // routing metadata once it has been read. Guarded: a throwing provider here escaped
+            // the parse filter below and the job was redelivered without ever running.
+            SafeLog.Try((Logger: _logger, messageJson.Length), static state => state.Logger.LogDebug(
+                "Ingress received a worker job. Payload: {PayloadLength} UTF-16 code units.", state.Length));
 
             job = JsonSafety.SafeDeserialize<WorkerJobEnvelope>(messageJson)
                 ?? throw new InvalidDataException("Worker message deserialized to null.");
@@ -191,7 +214,8 @@ internal sealed class AsyncResponseIngress(
             // same presence-only guarantee, and the executor validates them the moment it pushes
             // the job's context (whitespace-inclusive, exactly this rule) — outside this filter,
             // so a null or blank member threw on every delivery and was redelivered forever. A
-            // null Properties map carries no data and is read as empty.
+            // null Properties map carries no data: the reply target's init accessor reads it back
+            // as an empty map, so a handler never sees null there.
             if (job.ReplyTarget is { } replyTarget
                 && (string.IsNullOrWhiteSpace(replyTarget.Name)
                     || string.IsNullOrWhiteSpace(replyTarget.Transport)
@@ -216,12 +240,12 @@ internal sealed class AsyncResponseIngress(
             // Deliberately NOT the unsupported-schema rejection, which stays a throw: that envelope
             // is well-formed and a NEWER build can read it, so refusing lets it reach one instead
             // of being acknowledged away mid-rolling-deploy.
-            _logger.LogError(
-                ex,
-                "Ingress received a worker envelope it cannot parse; it can never be executed and is acknowledged without dispatch. Payload: {PayloadLength} UTF-16 code units.",
-                messageJson.Length);
             AsyncResponseDiagnostics.SetError(activity, ex);
             AsyncResponseDiagnostics.RecordWorkerOutcome("rejected");
+            SafeLog.Try((Logger: _logger, Error: ex, messageJson.Length), static state => state.Logger.LogError(
+                state.Error,
+                "Ingress received a worker envelope it cannot parse; it can never be executed and is acknowledged without dispatch. Payload: {PayloadLength} UTF-16 code units.",
+                state.Length));
             return;
         }
 
@@ -236,14 +260,18 @@ internal sealed class AsyncResponseIngress(
             // and the correlation id through the escaped excerpt (it is checked against the
             // portable-id contract only later, by the executor). An ordinary value reads exactly
             // as before; CR/LF or megabytes of text can no longer forge or flood the log line.
-            if (_logger.IsEnabled(LogLevel.Debug))
+            // Guarded: a throwing provider here failed the job before it ever ran.
+            SafeLog.Try((Logger: _logger, Job: job), static state =>
             {
-                _logger.LogDebug(
-                    "Ingress worker job for {CorrelationId} targets {Service}.{Method}.",
-                    job.CorrelationId is null ? null : DiagnosticText.EscapedExcerpt(job.CorrelationId, AsyncResponseChannelOptions.MaxCorrelationIdLength),
-                    AsyncResponseTypeResolution.DescribeForDiagnostics(job.Call.ServiceInterfaceFullName),
-                    DiagnosticText.EscapedExcerpt(job.Call.MethodName, 256));
-            }
+                if (state.Logger.IsEnabled(LogLevel.Debug))
+                {
+                    state.Logger.LogDebug(
+                        "Ingress worker job for {CorrelationId} targets {Service}.{Method}.",
+                        state.Job.CorrelationId is null ? null : DiagnosticText.EscapedExcerpt(state.Job.CorrelationId, AsyncResponseChannelOptions.MaxCorrelationIdLength),
+                        AsyncResponseTypeResolution.DescribeForDiagnostics(state.Job.Call.ServiceInterfaceFullName),
+                        DiagnosticText.EscapedExcerpt(state.Job.Call.MethodName, 256));
+                }
+            });
 
             // Authorize the target while the envelope is still inert data — BEFORE its propagated
             // context is restored. Both halves of this envelope are attacker-controlled to anyone
@@ -285,7 +313,9 @@ internal sealed class AsyncResponseIngress(
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Ingress worker job execution failed.");
+            // Guarded so the job's own exception is what propagates: transports classify it (a
+            // lease hand-back, an oversized re-publish), and a throwing provider replaced it.
+            SafeLog.Try((Logger: _logger, Error: ex), static state => state.Logger.LogError(state.Error, "Ingress worker job execution failed."));
             AsyncResponseDiagnostics.SetError(activity, ex);
 
             // Propagate: the transport dispatcher owns the retry/dead-letter decision for worker

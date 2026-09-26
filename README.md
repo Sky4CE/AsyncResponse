@@ -362,7 +362,7 @@ execution leases. They are independent axes — combine any one of each.
 | RabbitMQ | publisher confirms + mandatory routing, dead-letter exchange |
 | Azure Service Bus | peek-lock ACKs; reuses your own `ServiceBusClient` (e.g. Azure Identity) if registered |
 | Google Pub/Sub | streaming pull; redelivery bounds via the subscription's DeadLetterPolicy |
-| AWS SQS | long-poll `ReceiveMessage` (up to 10/batch in early ACK, one at a time otherwise), visibility-timeout redelivery, native dead-letter via redrive policies (provisionable with `CreateQueues`), opt-in FIFO ordering per correlation id; reuses your own `IAmazonSQS` if registered |
+| AWS SQS | long-poll `ReceiveMessage` (up to 10/batch; one at a time for the ack-after-handler worker), visibility-timeout redelivery, native dead-letter via redrive policies (provisionable with `CreateQueues`), opt-in FIFO ordering per correlation id; reuses your own `IAmazonSQS` if registered |
 | Kafka | classic consumer groups, manual offset management, in-process bounded retry, `{topic}.deadletter` topics; a handler that outlives `DetachHandlerAfter` runs detached with its partition paused, so long flow steps never overrun `max.poll.interval.ms`; also covers Redpanda / Amazon MSK / WarpStream / Aiven / Confluent Cloud |
 | NATS | JetStream explicit ACKs, NAK-with-delay redelivery, dead-lettering |
 | PostgreSQL | queue table claimed with `FOR UPDATE SKIP LOCKED`, idempotent publish, dead-lettering |

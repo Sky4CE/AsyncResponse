@@ -24,9 +24,9 @@ namespace AsyncResponse.IntegrationTests;
 // everything else — oracle 2,180 MiB, the two SQL Servers ~1,328 MiB each, cosmos 1,031 MiB — so the
 // split is mostly about keeping those apart. Oracle and SQL Server are also capped in the AppHost.
 //
-//   data           8 containers,  9 apps, 359 tests   every database-backed test
+//   data           8 containers,  9 apps, 380 tests   every database-backed test
 //   oracle-cosmos  2 containers,  0 apps,  16 tests   the two heavyweight stores, isolated
-//   brokers        5 containers, 10 apps,  64 tests   message brokers (all small)
+//   brokers        5 containers, 10 apps,  65 tests   message brokers (all small)
 //   cloud          4 containers,  4 apps,  18 tests   Service Bus + SQS emulators
 //
 // Tests needing no AppHost (in-memory suite, AOT publish gate, these guards) belong to no batch and
@@ -194,8 +194,8 @@ public sealed class DataBatchFixture : DriverOnlyBatchFixture
 
 /// <summary>
 /// Oracle and Cosmos, alone. Together they measured 3.2 GiB — more than half a default Docker VM —
-/// against exactly two tests, so they get a batch to themselves rather than making every other store
-/// test share a fleet that cannot reliably start.
+/// against only 16 tests (OracleCosmosStoreContractTests), so they get a batch to themselves rather
+/// than making every other store test share a fleet that cannot reliably start.
 /// </summary>
 public sealed class OracleCosmosBatchFixture : IntegrationFixture
 {
@@ -203,7 +203,7 @@ public sealed class OracleCosmosBatchFixture : IntegrationFixture
 
     protected override ValueTask WireAsync()
     {
-        // Both tests wait for their own server: Oracle takes minutes to provision its database on a
+        // Each test waits for its own server: Oracle takes minutes to provision its database on a
         // cold container, so there is nothing useful for the fixture to wait on here.
         WireOracleAndCosmosConnectionStrings();
         return ValueTask.CompletedTask;

@@ -3,6 +3,8 @@ using System.Reflection;
 using System.Text.Json;
 using AsyncResponse.DurableFlows.Cosmos;
 using Microsoft.Azure.Cosmos;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using Moq;
 using Xunit;
@@ -117,8 +119,15 @@ public sealed class CosmosDurableFlowStateStoreTests
         Assert.False(await harness.Store.TryRenewLeaseAsync("flow", "owner", TimeSpan.FromMinutes(1)));
         await harness.Store.ReleaseLeaseAsync("flow", "owner");
 
+        // Every patch losing its ETag race while every read shows the lease ours and live is
+        // contention (the holder's own checkpoints move the ETag), not loss: a renewal throws so
+        // the engine retries it instead of abandoning the execution. An acquire holds nothing yet
+        // and keeps answering false.
         harness.PatchesThrowing(CosmosError(HttpStatusCode.PreconditionFailed));
-        Assert.False(await harness.Store.TryRenewLeaseAsync("flow", "owner", TimeSpan.FromMinutes(1)));
+        var contended = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => harness.Store.TryRenewLeaseAsync("flow", "owner", TimeSpan.FromMinutes(1)));
+        Assert.IsType<CosmosException>(contended.InnerException);
+        Assert.False(await harness.Store.TryAcquireLeaseAsync("flow", "owner", TimeSpan.FromMinutes(1)));
         await harness.Store.ReleaseLeaseAsync("flow", "owner");
 
         // The lease paths never touch the document body: no point read, no replace.
@@ -265,8 +274,9 @@ public sealed class CosmosDurableFlowStateStoreTests
             LeaseExpiresAtUtc = DateTime.UtcNow.AddMinutes(1)
         });
         harness.PatchesThrowing(CosmosError(HttpStatusCode.PreconditionFailed));
-        Assert.False(await harness.Store.TryRenewLeaseAsync(
+        await Assert.ThrowsAsync<InvalidOperationException>(() => harness.Store.TryRenewLeaseAsync(
             "flow", "owner", TimeSpan.FromMinutes(1)));
+        Assert.False(await harness.Store.TryAcquireLeaseAsync("flow", "owner", TimeSpan.FromMinutes(1)));
         await harness.Store.ReleaseLeaseAsync("flow", "owner");
     }
 
@@ -1005,15 +1015,114 @@ public sealed class CosmosDurableFlowStateStoreTests
         }
 
         harness.Client.Verify(client => client.ReadAccountAsync(), Times.Once);
+    }
 
-        // AccountProperties has no public constructor: built from the account JSON the SDK itself parses.
-        static AccountProperties Account(ConsistencyLevel level)
-        {
-            var account = Newtonsoft.Json.JsonConvert.DeserializeObject<AccountProperties>(
-                $$$"""{"id":"account","userConsistencyPolicy":{"defaultConsistencyLevel":"{{{level}}}"}}""")!;
-            Assert.Equal(level, account.Consistency.DefaultConsistencyLevel);
-            return account;
-        }
+    /// <summary>
+    /// Regression: below Session a read carries no session token, so LoadCurrentAsync — recovery,
+    /// failure signals, resumes — can act on a ledger older than the last acknowledged write, and
+    /// nothing said so: the level was only ever consulted on the rare "present for writes, absent
+    /// for reads" path. Provisioning now resolves it once and warns (it does not refuse: the
+    /// emulator defaults to Eventual, and a client override can only weaken the account level).
+    /// </summary>
+    [Theory]
+    [InlineData(ConsistencyLevel.Eventual, true)]
+    [InlineData(ConsistencyLevel.ConsistentPrefix, true)]
+    [InlineData(ConsistencyLevel.BoundedStaleness, true)]
+    [InlineData(ConsistencyLevel.Session, false)]
+    [InlineData(ConsistencyLevel.Strong, false)]
+    public async Task Provisioning_WarnsOnce_WhenReadsRunBelowSessionConsistency(ConsistencyLevel accountDefault, bool warns)
+    {
+        var logger = new CollectingLogger();
+        using var harness = new CosmosHarness(logger: logger.For<CosmosFlowStateStore>());
+        harness.Client.SetupGet(client => client.ClientOptions).Returns(new CosmosClientOptions());
+        harness.Client.Setup(client => client.ReadAccountAsync()).ReturnsAsync(Account(accountDefault));
+        harness.Reads(Document(CreateState("flow"), DateTime.UtcNow.AddMinutes(5)));
+
+        Assert.NotNull(await harness.Store.LoadAsync("flow"));
+        Assert.NotNull(await harness.Store.LoadAsync("flow"));
+
+        var warnings = logger.Messages.Where(message => message.Contains("needs Session or Strong", StringComparison.Ordinal)).ToArray();
+        if (warns)
+            Assert.Contains(accountDefault.ToString(), Assert.Single(warnings), StringComparison.Ordinal);
+        else
+            Assert.Empty(warnings);
+
+        // Resolved once, and the rare absence path reuses the answer instead of asking again.
+        harness.WritePathSeesTheLedger();
+        harness.ReadsException(HttpStatusCode.NotFound);
+        if (warns)
+            await Assert.ThrowsAsync<FlowStateUnreadableException>(() => harness.Store.LoadAsync("flow"));
+        else
+            Assert.Null(await harness.Store.LoadAsync("flow"));
+        harness.Client.Verify(client => client.ReadAccountAsync(), Times.Once);
+    }
+
+    [Fact]
+    public async Task Provisioning_ThatCannotResolveTheConsistencyLevel_StillProvisions()
+    {
+        // The warning is best effort: an account read the credentials may not allow never fails
+        // the store's first operation, and the rare absence path asks again later.
+        var logger = new CollectingLogger();
+        using var harness = new CosmosHarness(logger: logger.For<CosmosFlowStateStore>());
+        harness.Client.SetupGet(client => client.ClientOptions).Returns(new CosmosClientOptions());
+        harness.Client.SetupSequence(client => client.ReadAccountAsync())
+            .ThrowsAsync(CosmosError(HttpStatusCode.Forbidden))
+            .ReturnsAsync(Account(ConsistencyLevel.Session));
+        harness.Reads(Document(CreateState("flow"), DateTime.UtcNow.AddMinutes(5)));
+
+        Assert.NotNull(await harness.Store.LoadAsync("flow"));
+        Assert.DoesNotContain(logger.Messages, message => message.Contains("needs Session or Strong", StringComparison.Ordinal));
+
+        harness.WritePathSeesTheLedger();
+        harness.ReadsException(HttpStatusCode.NotFound);
+        Assert.Null(await harness.Store.LoadAsync("flow"));
+        harness.Client.Verify(client => client.ReadAccountAsync(), Times.Exactly(2));
+    }
+
+    [Fact]
+    public async Task Provisioning_WithWarningsDisabled_SkipsTheAccountRead()
+    {
+        // No account round trip for a warning nobody would see.
+        using var harness = new CosmosHarness(logger: Microsoft.Extensions.Logging.Abstractions.NullLogger<CosmosFlowStateStore>.Instance);
+        harness.Client.SetupGet(client => client.ClientOptions).Returns(new CosmosClientOptions());
+        harness.Reads(Document(CreateState("flow"), DateTime.UtcNow.AddMinutes(5)));
+
+        Assert.NotNull(await harness.Store.LoadAsync("flow"));
+        harness.Client.Verify(client => client.ReadAccountAsync(), Times.Never);
+    }
+
+    [Fact]
+    public async Task Registration_HandsTheStoreItsLogger()
+    {
+        var logger = new CollectingLogger();
+        using var harness = new CosmosHarness();
+        harness.Client.SetupGet(client => client.ClientOptions).Returns(new CosmosClientOptions { ConsistencyLevel = ConsistencyLevel.Eventual });
+        harness.Reads(Document(CreateState("flow"), DateTime.UtcNow.AddMinutes(5)));
+        var services = new ServiceCollection();
+        services.AddSingleton(logger.For<CosmosFlowStateStore>());
+        services.AddSingleton(harness.Client.Object);
+        services.AddAsyncResponse()
+            .WithInMemoryChannel()
+            .WithInMemoryTransport()
+            .WithCosmosDurableFlows(options =>
+            {
+                options.DatabaseName = "flows";
+                options.ContainerName = "states";
+                options.AutoCreateContainer = false;
+            });
+        await using var provider = services.BuildServiceProvider();
+
+        Assert.NotNull(await provider.GetRequiredService<CosmosFlowStateStore>().LoadAsync("flow"));
+        Assert.Contains(logger.Messages, message => message.Contains("needs Session or Strong", StringComparison.Ordinal));
+    }
+
+    // AccountProperties has no public constructor: built from the account JSON the SDK itself parses.
+    private static AccountProperties Account(ConsistencyLevel level)
+    {
+        var account = Newtonsoft.Json.JsonConvert.DeserializeObject<AccountProperties>(
+            $$$"""{"id":"account","userConsistencyPolicy":{"defaultConsistencyLevel":"{{{level}}}"}}""")!;
+        Assert.Equal(level, account.Consistency.DefaultConsistencyLevel);
+        return account;
     }
 
     [Fact]
@@ -1159,7 +1268,12 @@ public sealed class CosmosDurableFlowStateStoreTests
         // The behavioural half of the normalization, through the lease projection. On a host west
         // of UTC the live lease below read as expired by the zone offset (a second worker took a
         // live holder's lease); east of UTC the dead one read as live for hours (contention
-        // churn). On a UTC host local ticks are UTC ticks, so both halves hold either way there.
+        // churn). On a UTC host local ticks are UTC ticks, so both halves hold either way there —
+        // skipped visibly rather than passing vacuously (CI's hosted runners are UTC; the
+        // deterministic half above pins the normalization on every host).
+        if (TimeZoneInfo.Local.GetUtcOffset(DateTime.UtcNow) == TimeSpan.Zero)
+            Assert.Skip("The host's local time is UTC, where local and UTC ticks coincide and this check cannot fail.");
+
         using var live = new CosmosHarness();
         live.QueriesLease(new CosmosFlowStateDocument
         {
@@ -1389,7 +1503,7 @@ public sealed class CosmosDurableFlowStateStoreTests
     {
         private readonly Mock<ContainerResponse> _containerResponse;
 
-        public CosmosHarness(ContainerProperties? properties = null)
+        public CosmosHarness(ContainerProperties? properties = null, ILogger<CosmosFlowStateStore>? logger = null)
         {
             Client = new Mock<CosmosClient>();
             Container = new Mock<Container>();
@@ -1409,7 +1523,7 @@ public sealed class CosmosDurableFlowStateStoreTests
                 DatabaseName = "flows",
                 ContainerName = "states",
                 AutoCreateContainer = false
-            }));
+            }), logger: logger);
         }
 
         public Mock<CosmosClient> Client { get; }

@@ -31,6 +31,8 @@ internal sealed class MongoDbChannelStore : IDisposable
     private readonly IMongoCollection<MongoChannelMessageDocument> _messages;
     private readonly IMongoCollection<MongoChannelSubscriberDocument> _subscribers;
     private readonly IMongoCollection<BsonDocument> _counters;
+    private readonly IMongoCollection<MongoChannelMessageDocument> _messagesReadBack;
+    private readonly IMongoCollection<BsonDocument> _countersReadBack;
     private readonly IMongoDatabase _database;
     private readonly MongoDbAsyncResponseChannelOptions _options;
     private readonly SemaphoreSlim _ensureGate = new(1, 1);
@@ -97,6 +99,12 @@ internal sealed class MongoDbChannelStore : IDisposable
         _counters = database.GetCollection<BsonDocument>(CountersCollectionName(_options.MessageCollection))
             .WithReadPreference(ReadPreference.Primary)
             .WithWriteConcern(writeConcern);
+        // The replication-timeout read-backs (see ReadOnPrimaryAsync) read at LOCAL concern: a
+        // write whose majority acknowledgement lapsed is by definition not majority-committed, so
+        // under an inherited readConcernLevel=majority the read-back missed the write it exists to
+        // find — a recovery claim that won read back as lost, and the response was dropped.
+        _messagesReadBack = _messages.WithReadConcern(ReadConcern.Local);
+        _countersReadBack = _counters.WithReadConcern(ReadConcern.Local);
         _ownedClient = ownedClient;
     }
 
@@ -130,6 +138,9 @@ internal sealed class MongoDbChannelStore : IDisposable
                     cancellationToken).ConfigureAwait(false);
             }
 
+            // Both branches: nothing else notices a folding default collation (see the method).
+            await WarnIfFoldingCollationAsync(cancellationToken).ConfigureAwait(false);
+
             if (!_options.AutoCreateIndexes)
             {
                 // Manually managed indexes get a one-time read-only check instead of DDL. There
@@ -145,43 +156,52 @@ internal sealed class MongoDbChannelStore : IDisposable
 
             // TTL indexes (expireAfterSeconds = 0 on the expiry timestamp) make MongoDB itself reap
             // expired documents — no application-side pruning needed. Reads still filter on the
-            // expiry because the TTL monitor only runs periodically (~60s).
+            // expiry because the TTL monitor only runs periodically (~60s). A TTL index an earlier
+            // deployment created under the same name with different options is replaced in place;
+            // an equivalent index under another name — the one the AutoCreateIndexes = false
+            // warning prescribes — is accepted (see MongoIndexes).
             await CreateTtlIndexAsync(
                 _recovery,
                 Builders<MongoRecoveryStateDocument>.IndexKeys.Ascending(item => item.ExpiresAtUtc),
                 $"{_options.RecoveryStateCollection}_expires_idx",
                 cancellationToken).ConfigureAwait(false);
-            await _recovery.Indexes.CreateOneAsync(
+            await MongoIndexes.CreateOrAcceptEquivalentAsync(
+                _recovery,
                 new CreateIndexModel<MongoRecoveryStateDocument>(
                     Builders<MongoRecoveryStateDocument>.IndexKeys
                         .Ascending(item => item.CorrelationId)
                         .Ascending(item => item.RegisteredAtUtc),
                     new CreateIndexOptions { Name = $"{_options.RecoveryStateCollection}_correlation_idx" }),
-                cancellationToken: cancellationToken).ConfigureAwait(false);
+                replaceConflicting: false,
+                cancellationToken).ConfigureAwait(false);
 
             await CreateTtlIndexAsync(
                 _messages,
                 Builders<MongoChannelMessageDocument>.IndexKeys.Ascending(item => item.ExpiresAtUtc),
                 $"{_options.MessageCollection}_expires_idx",
                 cancellationToken).ConfigureAwait(false);
-            await _messages.Indexes.CreateOneAsync(
+            await MongoIndexes.CreateOrAcceptEquivalentAsync(
+                _messages,
                 new CreateIndexModel<MongoChannelMessageDocument>(
                     Builders<MongoChannelMessageDocument>.IndexKeys
                         .Ascending(item => item.CorrelationId)
                         .Ascending(item => item.CreatedAtUtc),
                     new CreateIndexOptions { Name = $"{_options.MessageCollection}_correlation_created_idx" }),
-                cancellationToken: cancellationToken).ConfigureAwait(false);
+                replaceConflicting: false,
+                cancellationToken).ConfigureAwait(false);
 
             await CreateTtlIndexAsync(
                 _subscribers,
                 Builders<MongoChannelSubscriberDocument>.IndexKeys.Ascending(item => item.ExpiresAtUtc),
                 $"{_options.SubscriberCollection}_expires_idx",
                 cancellationToken).ConfigureAwait(false);
-            await _subscribers.Indexes.CreateOneAsync(
+            await MongoIndexes.CreateOrAcceptEquivalentAsync(
+                _subscribers,
                 new CreateIndexModel<MongoChannelSubscriberDocument>(
                     Builders<MongoChannelSubscriberDocument>.IndexKeys.Ascending(item => item.CorrelationId),
                     new CreateIndexOptions { Name = $"{_options.SubscriberCollection}_correlation_idx" }),
-                cancellationToken: cancellationToken).ConfigureAwait(false);
+                replaceConflicting: false,
+                cancellationToken).ConfigureAwait(false);
 
             _created = true;
         }
@@ -191,36 +211,67 @@ internal sealed class MongoDbChannelStore : IDisposable
         }
     }
 
-    private static async Task CreateTtlIndexAsync<TDocument>(
+    private static Task CreateTtlIndexAsync<TDocument>(
         IMongoCollection<TDocument> collection,
         IndexKeysDefinition<TDocument> keys,
         string indexName,
         CancellationToken cancellationToken)
+        => MongoIndexes.CreateOrAcceptEquivalentAsync(
+            collection,
+            new CreateIndexModel<TDocument>(keys, new CreateIndexOptions { Name = indexName, ExpireAfter = TimeSpan.Zero }),
+            replaceConflicting: true,
+            cancellationToken);
+
+    /// <summary>
+    /// Warns once when a channel collection was created with a non-simple default collation. The
+    /// per-id reads use it (they stay unpinned on purpose: an explicit simple collation cannot use
+    /// an index built under a folding one, so every targeted pass would scan the collection), and
+    /// under a case- or accent-folding one a read for "ABC" also returns "abc"'s documents: the
+    /// shared ordinal re-check drops them, but logs an Error per document per pass, which the
+    /// lookback window repeats. Nothing is misdelivered, so this is a warning, not a startup
+    /// failure. Fail-soft: without the listCollections privilege the check is skipped.
+    /// </summary>
+    private async Task WarnIfFoldingCollationAsync(CancellationToken cancellationToken)
     {
-        var model = new CreateIndexModel<TDocument>(
-            keys,
-            new CreateIndexOptions { Name = indexName, ExpireAfter = TimeSpan.Zero });
         try
         {
-            await collection.Indexes.CreateOneAsync(model, cancellationToken: cancellationToken).ConfigureAwait(false);
-        }
-        catch (MongoCommandException ex) when (ex.Code is 85 or 86)
-        {
-            // IndexOptionsConflict/IndexKeySpecsConflict: an earlier deployment created the
-            // same-named index with different options. Replace it in place.
-            try
+            var names = new BsonArray { _options.RecoveryStateCollection, _options.MessageCollection, _options.SubscriberCollection };
+            using var cursor = await _database.ListCollectionsAsync(
+                new ListCollectionsOptions { Filter = new BsonDocument("name", new BsonDocument("$in", names)) },
+                cancellationToken).ConfigureAwait(false);
+            foreach (var collection in await cursor.ToListAsync(cancellationToken).ConfigureAwait(false))
             {
-                await collection.Indexes.DropOneAsync(indexName, cancellationToken).ConfigureAwait(false);
-            }
-            catch (MongoCommandException dropException) when (dropException.Code == 27)
-            {
-                // IndexNotFound: a peer host in the same rolling deploy took the same branch and
-                // dropped it first. Converge on the recreate below (idempotent for an identical spec).
-            }
+                if (FoldingCollation(collection) is not { } collation)
+                    continue;
 
-            await collection.Indexes.CreateOneAsync(model, cancellationToken: cancellationToken).ConfigureAwait(false);
+                _logger.LogWarning(
+                    "MongoDB collection {Database}.{Collection} was created with the default collation {Collation}. The channel " +
+                    "compares correlation ids ordinally, and under a case- or accent-folding collation a lookup for one id also " +
+                    "returns the documents of ids that differ only by case or accents: they are discarded, with an Error logged " +
+                    "for each on every pass. Recreate the collection without a collation (or with {{ locale: 'simple' }}).",
+                    _database.DatabaseNamespace.DatabaseName,
+                    collection.GetValue("name", BsonNull.Value).ToString(),
+                    collation.ToJson());
+            }
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            // Same containment as the managed-index check: a deployment that cannot list
+            // collections must not lose the actual operation to a diagnostic (nor to a logging
+            // provider that throws).
+            SafeLog.Try(() => _logger.LogDebug(ex, "Skipping the collation check for the MongoDB channel collections; listCollections was not available."));
         }
     }
+
+    /// <summary>A listCollections entry's default collation when it is not the simple (binary) one.</summary>
+    internal static BsonDocument? FoldingCollation(BsonDocument collection)
+        => collection.TryGetValue("options", out var options)
+           && options is BsonDocument optionsDocument
+           && optionsDocument.TryGetValue("collation", out var collation)
+           && collation is BsonDocument collationDocument
+           && !(collationDocument.TryGetValue("locale", out var locale) && locale == "simple")
+            ? collationDocument
+            : null;
 
     private async Task WarnIfManagedIndexesMissingAsync(CancellationToken cancellationToken)
     {
@@ -381,17 +432,37 @@ internal sealed class MongoDbChannelStore : IDisposable
         // pipeline's $ifNull, together with its settlement columns — for the same-process fast
         // path's watermark comparison (a fabricated null acked_at replayed an already-consumed
         // response to a waiter registered after the ack).
-        var document = await _messages.FindOneAndUpdateAsync(
-            Builders<MongoChannelMessageDocument>.Filter.Eq(item => item.Id, id),
-            BuildInsertMessagePipeline(correlationId, envelopeJson, retention),
-            new FindOneAndUpdateOptions<MongoChannelMessageDocument>
-            {
-                IsUpsert = true,
-                ReturnDocument = ReturnDocument.After,
-                // The caller already holds the envelope: only the stamps travel back.
-                Projection = WithoutEnvelopeProjection
-            },
-            cancellationToken).ConfigureAwait(false);
+        MongoChannelMessageDocument? document;
+        try
+        {
+            document = await _messages.FindOneAndUpdateAsync(
+                Builders<MongoChannelMessageDocument>.Filter.Eq(item => item.Id, id),
+                BuildInsertMessagePipeline(correlationId, envelopeJson, retention),
+                new FindOneAndUpdateOptions<MongoChannelMessageDocument>
+                {
+                    IsUpsert = true,
+                    ReturnDocument = ReturnDocument.After,
+                    // The caller already holds the envelope: only the stamps travel back.
+                    Projection = WithoutEnvelopeProjection
+                },
+                cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (MongoWriteConcerns.IsReplicationTimeout(ex))
+        {
+            // The upsert applied on the primary — waiters there can already claim it — and only
+            // its majority acknowledgement timed out. Failing the publish made the ingress
+            // re-publish under a NEW message id (an Until waiter received the response once per
+            // attempt) and then store a failure envelope on top; retrying the same id re-waits on
+            // the same replication. So the stored document is read back by id and reported
+            // stored, like any other insert.
+            document = await ReadOnPrimaryAsync(
+                Builders<MongoChannelMessageDocument>.Filter.Eq(item => item.Id, id),
+                WithoutEnvelopeProjection,
+                cancellationToken).ConfigureAwait(false);
+            if (document is null)
+                throw;
+            LogReplicationTimeout(ex, "response insert", id);
+        }
 
         // Upsert + ReturnDocument.After cannot return null from a healthy server. If a driver
         // anomaly ever surfaces one, persistence is UNKNOWN — reporting success with a fabricated
@@ -408,6 +479,28 @@ internal sealed class MongoDbChannelStore : IDisposable
                 document.AckedAtUtc is { } acked ? new DateTimeOffset(acked, TimeSpan.Zero) : null,
                 document.AckedSeq);
     }
+
+    /// <summary>
+    /// One message document as the primary holds it now (the handle is pinned to the primary and
+    /// reads at local concern, so it sees a write that is not yet majority-committed): how a
+    /// write whose majority acknowledgement timed out (see
+    /// <see cref="MongoWriteConcerns.IsReplicationTimeout"/>) learns what it applied — a read
+    /// waits on no replication, so it answers while the set is still degraded.
+    /// </summary>
+    private async Task<MongoChannelMessageDocument?> ReadOnPrimaryAsync(
+        FilterDefinition<MongoChannelMessageDocument> filter,
+        ProjectionDefinition<MongoChannelMessageDocument, MongoChannelMessageDocument> projection,
+        CancellationToken cancellationToken)
+        => await _messagesReadBack.Find(filter).Project(projection).FirstOrDefaultAsync(cancellationToken).ConfigureAwait(false);
+
+    private void LogReplicationTimeout(Exception exception, string operation, Guid messageId)
+        => SafeLog.Try(() => _logger.LogWarning(
+            exception,
+            "MongoDB channel {Operation} for message {MessageId} was applied on the primary, but its majority acknowledgement timed out; " +
+            "acting on what the primary holds. A failover before it replicates can still roll it back — restore the replica set's " +
+            "secondaries (or remove the arbiter) rather than lowering the write concern.",
+            operation,
+            messageId));
 
     /// <summary>Every field but the envelope — what the insert needs back.</summary>
     internal static readonly ProjectionDefinition<MongoChannelMessageDocument, MongoChannelMessageDocument> WithoutEnvelopeProjection =
@@ -563,11 +656,31 @@ internal sealed class MongoDbChannelStore : IDisposable
         // counter). An unused draw on an already-acked row leaves a harmless gap; $ifNull keeps
         // the FIRST claim's stamp, mirroring acked_at.
         var ackSeq = await DrawAckSequenceAsync(cancellationToken).ConfigureAwait(false);
-        var claimed = await _messages.FindOneAndUpdateAsync(
-            BuildDeliveryClaimFilter(messageId),
-            BuildDeliveryClaimUpdate(ackSeq),
-            new FindOneAndUpdateOptions<MongoChannelMessageDocument> { ReturnDocument = ReturnDocument.After, Projection = IdOnlyProjection },
-            cancellationToken).ConfigureAwait(false);
+        MongoChannelMessageDocument? claimed;
+        try
+        {
+            claimed = await _messages.FindOneAndUpdateAsync(
+                BuildDeliveryClaimFilter(messageId),
+                BuildDeliveryClaimUpdate(ackSeq),
+                new FindOneAndUpdateOptions<MongoChannelMessageDocument> { ReturnDocument = ReturnDocument.After, Projection = IdOnlyProjection },
+                cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (MongoWriteConcerns.IsReplicationTimeout(ex))
+        {
+            // The claim ran on the primary and only its majority acknowledgement timed out, so
+            // acked_at may already be stamped — and the publisher's acknowledgement poll and its
+            // recovery claim both read that stamp as "delivered". Throwing here left the response
+            // acknowledged but never dispatched. What the claim left behind is its outcome: a
+            // document carrying acked_at and still not recovery-claimed (recovery_claimed only
+            // ever moves one way, and never once acked_at is set) is one a delivery claim won.
+            // The claim's own filter is NOT re-evaluated: its expiry check, run a wtimeout after
+            // the claim, reported a response that expired in between as unclaimed although the
+            // claim had stamped it — acknowledged and lost. The cost of reading the stamp instead
+            // is at worst a re-dispatch of a fan-out response that expired before this claim.
+            claimed = await ReadOnPrimaryAsync(BuildDeliveryClaimReadBackFilter(messageId), IdOnlyProjection, cancellationToken).ConfigureAwait(false);
+            LogReplicationTimeout(ex, "delivery claim", messageId);
+        }
+
         return claimed is not null;
     }
 
@@ -575,6 +688,12 @@ internal sealed class MongoDbChannelStore : IDisposable
         => Builders<MongoChannelMessageDocument>.Filter.Eq(item => item.Id, messageId)
            & Builders<MongoChannelMessageDocument>.Filter.Eq(item => item.RecoveryClaimed, false)
            & NotExpiredOnServerClock<MongoChannelMessageDocument>();
+
+    /// <summary>What a delivery claim whose majority acknowledgement lapsed reads back: the stamp it leaves.</summary>
+    internal static FilterDefinition<MongoChannelMessageDocument> BuildDeliveryClaimReadBackFilter(Guid messageId)
+        => Builders<MongoChannelMessageDocument>.Filter.Eq(item => item.Id, messageId)
+           & Builders<MongoChannelMessageDocument>.Filter.Eq(item => item.RecoveryClaimed, false)
+           & Builders<MongoChannelMessageDocument>.Filter.Ne(item => item.AckedAtUtc, null);
 
     internal static UpdateDefinition<MongoChannelMessageDocument> BuildDeliveryClaimUpdate(long ackSeq)
         => Builders<MongoChannelMessageDocument>.Update.Pipeline(new[]
@@ -599,11 +718,29 @@ internal sealed class MongoDbChannelStore : IDisposable
 
     private async Task<long> DrawAckSequenceAsync(CancellationToken cancellationToken)
     {
-        var counter = await _counters.FindOneAndUpdateAsync<BsonDocument>(
-            new BsonDocument("_id", "ack_seq"),
-            new BsonDocument("$inc", new BsonDocument("seq", 1L)),
-            new FindOneAndUpdateOptions<BsonDocument, BsonDocument> { IsUpsert = true, ReturnDocument = ReturnDocument.After },
-            cancellationToken).ConfigureAwait(false);
+        BsonDocument? counter;
+        try
+        {
+            counter = await _counters.FindOneAndUpdateAsync<BsonDocument>(
+                new BsonDocument("_id", "ack_seq"),
+                new BsonDocument("$inc", new BsonDocument("seq", 1L)),
+                new FindOneAndUpdateOptions<BsonDocument, BsonDocument> { IsUpsert = true, ReturnDocument = ReturnDocument.After },
+                cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (MongoWriteConcerns.IsReplicationTimeout(ex))
+        {
+            // The $inc applied on the primary; only its reply (the drawn value) is lost. The
+            // counter as read now is at or past that draw and is read before the claim lands, so
+            // it orders the delivery against registrations exactly as a draw made at this read
+            // would — a registration that drew in between ties it, and the watermark resolves a
+            // tie conservatively, as history. Throwing here stalled every delivery claim for as
+            // long as the set stayed degraded.
+            counter = await _countersReadBack.Find(new BsonDocument("_id", "ack_seq")).FirstOrDefaultAsync(cancellationToken).ConfigureAwait(false);
+            if (counter is null)
+                throw;
+            SafeLog.Try(() => _logger.LogDebug(ex, "MongoDB channel ack-sequence draw was applied on the primary, but its majority acknowledgement timed out; using the counter's current value."));
+        }
+
         return counter["seq"].ToInt64();
     }
 
@@ -617,11 +754,30 @@ internal sealed class MongoDbChannelStore : IDisposable
     public async Task<bool> TryClaimForRecoveryAsync(Guid messageId, CancellationToken cancellationToken)
     {
         await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
-        var claimed = await _messages.FindOneAndUpdateAsync(
-            BuildRecoveryClaimFilter(messageId),
-            Builders<MongoChannelMessageDocument>.Update.Set(item => item.RecoveryClaimed, true),
-            new FindOneAndUpdateOptions<MongoChannelMessageDocument> { ReturnDocument = ReturnDocument.After, Projection = IdOnlyProjection },
-            cancellationToken).ConfigureAwait(false);
+        MongoChannelMessageDocument? claimed;
+        try
+        {
+            claimed = await _messages.FindOneAndUpdateAsync(
+                BuildRecoveryClaimFilter(messageId),
+                Builders<MongoChannelMessageDocument>.Update.Set(item => item.RecoveryClaimed, true),
+                new FindOneAndUpdateOptions<MongoChannelMessageDocument> { ReturnDocument = ReturnDocument.After, Projection = IdOnlyProjection },
+                cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (MongoWriteConcerns.IsReplicationTimeout(ex))
+        {
+            // As for the delivery claim: the claim ran on the primary. recovery_claimed is set only
+            // by the publisher's recovery claim, and only while acked_at is null — after which no
+            // delivery claim can match — so a document carrying it is one recovery won. Throwing
+            // failed a publish whose response was already stored, and the ingress re-published it
+            // under a new id.
+            claimed = await ReadOnPrimaryAsync(
+                Builders<MongoChannelMessageDocument>.Filter.Eq(item => item.Id, messageId)
+                & Builders<MongoChannelMessageDocument>.Filter.Eq(item => item.RecoveryClaimed, true),
+                IdOnlyProjection,
+                cancellationToken).ConfigureAwait(false);
+            LogReplicationTimeout(ex, "recovery claim", messageId);
+        }
+
         return claimed is not null;
     }
 

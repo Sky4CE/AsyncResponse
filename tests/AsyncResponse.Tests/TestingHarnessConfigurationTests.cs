@@ -85,6 +85,25 @@ public sealed class TestingHarnessConfigurationTests
     }
 
     [Fact]
+    public async Task ConfigureServices_AScopedCallbackAuthorizer_StartsTheHarness()
+    {
+        // Fixpoint r2 (GS2#2): the harness builds its provider with ValidateScopes, and the
+        // startup validator's single-authorizer check took the authorizers as a constructor
+        // enumerable — so a scoped authorizer, which every runtime consumer resolves from a scope,
+        // failed StartAsync with "Cannot consume scoped service … from singleton IHostedService".
+        await using var harness = await AsyncResponseTestHarness.StartAsync(options =>
+            options.ConfigureServices = services => services.AddScoped<IAsyncResponseCallbackAuthorizer, ScopedAllowAllAuthorizer>());
+
+        using var scope = harness.Services.CreateScope();
+        Assert.IsType<ScopedAllowAllAuthorizer>(scope.ServiceProvider.GetRequiredService<IAsyncResponseCallbackAuthorizer>());
+    }
+
+    private sealed class ScopedAllowAllAuthorizer : IAsyncResponseCallbackAuthorizer
+    {
+        public bool IsAllowed(string serviceInterfaceFullName, string methodName) => true;
+    }
+
+    [Fact]
     public async Task NoUserLogging_StillFallsBackToNullLogger()
     {
         await using var harness = await AsyncResponseTestHarness.StartAsync();

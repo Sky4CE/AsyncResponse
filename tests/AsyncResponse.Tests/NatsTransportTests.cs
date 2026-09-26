@@ -103,6 +103,30 @@ public class NatsTransportOptionsAndSchemaTests
         Assert.Contains(option, ex.Message, StringComparison.Ordinal);
     }
 
+    /// <summary>
+    /// A blank stream name is NOT configured — the schema derives the stream from the subject
+    /// (IsNullOrWhiteSpace) — so the JetStream-name check must skip it the same way. It skipped
+    /// only null/empty, and a whitespace-only stream option that used to resolve to the derived
+    /// name started failing startup as "not a valid JetStream name".
+    /// </summary>
+    [Theory]
+    [InlineData(" ")]
+    [InlineData("\t")]
+    public void ValidateCommon_Accepts_BlankStreamNamesTheSchemaTreatsAsUnset(string blank)
+    {
+        var options = new NatsAsyncResponseTransportOptions
+        {
+            WorkerStream = blank,
+            ResponseStream = blank,
+            DeadLetterStream = blank
+        };
+
+        NatsTransportOptionsValidator.ValidateCommon(options);
+
+        var schema = new NatsTransportSubjectSchema(options);
+        Assert.Equal(NatsTransportSubjectSchema.SanitizeStreamName(schema.WorkerSubject), schema.WorkerStream);
+    }
+
     [Fact]
     public void ValidateCommon_Accepts_DashAndUnderscoreNames()
         => NatsTransportOptionsValidator.ValidateCommon(new NatsAsyncResponseTransportOptions

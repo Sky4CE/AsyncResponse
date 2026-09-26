@@ -55,11 +55,13 @@ internal interface INatsJetStreamTransport
 
     /// <summary>
     /// Creates the durable explicit-ack pull consumer on <paramref name="stream"/> when it does not
-    /// exist. An existing consumer is verified, never rewritten. Returns the ack wait the live
-    /// consumer actually runs with — <paramref name="ackWait"/> for one this call created, the
-    /// consumer's own for an existing one — which is what the in-progress heartbeat must beat.
+    /// exist. An existing consumer is verified, never rewritten — including that it delivers
+    /// <paramref name="subject"/>, the subject this transport publishes to. Returns the ack wait the
+    /// live consumer actually runs with — <paramref name="ackWait"/> for one this call created, the
+    /// consumer's own (its shortest BackOff step when that is shorter) for an existing one — which
+    /// is what the in-progress heartbeat must beat.
     /// </summary>
-    Task<TimeSpan> EnsureConsumerAsync(string stream, string durable, TimeSpan ackWait, int maxDeliveryAttempts, CancellationToken cancellationToken);
+    Task<TimeSpan> EnsureConsumerAsync(string stream, string subject, string durable, TimeSpan ackWait, int maxDeliveryAttempts, CancellationToken cancellationToken);
 
     /// <summary>Publishes <paramref name="payload"/> to <paramref name="subject"/> via JetStream and returns the assigned sequence.</summary>
     Task<string> PublishAsync(string subject, string payload, IReadOnlyDictionary<string, string>? headers, CancellationToken cancellationToken);
@@ -258,7 +260,7 @@ internal sealed class NatsJetStreamTransportAdapter(INatsJSContext _jetStream, I
     /// without (the streams follow the same rule), and its own ack wait is returned so the
     /// heartbeat follows the consumer rather than the options.
     /// </summary>
-    public async Task<TimeSpan> EnsureConsumerAsync(string stream, string durable, TimeSpan ackWait, int maxDeliveryAttempts, CancellationToken cancellationToken)
+    public async Task<TimeSpan> EnsureConsumerAsync(string stream, string subject, string durable, TimeSpan ackWait, int maxDeliveryAttempts, CancellationToken cancellationToken)
     {
         var existing = await TryGetConsumerConfigAsync(stream, durable, cancellationToken).ConfigureAwait(false);
         if (existing is null)
@@ -290,11 +292,26 @@ internal sealed class NatsJetStreamTransportAdapter(INatsJSContext _jetStream, I
             }
         }
 
-        VerifyExistingConsumer(stream, durable, existing, maxDeliveryAttempts);
+        VerifyExistingConsumer(stream, subject, durable, existing, maxDeliveryAttempts);
 
         // The server reports its resolved ack wait (30 s when none was set); a non-positive value
         // would only come from a non-conforming server, and then the options are all there is.
         var liveAckWait = existing.AckWait > TimeSpan.Zero ? existing.AckWait : ackWait;
+
+        // A BackOff consumer enforces BackOff[n] as the ack wait of its n-th redelivery (the last
+        // step for every later one) and reports only BackOff[0] as its AckWait. A non-ascending
+        // BackOff — [30s, 5s] — gave a redelivered message a 5 s window while the heartbeat renewed
+        // every 10 s from the reported 30 s, so it lapsed under a live handler and redelivered to a
+        // peer. The heartbeat must beat the shortest window any delivery can get.
+        if (existing.Backoff is { Count: > 0 } backoff)
+        {
+            foreach (var step in backoff)
+            {
+                if (step > TimeSpan.Zero && step < liveAckWait)
+                    liveAckWait = step;
+            }
+        }
+
         if (liveAckWait != ackWait)
             ReportAckWaitDrift(stream, durable, liveAckWait, ackWait);
 
@@ -322,7 +339,7 @@ internal sealed class NatsJetStreamTransportAdapter(INatsJSContext _jetStream, I
 
         _reportedAckWaitDrift[key] = liveAckWait;
         _logger?.LogWarning(
-            "NATS consumer {Consumer} on stream {Stream} already exists with ack wait {AckWait}; this host is configured for {DesiredAckWait}. " +
+            "NATS consumer {Consumer} on stream {Stream} already exists with ack wait {AckWait} (its shortest BackOff step, when it has a shorter one); this host is configured for {DesiredAckWait}. " +
             "The in-progress heartbeat follows the shorter of the two. An existing consumer is never modified by this transport — apply the change to the consumer yourself, or align AckWait with it.",
             durable,
             stream,
@@ -343,7 +360,7 @@ internal sealed class NatsJetStreamTransportAdapter(INatsJSContext _jetStream, I
         }
     }
 
-    private static void VerifyExistingConsumer(string stream, string durable, ConsumerConfig existing, int maxDeliveryAttempts)
+    private static void VerifyExistingConsumer(string stream, string subject, string durable, ConsumerConfig existing, int maxDeliveryAttempts)
     {
         const string NeverModified = "An existing consumer is never modified by this transport: fix it, or delete it so this host recreates it, or configure a different consumer name.";
 
@@ -369,6 +386,31 @@ internal sealed class NatsJetStreamTransportAdapter(INatsJSContext _jetStream, I
             throw new InvalidOperationException(
                 $"NATS consumer '{durable}' on stream '{stream}' already exists with max deliver {existing.MaxDeliver}, which stops redelivery before MaxDeliveryAttempts " +
                 $"({(maxDeliveryAttempts <= 0 ? "unlimited" : maxDeliveryAttempts)}) can dead-letter the message; it needs unlimited (-1) or more than MaxDeliveryAttempts. {NeverModified}");
+        }
+
+        // A headers-only consumer delivers every message without its body. The ingress reads an
+        // empty body as unparsable and acknowledges it without dispatch, so every job was removed
+        // from the work-queue stream with no NAK and no dead-letter copy.
+        if (existing.HeadersOnly)
+        {
+            throw new InvalidOperationException(
+                $"NATS consumer '{durable}' on stream '{stream}' already exists as headers-only; this transport needs every message's body. {NeverModified}");
+        }
+
+        // A consumer filtered to other subjects never delivers what this transport publishes: its
+        // long polls expire empty as if the stream were idle, with no error and no warning, while
+        // the jobs pile up on the stream.
+        var filters = new List<string>();
+        if (!string.IsNullOrEmpty(existing.FilterSubject))
+            filters.Add(existing.FilterSubject);
+        if (existing.FilterSubjects is not null)
+            filters.AddRange(existing.FilterSubjects.Where(filter => !string.IsNullOrEmpty(filter)));
+
+        if (filters.Count > 0 && !filters.Any(filter => SubjectCaptures(filter, subject)))
+        {
+            throw new InvalidOperationException(
+                $"NATS consumer '{durable}' on stream '{stream}' already exists filtered to {string.Join(", ", filters)}, which does not deliver subject '{subject}' " +
+                $"this transport publishes to. {NeverModified}");
         }
     }
 

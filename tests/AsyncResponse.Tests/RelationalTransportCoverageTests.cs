@@ -203,4 +203,76 @@ public sealed class RelationalTransportCoverageTests
         var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => subscriber.StartAsync(CancellationToken.None));
         Assert.Contains("BackgroundWorkerCount", ex.Message, StringComparison.Ordinal);
     }
+
+    /// <summary>
+    /// Regression (fixpoint round 2, S9#1): the PostgreSQL and SQL Server worker subscribers kept
+    /// claiming after host stop began (ApplicationStopping fires before any hosted service stops,
+    /// and the worker subscriber stops last), taking the wake-ups their own flow hand-overs had just
+    /// published and handing them back. From ApplicationStopping on the claim loop claims nothing
+    /// and parks until its own stop. Observed without a database: the store's schema latch is set
+    /// and the server is unreachable, so a claim can only FAIL — the old loop's first claim failed
+    /// against the dead port and the supervisor logged the retry; the gated loop never dials.
+    /// </summary>
+    [Theory]
+    [InlineData("postgresql")]
+    [InlineData("sqlserver")]
+    public async Task WorkerSubscriber_ClaimsNothingOnceTheHostIsStopping(string transport)
+    {
+        using var host = new DurableFlowContextTestSupport.StoppingHost();
+        host.StopApplication();
+        var logger = new CollectingLogger();
+        await using var dataSource = NpgsqlDataSource.Create(
+            "Host=127.0.0.1;Port=1;Username=unused;Password=unused;Database=none;Timeout=1;Pooling=false");
+
+        Microsoft.Extensions.Hosting.BackgroundService subscriber;
+        if (transport == "postgresql")
+        {
+            var options = Options.Create(new PostgreSqlAsyncResponseTransportOptions
+            {
+                SubscriberRetryBaseDelay = TimeSpan.FromMilliseconds(25),
+                SubscriberRetryMaxDelay = TimeSpan.FromMilliseconds(25),
+                ShutdownTimeout = TimeSpan.FromSeconds(5)
+            });
+            var store = new PostgreSqlTransportStore(dataSource, options);
+            Prelatch(store);
+            subscriber = new PostgreSqlWorkerSubscriber(options, store, Mock.Of<IAsyncResponseIngress>(), logger.For<PostgreSqlWorkerSubscriber>(), host);
+        }
+        else
+        {
+            var options = Options.Create(new SqlServerAsyncResponseTransportOptions
+            {
+                ConnectionString = "Server=tcp:127.0.0.1,1;Database=none;User ID=sa;Password=unused;Encrypt=False;Connect Timeout=1",
+                SubscriberRetryBaseDelay = TimeSpan.FromMilliseconds(25),
+                SubscriberRetryMaxDelay = TimeSpan.FromMilliseconds(25)
+            });
+            var store = new SqlServerTransportStore(options);
+            Prelatch(store);
+            subscriber = new SqlServerWorkerSubscriber(options, store, Mock.Of<IAsyncResponseIngress>(), logger.For<SqlServerWorkerSubscriber>(), host);
+        }
+
+        await subscriber.StartAsync(CancellationToken.None);
+        try
+        {
+            // Either the park (gated) or a failed claim (ungated) — whichever comes first decides.
+            var deadline = DateTime.UtcNow.AddSeconds(30);
+            while (!logger.Messages.Any(message => message.Contains("stopped claiming", StringComparison.Ordinal)
+                       || message.Contains("subscriber failed for queue", StringComparison.Ordinal))
+                   && DateTime.UtcNow < deadline)
+            {
+                await Task.Delay(15);
+            }
+
+            Assert.DoesNotContain(logger.Messages, message => message.Contains("subscriber failed for queue", StringComparison.Ordinal));
+            Assert.Contains(logger.Messages, message => message.Contains("stopped claiming", StringComparison.Ordinal));
+        }
+        finally
+        {
+            await subscriber.StopAsync(CancellationToken.None);
+        }
+    }
+
+    /// <summary>Latches the store's <c>_created</c> so EnsureCreated never dials the (bogus) server.</summary>
+    private static void Prelatch(object store)
+        => store.GetType().GetField("_created", BindingFlags.Instance | BindingFlags.NonPublic)!
+            .SetValue(store, true);
 }

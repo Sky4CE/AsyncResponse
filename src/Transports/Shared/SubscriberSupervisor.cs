@@ -14,7 +14,8 @@ namespace AsyncResponse.Transports;
 /// caused by host shutdown, e.g. a transport-internal timeout — increments the failure count, asks
 /// the caller-supplied delay policy how long to wait, reports the retry through the caller-supplied
 /// callback, and waits before trying again. The count is of CONSECUTIVE failures: a run that stayed
-/// up at least as long as the configured maximum retry delay before failing starts the count over.
+/// up at least as long as the longest retry delay the policy can produce before failing starts the
+/// count over.
 /// </summary>
 internal static class SubscriberSupervisor
 {
@@ -22,9 +23,11 @@ internal static class SubscriberSupervisor
     /// Runs <paramref name="run"/> until it completes or <paramref name="stoppingToken"/> requests
     /// shutdown. <paramref name="delayPolicy"/> receives the 1-based consecutive-failure count and
     /// returns how long to wait before the next attempt; <paramref name="logRetry"/> renders the
-    /// per-transport log line for that wait. <paramref name="healthyRunThreshold"/> — the policy's
-    /// configured maximum delay — is the healthy-run threshold past which a failed run no longer
-    /// counts as consecutive with the one before it. It is passed, not asked of the policy: every
+    /// per-transport log line for that wait. <paramref name="healthyRunThreshold"/> — the longest
+    /// delay the policy can actually produce (<c>AsyncResponseRetry.MaxAttainableDelay</c>: the
+    /// configured maximum, or the base times the backoff's 1024× multiplier cap when that is lower)
+    /// — is the healthy-run threshold past which a failed run no longer counts as consecutive with
+    /// the one before it. It is passed, not asked of the policy: every
     /// transport's policy is the half-jittered <c>AsyncResponseRetry.Backoff</c>, whose answer for
     /// any failure count is only a sample in [max/2, max], so a threshold drawn from it once reset
     /// the streak for runs that died well short of the maximum.
@@ -72,7 +75,12 @@ internal static class SubscriberSupervisor
 
                 failures++;
                 var retryDelay = delayPolicy(failures);
-                logRetry(ex, retryDelay);
+
+                // SafeLog: a logging provider that throws (MEL rethrows a provider's failure) turned
+                // this retry's log line into an exception out of the loop — the BackgroundService
+                // faulted, stopping the host under the default behavior and leaving the subscriber
+                // dead under Ignore, for a failure the loop exists to ride out.
+                SafeLog.Try((LogRetry: logRetry, Error: ex, Delay: retryDelay), static state => state.LogRetry(state.Error, state.Delay));
                 await Task.Delay(retryDelay, clock, stoppingToken).ConfigureAwait(false);
             }
         }

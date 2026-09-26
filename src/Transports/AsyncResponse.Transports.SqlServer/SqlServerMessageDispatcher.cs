@@ -21,7 +21,8 @@ internal sealed class SqlServerMessageDispatcher(
     SqlServerSubscriberOptions subscriberOptions,
     ILogger logger,
     SqlServerSubscriberRole role,
-    TimeProvider? timeProvider = null)
+    TimeProvider? timeProvider = null,
+    CancellationToken hostStopping = default)
     : DbMessageDispatcherBase(
         handler,
         options,
@@ -31,4 +32,5 @@ internal sealed class SqlServerMessageDispatcher(
         providerName: "SQL Server",
         unitNoun: "row",
         telemetryName: "sqlserver",
-        timeProvider: timeProvider);
+        timeProvider: timeProvider,
+        hostStopping: hostStopping);

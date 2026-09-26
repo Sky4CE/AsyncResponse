@@ -63,6 +63,17 @@ public static class AsyncResponseTypeResolution
     /// <summary>
     /// Registers an assembly (typically one loaded into a non-default <c>AssemblyLoadContext</c>) to
     /// be searched for persisted type names.
+    /// <para>
+    /// Unlike the default scan, this is not confined to assemblies already loaded: a name is
+    /// resolved with the runtime's own parser (<see cref="Assembly.GetType(string, bool)"/>), so
+    /// an assembly named in a generic argument that is not loaded yet is loaded through
+    /// <paramref name="assembly"/>'s <c>AssemblyLoadContext</c> — from its dependencies or the
+    /// application's trusted platform assemblies — on the way to a verdict, whoever wrote the
+    /// name. Only files the application or plugin deploys can load that way, and the resolved type
+    /// still meets the caller's own gate (payload marker, DI registration, callback authorizer);
+    /// when even that load is unwanted, register a <see cref="RegisterResolver"/> delegate that
+    /// answers only the names you expect.
+    /// </para>
     /// </summary>
     /// <returns>
     /// A handle that removes the registration when disposed. <b>Required</b> for a collectible
@@ -238,6 +249,16 @@ public static class AsyncResponseTypeResolution
     /// redelivery) answers with its type. Such a type still has to pass the caller's own gate —
     /// the payload marker interface, a DI registration, the flow contract — before anything uses it.
     /// </para>
+    /// <para>
+    /// <c>null</c> for every name that does not resolve — also one the runtime refuses to BUILD:
+    /// <c>throwOnError: false</c> covers lookups, not the instantiation of a resolved generic
+    /// definition, so a constraint or arity mismatch
+    /// (<c>Nullable`1[[System.String, …]]</c>), a non-generic definition given arguments, or a
+    /// malformed assembly name inside the brackets (<c>Version=x</c>) threw out of here instead. The
+    /// callers then skipped recording the miss, and the lost-subscriber dispatcher read the
+    /// escaped exception as a transient callback fault — the full retry ladder and a transport
+    /// redelivery for a name that can never resolve.
+    /// </para>
     /// </summary>
     [RequiresUnreferencedCode("Resolves a persisted type name by string; a trimmed app may have removed the type.")]
     internal static Type? ResolveLoaded(string fullName)
@@ -248,31 +269,44 @@ public static class AsyncResponseTypeResolution
             return null;
 
         var loaded = AppDomain.CurrentDomain.GetAssemblies();
-        return Type.GetType(
-            fullName,
-            assemblyResolver: name => Array.Find(loaded, assembly => AssemblyName.ReferenceMatchesDefinition(name, assembly.GetName())),
-            typeResolver: (assembly, typeName, ignoreCase) =>
-            {
-                if (assembly is not null)
+        try
+        {
+            return Type.GetType(
+                fullName,
+                assemblyResolver: name => Array.Find(loaded, assembly => AssemblyName.ReferenceMatchesDefinition(name, assembly.GetName())),
+                typeResolver: (assembly, typeName, ignoreCase) =>
                 {
-                    return assembly.GetType(typeName, throwOnError: false, ignoreCase) is { } named && IsDefinedIn(loaded, named)
-                        ? named
-                        : null;
-                }
+                    if (assembly is not null)
+                    {
+                        return assembly.GetType(typeName, throwOnError: false, ignoreCase) is { } named && IsDefinedIn(loaded, named)
+                            ? named
+                            : null;
+                    }
 
-                foreach (var candidate in loaded)
-                {
-                    // Only a candidate's OWN type: a forwarded hit is skipped, not final. The
-                    // defining assembly, when it is loaded, is itself a candidate and answers for
-                    // itself — so requiring the definer loses nothing, and a facade can never
-                    // answer ahead of it in load order.
-                    if (candidate.GetType(typeName, throwOnError: false, ignoreCase) is { } type && type.Assembly == candidate)
-                        return type;
-                }
+                    foreach (var candidate in loaded)
+                    {
+                        // Only a candidate's OWN type: a forwarded hit is skipped, not final. The
+                        // defining assembly, when it is loaded, is itself a candidate and answers for
+                        // itself — so requiring the definer loses nothing, and a facade can never
+                        // answer ahead of it in load order.
+                        if (candidate.GetType(typeName, throwOnError: false, ignoreCase) is { } type && type.Assembly == candidate)
+                            return type;
+                    }
 
-                return null;
-            },
-            throwOnError: false);
+                    return null;
+                },
+                throwOnError: false);
+        }
+        catch (Exception ex) when (ex is ArgumentException
+                                       or InvalidOperationException
+                                       or FileLoadException
+                                       or BadImageFormatException
+                                       or TypeLoadException)
+        {
+            // Unresolvable, like any other name this cannot build (see the summary); the caller
+            // records the miss and reports it through its own unresolved-type path.
+            return null;
+        }
     }
 
     /// <summary>Whether <paramref name="type"/> comes from one of the snapshotted assemblies rather than from one a type forwarder just loaded.</summary>

@@ -7,6 +7,7 @@ using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using Npgsql;
 using NpgsqlTypes;
+using PostgreSqlDdlGuard = AsyncResponse.Internal.PostgreSqlDdlGuard;
 
 namespace Microsoft.Extensions.DependencyInjection
 {
@@ -119,6 +120,8 @@ public sealed class PostgreSqlFlowStateStore : IFlowStateStore, IDisposable, IAs
     private readonly SemaphoreSlim _ensureGate = new(1, 1);
     private readonly bool _ownsDataSource;
     private readonly long _schemaLockKey;
+    private readonly long _tableLockKey;
+    private readonly PostgreSqlDdlGuard _ddl;
     private long _lastPruneTicks;
     private volatile bool _created;
 
@@ -130,6 +133,15 @@ public sealed class PostgreSqlFlowStateStore : IFlowStateStore, IDisposable, IAs
         _options.Validate();
         _ownsDataSource = ownsDataSource;
         _schemaLockKey = DurableFlowStoreShared.SchemaLockKey(_options.SchemaName);
+        _tableLockKey = PostgreSqlDdlGuard.TableLockKey(_options.SchemaName, _options.TableName);
+        _ddl = new PostgreSqlDdlGuard("durable-flow", $"'{_options.SchemaName}.{_options.TableName}'", "docs/durable-flow-state-stores.md", logger);
+    }
+
+    /// <summary>The clock of the startup-DDL retry-after window (test seam; see <see cref="PostgreSqlDdlGuard.RetryAfter"/>).</summary>
+    internal TimeProvider Clock
+    {
+        get => _ddl.Clock;
+        set => _ddl.Clock = value;
     }
 
     public async Task<FlowState?> LoadAsync(string flowId, CancellationToken cancellationToken = default)
@@ -300,119 +312,234 @@ public sealed class PostgreSqlFlowStateStore : IFlowStateStore, IDisposable, IAs
         if (_created)
             return;
 
+        _ddl.ThrowIfBackingOff();
         await _ensureGate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
             if (_created)
                 return;
 
+            // Again under the gate: a caller that queued behind the attempt that just failed —
+            // and latched the retry-after window — fails here instead of starting the next one.
+            _ddl.ThrowIfBackingOff();
+
             await using var connection = await _dataSource.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
-            await using var transaction = await connection.BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
 
-            if (_options.AutoCreateSchema)
+            if (!_options.AutoCreateSchema)
             {
-                // Serialize schema creation across processes. CREATE ... IF NOT EXISTS is not atomic
-                // against a concurrent create of the same object: two instances starting together both
-                // pass the existence check and collide on the system catalog ("duplicate key ...
-                // pg_type_typname_nsp_index"). The transaction-scoped advisory lock (keyed by schema,
-                // shared with the channel/transport packages) lets one instance build the schema while
-                // the rest wait and then find it already present.
-                await using (var lockCommand = connection.CreateCommand())
+                await using var transaction = await connection.BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
+                if (!await TableExistsAsync(connection, transaction, cancellationToken).ConfigureAwait(false))
                 {
-                    lockCommand.Transaction = transaction;
-                    lockCommand.CommandText = "SELECT pg_advisory_xact_lock(@lock_key);";
-                    lockCommand.Parameters.AddWithValue("lock_key", _schemaLockKey);
-                    await lockCommand.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+                    // Operator-managed schema and the migration has not run yet: the first query
+                    // surfaces a clear PostgreSQL error (the documented "create it yourself, later"
+                    // workflow), and _created stays unlatched so a later operation re-verifies once
+                    // the migration lands. When the relation DOES exist it flows into the same catalog
+                    // verification the DDL path uses — operator-provisioned schemas are exactly what
+                    // that check exists for.
+                    return;
                 }
 
-                await using var command = connection.CreateCommand();
-                command.Transaction = transaction;
-                command.CommandText =
-                    $"""
-                    CREATE SCHEMA IF NOT EXISTS {Schema};
-                    CREATE TABLE IF NOT EXISTS {Table} (
-                        flow_id text NOT NULL PRIMARY KEY,
-                        state_json text NOT NULL,
-                        expires_at_utc timestamptz NOT NULL,
-                        updated_at_utc timestamptz NOT NULL,
-                        revision bigint NOT NULL DEFAULT 0,
-                        lease_id text NULL,
-                        lease_expires_at_utc timestamptz NULL
-                    );
-                    CREATE INDEX IF NOT EXISTS {IndexName} ON {Table} (expires_at_utc);
-
-                    -- jsonb REJECTS the \u0000 escape System.Text.Json emits for U+0000 (SQLSTATE
-                    -- 22P05), so a ledger every other store accepts failed every write here: the
-                    -- flow could not start, or its checkpoint failed on every attempt until the
-                    -- job dead-lettered. Nothing queries INSIDE the ledger (it is read back with
-                    -- ::text), so text costs nothing. Guarded so the rewrite happens once.
-                    DO $$
-                    BEGIN
-                        IF EXISTS (
-                            SELECT 1 FROM information_schema.columns
-                            WHERE table_schema = {SqlLiteral(_options.SchemaName)} AND table_name = {SqlLiteral(_options.TableName)}
-                              AND column_name = 'state_json' AND data_type = 'jsonb')
-                        THEN
-                            ALTER TABLE {Table} ALTER COLUMN state_json TYPE text USING state_json::text;
-                        END IF;
-                    END $$;
-                    """;
-                try
-                {
-                    await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
-                }
-                catch (PostgresException ex) when (ex.SqlState is PostgresErrorCodes.WrongObjectType or PostgresErrorCodes.UndefinedColumn)
-                {
-                    // E.g. CREATE INDEX ... ON a name that is really another component's index:
-                    // IF NOT EXISTS skipped the table create, and the dependent statement then hits
-                    // the wrong relation kind mid-batch — surface the namespace collision instead of
-                    // the raw "cannot open relation".
-                    throw new InvalidOperationException(AsyncResponse.Internal.PostgreSqlRelationVerifier.DdlCollisionMessage("durable-flow", _options.SchemaName), ex);
-                }
-            }
-            else if (!await TableExistsAsync(connection, transaction, cancellationToken).ConfigureAwait(false))
-            {
-                // Operator-managed schema and the migration has not run yet: the first query
-                // surfaces a clear PostgreSQL error (the documented "create it yourself, later"
-                // workflow), and _created stays unlatched so a later operation re-verifies once
-                // the migration lands. When the relation DOES exist it flows into the same catalog
-                // verification the DDL path uses — operator-provisioned schemas are exactly what
-                // that check exists for.
+                await VerifyRelationsAsync(connection, transaction, PostgreSqlDdlGuard.IndexState.Usable, cancellationToken).ConfigureAwait(false);
+                await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+                _created = true;
                 return;
             }
 
-            // The flow store can share a schema with the channel and transport stores (and
-            // unrelated objects), whose derived names its own validation cannot see — and
-            // IF NOT EXISTS also accepts a same-name index with the WRONG definition, exactly as
-            // an operator-provisioned table can carry the wrong shape. Verify against the catalog
-            // that both relations actually ARE what this store reads and writes, definitions
-            // included (under the shared DDL lock when this build just ran the DDL).
-            var absent = await AsyncResponse.Internal.PostgreSqlRelationVerifier.VerifyAsync(
-                connection,
-                transaction,
-                _options.SchemaName,
-                "durable-flow",
-                ExpectedRelations(_options),
-                cancellationToken).ConfigureAwait(false);
-            // The verifier matches the index by NAME, so all this knows is that {table}_expires_idx
-            // is absent — an operator's migration may carry the same index under another name.
-            foreach (var index in absent)
+            // The transport's round-43 hardening (PostgreSqlDdlGuard), applied here. Every DDL
+            // transaction bounds its lock waits — the advisory key's first — with a lock_timeout:
+            // CREATE INDEX IF NOT EXISTS takes its SHARE lock BEFORE it finds the name taken, so on
+            // every process start it queued behind any conflicting holder (an operator's CREATE
+            // INDEX CONCURRENTLY, an anti-wraparound vacuum of this update-heavy table, an
+            // idle-in-transaction checkpoint writer), with every checkpoint, lease acquire and
+            // renewal of every host queued behind it until the 30 s command timeout — and the next
+            // operation did it again. Only a missing index is built now, and the one-time rewrite
+            // runs under the long-running command timeout, in its own transaction.
+            try
             {
-                _logger?.LogWarning(
-                    "PostgreSQL durable-flow table {Schema}.{Table} has no index named {Index} and AutoCreateSchema is disabled. " +
-                    "If an index on (expires_at_utc) exists under another name, prunes use it and nothing needs doing; otherwise " +
-                    "each prune batch scans for expired rows — performance only; create one as described in docs/durable-flow-state-stores.md.",
-                    _options.SchemaName,
-                    _options.TableName,
-                    index);
-            }
+                // 1. The schema-shared DDL, under the schema's advisory key (shared with the
+                //    channel and transport stores): creates only, none of which locks a table that
+                //    already exists. Serializes creation across processes — CREATE ... IF NOT EXISTS
+                //    is not atomic against a concurrent create of the same object: two instances
+                //    starting together both pass the existence check and collide on the system
+                //    catalog ("duplicate key ... pg_type_typname_nsp_index").
+                await using (var transaction = await PostgreSqlDdlGuard.BeginLockedTransactionAsync(connection, _schemaLockKey, cancellationToken).ConfigureAwait(false))
+                {
+                    await using (var command = connection.CreateCommand())
+                    {
+                        command.Transaction = transaction;
+                        command.CommandText =
+                            $"""
+                            CREATE SCHEMA IF NOT EXISTS {Schema};
+                            CREATE TABLE IF NOT EXISTS {Table} (
+                                flow_id text NOT NULL PRIMARY KEY,
+                                state_json text NOT NULL,
+                                expires_at_utc timestamptz NOT NULL,
+                                updated_at_utc timestamptz NOT NULL,
+                                revision bigint NOT NULL DEFAULT 0,
+                                lease_id text NULL,
+                                lease_expires_at_utc timestamptz NULL
+                            );
+                            """;
+                        await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+                    }
 
-            await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
-            _created = true;
+                    var (stateJsonb, index) = await ReadTableWorkAsync(connection, transaction, cancellationToken).ConfigureAwait(false);
+                    if (!stateJsonb && index is not PostgreSqlDdlGuard.IndexState.Absent)
+                    {
+                        await VerifyRelationsAsync(connection, transaction, index, cancellationToken).ConfigureAwait(false);
+                        await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+                        _created = true;
+                        return;
+                    }
+
+                    await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+                }
+
+                // 2. The table work — the one-time jsonb rewrite, the index build on an existing
+                //    table — in a transaction of its own under a key scoped to this table: a rewrite
+                //    held for up to an hour under the schema-wide key would stop every host starting
+                //    meanwhile from initializing ANY AsyncResponse store on the schema. Re-read under
+                //    the key: another host may have done the work while this one waited for it.
+                await using (var transaction = await PostgreSqlDdlGuard.BeginLockedTransactionAsync(connection, _tableLockKey, cancellationToken).ConfigureAwait(false))
+                {
+                    var (stateJsonb, index) = await ReadTableWorkAsync(connection, transaction, cancellationToken).ConfigureAwait(false);
+
+                    // jsonb REJECTS the \u0000 escape System.Text.Json emits for U+0000 (SQLSTATE
+                    // 22P05), so a ledger every other store accepts failed every write here: the
+                    // flow could not start, or its checkpoint failed on every attempt until the
+                    // job dead-lettered. Nothing queries INSIDE the ledger (it is read back with
+                    // ::text), so text costs nothing. The rewrite runs once, under ACCESS EXCLUSIVE.
+                    if (stateJsonb)
+                    {
+                        await _ddl.ExecuteLongRunningAsync(
+                            $"ALTER TABLE {Table} ALTER COLUMN state_json TYPE text USING state_json::text;", connection, transaction, cancellationToken).ConfigureAwait(false);
+                    }
+
+                    if (index is PostgreSqlDdlGuard.IndexState.Absent)
+                    {
+                        await _ddl.ExecuteLongRunningAsync(
+                            $"CREATE INDEX IF NOT EXISTS {IndexName} ON {Table} (expires_at_utc);", connection, transaction, cancellationToken).ConfigureAwait(false);
+                        index = PostgreSqlDdlGuard.IndexState.Usable;
+                    }
+
+                    await VerifyRelationsAsync(connection, transaction, index, cancellationToken).ConfigureAwait(false);
+                    await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+                    _created = true;
+                }
+            }
+            catch (PostgresException ex) when (ex.SqlState is PostgresErrorCodes.WrongObjectType or PostgresErrorCodes.UndefinedColumn)
+            {
+                // E.g. CREATE INDEX ... ON a name that is really another component's index:
+                // IF NOT EXISTS skipped the table create, and the dependent statement then hits
+                // the wrong relation kind — surface the namespace collision instead of the raw
+                // "cannot open relation".
+                throw new InvalidOperationException(AsyncResponse.Internal.PostgreSqlRelationVerifier.DdlCollisionMessage("durable-flow", _options.SchemaName), ex);
+            }
+            catch (PostgresException ex) when (ex.SqlState is PostgresErrorCodes.LockNotAvailable)
+            {
+                // A lock wait lost anywhere in the DDL — the advisory key's included — latches the
+                // retry-after window (a failed long-running step latched it already).
+                _ddl.BackOff(ex);
+                throw;
+            }
         }
         finally
         {
             _ensureGate.Release();
+        }
+    }
+
+    /// <summary>
+    /// The table work the auto-create DDL still owes: whether <c>state_json</c> still carries the
+    /// pre-text <c>jsonb</c> type, and the expiry index's state (only an absent one is built).
+    /// </summary>
+    private async Task<(bool StateJsonb, PostgreSqlDdlGuard.IndexState Index)> ReadTableWorkAsync(
+        NpgsqlConnection connection,
+        NpgsqlTransaction transaction,
+        CancellationToken cancellationToken)
+    {
+        bool stateJsonb;
+        await using (var command = connection.CreateCommand())
+        {
+            command.Transaction = transaction;
+            command.CommandText =
+                """
+                SELECT EXISTS (
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_schema = @schema AND table_name = @table AND column_name = 'state_json' AND data_type = 'jsonb');
+                """;
+            command.Parameters.AddWithValue("schema", _options.SchemaName);
+            command.Parameters.AddWithValue("table", _options.TableName);
+            stateJsonb = (bool)(await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false))!;
+        }
+
+        var index = await PostgreSqlDdlGuard.GetIndexStateAsync(
+            connection,
+            transaction,
+            _options.SchemaName,
+            DurableFlowStoreShared.DerivedName(_options.TableName, "_expires_idx", 63),
+            cancellationToken).ConfigureAwait(false);
+        return (stateJsonb, index);
+    }
+
+    /// <summary>
+    /// The flow store can share a schema with the channel and transport stores (and unrelated
+    /// objects), whose derived names its own validation cannot see — and IF NOT EXISTS also accepts
+    /// a same-name index with the WRONG definition, exactly as an operator-provisioned table can
+    /// carry the wrong shape. Verify against the catalog that both relations actually ARE what this
+    /// store reads and writes, definitions included (in the DDL transaction, under its advisory key,
+    /// when this build just ran the DDL).
+    /// </summary>
+    /// <remarks>
+    /// An expiry index that exists but is not valid and ready — an operator's
+    /// <c>CREATE INDEX CONCURRENTLY</c> still running, or one that failed — is prune performance
+    /// lost, exactly like an absent one, on either kind of schema (the DDL builds only an absent
+    /// index, so it leaves such a one alone): it is reported and warned about, never verified as
+    /// required. Verified as present, it failed every flow operation on every host that started
+    /// during the build, and forever after a failed one.
+    /// </remarks>
+    private async Task VerifyRelationsAsync(
+        NpgsqlConnection connection,
+        NpgsqlTransaction transaction,
+        PostgreSqlDdlGuard.IndexState index,
+        CancellationToken cancellationToken)
+    {
+        var expected = ExpectedRelations(_options);
+        if (index is PostgreSqlDdlGuard.IndexState.NotReady)
+            expected[^1] = expected[^1] with { Optional = true };
+
+        var (absent, notReady) = await AsyncResponse.Internal.PostgreSqlRelationVerifier.VerifyAsync(
+            connection,
+            transaction,
+            _options.SchemaName,
+            "durable-flow",
+            expected,
+            cancellationToken).ConfigureAwait(false);
+        if (_logger is not { } logger)
+            return;
+
+        // The verifier matches the index by NAME, so all this knows is that {table}_expires_idx
+        // is absent — an operator's migration may carry the same index under another name.
+        foreach (var name in absent)
+        {
+            SafeLog.Try(() => logger.LogWarning(
+                "PostgreSQL durable-flow table {Schema}.{Table} has no index named {Index} and AutoCreateSchema is disabled. " +
+                "If an index on (expires_at_utc) exists under another name, prunes use it and nothing needs doing; otherwise " +
+                "each prune batch scans for expired rows — performance only; create one as described in docs/durable-flow-state-stores.md.",
+                _options.SchemaName,
+                _options.TableName,
+                name));
+        }
+
+        foreach (var name in notReady)
+        {
+            SafeLog.Try(() => logger.LogWarning(
+                "PostgreSQL durable-flow index {Schema}.{Index} exists but is not valid and ready (a CREATE INDEX CONCURRENTLY " +
+                "still running, or one that failed). Flows still run, but each prune batch scans for expired rows until it is " +
+                "usable — performance only; if its build failed, drop it and create it again as described in " +
+                "docs/durable-flow-state-stores.md.",
+                _options.SchemaName,
+                name));
         }
     }
 
@@ -517,11 +644,5 @@ public sealed class PostgreSqlFlowStateStore : IFlowStateStore, IDisposable, IAs
     private string Table => $"{Schema}.{Quote(_options.TableName)}";
     private string IndexName => Quote(DurableFlowStoreShared.DerivedName(_options.TableName, "_expires_idx", 63));
     private static string Quote(string identifier) => "\"" + identifier.Replace("\"", "\"\"", StringComparison.Ordinal) + "\"";
-
-    /// <summary>
-    /// A single-quoted SQL string literal, for the catalog lookups inside the DDL's DO block where
-    /// a parameter cannot be bound.
-    /// </summary>
-    private static string SqlLiteral(string value) => "'" + value.Replace("'", "''", StringComparison.Ordinal) + "'";
 }
 }

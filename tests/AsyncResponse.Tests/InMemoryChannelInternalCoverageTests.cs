@@ -85,7 +85,7 @@ public sealed class InMemoryChannelInternalCoverageTests
             .GetMethod("DispatchSerialAsync", BindingFlags.Instance | BindingFlags.NonPublic)!
             .MakeGenericMethod(typeof(int));
         var exception = Assert.Throws<TargetInvocationException>(() =>
-            dispatchSerial.Invoke(first, [0, throwing]));
+            dispatchSerial.Invoke(first, [0, throwing, CancellationToken.None]));
         Assert.IsType<InvalidOperationException>(exception.InnerException);
 
         await CleanupAsync(first);
@@ -100,9 +100,9 @@ public sealed class InMemoryChannelInternalCoverageTests
         var cleaned = CreateSubscription(channel, "cleaned");
         await CleanupAsync(cleaned);
         Invoke(cleaned, "ArmTimeout");
-        await InvokeTaskAsync(cleaned, "DispatchExceptionAsync", new InvalidOperationException("late"));
-        await InvokeTaskAsync(cleaned, "DispatchResponseAsync", new OperationResult(), WireBytesStub);
-        await InvokeTaskAsync(cleaned, "DispatchRawJsonResponseAsync", new RawJsonResponse("{}"));
+        await InvokeTaskAsync(cleaned, "DispatchExceptionAsync", new InvalidOperationException("late"), CancellationToken.None);
+        await InvokeTaskAsync(cleaned, "DispatchResponseAsync", new OperationResult(), WireBytesStub, CancellationToken.None);
+        await InvokeTaskAsync(cleaned, "DispatchRawJsonResponseAsync", new RawJsonResponse("{}"), CancellationToken.None);
         await InvokeTaskAsync(cleaned, "TimeoutCoreAsync");
 
         var terminal = CreateSubscription(
@@ -110,9 +110,9 @@ public sealed class InMemoryChannelInternalCoverageTests
             "terminal",
             _ => throw new InvalidOperationException("predicate failed"));
         SetField(terminal, "_terminal", 1);
-        await InvokeTaskAsync(terminal, "DispatchExceptionAsync", new InvalidOperationException("duplicate"));
+        await InvokeTaskAsync(terminal, "DispatchExceptionAsync", new InvalidOperationException("duplicate"), CancellationToken.None);
         await InvokeTaskAsync(terminal, "TimeoutCoreAsync");
-        await InvokeTaskAsync(terminal, "DispatchResponseAsync", new OperationResult(), WireBytesStub);
+        await InvokeTaskAsync(terminal, "DispatchResponseAsync", new OperationResult(), WireBytesStub, CancellationToken.None);
         await InvokeTaskAsync(terminal, "FaultAsync", new InvalidOperationException("duplicate fault"));
         Assert.False(ResponseTask(terminal).IsCompleted);
         await CleanupAsync(terminal);
@@ -136,7 +136,7 @@ public sealed class InMemoryChannelInternalCoverageTests
                 await release.Task.ConfigureAwait(false);
                 throw new InvalidOperationException("async predicate failed");
             });
-        var dispatch = InvokeTaskAsync(asyncFailure, "DispatchResponseAsync", new OperationResult(), WireBytesStub);
+        var dispatch = InvokeTaskAsync(asyncFailure, "DispatchResponseAsync", new OperationResult(), WireBytesStub, CancellationToken.None);
         await entered.Task.WaitAsync(TimeSpan.FromSeconds(2));
         SetField(asyncFailure, "_terminal", 1);
         release.TrySetResult();
@@ -288,21 +288,129 @@ public sealed class InMemoryChannelInternalCoverageTests
              });
         await using var waiter = await channel.CreateResponseWaiter<OperationResult>("settled-then-slow-cleanup");
 
-        var publish = channel.SetResponse(new OperationResult { Status = OperationStatus.Completed, Message = "delivered" }, "settled-then-slow-cleanup");
-        await deleteEntered.Task.WaitAsync(TimeSpan.FromSeconds(5));
-        Assert.Equal("delivered", (await waiter.ResponseTask.WaitAsync(TimeSpan.FromSeconds(5))).Message);
+        // The delete gate is released on EVERY exit: a failed assertion below otherwise left the
+        // delivery's cleanup parked in the delete forever, and the waiter's disposal at scope end
+        // awaits that same cleanup task — the test hung CI until the job timeout instead of failing.
+        try
+        {
+            var publish = channel.SetResponse(new OperationResult { Status = OperationStatus.Completed, Message = "delivered" }, "settled-then-slow-cleanup");
+            await deleteEntered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            Assert.Equal("delivered", (await waiter.ResponseTask.WaitAsync(TimeSpan.FromSeconds(5))).Message);
 
-        // Fire the (still armed) timeout; its drain queues behind the held gate and lapses.
-        time.Advance(TimeSpan.FromSeconds(10));
-        Assert.Equal(time.GetUtcNow() + TimeSpan.FromSeconds(1), time.NextTimerDueAt);
-        time.Advance(TimeSpan.FromSeconds(1) + TimeSpan.FromMilliseconds(1));
-        Assert.Null(time.NextTimerDueAt);
+            // Fire the (still armed) timeout; its drain queues behind the held gate and lapses.
+            time.Advance(TimeSpan.FromSeconds(10));
+            Assert.Equal(time.GetUtcNow() + TimeSpan.FromSeconds(1), time.NextTimerDueAt);
+            time.Advance(TimeSpan.FromSeconds(1) + TimeSpan.FromMilliseconds(1));
+            Assert.Null(time.NextTimerDueAt);
 
-        releaseDelete.TrySetResult();
-        await publish.WaitAsync(TimeSpan.FromSeconds(5));
+            releaseDelete.TrySetResult();
+            await publish.WaitAsync(TimeSpan.FromSeconds(5));
 
-        Assert.True(waiter.ResponseTask.IsCompletedSuccessfully);
-        Assert.False(logger.HasEntry(LogLevel.Warning, "could not run within"));
+            Assert.True(waiter.ResponseTask.IsCompletedSuccessfully);
+            Assert.False(logger.HasEntry(LogLevel.Warning, "could not run within"));
+        }
+        finally
+        {
+            releaseDelete.TrySetResult();
+        }
+    }
+
+    [Fact]
+    public async Task CreateResponseWaiter_SaveFailsWhileADeliveryIsStillInsideUntil_ReturnsTheWaiterTheDrainLetSettle()
+    {
+        // The "already settled" filter ran when the save failure surfaced — while the delivery
+        // was still inside the Until predicate, holding the dispatch gate. The cleanup's drain then
+        // let that delivery complete the waiter, and the create rethrew anyway: the publisher had
+        // counted a delivery, the caller got the save failure, and nothing could recover the
+        // response. The create now re-checks after the drain.
+        var (channel, store) = CreateChannel();
+        var insidePredicate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releasePredicate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        Task? publish = null;
+        store.Setup(s => s.SaveAsync(It.IsAny<string>(), It.IsAny<RecoveryState>(), It.IsAny<TimeSpan>(), It.IsAny<CancellationToken>()))
+             .Returns(() =>
+             {
+                 // The subscription is already dispatchable: this delivery runs synchronously up
+                 // to the predicate's first await, so it is inside Until when the save fails.
+                 publish = channel.SetResponse(new OperationResult { Status = OperationStatus.Completed, Message = "delivered mid-save" }, "settling-mid-save");
+                 return Task.FromException(new InvalidOperationException("save failed"));
+             });
+
+        var create = channel.CreateResponseWaiter<OperationResult>(
+            "settling-mid-save",
+            async _ =>
+            {
+                insidePredicate.TrySetResult();
+                await releasePredicate.Task;
+                return true;
+            });
+        try
+        {
+            Assert.True(insidePredicate.Task.IsCompleted);
+            Assert.False(create.IsCompleted); // parked in the cleanup's drain behind the delivery
+        }
+        finally
+        {
+            releasePredicate.TrySetResult();
+        }
+
+        await using var waiter = await create.WaitAsync(TimeSpan.FromSeconds(10));
+        Assert.Equal("delivered mid-save", (await waiter.ResponseTask.WaitAsync(TimeSpan.FromSeconds(5))).Message);
+        await publish!.WaitAsync(TimeSpan.FromSeconds(5));
+    }
+
+    [Fact]
+    public async Task Publish_BehindAWedgedUntilPredicate_HonoursItsCancellationToken()
+    {
+        // The publish token was never passed down: a publisher queued behind a slow Until
+        // predicate (or awaiting the predicate its own delivery runs) waited unbounded — a
+        // predicate that publishes to its own correlation id deadlocked both publishers. Each
+        // publisher now stops waiting when its token fires; the gate stays with the running
+        // predicate, and a signal cancelled while still queued is never dispatched.
+        var (channel, _) = CreateChannel();
+        var insidePredicate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releasePredicate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var predicateCalls = 0;
+        var waiter = await channel.CreateResponseWaiter<OperationResult>(
+            "wedged-publish",
+            async _ =>
+            {
+                if (Interlocked.Increment(ref predicateCalls) > 1)
+                    return true;
+
+                insidePredicate.TrySetResult();
+                await releasePredicate.Task;
+                return false;
+            });
+        try
+        {
+            using var runningCts = new CancellationTokenSource();
+            var running = channel.SetResponse(new OperationResult { Status = OperationStatus.Running }, "wedged-publish", runningCts.Token);
+            await insidePredicate.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+            using var queuedCts = new CancellationTokenSource();
+            var queued = channel.SetResponse(new OperationResult { Status = OperationStatus.Completed, Message = "queued" }, "wedged-publish", queuedCts.Token);
+            Assert.False(queued.IsCompleted);
+
+            await queuedCts.CancelAsync();
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(() => queued.WaitAsync(TimeSpan.FromSeconds(10)));
+            await runningCts.CancelAsync();
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(() => running.WaitAsync(TimeSpan.FromSeconds(10)));
+            Assert.False(waiter.ResponseTask.IsCompleted);
+
+            // The gate was held by the running predicate throughout; once it finishes, the next
+            // publish is delivered — and the cancelled queued signal never reached the predicate.
+            releasePredicate.TrySetResult();
+            await channel.SetResponse(new OperationResult { Status = OperationStatus.Completed, Message = "after" }, "wedged-publish")
+                .WaitAsync(TimeSpan.FromSeconds(10));
+            Assert.Equal("after", (await waiter.ResponseTask.WaitAsync(TimeSpan.FromSeconds(5))).Message);
+            Assert.Equal(2, Volatile.Read(ref predicateCalls));
+        }
+        finally
+        {
+            releasePredicate.TrySetResult();
+            await waiter.DisposeAsync();
+        }
     }
 
     /// <summary>Advances the virtual clock to the disposal drain's timer — never to the waiter's own, later timeout.</summary>

@@ -208,13 +208,16 @@ internal abstract class GooglePubSubSubscriberService : BackgroundService
         // for up to BackgroundDrainTimeout, then queued work already ACKed at the broker (which
         // Pub/Sub will never redeliver) was refused as "drain budget lapsed" on a host that was not
         // stopping. It captures nothing per attempt, so every rebuilt client feeds the same queue.
+        // The worker's early-ACK dispatcher also stops acknowledging at ApplicationStopping (the
+        // intake gate); a response subscriber keeps serving waiters and is never gated.
         await using var dispatcher = GooglePubSubMessageDispatcher.Create(
             HandleMessageAsync,
             Options,
             SubscriberOptions,
             Logger,
             subscriptionId,
-            SubscriberRole);
+            SubscriberRole,
+            SubscriberRole is GooglePubSubSubscriberRole.Worker ? new WorkerIntakeGate(_hostLifetime) : null);
 
         await SubscriberSupervisor.RunAsync(
             ct => RunSubscriberAsync(subscriptionName, dispatcher, ct),
@@ -229,7 +232,7 @@ internal abstract class GooglePubSubSubscriberService : BackgroundService
                 subscriptionName.ToString(),
                 SubscriberRole,
                 retryDelay),
-            healthyRunThreshold: Options.SubscriberRetryMaxDelay).ConfigureAwait(false);
+            healthyRunThreshold: AsyncResponseRetry.MaxAttainableDelay(Options.SubscriberRetryBaseDelay, Options.SubscriberRetryMaxDelay)).ConfigureAwait(false);
     }
 
     private async Task RunSubscriberAsync(
@@ -312,7 +315,9 @@ internal abstract class GooglePubSubSubscriberService : BackgroundService
         }
         catch (Exception ex)
         {
-            Logger.LogDebug(ex, "Best-effort stop of a failed Pub/Sub subscriber client did not complete cleanly.");
+            SafeLog.Try(
+                (Logger, ex),
+                static state => state.Logger.LogDebug(state.ex, "Best-effort stop of a failed Pub/Sub subscriber client did not complete cleanly."));
         }
     }
 

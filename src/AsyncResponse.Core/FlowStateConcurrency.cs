@@ -290,6 +290,17 @@ internal sealed class FlowExecutionLease : IAsyncDisposable
     private int _ended;
     private Task<bool>? _end;
 
+    // A checkpoint its caller cancelled mid-write, whose outcome is unknown until
+    // ResolveUncertainSaveAsync reads the ledger back. Execution path only, like every save.
+    private UncertainSave? _uncertainSave;
+
+    /// <summary>
+    /// What a caller-cancelled checkpoint would have left in the store had it committed: the
+    /// revision it expected (it wrote the next one) and the fields that tell this execution's
+    /// write from another writer's at the same revision.
+    /// </summary>
+    private sealed record UncertainSave(long ExpectedRevision, DateTime UpdatedAtUtc, FlowRunStatus Status, string? LastMessage);
+
     /// <summary>
     /// Longest single wait the deadline watcher arms. ExecutionLeaseDuration is validated as a
     /// PERSISTENCE bound, not a timer bound (see <see cref="FlowStateConcurrency.ValidateOptions"/>) —
@@ -306,7 +317,7 @@ internal sealed class FlowExecutionLease : IAsyncDisposable
     /// loops are abandoned: the deadline watcher has already marked the lease lost and the
     /// server-side lease expires on its own.
     /// </summary>
-    private static readonly TimeSpan DisposeJoinLimit = TimeSpan.FromSeconds(30);
+    internal static readonly TimeSpan DisposeJoinLimit = TimeSpan.FromSeconds(30);
 
     /// <summary>
     /// Budget for the final lease release on disposal. The release is one conditional write, so
@@ -400,6 +411,34 @@ internal sealed class FlowExecutionLease : IAsyncDisposable
     public async Task SaveAsync(FlowState state, TimeSpan ttl, CancellationToken cancellationToken = default, Exception? cause = null)
     {
         ThrowIfLost(cause);
+
+        // A token cancelled before the call writes nothing, so there is no outcome to settle later.
+        cancellationToken.ThrowIfCancellationRequested();
+
+        // An earlier checkpoint whose caller cancelled it mid-write may have committed after all:
+        // settled first, or this write's compare-and-swap would be judged against a revision the
+        // store moved past on this execution's own account, and the execution abandoned as a lost
+        // race (see ResolveUncertainSaveAsync).
+        if (_uncertainSave is not null)
+        {
+            try
+            {
+                await ResolveUncertainSaveCoreAsync(state).ConfigureAwait(false);
+            }
+            catch
+            {
+                // A settle read that failed leaves this checkpoint unwritten like any failed write,
+                // and marks the lease lost like one: every throwing save does, so the executor takes
+                // its lost-lease path and runs no failure-path save after it. Left live, that save
+                // settled on a retry and persisted the attempt's terminal status with the store
+                // error as its message — a Succeeded run no parent was ever told about.
+                MarkLost();
+                if (cause is not null)
+                    LogCauseOfFailedCheckpoint(cause);
+                throw;
+            }
+        }
+
         var expectedRevision = state.Revision;
         state.Revision = checked(expectedRevision + 1);
         var nowUtc = _timeProvider.GetUtcNow().UtcDateTime;
@@ -420,15 +459,30 @@ internal sealed class FlowExecutionLease : IAsyncDisposable
                     cancellationToken).ConfigureAwait(false))
                 return;
         }
-        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        catch (Exception ex) when (cancellationToken.IsCancellationRequested)
         {
             // The CALLER cancelled the write — flow code's own token on a progress, value, park or
             // breadcrumb save. That says nothing about the lease: marking it lost here turned every
             // later context call into a misdiagnosed "lost its execution lease" and skipped the
-            // attempt's failure checkpoint. Should the write have committed after all, the next
-            // fenced save's compare-and-swap rejects and diagnoses it.
+            // attempt's failure checkpoint. Judged by the TOKEN, not the exception's type:
+            // SqlClient and ODP.NET report a cancellation that interrupts a running command as
+            // their own exception ("Operation cancelled by user", ORA-01013), and only one raised
+            // before the command ran as OperationCanceledException.
+            //
+            // Nor does it say the write did not happen: the server may have applied it before the
+            // cancellation reached it (an attention that arrives after the autocommit UPDATE, an
+            // HTTP request the store already holds). The outcome is recorded as UNKNOWN and settled
+            // by a read before the next step body or checkpoint (see ResolveUncertainSaveAsync) —
+            // carrying on as if it had failed ran the next step's side effect before a
+            // compare-and-swap that could only fail, and blamed the wrong writer.
             state.Revision = expectedRevision;
-            throw;
+            _uncertainSave = new UncertainSave(expectedRevision, nowUtc, state.Status, state.LastMessage);
+            if (ex is OperationCanceledException)
+                throw;
+            throw new OperationCanceledException(
+                $"Durable flow '{_flowId}' checkpoint was cancelled by its caller; whether it committed is settled before the next step runs.",
+                ex,
+                cancellationToken);
         }
         catch
         {
@@ -438,7 +492,7 @@ internal sealed class FlowExecutionLease : IAsyncDisposable
             // The store exception propagates; keep the failure this save was recording from
             // vanishing with it.
             if (cause is not null)
-                _logger.LogWarning(cause, "Durable flow '{FlowId}' failed to checkpoint; the failure it was recording is attached here and the store error propagates.", _flowId);
+                LogCauseOfFailedCheckpoint(cause);
             throw;
         }
 
@@ -446,6 +500,64 @@ internal sealed class FlowExecutionLease : IAsyncDisposable
         MarkLost();
         throw await CreateSaveRejectedExceptionAsync(expectedRevision, cause, cancellationToken).ConfigureAwait(false);
     }
+
+    /// <summary>
+    /// Settles a checkpoint whose caller cancelled it mid-write (see <see cref="SaveAsync"/>) with
+    /// one current read, before anything else runs on this execution's account: the context calls
+    /// it ahead of every step body, and every checkpoint ahead of its own write.
+    /// <list type="bullet">
+    /// <item>The ledger still at the revision the write expected: it did not commit. Carry on.</item>
+    /// <item>The ledger at the revision it wrote, carrying its stamp: it committed. That revision is
+    /// adopted, so the next compare-and-swap is judged against what this execution wrote itself.</item>
+    /// <item>Anything else — another writer (a recovery, a failure signal, an operator status
+    /// change) moved the ledger, or it is gone: the lease is marked lost and the execution
+    /// abandoned, as for any lost race, with the cancelled checkpoint named.</item>
+    /// </list>
+    /// Read through <see cref="IFlowStateStore.LoadCurrentAsync"/>, since a lagging copy would show
+    /// the expected revision for a write that did commit, and bounded by <see cref="LostToken"/>. A
+    /// failed read propagates with the outcome still unknown, and the next caller settles it again;
+    /// inside a checkpoint it fails that checkpoint, which marks the lease lost like any failed
+    /// checkpoint write.
+    /// </summary>
+    internal Task ResolveUncertainSaveAsync(FlowState state)
+        => _uncertainSave is null ? Task.CompletedTask : ResolveUncertainSaveCoreAsync(state);
+
+    private async Task ResolveUncertainSaveCoreAsync(FlowState state)
+    {
+        var uncertain = _uncertainSave!;
+        ThrowIfLost();
+
+        // Not the caller's token: the caller's cancellation is what left the outcome unknown, and
+        // this read is what settles it. The lease's own token, though: a wedged store must not
+        // pin the step past the lease deadline, when nothing here may run any more anyway.
+        var current = await _store.LoadCurrentAsync(_flowId, LostToken).ConfigureAwait(false);
+        _uncertainSave = null;
+        if (current?.Revision == uncertain.ExpectedRevision)
+            return;
+
+        if (current is not null
+            && current.Revision == uncertain.ExpectedRevision + 1
+            && current.UpdatedAtUtc?.Ticks == uncertain.UpdatedAtUtc.Ticks
+            && current.Status == uncertain.Status
+            && string.Equals(current.LastMessage, uncertain.LastMessage, StringComparison.Ordinal))
+        {
+            state.Revision = current.Revision;
+            return;
+        }
+
+        MarkLost();
+        throw new InvalidOperationException(
+            $"Durable flow '{_flowId}' could not confirm the checkpoint its caller cancelled mid-write (revision {uncertain.ExpectedRevision} -> {uncertain.ExpectedRevision + 1}): " +
+            (current is null
+                ? "its ledger entry is gone (expired or deleted)"
+                : $"the ledger now reads revision {current.Revision}, written by someone else (a recovery, failure signal, or operator status change)") +
+            "; the worker abandons this execution and the delivery retries from the last checkpoint.");
+    }
+
+    private void LogCauseOfFailedCheckpoint(Exception cause)
+        => SafeLog.Try(
+            (Logger: _logger, Cause: cause, FlowId: _flowId),
+            static s => s.Logger.LogWarning(s.Cause, "Durable flow '{FlowId}' failed to checkpoint; the failure it was recording is attached here and the store error propagates.", s.FlowId));
 
     /// <summary>
     /// Builds the exception for a rejected checkpoint write. The store's compare-and-swap only
@@ -492,13 +604,13 @@ internal sealed class FlowExecutionLease : IAsyncDisposable
         // (the database transports' lock renewal does the same): with the default 60 s lease and
         // 20 s interval, two failed beats — a 25-second store blip — lost a healthy lease, and one
         // renewal that took 20 s to time out lost it on its own. Floored at a millisecond: a zero
-        // wait would spin.
+        // wait would spin. The retries back off from there (see RenewalRetryDelay).
         var interval = _options.ExecutionLeaseRenewInterval;
         var retryInterval = TimeSpan.FromTicks(Math.Max(
             TimeSpan.TicksPerMillisecond,
             Math.Min(Math.Min(TimeSpan.TicksPerSecond, _options.ExecutionLeaseDuration.Ticks / 10), interval.Ticks)));
         var wait = firstWait;
-        var failing = false;
+        var failures = 0;
         while (!stop.IsCancellationRequested)
         {
             try
@@ -523,32 +635,59 @@ internal sealed class FlowExecutionLease : IAsyncDisposable
 
                 Volatile.Write(ref _validUntilUtcTicks, renewedDeadline);
                 wait = interval;
-                failing = false;
+                failures = 0;
             }
-            catch (OperationCanceledException) when (stop.IsCancellationRequested)
+            catch (Exception) when (stop.IsCancellationRequested)
             {
+                // Stopped — by a park's pause or by the end of the execution — whatever the call in
+                // flight threw on the way out: a renewal cancelled mid-command surfaces as the
+                // driver's own exception (SqlClient, ODP.NET), and is no renewal failure.
                 return;
             }
             catch (Exception ex)
             {
-                // Only the first failure of a streak is a warning: at the retry cadence a store
-                // outage would otherwise log one per second per running flow.
-                _logger.Log(
-                    failing ? LogLevel.Debug : LogLevel.Warning,
-                    ex,
-                    "Failed to renew durable flow {FlowId} execution lease; retrying every {RetryInterval} until it succeeds or the lease expires.",
-                    _flowId,
-                    retryInterval);
-                failing = true;
-                if (_timeProvider.GetUtcNow().UtcDateTime.Ticks >= Volatile.Read(ref _validUntilUtcTicks))
-                {
+                failures++;
+                var left = new DateTime(Volatile.Read(ref _validUntilUtcTicks), DateTimeKind.Utc) - _timeProvider.GetUtcNow().UtcDateTime;
+                if (left > TimeSpan.Zero)
+                    wait = RenewalRetryDelay(failures, retryInterval, interval, left);
+                else
                     MarkLost();
-                    return;
-                }
 
-                wait = retryInterval;
+                // Decided first, logged second, and guarded: a logging provider that throws ended
+                // this loop, and nothing renewed the lease for the rest of the execution. Only the
+                // first failure of a streak is a warning, or a store outage would log one per retry
+                // per running flow.
+                SafeLog.Try(
+                    (Lease: this, Error: ex, First: failures == 1, Lost: left <= TimeSpan.Zero, Wait: wait),
+                    static s =>
+                    {
+                        var level = s.First ? LogLevel.Warning : LogLevel.Debug;
+                        if (s.Lost)
+                            s.Lease._logger.Log(level, s.Error, "Failed to renew durable flow {FlowId} execution lease; it has reached its deadline, and this execution is abandoned.", s.Lease._flowId);
+                        else
+                            s.Lease._logger.Log(level, s.Error, "Failed to renew durable flow {FlowId} execution lease; retrying in {RetryDelay}, backing off, until it succeeds or the lease expires.", s.Lease._flowId, s.Wait);
+                    });
+
+                if (left <= TimeSpan.Zero)
+                    return;
             }
         }
+    }
+
+    /// <summary>
+    /// The wait before the next renewal attempt after <paramref name="failures"/> consecutive
+    /// failed ones: half-jitter exponential backoff from <paramref name="retryInterval"/>, capped at
+    /// the renew interval and at half the time the lease has <paramref name="left"/> — never under
+    /// <paramref name="retryInterval"/>. A fixed one-second cadence multiplied the store's renewal
+    /// load about twentyfold, per running flow, for as long as the store was failing; backing off
+    /// alone would have stretched the last waits past the deadline and lost a lease a blip ending
+    /// just before it could have kept. Capped at half of what is left, the attempts keep landing
+    /// before the deadline, closer together as it nears.
+    /// </summary>
+    internal static TimeSpan RenewalRetryDelay(int failures, TimeSpan retryInterval, TimeSpan interval, TimeSpan left)
+    {
+        var cap = Math.Max(retryInterval.Ticks, Math.Min(interval.Ticks, left.Ticks / 2));
+        return AsyncResponseRetry.Backoff(failures, retryInterval, TimeSpan.FromTicks(cap));
     }
 
     /// <summary>
@@ -575,10 +714,12 @@ internal sealed class FlowExecutionLease : IAsyncDisposable
 
                 if (remaining <= TimeSpan.Zero)
                 {
-                    _logger.LogWarning(
-                        "Durable flow {FlowId} execution lease reached its deadline without a successful renewal; abandoning this execution.",
-                        _flowId);
+                    // Marked first, logged second and guarded: a throwing logging provider left
+                    // LostToken live past the deadline, the one thing this loop exists to fire.
                     MarkLost();
+                    SafeLog.Try(this, static lease => lease._logger.LogWarning(
+                        "Durable flow {FlowId} execution lease reached its deadline without a successful renewal; abandoning this execution.",
+                        lease._flowId));
                     return;
                 }
 
@@ -613,9 +754,14 @@ internal sealed class FlowExecutionLease : IAsyncDisposable
     /// by whether it changes (<see cref="FlowLeaseContention"/>), and a renewal landing after its
     /// first look reads as a live holder executing a different job — proof enough to acknowledge
     /// it as a duplicate, although it is the park's own continuation. The deadline watcher keeps
-    /// running. Bounded like disposal: past the budget the stuck renewal is left behind.
+    /// running. Bounded like disposal.
     /// </summary>
-    internal async Task PauseRenewalAsync()
+    /// <returns>
+    /// <c>false</c> when the renewal did not stop within <see cref="DisposeJoinLimit"/> — a store
+    /// call that ignores its cancellation token is still in flight and may yet land, so the caller
+    /// must not publish anything that judges this lease by whether it changes.
+    /// </returns>
+    internal async Task<bool> PauseRenewalAsync()
     {
         _renewalStop.Cancel();
         try
@@ -624,11 +770,17 @@ internal sealed class FlowExecutionLease : IAsyncDisposable
         }
         catch (TimeoutException)
         {
-            _logger.LogWarning(
-                "Durable flow {FlowId} execution lease renewal did not stop within {DisposeJoinLimit} before the run parked; parking anyway.",
-                _flowId,
-                DisposeJoinLimit);
+            // Past the budget the verdict stands even should the renewal land a moment later: it
+            // was still in flight when the budget ran out.
+            return false;
         }
+        catch
+        {
+            // The loop swallows its own failures; one that faulted anyway has still ended, which is
+            // all a pause needs.
+        }
+
+        return true;
     }
 
     /// <summary>
@@ -687,23 +839,30 @@ internal sealed class FlowExecutionLease : IAsyncDisposable
     {
         Volatile.Write(ref _ended, 1);
         _stop.Cancel();
+        var loops = Task.WhenAll(_renewal, _deadline);
         try
         {
             // Bounded join (see DisposeJoinLimit): both loops swallow their own exceptions, so an
             // abandoned task cannot fault unobserved.
-            await Task.WhenAll(_renewal, _deadline).WaitAsync(DisposeJoinLimit, _timeProvider).ConfigureAwait(false);
+            await loops.WaitAsync(DisposeJoinLimit, _timeProvider).ConfigureAwait(false);
         }
-        catch (TimeoutException)
+        catch (TimeoutException) when (!loops.IsCompleted)
         {
             // The store call the renewal loop is stuck in ignores cancellation, so releasing the
             // lease through the same store would hang this disposal all over again. Skip the
             // release (the server-side lease expires) and leave the cancellation sources
             // undisposed for the abandoned loops.
-            _logger.LogWarning(
+            SafeLog.Try(this, static lease => lease._logger.LogWarning(
                 "Durable flow {FlowId} execution lease loops did not stop within {DisposeJoinLimit}; abandoning them (the lease will expire server-side).",
-                _flowId,
-                DisposeJoinLimit);
+                lease._flowId,
+                DisposeJoinLimit));
             return false;
+        }
+        catch
+        {
+            // A loop that faulted anyway (they swallow their own failures) has still ended: the
+            // release below must not be skipped for it, nor its fault thrown out of a disposal
+            // that follows a run already saved and notified.
         }
 
         // Bounded release (see ReleaseLimit), with a token the store can honor. An unbounded,
@@ -725,16 +884,16 @@ internal sealed class FlowExecutionLease : IAsyncDisposable
             // cancelled, observe whatever the abandoned call eventually does, and move on: the
             // server-side lease expires on its own, exactly as when the renewal loops are abandoned.
             releaseCancellation.Cancel();
-            _logger.LogWarning(
-                "Durable flow {FlowId} execution lease release did not complete within {ReleaseLimit}; abandoning it (the lease will expire server-side).",
-                _flowId,
-                ReleaseLimit);
             ObserveAbandonedRelease(release, releaseCancellation);
+            SafeLog.Try(this, static lease => lease._logger.LogWarning(
+                "Durable flow {FlowId} execution lease release did not complete within {ReleaseLimit}; abandoning it (the lease will expire server-side).",
+                lease._flowId,
+                ReleaseLimit));
         }
         catch (Exception ex)
         {
             releaseCancellation.Dispose();
-            _logger.LogWarning(ex, "Failed to release durable flow {FlowId} execution lease; it will expire.", _flowId);
+            SafeLog.Try((Lease: this, Error: ex), static s => s.Lease._logger.LogWarning(s.Error, "Failed to release durable flow {FlowId} execution lease; it will expire.", s.Lease._flowId));
         }
 
         return true;
@@ -751,22 +910,24 @@ internal sealed class FlowExecutionLease : IAsyncDisposable
             (task, state) =>
             {
                 var (lease, cancellation) = ((FlowExecutionLease, CancellationTokenSource))state!;
-                if (task.IsFaulted)
-                {
-                    lease._logger.LogWarning(
-                        task.Exception?.GetBaseException(),
-                        "The abandoned release of durable flow {FlowId}'s execution lease eventually failed; the lease expires server-side.",
-                        lease._flowId);
-                }
-                else
-                {
-                    lease._logger.LogDebug(
-                        "The abandoned release of durable flow {FlowId}'s execution lease eventually completed ({Status}).",
-                        lease._flowId,
-                        task.Status);
-                }
-
                 cancellation.Dispose();
+                SafeLog.Try((Lease: lease, Task: task), static s =>
+                {
+                    if (s.Task.IsFaulted)
+                    {
+                        s.Lease._logger.LogWarning(
+                            s.Task.Exception?.GetBaseException(),
+                            "The abandoned release of durable flow {FlowId}'s execution lease eventually failed; the lease expires server-side.",
+                            s.Lease._flowId);
+                    }
+                    else
+                    {
+                        s.Lease._logger.LogDebug(
+                            "The abandoned release of durable flow {FlowId}'s execution lease eventually completed ({Status}).",
+                            s.Lease._flowId,
+                            s.Task.Status);
+                    }
+                });
             },
             (this, releaseCancellation),
             CancellationToken.None,

@@ -362,6 +362,27 @@ public sealed record AsyncResponseWatchdogReport(
 /// </summary>
 internal sealed class AsyncResponseWatchdog : BackgroundService
 {
+    /// <summary>
+    /// What the in-memory channel's scanner registration resolves to when the store in use cannot
+    /// scan. A factory registration must not return <c>null</c>: Microsoft.Extensions.DI tolerates
+    /// it, but other containers (Autofac's delegate activator) reject a null result and failed to
+    /// activate the watchdog at startup. The watchdog treats this sentinel as "no scanner" and
+    /// idles; scanning it directly throws, because an empty enumeration would read as a clean pass
+    /// over a store nobody inspected.
+    /// </summary>
+    internal sealed class NonScanningRecoveryStateScanner : IRecoveryStateScanner
+    {
+        public static readonly NonScanningRecoveryStateScanner Instance = new();
+
+        private NonScanningRecoveryStateScanner()
+        {
+        }
+
+        public IAsyncEnumerable<RecoveryState> ScanAsync(CancellationToken cancellationToken = default)
+            => throw new NotSupportedException(
+                $"The registered {nameof(IRecoveryStateStore)} does not implement {nameof(IRecoveryStateScanner)}; its recovery registrations cannot be enumerated.");
+    }
+
     private readonly IRecoveryStateScanner? _scanner;
     private readonly IActiveSubscriberProbe? _subscriberProbe;
     private readonly AsyncResponseWatchdogState _state;
@@ -378,9 +399,10 @@ internal sealed class AsyncResponseWatchdog : BackgroundService
         ILogger<AsyncResponseWatchdog> logger,
         TimeProvider? timeProvider = null)
     {
-        // Null-tolerant: a channel registers its scanner as the capability of the store in use,
-        // which resolves to null when that (custom) store cannot scan — the watchdog then idles.
-        _scanner = scanners.FirstOrDefault(static scanner => scanner is not null);
+        // A channel registers its scanner as the capability of the store in use; when that
+        // (custom) store cannot scan it resolves to the non-scanning sentinel (or, from a
+        // container that allows it, null) — either way the watchdog then idles.
+        _scanner = scanners.FirstOrDefault(static scanner => scanner is not (null or NonScanningRecoveryStateScanner));
         _subscriberProbe = subscriberProbes.FirstOrDefault();
         _state = state;
         _options = options.Value.Watchdog;
@@ -600,9 +622,17 @@ internal sealed class AsyncResponseWatchdog : BackgroundService
 
             _logger.LogInformation("Recovery watchdog scan complete. Outstanding registrations: {Total}, with live waiter: {Active}, stale (no waiter, older than {StaleAfter}): {Stale}, unknown age: {UnknownAge}, liveness unprobeable: {Unprobeable}.", report.TotalEntries, report.EntriesWithActiveWaiter, _options.StaleAfter, report.StaleEntries.Count, report.UnknownAgeEntries, report.UnprobeableEntries);
 
+            // The id and type name are store-written text (the store is a trust boundary): quoted
+            // bounded and escaped like every other persisted name, so a CR/LF inside one cannot
+            // forge a log line and megabytes of it cannot flood the sink. An ordinary value reads
+            // exactly as before.
             foreach (var stale in report.StaleEntries)
             {
-                _logger.LogWarning("Stale async-response recovery state — correlationId {CorrelationId}, payload type {PayloadType}, registered {RegisteredAtUtc}, no live subscriber. The owning flow is likely stuck; investigate and resume or fail it.", stale.CorrelationId, stale.PayloadTypeFullName, stale.RegisteredAtUtc);
+                _logger.LogWarning(
+                    "Stale async-response recovery state — correlationId {CorrelationId}, payload type {PayloadType}, registered {RegisteredAtUtc}, no live subscriber. The owning flow is likely stuck; investigate and resume or fail it.",
+                    stale.CorrelationId is null ? null : DiagnosticText.EscapedExcerpt(stale.CorrelationId, AsyncResponseChannelOptions.MaxCorrelationIdLength),
+                    stale.PayloadTypeFullName is null ? null : AsyncResponseTypeResolution.DescribeForDiagnostics(stale.PayloadTypeFullName),
+                    stale.RegisteredAtUtc);
             }
 
             return report;

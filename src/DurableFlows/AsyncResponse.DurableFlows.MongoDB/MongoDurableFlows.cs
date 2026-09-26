@@ -113,10 +113,12 @@ public sealed class MongoDbFlowStateStore : IFlowStateStore, IDisposable
 {
     private readonly IMongoDatabase _database;
     private readonly IMongoCollection<MongoFlowStateDocument> _collection;
+    private readonly IMongoCollection<MongoFlowStateDocument> _currentCollection;
     private readonly MongoDbDurableFlowOptions _options;
     private readonly SemaphoreSlim _ensureGate = new(1, 1);
     private readonly IMongoClient? _ownedClient;
     private volatile bool _created;
+    private volatile bool _linearizableUnsupported;
 
     /// <summary>
     /// DI construction path: also claims the collection in the container's cross-component
@@ -166,17 +168,40 @@ public sealed class MongoDbFlowStateStore : IFlowStateStore, IDisposable
         // just recorded, silently disappears and the step's side effect runs again. The read
         // concern stays inherited on purpose: primary reads already see every write this store
         // had acknowledged (read-your-writes needs nothing more), and a majority snapshot could
-        // only hide a competitor's newer write, which the revision/lease filters reject anyway.
+        // only hide a competitor's newer write, which the revision/lease filters reject anyway —
+        // except on the no-write paths, which read linearizably (see LoadCurrentAsync).
         // Majority with a BOUND (see MongoWriteConcerns): a bare WMajority carried no wtimeout, so
         // on a primary-secondary-arbiter set with its secondary down every checkpoint blocked
         // indefinitely — and it discarded the operator's own wtimeoutMS/journal besides.
         _collection = database.GetCollection<MongoFlowStateDocument>(_options.CollectionName)
             .WithReadPreference(ReadPreference.Primary)
             .WithWriteConcern(MongoWriteConcerns.BoundedMajority(database));
+        _currentCollection = _collection.WithReadConcern(ReadConcern.Linearizable);
         _ownedClient = ownedClient;
     }
 
-    public async Task<FlowState?> LoadAsync(string flowId, CancellationToken cancellationToken = default)
+    public Task<FlowState?> LoadAsync(string flowId, CancellationToken cancellationToken = default)
+        => LoadCoreAsync(flowId, current: false, cancellationToken);
+
+    /// <inheritdoc />
+    /// <remarks>
+    /// A primary read is current except while a partitioned primary has not yet noticed it was
+    /// deposed (up to about <c>electionTimeoutMillis</c>): it still serves reads, and a process
+    /// that can reach only it misses a majority-acknowledged write the new primary took — a
+    /// breadcrumb a recovered response matches, a status an operator set back to Running. That
+    /// answer is dropped with no fence behind it, so this reads with <c>linearizable</c> read
+    /// concern, which a deposed primary cannot satisfy ("majority" would not help: its majority
+    /// snapshot is just as stale). A linearizable read waits for a majority to confirm the
+    /// primary, so it carries the same bound as the store's writes
+    /// (<see cref="MongoWriteConcerns.DefaultMajorityTimeout"/>, as <c>maxTimeMS</c>) and fails
+    /// rather than blocking while the set is degraded. A standalone server, which has no second
+    /// primary to be stale against, rejects the read concern (<c>NotAReplicaSet</c>); the store
+    /// then uses the plain read from that point on.
+    /// </remarks>
+    public Task<FlowState?> LoadCurrentAsync(string flowId, CancellationToken cancellationToken = default)
+        => LoadCoreAsync(flowId, current: true, cancellationToken);
+
+    private async Task<FlowState?> LoadCoreAsync(string flowId, bool current, CancellationToken cancellationToken)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(flowId);
         await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
@@ -184,7 +209,9 @@ public sealed class MongoDbFlowStateStore : IFlowStateStore, IDisposable
         // Expiry is evaluated against the server clock ($$NOW) — the same authority the TTL
         // monitor reaps with — so app clock skew can never resurrect an expired ledger or hide a
         // live one. All lease fencing below uses the same authority.
-        var document = await _collection.Find(BuildLiveFilter(flowId)).FirstOrDefaultAsync(cancellationToken).ConfigureAwait(false);
+        var document = current
+            ? await FindLinearizableAsync(flowId, cancellationToken).ConfigureAwait(false)
+            : await _collection.Find(BuildLiveFilter(flowId)).FirstOrDefaultAsync(cancellationToken).ConfigureAwait(false);
         if (document is null)
         {
             // A document whose expiry is missing or not a BSON date also misses the live filter —
@@ -212,6 +239,30 @@ public sealed class MongoDbFlowStateStore : IFlowStateStore, IDisposable
 
         return DurableFlowStoreShared.ReadState(flowId, document.StateJson, revision);
     }
+
+    /// <summary>The live-filter read of <see cref="LoadCurrentAsync"/> (see its remarks).</summary>
+    private async Task<MongoFlowStateDocument?> FindLinearizableAsync(string flowId, CancellationToken cancellationToken)
+    {
+        if (!_linearizableUnsupported)
+        {
+            try
+            {
+                return await _currentCollection
+                    .Find(BuildLiveFilter(flowId), new FindOptions { MaxTime = MongoWriteConcerns.DefaultMajorityTimeout })
+                    .FirstOrDefaultAsync(cancellationToken)
+                    .ConfigureAwait(false);
+            }
+            catch (MongoCommandException ex) when (ex.Code == NotAReplicaSet)
+            {
+                _linearizableUnsupported = true;
+            }
+        }
+
+        return await _collection.Find(BuildLiveFilter(flowId)).FirstOrDefaultAsync(cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>The server's rejection of a replica-set-only read concern on a standalone node.</summary>
+    private const int NotAReplicaSet = 123;
 
     /// <inheritdoc />
     public void ValidateCreate(string flowId, FlowState state, TimeSpan ttl)
@@ -379,6 +430,14 @@ public sealed class MongoDbFlowStateStore : IFlowStateStore, IDisposable
                     cancellationToken).ConfigureAwait(false);
             }
 
+            // One index listing serves both startup checks: the collation refusal, and (with
+            // AutoCreateIndexes off) the TTL verification. With AutoCreateIndexes on, a deployment
+            // whose credentials may create but not list indexes keeps working — unverified, as
+            // before the refusal existed.
+            var indexes = await ListIndexesAsync(tolerateUnauthorized: _options.AutoCreateIndexes, cancellationToken).ConfigureAwait(false);
+            if (indexes is not null)
+                ThrowIfFoldingCollation(indexes);
+
             if (!_options.AutoCreateIndexes)
             {
                 // The TTL index is this store's ONLY cleanup mechanism (no application-side
@@ -386,7 +445,7 @@ public sealed class MongoDbFlowStateStore : IFlowStateStore, IDisposable
                 // carry one — Cosmos and DynamoDB hard-fail the same way when their server-side
                 // reaper is missing. Without this, a collection provisioned without
                 // expireAfterSeconds grew without bound, with no error and no log line.
-                await VerifyTtlIndexAsync(cancellationToken).ConfigureAwait(false);
+                VerifyTtlIndex(indexes!);
                 _created = true;
                 return;
             }
@@ -411,7 +470,8 @@ public sealed class MongoDbFlowStateStore : IFlowStateStore, IDisposable
             }
             catch (MongoCommandException ex) when (ex.Code is 85 or 86)
             {
-                if (!await HasTtlIndexAsync(cancellationToken).ConfigureAwait(false))
+                indexes ??= await ListIndexesAsync(tolerateUnauthorized: false, cancellationToken).ConfigureAwait(false);
+                if (!HasTtlIndex(indexes!))
                     throw;
             }
 
@@ -424,13 +484,69 @@ public sealed class MongoDbFlowStateStore : IFlowStateStore, IDisposable
     }
 
     /// <summary>
+    /// The collection's indexes; empty when the collection does not exist yet (the first write
+    /// creates it, with the simple collation: MongoDB has no database-level default). <c>null</c>
+    /// when the credentials may not list indexes and <paramref name="tolerateUnauthorized"/> is set.
+    /// </summary>
+    private async Task<List<BsonDocument>?> ListIndexesAsync(bool tolerateUnauthorized, CancellationToken cancellationToken)
+    {
+        try
+        {
+            using var cursor = await _collection.Indexes.ListAsync(cancellationToken).ConfigureAwait(false);
+            return await cursor.ToListAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch (MongoCommandException ex) when (ex.Code == NamespaceNotFound)
+        {
+            return [];
+        }
+        catch (MongoCommandException ex) when (tolerateUnauthorized && ex.Code == Unauthorized)
+        {
+            return null;
+        }
+    }
+
+    private const int NamespaceNotFound = 26;
+    private const int Unauthorized = 13;
+
+    /// <summary>
+    /// Refuses a collection whose default collation folds: the flow id is the <c>_id</c>, and a
+    /// collection created with a default collation builds its <c>_id_</c> index — which cannot be
+    /// rebuilt — and evaluates every id equality under it. Two case- or accent-variant flow ids
+    /// then collide: the second run's create reports the first run's ledger as existing, its load
+    /// reads that ledger (refused as unreadable, so its start job dead-letters while the caller
+    /// was told it started), and a delete removes the other run. Pinning the simple collation on
+    /// the queries cannot help — the unique <c>_id_</c> index still folds — so startup refuses,
+    /// as the relational stores refuse a folding <c>flow_id</c> column.
+    /// </summary>
+    private void ThrowIfFoldingCollation(List<BsonDocument> indexes)
+    {
+        var idIndex = indexes.Find(index => index.TryGetValue("name", out var name) && name == "_id_");
+        if (idIndex is null
+            || !idIndex.TryGetValue("collation", out var collation)
+            || collation is not BsonDocument collationDocument
+            || (collationDocument.TryGetValue("locale", out var locale) && locale == "simple"))
+        {
+            return;
+        }
+
+        throw new InvalidOperationException(
+            $"The MongoDB durable-flow collection '{_options.CollectionName}' was created with the default collation " +
+            $"{collationDocument.ToJson()}, which its _id index — the flow id — carries too. The store compares flow ids " +
+            "ORDINALLY, and a collation folds whatever its rules call equal — case, accents, or width, depending on the " +
+            "locale and strength — into one key. Distinct flow ids would then collide: the second run's create finds the " +
+            "first run's ledger, its start job dead-letters, and a delete removes the other run. The _id index cannot be " +
+            "rebuilt: recreate the collection without a collation (or with { locale: 'simple' }) and copy the documents " +
+            "over, or configure a new CollectionName.");
+    }
+
+    /// <summary>
     /// Verifies an operator-provisioned collection carries the TTL reaper this store depends on:
     /// a single-field index on the expiry timestamp with <c>expireAfterSeconds</c> set (any
     /// value — a delayed reap is bounded; a missing one is unbounded growth).
     /// </summary>
-    private async Task VerifyTtlIndexAsync(CancellationToken cancellationToken)
+    private void VerifyTtlIndex(List<BsonDocument> indexes)
     {
-        if (await HasTtlIndexAsync(cancellationToken).ConfigureAwait(false))
+        if (HasTtlIndex(indexes))
             return;
 
         throw new InvalidOperationException(
@@ -444,17 +560,13 @@ public sealed class MongoDbFlowStateStore : IFlowStateStore, IDisposable
     /// Whether the collection carries a TTL reaper on the expiry timestamp, whatever it is named:
     /// a single-field index on <c>expires_at_utc</c> with <c>expireAfterSeconds</c> set.
     /// </summary>
-    private async Task<bool> HasTtlIndexAsync(CancellationToken cancellationToken)
-    {
-        using var cursor = await _collection.Indexes.ListAsync(cancellationToken).ConfigureAwait(false);
-        var indexes = await cursor.ToListAsync(cancellationToken).ConfigureAwait(false);
-        return indexes.Exists(index =>
+    private static bool HasTtlIndex(List<BsonDocument> indexes)
+        => indexes.Exists(index =>
             index.Contains("expireAfterSeconds")
             && index.TryGetValue("key", out var key)
             && key is BsonDocument keyDocument
             && keyDocument.ElementCount == 1
             && keyDocument.Contains("expires_at_utc"));
-    }
 
     /// <summary>
     /// Server clock for the one write that cannot compute it in place: plain inserts evaluate no

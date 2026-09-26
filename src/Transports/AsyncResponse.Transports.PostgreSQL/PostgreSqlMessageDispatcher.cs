@@ -21,7 +21,8 @@ internal sealed class PostgreSqlMessageDispatcher(
     PostgreSqlSubscriberOptions subscriberOptions,
     ILogger logger,
     PostgreSqlSubscriberRole role,
-    TimeProvider? timeProvider = null)
+    TimeProvider? timeProvider = null,
+    CancellationToken hostStopping = default)
     : DbMessageDispatcherBase(
         handler,
         options,
@@ -31,4 +32,5 @@ internal sealed class PostgreSqlMessageDispatcher(
         providerName: "PostgreSQL",
         unitNoun: "row",
         telemetryName: "postgresql",
-        timeProvider: timeProvider);
+        timeProvider: timeProvider,
+        hostStopping: hostStopping);

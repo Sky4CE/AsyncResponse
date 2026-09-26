@@ -56,6 +56,69 @@ public sealed class RecordingDeferredWorkAudit : IDeferredWorkAudit
     }
 }
 
+/// <summary>A lost-subscriber failure callback whose body always throws.</summary>
+public interface IFailureAudit
+{
+    Task FailedAsync(Exception exception);
+}
+
+public sealed class AlwaysThrowingFailureAudit : IFailureAudit
+{
+    private int _calls;
+
+    public int Calls => Volatile.Read(ref _calls);
+
+    public Task FailedAsync(Exception exception)
+    {
+        Interlocked.Increment(ref _calls);
+        throw new InvalidOperationException("the failure callback itself fails");
+    }
+}
+
+/// <summary>Coordinates <see cref="RecoveryKickoff"/>: sees the kicked-off run park, and holds the callback until released.</summary>
+public sealed class RecoveryKickoffState : IDurableFlowExecutionObserver
+{
+    public TaskCompletionSource Parked { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    public TaskCompletionSource Scheduled { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    public TaskCompletionSource Release { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+    public ValueTask OnStepWaitingAsync(DurableFlowStepEvent step)
+    {
+        Parked.TrySetResult();
+        return default;
+    }
+}
+
+/// <summary>Lost-subscriber resume callbacks that enqueue work, or wait, INSIDE the publish that runs them.</summary>
+public interface IRecoveryKickoff
+{
+    Task StartFlowAsync();
+    Task ScheduleDelayedJobAsync();
+    Task NapAsync();
+}
+
+public sealed class RecoveryKickoff(
+    IDurableFlows _flows,
+    IRecoverableAsyncResponseBuilder _builder,
+    TimeProvider _clock,
+    RecoveryKickoffState _state) : IRecoveryKickoff
+{
+    public async Task StartFlowAsync()
+    {
+        await _flows.StartAsync<ParkedOnReplyFlow, ParkedRestartInput>(new ParkedRestartInput("kicked-off"));
+        await _state.Release.Task;
+    }
+
+    public async Task ScheduleDelayedJobAsync()
+    {
+        await _builder.EnqueueWorkerAsync<IDeferredWorkAudit>(worker => worker.RanAsync("scheduled-by-a-callback"), TimeSpan.FromSeconds(2));
+        _state.Scheduled.TrySetResult();
+        await _state.Release.Task;
+    }
+
+    public Task NapAsync() => Task.Delay(TimeSpan.FromHours(1), _clock);
+}
+
 public class TestingHarnessDirectUsageTests
 {
     [Fact]
@@ -223,6 +286,149 @@ public class TestingHarnessDirectUsageTests
         await harness.AdvanceAsync(TimeSpan.FromHours(2));
         await harness.WaitForWorkerIdleAsync();
         Assert.Equal(["after-restart"], audit.Ran);
+    }
+
+    [Fact]
+    public async Task PublishException_ToALostSubscriberWhoseFailureCallbackThrows_DrivesItsRetryBackoff_InsteadOfHanging()
+    {
+        // GS2#1 (fixpoint r2): the in-memory channel runs a lost subscriber's failure callback
+        // INSIDE the publish and retries a throwing one with backoff on the engine clock. Nothing
+        // moved that clock while the test awaited the publish, so it hung with no bound and no
+        // diagnosis — production finishes the ladder in under two seconds with
+        // RecoveryCallbackFailedException. The harness publish now drives the clock to the timers
+        // the publish itself arms.
+        var audit = new AlwaysThrowingFailureAudit();
+        await using var harness = await AsyncResponseTestHarness.StartAsync(options =>
+            options.ConfigureServices = services => services.AddSingleton<IFailureAudit>(audit));
+
+        var subscriber = harness.Services.GetRequiredService<IRecoverableAsyncResponseSubscriber>();
+        const string correlationId = "order-failing-callback";
+        _ = await subscriber.CreateRecoverableResponseWaiter<OperationResult>(
+            correlationId,
+            failureCallback: CallbackExpressionConverter.ToReflectionCall<IFailureAudit>(target => target.FailedAsync(Placeholder.Exception())));
+
+        await harness.SimulateRestartAsync();
+
+        // Hang guard only (the old harness hung here forever).
+        var ex = await Assert.ThrowsAsync<RecoveryCallbackFailedException>(() =>
+            harness.PublishExceptionAsync(new InvalidOperationException("remote boom"), correlationId).WaitAsync(TimeSpan.FromSeconds(20)));
+
+        Assert.Equal(correlationId, ex.CorrelationId);
+        Assert.Equal(LostSubscriberCallbackDispatcher.FailureCallbackAttempts, audit.Calls);
+    }
+
+    // Pre-commit review (fixpoint r2, C5): a pending harness publish drives the clock to the
+    // timers it armed itself — but the in-memory transport runs every job under its enqueuer's
+    // ExecutionContext, so work a recovery callback enqueued inside the publish inherited the
+    // attribution, and the publish drove the clock to that work's timers (a flow run's lease
+    // renewals, a delayed job's due time), firing every unrelated timer in between; and it drove
+    // to its own timers however far away they were. Each publish below is left pending on purpose,
+    // so the real-time guard (shortened) is what ends it — with the clock unmoved.
+
+    [Fact]
+    public async Task Publish_WhoseRecoveryCallbackStartsAFlowRun_NeverDrivesTheClockToThatRunsLeaseRenewals()
+    {
+        var state = new RecoveryKickoffState();
+        await using var harness = await AsyncResponseTestHarness.StartAsync(options =>
+        {
+            options.RealTimeGuard = TimeSpan.FromSeconds(1);
+            options.FlowObservers.Add(state);
+            // A renewal due well inside the publish-driving horizon: only the attribution decides
+            // whether the publish drives the clock to it.
+            options.DurableFlows = flows =>
+            {
+                flows.ExecutionLeaseDuration = TimeSpan.FromSeconds(3);
+                flows.ExecutionLeaseRenewInterval = TimeSpan.FromSeconds(1);
+            };
+            options.ConfigureServices = services => services
+                .AddSingleton(state)
+                .AddSingleton<IRecoveryKickoff, RecoveryKickoff>();
+            options.ConfigureAsyncResponse = builder => builder.WithDurableFlow<ParkedOnReplyFlow, ParkedRestartInput>();
+        });
+
+        const string correlationId = "order-starts-a-flow";
+        await RegisterLostSubscriberAsync(harness, correlationId, target => target.StartFlowAsync());
+        var before = harness.Clock.GetUtcNow();
+        try
+        {
+            var publish = harness.PublishAsync(new OperationResult { Status = OperationStatus.Completed }, correlationId);
+
+            // Hang guard only: the run holds its lease — renewal armed — and parks on its step.
+            await state.Parked.Task.WaitAsync(TimeSpan.FromSeconds(10));
+
+            await Assert.ThrowsAsync<TimeoutException>(() => publish);
+            Assert.Equal(before, harness.Clock.GetUtcNow());
+        }
+        finally
+        {
+            state.Release.TrySetResult();
+        }
+    }
+
+    [Fact]
+    public async Task Publish_WhoseRecoveryCallbackSchedulesADelayedJob_NeverDrivesTheClockToItsDueTime()
+    {
+        var state = new RecoveryKickoffState();
+        var audit = new RecordingDeferredWorkAudit();
+        await using var harness = await AsyncResponseTestHarness.StartAsync(options =>
+        {
+            options.RealTimeGuard = TimeSpan.FromSeconds(1);
+            options.ConfigureServices = services => services
+                .AddSingleton(state)
+                .AddSingleton<IDeferredWorkAudit>(audit)
+                .AddSingleton<IRecoveryKickoff, RecoveryKickoff>();
+        });
+
+        const string correlationId = "order-schedules-a-job";
+        await RegisterLostSubscriberAsync(harness, correlationId, target => target.ScheduleDelayedJobAsync());
+        var before = harness.Clock.GetUtcNow();
+        try
+        {
+            var publish = harness.PublishAsync(new OperationResult { Status = OperationStatus.Completed }, correlationId);
+            await state.Scheduled.Task.WaitAsync(TimeSpan.FromSeconds(10));
+
+            await Assert.ThrowsAsync<TimeoutException>(() => publish);
+            Assert.Equal(before, harness.Clock.GetUtcNow());
+            Assert.Empty(audit.Ran);
+        }
+        finally
+        {
+            state.Release.TrySetResult();
+        }
+    }
+
+    [Fact]
+    public async Task Publish_WaitingOnALongTimerItArmedItself_IsBoundedByTheGuard_InsteadOfJumpingTheClock()
+    {
+        await using var harness = await AsyncResponseTestHarness.StartAsync(options =>
+        {
+            options.RealTimeGuard = TimeSpan.FromSeconds(1);
+            options.ConfigureServices = services => services
+                .AddSingleton(new RecoveryKickoffState())
+                .AddSingleton<IRecoveryKickoff, RecoveryKickoff>();
+        });
+
+        const string correlationId = "order-naps-an-hour";
+        await RegisterLostSubscriberAsync(harness, correlationId, target => target.NapAsync());
+        var before = harness.Clock.GetUtcNow();
+
+        // An hour is no retry backoff: driving the clock there fired an hour of unrelated timers.
+        await Assert.ThrowsAsync<TimeoutException>(() =>
+            harness.PublishAsync(new OperationResult { Status = OperationStatus.Completed }, correlationId));
+        Assert.Equal(before, harness.Clock.GetUtcNow());
+    }
+
+    /// <summary>Registers a recoverable wait whose resume callback is <paramref name="resume"/>, then loses its subscriber.</summary>
+    private static async Task RegisterLostSubscriberAsync(
+        AsyncResponseTestHarness harness,
+        string correlationId,
+        System.Linq.Expressions.Expression<Func<IRecoveryKickoff, Task>> resume)
+    {
+        var subscriber = harness.Services.GetRequiredService<IRecoverableAsyncResponseSubscriber>();
+        _ = await subscriber.CreateRecoverableResponseWaiter<OperationResult>(
+            correlationId,
+            resumeCallback: CallbackExpressionConverter.ToReflectionCall(resume));
+        await harness.SimulateRestartAsync();
     }
 
     [Fact]

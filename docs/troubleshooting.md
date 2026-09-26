@@ -195,10 +195,11 @@ owns the full story — this page is the map, not the territory.
   handler running. Strip `x-death` (and the `AR-DeadLetter-*` headers)
   when replaying so the replay starts from attempt 1, or, for a durable flow, call
   `ResumeAsync(flowId)` instead of replaying its wake-up.
-- **`MaxDeliveryAttempts = 1` with durable flows:** a startup warning. Every delivery the broker
-  requeues on its own — a flow handed back at host stop, a channel closed under a running handler —
-  comes back `redelivered`, resolves to attempt 2 and is rejected before its handler runs, so a
-  flow's wake-up can be lost on a routine deploy. Use 2 or more (or 0).
+- **`MaxDeliveryAttempts = 1` in `AckAfterHandlerCompletes`:** a startup warning (durable-flow jobs
+  ride the worker queue). Every delivery the broker requeues on its own — a flow handed back at host
+  stop, a delivery prefetched but not yet started when host stop began, a channel closed under a
+  running handler — comes back `redelivered`, resolves to attempt 2 and is rejected before its
+  handler runs, so a flow's wake-up can be lost on a routine deploy. Use 2 or more (or 0).
 
 ## Durable flows
 

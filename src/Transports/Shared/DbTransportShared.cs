@@ -44,6 +44,7 @@ internal abstract class DbMessageDispatcherBase : IAsyncDisposable
     private readonly string _roleTagName;
     private readonly string _ackModeTagName;
     private readonly TimeProvider _timeProvider;
+    private readonly CancellationToken _hostStopping;
 
     private readonly Channel<DbTransportDelivery>? _backgroundQueue;
     private readonly Task[]? _backgroundWorkers;
@@ -58,7 +59,8 @@ internal abstract class DbMessageDispatcherBase : IAsyncDisposable
         string providerName,
         string unitNoun,
         string telemetryName,
-        TimeProvider? timeProvider = null)
+        TimeProvider? timeProvider = null,
+        CancellationToken hostStopping = default)
     {
         DbTransportOptionsValidator.ValidateSubscriber(options, subscriberOptions, role.ToString());
 
@@ -74,8 +76,14 @@ internal abstract class DbMessageDispatcherBase : IAsyncDisposable
         _roleTagName = $"asyncresponse.{telemetryName}.role";
         _ackModeTagName = $"asyncresponse.{telemetryName}.ack_mode";
 
-        // Clocks the lease-renewal beat only (a test seam; the system clock when omitted).
+        // Clocks the lease-renewal beat and the parked claim's lease age (a test seam; the system
+        // clock when omitted).
         _timeProvider = timeProvider ?? TimeProvider.System;
+
+        // A worker subscriber's WorkerIntakeGate.HostStopping: once it fires, a delivery is handed
+        // back instead of started or early-ACKed. It never fires for a response subscriber (host
+        // stop does not interrupt waiters) or without a registered host lifetime.
+        _hostStopping = hostStopping;
 
         if (subscriberOptions.AckMode is DbAckMode.AckAfterEnqueue)
         {
@@ -95,6 +103,19 @@ internal abstract class DbMessageDispatcherBase : IAsyncDisposable
     /// <summary>Handles one claimed queue item.</summary>
     public async Task HandleAsync(DbTransportDelivery delivery, CancellationToken cancellationToken)
     {
+        // Worker intake stops at host stop (WorkerIntakeGate). The subscriber loop claims nothing
+        // once ApplicationStopping has fired, but a claim already in flight at that moment still
+        // lands here: hand it straight back — released for immediate redelivery, neither started
+        // nor early-ACKed — so a live replica runs it, instead of this host running it up to its
+        // first flow wait and handing it back there (a lock held until the lease lapses, or under
+        // early ACK a wake-up already settled and turned into a dead-letter copy). The claim's
+        // attempt is spent either way.
+        if (_hostStopping.IsCancellationRequested)
+        {
+            await NakWhileStoppingAsync(delivery, TimeSpan.Zero).ConfigureAwait(false);
+            return;
+        }
+
         // Pre-execution cap, BEFORE either ack mode. HandleFailureAsync below is the only other
         // place the cap is consulted, and it runs only when the handler THREW — so a delivery that
         // ends any other way (the process dies mid-handler, the host is killed, the lease lapses
@@ -107,13 +128,34 @@ internal abstract class DbMessageDispatcherBase : IAsyncDisposable
         var cap = _subscriberOptions.MaxDeliveryAttempts;
         if (cap > 0 && delivery.Attempt > cap)
         {
-            _logger.LogError(
-                "{Provider} message on queue {Queue} ({Role}) arrived on attempt {Attempt} with a cap of {MaxDeliveryAttempts}; dead-lettering without executing it.",
-                _providerName,
-                delivery.Queue,
-                _role,
-                delivery.Attempt,
-                cap);
+            // Every log line on a settle path goes through SafeLog: a throwing logging provider
+            // (Microsoft.Extensions.Logging rethrows a provider's failure) must not skip the
+            // settlement after it and tear the subscriber down with the row still claimed. With
+            // DeadLetterEnabled = false the store drops the row instead of burying it, and the line
+            // says so rather than claim a copy.
+            SafeLog.Try((Self: this, Delivery: delivery, Cap: cap), static s =>
+            {
+                if (s.Self._options.DeadLetterEnabled)
+                {
+                    s.Self._logger.LogError(
+                        "{Provider} message on queue {Queue} ({Role}) arrived on attempt {Attempt} with a cap of {MaxDeliveryAttempts}; dead-lettering without executing it.",
+                        s.Self._providerName,
+                        s.Delivery.Queue,
+                        s.Self._role,
+                        s.Delivery.Attempt,
+                        s.Cap);
+                }
+                else
+                {
+                    s.Self._logger.LogError(
+                        "{Provider} message on queue {Queue} ({Role}) arrived on attempt {Attempt} with a cap of {MaxDeliveryAttempts}; dropping it without executing it (DeadLetterEnabled is false, so no dead-letter copy is written).",
+                        s.Self._providerName,
+                        s.Delivery.Queue,
+                        s.Self._role,
+                        s.Delivery.Attempt,
+                        s.Cap);
+                }
+            });
 
             var buried = await DeadLetterSwallowingFailureAsync(
                     delivery,
@@ -124,11 +166,11 @@ internal abstract class DbMessageDispatcherBase : IAsyncDisposable
 
             if (!buried)
             {
-                _logger.LogWarning(
+                SafeLog.Try((Self: this, Delivery: delivery), static s => s.Self._logger.LogWarning(
                     "{Provider} dead-letter publish failed for over-cap message on queue {Queue} ({Role}); releasing for retry.",
-                    _providerName,
-                    delivery.Queue,
-                    _role);
+                    s.Self._providerName,
+                    s.Delivery.Queue,
+                    s.Self._role));
                 await NakSwallowingFailureAsync(delivery).ConfigureAwait(false);
             }
 
@@ -188,13 +230,13 @@ internal abstract class DbMessageDispatcherBase : IAsyncDisposable
             // exactly like the stop path (the heartbeat ends with the handler, so the lease lapses
             // and the row is redelivered after the restart), and RETURN rather than rethrow: with
             // a live token, a rethrow reads to the supervisor as a subscriber fault.
-            _logger.LogDebug(
-                ex,
+            SafeLog.Try((Self: this, Delivery: delivery, Error: ex), static s => s.Self._logger.LogDebug(
+                s.Error,
                 "{Provider} message {MessageId} on queue {Queue} ({Role}) was handed back by a stopping host; leaving the claim unsettled for redelivery.",
-                _providerName,
-                delivery.Id,
-                delivery.Queue,
-                _role);
+                s.Self._providerName,
+                s.Delivery.Id,
+                s.Delivery.Queue,
+                s.Self._role));
             return;
         }
         catch (Exception ex)
@@ -213,23 +255,25 @@ internal abstract class DbMessageDispatcherBase : IAsyncDisposable
         }
         catch (Exception ex)
         {
-            _logger.LogWarning(
-                ex,
+            SafeLog.Try((Self: this, Delivery: delivery, Error: ex), static s => s.Self._logger.LogWarning(
+                s.Error,
                 "Failed to ACK {Provider} message {MessageId} on queue {Queue} ({Role}) after a successful handler; the lease will lapse and the {Unit} may be redelivered.",
-                _providerName,
-                delivery.Id,
-                delivery.Queue,
-                _role,
-                _unitNoun);
+                s.Self._providerName,
+                s.Delivery.Id,
+                s.Delivery.Queue,
+                s.Self._role,
+                s.Self._unitNoun));
         }
     }
 
     /// <param name="delivery">The claimed delivery whose lease is renewed.</param>
     /// <param name="cancellationToken">Ends the loop (the handler finished, or the park ended).</param>
-    /// <param name="leaseLost">Cancelled when a renew reports the <c>lock_id</c> fence gone — positive
-    /// knowledge that a peer re-claimed (or finished) the row, since the renew is fenced on
-    /// <c>lock_id</c> alone.</param>
-    private async Task RenewLeaseLoopAsync(DbTransportDelivery delivery, CancellationToken cancellationToken, CancellationTokenSource? leaseLost = null)
+    /// <param name="park">The early-ACK park's view of the lease, when the loop runs for a parked
+    /// claim: dated by every renew that lands, and marked lost when a renew reports the
+    /// <c>lock_id</c> fence gone — positive knowledge that a peer re-claimed (or finished) the row,
+    /// since the renew is fenced on <c>lock_id</c> alone — or when renewals are still failing once
+    /// <c>LockTimeout</c> has passed since the last one that landed.</param>
+    private async Task RenewLeaseLoopAsync(DbTransportDelivery delivery, CancellationToken cancellationToken, ParkedLease? park = null)
     {
         // A third of the lease, and a FAILED beat retries on a short backoff instead of waiting out
         // another full beat. At LockTimeout/2 with the retry one more beat away, the retry landed
@@ -237,12 +281,22 @@ internal abstract class DbMessageDispatcherBase : IAsyncDisposable
         // command timeout, a broken pooled connection, a SQL Server 1205 deadlock victim)
         // guaranteed the lease lapsed, a peer claimed the row within its EmptyPollDelay, and a
         // healthy long handler ran twice concurrently. Now a failed beat leaves two thirds of the
-        // lease for retries a second (or LockTimeout/10) apart. Both waits are floored at a
-        // millisecond: Task.Delay truncates to whole milliseconds, and a zero wait would spin.
+        // lease for retries that start a second (or LockTimeout/10) apart. Both waits are floored
+        // at a millisecond: Task.Delay truncates to whole milliseconds, and a zero wait would spin.
+        //
+        // The retries back off from there (RenewRetryDelay): at a fixed second apart, a database
+        // outage had every in-flight delivery renewing once a second for as long as it lasted —
+        // past locked_until too — so the fleet's renewal load rose about twentyfold exactly while
+        // the store was failing.
         var interval = TimeSpan.FromTicks(Math.Max(TimeSpan.TicksPerMillisecond, _options.LockTimeout.Ticks / 3));
         var retryInterval = TimeSpan.FromTicks(Math.Max(TimeSpan.TicksPerMillisecond, Math.Min(TimeSpan.TicksPerSecond, _options.LockTimeout.Ticks / 10)));
         var wait = interval;
-        var failing = false;
+        var failures = 0;
+
+        // The local start of the last renew that landed: the database stamps locked_until = now +
+        // LockTimeout only once the statement runs, so the lease lasts at least LockTimeout past it.
+        // Until one lands, the loop's (or the park's) start stands in for the claim.
+        var leaseStart = park?.LastRenewStart ?? _timeProvider.GetTimestamp();
         try
         {
             while (true)
@@ -262,6 +316,7 @@ internal abstract class DbMessageDispatcherBase : IAsyncDisposable
                 // two thirds of the lease left after the beat, so the lease lapsed before the
                 // short-backoff retry below ever ran and a peer re-ran a healthy handler. A timed-out
                 // attempt is a failed beat: retried, on a fresh connection, inside the lease.
+                var attemptStart = _timeProvider.GetTimestamp();
                 bool renewed;
                 try
                 {
@@ -274,22 +329,40 @@ internal abstract class DbMessageDispatcherBase : IAsyncDisposable
                     if (cancellationToken.IsCancellationRequested)
                         return;
 
+                    // A parked claim has no handler under it to protect, only a queue slot to wait
+                    // for — and once LockTimeout has passed since the last renew that landed, a
+                    // peer may already hold the row: a renew that keeps FAILING (this host cut off
+                    // from the database while its peers are not) can never report the fence gone,
+                    // so waiting for that answer enqueued a job a peer was already running. Lost:
+                    // the park drops it, and the row itself stays claimable.
+                    if (park is not null && _timeProvider.GetElapsedTime(leaseStart) >= _options.LockTimeout)
+                    {
+                        park.MarkLost();
+                        SafeLog.Try((Self: this, Delivery: delivery, Error: ex), static s => s.Self._logger.LogWarning(
+                            s.Error,
+                            "Lease of parked {Provider} message {MessageId} on queue {Queue} ({Role}) could not be renewed within LockTimeout; treating it as lost — another subscriber may process it (at-least-once preserved).",
+                            s.Self._providerName,
+                            s.Delivery.Id,
+                            s.Delivery.Queue,
+                            s.Self._role));
+                        return;
+                    }
+
                     // Keep retrying past locked_until too: the renew is fenced on lock_id alone,
                     // so until a peer actually re-claims the row a late renew still re-establishes
-                    // the lease. Only the first failure of a streak is a warning — at this
-                    // cadence a database outage would otherwise log one per second per in-flight
-                    // delivery.
-                    _logger.Log(
-                        failing ? LogLevel.Debug : LogLevel.Warning,
-                        ex,
-                        "Failed to renew the lease of {Provider} message {MessageId} on queue {Queue} ({Role}); retrying every {RetryInterval} until it succeeds or the lease is lost.",
-                        _providerName,
-                        delivery.Id,
-                        delivery.Queue,
-                        _role,
-                        retryInterval);
-                    failing = true;
-                    wait = retryInterval;
+                    // the lease. Only the first failure of a streak is a warning — a database
+                    // outage would otherwise log one per retry per in-flight delivery.
+                    failures++;
+                    wait = RenewRetryDelay(failures, retryInterval, interval, leaseStart);
+                    SafeLog.Try((Self: this, Delivery: delivery, Error: ex, Level: failures == 1 ? LogLevel.Warning : LogLevel.Debug, Delay: wait), static s => s.Self._logger.Log(
+                        s.Level,
+                        s.Error,
+                        "Failed to renew the lease of {Provider} message {MessageId} on queue {Queue} ({Role}); retrying in {RetryDelay}, backing off, until it succeeds or the lease is lost.",
+                        s.Self._providerName,
+                        s.Delivery.Id,
+                        s.Delivery.Queue,
+                        s.Self._role,
+                        s.Delay));
                     continue;
                 }
 
@@ -303,26 +376,20 @@ internal abstract class DbMessageDispatcherBase : IAsyncDisposable
                 {
                     // The lock_id fence no longer matches: the lease expired and another subscriber
                     // claimed the queue item. Stop renewing; the fenced ack/NAK will no-op for this
-                    // claim.
-                    _logger.LogWarning(
+                    // claim. The park hears it before the log line runs.
+                    park?.MarkLost();
+                    SafeLog.Try((Self: this, Delivery: delivery), static s => s.Self._logger.LogWarning(
                         "Lease of {Provider} message {MessageId} on queue {Queue} ({Role}) was lost; another subscriber may process it (at-least-once preserved).",
-                        _providerName,
-                        delivery.Id,
-                        delivery.Queue,
-                        _role);
-                    try
-                    {
-                        leaseLost?.Cancel();
-                    }
-                    catch (ObjectDisposedException)
-                    {
-                        // The park already ended and disposed its source; nobody is listening.
-                    }
-
+                        s.Self._providerName,
+                        s.Delivery.Id,
+                        s.Delivery.Queue,
+                        s.Self._role));
                     return;
                 }
 
-                failing = false;
+                leaseStart = attemptStart;
+                park?.Renewed(attemptStart);
+                failures = 0;
                 wait = interval;
             }
         }
@@ -331,6 +398,61 @@ internal abstract class DbMessageDispatcherBase : IAsyncDisposable
             // A cancellation surfacing through RenewAsync while the token fires; the beat wait
             // itself never throws.
         }
+    }
+
+    /// <summary>
+    /// The wait before the next renew after <paramref name="failures"/> consecutive failed ones:
+    /// exponential with half-jitter from <paramref name="retryInterval"/> up to the beat
+    /// <paramref name="interval"/> (<see cref="AsyncResponseRetry.Backoff"/>), except that while the
+    /// lease is still in hand the wait never reaches past its last <paramref name="retryInterval"/>:
+    /// one attempt always lands just before the lease lapses, so a blip that clears anywhere inside
+    /// the lease still renews it (the backoff alone could jump from inside the lease to past it).
+    /// Past <c>locked_until</c> the plain backoff applies.
+    /// </summary>
+    private TimeSpan RenewRetryDelay(int failures, TimeSpan retryInterval, TimeSpan interval, long leaseStart)
+    {
+        var delay = AsyncResponseRetry.Backoff(failures, retryInterval, interval);
+        var untilLastRetry = _options.LockTimeout - retryInterval - _timeProvider.GetElapsedTime(leaseStart);
+        if (untilLastRetry > TimeSpan.Zero && delay > untilLastRetry)
+            delay = untilLastRetry;
+
+        return TimeSpan.FromTicks(Math.Max(TimeSpan.TicksPerMillisecond, delay.Ticks));
+    }
+
+    /// <summary>
+    /// What a claim parked on the full early-ACK queue knows of its lease: <see cref="Lost"/> fires
+    /// once the heartbeat has positive knowledge (the <c>lock_id</c> fence no longer matched, or
+    /// renewals kept failing past <c>LockTimeout</c>), and <see cref="LastRenewStart"/> dates the
+    /// lease — the local start of the last renew that landed, the park's own start before any — so
+    /// the park can judge its age itself when a slot frees before the heartbeat has run again (a GC
+    /// or VM pause resumes the in-memory write and the timer-driven beat in either order).
+    /// </summary>
+    private sealed class ParkedLease(long parkStart) : IDisposable
+    {
+        private long _lastRenewStart = parkStart;
+
+        public CancellationTokenSource Lost { get; } = new();
+
+        public long LastRenewStart => Volatile.Read(ref _lastRenewStart);
+
+        public void Renewed(long attemptStart) => Volatile.Write(ref _lastRenewStart, attemptStart);
+
+        /// <summary>True once <paramref name="lockTimeout"/> has passed since <see cref="LastRenewStart"/>.</summary>
+        public bool IsLapsed(TimeProvider clock, TimeSpan lockTimeout) => clock.GetElapsedTime(LastRenewStart) >= lockTimeout;
+
+        public void MarkLost()
+        {
+            try
+            {
+                Lost.Cancel();
+            }
+            catch (ObjectDisposedException)
+            {
+                // The park already ended and disposed its source; nobody is listening.
+            }
+        }
+
+        public void Dispose() => Lost.Dispose();
     }
 
     // Single choke point for handler execution so both ACK modes emit the consumer receive span.
@@ -392,7 +514,7 @@ internal abstract class DbMessageDispatcherBase : IAsyncDisposable
             // burning an attempt (and on PostgreSQL notifying the whole fleet to come do the same).
             // Parking here pauses the claim loop, which is the actual backpressure (mirrors the
             // RabbitMQ/Kafka/NATS pause); the queue is built with FullMode.Wait for exactly this.
-            _logger.LogDebug("Background queue full for {Provider} {Role}; pausing the claim loop until capacity frees.", _providerName, _role);
+            SafeLog.Try(this, static self => self._logger.LogDebug("Background queue full for {Provider} {Role}; pausing the claim loop until capacity frees.", self._providerName, self._role));
 
             // The park is unbounded by design, but the claim's lease is not — and in early-ACK
             // mode the inline path's heartbeat never runs, so nothing renews it. A park longer
@@ -405,47 +527,64 @@ internal abstract class DbMessageDispatcherBase : IAsyncDisposable
             // the lock_id fence means a peer re-claimed the row (the database was unreachable from
             // here for most of a LockTimeout, a long GC or VM pause). Enqueueing it anyway once
             // capacity freed ran a job a peer already owned — or had finished — a second time,
-            // with this ack's fence then failing silently. Drop it instead: not ours any more.
+            // with this ack's fence then failing silently. Drop it instead: not ours any more. A
+            // renew that keeps THROWING never answers "fence gone", so the lease's age counts too:
+            // once LockTimeout has passed since the last renew that landed, a peer may hold the
+            // row, and the park drops it the same way (the heartbeat signals it; the park judges
+            // the age itself when a slot frees before the heartbeat has run again).
+            //
+            // Host stop ends the park too (WorkerIntakeGate): a delivery never enqueued is released
+            // for a live replica at once, rather than enqueued, early-ACKed and run up to its first
+            // flow wait on a host that is stopping.
+            using var lease = new ParkedLease(_timeProvider.GetTimestamp());
             using var renewalCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-            using var leaseLost = new CancellationTokenSource();
-            using var parkCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, leaseLost.Token);
-            var renewalTask = RenewLeaseLoopAsync(delivery, renewalCancellation.Token, leaseLost);
+            using var parkCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, lease.Lost.Token, _hostStopping);
+            var renewalTask = RenewLeaseLoopAsync(delivery, renewalCancellation.Token, lease);
             try
             {
-                await _backgroundQueue.Writer.WriteAsync(delivery, parkCancellation.Token).ConfigureAwait(false);
+                // WaitToWriteAsync + TryWrite rather than WriteAsync, so the lease is judged again
+                // between the slot freeing and the write. The subscriber loop is the queue's only
+                // writer, so the slot this wait saw free is still free for the TryWrite; a TryWrite
+                // that fails anyway means the dispatcher completed the queue in between.
+                while (true)
+                {
+                    if (!await _backgroundQueue.Writer.WaitToWriteAsync(parkCancellation.Token).ConfigureAwait(false))
+                        throw new ChannelClosedException();
+
+                    if (lease.Lost.IsCancellationRequested || lease.IsLapsed(_timeProvider, _options.LockTimeout))
+                    {
+                        DropLostLease(delivery);
+                        return;
+                    }
+
+                    // A slot can free in the same instant ApplicationStopping fires, and the wait
+                    // then completes true rather than cancelled: judge host stop again before the
+                    // write, or the delivery is enqueued and early-ACKed on a stopping host.
+                    if (_hostStopping.IsCancellationRequested)
+                    {
+                        await NakWhileStoppingAsync(delivery, TimeSpan.Zero).ConfigureAwait(false);
+                        return;
+                    }
+
+                    if (_backgroundQueue.Writer.TryWrite(delivery))
+                        break;
+                }
             }
-            catch (OperationCanceledException) when (leaseLost.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
+            catch (OperationCanceledException) when (lease.Lost.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
             {
-                // No NAK either: the fence is gone, so it would no-op against the new owner's claim.
-                _logger.LogDebug(
-                    "{Provider} message {MessageId} on queue {Queue} ({Role}) lost its lease while parked on a full background queue; dropped without enqueueing it.",
-                    _providerName,
-                    delivery.Id,
-                    delivery.Queue,
-                    _role);
+                DropLostLease(delivery);
                 return;
             }
             catch (Exception ex) when (ex is OperationCanceledException or ChannelClosedException)
             {
-                // Subscriber stopping or dispatcher draining while parked: the delivery was never
-                // enqueued, so release it promptly; if the NAK itself fails the lease lapses to
+                // Subscriber stopping, host stopping or dispatcher draining while parked: the
+                // delivery was never enqueued, so release it promptly — at host stop with no delay,
+                // for a live replica to take at once; if the NAK itself fails the lease lapses to
                 // the same effect.
-                try
-                {
-                    await delivery.NakAsync(_subscriberOptions.RedeliveryDelay).ConfigureAwait(false);
-                }
-                catch (Exception nakException)
-                {
-                    _logger.LogWarning(
-                        nakException,
-                        "Failed to NAK {Provider} message {MessageId} on queue {Queue} ({Role}) while stopping; the lease will lapse and the {Unit} will be redelivered.",
-                        _providerName,
-                        delivery.Id,
-                        delivery.Queue,
-                        _role,
-                        _unitNoun);
-                }
-
+                await NakWhileStoppingAsync(
+                        delivery,
+                        _hostStopping.IsCancellationRequested ? TimeSpan.Zero : _subscriberOptions.RedeliveryDelay)
+                    .ConfigureAwait(false);
                 return;
             }
             finally
@@ -465,14 +604,46 @@ internal abstract class DbMessageDispatcherBase : IAsyncDisposable
         }
         catch (Exception ex)
         {
-            _logger.LogWarning(
-                ex,
+            SafeLog.Try((Self: this, Delivery: delivery, Error: ex), static s => s.Self._logger.LogWarning(
+                s.Error,
                 "Failed to ACK {Provider} message {MessageId} on queue {Queue} ({Role}) after enqueueing it for background execution; the lease will lapse and the {Unit} may be redelivered.",
-                _providerName,
-                delivery.Id,
-                delivery.Queue,
-                _role,
-                _unitNoun);
+                s.Self._providerName,
+                s.Delivery.Id,
+                s.Delivery.Queue,
+                s.Self._role,
+                s.Self._unitNoun));
+        }
+    }
+
+    // No NAK for a parked claim whose lease is lost: the fence is gone (or may be), so it would
+    // no-op against the new owner's claim — and the row stays claimable either way.
+    private void DropLostLease(DbTransportDelivery delivery)
+        => SafeLog.Try((Self: this, Delivery: delivery), static s => s.Self._logger.LogDebug(
+            "{Provider} message {MessageId} on queue {Queue} ({Role}) lost its lease while parked on a full background queue; dropped without enqueueing it.",
+            s.Self._providerName,
+            s.Delivery.Id,
+            s.Delivery.Queue,
+            s.Self._role));
+
+    // Releases a delivery this subscriber will not start because it is stopping (its own stop, the
+    // dispatcher draining, or host stop at the worker intake gate). A NAK that fails is logged and
+    // swallowed: the lease lapses to the same effect.
+    private async Task NakWhileStoppingAsync(DbTransportDelivery delivery, TimeSpan delay)
+    {
+        try
+        {
+            await delivery.NakAsync(delay).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            SafeLog.Try((Self: this, Delivery: delivery, Error: ex), static s => s.Self._logger.LogWarning(
+                s.Error,
+                "Failed to NAK {Provider} message {MessageId} on queue {Queue} ({Role}) while stopping; the lease will lapse and the {Unit} will be redelivered.",
+                s.Self._providerName,
+                s.Delivery.Id,
+                s.Delivery.Queue,
+                s.Self._role,
+                s.Self._unitNoun));
         }
     }
 
@@ -492,30 +663,19 @@ internal abstract class DbMessageDispatcherBase : IAsyncDisposable
             // dead-letter/OnBackgroundFailure path instead of losing them silently.
             if (cancellationToken.IsCancellationRequested)
             {
-                var lapsed = new OperationCanceledException(
-                    "The ACK-after-enqueue drain budget lapsed before this already-ACKed message was handled.");
-
-                _logger.LogWarning(
-                    "{Provider} background handler for already-ACKed message {MessageId} on queue {Queue} ({Role}) was not started: the drain budget had lapsed. Dead-lettering and surfacing via OnBackgroundFailure.",
-                    _providerName,
-                    delivery.Id,
-                    delivery.Queue,
-                    _role);
-
-                if (!await DeadLetterSwallowingFailureAsync(delivery, lapsed, deleteOriginal: false).ConfigureAwait(false))
-                {
-                    _logger.LogError(
-                        "Failed to dead-letter undrained {Provider} message {MessageId} on queue {Queue} ({Role}); the loss is only observable via logs and OnBackgroundFailure.",
-                        _providerName,
-                        delivery.Id,
-                        delivery.Queue,
-                        _role);
-                }
-
-                await InvokeBackgroundFailureAsync(delivery, lapsed).ConfigureAwait(false);
+                await RouteUnstartedAsync(
+                        delivery,
+                        new OperationCanceledException("The ACK-after-enqueue drain budget lapsed before this already-ACKed message was handled."),
+                        "the drain budget had lapsed")
+                    .ConfigureAwait(false);
                 continue;
             }
 
+            // Every arm below settles FIRST — the dead-letter copy, then the OnBackgroundFailure
+            // report — and logs through SafeLog: Microsoft.Extensions.Logging rethrows a provider's
+            // failure, and a log line thrown ahead of the burial cost the already-ACKed job both
+            // its dead-letter copy and its report, and ended this worker (the queue then filled
+            // with ACKed rows no worker would ever run).
             try
             {
                 await ExecuteHandlerAsync(delivery, cancellationToken).ConfigureAwait(false);
@@ -527,49 +687,114 @@ internal abstract class DbMessageDispatcherBase : IAsyncDisposable
                 // it. Dead-letter a copy under its own reason so the wake-up keeps a record
                 // (replaying it is safe: the run resumes from its last checkpoint) and surface it
                 // (Kafka/RabbitMQ/Redis/NATS parity). A Warning when the copy was written; an Error
-                // when it was not (dead-lettering disabled or the burial failed), since the wake-up
+                // when it was not — dead-lettering disabled (the store then reports success without
+                // writing anything, so the flag decides) or the burial failed — since the wake-up
                 // is then lost unless OnBackgroundFailure records it.
                 var handedBack = new DurableFlowInterruptedException($"{HandedBackAfterCommitReason}: {ex.Message}", ex);
-                if (await DeadLetterSwallowingFailureAsync(delivery, handedBack, deleteOriginal: false).ConfigureAwait(false))
+                var buried = await DeadLetterSwallowingFailureAsync(delivery, handedBack, deleteOriginal: false).ConfigureAwait(false);
+                SafeLog.Try((Self: this, Delivery: delivery, Error: ex, Buried: buried), static s =>
                 {
-                    _logger.LogWarning(
-                        ex,
-                        "{Provider} background handler for already-ACKed message {MessageId} on queue {Queue} ({Role}) was handed back by the flow engine because the host is stopping; the early ACK already removed its row. Dead-lettered a copy ({Reason}) and surfacing via OnBackgroundFailure.",
-                        _providerName,
-                        delivery.Id,
-                        delivery.Queue,
-                        _role,
-                        HandedBackAfterCommitReason);
-                }
-                else
-                {
-                    _logger.LogError(
-                        ex,
-                        "{Provider} background handler for already-ACKed message {MessageId} on queue {Queue} ({Role}) was handed back by the flow engine because the host is stopping, and no dead-letter copy could be written (dead-lettering disabled or the burial failed): the wake-up is lost unless OnBackgroundFailure records it — resume the flow explicitly.",
-                        _providerName,
-                        delivery.Id,
-                        delivery.Queue,
-                        _role);
-                }
+                    if (s.Buried && s.Self._options.DeadLetterEnabled)
+                    {
+                        s.Self._logger.LogWarning(
+                            s.Error,
+                            "{Provider} background handler for already-ACKed message {MessageId} on queue {Queue} ({Role}) was handed back by the flow engine because the host is stopping; the early ACK already removed its row. Dead-lettered a copy ({Reason}) and surfacing via OnBackgroundFailure.",
+                            s.Self._providerName,
+                            s.Delivery.Id,
+                            s.Delivery.Queue,
+                            s.Self._role,
+                            HandedBackAfterCommitReason);
+                    }
+                    else
+                    {
+                        s.Self._logger.LogError(
+                            s.Error,
+                            "{Provider} background handler for already-ACKed message {MessageId} on queue {Queue} ({Role}) was handed back by the flow engine because the host is stopping, and no dead-letter copy was written ({Cause}): the wake-up is lost unless OnBackgroundFailure records it — resume the flow explicitly.",
+                            s.Self._providerName,
+                            s.Delivery.Id,
+                            s.Delivery.Queue,
+                            s.Self._role,
+                            s.Self._options.DeadLetterEnabled ? "the burial failed" : "DeadLetterEnabled is false");
+                    }
+                });
 
                 await InvokeBackgroundFailureAsync(delivery, ex).ConfigureAwait(false);
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "{Provider} background handler failed for {Role} on queue {Queue} after early ACK.", _providerName, _role, delivery.Queue);
-                if (!await DeadLetterSwallowingFailureAsync(delivery, ex, deleteOriginal: false).ConfigureAwait(false))
+                var buried = await DeadLetterSwallowingFailureAsync(delivery, ex, deleteOriginal: false).ConfigureAwait(false);
+                SafeLog.Try((Self: this, Delivery: delivery, Error: ex, Buried: buried), static s =>
                 {
-                    _logger.LogError(
-                        "Failed to dead-letter already-ACKed {Provider} message {MessageId} on queue {Queue} ({Role}); the failure is only observable via logs and OnBackgroundFailure.",
-                        _providerName,
-                        delivery.Id,
-                        delivery.Queue,
-                        _role);
-                }
+                    s.Self._logger.LogError(s.Error, "{Provider} background handler failed for {Role} on queue {Queue} after early ACK.", s.Self._providerName, s.Self._role, s.Delivery.Queue);
+                    if (!s.Self._options.DeadLetterEnabled)
+                    {
+                        s.Self._logger.LogError(
+                            "No dead-letter copy of already-ACKed {Provider} message {MessageId} on queue {Queue} ({Role}) is written (DeadLetterEnabled is false); the failure is only observable via logs and OnBackgroundFailure.",
+                            s.Self._providerName,
+                            s.Delivery.Id,
+                            s.Delivery.Queue,
+                            s.Self._role);
+                    }
+                    else if (!s.Buried)
+                    {
+                        s.Self._logger.LogError(
+                            "Failed to dead-letter already-ACKed {Provider} message {MessageId} on queue {Queue} ({Role}); the failure is only observable via logs and OnBackgroundFailure.",
+                            s.Self._providerName,
+                            s.Delivery.Id,
+                            s.Delivery.Queue,
+                            s.Self._role);
+                    }
+                });
 
                 await InvokeBackgroundFailureAsync(delivery, ex).ConfigureAwait(false);
             }
         }
+    }
+
+    /// <summary>
+    /// Accounts for an already-ACKed entry that will never be started — the drain budget lapsed, or
+    /// no background worker is left to start it. Its row is gone (the early ACK deleted it), so the
+    /// dead-letter copy is written FIRST, then the outcome logged (through SafeLog), then the entry
+    /// surfaced through OnBackgroundFailure: a throwing logging provider must not cost the record.
+    /// </summary>
+    private async Task RouteUnstartedAsync(DbTransportDelivery delivery, OperationCanceledException notStarted, string why)
+    {
+        var buried = await DeadLetterSwallowingFailureAsync(delivery, notStarted, deleteOriginal: false).ConfigureAwait(false);
+        SafeLog.Try((Self: this, Delivery: delivery, Buried: buried, Why: why), static s =>
+        {
+            if (!s.Self._options.DeadLetterEnabled)
+            {
+                s.Self._logger.LogError(
+                    "{Provider} background handler for already-ACKed message {MessageId} on queue {Queue} ({Role}) was not started: {Why}, and no dead-letter copy is written (DeadLetterEnabled is false). The job is lost unless OnBackgroundFailure records it.",
+                    s.Self._providerName,
+                    s.Delivery.Id,
+                    s.Delivery.Queue,
+                    s.Self._role,
+                    s.Why);
+            }
+            else if (s.Buried)
+            {
+                s.Self._logger.LogWarning(
+                    "{Provider} background handler for already-ACKed message {MessageId} on queue {Queue} ({Role}) was not started: {Why}. Dead-lettered a copy and surfacing via OnBackgroundFailure.",
+                    s.Self._providerName,
+                    s.Delivery.Id,
+                    s.Delivery.Queue,
+                    s.Self._role,
+                    s.Why);
+            }
+            else
+            {
+                s.Self._logger.LogError(
+                    "Failed to dead-letter undrained {Provider} message {MessageId} on queue {Queue} ({Role}), which was not started: {Why}; the loss is only observable via logs and OnBackgroundFailure.",
+                    s.Self._providerName,
+                    s.Delivery.Id,
+                    s.Delivery.Queue,
+                    s.Self._role,
+                    s.Why);
+            }
+        });
+
+        await InvokeBackgroundFailureAsync(delivery, notStarted).ConfigureAwait(false);
     }
 
     private async Task HandleFailureAsync(DbTransportDelivery delivery, Exception exception)
@@ -577,13 +802,32 @@ internal abstract class DbMessageDispatcherBase : IAsyncDisposable
         var maxAttempts = _subscriberOptions.MaxDeliveryAttempts;
         if (maxAttempts > 0 && delivery.Attempt >= maxAttempts)
         {
-            _logger.LogError(
-                exception,
-                "{Provider} message on queue {Queue} ({Role}) failed after {Attempts} attempts; dead-lettering.",
-                _providerName,
-                delivery.Queue,
-                _role,
-                delivery.Attempt);
+            // With DeadLetterEnabled = false the store drops the row instead of burying it; the
+            // line says so rather than claim a copy. Logged through SafeLog, like every line on a
+            // settle path: a throwing provider must not skip the settlement that follows.
+            SafeLog.Try((Self: this, Delivery: delivery, Error: exception), static s =>
+            {
+                if (s.Self._options.DeadLetterEnabled)
+                {
+                    s.Self._logger.LogError(
+                        s.Error,
+                        "{Provider} message on queue {Queue} ({Role}) failed after {Attempts} attempts; dead-lettering.",
+                        s.Self._providerName,
+                        s.Delivery.Queue,
+                        s.Self._role,
+                        s.Delivery.Attempt);
+                }
+                else
+                {
+                    s.Self._logger.LogError(
+                        s.Error,
+                        "{Provider} message on queue {Queue} ({Role}) failed after {Attempts} attempts; dropping it (DeadLetterEnabled is false, so no dead-letter copy is written).",
+                        s.Self._providerName,
+                        s.Delivery.Queue,
+                        s.Self._role,
+                        s.Delivery.Attempt);
+                }
+            });
 
             // CancellationToken.None like every other settlement in this file: burying a poison
             // row must not be abandoned half-done by a shutdown — with the stopping token, a
@@ -593,19 +837,24 @@ internal abstract class DbMessageDispatcherBase : IAsyncDisposable
             var deadLettered = await DeadLetterSwallowingFailureAsync(delivery, exception, deleteOriginal: true).ConfigureAwait(false);
             if (!deadLettered)
             {
-                _logger.LogWarning(exception, "{Provider} dead-letter publish failed for queue {Queue} ({Role}); releasing for retry.", _providerName, delivery.Queue, _role);
+                SafeLog.Try((Self: this, Delivery: delivery, Error: exception), static s => s.Self._logger.LogWarning(
+                    s.Error,
+                    "{Provider} dead-letter publish failed for queue {Queue} ({Role}); releasing for retry.",
+                    s.Self._providerName,
+                    s.Delivery.Queue,
+                    s.Self._role));
                 await NakSwallowingFailureAsync(delivery).ConfigureAwait(false);
             }
         }
         else
         {
-            _logger.LogWarning(
-                exception,
+            SafeLog.Try((Self: this, Delivery: delivery, Error: exception), static s => s.Self._logger.LogWarning(
+                s.Error,
                 "{Provider} message on queue {Queue} ({Role}) failed on attempt {Attempt}; releasing for redelivery.",
-                _providerName,
-                delivery.Queue,
-                _role,
-                delivery.Attempt);
+                s.Self._providerName,
+                s.Delivery.Queue,
+                s.Self._role,
+                s.Delivery.Attempt));
             await NakSwallowingFailureAsync(delivery).ConfigureAwait(false);
         }
     }
@@ -627,13 +876,13 @@ internal abstract class DbMessageDispatcherBase : IAsyncDisposable
         }
         catch (Exception ex)
         {
-            _logger.LogWarning(
-                ex,
+            SafeLog.Try((Self: this, Delivery: delivery, Error: ex), static s => s.Self._logger.LogWarning(
+                s.Error,
                 "Failed to dead-letter {Provider} message {MessageId} on queue {Queue} ({Role}); treating the burial as failed.",
-                _providerName,
-                delivery.Id,
-                delivery.Queue,
-                _role);
+                s.Self._providerName,
+                s.Delivery.Id,
+                s.Delivery.Queue,
+                s.Self._role));
             return false;
         }
     }
@@ -651,14 +900,14 @@ internal abstract class DbMessageDispatcherBase : IAsyncDisposable
         }
         catch (Exception ex)
         {
-            _logger.LogWarning(
-                ex,
+            SafeLog.Try((Self: this, Delivery: delivery, Error: ex), static s => s.Self._logger.LogWarning(
+                s.Error,
                 "Failed to NAK {Provider} message {MessageId} on queue {Queue} ({Role}) after a failed handler; the lease will lapse and the {Unit} will be redelivered.",
-                _providerName,
-                delivery.Id,
-                delivery.Queue,
-                _role,
-                _unitNoun);
+                s.Self._providerName,
+                s.Delivery.Id,
+                s.Delivery.Queue,
+                s.Self._role,
+                s.Self._unitNoun));
         }
     }
 
@@ -675,7 +924,7 @@ internal abstract class DbMessageDispatcherBase : IAsyncDisposable
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "{Provider} OnBackgroundFailure callback threw for {Role}.", _providerName, _role);
+            SafeLog.Try((Self: this, Error: ex), static s => s.Self._logger.LogError(s.Error, "{Provider} OnBackgroundFailure callback threw for {Role}.", s.Self._providerName, s.Self._role));
         }
     }
 
@@ -704,20 +953,58 @@ internal abstract class DbMessageDispatcherBase : IAsyncDisposable
         }
         catch (TimeoutException)
         {
-            _logger.LogWarning("{Provider} background handlers for {Role} did not drain within {Timeout}; dead-lettering the entries still queued.", _providerName, _role, drainBudget);
+            // Cancel FIRST, then log (through SafeLog, like every line in this drain): a throwing
+            // logging provider must not keep the workers from switching to post-lapse routing, nor
+            // throw out of the dispose.
             await _backgroundCts!.CancelAsync().ConfigureAwait(false);
+            // Each line of this drain claims a dead-letter copy only when one is written: with
+            // DeadLetterEnabled = false the entries are only reported (RouteUnstartedAsync parity).
+            SafeLog.Try((Self: this, Budget: drainBudget), static s =>
+            {
+                if (s.Self._options.DeadLetterEnabled)
+                {
+                    s.Self._logger.LogWarning(
+                        "{Provider} background handlers for {Role} did not drain within {Timeout}; dead-lettering the entries still queued.",
+                        s.Self._providerName,
+                        s.Self._role,
+                        s.Budget);
+                }
+                else
+                {
+                    s.Self._logger.LogWarning(
+                        "{Provider} background handlers for {Role} did not drain within {Timeout}; reporting the entries still queued to OnBackgroundFailure without a dead-letter copy (DeadLetterEnabled is false).",
+                        s.Self._providerName,
+                        s.Self._role,
+                        s.Budget);
+                }
+            });
 
+            var reserveStart = System.Diagnostics.Stopwatch.GetTimestamp();
             try
             {
                 await Task.WhenAll(_backgroundWorkers!).WaitAsync(routingReserve).ConfigureAwait(false);
             }
             catch (TimeoutException)
             {
-                _logger.LogError(
-                    "{Provider} background workers for {Role} did not finish dead-lettering the undrained entries within the reserved {Reserve}; entries still queued at process exit are lost (their rows were deleted by the early ACK).",
-                    _providerName,
-                    _role,
-                    routingReserve);
+                SafeLog.Try((Self: this, Reserve: routingReserve), static s =>
+                {
+                    if (s.Self._options.DeadLetterEnabled)
+                    {
+                        s.Self._logger.LogError(
+                            "{Provider} background workers for {Role} did not finish dead-lettering the undrained entries within the reserved {Reserve}; entries still queued at process exit are lost (their rows were deleted by the early ACK).",
+                            s.Self._providerName,
+                            s.Self._role,
+                            s.Reserve);
+                    }
+                    else
+                    {
+                        s.Self._logger.LogError(
+                            "{Provider} background workers for {Role} did not finish reporting the undrained entries within the reserved {Reserve}; entries still queued at process exit are lost (their rows were deleted by the early ACK, and DeadLetterEnabled is false).",
+                            s.Self._providerName,
+                            s.Self._role,
+                            s.Reserve);
+                    }
+                });
 
                 // The workers are still running and observe _backgroundCts.Token inside ReadAllAsync, so disposing
                 // it now would throw ObjectDisposedException inside them. Dispose once they actually finish, off
@@ -731,7 +1018,11 @@ internal abstract class DbMessageDispatcherBase : IAsyncDisposable
             }
             catch (Exception ex)
             {
-                _logger.LogDebug(ex, "{Provider} background worker drain for {Role} ended with an error.", _providerName, _role);
+                SafeLog.Try((Self: this, Error: ex), static s => s.Self._logger.LogDebug(s.Error, "{Provider} background worker drain for {Role} ended with an error.", s.Self._providerName, s.Self._role));
+
+                // Every worker has finished, at least one by faulting: route what it left queued
+                // with whatever is left of the reserve.
+                await RouteStrandedAsync(routingReserve - System.Diagnostics.Stopwatch.GetElapsedTime(reserveStart)).ConfigureAwait(false);
             }
 
             // WhenAll completed one way or the other, so every worker has finished.
@@ -739,9 +1030,62 @@ internal abstract class DbMessageDispatcherBase : IAsyncDisposable
         }
         catch (Exception ex)
         {
-            // WhenAll only completes once every worker has finished, so the source is safe to dispose here.
-            _logger.LogDebug(ex, "{Provider} background worker drain for {Role} ended with an error.", _providerName, _role);
+            // WhenAll only completes once every worker has finished, so the source is safe to dispose
+            // here — but at least one of them FAULTED, and a worker that ended early left whatever was
+            // still queued with no reader: already-ACKed jobs whose rows the early ACK deleted. Route
+            // them here, inside the reserve, instead of losing them without a record.
+            SafeLog.Try((Self: this, Error: ex), static s => s.Self._logger.LogDebug(s.Error, "{Provider} background worker drain for {Role} ended with an error.", s.Self._providerName, s.Self._role));
             _backgroundCts!.Dispose();
+            await RouteStrandedAsync(routingReserve).ConfigureAwait(false);
+        }
+    }
+
+    /// <summary>
+    /// Routes (dead-letter, then OnBackgroundFailure) every entry still queued once all background
+    /// workers have finished with at least one of them faulted, bounded by <paramref name="budget"/>
+    /// like the rest of the drain.
+    /// </summary>
+    private async Task RouteStrandedAsync(TimeSpan budget)
+    {
+        try
+        {
+            await RouteEveryStrandedEntryAsync().WaitAsync(budget > TimeSpan.Zero ? budget : TimeSpan.Zero).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            SafeLog.Try((Self: this, Error: ex, Budget: budget), static s =>
+            {
+                if (s.Self._options.DeadLetterEnabled)
+                {
+                    s.Self._logger.LogError(
+                        s.Error,
+                        "{Provider} background workers for {Role} faulted, and the entries they left queued were not all dead-lettered within {Reserve}; entries still queued at process exit are lost (their rows were deleted by the early ACK).",
+                        s.Self._providerName,
+                        s.Self._role,
+                        s.Budget);
+                }
+                else
+                {
+                    s.Self._logger.LogError(
+                        s.Error,
+                        "{Provider} background workers for {Role} faulted, and the entries they left queued were not all reported within {Reserve}; entries still queued at process exit are lost (their rows were deleted by the early ACK, and DeadLetterEnabled is false).",
+                        s.Self._providerName,
+                        s.Self._role,
+                        s.Budget);
+                }
+            });
+        }
+    }
+
+    private async Task RouteEveryStrandedEntryAsync()
+    {
+        while (_backgroundQueue!.Reader.TryRead(out var delivery))
+        {
+            await RouteUnstartedAsync(
+                    delivery,
+                    new OperationCanceledException("No background worker was left to handle this already-ACKed message before the dispatcher stopped."),
+                    "no background worker was left to start it")
+                .ConfigureAwait(false);
         }
     }
 }

@@ -375,6 +375,31 @@ public class VirtualTimeProviderTests
         Assert.Equal(start + TimeSpan.FromSeconds(threads * advancesPerThread), clock.GetUtcNow());
     }
 
+    [Fact]
+    public void AdvanceToAtLeast_ATargetAnotherDriverAlreadyPassed_NeverMovesBackwards_ButFiresWhatIsDueNow()
+    {
+        // Pre-commit review (fixpoint r2, C4): the harness has two clock drivers — a pending
+        // publish driving its own backoffs, and the test's AdvanceAsync. Each read "now" outside
+        // the advance gate and then called AdvanceTo with a target computed from it; when the
+        // other driver moved past that target in between, AdvanceTo threw "Cannot advance virtual
+        // time backwards" and faulted the publish or the test's advance.
+        var clock = new VirtualTimeProvider();
+        var start = clock.GetUtcNow();
+        var staleTarget = start + TimeSpan.FromSeconds(1); // read before the other driver moved
+
+        clock.Advance(TimeSpan.FromSeconds(10)); // the other driver
+        var fired = 0;
+        using var dueNow = clock.CreateTimer(_ => fired++, null, TimeSpan.Zero, Timeout.InfiniteTimeSpan);
+
+        clock.AdvanceToAtLeast(staleTarget);
+
+        Assert.Equal(start + TimeSpan.FromSeconds(10), clock.GetUtcNow());
+        Assert.Equal(1, fired); // a timer due at the current instant still fires, as AdvanceTo(now) fired it
+
+        clock.AdvanceToAtLeast(start + TimeSpan.FromSeconds(12));
+        Assert.Equal(start + TimeSpan.FromSeconds(12), clock.GetUtcNow());
+    }
+
     // ---------------------------------------------------------------------------------------
     // Argument parity with the real timer. Code that arms a timer the BCL rejects (beyond the
     // ~49.7-day ceiling, a negative period) used to pass on the virtual clock and throw

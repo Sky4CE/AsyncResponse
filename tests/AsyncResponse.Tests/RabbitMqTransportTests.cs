@@ -1447,17 +1447,17 @@ public class RabbitMqTransportTests
         var options = new RabbitMqAsyncResponseOptions();
         options.WorkerSubscriber.PrefetchCount = 100;
 
-        var entries = await StartAndStopWorkerSubscriberAsync(options, durableFlows: true);
+        // Unconditional (fixpoint r2 GS5#1): the old "durable flows are registered" gate read
+        // IEnumerable<DurableFlowOptions>, which every host registers — so it was true in every real
+        // host and only a test could reach its false branch.
+        var entries = await StartAndStopWorkerSubscriberAsync(options);
 
         var warning = Assert.Single(entries, entry => entry.Level == LogLevel.Warning && entry.Message.Contains("prefetches 100", StringComparison.Ordinal));
         Assert.Contains("to 30 or less", warning.Message, StringComparison.Ordinal);
 
-        // Not at the default prefetch (30 min / 16 ≈ 112 s is above the floor), nor without flows.
+        // Not at the default prefetch (30 min / 16 ≈ 112 s is above the floor).
         Assert.DoesNotContain(
-            await StartAndStopWorkerSubscriberAsync(new RabbitMqAsyncResponseOptions(), durableFlows: true),
-            entry => entry.Message.Contains("prefetches", StringComparison.Ordinal));
-        Assert.DoesNotContain(
-            await StartAndStopWorkerSubscriberAsync(options, durableFlows: false),
+            await StartAndStopWorkerSubscriberAsync(new RabbitMqAsyncResponseOptions()),
             entry => entry.Message.Contains("prefetches", StringComparison.Ordinal));
     }
 
@@ -1473,17 +1473,15 @@ public class RabbitMqTransportTests
         capOfOne.WorkerSubscriber.MaxDeliveryAttempts = 1;
 
         var warning = Assert.Single(
-            await StartAndStopWorkerSubscriberAsync(capOfOne, durableFlows: true),
+            await StartAndStopWorkerSubscriberAsync(capOfOne),
             entry => entry.Level == LogLevel.Warning && entry.Message.Contains("MaxDeliveryAttempts = 1", StringComparison.Ordinal));
         Assert.Contains("attempt 2", warning.Message, StringComparison.Ordinal);
+        Assert.Contains("durable-flow jobs ride this queue", warning.Message, StringComparison.Ordinal);
 
         var capOfTwo = new RabbitMqAsyncResponseOptions();
         capOfTwo.WorkerSubscriber.MaxDeliveryAttempts = 2;
         Assert.DoesNotContain(
-            await StartAndStopWorkerSubscriberAsync(capOfTwo, durableFlows: true),
-            entry => entry.Message.Contains("MaxDeliveryAttempts = 1", StringComparison.Ordinal));
-        Assert.DoesNotContain(
-            await StartAndStopWorkerSubscriberAsync(capOfOne, durableFlows: false),
+            await StartAndStopWorkerSubscriberAsync(capOfTwo),
             entry => entry.Message.Contains("MaxDeliveryAttempts = 1", StringComparison.Ordinal));
     }
 
@@ -1552,9 +1550,55 @@ public class RabbitMqTransportTests
                 && entry.Message.Contains("consumer cancel", StringComparison.Ordinal));
     }
 
-    private static async Task<IReadOnlyList<RecordedLog>> StartAndStopWorkerSubscriberAsync(
-        RabbitMqAsyncResponseOptions options,
-        bool durableFlows)
+    [Theory]
+    [InlineData(RabbitMqAckMode.AckAfterHandlerCompletes)]
+    [InlineData(RabbitMqAckMode.AckAfterEnqueue)]
+    public async Task WorkerSubscriber_OnceTheHostIsStopping_TakesNoNewDelivery(RabbitMqAckMode ackMode)
+    {
+        // Regression (fixpoint r2 S7#2): the worker subscriber hands its host lifetime to its
+        // dispatcher, so ApplicationStopping — which fires before any hosted service stops, and the
+        // worker subscriber stops last — closes its intake, not the subscriber's own later stop.
+        using var host = new DurableFlowContextTestSupport.StoppingHost();
+        var channel = new FakeRabbitMqChannel();
+        var handled = new System.Collections.Concurrent.ConcurrentQueue<string>();
+        var ingress = new Mock<IAsyncResponseIngress>();
+        ingress
+            .Setup(i => i.HandleWorkerMessageAsync(It.IsAny<string>()))
+            .Returns((string message) =>
+            {
+                handled.Enqueue(message);
+                return Task.CompletedTask;
+            });
+        var options = new RabbitMqAsyncResponseOptions
+        {
+            WorkerExchange = "worker.ex",
+            WorkerQueue = "worker.q",
+            WorkerRoutingKey = "worker.rk"
+        };
+        if (ackMode == RabbitMqAckMode.AckAfterEnqueue)
+            options.WorkerSubscriber.UseAckAfterEnqueue(1, 8, TimeSpan.FromSeconds(5));
+        var subscriber = new RabbitMqWorkerSubscriber(
+            Options.Create(options),
+            ingress.Object,
+            NullLogger<RabbitMqWorkerSubscriber>.Instance,
+            new FakeConnectionFactory(channel),
+            host);
+
+        await using (new HostedServiceRun(subscriber))
+        {
+            await channel.WaitForConsumerAsync();
+            await channel.DeliverAsync(Delivery("before", deliveryTag: 1));
+            host.StopApplication();
+            await channel.DeliverAsync(Delivery("after", deliveryTag: 2));
+        }
+
+        // Stopping drained the early-ACK queue, so "before" has run in both modes by now.
+        Assert.Equal(["before"], handled.ToArray());
+        Assert.Equal([1UL], channel.Acks);
+        Assert.Empty(channel.Nacks);
+    }
+
+    private static async Task<IReadOnlyList<RecordedLog>> StartAndStopWorkerSubscriberAsync(RabbitMqAsyncResponseOptions options)
     {
         var channel = new FakeRabbitMqChannel();
         var logger = new CapturingLogger<RabbitMqWorkerSubscriber>();
@@ -1562,8 +1606,7 @@ public class RabbitMqTransportTests
             Options.Create(options),
             Mock.Of<IAsyncResponseIngress>(),
             logger,
-            new FakeConnectionFactory(channel),
-            durableFlows ? [new DurableFlowOptions()] : null);
+            new FakeConnectionFactory(channel));
 
         await using (new HostedServiceRun(subscriber))
         {

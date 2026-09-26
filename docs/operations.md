@@ -143,11 +143,11 @@ containers dominate everything else, so the split is mostly about keeping them a
 
 | Batch | Collection | Containers | Apps | Tests | What's in it |
 | --- | --- | --- | --- | --- | --- |
-| `data` | `DataCollection` | 8 | 9 | 359 | Everything database-backed: channel conformance, store contracts, the "direct" driver tests, and the database channel/transport SUTs |
+| `data` | `DataCollection` | 8 | 9 | 380 | Everything database-backed: channel conformance, store contracts, the "direct" driver tests, and the database channel/transport SUTs |
 | `oracle-cosmos` | `OracleCosmosCollection` | 2 | 0 | 16 | Oracle and Cosmos store contracts, isolated — the two largest containers in the suite |
-| `brokers` | `BrokersCollection` | 5 | 10 | 64 | Message brokers proper (Redis, Pub/Sub, RabbitMQ, NATS, Kafka) |
+| `brokers` | `BrokersCollection` | 5 | 10 | 65 | Message brokers proper (Redis, Pub/Sub, RabbitMQ, NATS, Kafka) |
 | `cloud` | `CloudCollection` | 4 | 4 | 18 | Azure Service Bus + SQS emulators. Service Bus brings its own SQL Server |
-| `matrix-*` | nine collections | 5–10 | 0 | 2,111 | The provider cross product and the transport contract — see [The provider cross product](#the-provider-cross-product) — plus the Pub/Sub emulator's stop-drain test (`matrix-cloud-light`) |
+| `matrix-*` | nine collections | 5–10 | 0 | 2,121 | The provider cross product and the transport contract — see [The provider cross product](#the-provider-cross-product) — plus the Pub/Sub emulator's stop-drain test (`matrix-cloud-light`) |
 
 Peak footprint across a full run is ~3.3 GiB, against 5.8 GiB when the store contracts shared a batch.
 That earlier arrangement fit when the suite ran alone and failed wholesale when anything else used the
@@ -261,12 +261,13 @@ than per combination — so adding a scenario costs N runs, not 660:
 | Suite | Facts | Derivations |
 | --- | --- | --- |
 | `ChannelConformanceSuite` | 34 | 6 channels |
-| `TransportConformanceSuite` | 13 | 11 transports |
+| `TransportConformanceSuite` | 14 | 11 transports |
 | `FlowStoreContract` | one composed contract | 10 stores |
 
 `TransportConformanceSuite` covers what the per-broker suites never did: dead-lettering, redelivery
-after a transient failure, poison-message bounds, shutdown drain, large payloads, concurrency, ambient
-context restoration, and durability across a consumer outage.
+after a transient failure, poison-message bounds, shutdown drain (and a graceful stop that settles
+the job it drained, so a peer never receives it again), large payloads, concurrency, ambient context
+restoration, and durability across a consumer outage.
 
 Transports differ in *where* a guarantee comes from, and `TransportCapabilities` records that rather
 than letting it become a skipped test. Every transport bounds redelivery, but the bound lives in a

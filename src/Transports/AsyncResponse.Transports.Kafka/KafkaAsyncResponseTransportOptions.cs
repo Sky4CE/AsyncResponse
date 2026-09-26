@@ -178,7 +178,10 @@ public sealed class KafkaAsyncResponseTransportOptions
     /// security settings, …) after the package applies its defaults. The package sets
     /// <c>Acks = All</c> and <c>EnableIdempotence = true</c> so a producer-side retry can neither
     /// duplicate nor reorder a worker job; overriding either from this hook silently breaks that
-    /// guarantee — a retried publish then becomes a duplicate worker execution.
+    /// guarantee — a retried publish then becomes a duplicate worker execution. The resulting
+    /// <c>MessageMaxBytes</c> (default 1,000,000) also sizes dead-letter copies: while
+    /// <see cref="DeadLetterEnabled"/>, a worker job whose record plus the burial headers its copy
+    /// would carry exceeds it is refused at publish, since a failed run of it could never be buried.
     /// </summary>
     public Action<ProducerConfig>? ConfigureProducer { get; set; }
 
@@ -186,7 +189,9 @@ public sealed class KafkaAsyncResponseTransportOptions
     /// Optional last-chance hook over each subscriber's consumer configuration (fetch sizes,
     /// <c>max.poll.interval.ms</c>, security settings, …) after the package applies its defaults.
     /// The package relies on <c>enable.auto.commit=true</c> with <c>enable.auto.offset.store=false</c>
-    /// for its manual offset management; overriding those breaks delivery guarantees.
+    /// for its manual offset management; overriding those breaks delivery guarantees. A
+    /// <c>max.poll.interval.ms</c> set here replaces <see cref="KafkaSubscriberOptions.MaxPollInterval"/>
+    /// for the poll-gap validation and the dead-letter budget too.
     /// </summary>
     public Action<ConsumerConfig>? ConfigureConsumer { get; set; }
 

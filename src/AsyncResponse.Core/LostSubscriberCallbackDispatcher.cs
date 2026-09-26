@@ -94,12 +94,15 @@ internal sealed class LostSubscriberCallbackDispatcher(
         if (hasLiveSubscriber is not null && await hasLiveSubscriber().ConfigureAwait(false))
             return new LostSubscriberDispatchResult(null, false) { RetryLive = true };
 
+        // Nothing to classify or invoke: no wire form is needed (building one serialized the
+        // whole payload a second time on every typed publish that found nobody at all, a late
+        // duplicate or progress after completion included).
+        if (recoveryStates.Count == 0)
+            return await DispatchLostResponse(null, response, channel).ConfigureAwait(false);
+
         // Classification and callbacks must see the payload exactly as a broker delivery would
         // have carried it, whichever process publishes.
         var wirePayload = WirePayload(response);
-
-        if (recoveryStates.Count == 0)
-            return await DispatchLostResponse(null, wirePayload, channel).ConfigureAwait(false);
 
         var callbackInvoked = false;
         RecoveryAction? action = null;
@@ -329,8 +332,6 @@ internal sealed class LostSubscriberCallbackDispatcher(
             correlationId: recoveryState?.CorrelationId);
         activity?.SetTag("asyncresponse.lost_subscriber.kind", "response");
         activity?.SetTag("asyncresponse.channel_name", channel);
-        if (response is not null)
-            AsyncResponseDiagnostics.SetPayloadType(activity, response.GetType());
 
         try
         {
@@ -361,6 +362,7 @@ internal sealed class LostSubscriberCallbackDispatcher(
                 : PayloadRecoveryClassifier.Classify(response, recoveryState.PayloadTypeFullName);
             var action = classification.Action;
             var callbackPayload = classification.MaterializedPayload ?? (object?)response;
+            TagPayloadType(activity, classification.MaterializedPayload, recoveryState, response);
             AsyncResponseDiagnostics.SetLostSubscriberRoute(activity, action);
 
             if (action == RecoveryAction.KeepWaiting)
@@ -388,7 +390,7 @@ internal sealed class LostSubscriberCallbackDispatcher(
                     return new LostSubscriberDispatchResult(action, false);
                 }
 
-                var invoked = await DispatchToFailureCallback(recoveryState, callbackPayload, channel, activity).ConfigureAwait(false);
+                var invoked = await DispatchToFailureCallback(recoveryState, callbackPayload, response, channel, activity).ConfigureAwait(false);
                 activity?.SetTag("asyncresponse.recovery.callback_invoked", invoked);
                 return new LostSubscriberDispatchResult(action, invoked);
             }
@@ -404,7 +406,7 @@ internal sealed class LostSubscriberCallbackDispatcher(
                 if (recoveryState.FailureCallback != null)
                 {
                     _logger.LogWarning("No subscribers for channel {Channel}; payload is resumable but no resume callback is registered — routing to the failure callback.", channel);
-                    var fallbackInvoked = await DispatchToFailureCallback(recoveryState, callbackPayload, channel, activity).ConfigureAwait(false);
+                    var fallbackInvoked = await DispatchToFailureCallback(recoveryState, callbackPayload, response, channel, activity).ConfigureAwait(false);
                     activity?.SetTag("asyncresponse.recovery.callback_invoked", fallbackInvoked);
                     return new LostSubscriberDispatchResult(action, fallbackInvoked);
                 }
@@ -428,7 +430,9 @@ internal sealed class LostSubscriberCallbackDispatcher(
             // business-failure callback. This catch only marks the activity before rethrowing.
             await InvokeAsync(invocation, recoveryState.Context).ConfigureAwait(false);
 
-            _logger.LogInformation("Resume callback invoked for channel {Channel}.", channel);
+            // The callback ran: a throwing logging provider must not report it as failed (the
+            // registration would stay armed and the redelivery would invoke it again).
+            SafeLog.Try((Logger: _logger, Channel: channel), static state => state.Logger.LogInformation("Resume callback invoked for channel {Channel}.", state.Channel));
             activity?.SetTag("asyncresponse.recovery.callback_invoked", true);
 
             return new LostSubscriberDispatchResult(action, true);
@@ -485,21 +489,27 @@ internal sealed class LostSubscriberCallbackDispatcher(
     /// returned <see cref="RecoveryAction.Fail"/>, or it could not be classified) to the failure
     /// callback, wrapped in an <see cref="AsyncResponseDomainFailureException"/> — so it takes the
     /// same path as a technical <c>SetException</c>. <paramref name="response"/> is the
-    /// materialized payload when classification succeeded, the raw one otherwise.
+    /// materialized payload when classification succeeded, the raw one otherwise — what the
+    /// callback receives; <paramref name="wirePayload"/> is the payload as the wire carried it,
+    /// what <see cref="AsyncResponseDomainFailureException.PayloadJson"/> reports.
     /// </summary>
-    private async Task<bool> DispatchToFailureCallback(RecoveryState recoveryState, object? response, string channel, Activity? activity)
+    private async Task<bool> DispatchToFailureCallback(RecoveryState recoveryState, object? response, object? wirePayload, string channel, Activity? activity)
     {
         string? payloadJson = null;
         try
         {
-            // The payload arrives as its wire representation (declared-type-normalized JSON or
-            // raw ingress JSON); reuse it verbatim for diagnostics rather than re-serializing.
-            payloadJson = response switch
+            // The wire representation (declared-type-normalized JSON or raw ingress JSON), reused
+            // verbatim for diagnostics. Re-serializing the MATERIALIZED instance by its runtime
+            // type dropped a polymorphic base's discriminator and every wire member the registered
+            // type does not declare — PayloadJson then differed from what was published.
+            payloadJson = wirePayload switch
             {
                 string s => s,
                 JsonElement je => je.GetRawText(),
-                null => AsyncResponseJson.Serialize(response),
-                _ => AsyncResponseJson.Serialize(response, response.GetType())
+                null => AsyncResponseJson.Serialize(wirePayload),
+                // Only a payload with no wire form reaches here (WirePayload's backstop): this
+                // attempt fails like its publish-side one did, and is ignored below.
+                _ => AsyncResponseJson.Serialize(wirePayload, wirePayload.GetType())
             };
         }
         catch (Exception)
@@ -586,7 +596,7 @@ internal sealed class LostSubscriberCallbackDispatcher(
                 CancellationToken.None,
                 _timeProvider).ConfigureAwait(false);
 
-            _logger.LogInformation("Failure callback invoked for channel {Channel}.", channel);
+            SafeLog.Try((Logger: _logger, Channel: channel), static state => state.Logger.LogInformation("Failure callback invoked for channel {Channel}.", state.Channel));
 
             return true;
         }
@@ -601,7 +611,8 @@ internal sealed class LostSubscriberCallbackDispatcher(
                 // on RabbitMQ's unbounded default). Swallow: the message is acknowledged, the
                 // kept recovery row is surfaced by the watchdog's staleness report, and the
                 // error log names the misconfiguration to fix.
-                _logger.LogError(ex, "Failure callback for channel {Channel} cannot be invoked (deterministic fault); the message is acknowledged and the registration stays for the watchdog.", channel);
+                SafeLog.Try((Logger: _logger, Error: ex, Channel: channel), static state => state.Logger.LogError(
+                    state.Error, "Failure callback for channel {Channel} cannot be invoked (deterministic fault); the message is acknowledged and the registration stays for the watchdog.", state.Channel));
                 return false;
             }
 
@@ -613,11 +624,11 @@ internal sealed class LostSubscriberCallbackDispatcher(
             // bounded redelivery and dead-letter policy. On RabbitMQ's default MaxDeliveryAttempts
             // = 0 that is the documented unlimited requeue any failing handler gets; configure a
             // cap there as for worker jobs.
-            _logger.LogError(
-                ex,
+            SafeLog.Try((Logger: _logger, Error: ex, Channel: channel), static state => state.Logger.LogError(
+                state.Error,
                 "Failure callback for channel {Channel} failed on all {Attempts} attempts; the message is left unacknowledged for transport redelivery and the registration stays armed.",
-                channel,
-                FailureCallbackAttempts);
+                state.Channel,
+                FailureCallbackAttempts));
             throw new RecoveryCallbackFailedException(recoveryState.CorrelationId ?? string.Empty, FailureCallbackAttempts, ex);
         }
     }
@@ -675,12 +686,35 @@ internal sealed class LostSubscriberCallbackDispatcher(
         }
         catch (Exception ex)
         {
-            _logger.LogWarning(
-                ex,
+            // Best-effort means best-effort: a throwing logging provider here turned the
+            // succeeded callback into a dispatch failure and a redelivery that invoked it again.
+            SafeLog.Try((Logger: _logger, Error: ex, CorrelationId: correlationId, RegistrationId: registrationId), static state => state.Logger.LogWarning(
+                state.Error,
                 "Recovery callback for correlationId {CorrelationId} succeeded but deleting its registration {RegistrationId} failed; the registration remains until its TTL or the next delivery.",
-                correlationId,
-                registrationId);
+                state.CorrelationId,
+                state.RegistrationId));
         }
+    }
+
+    /// <summary>
+    /// Tags <c>asyncresponse.payload_type</c> with the payload's real type. The dispatch receives
+    /// the WIRE form (a JSON string or <see cref="JsonElement"/>), whose runtime type said nothing:
+    /// the tag read <c>System.String</c> or <c>System.Text.Json.JsonElement</c> for every lost
+    /// response. Prefers the materialized type, then the registration's persisted type name (store
+    /// text, so bounded and escaped), then a typed instance; a raw payload with no registration
+    /// leaves the tag unset rather than naming its JSON container.
+    /// </summary>
+    private static void TagPayloadType<T>(Activity? activity, object? materialized, RecoveryState? recoveryState, T response)
+    {
+        if (activity is null)
+            return;
+
+        if (materialized is not null)
+            AsyncResponseDiagnostics.SetPayloadType(activity, materialized.GetType());
+        else if (recoveryState?.PayloadTypeFullName is { } registeredTypeName)
+            activity.SetTag("asyncresponse.payload_type", AsyncResponseTypeResolution.DescribeForDiagnostics(registeredTypeName));
+        else if (response is not (null or JsonElement or string))
+            AsyncResponseDiagnostics.SetPayloadType(activity, response.GetType());
     }
 
     /// <summary>

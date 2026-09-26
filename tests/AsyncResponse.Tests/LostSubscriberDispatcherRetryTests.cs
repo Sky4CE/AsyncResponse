@@ -78,6 +78,54 @@ public sealed class LostSubscriberDispatcherRetryTests
         // The successful retry consumed the registration.
         Assert.Empty(await recoveryStateStore.GetAllAsync(CorrelationId));
     }
+
+    [Fact]
+    public async Task AFailureCallbackNamingATypeTheRuntimeRefusesToBuild_IsADeterministicFault_AcknowledgedWithoutRetry()
+    {
+        // Fixpoint r2 (S3#4): the default scan let the runtime's ArgumentException out for a name
+        // it parses but cannot instantiate (Nullable<string>: a constraint violation), and the
+        // dispatcher classified that as TRANSIENT — four in-process attempts on the backoff
+        // ladder, then RecoveryCallbackFailedException and a transport redelivery, for a callback
+        // that can never be wired up. It is now an unresolved type: acknowledged on the first
+        // attempt, the registration kept for the watchdog.
+        const string correlationId = "dispatcher-unbuildable-service-type";
+        var time = new VirtualTimeProvider();
+        var services = new ServiceCollection();
+        services.AddSingleton(typeof(ILogger<>), typeof(NullLogger<>));
+        services.AddSingleton<TimeProvider>(time);
+        services.AddAsyncResponse().WithInMemoryChannel();
+        await using var provider = services.BuildServiceProvider();
+
+        var recoveryStateStore = provider.GetRequiredService<IRecoveryStateStore>();
+        await recoveryStateStore.SaveAsync(
+            correlationId,
+            new RecoveryState
+            {
+                RegistrationId = Guid.NewGuid(),
+                CorrelationId = correlationId,
+                PayloadTypeFullName = typeof(OperationResult).FullName,
+                RegisteredAtUtc = DateTime.UtcNow,
+                FailureCallback = new ReflectionCallDto
+                {
+                    ServiceInterfaceFullName = "System.Nullable`1[[System.String, System.Private.CoreLib]]",
+                    MethodName = "OnFailure",
+                    Params = [CallbackParam.ForPlaceholder(PlaceholderType.Exception)]
+                }
+            },
+            TimeSpan.FromMinutes(5));
+
+        var publisher = provider.GetRequiredService<IAsyncResponsePublisher>();
+        var dispatching = publisher.SetResponse(
+            new OperationResult { Status = OperationStatus.Failed, Message = "remote step failed" },
+            correlationId);
+
+        // No virtual time is advanced: a transient classification parks the second attempt on the
+        // virtual clock and this never completes (the bound is only the red-path hang guard).
+        await dispatching.WaitAsync(TimeSpan.FromSeconds(10));
+
+        Assert.Null(time.NextTimerDueAt);
+        Assert.NotEmpty(await recoveryStateStore.GetAllAsync(correlationId));
+    }
 }
 
 /// <summary>

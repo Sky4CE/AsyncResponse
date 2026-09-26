@@ -33,8 +33,10 @@ internal sealed class PostgreSqlChannelSql
     private readonly PostgreSqlAsyncResponseChannelOptions _options;
     private readonly ILogger<PostgreSqlChannelSql>? _logger;
     private readonly SemaphoreSlim _ensureGate = new(1, 1);
+    private readonly PostgreSqlDdlGuard _ddl;
     private bool _created;
     private readonly long _schemaLockKey;
+    private readonly long _tableLockKey;
     private long _lastRecoveryPruneTicks;
     private long _lastMessagePruneTicks;
     private long _lastSubscriberPruneTicks;
@@ -56,6 +58,8 @@ internal sealed class PostgreSqlChannelSql
         AckSequenceName = SequenceName(_options.MessageTable);
         AckSequence = $"{Schema}.{Quote(AckSequenceName)}";
         _schemaLockKey = SchemaAdvisoryLockKey(_options.SchemaName);
+        _tableLockKey = PostgreSqlDdlGuard.TableLockKey(_options.SchemaName, _options.MessageTable);
+        _ddl = new PostgreSqlDdlGuard("channel", $"the channel tables in '{_options.SchemaName}'", "docs/postgresql.md", logger);
     }
 
     public string Schema { get; }
@@ -74,6 +78,13 @@ internal sealed class PostgreSqlChannelSql
     public string AckSequenceName { get; }
     public string NotificationChannel => _options.NotificationChannel;
 
+    /// <summary>The clock of the startup-DDL retry-after window (test seam; see <see cref="PostgreSqlDdlGuard.RetryAfter"/>).</summary>
+    internal TimeProvider Clock
+    {
+        get => _ddl.Clock;
+        set => _ddl.Clock = value;
+    }
+
     public async Task EnsureCreatedAsync(CancellationToken cancellationToken = default)
     {
         if (_created)
@@ -90,127 +101,207 @@ internal sealed class PostgreSqlChannelSql
             return;
         }
 
+        _ddl.ThrowIfBackingOff();
         await _ensureGate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
             if (_created)
                 return;
 
+            // Again under the gate: a caller that queued behind the attempt that just failed —
+            // and latched the retry-after window — fails here instead of starting the next one.
+            _ddl.ThrowIfBackingOff();
+
             await using var connection = await _dataSource.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
-            await using var transaction = await connection.BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
 
-            // Serialize schema creation across processes. CREATE ... IF NOT EXISTS is not atomic against a
-            // concurrent create of the same object: two instances starting together both pass the existence
-            // check and collide on the system catalog ("duplicate key ... pg_type_typname_nsp_index"). A
-            // transaction-scoped advisory lock (keyed by schema, shared with the transport store) lets one
-            // instance build the schema while the rest wait and then find it already present.
-            await using (var lockCommand = connection.CreateCommand())
-            {
-                lockCommand.Transaction = transaction;
-                lockCommand.CommandText = "SELECT pg_advisory_xact_lock(@lock_key);";
-                lockCommand.Parameters.AddWithValue("lock_key", _schemaLockKey);
-                await lockCommand.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
-            }
-
-            await using var command = connection.CreateCommand();
-            command.Transaction = transaction;
-            command.CommandText =
-                $"""
-                CREATE SCHEMA IF NOT EXISTS {Schema};
-
-                CREATE TABLE IF NOT EXISTS {RecoveryTable} (
-                    correlation_id text NOT NULL,
-                    registration_id uuid NOT NULL,
-                    state_json text NOT NULL,
-                    expires_at timestamptz NOT NULL,
-                    registered_at timestamptz NOT NULL DEFAULT now(),
-                    PRIMARY KEY (correlation_id, registration_id)
-                );
-                CREATE INDEX IF NOT EXISTS {Quote(IndexName(_options.RecoveryStateTable, "expires"))}
-                    ON {RecoveryTable} (expires_at);
-
-                CREATE TABLE IF NOT EXISTS {MessageTable} (
-                    id uuid PRIMARY KEY,
-                    correlation_id text NOT NULL,
-                    envelope_json text NOT NULL,
-                    created_at timestamptz NOT NULL DEFAULT now(),
-                    expires_at timestamptz NOT NULL,
-                    acked_at timestamptz NULL,
-                    acked_seq bigint NULL,
-                    recovery_claimed boolean NOT NULL DEFAULT false
-                );
-                ALTER TABLE {MessageTable} ADD COLUMN IF NOT EXISTS recovery_claimed boolean NOT NULL DEFAULT false;
-                ALTER TABLE {MessageTable} ADD COLUMN IF NOT EXISTS acked_seq bigint NULL;
-
-                -- jsonb REJECTS the \u0000 escape that System.Text.Json emits for U+0000 (SQLSTATE
-                -- 22P05), so any payload, exception message, propagated context value or callback
-                -- argument containing a NUL was unpublishable on PostgreSQL alone while every other
-                -- channel delivered it. Nothing here ever queries INSIDE the document — both columns
-                -- are read back with ::text — so text costs nothing and accepts the whole contract.
-                -- Guarded so the rewrite happens once, not on every start.
-                DO $$
-                BEGIN
-                    IF EXISTS (
-                        SELECT 1 FROM information_schema.columns
-                        WHERE table_schema = {SqlLiteral(_options.SchemaName)} AND table_name = {SqlLiteral(_options.MessageTable)}
-                          AND column_name = 'envelope_json' AND data_type = 'jsonb')
-                    THEN
-                        ALTER TABLE {MessageTable} ALTER COLUMN envelope_json TYPE text USING envelope_json::text;
-                    END IF;
-
-                    IF EXISTS (
-                        SELECT 1 FROM information_schema.columns
-                        WHERE table_schema = {SqlLiteral(_options.SchemaName)} AND table_name = {SqlLiteral(_options.RecoveryStateTable)}
-                          AND column_name = 'state_json' AND data_type = 'jsonb')
-                    THEN
-                        ALTER TABLE {RecoveryTable} ALTER COLUMN state_json TYPE text USING state_json::text;
-                    END IF;
-                END $$;
-                CREATE SEQUENCE IF NOT EXISTS {AckSequence} AS bigint;
-                CREATE INDEX IF NOT EXISTS {Quote(IndexName(_options.MessageTable, "correlation_created"))}
-                    ON {MessageTable} (correlation_id, created_at);
-                CREATE INDEX IF NOT EXISTS {Quote(IndexName(_options.MessageTable, "expires"))}
-                    ON {MessageTable} (expires_at);
-
-                CREATE TABLE IF NOT EXISTS {SubscriberTable} (
-                    correlation_id text NOT NULL,
-                    registration_id uuid NOT NULL,
-                    instance_id text NOT NULL,
-                    expires_at timestamptz NOT NULL,
-                    PRIMARY KEY (correlation_id, registration_id)
-                );
-                CREATE INDEX IF NOT EXISTS {Quote(IndexName(_options.SubscriberTable, "expires"))}
-                    ON {SubscriberTable} (expires_at);
-                """;
+            // The transport's round-43 hardening (PostgreSqlDdlGuard), applied here. Every DDL
+            // transaction bounds its lock waits — the advisory key's first — with a lock_timeout:
+            // ALTER TABLE … ADD COLUMN IF NOT EXISTS takes its ACCESS EXCLUSIVE lock, and CREATE
+            // INDEX IF NOT EXISTS its SHARE lock, BEFORE finding the object present, so on every
+            // process start they queued behind any conflicting holder (pg_dump, an idle-in-
+            // transaction reader, an anti-wraparound vacuum) with every statement on the table,
+            // from every host, queued behind them until the 30 s command timeout — and the next
+            // operation did it again. Only what the catalog shows missing is altered or built now.
             try
             {
-                await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+                // 1. The schema-shared DDL, under the schema's advisory key (shared with the
+                //    transport and durable-flow stores): creates only, none of which locks a table
+                //    that already exists. Serializes creation across processes — CREATE ... IF NOT
+                //    EXISTS is not atomic against a concurrent create of the same object: two
+                //    instances starting together both pass the existence check and collide on the
+                //    system catalog ("duplicate key ... pg_type_typname_nsp_index").
+                await using (var transaction = await PostgreSqlDdlGuard.BeginLockedTransactionAsync(connection, _schemaLockKey, cancellationToken).ConfigureAwait(false))
+                {
+                    await using (var command = connection.CreateCommand())
+                    {
+                        command.Transaction = transaction;
+                        command.CommandText =
+                            $"""
+                            CREATE SCHEMA IF NOT EXISTS {Schema};
+
+                            CREATE TABLE IF NOT EXISTS {RecoveryTable} (
+                                correlation_id text NOT NULL,
+                                registration_id uuid NOT NULL,
+                                state_json text NOT NULL,
+                                expires_at timestamptz NOT NULL,
+                                registered_at timestamptz NOT NULL DEFAULT now(),
+                                PRIMARY KEY (correlation_id, registration_id)
+                            );
+
+                            CREATE TABLE IF NOT EXISTS {MessageTable} (
+                                id uuid PRIMARY KEY,
+                                correlation_id text NOT NULL,
+                                envelope_json text NOT NULL,
+                                created_at timestamptz NOT NULL DEFAULT now(),
+                                expires_at timestamptz NOT NULL,
+                                acked_at timestamptz NULL,
+                                acked_seq bigint NULL,
+                                recovery_claimed boolean NOT NULL DEFAULT false
+                            );
+                            CREATE SEQUENCE IF NOT EXISTS {AckSequence} AS bigint;
+
+                            CREATE TABLE IF NOT EXISTS {SubscriberTable} (
+                                correlation_id text NOT NULL,
+                                registration_id uuid NOT NULL,
+                                instance_id text NOT NULL,
+                                expires_at timestamptz NOT NULL,
+                                PRIMARY KEY (correlation_id, registration_id)
+                            );
+                            """;
+                        await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+                    }
+
+                    var work = await ReadTableWorkAsync(connection, transaction, cancellationToken).ConfigureAwait(false);
+                    if (work.Length == 0)
+                    {
+                        await VerifyRelationsAsync(connection, transaction, cancellationToken).ConfigureAwait(false);
+                        await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+                        _created = true;
+                        return;
+                    }
+
+                    await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+                }
+
+                // 2. The table work — columns an older build's table lacks, the one-time jsonb
+                //    rewrite, index builds on existing tables — in a transaction of its own under a
+                //    key scoped to this channel's tables: a rewrite held for up to an hour under the
+                //    schema-wide key would stop every host starting meanwhile from initializing ANY
+                //    AsyncResponse store on the schema. Re-read under the key: another host may have
+                //    done the work while this one waited for it.
+                await using (var transaction = await PostgreSqlDdlGuard.BeginLockedTransactionAsync(connection, _tableLockKey, cancellationToken).ConfigureAwait(false))
+                {
+                    var work = await ReadTableWorkAsync(connection, transaction, cancellationToken).ConfigureAwait(false);
+                    if (work.Length > 0)
+                        await _ddl.ExecuteLongRunningAsync(work, connection, transaction, cancellationToken).ConfigureAwait(false);
+
+                    // Options-level ValidateNamePlan keeps THIS component's names distinct, but the
+                    // channel can share a schema with the transport and durable-flow stores (and
+                    // unrelated objects), whose derived names it cannot see — and IF NOT EXISTS also
+                    // accepts a same-name index with the WRONG definition. Verify against the
+                    // catalog, in the DDL transaction, that every relation actually IS what the DDL
+                    // intended, definitions included.
+                    await VerifyRelationsAsync(connection, transaction, cancellationToken).ConfigureAwait(false);
+                    await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+                    _created = true;
+                }
             }
             catch (PostgresException ex) when (ex.SqlState is PostgresErrorCodes.WrongObjectType or PostgresErrorCodes.UndefinedColumn)
             {
                 // E.g. CREATE INDEX ... ON a name that is really another component's index:
                 // IF NOT EXISTS skipped the table create, and the dependent statement then hits
-                // the wrong relation kind mid-batch — surface the namespace collision instead of
-                // the raw "cannot open relation".
+                // the wrong relation kind — surface the namespace collision instead of the raw
+                // "cannot open relation".
                 throw new InvalidOperationException(PostgreSqlRelationVerifier.DdlCollisionMessage("channel", _options.SchemaName), ex);
             }
-
-            // Options-level ValidateNamePlan keeps THIS component's names distinct, but the
-            // channel can share a schema with the transport and durable-flow stores (and
-            // unrelated objects), whose derived names it cannot see — and IF NOT EXISTS also
-            // accepts a same-name index with the WRONG definition. Verify against the catalog,
-            // in-transaction under the shared DDL lock, that every relation actually IS what the
-            // DDL above intended, definitions included.
-            await VerifyRelationsAsync(connection, transaction, cancellationToken).ConfigureAwait(false);
-
-            await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
-            _created = true;
+            catch (PostgresException ex) when (ex.SqlState is PostgresErrorCodes.LockNotAvailable)
+            {
+                // A lock wait lost anywhere in the DDL — the advisory key's included — latches the
+                // retry-after window (a failed table-work step latched it already).
+                _ddl.BackOff(ex);
+                throw;
+            }
         }
         finally
         {
             _ensureGate.Release();
         }
     }
+
+    /// <summary>
+    /// The table work the auto-create DDL still owes, as one script (empty when there is none):
+    /// the two message-table columns an older build's table lacks, the one-time jsonb → text
+    /// conversion of the two document columns, and the indexes that do not exist yet. Each is
+    /// included only when the catalog shows it missing — the statements take their table lock
+    /// before any IF NOT EXISTS check, so the old unconditional script locked every table on every
+    /// process start.
+    /// </summary>
+    /// <remarks>
+    /// jsonb REJECTS the \u0000 escape that System.Text.Json emits for U+0000 (SQLSTATE 22P05), so
+    /// any payload, exception message, propagated context value or callback argument containing a
+    /// NUL was unpublishable on PostgreSQL alone while every other channel delivered it. Nothing here
+    /// ever queries INSIDE the document — both columns are read back with ::text — so text costs
+    /// nothing and accepts the whole contract.
+    /// </remarks>
+    private async Task<string> ReadTableWorkAsync(NpgsqlConnection connection, NpgsqlTransaction transaction, CancellationToken cancellationToken)
+    {
+        bool hasRecoveryClaimed, hasAckedSeq, envelopeJsonb, stateJsonb;
+        await using (var command = connection.CreateCommand())
+        {
+            command.Transaction = transaction;
+            command.CommandText =
+                """
+                SELECT
+                  EXISTS (SELECT 1 FROM information_schema.columns
+                          WHERE table_schema = @schema AND table_name = @messages AND column_name = 'recovery_claimed'),
+                  EXISTS (SELECT 1 FROM information_schema.columns
+                          WHERE table_schema = @schema AND table_name = @messages AND column_name = 'acked_seq'),
+                  EXISTS (SELECT 1 FROM information_schema.columns
+                          WHERE table_schema = @schema AND table_name = @messages AND column_name = 'envelope_json' AND data_type = 'jsonb'),
+                  EXISTS (SELECT 1 FROM information_schema.columns
+                          WHERE table_schema = @schema AND table_name = @recovery AND column_name = 'state_json' AND data_type = 'jsonb');
+                """;
+            command.Parameters.AddWithValue("schema", _options.SchemaName);
+            command.Parameters.AddWithValue("messages", _options.MessageTable);
+            command.Parameters.AddWithValue("recovery", _options.RecoveryStateTable);
+            await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+            await reader.ReadAsync(cancellationToken).ConfigureAwait(false);
+            hasRecoveryClaimed = reader.GetBoolean(0);
+            hasAckedSeq = reader.GetBoolean(1);
+            envelopeJsonb = reader.GetBoolean(2);
+            stateJsonb = reader.GetBoolean(3);
+        }
+
+        var work = new StringBuilder();
+        if (!hasRecoveryClaimed)
+            work.Append($"ALTER TABLE {MessageTable} ADD COLUMN IF NOT EXISTS recovery_claimed boolean NOT NULL DEFAULT false;\n");
+        if (!hasAckedSeq)
+            work.Append($"ALTER TABLE {MessageTable} ADD COLUMN IF NOT EXISTS acked_seq bigint NULL;\n");
+        if (envelopeJsonb)
+            work.Append($"ALTER TABLE {MessageTable} ALTER COLUMN envelope_json TYPE text USING envelope_json::text;\n");
+        if (stateJsonb)
+            work.Append($"ALTER TABLE {RecoveryTable} ALTER COLUMN state_json TYPE text USING state_json::text;\n");
+
+        foreach (var (index, table, keys) in Indexes())
+        {
+            if (await PostgreSqlDdlGuard.GetIndexStateAsync(connection, transaction, _options.SchemaName, index, cancellationToken).ConfigureAwait(false)
+                is PostgreSqlDdlGuard.IndexState.Absent)
+            {
+                work.Append($"CREATE INDEX IF NOT EXISTS {Quote(index)} ON {Schema}.{Quote(table)} ({keys});\n");
+            }
+        }
+
+        return work.ToString();
+    }
+
+    /// <summary>The channel's indexes: name, owning table, key columns.</summary>
+    private (string Index, string Table, string Keys)[] Indexes() =>
+    [
+        (IndexName(_options.RecoveryStateTable, "expires"), _options.RecoveryStateTable, "expires_at"),
+        (IndexName(_options.MessageTable, "correlation_created"), _options.MessageTable, "correlation_id, created_at"),
+        (IndexName(_options.MessageTable, "expires"), _options.MessageTable, "expires_at"),
+        (IndexName(_options.SubscriberTable, "expires"), _options.SubscriberTable, "expires_at"),
+    ];
 
     private Task VerifyRelationsAsync(NpgsqlConnection connection, NpgsqlTransaction? transaction, CancellationToken cancellationToken)
         => PostgreSqlRelationVerifier.VerifyAsync(
@@ -754,7 +845,7 @@ internal sealed class PostgreSqlChannelSql
     /// <summary>
     /// LISTENs on the notification channel and invokes <paramref name="onNotification"/> with every
     /// NOTIFY payload until cancellation or a connection failure; <paramref name="onListening"/>
-    /// runs once the LISTEN is established.
+    /// runs once the LISTEN is established and a delivery probe has come back through it.
     /// </summary>
     public async Task ExecuteListenAsync(Func<string?, Task> onNotification, CancellationToken cancellationToken, Action? onListening = null)
     {
@@ -762,9 +853,17 @@ internal sealed class PostgreSqlChannelSql
         // Not `await using`: the release below owns disposal, and may finish it after this returns.
         var connection = await _dataSource.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         var listening = false;
+        var probe = new ListenProbe();
         try
         {
-            connection.Notification += (_, args) => _ = onNotification(args.Payload);
+            // The probe's own notification is consumed here, never handed on as a wake. Other
+            // processes' probes are handed on like any payload and dropped by the channel, which
+            // holds no waiter under a probe payload.
+            connection.Notification += (_, args) =>
+            {
+                if (!probe.TryComplete(args.Payload))
+                    _ = onNotification(args.Payload);
+            };
             await using (var command = connection.CreateCommand())
             {
                 command.CommandText = $"LISTEN {Quote(NotificationChannel)};";
@@ -772,39 +871,129 @@ internal sealed class PostgreSqlChannelSql
             }
 
             listening = true;
+
+            // A LISTEN that succeeded proves the command ran, not that notifications will arrive
+            // on THIS connection: behind a transaction-mode pooler (PgBouncer pool_mode=transaction
+            // or statement) the LISTEN ran on a server connection that went straight back to the
+            // pool, and nothing published afterwards reaches it. The channel then trusted a push
+            // wake that never came and kept the full-sweep throttle — whose 5 s default equals the
+            // publisher's confirmation budget — for the life of the process, so cross-process
+            // responses routinely lost the race to lost-subscriber recovery under live waiters.
+            // Only a notification this connection sends itself and receives back proves delivery.
+            await ProbeListenDeliveryAsync(connection, probe, cancellationToken).ConfigureAwait(false);
             onListening?.Invoke();
 
-            // A BOUNDED wait with a ping on every quiet interval. An unbounded WaitAsync on a
+            // A BOUNDED wait with a probe on every quiet interval. An unbounded WaitAsync on a
             // half-open socket (a NAT or load balancer silently dropping an idle LISTEN
             // connection; Npgsql's keepalive is off by default) blocked forever while the channel
-            // kept trusting a push wake that could no longer deliver. A failed or timed-out ping
-            // throws into the listen loop's reconnect path.
+            // kept trusting a push wake that could no longer deliver. A failed, timed-out or
+            // undelivered probe throws into the listen loop's reconnect path. (It used to be a
+            // SELECT 1, which proves the socket, not delivery.)
             while (!cancellationToken.IsCancellationRequested)
             {
                 if (!await connection.WaitAsync(ListenLivenessInterval, cancellationToken).ConfigureAwait(false))
-                    await PingListenConnectionAsync(connection, cancellationToken).ConfigureAwait(false);
+                    await ProbeListenDeliveryAsync(connection, probe, cancellationToken).ConfigureAwait(false);
             }
         }
         finally
         {
             // UNLISTEN before the pool gets it back, bounded so a half-open socket cannot hold
             // disposal (see PostgreSqlListenConnection).
-            await PostgreSqlListenConnection.ReleaseAsync(_dataSource, connection, listening).ConfigureAwait(false);
+            await PostgreSqlListenConnection.ReleaseAsync(_dataSource, connection, listening, _logger).ConfigureAwait(false);
         }
     }
 
-    /// <summary>How long the LISTEN connection may stay silent before it is pinged.</summary>
-    internal static readonly TimeSpan ListenLivenessInterval = TimeSpan.FromSeconds(10);
+    /// <summary>How long the LISTEN connection may stay silent before it is probed. Settable only so a test can shorten it.</summary>
+    internal TimeSpan ListenLivenessInterval { get; set; } = TimeSpan.FromSeconds(10);
 
-    /// <summary>Seconds a liveness ping may take before the connection is treated as dead.</summary>
-    private const int ListenPingTimeoutSeconds = 5;
+    /// <summary>
+    /// How long a delivery probe — the <c>NOTIFY</c> and its notification coming back — may take
+    /// before the listen connection is treated as not delivering. Settable only so a test can
+    /// shorten it.
+    /// </summary>
+    internal TimeSpan ListenProbeTimeout { get; set; } = TimeSpan.FromSeconds(5);
 
-    private static async Task PingListenConnectionAsync(NpgsqlConnection connection, CancellationToken cancellationToken)
+    /// <summary>
+    /// Sends a <c>NOTIFY</c> with a fresh payload on the listen connection itself and waits for
+    /// PostgreSQL to deliver it back (a session listening on a channel receives its own
+    /// notifications too). Throws when the command fails or the notification does not arrive
+    /// within <see cref="ListenProbeTimeout"/>.
+    /// </summary>
+    private async Task ProbeListenDeliveryAsync(NpgsqlConnection connection, ListenProbe probe, CancellationToken cancellationToken)
     {
-        await using var ping = connection.CreateCommand();
-        ping.CommandText = "SELECT 1;";
-        ping.CommandTimeout = ListenPingTimeoutSeconds;
-        await ping.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false);
+        var startedAt = System.Diagnostics.Stopwatch.GetTimestamp();
+        var payload = probe.Arm();
+        await using (var notify = connection.CreateCommand())
+        {
+            // A literal, not a parameter: NOTIFY is a utility statement. The payload is a fixed
+            // prefix and a hex GUID (no quote can occur in it), the channel a validated identifier.
+            notify.CommandText = $"NOTIFY {Quote(NotificationChannel)}, '{payload}';";
+            notify.CommandTimeout = Math.Max(1, (int)Math.Ceiling(ListenProbeTimeout.TotalSeconds));
+            await notify.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+        }
+
+        // Usually already delivered with the command's reply (PostgreSQL sends a session its own
+        // notification at commit); otherwise it arrives on the connection shortly after.
+        while (!probe.Delivered)
+        {
+            var remaining = ListenProbeTimeout - System.Diagnostics.Stopwatch.GetElapsedTime(startedAt);
+            if (ProbeBudgetSpent(remaining) || !await connection.WaitAsync(remaining, cancellationToken).ConfigureAwait(false))
+            {
+                if (probe.Delivered)
+                    break;
+                throw new TimeoutException(
+                    $"The PostgreSQL LISTEN connection did not receive its own delivery-probe notification on channel '{NotificationChannel}' within {ListenProbeTimeout}: " +
+                    "notifications are not reaching it. The channel needs a session-pooled or direct connection for LISTEN — a transaction- or statement-mode pooler " +
+                    "(PgBouncer pool_mode=transaction) never delivers them — or the connection is dead. Reconnecting; meanwhile the sweep is the only cross-process wake.");
+            }
+        }
+    }
+
+    /// <summary>
+    /// Whether the probe's <paramref name="remaining"/> budget is spent. Under a millisecond counts:
+    /// Npgsql's <c>WaitAsync(TimeSpan)</c> truncates to whole milliseconds, and a 0 ms timeout means
+    /// wait FOREVER — the probe's last fraction of a millisecond became the unbounded wait on a
+    /// half-open socket that the probe exists to catch.
+    /// </summary>
+    internal static bool ProbeBudgetSpent(TimeSpan remaining) => remaining < TimeSpan.FromMilliseconds(1);
+
+    /// <summary>
+    /// The pending delivery probe of one listen connection: the payload it waits for and whether
+    /// it came back. Completed from Npgsql's notification callback, armed and read by the listen
+    /// loop.
+    /// </summary>
+    private sealed class ListenProbe
+    {
+        private const string PayloadPrefix = "asyncresponse:listen-probe:";
+
+        // One object per probe, swapped whole: a callback completing an earlier probe can never
+        // mark a later one delivered.
+        private Pending? _pending;
+
+        public bool Delivered => Volatile.Read(ref _pending)?.Delivered == true;
+
+        public string Arm()
+        {
+            var pending = new Pending(PayloadPrefix + Guid.NewGuid().ToString("N"));
+            Volatile.Write(ref _pending, pending);
+            return pending.Payload;
+        }
+
+        /// <summary>Whether <paramref name="payload"/> is the pending probe's; completes it if so.</summary>
+        public bool TryComplete(string? payload)
+        {
+            if (Volatile.Read(ref _pending) is not { } pending || !string.Equals(payload, pending.Payload, StringComparison.Ordinal))
+                return false;
+
+            pending.Delivered = true;
+            return true;
+        }
+
+        private sealed class Pending(string payload)
+        {
+            public string Payload { get; } = payload;
+            public volatile bool Delivered;
+        }
     }
 
     // Every prune below is opportunistic housekeeping riding on a publish, a waiter registration,
@@ -900,13 +1089,6 @@ internal sealed class PostgreSqlChannelSql
 
     private static string Quote(string identifier) => "\"" + identifier + "\"";
 
-    /// <summary>
-    /// A single-quoted SQL string literal, for the catalog lookups inside the DDL's DO block where
-    /// a parameter cannot be bound. Names are already validated by the options; the doubling keeps
-    /// the literal well-formed regardless.
-    /// </summary>
-    private static string SqlLiteral(string value) => "'" + value.Replace("'", "''", StringComparison.Ordinal) + "'";
-
     /// <summary>PostgreSQL's identifier length cap (NAMEDATALEN - 1); longer names are silently truncated server-side.</summary>
     internal const int IdentifierCap = 63;
 
@@ -965,19 +1147,7 @@ internal sealed class PostgreSqlChannelSql
     /// <see cref="string.GetHashCode()"/>, which is per-process randomized, is unusable) and identical
     /// to the transport store's key for the same schema so both serialize their shared CREATE SCHEMA.
     /// </summary>
-    internal static long SchemaAdvisoryLockKey(string schemaName)
-    {
-        const ulong offset = 14695981039346656037UL;
-        const ulong prime = 1099511628211UL;
-        var hash = offset;
-        foreach (var b in Encoding.UTF8.GetBytes($"asyncresponse:ddl:{schemaName}"))
-        {
-            hash ^= b;
-            hash *= prime;
-        }
-
-        return unchecked((long)hash);
-    }
+    internal static long SchemaAdvisoryLockKey(string schemaName) => PostgreSqlDdlGuard.SchemaLockKey(schemaName);
 
     /// <summary>
     /// Time-gates opportunistic pruning so the housekeeping DELETE runs at most once per

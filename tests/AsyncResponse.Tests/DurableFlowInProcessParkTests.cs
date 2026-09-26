@@ -58,20 +58,26 @@ public class DurableFlowInProcessParkTests
         Assert.True(persisted.RetainUntilUtc >= dueAt);
     }
 
-    [Fact]
-    public async Task InProcessTimer_HostStop_WhoseHandOverCannotPublish_HandsTheDeliveryBack_AndStaysInterrupted()
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task InProcessTimer_HostStop_WhoseHandOverCannotPublish_HandsTheDeliveryBack_AndStaysInterrupted(bool throwingLogger)
     {
+        // Fixpoint r2 (GS1#2), the throwing-logger case: the warning about the failed hand-over was
+        // logged unguarded, so a logging provider that throws replaced the interruption and the
+        // transport counted the hand-back as a failed attempt.
         var clock = new VirtualTimeProvider();
         var transport = new RecordingTransport();
         await using var provider = BuildProvider(transport, clock);
         var store = provider.GetRequiredService<IFlowStateStore>();
         var options = Options();
-        var state = State("park-host-stop-publish-fails");
+        var state = State($"park-host-stop-publish-fails-{throwingLogger}");
         Assert.True(await store.TryCreateAsync(state.FlowId!, state, options.StateExpiry));
         using var hostStopping = new CancellationTokenSource();
+        var logger = throwingLogger ? new CollectingLogger { ThrowOnMessageContaining = "could not hand its in-process timer" } : null;
 
         await using var lease = await AcquireAsync(store, state.FlowId!, options, clock);
-        var context = CreateContext(provider, state, store, lease, options, clock, transport, hostStopping: hostStopping.Token);
+        var context = CreateContext(provider, state, store, lease, options, clock, transport, logger, hostStopping.Token);
         var sleeping = context.DelayAsync("nap", SixHours);
         await WaitForArmedTimerAsync(clock, SixHours);
 
@@ -765,13 +771,14 @@ public class DurableFlowInProcessParkTests
     internal sealed class UnregisteredConvertingFlow : ConvertingFlowBase { }
 
     /// <summary>A whole host: the real executor, resolved from DI with a host lifetime the test stops.</summary>
-    private static ServiceProvider BuildHost(IWorkerTransport transport, TimeProvider clock, StoppingHost host)
+    private static ServiceProvider BuildHost(IWorkerTransport transport, TimeProvider clock, StoppingHost host, Action<IServiceCollection>? configure = null)
     {
         var services = new ServiceCollection();
         services.AddSingleton(typeof(Microsoft.Extensions.Logging.ILogger<>), typeof(NullLogger<>));
         services.AddSingleton(clock);
         services.AddSingleton<Microsoft.Extensions.Hosting.IHostApplicationLifetime>(host);
         services.AddSingleton<SwallowingFlow>();
+        services.AddSingleton<HostTokenSleepyFlow>();
         services.AddSingleton<SlowStepThenSleepFlow>();
         services.AddSingleton<ConvertingFlow>();
         services.AddSingleton<UnregisteredConvertingFlow>();
@@ -786,8 +793,10 @@ public class DurableFlowInProcessParkTests
             .WithDurableFlow<SleepyFlow, ParkInput>()
             .WithDurableFlow<SwallowingFlow, ParkInput>()
             .WithDurableFlow<SlowStepThenSleepFlow, ParkInput>()
-            .WithDurableFlow<ConvertingFlow, ParkInput>();
+            .WithDurableFlow<ConvertingFlow, ParkInput>()
+            .WithDurableFlow<HostTokenSleepyFlow, ParkInput>();
         services.AddSingleton(transport);
+        configure?.Invoke(services);
         return services.BuildServiceProvider();
     }
 
@@ -1005,6 +1014,284 @@ public class DurableFlowInProcessParkTests
         gate.SetResult();
         await running;
         Assert.Equal(alreadyCompleted, (await store.LoadAsync(state.FlowId!))!.Steps!.ContainsKey("a"));
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // Fixpoint round 2.
+    // -----------------------------------------------------------------------------------------
+
+    [Fact]
+    public async Task APark_WhoseLeaseRenewalWillNotStop_PublishesNothing_AndFailsAsRetriable()
+    {
+        // Fixpoint r2 (S1#1): a park stops renewing before it publishes its wake-up, because that
+        // wake-up judges the lease by whether it changes. A renewal stuck in a store call that
+        // ignores its cancellation token outlived the 30 s join, and the park published anyway: the
+        // renewal landing afterwards read as a live holder running another job, and the park's own
+        // continuation was acknowledged as a duplicate. The park now fails before it publishes; its
+        // redelivery carries this same job, which a late renewal can never get acknowledged.
+        var clock = new VirtualTimeProvider();
+        var transport = new RecordingDelayedTransport();
+        await using var provider = BuildProvider(transport, clock);
+        var store = new StuckRenewalStore(new InMemoryFlowStateStore(clock));
+        var options = Options(o =>
+        {
+            o.ExecutionLeaseDuration = TimeSpan.FromHours(1);
+            o.ExecutionLeaseRenewInterval = TimeSpan.FromMinutes(1);
+        });
+        var state = State("park-renewal-will-not-stop");
+        Assert.True(await store.TryCreateAsync(state.FlowId!, state, options.StateExpiry));
+        var lease = await AcquireAsync(store, state.FlowId!, options, clock);
+        try
+        {
+            clock.Advance(options.ExecutionLeaseRenewInterval);
+            await store.RenewEntered.WaitAsync(TimeSpan.FromSeconds(30));
+
+            var context = CreateContext(provider, state, store, lease, options, clock, transport);
+            var sleeping = context.DelayAsync("nap", SixHours);
+            await WaitForArmedTimerAsync(clock, FlowExecutionLease.DisposeJoinLimit);
+            Assert.False(sleeping.IsCompleted);
+
+            // The join budget runs out with the renewal still in flight; it lands a moment later.
+            clock.Advance(FlowExecutionLease.DisposeJoinLimit);
+            store.ReleaseRenewal();
+
+            var failed = await Assert.ThrowsAsync<InvalidOperationException>(() => sleeping);
+            Assert.Contains("could not park", failed.Message, StringComparison.Ordinal);
+            Assert.Equal(0, transport.Count);
+            Assert.False(context.IsSuspended);
+            // Sticky like any failed park: the attempt ends as the retriable failure it is.
+            Assert.Same(failed, await Assert.ThrowsAsync<InvalidOperationException>(() => context.StepAsync("after", () => Task.CompletedTask)));
+        }
+        finally
+        {
+            store.ReleaseRenewal();
+            await lease.DisposeAsync();
+        }
+    }
+
+    [Fact]
+    public async Task AHostStopHandBack_ThroughTheExecutor_SkipsTheFailurePath_AndKeepsItsType()
+    {
+        // Fixpoint r2 (S1#3): the executor had no catch for the hand-back, so it took the generic
+        // failure path — the interruption's message checkpointed over the ledger (and the span
+        // marked as an error) on every deploy that reached an in-process timer. When that
+        // checkpoint failed (a revision race with a recovery, a store error during shutdown), the
+        // store's exception REPLACED the hand-back, which transports recognise by its type alone.
+        var clock = new VirtualTimeProvider();
+        var transport = new RecordingTransport();
+        using var host = new StoppingHost();
+        var observer = new AttemptObserver();
+        var store = new RefusingInterruptionCheckpointStore(new InMemoryFlowStateStore(clock));
+        await using var provider = BuildHost(transport, clock, host, services =>
+        {
+            services.AddSingleton<IFlowStateStore>(store);
+            services.AddSingleton<IDurableFlowExecutionObserver>(observer);
+        });
+        var state = HostState<SleepyFlow>("host-stop-hand-back-keeps-its-type");
+        Assert.True(await store.TryCreateAsync(state.FlowId!, state, TimeSpan.FromDays(1)));
+        host.StopApplication();
+
+        await Assert.ThrowsAsync<DurableFlowInterruptedException>(
+            () => provider.GetRequiredService<IDurableFlowExecutor>().ExecuteAsync(state.FlowId!).WaitAsync(TimeSpan.FromSeconds(30)));
+
+        Assert.Equal(0, store.InterruptionCheckpoints);
+        var persisted = (await store.LoadAsync(state.FlowId!))!;
+        Assert.Equal(FlowRunStatus.Running, persisted.Status);
+        Assert.NotNull(persisted.Steps!["nap"].WakeAtUtc);
+        // The attempt still ended without the run reaching a terminal status, and observers hear it
+        // once: the Testing harness clears its parked-step bookkeeping on exactly this event.
+        Assert.Single(observer.AttemptFailures);
+    }
+
+    [Fact]
+    public async Task AHostStopHandBack_BehindAThrowingObserverAndAThrowingLogger_KeepsItsType()
+    {
+        // Pre-commit r2 (A2): the hand-back catch guards its own log line, then notifies observers
+        // — and the warning for an observer that throws there (the documented crash-injection
+        // contract) was unguarded. With a logging provider that throws too (MEL rethrows provider
+        // failures), the logger's exception replaced DurableFlowInterruptedException, and the
+        // transport counted a failed attempt on every deploy.
+        var clock = new VirtualTimeProvider();
+        var transport = new RecordingTransport();
+        using var host = new StoppingHost();
+        var logger = new CollectingLogger { ThrowOnMessageContaining = "execution observer threw" };
+        var observer = new ThrowingAttemptObserver();
+        await using var provider = BuildHost(transport, clock, host, services =>
+        {
+            services.AddSingleton(logger.For<DurableFlowExecutor>());
+            services.AddSingleton<IDurableFlowExecutionObserver>(observer);
+        });
+        var store = provider.GetRequiredService<IFlowStateStore>();
+        var state = HostState<SleepyFlow>("host-stop-hand-back-behind-throwing-observer");
+        Assert.True(await store.TryCreateAsync(state.FlowId!, state, TimeSpan.FromDays(1)));
+        host.StopApplication();
+
+        await Assert.ThrowsAsync<DurableFlowInterruptedException>(
+            () => provider.GetRequiredService<IDurableFlowExecutor>().ExecuteAsync(state.FlowId!).WaitAsync(TimeSpan.FromSeconds(30)));
+
+        Assert.Equal(1, observer.AttemptFailures);
+        Assert.Contains(logger.Messages, message => message.Contains("execution observer threw", StringComparison.Ordinal));
+        Assert.Equal(FlowRunStatus.Running, (await store.LoadAsync(state.FlowId!))!.Status);
+    }
+
+    /// <summary>Throws from every attempt-failed notification (crash injection), counting them.</summary>
+    private sealed class ThrowingAttemptObserver : IDurableFlowExecutionObserver
+    {
+        private int _attemptFailures;
+
+        public int AttemptFailures => Volatile.Read(ref _attemptFailures);
+
+        public ValueTask OnRunAttemptFailedAsync(DurableFlowRunEvent run)
+        {
+            Interlocked.Increment(ref _attemptFailures);
+            throw new InvalidOperationException("Observer crash injection.");
+        }
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task AnInProcessTimer_WaitingOnTheHostsOwnStoppingToken_IsStillHandedOverOrBack_NotFailed(bool alreadyStopping)
+    {
+        // Fixpoint r2 (GS1#1): flow code that injects IHostApplicationLifetime and passes
+        // ApplicationStopping to DelayAsync had host stop cancel BOTH tokens at once, and the timer
+        // handed over (or back) only while the caller's token was still live — so it ended as a
+        // plain OperationCanceledException: a failed attempt, on every deploy.
+        var clock = new VirtualTimeProvider();
+        var transport = new RecordingTransport();
+        using var host = new StoppingHost();
+        await using var provider = BuildHost(transport, clock, host);
+        var store = provider.GetRequiredService<IFlowStateStore>();
+        var state = HostState<HostTokenSleepyFlow>($"host-token-timer-{alreadyStopping}");
+        Assert.True(await store.TryCreateAsync(state.FlowId!, state, TimeSpan.FromDays(1)));
+
+        if (alreadyStopping)
+        {
+            host.StopApplication();
+
+            // Reached on a stopping host: handed BACK — as the interruption, not the caller's cancellation.
+            await Assert.ThrowsAsync<DurableFlowInterruptedException>(
+                () => provider.GetRequiredService<IDurableFlowExecutor>().ExecuteAsync(state.FlowId!).WaitAsync(TimeSpan.FromSeconds(30)));
+            Assert.Equal(0, transport.Count);
+            Assert.Equal(FlowRunStatus.Running, (await store.LoadAsync(state.FlowId!))!.Status);
+            return;
+        }
+
+        var execution = provider.GetRequiredService<IDurableFlowExecutor>().ExecuteAsync(state.FlowId!);
+        await WaitForArmedTimerAsync(clock, SixHours);
+        host.StopApplication();
+
+        // Interrupted mid-wait: handed OVER — the delivery is acknowledged, a fresh wake-up queued.
+        await execution.WaitAsync(TimeSpan.FromSeconds(30));
+        var wakeUp = Assert.Single(transport.Jobs);
+        Assert.Null(wakeUp.NotBeforeUtc);
+        var persisted = (await store.LoadAsync(state.FlowId!))!;
+        Assert.Equal(FlowRunStatus.Running, persisted.Status);
+        Assert.False(persisted.Steps!["nap"].Completed);
+        Assert.False(persisted.Steps["nap"].Faulted);
+    }
+
+    [Fact]
+    public async Task ASuspendedTimersWakeUp_IsDueAtTheCheckpointedInstant_HoweverLongTheParkTook()
+    {
+        // Fixpoint r2 (GS1#3): the wake-up's delay was the remainder measured BEFORE the park's two
+        // checkpoints (and its renewal join), so it came due late by however long they took — here
+        // five seconds per checkpoint.
+        var clock = new VirtualTimeProvider();
+        var transport = new RecordingDelayedTransport();
+        await using var provider = BuildProvider(transport, clock);
+        var store = new SlowUpdateStore(new InMemoryFlowStateStore(clock), clock, TimeSpan.FromSeconds(5));
+        var options = Options();
+        var state = State("park-due-at-the-checkpoint");
+        Assert.True(await store.TryCreateAsync(state.FlowId!, state, options.StateExpiry));
+
+        await using var lease = await AcquireAsync(store, state.FlowId!, options, clock);
+        var context = CreateContext(provider, state, store, lease, options, clock, transport);
+        await Assert.ThrowsAsync<DurableFlowSuspendedException>(() => context.DelayAsync("nap", TimeSpan.FromHours(1)));
+
+        Assert.Equal(2, store.Updates);
+        var wakeAt = (await store.LoadAsync(state.FlowId!))!.Steps!["nap"].WakeAtUtc;
+        Assert.NotNull(wakeAt);
+        Assert.Equal(wakeAt, Assert.Single(transport.Jobs).NotBeforeUtc);
+    }
+
+    /// <summary><see cref="SleepyFlow"/>, waiting on the host's own stopping token.</summary>
+    internal sealed class HostTokenSleepyFlow(Microsoft.Extensions.Hosting.IHostApplicationLifetime lifetime) : IDurableFlow<ParkInput>
+    {
+        public async Task ExecuteAsync(IDurableFlowContext flow, ParkInput input)
+        {
+            await flow.DelayAsync("nap", SixHours, lifetime.ApplicationStopping);
+            await flow.StepAsync("after", () => Task.CompletedTask);
+        }
+    }
+
+    /// <summary>A store whose lease renewal ignores its cancellation token until the test lets it land.</summary>
+    private sealed class StuckRenewalStore(IFlowStateStore inner) : DelegatingFlowStateStore(inner)
+    {
+        private readonly TaskCompletionSource _entered = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private readonly TaskCompletionSource<bool> _landed = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public Task RenewEntered => _entered.Task;
+
+        public void ReleaseRenewal() => _landed.TrySetResult(true);
+
+        public override Task<bool> TryRenewLeaseAsync(string flowId, string leaseId, TimeSpan leaseDuration, CancellationToken cancellationToken = default)
+        {
+            _entered.TrySetResult();
+            return _landed.Task;
+        }
+    }
+
+    /// <summary>Throws on any checkpoint that records a host-stop interruption as the run's last message.</summary>
+    private sealed class RefusingInterruptionCheckpointStore(IFlowStateStore inner) : DelegatingFlowStateStore(inner)
+    {
+        private int _interruptionCheckpoints;
+
+        public int InterruptionCheckpoints => Volatile.Read(ref _interruptionCheckpoints);
+
+        public override Task<bool> TryUpdateAsync(string flowId, FlowState state, long expectedRevision, TimeSpan ttl, string? leaseId = null, CancellationToken cancellationToken = default)
+        {
+            if (state.LastMessage?.Contains("Host is stopping", StringComparison.Ordinal) == true)
+            {
+                Interlocked.Increment(ref _interruptionCheckpoints);
+                return Task.FromException<bool>(new InvalidOperationException("The store is unavailable during shutdown."));
+            }
+
+            return base.TryUpdateAsync(flowId, state, expectedRevision, ttl, leaseId, cancellationToken);
+        }
+    }
+
+    /// <summary>Every checkpoint takes <c>latency</c> of virtual time.</summary>
+    private sealed class SlowUpdateStore(IFlowStateStore inner, VirtualTimeProvider clock, TimeSpan latency) : DelegatingFlowStateStore(inner)
+    {
+        private int _updates;
+
+        public int Updates => Volatile.Read(ref _updates);
+
+        public override Task<bool> TryUpdateAsync(string flowId, FlowState state, long expectedRevision, TimeSpan ttl, string? leaseId = null, CancellationToken cancellationToken = default)
+        {
+            Interlocked.Increment(ref _updates);
+            clock.Advance(latency);
+            return base.TryUpdateAsync(flowId, state, expectedRevision, ttl, leaseId, cancellationToken);
+        }
+    }
+
+    /// <summary>Records the attempt-failed events the executor raises.</summary>
+    private sealed class AttemptObserver : IDurableFlowExecutionObserver
+    {
+        private readonly List<DurableFlowRunEvent> _attemptFailures = [];
+
+        public IReadOnlyList<DurableFlowRunEvent> AttemptFailures
+        {
+            get { lock (_attemptFailures) return [.. _attemptFailures]; }
+        }
+
+        public ValueTask OnRunAttemptFailedAsync(DurableFlowRunEvent run)
+        {
+            lock (_attemptFailures)
+                _attemptFailures.Add(run);
+            return default;
+        }
     }
 
     /// <summary>How long the first delivery of a six-hour timer is held before it hands over.</summary>

@@ -1241,7 +1241,9 @@ public class KafkaDispatcherTests
         // also carry a general arm). A worker faulting outside its handler guard — here the log
         // sink throwing from the "handler failed" entry inside the catch arm — rethrew from
         // Task.WhenAll, escaped DisposeAsync into the subscriber's `await using` (masking the real
-        // shutdown path) and leaked the drain token source.
+        // shutdown path) and leaked the drain token source. Since round 2 that log line is guarded
+        // (a throwing provider must never change an outcome), so the sink failure no longer faults
+        // the worker at all; the dispose still has to complete cleanly after it.
         var logger = new ErrorThrowingLogger();
         var dispatcher = KafkaMessageDispatcher.Create(
             (_, _) => throw new InvalidOperationException("handler boom"),
@@ -1646,7 +1648,9 @@ public class KafkaDispatcherTests
             FakeKafkaProducerClient.Header(Assert.Single(producer.Publishes).Headers, "reason"));
         Assert.DoesNotContain(logger.Entries, entry => entry.Level >= LogLevel.Error);
         var warning = Assert.Single(logger.Entries, entry => entry.Level == LogLevel.Warning && entry.Message.Contains("handed back", StringComparison.Ordinal));
-        Assert.Contains("Dead-lettering a copy (handed_back_after_commit)", warning.Message, StringComparison.Ordinal);
+        // Logged once the copy is written (r2 S6a#5: dead-letter first, then log and notify), so
+        // it reports the copy as made rather than as about to be.
+        Assert.Contains("Dead-lettered a copy (handed_back_after_commit)", warning.Message, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -1806,9 +1810,13 @@ public class KafkaDispatcherTests
         // Regression (r1 S7#6): after P3 moved away and came back, P3@621 was held behind the stale
         // @500 handler for as long as that one still ran — a 45-minute flow park stalled the whole
         // partition. The orphan no longer holds anything, and never stores its offset.
+        // r2 S11#16(e): "never stores" is asserted only once the orphan's settlement has really
+        // completed — observed through its outcome log, written by a continuation of that task —
+        // and a settlement tick has run after it; a signal from inside the handler fired before
+        // the settlement finished, so the old assertion ran ahead of the path it was pinning.
         var consumer = new FakeKafkaConsumerClient();
+        var logger = new ListLogger();
         var releaseStale = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        var staleDone = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var freshHandled = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var dispatcher = CreateDispatcher(
             async (delivery, _) =>
@@ -1816,14 +1824,14 @@ public class KafkaDispatcherTests
                 if (delivery.Offset == 500)
                 {
                     await releaseStale.Task;
-                    staleDone.TrySetResult();
                     return;
                 }
 
                 freshHandled.TrySetResult();
             },
             new KafkaSubscriberOptions { DetachHandlerAfter = TimeSpan.FromMilliseconds(20) },
-            consumer: consumer);
+            consumer: consumer,
+            logger: logger);
 
         try
         {
@@ -1841,7 +1849,7 @@ public class KafkaDispatcherTests
             });
 
             releaseStale.SetResult();
-            await staleDone.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            await KafkaTestData.WaitUntilAsync(() => logger.Entries.Any(entry => IsOrphanCompletion(entry.Message, 500)));
             dispatcher.SettleCompleted();
 
             Assert.Equal(new FakeKafkaConsumerClient.StoredOffset(Topic, 3, 621), Assert.Single(consumer.StoredOffsets));
@@ -1861,12 +1869,17 @@ public class KafkaDispatcherTests
         // r1 S7#6 on the stop path: the unbounded stop-time wait exists to store detached offsets
         // before the close commits — for a revoked partition there is nothing of ours to store, so
         // the stop neither waits for that handler nor stores its offset.
+        // r2 S11#16(e): the disposal is awaited and must have completed SUCCESSFULLY while the
+        // handler was still gated (IsCompleted is true for a faulted dispose too), and "never
+        // stores" is asserted once the orphan's completion path has actually run.
         var consumer = new FakeKafkaConsumerClient();
+        var logger = new ListLogger();
         var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var dispatcher = CreateDispatcher(
             async (_, _) => await release.Task,
             new KafkaSubscriberOptions { DetachHandlerAfter = TimeSpan.Zero },
-            consumer: consumer);
+            consumer: consumer,
+            logger: logger);
 
         dispatcher.Accept(KafkaTestData.Delivery(Topic, offset: 500, partition: 3), CancellationToken.None);
         consumer.Revoke(3);
@@ -1874,15 +1887,22 @@ public class KafkaDispatcherTests
         var disposal = dispatcher.DisposeAsync();
         try
         {
-            Assert.True(disposal.IsCompleted);
+            Assert.True(disposal.IsCompletedSuccessfully);
         }
         finally
         {
             release.SetResult();
         }
 
+        await disposal;
+        await KafkaTestData.WaitUntilAsync(() => logger.Entries.Any(entry => IsOrphanCompletion(entry.Message, 500)));
         Assert.Empty(consumer.StoredOffsets);
     }
+
+    /// <summary>The outcome log a revoked handler's settlement writes once it has completed.</summary>
+    private static bool IsOrphanCompletion(string message, long offset)
+        => message.StartsWith("Orphaned Kafka handler", StringComparison.Ordinal)
+            && message.Contains($"@{offset} completed", StringComparison.Ordinal);
 
     [Fact]
     public async Task Awaiting_APartitionHandedStraightBack_RedeliveringTheRunningMessage_HoldsTheCopyBehindIt()
@@ -2122,6 +2142,436 @@ public class KafkaDispatcherTests
         Assert.Equal(
             KafkaMessageDispatcher.MaxDeadLetterHeaderLength,
             FakeKafkaProducerClient.Header(Assert.Single(producer.Publishes).Headers, "exceptionMessage")!.Length);
+    }
+
+    // ---------- Fixpoint round 2 (G9) ----------
+
+    [Fact]
+    public async Task DeadLetter_ARecordThatLeavesNoRoomForTheBurialHeaders_FailsNamingTheSize_WithoutAProduce()
+    {
+        // Regression (r2 S7#4): only the two exception headers were cut to fit message.max.bytes;
+        // the fixed burial headers were not. A record within ~270 bytes of the limit (a foreign
+        // one, or one published with a larger limit) produced a copy librdkafka rejects locally on
+        // every attempt, so the subscriber restarted on it for ever — and the error told the
+        // operator to "fix the dead-letter topic", which cannot help. It now fails before the
+        // produce with the size cause and the ConfigureProducer remedy (the stall itself is the
+        // standing position-commit design).
+        var options = KafkaTestData.NewOptions();
+        options.ConfigureProducer = config => config.MessageMaxBytes = 10_000;
+        var producer = new FakeKafkaProducerClient();
+        await using var dispatcher = CreateDispatcher(
+            (_, _) => throw new InvalidOperationException("boom"),
+            FastRetries(new KafkaSubscriberOptions { MaxDeliveryAttempts = 1 }),
+            options: options,
+            producer: producer);
+
+        var ex = await Assert.ThrowsAsync<KafkaDeadLetterPublishFailedException>(() =>
+            dispatcher.HandleAsync(KafkaTestData.Delivery(Topic, offset: 1, payload: new string('p', 9_900)), CancellationToken.None));
+
+        var tooLarge = Assert.IsType<KafkaDeadLetterTooLargeException>(ex.InnerException);
+        Assert.Equal(10_000, tooLarge.MessageMaxBytes);
+        Assert.True(tooLarge.RequiredBytes > 10_000);
+        Assert.Contains("ConfigureProducer", ex.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("fix the dead-letter topic", ex.Message, StringComparison.Ordinal);
+        Assert.Empty(producer.Publishes);
+    }
+
+    [Fact]
+    public void ValidateOptions_JudgesThePollGapByTheMaxPollIntervalConfigureConsumerSets()
+    {
+        // Regression (r2 S7#5): ConfigureConsumer runs last and may set max.poll.interval.ms, but
+        // the poll-gap rule read the MaxPollInterval option: a 60 s override passed validation for
+        // a 35 s gap that only fits half of the 5-minute option.
+        var options = KafkaTestData.NewOptions();
+        options.ConfigureConsumer = config => config.MaxPollIntervalMs = 60_000;
+        var subscriber = new KafkaSubscriberOptions
+        {
+            DetachHandlerAfter = TimeSpan.FromSeconds(25),
+            PollTimeout = TimeSpan.FromSeconds(10)
+        };
+
+        var ex = Assert.Throws<InvalidOperationException>(() =>
+            KafkaMessageDispatcher.ValidateOptions(options, subscriber, KafkaSubscriberRole.Worker));
+
+        Assert.Contains(nameof(KafkaAsyncResponseTransportOptions.ConfigureConsumer), ex.Message, StringComparison.Ordinal);
+        Assert.Contains("00:01:00", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task DiscardUnprocessable_BoundsTheDeadLetterProduceByTheMaxPollIntervalTheConsumerRunsWith()
+    {
+        // Regression (r2 S7#5): the burial budget was a quarter of the MaxPollInterval OPTION —
+        // 75 s by default — even with ConfigureConsumer setting a shorter max.poll.interval.ms, so
+        // an unprocessable-message burial blocking the poll thread outlived the interval the
+        // consumer actually ran with and got it evicted: the storm the budget exists to prevent.
+        var producer = new HangingKafkaProducerClient();
+        var options = KafkaTestData.NewOptions();
+        options.ConfigureConsumer = config => config.MaxPollIntervalMs = 400;
+        await using var dispatcher = KafkaMessageDispatcher.Create(
+            (_, _) => Task.CompletedTask,
+            new FakeKafkaConsumerClient(),
+            producer,
+            options,
+            new KafkaSubscriberOptions
+            {
+                MaxDeliveryAttempts = 0,
+                PollTimeout = TimeSpan.FromMilliseconds(10),
+                DetachHandlerAfter = TimeSpan.FromMilliseconds(50)
+            },
+            NullLogger.Instance,
+            Topic,
+            Group,
+            KafkaSubscriberRole.Worker);
+
+        await Assert.ThrowsAsync<KafkaDeadLetterPublishFailedException>(() => dispatcher.DiscardUnprocessableAsync(
+            KafkaTestData.Message(Topic, offset: 4, payload: ""),
+            new InvalidDataException("no payload"),
+            CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(5)));
+
+        Assert.True(producer.SawCancellation);
+    }
+
+    [Fact]
+    public async Task Awaiting_HeldUnprocessableMessages_AreBuriedOffThePollThread()
+    {
+        // Regression (r2 S7#6): once a detached handler settled, every unprocessable message held
+        // behind it was buried on the poll thread, back to back within one tick — each produce
+        // bounded only by a quarter of max.poll.interval.ms, with no Consume in between, so a few
+        // slow produces on a degraded broker overran the interval and evicted the consumer. The
+        // burial now runs detached like a handler: the tick returns while it is still producing,
+        // and its offset is stored — in order — on a later tick.
+        var consumer = new FakeKafkaConsumerClient();
+        var publishStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releasePublish = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var producer = new FakeKafkaProducerClient
+        {
+            PublishDelay = async _ =>
+            {
+                publishStarted.TrySetResult();
+                await releasePublish.Task;
+            }
+        };
+        var releaseHandler = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var dispatcher = CreateDispatcher(
+            async (_, _) => await releaseHandler.Task,
+            new KafkaSubscriberOptions { DetachHandlerAfter = TimeSpan.Zero },
+            consumer: consumer,
+            producer: producer);
+
+        try
+        {
+            dispatcher.Accept(KafkaTestData.Delivery(Topic, offset: 10, partition: 3), CancellationToken.None);
+            dispatcher.AcceptUnprocessable(KafkaTestData.MessageOn(Topic, 3, 11, ""), new InvalidDataException("no payload"), CancellationToken.None);
+            dispatcher.AcceptUnprocessable(KafkaTestData.MessageOn(Topic, 3, 12, ""), new InvalidDataException("no payload"), CancellationToken.None);
+            releaseHandler.SetResult();
+
+            // Poll-thread ticks until the handler's offset is stored — the tick that then reaches the
+            // held burials. On a separate thread, bounded: the old tick never came back from them.
+            var ticks = Task.Run(() =>
+            {
+                while (consumer.StoredOffsets.Count == 0)
+                {
+                    dispatcher.SettleCompleted();
+                    Thread.Sleep(2);
+                }
+            });
+            await publishStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            await ticks.WaitAsync(TimeSpan.FromSeconds(10)); // returned with the burial still producing
+
+            Assert.Equal([10L], consumer.StoredOffsets.Select(stored => stored.Offset));
+            Assert.Empty(producer.Publishes);
+
+            releasePublish.SetResult();
+            await KafkaTestData.WaitUntilAsync(() =>
+            {
+                dispatcher.SettleCompleted();
+                return consumer.StoredOffsets.Count == 3;
+            });
+
+            Assert.Equal([10L, 11L, 12L], consumer.StoredOffsets.Select(stored => stored.Offset));
+            Assert.Equal(
+                ["11", "12"],
+                producer.Publishes.Select(publish => FakeKafkaProducerClient.Header(publish.Headers, "sourceOffset")));
+        }
+        finally
+        {
+            releaseHandler.TrySetResult();
+            releasePublish.TrySetResult();
+            await dispatcher.DisposeAsync();
+        }
+    }
+
+    [Fact]
+    public async Task Queued_AHandBackAfterTheDrainLapsed_IsBuriedAsAHandBack_NotAsALapse()
+    {
+        // Regression (r2 S7#8): DurableFlowInterruptedException IS an OperationCanceledException,
+        // and once the drain had lapsed the lapse filter caught it before the hand-back branch — a
+        // flow step still running at the lapse that then reached a timer on the stopping host was
+        // buried as drain_budget_lapsed_after_commit, which replay tooling reads as "never started".
+        var producer = new FakeKafkaProducerClient();
+        var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var subscriber = new KafkaSubscriberOptions { MaxDeliveryAttempts = 5 }.UseAckAfterEnqueue(1, 8, TimeSpan.FromMilliseconds(400));
+        var dispatcher = CreateDispatcher(
+            async (_, drainToken) =>
+            {
+                started.TrySetResult();
+                try
+                {
+                    await Task.Delay(Timeout.Infinite, drainToken); // a step still running at the lapse...
+                }
+                catch (OperationCanceledException)
+                {
+                    // ...that then reaches a timer on the stopping host.
+                    throw new DurableFlowInterruptedException("Host is stopping; the wake-up is handed back.");
+                }
+            },
+            subscriber,
+            producer: producer);
+
+        await dispatcher.HandleAsync(KafkaTestData.Delivery(Topic, offset: 3), CancellationToken.None);
+        await started.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await dispatcher.DisposeAsync();
+
+        await KafkaTestData.WaitUntilAsync(() => producer.Publishes.Count == 1);
+        Assert.Equal("handed_back_after_commit", FakeKafkaProducerClient.Header(Assert.Single(producer.Publishes).Headers, "reason"));
+    }
+
+    [Fact]
+    public async Task Awaiting_DeadLetteringDisabled_TheCapLogClaimsNoCopy()
+    {
+        // Regression (r2 S7#9): with DeadLetterEnabled = false the cap path logged "producing to
+        // dead-letter topic" and then stored the offset: the message was silently discarded.
+        var logger = new ListLogger();
+        var options = KafkaTestData.NewOptions();
+        options.DeadLetterEnabled = false;
+        await using var dispatcher = CreateDispatcher(
+            (_, _) => throw new InvalidOperationException("boom"),
+            FastRetries(new KafkaSubscriberOptions { MaxDeliveryAttempts = 1 }),
+            options: options,
+            logger: logger);
+
+        await dispatcher.HandleAsync(KafkaTestData.Delivery(Topic, offset: 1), CancellationToken.None);
+
+        Assert.DoesNotContain(logger.Entries, entry => entry.Message.Contains("producing to dead-letter", StringComparison.Ordinal));
+        var error = Assert.Single(logger.Entries, entry => entry.Level == LogLevel.Error && entry.Message.Contains("max delivery attempts", StringComparison.Ordinal));
+        Assert.Contains("dead-lettering is disabled", error.Message, StringComparison.Ordinal);
+        Assert.Contains("no copy is kept", error.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task DiscardUnprocessable_DeadLetteringDisabled_TheLogClaimsNoCopy()
+    {
+        // Regression (r2 S7#9): "dead-lettering and committing it" was logged with no copy written.
+        var logger = new ListLogger();
+        var options = KafkaTestData.NewOptions();
+        options.DeadLetterEnabled = false;
+        var consumer = new FakeKafkaConsumerClient();
+        await using var dispatcher = CreateDispatcher(
+            (_, _) => Task.CompletedTask,
+            new KafkaSubscriberOptions(),
+            options: options,
+            consumer: consumer,
+            logger: logger);
+
+        await dispatcher.DiscardUnprocessableAsync(
+            KafkaTestData.Message(Topic, offset: 4, payload: ""),
+            new InvalidDataException("no payload"),
+            CancellationToken.None);
+
+        Assert.DoesNotContain(logger.Entries, entry => entry.Message.Contains("dead-lettering and committing", StringComparison.Ordinal));
+        var error = Assert.Single(logger.Entries, entry => entry.Level == LogLevel.Error);
+        Assert.Contains("dead-lettering is disabled", error.Message, StringComparison.Ordinal);
+        Assert.Equal(4, Assert.Single(consumer.StoredOffsets).Offset);
+    }
+
+    [Fact]
+    public async Task Queued_DrainLapse_WithDeadLetteringDisabled_SaysEachUnstartedMessageIsLost_NotDeadLettered()
+    {
+        // Regression (r2 S7#9): the lapse paths logged "Dead-lettering ..." (the stop's warning and
+        // each unstarted entry's) with no copy written — for an already-committed message, a loss.
+        var logger = new ListLogger();
+        var options = KafkaTestData.NewOptions();
+        options.DeadLetterEnabled = false;
+        var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var dispatcher = CreateDispatcher(
+            async (delivery, _) =>
+            {
+                if (delivery.Offset == 1)
+                {
+                    started.TrySetResult();
+                    await release.Task.ConfigureAwait(false); // ignores the drain token, like the ingress
+                }
+            },
+            new KafkaSubscriberOptions().UseAckAfterEnqueue(1, 8, TimeSpan.FromSeconds(2)),
+            options,
+            logger: logger);
+
+        try
+        {
+            await dispatcher.HandleAsync(KafkaTestData.Delivery(Topic, offset: 1), CancellationToken.None);
+            await started.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            await dispatcher.HandleAsync(KafkaTestData.Delivery(Topic, offset: 2), CancellationToken.None);
+
+            await dispatcher.DisposeAsync();
+        }
+        finally
+        {
+            release.TrySetResult();
+        }
+
+        Assert.DoesNotContain(logger.Entries, entry => entry.Message.Contains("Dead-lettering", StringComparison.OrdinalIgnoreCase)
+            || entry.Message.Contains("dead-lettered a copy", StringComparison.OrdinalIgnoreCase));
+        var lost = Assert.Single(logger.Entries, entry => entry.Level == LogLevel.Error && entry.Message.Contains("@2", StringComparison.Ordinal));
+        Assert.Contains("no dead-letter destination is configured, so the message is lost", lost.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Queued_AHandBack_IsDeadLetteredBeforeOnBackgroundFailureIsAwaited()
+    {
+        // Regression (r2 S6a#5): the early-ACK arms awaited OnBackgroundFailure BEFORE the dead-letter
+        // produce. A slow callback during the stop (an alert on a timeout-less HTTP client) held the
+        // only durable record back until the drain lapsed and the producer was disposed. The copy
+        // is written first now: it exists by the time the callback runs.
+        var producer = new FakeKafkaProducerClient();
+        var callbackEntered = new TaskCompletionSource<int>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseCallback = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var subscriber = FastRetries(new KafkaSubscriberOptions { MaxDeliveryAttempts = 5 }.UseAckAfterEnqueue(1, 8));
+        subscriber.OnBackgroundFailure = async _ =>
+        {
+            callbackEntered.TrySetResult(producer.Publishes.Count);
+            await releaseCallback.Task;
+        };
+        var dispatcher = CreateDispatcher(
+            (_, _) => Task.FromException(new DurableFlowInterruptedException("Host is stopping.")),
+            subscriber,
+            producer: producer);
+
+        try
+        {
+            await dispatcher.HandleAsync(KafkaTestData.Delivery(Topic, offset: 1), CancellationToken.None);
+
+            Assert.Equal(1, await callbackEntered.Task.WaitAsync(TimeSpan.FromSeconds(5)));
+        }
+        finally
+        {
+            releaseCallback.TrySetResult();
+            await dispatcher.DisposeAsync();
+        }
+    }
+
+    [Fact]
+    public async Task Queued_AFailureAtTheCap_IsDeadLetteredBeforeOnBackgroundFailureIsAwaited()
+    {
+        // r2 S6a#5, the background_handler_failed_after_commit arm.
+        var producer = new FakeKafkaProducerClient();
+        var callbackEntered = new TaskCompletionSource<int>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseCallback = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var subscriber = FastRetries(new KafkaSubscriberOptions { MaxDeliveryAttempts = 1 }.UseAckAfterEnqueue(1, 8));
+        subscriber.OnBackgroundFailure = async _ =>
+        {
+            callbackEntered.TrySetResult(producer.Publishes.Count);
+            await releaseCallback.Task;
+        };
+        var dispatcher = CreateDispatcher(
+            (_, _) => Task.FromException(new InvalidOperationException("boom")),
+            subscriber,
+            producer: producer);
+
+        try
+        {
+            await dispatcher.HandleAsync(KafkaTestData.Delivery(Topic, offset: 1), CancellationToken.None);
+
+            Assert.Equal(1, await callbackEntered.Task.WaitAsync(TimeSpan.FromSeconds(5)));
+        }
+        finally
+        {
+            releaseCallback.TrySetResult();
+            await dispatcher.DisposeAsync();
+        }
+    }
+
+    [Fact]
+    public async Task Queued_DrainLapse_BuriesEveryQueuedEntryFirst_AndBoundsTheCallbacksByTheReserve()
+    {
+        // Regression (r2 S6b#5): the dispose reserve surfaced each still-queued entry through
+        // OnBackgroundFailure before burying it, and awaited that callback with no bound — one
+        // callback writing to a database that is down held DisposeAsync past its budget, and the
+        // entries behind it were neither buried nor counted. Every entry is buried first now, and
+        // each callback is waited for only as long as the reserve lasts.
+        var producer = new FakeKafkaProducerClient();
+        var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var callbacksHang = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var notified = new System.Collections.Concurrent.ConcurrentQueue<long>();
+        var subscriber = new KafkaSubscriberOptions().UseAckAfterEnqueue(1, 8, TimeSpan.FromSeconds(2)); // a 500 ms reserve
+        subscriber.OnBackgroundFailure = async context =>
+        {
+            notified.Enqueue(context.Offset);
+            await callbacksHang.Task;
+        };
+        var dispatcher = CreateDispatcher(
+            async (delivery, _) =>
+            {
+                if (delivery.Offset == 1)
+                {
+                    started.TrySetResult();
+                    await release.Task.ConfigureAwait(false); // ignores the drain token, like the ingress
+                }
+            },
+            subscriber,
+            producer: producer);
+
+        try
+        {
+            await dispatcher.HandleAsync(KafkaTestData.Delivery(Topic, offset: 1), CancellationToken.None);
+            await started.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            await dispatcher.HandleAsync(KafkaTestData.Delivery(Topic, offset: 2), CancellationToken.None);
+            await dispatcher.HandleAsync(KafkaTestData.Delivery(Topic, offset: 3), CancellationToken.None);
+
+            // Bounded by the drain budget, not by the hanging callback.
+            await dispatcher.DisposeAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(10));
+
+            Assert.Equal(
+                ["2", "3"],
+                producer.Publishes.Select(publish => FakeKafkaProducerClient.Header(publish.Headers, "sourceOffset")).Order().ToArray());
+            Assert.Equal([2L, 3L], notified.Order().ToArray()); // every entry still surfaced
+        }
+        finally
+        {
+            release.TrySetResult();
+            callbacksHang.TrySetResult();
+        }
+    }
+
+    [Fact]
+    public async Task Queued_AThrowingLoggingProvider_NeitherStopsTheWorkerNorCostsTheDeadLetterCopy()
+    {
+        // Round-2 rule (a throwing logging provider must never change an outcome): the Error logged
+        // at the cap ran before the burial, so a provider failure there escaped the worker loop —
+        // no dead-letter copy for an already-committed message, and no worker left to run the jobs
+        // queued behind it.
+        var producer = new FakeKafkaProducerClient();
+        var handled = new System.Collections.Concurrent.ConcurrentQueue<long>();
+        var dispatcher = CreateDispatcher(
+            (delivery, _) =>
+            {
+                handled.Enqueue(delivery.Offset);
+                return delivery.Offset == 1
+                    ? Task.FromException(new InvalidOperationException("boom"))
+                    : Task.CompletedTask;
+            },
+            FastRetries(new KafkaSubscriberOptions { MaxDeliveryAttempts = 1 }.UseAckAfterEnqueue(1, 8)),
+            producer: producer,
+            logger: new ErrorThrowingLogger());
+
+        await dispatcher.HandleAsync(KafkaTestData.Delivery(Topic, offset: 1), CancellationToken.None);
+        await dispatcher.HandleAsync(KafkaTestData.Delivery(Topic, offset: 2), CancellationToken.None);
+
+        await KafkaTestData.WaitUntilAsync(() => handled.Count == 2 && producer.Publishes.Count == 1);
+        await dispatcher.DisposeAsync();
+
+        Assert.Equal("1", FakeKafkaProducerClient.Header(Assert.Single(producer.Publishes).Headers, "sourceOffset"));
     }
 
     private static KafkaMessageDispatcher CreateDispatcher(

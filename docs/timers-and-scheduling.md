@@ -68,10 +68,10 @@ delivery may stay in flight however alive its handler is: Google Pub/Sub stops e
 [`BrokerConsumerTimeout`](configuration.md#transport-options) — and since that clock starts when the
 broker sends a delivery, prefetched deliveries age while they wait, so RabbitMQ advertises
 `BrokerConsumerTimeout / WorkerSubscriber.PrefetchCount`, never less than one minute nor more than
-the timeout itself — with durable flows in ack-after-handler mode a startup warning says when the share falls below that floor; set
-`PrefetchCount = 1` for longer in-process hops), and SQS never keeps a message invisible beyond 12
-hours. Past the ceiling the broker hands the **same job** to another consumer while the first
-handler is still sleeping. A transport that knows its ceiling advertises it
+the timeout itself — in ack-after-handler mode a startup warning says when the share falls below
+that floor; set `PrefetchCount = 1` for longer in-process hops), and SQS never keeps a message
+invisible beyond 12 hours. Past the ceiling the broker hands the **same job** to another consumer
+while the first handler is still sleeping. A transport that knows its ceiling advertises it
 (`IWorkerTransportInFlightLimit`), and the engine then waits a long sleep in **hops**: it parks for
 at most half the ceiling — never longer than what the delivery has left of it after the steps
 that ran before the timer, less a tenth of the ceiling as headroom (with nothing left it hands over
@@ -86,9 +86,13 @@ wake-up and acknowledges its delivery, so a sleep that spans many deploys never 
 delivery attempts — brokers count an unsettled redelivery like a failed one, and a transport's
 attempt cap would eventually dead-letter the run's only wake-up without running it. A timer reached
 on a host that is already stopping, or whose hand-over cannot be published, hands the delivery back
-to the transport instead (`DurableFlowInterruptedException`), to be redelivered after the restart.
-That redelivery does count: on RabbitMQ it arrives `redelivered`, so a worker `MaxDeliveryAttempts`
-of 1 rejects it unrun (the worker subscriber warns about that at startup) — keep it at 2 or more.
+to the transport instead (`DurableFlowInterruptedException`), to be redelivered — to a live
+replica, or after the restart. That redelivery does count: on RabbitMQ it arrives `redelivered`, so
+a worker `MaxDeliveryAttempts` of 1 rejects it unrun (the worker subscriber warns about that at
+startup) — keep it at 2 or more.
+Either way host stop decides, even when the token passed to `DelayAsync` is one it cancels too
+(`ApplicationStopping` injected into the flow), and the executor runs none of its failure path for
+it (no failure checkpoint, no error span).
 
 Awaited-response steps are **not** hopped: a step re-attaches to a correlation id, so handing its
 delivery back would need the wait to be re-established from the ledger on every hop. A step whose
@@ -169,9 +173,10 @@ published or the run is seen to have executed (another replica started it). An a
 *expected* shape of an occurrence still waiting for its first successful publish, and the re-drive
 starts it again — an earlier reading treated the absence as "expired" and gave up, which lost every
 occurrence that fell due during an outage longer than the start's retry ladder. The queue dies with
-its process: an occurrence whose publish was still failing at shutdown persisted nothing, so
-nothing can find it after a restart and it is skipped like any occurrence missed while no replica
-was up (the run history shows the gap). Separately, each schedule probes the last
+its process: an occurrence whose publish was still failing at shutdown — or whose publish the host
+stop itself cancelled, which ends quietly as a cancellation rather than as an undispatched start —
+persisted nothing, so nothing can find it after a restart and it is skipped like any occurrence
+missed while no replica was up (the run history shows the gap). Separately, each schedule probes the last
 `StartupRedriveWindow` (default 1 hour; zero disables it; at most the 64 most recent occurrences —
 the probe looks back only as far as it needs to find them, so a long window on a frequent schedule
 costs startup nothing)

@@ -24,6 +24,17 @@ internal static class GooglePubSubOptionsValidator
         // loop), so fail fast here — the ASB sibling validates its CorrelationIdProperty the
         // same way.
         _ = Required(options.CorrelationIdAttribute, nameof(options.CorrelationIdAttribute));
+
+        // Every correlated publish writes this attribute key, and Pub/Sub rejects a publish whose
+        // key starts with "goog" or exceeds 256 bytes — so such a name failed every correlated
+        // publish (and every external responder told to use it) after a clean startup.
+        if (!IsValidAttributeKey(options.CorrelationIdAttribute))
+        {
+            throw new InvalidOperationException(
+                $"{nameof(GooglePubSubAsyncResponseOptions)}.{nameof(options.CorrelationIdAttribute)} '{options.CorrelationIdAttribute}' is not a valid " +
+                $"Pub/Sub attribute key: it must not start with 'goog' (reserved by Google) and must not exceed {MaxAttributeKeyBytes} bytes in UTF-8.");
+        }
+
         AsyncResponseChannelOptions.EnsureTimerBacked(options.SubscriberRetryBaseDelay, nameof(GooglePubSubAsyncResponseOptions), nameof(options.SubscriberRetryBaseDelay));
         AsyncResponseChannelOptions.EnsureTimerBacked(options.SubscriberRetryMaxDelay, nameof(GooglePubSubAsyncResponseOptions), nameof(options.SubscriberRetryMaxDelay));
         if (options.SubscriberRetryBaseDelay > options.SubscriberRetryMaxDelay)
@@ -33,6 +44,17 @@ internal static class GooglePubSubOptionsValidator
         if (options.HostShutdownTimeout is { } hostShutdownTimeout && hostShutdownTimeout <= TimeSpan.Zero)
             throw new InvalidOperationException($"{nameof(GooglePubSubAsyncResponseOptions)}.{nameof(options.HostShutdownTimeout)} must be positive when set.");
     }
+
+    /// <summary>The Pub/Sub attribute-key size limit, in UTF-8 bytes.</summary>
+    internal const int MaxAttributeKeyBytes = 256;
+
+    /// <summary>
+    /// Whether Pub/Sub accepts <paramref name="key"/> as a message-attribute key: at most 256 bytes
+    /// in UTF-8, and not starting with <c>goog</c> (reserved by Google).
+    /// </summary>
+    internal static bool IsValidAttributeKey(string key)
+        => !key.StartsWith("goog", StringComparison.Ordinal)
+            && System.Text.Encoding.UTF8.GetByteCount(key) <= MaxAttributeKeyBytes;
 
     /// <summary>
     /// The first lease already lasts the client's 60-second ack deadline, so a smaller total

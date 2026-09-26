@@ -231,6 +231,49 @@ public class NatsSubscriberServicesTests
     }
 
     [Fact]
+    public async Task WorkerSubscriber_AnSdkCancellationThatIsNotTheRenewalToken_DoesNotStopTheHeartbeat()
+    {
+        // The renewal loop treated ANY OperationCanceledException as its own end. NATS.Net raises
+        // one of its own — a publish waiting out a disconnect under PublishTimeoutOnDisconnected is
+        // cancelled by the connection's CommandTimeout — and renewals then stopped for the rest of
+        // the batch: AckWait lapsed under a live handler and the job redelivered to a peer.
+        // Deterministic: the heartbeat runs on the injected clock.
+        _jetStream.LiveAckWait = TimeSpan.FromSeconds(3); // renew every 1 s
+        var clock = new AsyncResponse.Testing.VirtualTimeProvider();
+        var ingress = new GatedIngress();
+        var renewals = 0;
+        var first = new RecordingDelivery
+        {
+            ProgressBehavior = _ => Interlocked.Increment(ref renewals) == 1
+                ? throw new OperationCanceledException("The SDK's command timeout, not the renewal token.")
+                : ValueTask.CompletedTask
+        };
+        _jetStream.EnqueueDelivery(first.Create("p1", numDelivered: 1));
+        var subscriber = new NatsWorkerSubscriber(Options(), _jetStream, ingress, new TestLogger<NatsWorkerSubscriber>(), clock);
+
+        await subscriber.StartAsync(CancellationToken.None);
+        try
+        {
+            await ingress.Started.Task.WaitAsync(TimeSpan.FromSeconds(5)); // p1 is wedged in the handler
+            await Eventually(() => clock.NextTimerDueAt is not null);
+            clock.Advance(TimeSpan.FromSeconds(1));
+            await Eventually(() => first.Progresses >= 1); // this renewal failed with the SDK's cancellation
+
+            // The loop is still alive: it re-arms and renews again on the next tick.
+            await Eventually(() => clock.NextTimerDueAt is not null);
+            clock.Advance(TimeSpan.FromSeconds(1));
+            await Eventually(() => first.Progresses >= 2);
+            Assert.Equal(0, first.Acks);
+        }
+        finally
+        {
+            ingress.Release.TrySetResult();
+            await subscriber.StopAsync(CancellationToken.None);
+            subscriber.Dispose();
+        }
+    }
+
+    [Fact]
     public async Task Subscriber_LongPollsAnsweredEmptyAtOnce_BackOffOnTheClock()
     {
         // Round 42: a pull request that reaches no live consumer is answered "no responders", which
@@ -383,6 +426,106 @@ public class NatsSubscriberServicesTests
         Assert.DoesNotContain("p3", ingress.Received);
         Assert.DoesNotContain("p4", ingress.Received);
         Assert.DoesNotContain("p5", ingress.Received);
+    }
+
+    [Fact]
+    public async Task WorkerSubscriber_HostStopping_EndsTheIdleLongPollAtOnce_AndFetchesNothingMore()
+    {
+        // Fixpoint round 2 (worker intake stops at host stop): from ApplicationStopping on, the
+        // durable-flow engine hands back any timer or lease wait that starts on this host, so a
+        // delivery taken in the window before this subscriber's own stop only runs up to its first
+        // such wait and comes back — an attempt spent on a stopping host that a live replica would
+        // have used. The idle long poll (up to 30 s) now ends the moment host stop begins and the
+        // loop fetches nothing more; before, it kept polling until the subscriber's own token.
+        using var host = new StoppingHostLifetime();
+        var subscriber = new NatsWorkerSubscriber(Options(), _jetStream, _ingress, new TestLogger<NatsWorkerSubscriber>(), hostLifetime: host);
+
+        await subscriber.StartAsync(CancellationToken.None);
+        var late = new RecordingDelivery();
+        int fetchesAtHostStop;
+        try
+        {
+            await Eventually(() => _jetStream.FetchSizes.Count >= 2); // the no-wait drain, then the long poll now waiting
+            host.StopApplication();
+
+            await _jetStream.LongPollCancelled.Task.WaitAsync(TimeSpan.FromSeconds(5)); // not its 30 s expiry
+            fetchesAtHostStop = _jetStream.FetchSizes.Count;
+            _jetStream.EnqueueDelivery(late.Create("late", numDelivered: 1));
+        }
+        finally
+        {
+            await subscriber.StopAsync(CancellationToken.None);
+            subscriber.Dispose();
+        }
+
+        Assert.Equal(fetchesAtHostStop, _jetStream.FetchSizes.Count);
+        Assert.Equal(0, _ingress.WorkerCount);
+        Assert.Equal(0, late.Acks);
+    }
+
+    [Fact]
+    public async Task WorkerSubscriber_HostStopping_HandsBackWhatTheEarlyAckBatchHadNotStarted_WithoutSettlingItFirst()
+    {
+        // Fixpoint round 2 (worker intake stops at host stop): an early-ACK delivery taken after
+        // host stop begins is ACKed at enqueue and then handed back by the flow engine at its
+        // first wait — JetStream never redelivers it, so it survives only as a dead-letter copy.
+        // Deterministic: p1 is wedged in the only worker, p2 fills the one-slot queue and p3 parks
+        // the loop on it. Host stop now wakes that wait at once and NAKs p3 — and the rest of the
+        // batch — with no delay for a live peer, none of them ACKed first. Before, p3 waited for a
+        // slot that never freed, and would have been ACKed once one did.
+        using var host = new StoppingHostLifetime();
+        var ingress = new GatedIngress();
+        var deliveries = Enumerable.Range(1, 5).Select(_ => new RecordingDelivery()).ToArray();
+        for (var i = 0; i < deliveries.Length; i++)
+            _jetStream.EnqueueDelivery(deliveries[i].Create($"p{i + 1}", numDelivered: 1));
+        var subscriber = new NatsWorkerSubscriber(
+            Options(o =>
+            {
+                o.WorkerSubscriber.UseAckAfterEnqueue(backgroundWorkerCount: 1, backgroundQueueCapacity: 1, TimeSpan.FromSeconds(5));
+                o.WorkerSubscriber.BatchSize = 5;
+            }),
+            _jetStream,
+            ingress,
+            new TestLogger<NatsWorkerSubscriber>(),
+            hostLifetime: host);
+
+        await subscriber.StartAsync(CancellationToken.None);
+        try
+        {
+            await ingress.Started.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            await Eventually(() => deliveries[1].Acks == 1); // p2 accepted into the full queue
+
+            host.StopApplication();
+            await Eventually(() => deliveries[2].Naks.Count == 1 && deliveries[3].Naks.Count == 1 && deliveries[4].Naks.Count == 1);
+
+            for (var i = 2; i < deliveries.Length; i++)
+            {
+                Assert.Equal([TimeSpan.Zero], deliveries[i].Naks);
+                Assert.Equal(0, deliveries[i].Acks);
+            }
+        }
+        finally
+        {
+            ingress.Release.TrySetResult();
+            await subscriber.StopAsync(CancellationToken.None);
+            subscriber.Dispose();
+        }
+
+        Assert.DoesNotContain("p3", ingress.Received);
+        Assert.DoesNotContain("p4", ingress.Received);
+        Assert.DoesNotContain("p5", ingress.Received);
+    }
+
+    /// <summary>A host lifetime whose ApplicationStopping the test fires.</summary>
+    private sealed class StoppingHostLifetime : IHostApplicationLifetime, IDisposable
+    {
+        private readonly CancellationTokenSource _stopping = new();
+
+        public CancellationToken ApplicationStarted => CancellationToken.None;
+        public CancellationToken ApplicationStopping => _stopping.Token;
+        public CancellationToken ApplicationStopped => CancellationToken.None;
+        public void StopApplication() => _stopping.Cancel();
+        public void Dispose() => _stopping.Dispose();
     }
 
     /// <summary>Wedges the FIRST worker message until released, then hands it back as the flow engine does at host stop; later ones pass through.</summary>

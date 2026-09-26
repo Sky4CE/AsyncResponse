@@ -175,9 +175,11 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
         // the ambient context captured at start before any flow code runs.
         using var ambientScope = _propagation.Restore(state.Context);
 
+        DurableFlowContext? context = null;
         try
         {
-            var suspended = await InvokeFlowAsync(scope.ServiceProvider, store, state, lease, deliveryStartedUtc).ConfigureAwait(false);
+            context = CreateContext(store, state, lease, deliveryStartedUtc);
+            var suspended = await InvokeFlowAsync(scope.ServiceProvider, state, context).ConfigureAwait(false);
             if (suspended)
             {
                 // The context persisted the suspended state BEFORE enqueueing the child; saving here
@@ -199,6 +201,25 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
             // save here races the child-triggered parent re-execution.
             _logger.LogDebug("Durable flow {FlowId} suspended: {Message}", flowId, ex.Message);
             return;
+        }
+        catch (DurableFlowInterruptedException ex)
+        {
+            // Host stop handed the delivery back — an in-process timer reached on a stopping host,
+            // or a hand-over that could not commit — and the transport redelivers it after the
+            // restart. Nothing failed, so none of the failure path below: no error span, no
+            // checkpoint of the interruption's message over the ledger's "sleeping until" (a
+            // breadcrumb already persisted stays as it is; a timer handed back on entry, before
+            // its first-pass save, persisted none, and its redelivery anchors the due time then,
+            // as it always did), and above all no save that could throw and replace the
+            // hand-back's TYPE, which is all a transport tells a hand-back from a failure by.
+            // Before the lost-lease catch too, so a lease lapsing in the same instant does not
+            // turn it into a failure either. Observers still hear that the attempt ended: a step
+            // it reported waiting is no longer parked here.
+            SafeLog.Try(
+                (Logger: _logger, FlowId: flowId, ex.Message),
+                static s => s.Logger.LogDebug("Durable flow {FlowId} handed its delivery back to the worker transport: {Message}", s.FlowId, s.Message));
+            await NotifyRunAttemptFailedAsync(state).ConfigureAwait(false);
+            throw;
         }
         catch (DurableFlowFailedException ex)
         {
@@ -227,6 +248,13 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
 
             await lease.SaveAsync(state, _options.StateExpiry, cause: ex).ConfigureAwait(false);
 
+            // The failure's message can be the write that takes the ledger past a warning band.
+            // Judged like the context's own saves — against the band seeded from the ledger as
+            // this execution loaded it — so the redeliveries that fail the same way and write the
+            // same message back do not warn again. Guarded: the attempt's failure propagates.
+            if (context is not null)
+                SafeLog.Try(context, static c => c.WarnIfLedgerLargeAfterExecutorSave());
+
             // Retriable: propagate so the worker transport redelivers the run with bounded
             // attempts and dead-letters it when they are exhausted — the "run is stuck" alarm.
             throw;
@@ -241,6 +269,14 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
         await NotifyRunFinishedAsync(state).ConfigureAwait(false);
         await NotifyParentAsync(state).ConfigureAwait(false);
     }
+
+    private int _leaseContentionWaits;
+
+    /// <summary>
+    /// Deliveries asleep in the lease-contention poll below — a wait on the engine clock, not user
+    /// code (AsyncResponse.Testing's quiescence probe). Counted only once the poll's timer exists.
+    /// </summary>
+    internal int LeaseContentionWaits => Volatile.Read(ref _leaseContentionWaits);
 
     /// <summary>
     /// Acquires the execution lease for <paramref name="flowId"/>, retrying while the current
@@ -471,9 +507,11 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
             if (_timeProvider.GetUtcNow().UtcDateTime >= deadline)
                 break;
 
+            var poll = Task.Delay(pollDelay, _timeProvider, _hostStopping);
+            Interlocked.Increment(ref _leaseContentionWaits);
             try
             {
-                await Task.Delay(pollDelay, _timeProvider, _hostStopping).ConfigureAwait(false);
+                await poll.ConfigureAwait(false);
             }
             catch (OperationCanceledException ex)
             {
@@ -486,6 +524,10 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
                 // ladder, a dead-lettered wake-up.
                 throw new DurableFlowInterruptedException(
                     $"Host is stopping; durable flow '{flowId}' wake-up is abandoned for redelivery.", ex);
+            }
+            finally
+            {
+                Interlocked.Decrement(ref _leaseContentionWaits);
             }
         }
 
@@ -991,14 +1033,12 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
         _logger.LogWarning(exception, "Durable flow {FlowId} failed via lost-subscriber routing: {Message}", flowId, exception.Message);
     }
 
-    private async Task<bool> InvokeFlowAsync(
-        IServiceProvider serviceProvider,
+    private DurableFlowContext CreateContext(
         IFlowStateStore store,
         FlowState state,
         FlowExecutionLease lease,
         DateTime deliveryStartedUtc)
-    {
-        var context = new DurableFlowContext(
+        => new(
             state,
             store,
             _builder,
@@ -1015,6 +1055,11 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
             _hostStopping,
             deliveryStartedUtc);
 
+    private async Task<bool> InvokeFlowAsync(
+        IServiceProvider serviceProvider,
+        FlowState state,
+        DurableFlowContext context)
+    {
         // Statically-typed path for flows registered via WithDurableFlow<TFlow, TInput>(): no
         // type-name resolution, no MakeGenericType, no MethodInfo.Invoke — the path trimmed and
         // Native AOT apps rely on.
@@ -1274,10 +1319,15 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
             }
             catch (Exception ex)
             {
-                _logger.LogWarning(
-                    ex,
-                    "A durable-flow execution observer threw in OnRunAttemptFailedAsync for {FlowId}; ignoring so the attempt's own failure propagates.",
-                    state.FlowId);
+                // Guarded: a throwing provider here replaced the attempt's own exception — on a
+                // hand-back, the DurableFlowInterruptedException whose TYPE is all a transport
+                // tells a hand-back from a failure by.
+                SafeLog.Try(
+                    (Logger: _logger, Error: ex, state.FlowId),
+                    static s => s.Logger.LogWarning(
+                        s.Error,
+                        "A durable-flow execution observer threw in OnRunAttemptFailedAsync for {FlowId}; ignoring so the attempt's own failure propagates.",
+                        s.FlowId));
             }
         }
     }

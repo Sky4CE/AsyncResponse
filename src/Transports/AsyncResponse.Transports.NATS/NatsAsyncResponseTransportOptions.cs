@@ -153,8 +153,11 @@ public sealed class NatsAsyncResponseTransportOptions
     /// <summary>
     /// The hosting shutdown budget that must contain
     /// <see cref="NatsSubscriberOptions.BackgroundDrainTimeout"/> when a subscriber uses
-    /// <see cref="NatsAckMode.AckAfterEnqueue"/>. Defaults to the Generic Host default of
-    /// 30 seconds. Set to <c>null</c> only when this budget is validated externally.
+    /// <see cref="NatsAckMode.AckAfterEnqueue"/> — and the SUM of both subscribers'
+    /// <see cref="NatsSubscriberOptions.BackgroundDrainTimeout"/> when the worker and response
+    /// subscribers both use it, because the host stops them one after the other inside this one
+    /// budget. Defaults to the Generic Host default of 30 seconds. Set to <c>null</c> only when
+    /// this budget is validated externally.
     /// </summary>
     public TimeSpan? HostShutdownTimeout { get; set; } = TimeSpan.FromSeconds(30);
 

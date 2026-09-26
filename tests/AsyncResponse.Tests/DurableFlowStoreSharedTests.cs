@@ -225,6 +225,55 @@ public sealed class DurableFlowStoreSharedTests
         Task Quietly(Func<Task<int>> prune) => (Task)pruneQuietly!.Invoke(null, [prune, TimeSpan.Zero, "test", null, CancellationToken.None])!;
     }
 
+    /// <summary>
+    /// Regression (fixpoint r2): both of PruneQuietlyAsync's log calls ran bare. A logging provider
+    /// that throws (MEL rethrows a provider's failure) escaped the catch-all's warning out of a
+    /// helper whose failure must never fail the create it rides on — and the budget-lapse warning,
+    /// inside the try, landed in that catch-all: counted as a prune failure, logged again, and
+    /// thrown out the same way.
+    /// </summary>
+    [Theory]
+    [MemberData(nameof(ProviderOptionTypes))]
+    public async Task PruneQuietly_AThrowingLogger_NeverFailsTheCreate_NorCountsTheBudgetLineAsAFailure(Type providerOptionsType)
+    {
+        var shared = providerOptionsType.Assembly.GetType(SharedTypeName, throwOnError: true)!;
+        var pruneQuietly = shared.GetMethod("PruneQuietlyAsync", BindingFlags.Public | BindingFlags.Static)!;
+        var provider = $"throwing-logger-{providerOptionsType.Name}";
+        var logger = new CollectingLogger { ThrowOnMessageContaining = "durable-flow prune" };
+
+        // Only this fact's provider tag counts: the meter is process-wide.
+        var failures = 0L;
+        using var listener = new System.Diagnostics.Metrics.MeterListener
+        {
+            InstrumentPublished = (instrument, l) =>
+            {
+                if (instrument.Meter.Name == AsyncResponseDiagnostics.MeterName && instrument.Name == "asyncresponse.flow_state.prune_failures")
+                    l.EnableMeasurementEvents(instrument);
+            }
+        };
+        listener.SetMeasurementEventCallback<long>((_, value, tags, _) =>
+        {
+            foreach (var tag in tags)
+            {
+                if (tag.Key == "provider" && Equals(tag.Value, provider))
+                    Interlocked.Add(ref failures, value);
+            }
+        });
+        listener.Start();
+
+        // A real prune failure, whose warning then throws.
+        await Quietly(() => throw new InvalidOperationException("deadlock victim"));
+        Assert.Equal(1, Interlocked.Read(ref failures));
+
+        // A full batch at a zero budget, whose budget-lapse warning throws: not a prune failure.
+        await Quietly(() => Task.FromResult(1000));
+        Assert.Equal(1, Interlocked.Read(ref failures));
+
+        Assert.Equal(2, logger.Messages.Count(message => message.Contains("durable-flow prune", StringComparison.Ordinal)));
+
+        Task Quietly(Func<Task<int>> prune) => (Task)pruneQuietly.Invoke(null, [prune, TimeSpan.Zero, provider, logger, CancellationToken.None])!;
+    }
+
     public static TheoryData<Type> ProviderOptionTypes =>
     [
         typeof(CosmosDurableFlowOptions),

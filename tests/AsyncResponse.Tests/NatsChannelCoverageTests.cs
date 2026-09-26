@@ -316,6 +316,47 @@ public sealed class NatsChannelCoverageTests
     }
 
     /// <summary>
+    /// Red-on-old (fixpoint r2 pre-commit, H3): one budget covers the cleanup core's delete and its
+    /// teardown, and during an outage the delete spends all of it. The teardown wait then ran on an
+    /// already-cancelled token and threw at once — unless the client's unsubscribe happened to
+    /// finish synchronously — so every waiter disposed during the outage logged an Error "Error
+    /// during cleanup" on top of the indeterminate Warning, although the teardown had started and
+    /// the backstop cancel ends the loop. The core now skips a wait on a spent budget.
+    /// </summary>
+    [Fact]
+    public async Task Dispose_DuringAnOutage_TheDeleteSpendingTheCoreBudget_LogsNoCleanupError()
+    {
+        var reconnected = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var unsubscribed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var client = new FakeNatsResponseChannelClient
+        {
+            // The unsubscribe does not finish synchronously (it completes once the outage ends).
+            SubscriptionDisposeOverride = () => new ValueTask(unsubscribed.Task)
+        };
+        _store.Setup(s => s.TryDeleteAsync(It.IsAny<string>(), It.IsAny<Guid>(), It.IsAny<CancellationToken>()))
+            .Returns(() => reconnected.Task);
+        var logger = new CollectingLogger();
+        var channel = CreateChannel(client, logger.For<NatsAsyncResponseChannel>(), drainTimeout: TimeSpan.FromMilliseconds(200));
+        var waiter = await channel.CreateResponseWaiter<OperationResult>("corr-outage-cleanup");
+
+        try
+        {
+            await waiter.DisposeAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(10));
+
+            await Assert.ThrowsAsync<AsyncResponseIndeterminateDeliveryException>(
+                () => waiter.ResponseTask.WaitAsync(TimeSpan.FromSeconds(5)));
+            Assert.Equal(1, client.SubscriptionDisposeCount); // the teardown was still started
+            Assert.DoesNotContain(logger.Entries, entry =>
+                entry.Message.StartsWith("Error during cleanup for subject", StringComparison.Ordinal));
+        }
+        finally
+        {
+            reconnected.TrySetResult(true);
+            unsubscribed.TrySetResult();
+        }
+    }
+
+    /// <summary>
     /// Round 36: the reader deserialized the payload directly, so a payload that failed to
     /// convert faulted the waiter with — and logged — the raw System.Text.Json exception, whose
     /// message quotes the inbound dictionary key (<c>Path: $.Payload.Values['…']</c>). Pre-fix
@@ -406,7 +447,7 @@ public sealed class NatsChannelCoverageTests
             AsyncResponseEnvelopeOptions<OperationResult>.Instance);
 
         var client = new Mock<INatsResponseChannelClient>();
-        client.Setup(instance => instance.SubscribeAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()))
+        client.Setup(instance => instance.SubscribeAsync(It.IsAny<string>(), It.IsAny<Action<int>>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync(new TerminalThenFaultSubscription(terminal));
         client.Setup(instance => instance.FlushAsync(It.IsAny<CancellationToken>()))
             .Returns(Task.CompletedTask);

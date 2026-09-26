@@ -617,6 +617,248 @@ public class DurableFlowTests
         Assert.True((await store.LoadAsync(state.FlowId!))!.Steps!["after"].Completed);
     }
 
+    [Theory]
+    [InlineData("value")]
+    [InlineData("progress")]
+    [InlineData("await")]
+    public async Task ACheckpointCancelledMidCommand_ReportedAsTheDriversOwnException_IsACancellation_NotALostLease(string call)
+    {
+        // Fixpoint r2 (S10#1): round 43 recognised a caller-cancelled save by the exception's TYPE.
+        // SqlClient and ODP.NET report a cancellation that interrupts a running command as their own
+        // exception ("Operation cancelled by user", ORA-01013) — only one raised before the command
+        // ran is an OperationCanceledException — so on SQL Server and Oracle (and EF Core over them)
+        // such a save still marked the lease lost, and every later context call failed as a
+        // misdiagnosed takeover. The caller's TOKEN decides now.
+        using var caller = new CancellationTokenSource();
+        var store = new CancelMidWriteStore(caller, commit: false, () => new InvalidOperationException("Operation cancelled by user."));
+        var state = new FlowState { FlowId = $"cancelled-mid-command-{call}" };
+        await using var lease = await CreateLeaseAsync(store, state);
+        var context = ContextOver(store, state, lease);
+
+        Func<Task> cancelledCall = call switch
+        {
+            "value" => () => context.SetValueAsync("key", 1, caller.Token),
+            "progress" => () => context.ReportProgressAsync("working", caller.Token),
+            _ => () => context.AwaitStepAsync<OperationResult>("remote", _ => Task.CompletedTask, cancellationToken: caller.Token)
+        };
+
+        var cancelled = await Assert.ThrowsAnyAsync<OperationCanceledException>(cancelledCall);
+        Assert.Equal("Operation cancelled by user.", cancelled.InnerException?.Message);
+        Assert.False(lease.IsLost);
+        Assert.Equal(7, await context.StepAsync("after", () => Task.FromResult(7)));
+        Assert.True((await store.LoadAsync(state.FlowId!))!.Steps!["after"].Completed);
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task ACheckpointCancelledMidWrite_IsSettledBeforeTheNextStepBodyRuns(bool committed)
+    {
+        // Fixpoint r2 (S1#5): since round 43 a caller-cancelled checkpoint no longer marks the lease
+        // lost — but it was taken as NOT written. Had it committed (the cancellation reaching the
+        // server after the write: an attention behind the autocommit UPDATE, an HTTP request the
+        // store already held), flow code that caught the cancellation carried on, the next step's
+        // side effect ran, and only then did its checkpoint's compare-and-swap fail — blaming "a
+        // recovery, failure signal, or operator status change" — so the redelivery ran the side
+        // effect again. The outcome is now unknown until one current read settles it, BEFORE the
+        // next step body: our own write is adopted, anyone else's abandons the execution first.
+        using var caller = new CancellationTokenSource();
+        var store = new CancelMidWriteStore(caller, commit: committed, () => new OperationCanceledException(caller.Token));
+        var state = new FlowState { FlowId = $"cancelled-mid-write-{committed}" };
+        await using var lease = await CreateLeaseAsync(store, state);
+        var context = ContextOver(store, state, lease);
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => context.SetValueAsync("key", 1, caller.Token));
+        if (!committed)
+        {
+            // The write did not land, and a lease-less writer (an operator, say) took the revision it expected.
+            Assert.True(await FlowStateConcurrency.MutateAsync(store, state.FlowId!, TimeSpan.FromMinutes(5), timeProvider: null, ledger =>
+            {
+                ledger.LastMessage = "Touched by an operator.";
+                return true;
+            }));
+        }
+
+        var sideEffects = 0;
+        var charge = context.StepAsync("charge", () =>
+        {
+            sideEffects++;
+            return Task.FromResult(7);
+        });
+
+        if (committed)
+        {
+            Assert.Equal(7, await charge);
+            Assert.Equal(1, sideEffects);
+            Assert.False(lease.IsLost);
+            var persisted = (await store.LoadAsync(state.FlowId!))!;
+            Assert.True(persisted.Steps!["charge"].Completed);
+            Assert.Equal("1", persisted.Values!["key"]);
+        }
+        else
+        {
+            var abandoned = await Assert.ThrowsAsync<InvalidOperationException>(() => charge);
+            Assert.Contains("cancelled mid-write", abandoned.Message, StringComparison.Ordinal);
+            Assert.Equal(0, sideEffects);
+            Assert.True(lease.IsLost);
+        }
+    }
+
+    [Fact]
+    public async Task ACheckpointWhoseSettleReadFails_MarksTheLeaseLost_SoNoFailurePathSavePersistsTheTerminalStatus()
+    {
+        // Pre-commit r2 (A3): every checkpoint that throws marks the lease lost, so the executor
+        // takes its lost-lease path and writes nothing more. The settle read a caller-cancelled
+        // checkpoint leaves for the next one was the exception: when THAT read failed, the lease
+        // stayed live — flow code had caught the cancellation and returned, the executor's
+        // Succeeded save failed in the settle read, and its generic catch saved again with the
+        // store error as the message: that save settled on a retry and persisted Succeeded with an
+        // error, as a failed attempt no parent was ever told about.
+        using var caller = new CancellationTokenSource();
+        var store = new SettleReadFailsOnceStore(caller);
+        var state = new FlowState { FlowId = "settle-read-fails" };
+        await using var lease = await CreateLeaseAsync(store, state);
+        var context = ContextOver(store, state, lease);
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => context.SetValueAsync("key", 1, caller.Token));
+        Assert.False(lease.IsLost);
+
+        state.Status = FlowRunStatus.Succeeded;
+        state.LastMessage = "Flow completed.";
+        var failed = await Assert.ThrowsAsync<TimeoutException>(() => lease.SaveAsync(state, TimeSpan.FromMinutes(5)));
+        Assert.True(lease.IsLost);
+        Assert.Equal(1, store.CurrentLoads);
+
+        // The executor's failure-path save after it is refused before it can settle and write.
+        state.LastMessage = failed.Message;
+        await Assert.ThrowsAsync<InvalidOperationException>(() => lease.SaveAsync(state, TimeSpan.FromMinutes(5), cause: failed));
+        Assert.Equal(1, store.CurrentLoads);
+        var persisted = (await store.LoadAsync(state.FlowId!))!;
+        Assert.Equal(FlowRunStatus.Running, persisted.Status);
+        Assert.NotEqual(failed.Message, persisted.LastMessage);
+    }
+
+    [Fact]
+    public async Task ASettleReadThatNeverAnswers_IsCancelledWhenTheLeaseIsLost()
+    {
+        // Pre-commit r2 (A-res): the settle read ran on CancellationToken.None, so a wedged store
+        // pinned the checkpoint — and the step behind it — past the moment the lease was lost,
+        // when nothing on this execution's account may run any more. It runs on the lease's token.
+        var clock = new AsyncResponse.Testing.VirtualTimeProvider();
+        using var caller = new CancellationTokenSource();
+        var store = new WedgedSettleReadStore(caller);
+        var state = new FlowState { FlowId = "settle-read-wedged" };
+        Assert.True(await store.TryCreateAsync(state.FlowId!, state, TimeSpan.FromMinutes(5)));
+        await using var lease = Assert.IsType<FlowExecutionLease>(await FlowStateConcurrency.TryAcquireExecutionLeaseAsync(
+            store, state.FlowId!, new DurableFlowOptions(), NullLogger.Instance, clock));
+        var context = ContextOver(store, state, lease);
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => context.SetValueAsync("key", 1, caller.Token));
+
+        var save = lease.SaveAsync(state, TimeSpan.FromMinutes(5));
+        await store.SettleReadEntered.WaitAsync(TimeSpan.FromSeconds(30));
+        Assert.False(save.IsCompleted);
+
+        // The first renewal is refused: the lease is lost, and the read waiting on it lets go.
+        clock.Advance(new DurableFlowOptions().ExecutionLeaseRenewInterval);
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => save.WaitAsync(TimeSpan.FromSeconds(30)));
+        Assert.True(lease.IsLost);
+    }
+
+    /// <summary>
+    /// The first value checkpoint is cancelled by its caller mid-write; the current read that
+    /// settles it then waits until its token fires, and every lease renewal is refused.
+    /// </summary>
+    private sealed class WedgedSettleReadStore(CancellationTokenSource caller)
+        : DurableFlowContextTestSupport.DelegatingFlowStateStore(new InMemoryFlowStateStore())
+    {
+        private readonly TaskCompletionSource _settleReadEntered = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private int _cancelledWrites;
+
+        public Task SettleReadEntered => _settleReadEntered.Task;
+
+        public override async Task<bool> TryUpdateAsync(string flowId, FlowState state, long expectedRevision, TimeSpan ttl, string? leaseId = null, CancellationToken cancellationToken = default)
+        {
+            if (state.Values?.ContainsKey("key") != true || Interlocked.Increment(ref _cancelledWrites) != 1)
+                return await base.TryUpdateAsync(flowId, state, expectedRevision, ttl, leaseId, cancellationToken);
+
+            await caller.CancelAsync();
+            throw new OperationCanceledException(caller.Token);
+        }
+
+        public override async Task<FlowState?> LoadCurrentAsync(string flowId, CancellationToken cancellationToken = default)
+        {
+            _settleReadEntered.TrySetResult();
+            await Task.Delay(Timeout.Infinite, cancellationToken);
+            throw new InvalidOperationException("Unreachable.");
+        }
+
+        public override Task<bool> TryRenewLeaseAsync(string flowId, string leaseId, TimeSpan leaseDuration, CancellationToken cancellationToken = default)
+            => Task.FromResult(false);
+    }
+
+    /// <summary>
+    /// The first checkpoint that records a value is cancelled by its caller mid-write, after the
+    /// write landed; the first current read that settles it then fails.
+    /// </summary>
+    private sealed class SettleReadFailsOnceStore(CancellationTokenSource caller)
+        : DurableFlowContextTestSupport.DelegatingFlowStateStore(new InMemoryFlowStateStore())
+    {
+        private int _cancelledWrites;
+        private int _currentLoads;
+
+        public int CurrentLoads => Volatile.Read(ref _currentLoads);
+
+        public override async Task<bool> TryUpdateAsync(string flowId, FlowState state, long expectedRevision, TimeSpan ttl, string? leaseId = null, CancellationToken cancellationToken = default)
+        {
+            if (state.Values?.ContainsKey("key") != true || Interlocked.Increment(ref _cancelledWrites) != 1)
+                return await base.TryUpdateAsync(flowId, state, expectedRevision, ttl, leaseId, cancellationToken);
+
+            Assert.True(await base.TryUpdateAsync(flowId, state, expectedRevision, ttl, leaseId, CancellationToken.None));
+            await caller.CancelAsync();
+            throw new OperationCanceledException(caller.Token);
+        }
+
+        public override Task<FlowState?> LoadCurrentAsync(string flowId, CancellationToken cancellationToken = default)
+            => Interlocked.Increment(ref _currentLoads) == 1
+                ? Task.FromException<FlowState?>(new TimeoutException("The settle read timed out."))
+                : base.LoadCurrentAsync(flowId, cancellationToken);
+    }
+
+    private static DurableFlowContext ContextOver(IFlowStateStore store, FlowState state, FlowExecutionLease lease)
+        => new(
+            state,
+            store,
+            Mock.Of<IAsyncResponseBuilder>(),
+            new AsyncResponseContextPropagation([]),
+            new DurableFlowOptions { ProgressPersistenceInterval = TimeSpan.Zero },
+            SubscriberReturning(new TaskCompletionSource<OperationResult>().Task, []),
+            recoverableSubscriber: null,
+            NullLogger.Instance,
+            lease);
+
+    /// <summary>
+    /// The first state update cancels the caller's token mid-write, then fails the way the driver
+    /// reports it — after applying the write when <c>commit</c> is set, as a server does that got
+    /// the request before the cancellation.
+    /// </summary>
+    private sealed class CancelMidWriteStore(CancellationTokenSource caller, bool commit, Func<Exception> failWith)
+        : DurableFlowContextTestSupport.DelegatingFlowStateStore(new InMemoryFlowStateStore())
+    {
+        private int _updates;
+
+        public override async Task<bool> TryUpdateAsync(string flowId, FlowState state, long expectedRevision, TimeSpan ttl, string? leaseId = null, CancellationToken cancellationToken = default)
+        {
+            if (Interlocked.Increment(ref _updates) != 1)
+                return await base.TryUpdateAsync(flowId, state, expectedRevision, ttl, leaseId, cancellationToken);
+
+            if (commit)
+                Assert.True(await base.TryUpdateAsync(flowId, state, expectedRevision, ttl, leaseId, CancellationToken.None));
+            await caller.CancelAsync();
+            throw failWith();
+        }
+    }
+
     [Fact]
     public async Task AwaitStep_ResponseWinningTheDisposalSettlement_IsCheckpointedNotStranded()
     {

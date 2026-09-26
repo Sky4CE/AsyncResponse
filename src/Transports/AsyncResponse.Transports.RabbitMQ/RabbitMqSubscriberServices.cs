@@ -34,6 +34,12 @@ internal abstract class RabbitMqSubscriberService : BackgroundService
     protected abstract string QueueName { get; }
     protected abstract RabbitMqSubscriberOptions SubscriberOptions { get; }
     protected abstract RabbitMqSubscriberRole SubscriberRole { get; }
+
+    /// <summary>
+    /// The host lifetime whose stop closes this subscriber's intake — the worker subscriber's only;
+    /// <c>null</c> for the response subscriber, which keeps serving waiters through the stop.
+    /// </summary>
+    protected virtual IHostApplicationLifetime? IntakeLifetime => null;
     /// <summary>Ensures the required resource exists.</summary>
     protected abstract Task EnsureTopologyAsync(IRabbitMqChannel channel, CancellationToken cancellationToken);
     /// <summary>Handles the delivered message.</summary>
@@ -62,7 +68,7 @@ internal abstract class RabbitMqSubscriberService : BackgroundService
         if (SubscriberOptions.AckMode is RabbitMqAckMode.AckAfterHandlerCompletes
             && SubscriberOptions.MaxDeliveryAttempts > 2)
         {
-            Logger.LogWarning(
+            SafeLog.Try(() => Logger.LogWarning(
                 "RabbitMQ {OptionName} is {MaxDeliveryAttempts} for queue {Queue} ({Role}), but attempts beyond 2 cannot be counted: "
                 + "basic.nack requeue does not increment x-death, so the cap only takes effect once a TTL-retry dead-letter cycle "
                 + "re-delivers the message through a dead-letter exchange. Until then the effective cap is 2 — a failing message is "
@@ -70,7 +76,7 @@ internal abstract class RabbitMqSubscriberService : BackgroundService
                 nameof(RabbitMqSubscriberOptions.MaxDeliveryAttempts),
                 SubscriberOptions.MaxDeliveryAttempts,
                 queue,
-                SubscriberRole);
+                SubscriberRole));
         }
 
         // The dispatcher — and with it the ACK-after-enqueue queue and its workers — belongs to the
@@ -88,7 +94,8 @@ internal abstract class RabbitMqSubscriberService : BackgroundService
             SubscriberOptions,
             Logger,
             queue,
-            SubscriberRole);
+            SubscriberRole,
+            IntakeLifetime);
 
         await SubscriberSupervisor.RunAsync(
             ct => RunSubscriberAsync(dispatcher, queue, ct),
@@ -98,13 +105,14 @@ internal abstract class RabbitMqSubscriberService : BackgroundService
             // of an existing connection): a broker restart drops every consumer on every
             // replica at once, and a flat shared delay reconnects them all on the same tick.
             failures => AsyncResponseRetry.Backoff(failures, Options.SubscriberRetryBaseDelay, Options.SubscriberRetryMaxDelay),
-            (ex, retryDelay) => Logger.LogWarning(
+            // Guarded: a throwing logging provider must not end the restart loop it reports on.
+            (ex, retryDelay) => SafeLog.Try(() => Logger.LogWarning(
                 ex,
                 "RabbitMQ subscriber failed for queue {Queue} ({Role}); retrying in {RetryDelay}.",
                 queue,
                 SubscriberRole,
-                retryDelay),
-            healthyRunThreshold: Options.SubscriberRetryMaxDelay).ConfigureAwait(false);
+                retryDelay)),
+            healthyRunThreshold: AsyncResponseRetry.MaxAttainableDelay(Options.SubscriberRetryBaseDelay, Options.SubscriberRetryMaxDelay)).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -139,11 +147,11 @@ internal abstract class RabbitMqSubscriberService : BackgroundService
         // work that outlives the attempt publishes through the NEXT attempt's channel.
         using var attached = dispatcher.AttachChannel(channel);
 
-        Logger.LogInformation(
+        SafeLog.Try(() => Logger.LogInformation(
             "RabbitMQ subscriber started. Queue: {Queue}. Role: {Role}. AckMode: {AckMode}.",
             queue,
             SubscriberRole,
-            SubscriberOptions.AckMode);
+            SubscriberOptions.AckMode));
 
         var consumer = await channel.BasicConsumeAsync(
             queue,
@@ -187,12 +195,13 @@ internal abstract class RabbitMqSubscriberService : BackgroundService
             // in-flight wait ran after the close it exists to precede. A consumer still registered
             // meanwhile is harmless: the awaiting dispatcher starts nothing once stoppingToken is
             // cancelled, and the queued one leaves whatever arrives after its drain began un-ACKed
-            // until the channel close below requeues it.
-            Logger.LogWarning(
+            // until the channel close below requeues it. Guarded, for the same reason: a throwing
+            // logging provider must not skip the drain either.
+            SafeLog.Try(() => Logger.LogWarning(
                 ex,
                 "RabbitMQ consumer cancel for queue {Queue} ({Role}) failed while stopping; draining and closing the channel anyway.",
                 queue,
-                SubscriberRole);
+                SubscriberRole));
         }
 
         // Host stop only (the termination path above threw): drain BEFORE closing the channel and
@@ -220,18 +229,18 @@ internal abstract class RabbitMqSubscriberService : BackgroundService
 internal sealed class RabbitMqWorkerSubscriber : RabbitMqSubscriberService
 {
     private readonly IAsyncResponseIngress _ingress;
-    private readonly bool _durableFlowsRegistered;
+    private readonly IHostApplicationLifetime? _hostLifetime;
 
     /// <summary>Runs the RabbitMqWorkerSubscriber operation.</summary>
     public RabbitMqWorkerSubscriber(
         IOptions<RabbitMqAsyncResponseOptions> options,
         IAsyncResponseIngress ingress,
         ILogger<RabbitMqWorkerSubscriber> logger,
-        IEnumerable<DurableFlowOptions>? durableFlowOptions = null)
+        IHostApplicationLifetime? hostLifetime = null)
         : base(options, logger)
     {
         _ingress = ingress;
-        _durableFlowsRegistered = durableFlowOptions?.Any() == true;
+        _hostLifetime = hostLifetime;
     }
 
     internal RabbitMqWorkerSubscriber(
@@ -239,21 +248,32 @@ internal sealed class RabbitMqWorkerSubscriber : RabbitMqSubscriberService
         IAsyncResponseIngress ingress,
         ILogger<RabbitMqWorkerSubscriber> logger,
         IRabbitMqConnectionFactory connectionFactory,
-        IEnumerable<DurableFlowOptions>? durableFlowOptions = null)
+        IHostApplicationLifetime? hostLifetime = null)
         : base(options, logger, connectionFactory)
     {
         _ingress = ingress;
-        _durableFlowsRegistered = durableFlowOptions?.Any() == true;
+        _hostLifetime = hostLifetime;
     }
 
     /// <summary>
+    /// Host stop closes the worker intake (<see cref="WorkerIntakeGate"/>): from
+    /// <see cref="IHostApplicationLifetime.ApplicationStopping"/> on, the dispatcher starts and
+    /// settles no new delivery, so the wake-ups this host's own hand-overs just published go to a
+    /// live replica instead of being handed back here.
+    /// </summary>
+    protected override IHostApplicationLifetime? IntakeLifetime => _hostLifetime;
+
+    /// <summary>
     /// Validates like every subscriber, then warns about the worker configurations in which durable
-    /// flows run against RabbitMQ limits the engine cannot see (SQS parity).
+    /// flows run against RabbitMQ limits the engine cannot see (SQS parity). Unconditionally: every
+    /// host registers a durable-flow state store (startup fails without one) and durable-flow jobs
+    /// ride this queue whenever a flow runs, which registration cannot tell in advance
+    /// (<c>WithDurableFlow</c> is optional on JIT).
     /// </summary>
     public override Task StartAsync(CancellationToken cancellationToken)
     {
         var start = base.StartAsync(cancellationToken);
-        if (_durableFlowsRegistered && SubscriberOptions.AckMode == RabbitMqAckMode.AckAfterHandlerCompletes)
+        if (SubscriberOptions.AckMode == RabbitMqAckMode.AckAfterHandlerCompletes)
             WarnAboutDurableFlowLimits();
         return start;
     }
@@ -268,10 +288,10 @@ internal sealed class RabbitMqWorkerSubscriber : RabbitMqSubscriberService
             // redelivers it; a requeue NACK sets `redelivered` too, and an ACK-and-republish is what
             // the flow engine's hand-over already tried — the hand-back is its fallback when that
             // publish failed, or when the wake-up would only come straight back to this stopping host.
-            Logger.LogWarning(
-                "The RabbitMQ worker subscriber for {Queue} has {OptionName} = 1 and durable flows are registered: every delivery the broker requeues on its own — a flow handed back at host stop, a channel closed under a running handler (a stop that outlives its in-flight wait, a connection loss, consumer_timeout) — comes back redelivered, resolves to attempt 2 and is rejected before its handler runs (dead-lettered, or dropped without a dead-letter exchange). A durable flow's wake-up can be lost that way on a routine deploy. Set it to 2 or more, or 0 for unlimited.",
+            SafeLog.Try(() => Logger.LogWarning(
+                "The RabbitMQ worker subscriber for {Queue} has {OptionName} = 1, and durable-flow jobs ride this queue: every delivery the broker requeues on its own — a flow handed back at host stop, a delivery prefetched but not yet started when host stop began, a channel closed under a running handler (a stop that outlives its in-flight wait, a connection loss, consumer_timeout) — comes back redelivered, resolves to attempt 2 and is rejected before its handler runs (dead-lettered, or dropped without a dead-letter exchange). A durable flow's wake-up can be lost that way on a routine deploy. Set it to 2 or more, or 0 for unlimited.",
                 Options.WorkerQueue,
-                $"{nameof(RabbitMqAsyncResponseOptions.WorkerSubscriber)}.{nameof(RabbitMqSubscriberOptions.MaxDeliveryAttempts)}");
+                $"{nameof(RabbitMqAsyncResponseOptions.WorkerSubscriber)}.{nameof(RabbitMqSubscriberOptions.MaxDeliveryAttempts)}"));
         }
 
         if (Options.BrokerConsumerTimeout is { } consumerTimeout
@@ -282,7 +302,7 @@ internal sealed class RabbitMqWorkerSubscriber : RabbitMqSubscriberService
             // The transport advertises the floor rather than a share that would hop timers every
             // few seconds (or not at all); what the floor gives up is the guarantee that the last
             // buffered delivery stays inside the timeout when most of the buffer is parked flows.
-            Logger.LogWarning(
+            SafeLog.Try(() => Logger.LogWarning(
                 "The RabbitMQ worker subscriber for {Queue} prefetches {PrefetchCount} deliveries, which leaves each {Share} of BrokerConsumerTimeout ({ConsumerTimeout}) — below the {InFlightCeiling} the transport advertises to the durable-flow engine as its in-flight ceiling instead (timers wait in process for at most half of it per delivery). When most prefetched deliveries are parked flows, the last one buffered can outlive the broker's consumer_timeout, which closes the channel and requeues every unacknowledged delivery. Lower {PrefetchOption} to {MaxPrefetch} or less, or raise the broker's consumer_timeout together with BrokerConsumerTimeout.",
                 Options.WorkerQueue,
                 SubscriberOptions.PrefetchCount,
@@ -290,7 +310,7 @@ internal sealed class RabbitMqWorkerSubscriber : RabbitMqSubscriberService
                 consumerTimeout,
                 ceiling,
                 $"{nameof(RabbitMqAsyncResponseOptions.WorkerSubscriber)}.{nameof(RabbitMqSubscriberOptions.PrefetchCount)}",
-                Math.Max(1L, consumerTimeout.Ticks / ceiling.Ticks));
+                Math.Max(1L, consumerTimeout.Ticks / ceiling.Ticks)));
         }
     }
 

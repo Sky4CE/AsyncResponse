@@ -905,7 +905,9 @@ internal sealed class SqlServerChannelSql
         var connection = new SqlConnection(_connectionString);
         try
         {
-            await connection.OpenAsync(cancellationToken).ConfigureAwait(false);
+            // Pool exhaustion surfaces as a transient TimeoutException (see the helper), so the
+            // retry policies and the sweep's outage breaker count it.
+            await SqlServerTransientFaults.OpenAsync(connection, cancellationToken).ConfigureAwait(false);
             return connection;
         }
         catch

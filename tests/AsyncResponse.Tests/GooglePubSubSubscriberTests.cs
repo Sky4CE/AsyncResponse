@@ -1020,11 +1020,13 @@ public class GooglePubSubSubscriberTests
     }
 
     [Fact]
-    public async Task Dispatcher_AckAfterEnqueue_FlowHandBack_WarnsAndSurfacesIt_WithoutAnErrorLog()
+    public async Task Dispatcher_AckAfterEnqueue_FlowHandBack_LogsTheLostWakeUpAtError_AndSurfacesIt()
     {
         // Fixpoint r1 pre-commit (H6): an early-ACK job the flow engine hands back at host stop
         // cannot be redelivered (it was ACKed at enqueue) and Pub/Sub has no dead-letter write, so
-        // it is surfaced through OnBackgroundFailure — at Warning: nothing failed.
+        // it is surfaced through OnBackgroundFailure. Red-on-old (fixpoint r2, S8#2): it was logged
+        // at Warning, while every sibling transport logs a hand-back no copy records at Error — the
+        // wake-up is lost unless the callback records it.
         var failure = new TaskCompletionSource<GooglePubSubBackgroundFailureContext>(TaskCreationOptions.RunContinuationsAsynchronously);
         var logger = new CapturingLogger<GooglePubSubWorkerSubscriber>();
         await using var dispatcher = GooglePubSubMessageDispatcher.Create(
@@ -1046,9 +1048,181 @@ public class GooglePubSubSubscriberTests
 
         var surfaced = await failure.Task.WaitAsync(TimeSpan.FromSeconds(5));
         Assert.IsType<DurableFlowInterruptedException>(surfaced.Exception);
-        Assert.Contains(logger.Entries, entry => entry.Level == LogLevel.Warning
-            && entry.Message.Contains("handed back by the flow engine", StringComparison.Ordinal));
-        Assert.DoesNotContain(logger.Entries, entry => entry.Level >= LogLevel.Error);
+        var handBack = Assert.Single(logger.Entries, entry => entry.Message.Contains("handed back by the flow engine", StringComparison.Ordinal));
+        Assert.Equal(LogLevel.Error, handBack.Level);
+        Assert.Contains("the wake-up is lost unless OnBackgroundFailure records it", handBack.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task WorkerSubscriberService_AckAfterEnqueue_HostStopBegun_HoldsNewDeliveriesForTheClientStop_InsteadOfAckingThem()
+    {
+        // Red-on-old (fixpoint r2, S8#1): the streaming pull keeps delivering from
+        // ApplicationStopping until the worker subscriber's own stop — registered first, it stops
+        // last — and early ACK acknowledged each delivery at enqueue: a flow wake-up the engine's
+        // hand-over had just published for a live replica reached its timer on this stopping host,
+        // was handed back and lost. From the host stop on, a delivery is now held unstarted (its
+        // flow-control slot pinned, so the pull stalls) and handed back when the client stops.
+        using var host = new DurableFlowContextTestSupport.StoppingHost();
+        var client = new FakeSubscriberClient();
+        var ingress = new Mock<IAsyncResponseIngress>();
+        ingress.Setup(i => i.HandleWorkerMessageAsync(It.IsAny<string>())).Returns(Task.CompletedTask);
+        var options = new GooglePubSubAsyncResponseOptions
+        {
+            ProjectId = "project-a",
+            WorkerSubscriptionId = "workers",
+            ShutdownTimeout = TimeSpan.FromMilliseconds(250)
+        };
+        options.WorkerSubscriber.UseAckAfterEnqueue(1, 8, TimeSpan.FromSeconds(5));
+        var subscriber = new GooglePubSubWorkerSubscriber(
+            Options.Create(options),
+            ingress.Object,
+            NullLogger<GooglePubSubWorkerSubscriber>.Instance,
+            (_, _, _) => Task.FromResult<IGooglePubSubSubscriberClient>(client),
+            host);
+
+        await subscriber.StartAsync(CancellationToken.None);
+        var handler = await WaitForHandlerAsync(client);
+        Assert.Equal(
+            SubscriberClient.Reply.Ack,
+            await handler(new PubsubMessage { MessageId = "before", Data = ByteString.CopyFromUtf8("before") }, CancellationToken.None));
+
+        host.StopApplication();
+        var late = handler(new PubsubMessage { MessageId = "wake-up", Data = ByteString.CopyFromUtf8("wake-up") }, CancellationToken.None);
+        Assert.False(late.IsCompleted, "a delivery taken after the host stop began was acknowledged");
+
+        await subscriber.StopAsync(CancellationToken.None);
+
+        Assert.Equal(SubscriberClient.Reply.Nack, await late.WaitAsync(TimeSpan.FromSeconds(5)));
+        Assert.Equal(1, client.StopCalls);
+        ingress.Verify(i => i.HandleWorkerMessageAsync("before"), Times.Once);
+        ingress.Verify(i => i.HandleWorkerMessageAsync("wake-up"), Times.Never);
+    }
+
+    [Fact]
+    public async Task WorkerSubscriberService_AckAfterEnqueue_HostStopBegins_WhileADeliveryWaitsForCapacity_HoldsIt()
+    {
+        // Red-on-old (fixpoint r2, S8#1): a delivery parked in the queue-full backpressure wait when
+        // the host stop begins was enqueued — and acknowledged — as soon as the drain freed a slot.
+        // The wait now ends at ApplicationStopping and the delivery is held for the client stop.
+        using var host = new DurableFlowContextTestSupport.StoppingHost();
+        var client = new FakeSubscriberClient();
+        var releaseHandler = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var handlerStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var ingress = new Mock<IAsyncResponseIngress>();
+        ingress.Setup(i => i.HandleWorkerMessageAsync("running")).Returns(async () =>
+        {
+            handlerStarted.TrySetResult();
+            await releaseHandler.Task.ConfigureAwait(false);
+        });
+        ingress.Setup(i => i.HandleWorkerMessageAsync(It.Is<string>(body => body != "running"))).Returns(Task.CompletedTask);
+        var logger = new CollectingLogger();
+        var options = new GooglePubSubAsyncResponseOptions
+        {
+            ProjectId = "project-a",
+            WorkerSubscriptionId = "workers",
+            ShutdownTimeout = TimeSpan.FromMilliseconds(250)
+        };
+        options.WorkerSubscriber.UseAckAfterEnqueue(1, 1, TimeSpan.FromSeconds(5));
+        var subscriber = new GooglePubSubWorkerSubscriber(
+            Options.Create(options),
+            ingress.Object,
+            logger.For<GooglePubSubWorkerSubscriber>(),
+            (_, _, _) => Task.FromResult<IGooglePubSubSubscriberClient>(client),
+            host);
+
+        await subscriber.StartAsync(CancellationToken.None);
+        var handler = await WaitForHandlerAsync(client);
+        Assert.Equal(SubscriberClient.Reply.Ack, await handler(Message("running", "running"), CancellationToken.None));
+        await handlerStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal(SubscriberClient.Reply.Ack, await handler(Message("queued", "queued"), CancellationToken.None)); // fills the one slot
+        var waiting = handler(Message("waiting", "waiting"), CancellationToken.None);
+        Assert.False(waiting.IsCompleted, "the queue-full delivery should wait for capacity");
+
+        host.StopApplication();
+        await logger.WaitForAsync("Holding Pub/Sub message waiting");
+        releaseHandler.TrySetResult(); // frees the slot the old code then enqueued (and acknowledged) it into
+
+        await subscriber.StopAsync(CancellationToken.None);
+
+        Assert.Equal(SubscriberClient.Reply.Nack, await waiting.WaitAsync(TimeSpan.FromSeconds(5)));
+        ingress.Verify(i => i.HandleWorkerMessageAsync("waiting"), Times.Never);
+        ingress.Verify(i => i.HandleWorkerMessageAsync("queued"), Times.Once);
+    }
+
+    [Fact]
+    public async Task ResponseSubscriberService_AckAfterEnqueue_KeepsAckingAfterTheHostStopBegins()
+    {
+        // The intake gate is the worker's alone: a response subscriber keeps delivering to the
+        // waiters host stop deliberately does not interrupt.
+        using var host = new DurableFlowContextTestSupport.StoppingHost();
+        host.StopApplication();
+        var client = new FakeSubscriberClient();
+        var handled = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var ingress = new Mock<IAsyncResponseIngress>();
+        ingress.Setup(i => i.HandleResponseMessageAsync(It.IsAny<string>(), It.IsAny<string?>())).Returns(() =>
+        {
+            handled.TrySetResult();
+            return Task.CompletedTask;
+        });
+        var options = new GooglePubSubAsyncResponseOptions
+        {
+            ProjectId = "project-a",
+            WorkerSubscriptionId = "workers",
+            ResponseSubscriptionId = "responses",
+            ShutdownTimeout = TimeSpan.FromMilliseconds(250)
+        };
+        options.ResponseSubscriber.UseAckAfterEnqueue(1, 8, TimeSpan.FromSeconds(5));
+        var subscriber = new GooglePubSubResponseIngressSubscriber(
+            Options.Create(options),
+            ingress.Object,
+            NullLogger<GooglePubSubResponseIngressSubscriber>.Instance,
+            (_, _, _) => Task.FromResult<IGooglePubSubSubscriberClient>(client),
+            host);
+
+        await subscriber.StartAsync(CancellationToken.None);
+        var handler = await WaitForHandlerAsync(client);
+        Assert.Equal(SubscriberClient.Reply.Ack, await handler(Message("response", "{}"), CancellationToken.None));
+        await handled.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await subscriber.StopAsync(CancellationToken.None);
+    }
+
+    [Fact]
+    public async Task Dispatcher_AckAfterEnqueue_ThrowingLoggerOnAFailedJob_KeepsTheWorkerRunning()
+    {
+        // Red-on-old (fixpoint r2, throwing-logger rule): the worker logged a failed job's Error
+        // before its OnBackgroundFailure call, and Microsoft.Extensions.Logging rethrows a
+        // provider's failure — so a throwing provider skipped the report and ended the worker
+        // loop, and every already-ACKed job queued behind it never ran.
+        var healthyRan = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var reported = new TaskCompletionSource<GooglePubSubBackgroundFailureContext>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var logger = new CollectingLogger { ThrowOnMessageContaining = "background handler failed" };
+        await using var dispatcher = GooglePubSubMessageDispatcher.Create(
+            (message, _) =>
+            {
+                if (message.MessageId == "poison")
+                    return Task.FromException(new InvalidOperationException("boom"));
+
+                healthyRan.TrySetResult();
+                return Task.CompletedTask;
+            },
+            new GooglePubSubAsyncResponseOptions(),
+            new GooglePubSubSubscriberOptions
+            {
+                OnBackgroundFailure = context =>
+                {
+                    reported.TrySetResult(context);
+                    return ValueTask.CompletedTask;
+                }
+            }.UseAckAfterEnqueue(1, 8, TimeSpan.FromSeconds(5)),
+            logger,
+            "workers",
+            GooglePubSubSubscriberRole.Worker);
+
+        Assert.Equal(SubscriberClient.Reply.Ack, await dispatcher.HandleAsync(Message("poison"), CancellationToken.None));
+        Assert.Equal(SubscriberClient.Reply.Ack, await dispatcher.HandleAsync(Message("healthy"), CancellationToken.None));
+
+        Assert.Equal("poison", (await reported.Task.WaitAsync(TimeSpan.FromSeconds(5))).Message.MessageId);
+        await healthyRan.Task.WaitAsync(TimeSpan.FromSeconds(5));
     }
 
     [Fact]
@@ -1755,11 +1929,11 @@ public class GooglePubSubSubscriberTests
         return (string)property.GetValue(subscriber)!;
     }
 
-    private static PubsubMessage Message(string messageId)
+    private static PubsubMessage Message(string messageId, string data = "{}")
         => new()
         {
             MessageId = messageId,
-            Data = ByteString.CopyFromUtf8("{}")
+            Data = ByteString.CopyFromUtf8(data)
         };
 
     private static async Task<Func<PubsubMessage, CancellationToken, Task<SubscriberClient.Reply>>> WaitForHandlerAsync(

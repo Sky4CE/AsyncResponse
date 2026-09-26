@@ -199,6 +199,48 @@ public sealed class PostgreSqlRelationVerifierTests
         Assert.Contains("to exist after schema creation", missing.Message, StringComparison.Ordinal);
     }
 
+    /// <summary>
+    /// Regression (fixpoint r2 S4#6): an Optional index that EXISTS but is not valid and ready failed
+    /// verification — the "invalid or not ready" check ran before the Optional branch, which only
+    /// covered absence. An operator's <c>CREATE INDEX CONCURRENTLY</c> of the flow store's
+    /// operator-managed <c>_expires_idx</c> leaves exactly that row for the whole build, and forever
+    /// after a failed one, so every flow operation on every host that started meanwhile failed — with
+    /// advice ("restart so the store can recreate it") that nothing honours on an operator-managed
+    /// schema. It is now reported, like an absent one, for the store to warn about; a required index
+    /// in that state, and an Optional one of the wrong shape, still fail.
+    /// </summary>
+    [Theory]
+    [MemberData(nameof(AnchorTypes))]
+    public void Evaluate_AnOptionalIndexThatIsNotValidAndReady_IsReported_NotFatal(Type anchor)
+    {
+        var verifier = new Verifier(anchor);
+        var building = verifier.IndexRow("jobs", ["expires_at"], validAndReady: false);
+
+        var optional = verifier.Relations(verifier.Table("jobs"), verifier.Index("jobs_expires_idx", "jobs", ["expires_at"], optional: true));
+        Assert.Null(verifier.Evaluate(optional, [("jobs", verifier.Row()), ("jobs_expires_idx", building)], null, out var absent, out var notReady));
+        Assert.Empty(absent);
+        Assert.Equal(["jobs_expires_idx"], notReady);
+
+        // Its shape is still verified: the catalog records it from the start of the build.
+        var misshapen = verifier.Evaluate(
+            optional,
+            [("jobs", verifier.Row()), ("jobs_expires_idx", verifier.IndexRow("jobs", ["created_at"], validAndReady: false))]);
+        Assert.NotNull(misshapen);
+        Assert.Contains("does not match the expected definition", misshapen.Message, StringComparison.Ordinal);
+
+        // A required index in that state is still the finding.
+        var required = verifier.Relations(verifier.Table("jobs"), verifier.Index("jobs_expires_idx", "jobs", ["expires_at"], optional: false));
+        var invalid = verifier.Evaluate(required, [("jobs", verifier.Row()), ("jobs_expires_idx", building)]);
+        Assert.NotNull(invalid);
+        Assert.Contains("exists but is invalid or not ready", invalid.Message, StringComparison.Ordinal);
+
+        // And a healthy optional index reports nothing.
+        Assert.Null(verifier.Evaluate(
+            optional, [("jobs", verifier.Row()), ("jobs_expires_idx", verifier.IndexRow("jobs", ["expires_at"]))], null, out absent, out notReady));
+        Assert.Empty(absent);
+        Assert.Empty(notReady);
+    }
+
     [Theory]
     [InlineData(false)]
     [InlineData(true)]
@@ -285,11 +327,11 @@ public sealed class PostgreSqlRelationVerifierTests
             return index;
         }
 
-        /// <summary>A healthy plain btree index row on <paramref name="owningTable"/>.</summary>
-        public object IndexRow(string owningTable, string[] keyColumns)
+        /// <summary>A healthy plain btree index row on <paramref name="owningTable"/> (or one not valid and ready).</summary>
+        public object IndexRow(string owningTable, string[] keyColumns, bool validAndReady = true)
             => Activator.CreateInstance(
                 _actualRelation,
-                "i", "p", owningTable, "btree", false, false, true,
+                "i", "p", owningTable, "btree", false, false, validAndReady,
                 keyColumns, "", 1L, 1L, false, long.MaxValue,
                 Array.Empty<string>())!;
 
@@ -332,8 +374,18 @@ public sealed class PostgreSqlRelationVerifierTests
             (string Name, object Row)[] relations,
             ((string Table, string Column) Key, object Row)[]? columns,
             out IReadOnlyList<string> absentOptional)
+            => Evaluate(expected, relations, columns, out absentOptional, out _);
+
+        /// <summary>As above, also returning the optional indexes reported present but not valid and ready.</summary>
+        public InvalidOperationException? Evaluate(
+            Array expected,
+            (string Name, object Row)[] relations,
+            ((string Table, string Column) Key, object Row)[]? columns,
+            out IReadOnlyList<string> absentOptional,
+            out IReadOnlyList<string> notReadyOptional)
         {
             absentOptional = [];
+            notReadyOptional = [];
             var relationRows = (IDictionary)Activator.CreateInstance(
                 typeof(Dictionary<,>).MakeGenericType(typeof(string), _actualRelation))!;
             foreach (var (name, row) in relations)
@@ -346,7 +398,8 @@ public sealed class PostgreSqlRelationVerifierTests
 
             try
             {
-                absentOptional = (IReadOnlyList<string>?)_evaluate.Invoke(null, ["catalog_test", "channel", expected, relationRows, columnRows]) ?? [];
+                (absentOptional, notReadyOptional) =
+                    ((IReadOnlyList<string>, IReadOnlyList<string>))_evaluate.Invoke(null, ["catalog_test", "channel", expected, relationRows, columnRows])!;
                 return null;
             }
             catch (TargetInvocationException wrapped)

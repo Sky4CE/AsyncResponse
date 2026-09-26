@@ -249,7 +249,8 @@ public sealed class Round35NewApiTests
             .AddAsyncResponse()
             .WithInMemoryChannel()
             .WithInMemoryDurableFlows(options => options.LedgerSizeWarningBytes = 512)
-            .WithDurableFlow<OneSmallStepFlow, ChattyInput>();
+            .WithDurableFlow<OneSmallStepFlow, ChattyInput>()
+            .WithDurableFlow<LargeFailureFlow, ChattyInput>();
         services.AddSingleton<IWorkerTransport>(new NullWorkerTransport());
         return services.BuildServiceProvider();
     }
@@ -269,6 +270,43 @@ public sealed class Round35NewApiTests
     private static string[] LedgerWarnings(CollectingLogger logger, string flowId)
         => logger.Messages.Where(m => m.Contains("LedgerSizeWarningBytes threshold", StringComparison.Ordinal)
             && m.Contains(flowId, StringComparison.Ordinal)).ToArray();
+
+    /// <summary>Reports progress, then fails with a message that alone takes the ledger past 512 bytes.</summary>
+    public sealed class LargeFailureFlow : IDurableFlow<ChattyInput>
+    {
+        public async Task ExecuteAsync(IDurableFlowContext flow, ChattyInput input)
+        {
+            await flow.ReportProgressAsync("calling the remote system");
+            throw new InvalidOperationException(new string('e', 700));
+        }
+    }
+
+    [Fact]
+    public async Task ALedgerOnlyARetriedFailuresMessagePushesPastTheThreshold_IsWarnedOnce_NotOnEveryRedelivery()
+    {
+        // Fixpoint r2 (carried from r1): the executor's save of a retriable failure's message can be
+        // the write that takes the ledger past LedgerSizeWarningBytes, and no context save sees it,
+        // so it was never warned. Round 1's fix measured the crossing from the in-memory ledger just
+        // before that save — where each execution's progress report had shortened the message — and
+        // warned again on every redelivery. Judged against the band seeded from the ledger as each
+        // execution loaded it, it warns once: every redelivery loads a ledger that already carries
+        // the message, however its progress report shortens it in between.
+        var logger = new CollectingLogger();
+        await using var provider = BuildLedgerWarningProvider(logger);
+        var store = provider.GetRequiredService<IFlowStateStore>();
+        var executor = provider.GetRequiredService<IDurableFlowExecutor>();
+        var ledger = SmallLedger("failure-message-past-the-threshold", typeof(LargeFailureFlow), attempts: 0);
+        Assert.True(await store.TryCreateAsync(ledger.FlowId!, ledger, TimeSpan.FromDays(1)));
+        Assert.InRange(FlowStateJson.EstimateLedgerChars(ledger), 0, 511);
+
+        for (var delivery = 1; delivery <= 3; delivery++)
+            await Assert.ThrowsAsync<InvalidOperationException>(() => executor.ExecuteAsync(ledger.FlowId!));
+
+        var persisted = (await store.LoadAsync(ledger.FlowId!))!;
+        Assert.Equal(3, persisted.Attempts);
+        Assert.InRange(FlowStateJson.EstimateLedgerChars(persisted), 512, 1023);
+        Assert.Single(LedgerWarnings(logger, ledger.FlowId!));
+    }
 
     [Fact]
     public async Task ALedgerARecoveredResponsePushesPastTheThreshold_BetweenLaterExecutions_IsWarnedExactlyOnce()

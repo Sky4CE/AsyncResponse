@@ -1444,6 +1444,11 @@ public sealed class DbChannelSharedCoverageTests
     /// wake-down floor, a quarter of the confirmation budget (the harness's 2 ms budget makes that
     /// every 20 ms tick here). Pre-fix: the configured 10 minutes was returned throughout, and the
     /// second pass below scanned nothing.
+    /// <para>
+    /// Fixpoint r2 S11#5: this fact never had a LISTEN established, so the listen loop's
+    /// <c>_listening = false</c> reset was unpinned (deleting it stayed green). Like its MongoDB
+    /// twin it now establishes one first: the throttle applies, then the loop fails and lifts it.
+    /// </para>
     /// </summary>
     [Fact]
     public async Task FullSweepThrottle_PostgreSql_IsLiftedUntilListenIsEstablished_AndAfterEveryListenFailure()
@@ -1456,7 +1461,11 @@ public sealed class DbChannelSharedCoverageTests
         Assert.Null(await harness.CollectDispatchScopeAsync());
         Assert.Null(await harness.CollectDispatchScopeAsync());
 
-        // The listen loop fails (closed port) and keeps retrying: still no push wake.
+        // An established LISTEN carries delivery: the configured throttle applies.
+        harness.MarkWakeListenerEstablished();
+        Assert.Equal(TimeSpan.FromMinutes(10), harness.CurrentFullSweepInterval());
+
+        // The listen loop fails (closed port) and keeps retrying: no push wake from then on.
         harness.Invoke("EnsureListenerStarted");
         await harness.Logger.WaitForAsync("PostgreSQL LISTEN loop failed");
         Assert.Equal(HarnessWakeDownInterval, harness.CurrentFullSweepInterval());
@@ -1549,15 +1558,16 @@ public sealed class DbChannelSharedCoverageTests
 
     /// <summary>
     /// A channel whose wake listener connects and is dropped straight away, every time: a
-    /// <see cref="FakePostgresWireServer"/> that answers the LISTEN and closes the socket, or a
-    /// change stream that opens and then fails its first read. (The server is unused for MongoDB.)
+    /// <see cref="FakePostgresWireServer"/> that answers the LISTEN and its delivery probe and then
+    /// closes the socket, or a change stream that opens and then fails its first read. (The server
+    /// is unused for MongoDB.)
     /// </summary>
     private static Harness FlappingWakeListener(Provider provider, FakePostgresWireServer server)
     {
         if (provider == Provider.PostgreSql)
         {
             server.Respond = (_, sql) => Task.FromResult(
-                FakePostgresWireServer.Reply.Complete(sql, closeAfter: sql.StartsWith("LISTEN", StringComparison.Ordinal)));
+                FakePostgresWireServer.Reply.CompleteEchoingNotify(sql, closeAfter: sql.StartsWith("NOTIFY", StringComparison.Ordinal)));
             var postgres = Harness.Create(
                 Provider.PostgreSql, failing: false, pollInterval: TimeSpan.FromSeconds(30), postgreSqlConnectionString: server.ConnectionString());
             postgres.MarkStoreCreated();
@@ -1636,6 +1646,38 @@ public sealed class DbChannelSharedCoverageTests
         await harness.Logger.WaitForAsync("change-stream loop failed");
 
         Assert.Equal(HarnessWakeDownInterval, harness.CurrentFullSweepInterval());
+    }
+
+    /// <summary>
+    /// Fixpoint r2 precommit J7: the change-stream loop's failure warning ran unguarded, so a
+    /// logging provider that throws (Microsoft.Extensions.Logging rethrows a provider's failure)
+    /// ended the loop for good at its first stream failure — no stream was ever re-opened, and the
+    /// waiters were left on the wake-down sweep for the rest of the process's uptime. The loop now
+    /// survives its own log line. Red on the old code: the stream was never re-opened.
+    /// </summary>
+    [Fact]
+    public async Task ChangeStreamLoop_ALoggerThatThrowsOnTheFailureWarning_KeepsReopeningTheStream()
+    {
+        await using var harness = Harness.Create(Provider.MongoDb, failing: false, pollInterval: TimeSpan.FromSeconds(30), useChangeStreams: true);
+        harness.Logger.ThrowOnMessageContaining = "change-stream loop failed";
+        var watches = 0;
+        var reopened = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        harness.MongoMessages!
+            .Setup(collection => collection.WatchAsync(
+                It.IsAny<PipelineDefinition<ChangeStreamDocument<MongoChannelMessageDocument>, ChangeStreamDocument<MongoChannelMessageDocument>>>(),
+                It.IsAny<ChangeStreamOptions>(),
+                It.IsAny<CancellationToken>()))
+            .Returns(() =>
+            {
+                if (Interlocked.Increment(ref watches) >= 2)
+                    reopened.TrySetResult();
+                return Task.FromException<IChangeStreamCursor<ChangeStreamDocument<MongoChannelMessageDocument>>>(new MongoException("stream down"));
+            });
+
+        harness.Invoke("EnsureListenerStarted");
+
+        await reopened.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        Assert.Contains(harness.Logger.Messages, message => message.Contains("change-stream loop failed", StringComparison.Ordinal));
     }
 
     /// <summary>
@@ -2018,59 +2060,6 @@ public sealed class DbChannelSharedCoverageTests
     }
 
     /// <summary>
-    /// Fixpoint r1 S5#6: nothing measured the sweep, so the cliff past the confirmation budget
-    /// was invisible. Each full sweep now records its duration on the AsyncResponse meter, and a
-    /// sweep longer than half the confirmation budget logs a warning — at most once a minute.
-    /// </summary>
-    [Fact]
-    public async Task FullSweep_RecordsItsDuration_AndWarnsOnceAMinuteWhenItNearsTheConfirmationBudget()
-    {
-        var durations = new List<double>();
-        using var listener = new System.Diagnostics.Metrics.MeterListener
-        {
-            InstrumentPublished = (instrument, l) =>
-            {
-                if (instrument.Meter.Name == AsyncResponseDiagnostics.MeterName && instrument.Name == "asyncresponse.channel.sweep.duration")
-                    l.EnableMeasurementEvents(instrument);
-            }
-        };
-        listener.SetMeasurementEventCallback<double>((_, value, tags, _) =>
-        {
-            foreach (var tag in tags)
-            {
-                if (tag.Key == "asyncresponse.channel" && Equals(tag.Value, "mongodb"))
-                {
-                    lock (durations)
-                        durations.Add(value);
-                }
-            }
-        });
-        listener.Start();
-
-        await using var harness = Harness.Create(Provider.MongoDb, false, TimeSpan.FromSeconds(30));
-        harness.ConfigureDeliveryConfirmation(timeout: TimeSpan.FromMilliseconds(40), pollInterval: TimeSpan.FromMilliseconds(1));
-        harness.AddWaiters("corr");
-        harness.MongoMessages!
-            .Setup(collection => collection.FindAsync(
-                It.IsAny<FilterDefinition<MongoChannelMessageDocument>>(),
-                It.IsAny<FindOptions<MongoChannelMessageDocument, MongoChannelMessageDocument>>(),
-                It.IsAny<CancellationToken>()))
-            .Returns(async () =>
-            {
-                // A slow store round trip, so the sweep outlasts half the 40 ms budget.
-                await Task.Delay(TimeSpan.FromMilliseconds(60));
-                return Cursor(new List<MongoChannelMessageDocument>());
-            });
-
-        await harness.InvokeAsync("DispatchPendingMessagesAsync", null, CancellationToken.None);
-        await harness.InvokeAsync("DispatchPendingMessagesAsync", null, CancellationToken.None);
-
-        Assert.Single(harness.Logger.Messages, message => message.Contains("full dispatch sweep over 1 correlation ids took", StringComparison.Ordinal));
-        lock (durations)
-            Assert.True(durations.Count(value => value >= 0.05) >= 2, $"Expected both sweeps' durations recorded; saw [{string.Join(", ", durations)}].");
-    }
-
-    /// <summary>
     /// Fixpoint r1 S5#14: the Mongo channel counted subscribers under the collection's DEFAULT
     /// collation. On an operator-provisioned case-folding collection a count for "ABC" counted
     /// "abc"'s live waiter, so publishes to "ABC" took the live route and sat out the whole
@@ -2269,6 +2258,591 @@ public sealed class DbChannelSharedCoverageTests
         Assert.StartsWith("boom\\u000d\\u000aFORGED", status, StringComparison.Ordinal);
         Assert.True(status.Length < 1024, $"status is {status.Length} characters");
         Assert.Equal(hostile, (await Assert.ThrowsAnyAsync<Exception>(() => completion.Task)).Message);
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Fixpoint round 2 (G5): database-channel dispatch, sweep and listen loop
+    // ---------------------------------------------------------------------------------------
+
+    /// <summary>
+    /// Fixpoint r2 S5#3: a pass whose load failed transiently had already consumed its id's wake
+    /// (a NOTIFY, a change event, a local publish), and unless the breaker tripped nothing came
+    /// back for the id but the next full sweep — with the push wake up, <c>FullSweepInterval</c>
+    /// away (5 s by default, the publisher's whole confirmation budget), so a response behind one
+    /// dead pooled connection after a failover was claimed for lost-subscriber recovery under its
+    /// live waiter. The id is now rescanned on its own after the wake-down floor (a quarter of the
+    /// confirmation budget; 50 ms here) — never the poll interval, which would retry every failed
+    /// id on every tick. The poll is 30 s and the full sweep 10 minutes away here, so only that
+    /// rescan can produce the targeted scope. Red on the old code: nothing signalled the id.
+    /// </summary>
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task DispatchPass_ATransientLoadFailureBelowTheBreaker_IsRescannedAfterTheWakeDownFloor(bool fullSweep)
+    {
+        var floor = TimeSpan.FromMilliseconds(50);
+        await using var harness = Harness.Create(
+            Provider.MongoDb, failing: false, pollInterval: TimeSpan.FromSeconds(30), fullSweepInterval: TimeSpan.FromMinutes(10), useChangeStreams: true);
+        harness.ConfigureDeliveryConfirmation(timeout: floor * 4, pollInterval: TimeSpan.FromMilliseconds(5));
+        // A change stream carrying delivery (so the throttle is the 10 minutes); its "sweep once
+        // now" request is taken off the queue first.
+        harness.MarkWakeListenerEstablished();
+        Assert.Null(await harness.CollectDispatchScopeAsync().WaitAsync(TimeSpan.FromSeconds(10)));
+
+        var startedAt = DateTimeOffset.UtcNow;
+        var (waiter, _) = harness.Subscription("corr", startedAt);
+        var delivered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        harness.SetProcessHook(waiter, () => { delivered.TrySetResult(); return Task.CompletedTask; });
+        harness.AddSubscription("corr", waiter);
+        var pending = Stored(Guid.NewGuid(), "corr", startedAt);
+        var loads = 0;
+        harness.MongoMessages!
+            .Setup(collection => collection.FindAsync(
+                It.IsAny<FilterDefinition<MongoChannelMessageDocument>>(),
+                It.IsAny<FindOptions<MongoChannelMessageDocument, MongoChannelMessageDocument>>(),
+                It.IsAny<CancellationToken>()))
+            .Returns(() => Interlocked.Increment(ref loads) == 1
+                ? Task.FromException<IAsyncCursor<MongoChannelMessageDocument>>(new TimeoutException("a pooled connection died in the failover"))
+                : Task.FromResult(Cursor(new List<MongoChannelMessageDocument> { pending })));
+        harness.MongoMessages
+            .Setup(collection => collection.FindOneAndUpdateAsync(
+                It.IsAny<FilterDefinition<MongoChannelMessageDocument>>(),
+                It.IsAny<UpdateDefinition<MongoChannelMessageDocument>>(),
+                It.IsAny<FindOneAndUpdateOptions<MongoChannelMessageDocument, MongoChannelMessageDocument>>(),
+                It.IsAny<CancellationToken>()))
+            .ReturnsAsync(pending);
+
+        var failedAt = System.Diagnostics.Stopwatch.GetTimestamp();
+        await Assert.ThrowsAsync<TimeoutException>(() => harness.InvokeAsync(
+            "DispatchPendingMessagesAsync",
+            fullSweep ? null : new HashSet<string>(StringComparer.Ordinal) { "corr" },
+            CancellationToken.None));
+
+        var scope = Assert.IsType<HashSet<string>>(await harness.CollectDispatchScopeAsync().WaitAsync(TimeSpan.FromSeconds(10)));
+        Assert.Single(scope, "corr");
+        // The floor, not an immediate retry (the timer behind it has a millisecond or so of slack).
+        Assert.True(System.Diagnostics.Stopwatch.GetElapsedTime(failedAt) >= floor - TimeSpan.FromMilliseconds(15));
+
+        await harness.InvokeAsync("DispatchPendingMessagesAsync", scope, CancellationToken.None);
+        await delivered.Task.WaitAsync(TimeSpan.FromSeconds(10));
+    }
+
+    /// <summary>
+    /// Fixpoint r2 S5#3 (the round-1 pre-commit B-p2 #1 redo): a REQUESTED full sweep — here the
+    /// one an established change stream asks for — carries work nothing else comes back for, and
+    /// when the outage breaker cut it short its unvisited ids waited for the regular throttle (10
+    /// minutes here, 5 s by default). Round 1 re-requested it outright, which made every poll tick
+    /// sweep in full while the outage lasted, past both throttles, so it was taken out. The retry
+    /// now waits for the wake-down floor (500 ms here) after the tripped sweep — never less — while
+    /// a timer sweep that trips is left to the next scheduled one. Red with the re-arm removed: the
+    /// retry never came.
+    /// </summary>
+    [Fact]
+    public async Task FullSweep_ARequestedSweepTheBreakerCutShort_IsRetriedAtTheWakeDownFloor_NeverSooner()
+    {
+        var floor = TimeSpan.FromMilliseconds(500);
+        await using var harness = Harness.Create(
+            Provider.MongoDb, failing: false, pollInterval: TimeSpan.FromMilliseconds(20), fullSweepInterval: TimeSpan.FromMinutes(10), useChangeStreams: true);
+        harness.ConfigureDeliveryConfirmation(timeout: floor * 4, pollInterval: TimeSpan.FromMilliseconds(5));
+        harness.AddWaiters(Enumerable.Range(0, 40).Select(i => $"corr-{i}").ToArray());
+        harness.MongoMessages!
+            .Setup(collection => collection.FindAsync(
+                It.IsAny<FilterDefinition<MongoChannelMessageDocument>>(),
+                It.IsAny<FindOptions<MongoChannelMessageDocument, MongoChannelMessageDocument>>(),
+                It.IsAny<CancellationToken>()))
+            .Returns(() => Task.FromException<IAsyncCursor<MongoChannelMessageDocument>>(new TimeoutException("server selection timed out")));
+
+        // A timer sweep that trips leaves its unvisited ids to the next scheduled sweep.
+        await Assert.ThrowsAsync<AggregateException>(() => harness.InvokeAsync("DispatchPendingMessagesAsync", null, CancellationToken.None));
+        Assert.False(harness.RequestedSweepRetryArmed);
+
+        // A requested one is retried.
+        harness.MarkWakeListenerEstablished();
+        var requestedAt = System.Diagnostics.Stopwatch.GetTimestamp();
+        Assert.Null(await harness.CollectDispatchScopeAsync().WaitAsync(TimeSpan.FromSeconds(10)));
+        var tripped = await Assert.ThrowsAsync<AggregateException>(() => harness.InvokeAsync("DispatchPendingMessagesAsync", null, CancellationToken.None));
+        Assert.Contains("the store looks unavailable", tripped.Message, StringComparison.Ordinal);
+        Assert.True(harness.RequestedSweepRetryArmed);
+
+        await RetryIsDueAsync().WaitAsync(TimeSpan.FromSeconds(10));
+        // The poll ticks every 20 ms; the retry waited for the floor, measured from the stamp the
+        // requested sweep took (which is after requestedAt).
+        Assert.True(System.Diagnostics.Stopwatch.GetElapsedTime(requestedAt) >= floor);
+        Assert.False(harness.RequestedSweepRetryArmed);
+
+        async Task RetryIsDueAsync()
+        {
+            while (await harness.CollectDispatchScopeAsync() is not null)
+            {
+            }
+        }
+    }
+
+    /// <summary>
+    /// Fixpoint r2 S5#4: an id whose subscriptions are all dropped (waiters mid-cleanup, their
+    /// store deletes still riding the connect timeout of the outage) returns without a store call,
+    /// and it counted as a success: settling at once, it took a place in the breaker's first wave
+    /// and kept it from ever tripping — every waiter's failing call then ran on every pass. Such
+    /// ids no longer count. The targeted scope enumerates in insertion order, so the dropped id
+    /// settles first. Red on the old code: all 20 failing ids were loaded.
+    /// </summary>
+    [Fact]
+    public async Task TargetedPass_AStoreOutage_StillTripsWhenAWaiterIsMidCleanup()
+    {
+        await using var harness = Harness.Create(Provider.MongoDb, failing: false, TimeSpan.FromSeconds(30));
+        var ids = Enumerable.Range(0, 20).Select(i => $"corr-{i}").ToArray();
+        AddMidCleanupWaiter(harness, "corr-dropped");
+        harness.AddWaiters(ids);
+        var loads = 0;
+        harness.MongoMessages!
+            .Setup(collection => collection.FindAsync(
+                It.IsAny<FilterDefinition<MongoChannelMessageDocument>>(),
+                It.IsAny<FindOptions<MongoChannelMessageDocument, MongoChannelMessageDocument>>(),
+                It.IsAny<CancellationToken>()))
+            .Returns(() =>
+            {
+                Interlocked.Increment(ref loads);
+                return Task.FromException<IAsyncCursor<MongoChannelMessageDocument>>(new TimeoutException("server selection timed out"));
+            });
+        var scope = new HashSet<string>(StringComparer.Ordinal) { "corr-dropped" };
+        scope.UnionWith(ids);
+
+        await Assert.ThrowsAsync<AggregateException>(() => harness.InvokeAsync("DispatchPendingMessagesAsync", scope, CancellationToken.None));
+
+        Assert.Equal(8, loads);
+        harness.Invoke("SignalDispatcher", "corr-0");
+        Assert.Null(await harness.CollectDispatchScopeAsync());
+    }
+
+    /// <summary>
+    /// The full-sweep counterpart. The map enumerates in hash order, so the dropped ids are the
+    /// majority: on the old code the first eight to settle were all failures well under one run
+    /// in a thousand, and the sweep visited all 40 failing ids.
+    /// </summary>
+    [Fact]
+    public async Task FullSweep_AStoreOutage_StillTripsWhenWaitersAreMidCleanup()
+    {
+        await using var harness = Harness.Create(Provider.MongoDb, failing: false, TimeSpan.FromSeconds(30));
+        harness.AddWaiters(Enumerable.Range(0, 40).Select(i => $"corr-{i}").ToArray());
+        for (var i = 0; i < 120; i++)
+            AddMidCleanupWaiter(harness, $"corr-dropped-{i}");
+        var loaded = new System.Collections.Concurrent.ConcurrentDictionary<string, byte>();
+        harness.MongoMessages!
+            .Setup(collection => collection.FindAsync(
+                It.IsAny<FilterDefinition<MongoChannelMessageDocument>>(),
+                It.IsAny<FindOptions<MongoChannelMessageDocument, MongoChannelMessageDocument>>(),
+                It.IsAny<CancellationToken>()))
+            .Returns((FilterDefinition<MongoChannelMessageDocument> filter, FindOptions<MongoChannelMessageDocument, MongoChannelMessageDocument> _, CancellationToken _) =>
+            {
+                loaded.TryAdd(CorrelationIdOf(filter)!, 0);
+                return Task.FromException<IAsyncCursor<MongoChannelMessageDocument>>(new TimeoutException("server selection timed out"));
+            });
+
+        var failure = await Assert.ThrowsAsync<AggregateException>(
+            () => harness.InvokeAsync("DispatchPendingMessagesAsync", null, CancellationToken.None));
+
+        Assert.InRange(loaded.Count, 8, 15);
+        Assert.DoesNotContain(loaded.Keys, id => id.StartsWith("corr-dropped", StringComparison.Ordinal));
+        Assert.Contains("the store looks unavailable", failure.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>A registered waiter whose only subscription is already dropped: one whose cleanup is still running.</summary>
+    private static void AddMidCleanupWaiter(Harness harness, string correlationId)
+    {
+        var (subscription, _) = harness.Subscription(correlationId);
+        SetField(subscription, "_dropped", true);
+        harness.AddSubscription(correlationId, subscription);
+    }
+
+    /// <summary>
+    /// Fixpoint r2 S5#5: while a cursor was fresh every pass re-read the whole late-commit
+    /// lookback window, and a steady stream on one id (an Until progress stream) keeps it fresh —
+    /// with a pass per publish that was about 2R² rows a second for R responses a second. The
+    /// window is now revisited at most once per poll interval (30 s here — capped at the lookback,
+    /// see the precommit D2 test below); the passes in between read the last tick only and schedule
+    /// a rescan for when the throttle is over. Two seconds of window here (a 4 s confirmation
+    /// budget), 200 rows inside it. Red on the old code: all five passes read the 200 rows (1,000).
+    /// (Each throttled pass is stamped as right after the revisit, so the 2 s throttle cannot run
+    /// out on a slow runner between two sweeps.)
+    /// </summary>
+    [Fact]
+    public async Task DispatchSweep_TheLookbackWindow_IsRevisitedAtMostOncePerPollInterval()
+    {
+        var clock = new AsyncResponse.Testing.VirtualTimeProvider();
+        await using var harness = Harness.Create(Provider.MongoDb, false, TimeSpan.FromSeconds(30), timeProvider: clock);
+        harness.ConfigureDeliveryConfirmation(timeout: TimeSpan.FromSeconds(4), pollInterval: TimeSpan.FromMilliseconds(50));
+        harness.SetOption("HistoryReconciliationInterval", TimeSpan.FromHours(1));
+        var started = clock.GetUtcNow();
+        var rows = Enumerable.Range(0, 200).Select(i => HistoryRow(started, i)).ToList();
+        var delivered = 0;
+        var subscription = harness.Subscription("corr", started).Instance;
+        harness.SetProcessHook(subscription, () => { Interlocked.Increment(ref delivered); return Task.CompletedTask; });
+        harness.AddSubscription("corr", subscription);
+        var reads = new List<int>();
+        ServeHistory(harness, rows, reads);
+        await SweepAndDrainAsync(harness);
+        Assert.Equal(200, delivered);
+        Assert.Empty(harness.BackpressureRescans);
+        Assert.Empty(harness.LookbackRescans);
+
+        reads.Clear();
+        harness.HoldLookbackWindowOpen("corr");
+        await SweepAndDrainAsync(harness);
+        for (var pass = 1; pass < 5; pass++)
+        {
+            harness.StampWindowRevisit("corr", TimeSpan.Zero);
+            await SweepAndDrainAsync(harness);
+        }
+
+        // One window revisit (200 rows), then the last tick (one row) four times.
+        Assert.Equal(204, reads.Sum());
+        Assert.Equal(200, delivered);
+        Assert.Contains("corr", harness.LookbackRescans.Keys.Cast<string>());
+    }
+
+    /// <summary>
+    /// Fixpoint r2 precommit D2: the revisit throttle was the poll interval, and the window is open
+    /// for only twice the lookback (at most 4 s). With a poll interval of a few seconds (allowed;
+    /// nothing ties it to the confirmation budget the lookback derives from) a late commit whose
+    /// wake pass was throttled got its rescan a whole interval later — past the window's close — and
+    /// waited for history reconciliation while its publisher's confirmation lapsed into
+    /// lost-subscriber recovery under a live waiter. The throttle is now at most the lookback, and
+    /// the rescan is due when it ends. Here: a 3 s poll interval, a 2 s lookback. Red on the old
+    /// code: the pass 2.2 s after the revisit read the last tick only (still inside the 3 s
+    /// interval), and the throttled pass logged no lookback rescan (a backpressure rescan a full
+    /// 3 s out instead).
+    /// </summary>
+    [Fact]
+    public async Task DispatchSweep_ALongPollInterval_ThrottlesTheLookbackRevisitToTheLookback()
+    {
+        var clock = new AsyncResponse.Testing.VirtualTimeProvider();
+        await using var harness = Harness.Create(Provider.MongoDb, false, TimeSpan.FromSeconds(3), timeProvider: clock);
+        harness.ConfigureDeliveryConfirmation(timeout: TimeSpan.FromSeconds(4), pollInterval: TimeSpan.FromMilliseconds(50));
+        harness.SetOption("HistoryReconciliationInterval", TimeSpan.FromHours(1));
+        var started = clock.GetUtcNow();
+        var rows = Enumerable.Range(0, 200).Select(i => HistoryRow(started, i)).ToList();
+        var subscription = harness.Subscription("corr", started).Instance;
+        harness.SetProcessHook(subscription, () => Task.CompletedTask);
+        harness.AddSubscription("corr", subscription);
+        var reads = new List<int>();
+        ServeHistory(harness, rows, reads);
+        await SweepAndDrainAsync(harness);
+
+        // Past the 2 s lookback, still inside the 3 s poll interval: the window is revisited.
+        harness.HoldLookbackWindowOpen("corr");
+        harness.StampWindowRevisit("corr", TimeSpan.FromSeconds(2.2));
+        reads.Clear();
+        await SweepAndDrainAsync(harness);
+        Assert.Equal(200, reads.Sum());
+
+        // Inside the throttle: the last tick only, and a rescan due when the throttle ends — within
+        // the lookback, not a whole poll interval out.
+        harness.StampWindowRevisit("corr", TimeSpan.FromSeconds(0.1));
+        reads.Clear();
+        await SweepAndDrainAsync(harness);
+        Assert.Equal(1, reads.Sum());
+        Assert.Contains("corr", harness.LookbackRescans.Keys.Cast<string>());
+        var scheduled = harness.Logger.Messages.Single(message => message.Contains("the window is revisited again in", StringComparison.Ordinal));
+        var delay = TimeSpan.Parse(
+            System.Text.RegularExpressions.Regex.Match(scheduled, @"revisited again in (?<delay>[0-9:.]+)\.$").Groups["delay"].Value,
+            System.Globalization.CultureInfo.InvariantCulture);
+        Assert.InRange(delay, TimeSpan.FromTicks(1), TimeSpan.FromSeconds(1.9));
+    }
+
+    /// <summary>
+    /// Fixpoint r2 precommit D2, the throttle itself: the poll interval capped at the lookback, and
+    /// the rescan due when it ends. Red on the old rule (throttle = poll interval, rescan a whole
+    /// interval out): the 3 s rows.
+    /// </summary>
+    [Theory]
+    [InlineData(3000, 2000, 500, 1500)]
+    [InlineData(3000, 2000, 2100, null)]
+    [InlineData(250, 2000, 100, 150)]
+    [InlineData(250, 2000, 300, null)]
+    public void LookbackRescanDelay_IsThePollIntervalCappedAtTheLookback_LessTheTimeSinceTheRevisit(int pollMs, int lookbackMs, int sinceMs, int? expectedMs)
+    {
+        var helper = typeof(MongoDbAsyncResponseChannel).BaseType!.GetMethod("LookbackRescanDelay", BindingFlags.Static | BindingFlags.NonPublic)!;
+
+        var delay = (TimeSpan?)helper.Invoke(null, [TimeSpan.FromMilliseconds(pollMs), TimeSpan.FromMilliseconds(lookbackMs), TimeSpan.FromMilliseconds(sinceMs)]);
+
+        Assert.Equal(expectedMs is { } ms ? TimeSpan.FromMilliseconds(ms) : null, delay);
+    }
+
+    /// <summary>
+    /// Fixpoint r2 GS3#3: the dispatch loop serves every correlation id of the channel, and a
+    /// logging provider that throws (Microsoft.Extensions.Logging rethrows a provider's failure)
+    /// ended it at its failure warning — every live waiter then timed out. The loop now survives
+    /// its own log line. Red on the old code: the response was never delivered.
+    /// </summary>
+    [Fact]
+    public async Task DispatchLoop_ALoggerThatThrowsOnTheFailureWarning_DoesNotEndTheLoop()
+    {
+        await using var harness = Harness.Create(Provider.MongoDb, failing: false, pollInterval: TimeSpan.FromMilliseconds(20));
+        harness.Logger.ThrowOnMessageContaining = "response dispatch loop failed";
+        var startedAt = DateTimeOffset.UtcNow;
+        var (waiter, _) = harness.Subscription("corr", startedAt);
+        var delivered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        harness.SetProcessHook(waiter, () => { delivered.TrySetResult(); return Task.CompletedTask; });
+        harness.AddSubscription("corr", waiter);
+        var pending = Stored(Guid.NewGuid(), "corr", startedAt);
+        var loads = 0;
+        harness.MongoMessages!
+            .Setup(collection => collection.FindAsync(
+                It.IsAny<FilterDefinition<MongoChannelMessageDocument>>(),
+                It.IsAny<FindOptions<MongoChannelMessageDocument, MongoChannelMessageDocument>>(),
+                It.IsAny<CancellationToken>()))
+            .Returns(() => Interlocked.Increment(ref loads) == 1
+                ? Task.FromException<IAsyncCursor<MongoChannelMessageDocument>>(new InvalidOperationException("one failed pass"))
+                : Task.FromResult(Cursor(new List<MongoChannelMessageDocument> { pending })));
+        harness.MongoMessages
+            .Setup(collection => collection.FindOneAndUpdateAsync(
+                It.IsAny<FilterDefinition<MongoChannelMessageDocument>>(),
+                It.IsAny<UpdateDefinition<MongoChannelMessageDocument>>(),
+                It.IsAny<FindOneAndUpdateOptions<MongoChannelMessageDocument, MongoChannelMessageDocument>>(),
+                It.IsAny<CancellationToken>()))
+            .ReturnsAsync(pending);
+
+        harness.Invoke("EnsureListenerStarted");
+
+        await harness.Logger.WaitForAsync("response dispatch loop failed");
+        await delivered.Task.WaitAsync(TimeSpan.FromSeconds(10));
+    }
+
+    /// <summary>
+    /// Fixpoint r2 GS3#3: the heartbeat's failure warning threw, skipped the drop compensation,
+    /// and the outer catch's own warning threw too — ending the loop, so every live waiter's
+    /// subscriber row lapsed and their responses routed to lost-subscriber recovery until the
+    /// process restarted. Red on the old code: no second round ever ran.
+    /// </summary>
+    [Fact]
+    public async Task Heartbeat_ALoggerThatThrowsOnItsFailureWarnings_DoesNotEndTheLoop()
+    {
+        await using var harness = Harness.Create(Provider.MongoDb, failing: false, pollInterval: TimeSpan.FromSeconds(30));
+        harness.Logger.ThrowOnMessageContaining = "subscriber heartbeat";
+        harness.AddWaiters("corr");
+        var rounds = 0;
+        var secondRound = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        harness.MongoSubscribers!
+            .Setup(collection => collection.BulkWriteAsync(
+                It.IsAny<IEnumerable<WriteModel<MongoChannelSubscriberDocument>>>(),
+                It.IsAny<BulkWriteOptions>(),
+                It.IsAny<CancellationToken>()))
+            .Returns(() =>
+            {
+                if (Interlocked.Increment(ref rounds) == 1)
+                    return Task.FromException<BulkWriteResult<MongoChannelSubscriberDocument>>(new TimeoutException("heartbeat round failed"));
+                secondRound.TrySetResult();
+                return Task.FromResult<BulkWriteResult<MongoChannelSubscriberDocument>>(null!);
+            });
+
+        harness.Invoke("EnsureListenerStarted");
+
+        await secondRound.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        Assert.Contains(harness.Logger.Messages, message => message.Contains("subscriber heartbeat failed", StringComparison.Ordinal));
+    }
+
+    /// <summary>
+    /// Fixpoint r2 GS3#3: disposal absorbed only a loop's cancellation. A loop that had died of
+    /// anything else rethrew here and skipped every waiter's cleanup, so their response tasks
+    /// never settled and their executors were never retired. Red on the old code: disposal threw
+    /// the loop's fault.
+    /// </summary>
+    [Fact]
+    public async Task Dispose_ABackgroundLoopThatFaulted_StillCleansUpEveryWaiter()
+    {
+        await using var harness = Harness.Create(Provider.MongoDb, failing: false, pollInterval: TimeSpan.FromSeconds(30));
+        var (waiter, completion) = harness.Subscription("corr", cleanupStarted: false);
+        harness.AddSubscription("corr", waiter);
+        harness.Invoke("EnsureListenerStarted");
+        harness.SetChannelField("_heartbeatTask", Task.FromException(new InvalidOperationException("the heartbeat loop died")));
+
+        await harness.Channel.DisposeAsync();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => completion.Task.WaitAsync(TimeSpan.FromSeconds(10)));
+        Assert.Empty(harness.Subscriptions);
+        Assert.Contains(harness.Logger.Messages, message => message.Contains("background loop had failed before disposal", StringComparison.Ordinal));
+    }
+
+    /// <summary>
+    /// Fixpoint r2 S2#13: a registration that failed (here the recovery-state save) logged before
+    /// cleaning up, so a logging provider that throws skipped the cleanup — the subscriber row
+    /// stayed for publishers to count — and replaced the failure the caller received. Cleanup
+    /// runs first now, and the original failure is rethrown. Red on the old code: the caller got
+    /// the logger's exception and the subscriber row was never deleted.
+    /// </summary>
+    [Fact]
+    public async Task CreateWaiter_AFailedRegistration_IsCleanedUpAndRethrown_EvenWhenTheLoggerThrows()
+    {
+        await using var harness = Harness.Create(Provider.MongoDb, failing: false, pollInterval: TimeSpan.FromSeconds(30));
+        harness.Logger.ThrowOnMessageContaining = "Failed to create";
+        harness.RecoveryState
+            .Setup(store => store.SaveAsync(It.IsAny<string>(), It.IsAny<RecoveryState>(), It.IsAny<TimeSpan>(), It.IsAny<CancellationToken>()))
+            .ThrowsAsync(new TimeoutException("recovery store unreachable"));
+
+        var failure = await Assert.ThrowsAsync<TimeoutException>(
+            () => ((IAsyncResponseSubscriber)harness.Channel).CreateResponseWaiter<OperationResult>("corr"));
+
+        Assert.Equal("recovery store unreachable", failure.Message);
+        harness.MongoSubscribers!.Verify(
+            collection => collection.DeleteOneAsync(It.IsAny<FilterDefinition<MongoChannelSubscriberDocument>>(), It.IsAny<CancellationToken>()),
+            Times.Once);
+        Assert.Contains(harness.Logger.Messages, message => message.Contains("Failed to create", StringComparison.Ordinal));
+    }
+
+    /// <summary>
+    /// Fixpoint r2 S5#6: a LISTEN that succeeded was taken as proof NOTIFY works, but behind a
+    /// transaction-mode pooler (PgBouncer pool_mode=transaction) the LISTEN runs on a server
+    /// connection that goes straight back to the pool, and nothing reaches the channel's — while
+    /// <c>SELECT 1</c> pings kept succeeding, so the channel kept its full-sweep throttle for good.
+    /// A delivery probe (a NOTIFY the listen connection sends itself) must now come back before
+    /// the LISTEN counts as established. Here the server completes the NOTIFY but never delivers
+    /// it. Red on the old code: the listener reported itself established straight after LISTEN.
+    /// </summary>
+    [Fact]
+    public async Task PostgreSqlListen_AListenWhoseNotificationsNeverArrive_IsNotEstablished()
+    {
+        await using var server = new FakePostgresWireServer();
+        await using var dataSource = NpgsqlDataSource.Create(server.ConnectionString());
+        var sql = ListenOnlyStore(dataSource);
+        sql.ListenProbeTimeout = TimeSpan.FromMilliseconds(200);
+        var established = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var stop = new CancellationTokenSource();
+
+        var listen = sql.ExecuteListenAsync(_ => Task.CompletedTask, stop.Token, () => established.TrySetResult());
+        try
+        {
+            Assert.Same(listen, await Task.WhenAny(listen, established.Task).WaitAsync(TimeSpan.FromSeconds(30)));
+            var failure = await Assert.ThrowsAsync<TimeoutException>(() => listen);
+            Assert.Contains("delivery-probe notification", failure.Message, StringComparison.Ordinal);
+            Assert.Contains(server.Statements, statement => statement.Sql.StartsWith("NOTIFY", StringComparison.Ordinal));
+        }
+        finally
+        {
+            await stop.CancelAsync();
+        }
+    }
+
+    /// <summary>
+    /// Fixpoint r2 precommit D3: the probe waited <c>connection.WaitAsync(remaining)</c> once any
+    /// budget was left, but Npgsql truncates the TimeSpan to whole milliseconds and treats 0 ms as
+    /// an INFINITE wait — so a notification-free final fraction of a millisecond on a half-open
+    /// socket blocked the listener forever, the hang the bounded wait exists to prevent. Under a
+    /// millisecond now counts as spent. (The sub-millisecond window cannot be hit reliably through
+    /// the wire, so the budget rule is pinned directly, plus the probe's use of it.) Red on the old
+    /// rule (<c>remaining &lt;= 0</c>): the sub-millisecond rows.
+    /// </summary>
+    [Theory]
+    [InlineData(-10_000L, true)]
+    [InlineData(0L, true)]
+    [InlineData(5_000L, true)]
+    [InlineData(9_999L, true)]
+    [InlineData(10_000L, false)]
+    [InlineData(50_000_000L, false)]
+    public void PostgreSqlListenProbe_ABudgetUnderAMillisecond_IsSpent(long remainingTicks, bool spent)
+    {
+        Assert.Equal(spent, PostgreSqlChannelSql.ProbeBudgetSpent(TimeSpan.FromTicks(remainingTicks)));
+
+        var calls = SqlServerTransportStorePruneTests.Decode(SqlServerTransportStorePruneTests.AsyncBody(typeof(PostgreSqlChannelSql), "ProbeListenDeliveryAsync"))
+            .Select(instruction => instruction.Operand)
+            .OfType<MethodBase>()
+            .Select(method => method.Name);
+        Assert.Contains(nameof(PostgreSqlChannelSql.ProbeBudgetSpent), calls);
+    }
+
+    /// <summary>
+    /// The counterpart: a probe that comes back makes the LISTEN established, and its own
+    /// notification is consumed — never handed on as a wake. Other payloads still are.
+    /// </summary>
+    [Fact]
+    public async Task PostgreSqlListen_ADeliveredProbe_EstablishesTheListen_AndIsNotHandedOnAsAWake()
+    {
+        await using var server = new FakePostgresWireServer();
+        server.Respond = (_, statement) => Task.FromResult(FakePostgresWireServer.Reply.CompleteEchoingNotify(statement));
+        await using var dataSource = NpgsqlDataSource.Create(server.ConnectionString());
+        var sql = ListenOnlyStore(dataSource);
+        var established = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var payloads = new System.Collections.Concurrent.ConcurrentQueue<string?>();
+        using var stop = new CancellationTokenSource();
+
+        var listen = sql.ExecuteListenAsync(payload => { payloads.Enqueue(payload); return Task.CompletedTask; }, stop.Token, () => established.TrySetResult());
+        try
+        {
+            await established.Task.WaitAsync(TimeSpan.FromSeconds(30));
+            Assert.Empty(payloads);
+        }
+        finally
+        {
+            await stop.CancelAsync();
+            await Ignoring(() => listen);
+        }
+    }
+
+    /// <summary>
+    /// The liveness check on a quiet listen connection is the same probe: a connection that stops
+    /// delivering (the server here echoes only the first NOTIFY) fails into the reconnect path
+    /// after one liveness interval. Red with the old <c>SELECT 1</c> ping: the listener never
+    /// noticed.
+    /// </summary>
+    [Fact]
+    public async Task PostgreSqlListen_AQuietConnectionThatStopsDelivering_FailsIntoTheReconnectPath()
+    {
+        await using var server = new FakePostgresWireServer();
+        var notifies = 0;
+        server.Respond = (_, statement) => Task.FromResult(
+            statement.StartsWith("NOTIFY", StringComparison.Ordinal) && Interlocked.Increment(ref notifies) > 1
+                ? FakePostgresWireServer.Reply.Complete(statement)
+                : FakePostgresWireServer.Reply.CompleteEchoingNotify(statement));
+        await using var dataSource = NpgsqlDataSource.Create(server.ConnectionString());
+        var sql = ListenOnlyStore(dataSource);
+        sql.ListenLivenessInterval = TimeSpan.FromMilliseconds(100);
+        sql.ListenProbeTimeout = TimeSpan.FromMilliseconds(200);
+        var established = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var stop = new CancellationTokenSource();
+
+        var listen = sql.ExecuteListenAsync(_ => Task.CompletedTask, stop.Token, () => established.TrySetResult());
+        try
+        {
+            await established.Task.WaitAsync(TimeSpan.FromSeconds(30));
+            // The message tells the probe's timeout apart from the hang guard's.
+            var failure = await Assert.ThrowsAsync<TimeoutException>(() => listen.WaitAsync(TimeSpan.FromSeconds(30)));
+            Assert.Contains("delivery-probe notification", failure.Message, StringComparison.Ordinal);
+            Assert.True(Volatile.Read(ref notifies) >= 2);
+        }
+        finally
+        {
+            await stop.CancelAsync();
+        }
+    }
+
+    /// <summary>
+    /// The channel-level consequence: behind a server whose NOTIFYs never come back, the channel
+    /// never treats its push wake as up — it keeps sweeping at the wake-down floor instead of the
+    /// configured throttle. Red on the old code: the LISTEN counted as established (the 10 minute
+    /// throttle applied) and the loop never failed.
+    /// </summary>
+    [Fact]
+    public async Task FullSweepThrottle_PostgreSql_AListenThatDeliversNothing_KeepsTheThrottleLifted()
+    {
+        await using var server = new FakePostgresWireServer();
+        await using var harness = Harness.Create(
+            Provider.PostgreSql, failing: false, pollInterval: TimeSpan.FromSeconds(30), fullSweepInterval: TimeSpan.FromMinutes(10),
+            postgreSqlConnectionString: server.ConnectionString());
+        harness.MarkStoreCreated();
+        harness.PostgreSqlStore.ListenProbeTimeout = TimeSpan.FromMilliseconds(200);
+
+        harness.Invoke("EnsureListenerStarted");
+
+        await harness.Logger.WaitForAsync("PostgreSQL LISTEN loop failed");
+        Assert.Contains(server.Statements, statement => statement.Sql.StartsWith("LISTEN", StringComparison.Ordinal));
+        Assert.Equal(HarnessWakeDownInterval, harness.CurrentFullSweepInterval());
+    }
+
+    /// <summary>A PostgreSQL channel store over <paramref name="dataSource"/> whose schema check is skipped (a fake server cannot answer the catalog).</summary>
+    private static PostgreSqlChannelSql ListenOnlyStore(NpgsqlDataSource dataSource)
+    {
+        var sql = new PostgreSqlChannelSql(dataSource, Options.Create(new PostgreSqlAsyncResponseChannelOptions { AutoCreateSchema = false }));
+        SetField(sql, "_created", true);
+        return sql;
     }
 
     private const string LiveEnvelope =
@@ -2663,11 +3237,26 @@ public sealed class DbChannelSharedCoverageTests
         /// <summary>Skips the store's one-time schema validation, whose catalog queries a fake server cannot answer.</summary>
         public void MarkStoreCreated() => SetField(Field("_store").GetValue(Channel)!, "_created", true);
 
+        /// <summary>PostgreSQL harness only: the channel's store, for its listen-loop timing seams.</summary>
+        public PostgreSqlChannelSql PostgreSqlStore => (PostgreSqlChannelSql)Field("_store").GetValue(Channel)!;
+
+        /// <summary>Whether a requested full sweep the outage breaker cut short is waiting for its retry.</summary>
+        public bool RequestedSweepRetryArmed => (bool)Field("_requestedSweepRetryArmed").GetValue(Channel)!;
+
+        /// <summary>The correlation ids with a backpressure rescan pending.</summary>
+        public System.Collections.IDictionary BackpressureRescans
+            => (System.Collections.IDictionary)Field("_backpressureRescans").GetValue(Channel)!;
+
+        /// <summary>Overwrites one of the shared base's fields (a background loop's task, say).</summary>
+        public void SetChannelField(string name, object? value) => Field(name).SetValue(Channel, value);
+
         /// <summary>
         /// Holds the correlation id's late-commit lookback window open for the next hour, as if
-        /// its cursor had just moved. The window runs on the real monotonic clock (twice the
-        /// lookback after the cursor last advanced), so a test that needs it open must not
-        /// depend on how much real time passes between two sweeps on a loaded runner.
+        /// its cursor had just moved, and lets the next pass revisit the whole window (a pass
+        /// otherwise does at most once per poll interval — the harness's is 30 s). The window
+        /// runs on the real monotonic clock (twice the lookback after the cursor last advanced),
+        /// so a test that needs it open must not depend on how much real time passes between two
+        /// sweeps on a loaded runner.
         /// </summary>
         public void HoldLookbackWindowOpen(string correlationId)
         {
@@ -2675,6 +3264,24 @@ public sealed class DbChannelSharedCoverageTests
             scan.GetType().GetField("ForwardAdvancedAt")!.SetValue(
                 scan,
                 (long?)(System.Diagnostics.Stopwatch.GetTimestamp() + System.Diagnostics.Stopwatch.Frequency * 3600));
+            scan.GetType().GetField("WindowRevisitedAt")!.SetValue(scan, null);
+        }
+
+        /// <summary>The correlation ids with a lookback-window rescan pending.</summary>
+        public System.Collections.IDictionary LookbackRescans
+            => (System.Collections.IDictionary)Field("_lookbackRescans").GetValue(Channel)!;
+
+        /// <summary>
+        /// Stamps the correlation id's last full lookback revisit <paramref name="ago"/> in the
+        /// past (real monotonic clock), so the next pass's revisit throttle is decided by the stamp,
+        /// not by how much real time the runner took between two sweeps.
+        /// </summary>
+        public void StampWindowRevisit(string correlationId, TimeSpan ago)
+        {
+            var scan = Scan(correlationId);
+            scan.GetType().GetField("WindowRevisitedAt")!.SetValue(
+                scan,
+                (long?)(System.Diagnostics.Stopwatch.GetTimestamp() - (long)(ago.TotalSeconds * System.Diagnostics.Stopwatch.Frequency)));
         }
 
         /// <summary>The correlation id's lookback-window stamp: the Stopwatch timestamp the late-commit window runs from.</summary>
@@ -2857,4 +3464,114 @@ public sealed class DbChannelSharedCoverageTests
     private static void SetField(object target, string name, object value)
         => target.GetType().GetField(name, BindingFlags.Instance | BindingFlags.NonPublic)!.SetValue(target, value);
 
+    /// <summary>
+    /// The sweep-duration histogram facts. Serialized against the rest of the suite (fixpoint r2
+    /// S11#16 h): the <see cref="System.Diagnostics.Metrics.MeterListener"/> they read is
+    /// process-wide and filtered only by the channel tag, so the sweeps of MongoDB harnesses in
+    /// parallel classes landed in it too — enough to satisfy a count, or to fail an absence.
+    /// Nested only to reach the shared harness.
+    /// </summary>
+    [Collection(nameof(DbChannelSweepMetricsCollection))]
+    public sealed class SweepMetrics
+    {
+        /// <summary>
+        /// Fixpoint r1 S5#6: nothing measured the sweep, so the cliff past the confirmation budget
+        /// was invisible. Each full sweep now records its duration on the AsyncResponse meter, and a
+        /// sweep longer than half the confirmation budget logs a warning — at most once a minute.
+        /// </summary>
+        [Fact]
+        public async Task FullSweep_RecordsItsDuration_AndWarnsOnceAMinuteWhenItNearsTheConfirmationBudget()
+        {
+            using var listener = SweepDurationListener(out var durations);
+
+            await using var harness = Harness.Create(Provider.MongoDb, false, TimeSpan.FromSeconds(30));
+            harness.ConfigureDeliveryConfirmation(timeout: TimeSpan.FromMilliseconds(40), pollInterval: TimeSpan.FromMilliseconds(1));
+            harness.AddWaiters("corr");
+            harness.MongoMessages!
+                .Setup(collection => collection.FindAsync(
+                    It.IsAny<FilterDefinition<MongoChannelMessageDocument>>(),
+                    It.IsAny<FindOptions<MongoChannelMessageDocument, MongoChannelMessageDocument>>(),
+                    It.IsAny<CancellationToken>()))
+                .Returns(async () =>
+                {
+                    // A slow store round trip, so the sweep outlasts half the 40 ms budget.
+                    await Task.Delay(TimeSpan.FromMilliseconds(60));
+                    return Cursor(new List<MongoChannelMessageDocument>());
+                });
+
+            await harness.InvokeAsync("DispatchPendingMessagesAsync", null, CancellationToken.None);
+            await harness.InvokeAsync("DispatchPendingMessagesAsync", null, CancellationToken.None);
+
+            Assert.Single(harness.Logger.Messages, message => message.Contains("full dispatch sweep over 1 correlation ids took", StringComparison.Ordinal));
+            lock (durations)
+                Assert.True(durations.Count(value => value >= 0.05) >= 2, $"Expected both sweeps' durations recorded; saw [{string.Join(", ", durations)}].");
+        }
+
+        /// <summary>
+        /// Fixpoint r2 S5#12: only a tripped sweep was left out of the histogram and the
+        /// slow-sweep warning, yet any failing sweep measured the failure — a connect or
+        /// server-selection timeout per failed id — not the sweep: fewer than eight waiters never
+        /// trip, and the warning then told an operator in a database outage to reduce the number
+        /// of waiters. A sweep with any failure is no longer recorded. Three waiters here, each
+        /// load failing transiently after more than half the budget. Red on the old code: the
+        /// sweep was recorded and the warning logged.
+        /// </summary>
+        [Fact]
+        public async Task FullSweep_ThatFailsWithoutTripping_IsNeitherRecordedNorReportedAsSlow()
+        {
+            using var listener = SweepDurationListener(out var durations);
+
+            await using var harness = Harness.Create(Provider.MongoDb, false, TimeSpan.FromSeconds(30));
+            harness.ConfigureDeliveryConfirmation(timeout: TimeSpan.FromMilliseconds(40), pollInterval: TimeSpan.FromMilliseconds(1));
+            harness.AddWaiters("corr-0", "corr-1", "corr-2");
+            harness.MongoMessages!
+                .Setup(collection => collection.FindAsync(
+                    It.IsAny<FilterDefinition<MongoChannelMessageDocument>>(),
+                    It.IsAny<FindOptions<MongoChannelMessageDocument, MongoChannelMessageDocument>>(),
+                    It.IsAny<CancellationToken>()))
+                .Returns(async () =>
+                {
+                    await Task.Delay(TimeSpan.FromMilliseconds(60));
+                    throw new TimeoutException("server selection timed out");
+                });
+
+            var failure = await Assert.ThrowsAsync<AggregateException>(() => harness.InvokeAsync("DispatchPendingMessagesAsync", null, CancellationToken.None));
+
+            Assert.Contains("every other id was still dispatched", failure.Message, StringComparison.Ordinal);
+            Assert.DoesNotContain(harness.Logger.Messages, message => message.Contains("full dispatch sweep over", StringComparison.Ordinal));
+            lock (durations)
+                Assert.Empty(durations);
+        }
+
+        /// <summary>Collects the MongoDB channel's <c>asyncresponse.channel.sweep.duration</c> measurements while it lives.</summary>
+        private static System.Diagnostics.Metrics.MeterListener SweepDurationListener(out List<double> durations)
+        {
+            var collected = durations = [];
+            var listener = new System.Diagnostics.Metrics.MeterListener
+            {
+                InstrumentPublished = (instrument, l) =>
+                {
+                    if (instrument.Meter.Name == AsyncResponseDiagnostics.MeterName && instrument.Name == "asyncresponse.channel.sweep.duration")
+                        l.EnableMeasurementEvents(instrument);
+                }
+            };
+            listener.SetMeasurementEventCallback<double>((_, value, tags, _) =>
+            {
+                foreach (var tag in tags)
+                {
+                    if (tag.Key == "asyncresponse.channel" && Equals(tag.Value, "mongodb"))
+                    {
+                        lock (collected)
+                            collected.Add(value);
+                    }
+                }
+            });
+            listener.Start();
+            return listener;
+        }
+    }
 }
+
+/// <summary>Serializes <see cref="DbChannelSharedCoverageTests.SweepMetrics"/> against the rest of the suite.</summary>
+[CollectionDefinition(nameof(DbChannelSweepMetricsCollection), DisableParallelization = true)]
+public sealed class DbChannelSweepMetricsCollection;

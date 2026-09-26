@@ -20,6 +20,34 @@ namespace AsyncResponse.IntegrationTests;
 public sealed class PostgreSqlDirectIntegrationTests(DataBatchFixture fixture) : IntegrationTestBase(fixture)
 {
     [Fact]
+    public async Task ChannelListen_IsEstablishedOnceItsDeliveryProbeComesBack()
+    {
+        // Fixpoint r2 S5#6: a LISTEN counts as established only once a NOTIFY the listen
+        // connection sends itself has come back through it (behind a transaction-mode pooler none
+        // ever does). The unit tests drive that against a fake server; this pins that a real
+        // PostgreSQL delivers a listening session its own notification, so the channel's push wake
+        // (and the full-sweep throttle it earns) is not silently lost everywhere.
+        await WithDataSourceAsync("listen_probe", async (schema, dataSource) =>
+        {
+            var sql = new PostgreSqlChannelSql(dataSource, Options.Create(ChannelOptions(schema)));
+            await sql.EnsureCreatedAsync();
+            var established = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            using var cts = new CancellationTokenSource();
+            var listen = Task.Run(() => sql.ExecuteListenAsync(_ => Task.CompletedTask, cts.Token, () => established.TrySetResult()));
+            try
+            {
+                await Task.WhenAny(established.Task, listen).WaitAsync(TimeSpan.FromSeconds(30));
+                Assert.True(established.Task.IsCompleted, $"the delivery probe did not come back: {listen.Exception?.GetBaseException().Message}");
+            }
+            finally
+            {
+                await cts.CancelAsync();
+                await IgnoreCancellationAsync(listen);
+            }
+        });
+    }
+
+    [Fact]
     public async Task MaximumLengthMessageTableName_CreatesADistinctSequence_AndDrawsFromIt()
     {
         // A 63-character table name used to collide with its own generated sequence name
@@ -1663,6 +1691,376 @@ public sealed class PostgreSqlDirectIntegrationTests(DataBatchFixture fixture) :
                 WHERE table_schema = '{schema}' AND table_name = 'jobs' AND column_name IN ('payload_json', 'headers_json') AND data_type = 'jsonb';
                 """));
         });
+    }
+
+    [Fact]
+    public async Task Channel_AutoCreate_OnAnExistingSchema_LocksNoTable_SoAWriterDoesNotStallIt()
+    {
+        // Regression (fixpoint r2 S5#2): the channel ran ALTER TABLE … ADD COLUMN IF NOT EXISTS and
+        // CREATE INDEX IF NOT EXISTS on every start, and PostgreSQL takes their ACCESS EXCLUSIVE /
+        // SHARE lock BEFORE the IF NOT EXISTS check — so behind a session holding a conflicting lock
+        // (here: an open writer's ROW EXCLUSIVE) a fresh host's EnsureCreated queued until the 30 s
+        // command timeout, with every channel statement of every host queued behind its request. It
+        // now alters and builds only what the catalog shows missing, and on an existing schema that
+        // is nothing, so it takes no table lock at all.
+        await WithDataSourceAsync("chan_busy", async (schema, dataSource) =>
+        {
+            var options = ChannelOptions(schema);
+            await new PostgreSqlChannelSql(dataSource, Options.Create(options)).EnsureCreatedAsync();
+
+            await using var holder = await dataSource.OpenConnectionAsync();
+            await using var transaction = await holder.BeginTransactionAsync();
+            await using (var writer = holder.CreateCommand())
+            {
+                writer.Transaction = transaction;
+                writer.CommandText =
+                    $"""
+                    LOCK TABLE "{schema}"."{options.MessageTable}", "{schema}"."{options.RecoveryStateTable}", "{schema}"."{options.SubscriberTable}"
+                        IN ROW EXCLUSIVE MODE;
+                    """;
+                await writer.ExecuteNonQueryAsync();
+            }
+
+            await new PostgreSqlChannelSql(dataSource, Options.Create(ChannelOptions(schema))).EnsureCreatedAsync().WaitAsync(TimeSpan.FromSeconds(10));
+            await transaction.RollbackAsync();
+        });
+    }
+
+    [Fact]
+    public async Task Channel_AutoCreate_TheJsonbConversionFailsFastOnABusyTable_AndBacksOff()
+    {
+        // Regression (fixpoint r2 S5#2): the channel's jsonb → text rewrite ran with no lock bound
+        // and under the 30 s default command timeout, retried by every operation. Its lock wait is now
+        // bounded by the DDL transaction's lock_timeout (55P03, nothing changed), the retry-after
+        // window latches, and once the table is free the conversion runs as long-running DDL.
+        await WithDataSourceAsync("chan_jsonb", async (schema, dataSource) =>
+        {
+            var options = ChannelOptions(schema);
+            var creator = new PostgreSqlChannelSql(dataSource, Options.Create(options));
+            await creator.EnsureCreatedAsync();
+            await ExecuteAsync(dataSource, $"""ALTER TABLE {creator.MessageTable} ALTER COLUMN envelope_json TYPE jsonb USING envelope_json::jsonb;""");
+
+            var clock = new ManualClock();
+            var store = new PostgreSqlChannelSql(dataSource, Options.Create(ChannelOptions(schema))) { Clock = clock };
+            await using (var holder = await dataSource.OpenConnectionAsync())
+            await using (var transaction = await holder.BeginTransactionAsync())
+            {
+                await using (var read = holder.CreateCommand())
+                {
+                    read.Transaction = transaction;
+                    read.CommandText = $"SELECT count(*) FROM {creator.MessageTable};";
+                    await read.ExecuteScalarAsync();
+                }
+
+                var busy = await Assert.ThrowsAsync<PostgresException>(() => store.EnsureCreatedAsync().WaitAsync(TimeSpan.FromSeconds(20)));
+                Assert.Equal(PostgresErrorCodes.LockNotAvailable, busy.SqlState);
+                var latched = await Assert.ThrowsAsync<InvalidOperationException>(() => store.EnsureCreatedAsync());
+                Assert.Same(busy, latched.InnerException);
+                await transaction.CommitAsync();
+            }
+
+            clock.Advance(TimeSpan.FromMinutes(2));
+            await store.EnsureCreatedAsync();
+            Assert.Equal(0L, await CountAsync(dataSource, $"""
+                SELECT count(*) FROM information_schema.columns
+                WHERE table_schema = '{schema}' AND table_name = '{options.MessageTable}' AND column_name = 'envelope_json' AND data_type = 'jsonb';
+                """));
+        });
+    }
+
+    [Fact]
+    public async Task Channel_AutoCreate_TheSchemaKeyHeldElsewhere_FailsFastAndBacksOff()
+    {
+        // Regression (fixpoint r2 S5#11): the channel waited for the schema's advisory DDL key with no
+        // bound but the 30 s command timeout — the key the transport held through its hour-bounded
+        // rewrite — and the next operation queued for it again. lock_timeout now comes first in the
+        // transaction and bounds the advisory wait too: the attempt fails fast (55P03) and latches.
+        await WithDataSourceAsync("chan_key", async (schema, dataSource) =>
+        {
+            await new PostgreSqlChannelSql(dataSource, Options.Create(ChannelOptions(schema))).EnsureCreatedAsync();
+
+            await using var holder = await dataSource.OpenConnectionAsync();
+            await using var transaction = await holder.BeginTransactionAsync();
+            await using (var key = holder.CreateCommand())
+            {
+                key.Transaction = transaction;
+                key.CommandText = "SELECT pg_advisory_xact_lock(@key);";
+                key.Parameters.AddWithValue("key", PostgreSqlChannelSql.SchemaAdvisoryLockKey(schema));
+                await key.ExecuteNonQueryAsync();
+            }
+
+            var store = new PostgreSqlChannelSql(dataSource, Options.Create(ChannelOptions(schema)));
+            var busy = await Assert.ThrowsAsync<PostgresException>(() => store.EnsureCreatedAsync().WaitAsync(TimeSpan.FromSeconds(20)));
+            Assert.Equal(PostgresErrorCodes.LockNotAvailable, busy.SqlState);
+            Assert.Same(busy, (await Assert.ThrowsAsync<InvalidOperationException>(() => store.EnsureCreatedAsync())).InnerException);
+            await transaction.RollbackAsync();
+        });
+    }
+
+    [Fact]
+    public async Task FlowStore_AutoCreate_OnAnExistingTable_LocksNoTable_SoAWriterDoesNotStallIt()
+    {
+        // Regression (fixpoint r2 S10#2): CREATE INDEX IF NOT EXISTS {table}_expires_idx ran on every
+        // start and took its SHARE lock before finding the name taken — behind any open checkpoint
+        // writer (ROW EXCLUSIVE), until the 30 s command timeout, with every checkpoint, lease acquire
+        // and renewal of every host queued behind it. Only an absent index is built now.
+        await WithDataSourceAsync("flow_busy", async (schema, dataSource) =>
+        {
+            var options = new PostgreSqlDurableFlowOptions { SchemaName = schema, TableName = "flow_state" };
+            await new PostgreSqlFlowStateStore(dataSource, Options.Create(options)).LoadAsync("warm-up");
+
+            await using var holder = await dataSource.OpenConnectionAsync();
+            await using var transaction = await holder.BeginTransactionAsync();
+            await using (var writer = holder.CreateCommand())
+            {
+                writer.Transaction = transaction;
+                writer.CommandText =
+                    $"""
+                    INSERT INTO "{schema}"."flow_state" (flow_id, state_json, expires_at_utc, updated_at_utc, revision)
+                    VALUES ('open-writer', '{"{}"}', now() + interval '1 hour', now(), 1);
+                    """;
+                await writer.ExecuteNonQueryAsync();
+            }
+
+            var fresh = new PostgreSqlFlowStateStore(dataSource, Options.Create(new PostgreSqlDurableFlowOptions { SchemaName = schema, TableName = "flow_state" }));
+            Assert.Null(await fresh.LoadAsync("missing").WaitAsync(TimeSpan.FromSeconds(10)));
+            await transaction.RollbackAsync();
+        });
+    }
+
+    [Fact]
+    public async Task FlowStore_AutoCreate_TheJsonbConversionFailsFastOnABusyTable_AndBacksOff()
+    {
+        // Regression (fixpoint r2 S10#2): the flow store's jsonb → text rewrite ran with no lock bound
+        // and under the 30 s default command timeout, and a failed attempt was retried by every flow
+        // operation. The wait is bounded (55P03, nothing changed), the window latches, and once the
+        // table is free the conversion runs as long-running DDL.
+        await WithDataSourceAsync("flow_jsonb", async (schema, dataSource) =>
+        {
+            await ExecuteAsync(dataSource, $"""
+                CREATE SCHEMA IF NOT EXISTS "{schema}";
+                CREATE TABLE "{schema}"."flow_state" (
+                    flow_id text NOT NULL PRIMARY KEY,
+                    state_json jsonb NOT NULL,
+                    expires_at_utc timestamptz NOT NULL,
+                    updated_at_utc timestamptz NOT NULL,
+                    revision bigint NOT NULL DEFAULT 0,
+                    lease_id text NULL,
+                    lease_expires_at_utc timestamptz NULL
+                );
+                CREATE INDEX "flow_state_expires_idx" ON "{schema}"."flow_state" (expires_at_utc);
+                """);
+            var clock = new ManualClock();
+            var store = new PostgreSqlFlowStateStore(
+                dataSource,
+                Options.Create(new PostgreSqlDurableFlowOptions { SchemaName = schema, TableName = "flow_state" })) { Clock = clock };
+
+            await using (var holder = await dataSource.OpenConnectionAsync())
+            await using (var transaction = await holder.BeginTransactionAsync())
+            {
+                await using (var read = holder.CreateCommand())
+                {
+                    read.Transaction = transaction;
+                    read.CommandText = $"""SELECT count(*) FROM "{schema}"."flow_state";""";
+                    await read.ExecuteScalarAsync();
+                }
+
+                var busy = await Assert.ThrowsAsync<PostgresException>(() => store.LoadAsync("flow").WaitAsync(TimeSpan.FromSeconds(20)));
+                Assert.Equal(PostgresErrorCodes.LockNotAvailable, busy.SqlState);
+                Assert.Same(busy, (await Assert.ThrowsAsync<InvalidOperationException>(() => store.LoadAsync("flow"))).InnerException);
+                await transaction.CommitAsync();
+            }
+
+            clock.Advance(TimeSpan.FromMinutes(2));
+            Assert.Null(await store.LoadAsync("flow"));
+            Assert.Equal(0L, await CountAsync(dataSource, $"""
+                SELECT count(*) FROM information_schema.columns
+                WHERE table_schema = '{schema}' AND table_name = 'flow_state' AND column_name = 'state_json' AND data_type = 'jsonb';
+                """));
+        });
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task FlowStore_AnExpiryIndexNotValidAndReady_WarnsInsteadOfFailing(bool autoCreateSchema)
+    {
+        // Regression (fixpoint r2 S4#6): with AutoCreateSchema = false the expiry index is Optional,
+        // but an Optional index that EXISTS and is not valid and ready — an operator's CREATE INDEX
+        // CONCURRENTLY in progress, or one that failed — threw "invalid or not ready", failing every
+        // flow operation on every host that started meanwhile. It is prune performance, like an absent
+        // index: a warning, on the auto-create path too (which builds only an ABSENT index).
+        await WithDataSourceAsync("flow_invalid", async (schema, dataSource) =>
+        {
+            await new PostgreSqlFlowStateStore(
+                dataSource,
+                Options.Create(new PostgreSqlDurableFlowOptions { SchemaName = schema, TableName = "flow_state" })).LoadAsync("warm-up");
+            await ExecuteAsync(dataSource, $"""UPDATE pg_index SET indisvalid = false WHERE indexrelid = '"{schema}"."flow_state_expires_idx"'::regclass;""");
+
+            var logger = new RecordingLogger<PostgreSqlFlowStateStore>();
+            var store = new PostgreSqlFlowStateStore(
+                dataSource,
+                Options.Create(new PostgreSqlDurableFlowOptions { SchemaName = schema, TableName = "flow_state", AutoCreateSchema = autoCreateSchema }),
+                logger: logger);
+
+            Assert.Null(await store.LoadAsync("missing"));
+            Assert.Contains(logger.Warnings, warning => warning.Contains("not valid and ready", StringComparison.Ordinal));
+        });
+    }
+
+    [Fact]
+    public async Task Transport_AutoCreate_AConversionFailureOtherThanALockTimeout_BacksOffToo()
+    {
+        // Regression (fixpoint r2 S9#2, S11#2): only a lock timeout latched the retry-after window, so
+        // a conversion that failed any other way — here a view over payload_json (0A000); equally a
+        // statement_timeout it outran (57014), or a full disk — re-ran its ACCESS EXCLUSIVE rewrite on
+        // every later publish and claim of every host. Any failure of the long-running step latches now.
+        await WithDataSourceAsync("jsonb_view", async (schema, dataSource) =>
+        {
+            var options = TransportOptions(schema);
+            options.MessageTable = "jobs";
+            await CreatePreTextQueueTableAsync(dataSource, schema, options, Guid.NewGuid());
+            await ExecuteAsync(dataSource, $"""CREATE VIEW "{schema}"."jobs_payloads" AS SELECT payload_json FROM "{schema}"."jobs";""");
+            var store = new PostgreSqlTransportStore(dataSource, Options.Create(options)) { Clock = new ManualClock() };
+
+            var failed = await Assert.ThrowsAsync<PostgresException>(() => store.EnsureCreatedAsync());
+            Assert.Equal(PostgresErrorCodes.FeatureNotSupported, failed.SqlState);
+
+            var latched = await Assert.ThrowsAsync<InvalidOperationException>(() => store.EnsureCreatedAsync());
+            Assert.Same(failed, latched.InnerException);
+            Assert.Contains("failed and was rolled back", latched.Message, StringComparison.Ordinal);
+        });
+    }
+
+    [Fact]
+    public async Task Transport_TheOneTimeTableWork_HoldsTheTableKey_NotTheSchemaKey()
+    {
+        // Regression (fixpoint r2 S9#6): the hour-bounded rewrite ran inside the transaction holding
+        // the schema-wide advisory key the channel and flow store also take, so for the whole rewrite
+        // no host starting meanwhile could initialize either of them. The schema-shared DDL now
+        // commits first and the rewrite runs under a key scoped to the table: while it waits for its
+        // lock here, the schema key is free and the table key is held.
+        await WithDataSourceAsync("table_key", async (schema, dataSource) =>
+        {
+            var options = TransportOptions(schema);
+            options.MessageTable = "jobs";
+            await CreatePreTextQueueTableAsync(dataSource, schema, options, Guid.NewGuid());
+            var store = new PostgreSqlTransportStore(dataSource, Options.Create(options));
+
+            await using var holder = await dataSource.OpenConnectionAsync();
+            await using var transaction = await holder.BeginTransactionAsync();
+            await using (var read = holder.CreateCommand())
+            {
+                read.Transaction = transaction;
+                read.CommandText = $"""SELECT count(*) FROM "{schema}"."jobs";""";
+                await read.ExecuteScalarAsync();
+            }
+
+            var ensure = store.EnsureCreatedAsync();
+            await EventuallyAsync(async () => await CountAsync(dataSource, $"""
+                SELECT count(*) FROM pg_locks WHERE relation = '"{schema}"."jobs"'::regclass AND NOT granted;
+                """) > 0);
+
+            Assert.True(await TryAdvisoryKeyAsync(dataSource, PostgreSqlTransportStore.SchemaAdvisoryLockKey(schema)));
+            Assert.False(await TryAdvisoryKeyAsync(dataSource, PostgreSqlTransportStore.TableAdvisoryLockKey(schema, "jobs")));
+
+            await transaction.CommitAsync();
+            try
+            {
+                await ensure;
+            }
+            catch (PostgresException ex) when (ex.SqlState == PostgresErrorCodes.LockNotAvailable)
+            {
+                // A slow runner outwaited the 5 s lock_timeout; the keys were the assertion.
+            }
+        });
+    }
+
+    [Fact]
+    public async Task Transport_AutoCreate_ACancelledCaller_DoesNotRollBackTheConversion()
+    {
+        // Regression (fixpoint r2 S9#9): the startup DDL ran under the first caller's token, so a
+        // publish whose request token fired partway cancelled the hour-bounded rewrite and rolled it
+        // back, after the table had been locked all that time. The attempt now runs under the store's
+        // lifetime: the cancelled caller leaves, and the rewrite finishes once its lock is free.
+        await WithDataSourceAsync("jsonb_cancel", async (schema, dataSource) =>
+        {
+            var options = TransportOptions(schema);
+            options.MessageTable = "jobs";
+            await CreatePreTextQueueTableAsync(dataSource, schema, options, Guid.NewGuid());
+            var store = new PostgreSqlTransportStore(dataSource, Options.Create(options));
+            using var caller = new CancellationTokenSource();
+
+            await using (var holder = await dataSource.OpenConnectionAsync())
+            await using (var transaction = await holder.BeginTransactionAsync())
+            {
+                await using (var read = holder.CreateCommand())
+                {
+                    read.Transaction = transaction;
+                    read.CommandText = $"""SELECT count(*) FROM "{schema}"."jobs";""";
+                    await read.ExecuteScalarAsync();
+                }
+
+                var publish = store.PublishAsync(Guid.NewGuid(), options.WorkerQueue, "{}", null, caller.Token);
+                await EventuallyAsync(async () => await CountAsync(dataSource, $"""
+                    SELECT count(*) FROM pg_locks WHERE relation = '"{schema}"."jobs"'::regclass AND NOT granted;
+                    """) > 0);
+                await caller.CancelAsync();
+                await Assert.ThrowsAnyAsync<OperationCanceledException>(() => publish);
+                await transaction.CommitAsync();
+            }
+
+            await EventuallyAsync(async () => await CountAsync(dataSource, $"""
+                SELECT count(*) FROM information_schema.columns
+                WHERE table_schema = '{schema}' AND table_name = 'jobs' AND column_name IN ('payload_json', 'headers_json') AND data_type = 'jsonb';
+                """) == 0);
+        });
+    }
+
+    [Fact]
+    public async Task Transport_ADelayedPublish_SendsNoNotify()
+    {
+        // Regression (fixpoint r2 GS3#4): a delayed publish NOTIFYed the queue for a row nobody can
+        // claim until its delay has passed, waking every idle subscriber of the queue in every process
+        // into a claim that found nothing. One session's notifications arrive in commit order, so the
+        // first one received after a delayed publish to one queue and an immediate publish to another
+        // is the immediate one's — had the delayed publish notified, its queue would arrive first.
+        await WithDataSourceAsync("delay_notify", async (schema, dataSource) =>
+        {
+            var options = TransportOptions(schema);
+            var store = new PostgreSqlTransportStore(dataSource, Options.Create(options));
+            await store.EnsureCreatedAsync();
+
+            await using var listener = await dataSource.OpenConnectionAsync();
+            var received = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
+            listener.Notification += (_, e) => received.TrySetResult(e.Payload);
+            await using (var listen = listener.CreateCommand())
+            {
+                listen.CommandText = $"""LISTEN "{options.NotificationChannel}";""";
+                await listen.ExecuteNonQueryAsync();
+            }
+
+            await store.PublishAsync(Guid.NewGuid(), options.WorkerQueue, "{}", null, CancellationToken.None, delay: TimeSpan.FromMinutes(5));
+            await store.PublishAsync(Guid.NewGuid(), options.ResponseQueue, "{}", null, CancellationToken.None);
+
+            using var wait = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+            while (!received.Task.IsCompleted)
+                await listener.WaitAsync(wait.Token);
+            Assert.Equal(options.ResponseQueue, await received.Task);
+        });
+    }
+
+    private static async Task<bool> TryAdvisoryKeyAsync(NpgsqlDataSource dataSource, long key)
+    {
+        await using var connection = await dataSource.OpenConnectionAsync();
+        await using var transaction = await connection.BeginTransactionAsync();
+        await using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = "SELECT pg_try_advisory_xact_lock(@key);";
+        command.Parameters.AddWithValue("key", key);
+        var taken = (bool)(await command.ExecuteScalarAsync())!;
+        await transaction.RollbackAsync();
+        return taken;
     }
 
     [Fact]

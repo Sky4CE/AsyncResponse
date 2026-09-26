@@ -9,16 +9,24 @@ internal abstract class AzureServiceBusSubscriberService : BackgroundService
 {
     private readonly IAzureServiceBusClient _client;
 
+    /// <summary>The worker role's host-stop intake gate; <c>null</c> for the response role, which is never gated.</summary>
+    private readonly WorkerIntakeGate? _intakeGate;
+
     protected AzureServiceBusSubscriberService(
         IOptions<AzureServiceBusAsyncResponseOptions> options,
         IAzureServiceBusClient client,
-        ILogger logger)
+        ILogger logger,
+        WorkerIntakeGate? intakeGate = null)
     {
         Options = options.Value;
         AzureServiceBusOptionsValidator.ValidateCommon(Options);
         _client = client;
         Logger = logger;
+        _intakeGate = intakeGate;
     }
+
+    /// <summary>Host stop has begun and this is the worker subscriber: take no new delivery.</summary>
+    private bool IntakeClosed => _intakeGate?.IsClosed == true;
 
     protected AzureServiceBusAsyncResponseOptions Options { get; }
     protected ILogger Logger { get; }
@@ -52,6 +60,19 @@ internal abstract class AzureServiceBusSubscriberService : BackgroundService
             // their late Complete here, and burn DeliveryCount toward MaxDeliveryAttempts.
             Logger.LogWarning(
                 "Azure Service Bus {Role} subscriber for {Queue} prefetches {PrefetchCount} message(s) in AckAfterHandlerCompletes mode: buffered messages are locked but never renewed while they wait behind the running handler, so a slow handler lets their locks expire and they run twice. Keep PrefetchCount × handler latency well under the queue's LockDuration, or set PrefetchCount = 0.",
+                SubscriberRole,
+                QueueName,
+                SubscriberOptions.PrefetchCount);
+        }
+        else if (SubscriberOptions is { AckMode: AzureServiceBusAckMode.AckAfterEnqueue, PrefetchCount: > 0 })
+        {
+            // Early ACK completes a message only once the background queue accepts it, and while
+            // that queue is saturated the receive loop parks — but the client buffer keeps up to
+            // PrefetchCount messages locked, never renewed, all that time. Saturated for longer
+            // than the queue's LockDuration, the buffered locks lapse: those messages run on a
+            // peer, then again here once handed out, and burn DeliveryCount.
+            Logger.LogWarning(
+                "Azure Service Bus {Role} subscriber for {Queue} prefetches {PrefetchCount} message(s) in AckAfterEnqueue mode: buffered messages are locked but never renewed while the receive loop waits for background capacity, so a background queue saturated for longer than the queue's LockDuration lets their locks expire and they run twice. Set PrefetchCount = 0, or keep it well under what the background workers drain within one LockDuration.",
                 SubscriberRole,
                 QueueName,
                 SubscriberOptions.PrefetchCount);
@@ -90,7 +111,7 @@ internal abstract class AzureServiceBusSubscriberService : BackgroundService
                 queue,
                 SubscriberRole,
                 retryDelay),
-            healthyRunThreshold: Options.SubscriberRetryMaxDelay).ConfigureAwait(false);
+            healthyRunThreshold: AsyncResponseRetry.MaxAttainableDelay(Options.SubscriberRetryBaseDelay, Options.SubscriberRetryMaxDelay)).ConfigureAwait(false);
     }
 
     private async Task RunSubscriberAsync(string queue, AzureServiceBusMessageDispatcher dispatcher, CancellationToken stoppingToken)
@@ -110,9 +131,13 @@ internal abstract class AzureServiceBusSubscriberService : BackgroundService
         // batch-mates' MaxDeliveryAttempts budget, and a long handler kept up to
         // MaxMessagesPerReceive - 1 jobs locked under the heartbeat while idle peers could have run
         // them. One message per receive leaves the rest on the entity, where any peer can take it
-        // (NATS parity). Early ACK settles each message as it is accepted, and the response
-        // ingress runs the library's own short handler, so both keep the batch — one receive
-        // round trip per response would cut response throughput for no such risk.
+        // (NATS parity). Early ACK settles each message as it is accepted, so it keeps the batch.
+        // The response subscriber keeps it too — one receive round trip per response would cut
+        // response throughput — although its handler is not always short: a response whose
+        // waiter is gone runs that correlation's recovery callbacks inline, retries included, so
+        // with LockRenewalInterval = null slow callbacks can let batch-mates' locks lapse (a peer
+        // then runs their callbacks too, each lapse counted). Callbacks are at-least-once by
+        // contract; the default lock renewal covers the whole batch.
         var receiveSize = SubscriberOptions.AckMode is AzureServiceBusAckMode.AckAfterHandlerCompletes
             && SubscriberRole is AzureServiceBusSubscriberRole.Worker
                 ? 1
@@ -126,6 +151,20 @@ internal abstract class AzureServiceBusSubscriberService : BackgroundService
                 // DeliveryCount via queue-full abandons, so wait for free capacity and never request
                 // more messages than the dispatcher can accept.
                 await dispatcher.WaitForCapacityAsync(stoppingToken).ConfigureAwait(false);
+
+                // Host stop has begun (ApplicationStopping), and the worker subscriber — registered
+                // first, so stopped last — would keep receiving until its own stop: every flow
+                // wake-up the engine's hand-overs had just published for a live replica, taken
+                // here, reached its first timer on this stopping host and was handed back again —
+                // under early ACK already completed, so lost. Checked before every receive (and
+                // before every dispatch, in DispatchBatchAsync); the hand-back latch below stays as
+                // the fallback for a host that registers no lifetime.
+                if (IntakeClosed)
+                {
+                    await StopReceivingUntilStoppedAsync(queue, "the host is stopping", stoppingToken).ConfigureAwait(false);
+                    return;
+                }
+
                 var maxMessages = Math.Min(receiveSize, dispatcher.FreeCapacity);
 
                 var messages = await receiver.ReceiveMessagesAsync(
@@ -141,11 +180,11 @@ internal abstract class AzureServiceBusSubscriberService : BackgroundService
                     // them the wake-ups the engine hands over for a replica still running to take
                     // at once. So stop receiving for the rest of the attempt (Redis/NATS rule) and
                     // wait for the stop.
-                    Logger.LogInformation(
-                        "Azure Service Bus {Role} subscriber for {Queue} stops receiving: the flow engine handed a delivery back because the host is stopping.",
-                        SubscriberRole,
-                        queue);
-                    await Task.Delay(Timeout.InfiniteTimeSpan, stoppingToken).ConfigureAwait(false);
+                    await StopReceivingUntilStoppedAsync(
+                        queue,
+                        "the flow engine handed a delivery back because the host is stopping",
+                        stoppingToken).ConfigureAwait(false);
+                    return;
                 }
             }
         }
@@ -159,6 +198,19 @@ internal abstract class AzureServiceBusSubscriberService : BackgroundService
             if (stoppingToken.IsCancellationRequested)
                 await CloseReceiverAsync(receiver, queue, stopBudget.Remaining()).ConfigureAwait(false);
         }
+    }
+
+    /// <summary>Parks the receive loop until this subscriber's own stop: nothing more is received.</summary>
+    private async Task StopReceivingUntilStoppedAsync(string queue, string reason, CancellationToken stoppingToken)
+    {
+        SafeLog.Try(
+            (Logger, SubscriberRole, queue, reason),
+            static state => state.Logger.LogInformation(
+                "Azure Service Bus {Role} subscriber for {Queue} stops receiving: {Reason}.",
+                state.SubscriberRole,
+                state.queue,
+                state.reason));
+        await Task.Delay(Timeout.InfiniteTimeSpan, stoppingToken).ConfigureAwait(false);
     }
 
     private async Task CloseReceiverAsync(IAzureServiceBusReceiver receiver, string queue, TimeSpan budget)
@@ -175,12 +227,14 @@ internal abstract class AzureServiceBusSubscriberService : BackgroundService
         catch (Exception ex)
         {
             // The source stays undisposed: an abandoned close may still hold its token.
-            Logger.LogWarning(
-                ex,
-                "Azure Service Bus receiver for {Queue} ({Role}) did not close cleanly within the shutdown budget ({ShutdownTimeout}); abandoning it.",
-                queue,
-                SubscriberRole,
-                budget);
+            SafeLog.Try(
+                (Logger, ex, queue, SubscriberRole, budget),
+                static state => state.Logger.LogWarning(
+                    state.ex,
+                    "Azure Service Bus receiver for {Queue} ({Role}) did not close cleanly within the shutdown budget ({ShutdownTimeout}); abandoning it.",
+                    state.queue,
+                    state.SubscriberRole,
+                    state.budget));
         }
     }
 
@@ -211,8 +265,10 @@ internal abstract class AzureServiceBusSubscriberService : BackgroundService
                     // The handler takes no token, so a stop cannot interrupt the message in hand —
                     // but it must not START the rest of the batch: every fresh handler runs against
                     // the host's shutdown budget, and in early-ACK mode every further enqueue
-                    // completes work the drain budget may then have to refuse.
-                    if (stoppingToken.IsCancellationRequested)
+                    // completes work the drain budget may then have to refuse. From
+                    // ApplicationStopping on the worker takes nothing new either: a message not yet
+                    // dispatched is abandoned below — under early ACK never completed first.
+                    if (stoppingToken.IsCancellationRequested || IntakeClosed)
                         break;
 
                     try
@@ -260,13 +316,39 @@ internal abstract class AzureServiceBusSubscriberService : BackgroundService
         {
             for (; next < messages.Count; next++)
             {
-                // Same stop rule as the renewal-free path above.
-                if (stoppingToken.IsCancellationRequested)
+                // Same stop and intake rule as the renewal-free path above.
+                if (stoppingToken.IsCancellationRequested || IntakeClosed)
                     break;
 
+                var delivery = messages[next];
+                var batchIndex = next;
+                // Settlement runs inside HandleAsync, but MarkSettled only after it returns, so a
+                // renewal beat racing the handler's Complete/Abandon/DeadLetter found the message
+                // still unsettled, renewed a lock the settle had just released and logged it as
+                // lost mid-processing — a false alarm on every such race. The settlement delegates
+                // mark the message first; the sweep re-checks the mark before each renew and
+                // treats a failure behind it as the race it is (SQS tracked-delivery parity).
+                var tracked = delivery with
+                {
+                    CompleteAsync = () =>
+                    {
+                        progress.SuppressRenewal(batchIndex);
+                        return delivery.CompleteAsync();
+                    },
+                    AbandonAsync = () =>
+                    {
+                        progress.SuppressRenewal(batchIndex);
+                        return delivery.AbandonAsync();
+                    },
+                    DeadLetterAsync = (reason, description) =>
+                    {
+                        progress.SuppressRenewal(batchIndex);
+                        return delivery.DeadLetterAsync(reason, description);
+                    }
+                };
                 try
                 {
-                    handedBack = await dispatcher.HandleAsync(messages[next], stoppingToken).ConfigureAwait(false)
+                    handedBack = await dispatcher.HandleAsync(tracked, stoppingToken).ConfigureAwait(false)
                         is AzureServiceBusDispatchOutcome.HandedBack;
                 }
                 finally
@@ -282,8 +364,8 @@ internal abstract class AzureServiceBusSubscriberService : BackgroundService
         {
             renewalCancellation.Cancel();
 
-            // Hand back whatever never started — a stop, a flow hand-back, or a handler that exited
-            // through the stop's cancellation, cut the batch short (NATS rule: a message whose
+            // Hand back whatever never started — a stop, the intake gate, a flow hand-back, or a
+            // handler that exited through the stop's cancellation, cut the batch short (NATS rule: a message whose
             // handler ran is past `next`). Started before the join below and bounded by its own
             // ShutdownTimeout, so the two overlap: the stop path spends one ShutdownTimeout here,
             // not two, and the validator's renewal-join + receiver-close sum stays true.
@@ -298,11 +380,13 @@ internal abstract class AzureServiceBusSubscriberService : BackgroundService
             }
             catch (TimeoutException)
             {
-                Logger.LogWarning(
-                    "Azure Service Bus lock renewal for {Queue} ({Role}) did not stop within the shutdown budget ({ShutdownTimeout}); abandoning the renewal task.",
-                    queue,
-                    SubscriberRole,
-                    Options.ShutdownTimeout);
+                SafeLog.Try(
+                    (Logger, queue, SubscriberRole, Options.ShutdownTimeout),
+                    static state => state.Logger.LogWarning(
+                        "Azure Service Bus lock renewal for {Queue} ({Role}) did not stop within the shutdown budget ({ShutdownTimeout}); abandoning the renewal task.",
+                        state.queue,
+                        state.SubscriberRole,
+                        state.ShutdownTimeout));
             }
 
             await handBack.ConfigureAwait(false);
@@ -340,11 +424,13 @@ internal abstract class AzureServiceBusSubscriberService : BackgroundService
         }
         catch (TimeoutException)
         {
-            Logger.LogWarning(
-                "Handing unstarted Azure Service Bus messages back to {Queue} ({Role}) did not finish within the shutdown budget ({ShutdownTimeout}); they redeliver when their locks lapse.",
-                queue,
-                SubscriberRole,
-                budget);
+            SafeLog.Try(
+                (Logger, queue, SubscriberRole, budget),
+                static state => state.Logger.LogWarning(
+                    "Handing unstarted Azure Service Bus messages back to {Queue} ({Role}) did not finish within the shutdown budget ({ShutdownTimeout}); they redeliver when their locks lapse.",
+                    state.queue,
+                    state.SubscriberRole,
+                    state.budget));
         }
 
         async Task ReleaseAsync(AzureServiceBusTransportDelivery delivery)
@@ -355,11 +441,13 @@ internal abstract class AzureServiceBusSubscriberService : BackgroundService
             }
             catch (Exception ex)
             {
-                Logger.LogWarning(
-                    ex,
-                    "Failed to hand unstarted Azure Service Bus message {MessageId} back to {Queue}; it redelivers when its lock lapses.",
-                    delivery.MessageId,
-                    queue);
+                SafeLog.Try(
+                    (Logger, ex, delivery.MessageId, queue),
+                    static state => state.Logger.LogWarning(
+                        state.ex,
+                        "Failed to hand unstarted Azure Service Bus message {MessageId} back to {Queue}; it redelivers when its lock lapses.",
+                        state.MessageId,
+                        state.queue));
             }
         }
     }
@@ -378,8 +466,10 @@ internal abstract class AzureServiceBusSubscriberService : BackgroundService
                 await Task.Delay(renewalInterval, cancellationToken).ConfigureAwait(false);
 
                 // Renew from the first unsettled message onward: that covers the message currently in
-                // the handler plus everything still waiting its turn. A renewal racing a just-settled
-                // message merely fails and is logged; redelivery keeps at-least-once intact.
+                // the handler plus everything still waiting its turn. A message whose handler has
+                // begun settling it is skipped (re-read per message: the handler loop moves on while
+                // the sweep renews one RPC at a time); a renewal that still races the settle RPC
+                // merely fails, and is logged only at Debug — nothing is lost.
                 for (var i = progress.SettledCount; i < messages.Count; i++)
                 {
                     // The batch finished or the subscriber is stopping: exit quietly between messages
@@ -387,7 +477,7 @@ internal abstract class AzureServiceBusSubscriberService : BackgroundService
                     if (cancellationToken.IsCancellationRequested)
                         return;
 
-                    if (progress.IsRenewalSuppressed(i))
+                    if (i < progress.SettledCount || progress.IsRenewalSuppressed(i))
                         continue;
 
                     var message = messages[i];
@@ -400,6 +490,19 @@ internal abstract class AzureServiceBusSubscriberService : BackgroundService
                         // Our token interrupted the in-flight renew; not a renewal failure.
                         return;
                     }
+                    catch (Exception ex) when (IsSettling(progress, i, cancellationToken))
+                    {
+                        // The renew raced the handler's own settlement (or the batch's end), which
+                        // released the lock first: nothing is being processed under it any more.
+                        progress.SuppressRenewal(i);
+                        SafeLog.Try(
+                            (Logger, ex, message.MessageId, queue),
+                            static state => state.Logger.LogDebug(
+                                state.ex,
+                                "Renewing the lock of Azure Service Bus message {MessageId} on {Queue} failed after its settlement had begun; nothing is left to renew.",
+                                state.MessageId,
+                                state.queue));
+                    }
                     catch (ServiceBusException ex) when (ex.Reason is ServiceBusFailureReason.MessageLockLost)
                     {
                         // Definitive, not transient: a lost lock token can never be renewed again,
@@ -408,19 +511,23 @@ internal abstract class AzureServiceBusSubscriberService : BackgroundService
                         // parity) instead of spending a failing RPC ahead of the healthy messages,
                         // plus a warning, on every remaining beat.
                         progress.SuppressRenewal(i);
-                        Logger.LogWarning(
-                            ex,
-                            "The lock of Azure Service Bus message {MessageId} on {Queue} is lost and can no longer be renewed; Service Bus redelivers it while it is still being processed (at-least-once preserved). Renewal stops for this message.",
-                            message.MessageId,
-                            queue);
+                        SafeLog.Try(
+                            (Logger, ex, message.MessageId, queue),
+                            static state => state.Logger.LogWarning(
+                                state.ex,
+                                "The lock of Azure Service Bus message {MessageId} on {Queue} is lost and can no longer be renewed; Service Bus redelivers it while it is still being processed (at-least-once preserved). Renewal stops for this message.",
+                                state.MessageId,
+                                state.queue));
                     }
                     catch (Exception ex)
                     {
-                        Logger.LogWarning(
-                            ex,
-                            "Failed to renew the lock of Azure Service Bus message {MessageId} on {Queue}; it may redeliver while still being processed (at-least-once preserved).",
-                            message.MessageId,
-                            queue);
+                        SafeLog.Try(
+                            (Logger, ex, message.MessageId, queue),
+                            static state => state.Logger.LogWarning(
+                                state.ex,
+                                "Failed to renew the lock of Azure Service Bus message {MessageId} on {Queue}; it may redeliver while still being processed (at-least-once preserved).",
+                                state.MessageId,
+                                state.queue));
                     }
                 }
             }
@@ -430,6 +537,14 @@ internal abstract class AzureServiceBusSubscriberService : BackgroundService
             // The batch finished or the subscriber is stopping.
         }
     }
+
+    /// <summary>
+    /// Whether a failed renew of the message at <paramref name="index"/> merely raced its end: the
+    /// handler has begun settling it (or already has), or the batch is over. Read at failure time —
+    /// the sweep's own lock-lost mark is set only after this check.
+    /// </summary>
+    private static bool IsSettling(BatchProgress progress, int index, CancellationToken cancellationToken)
+        => index < progress.SettledCount || progress.IsRenewalSuppressed(index) || cancellationToken.IsCancellationRequested;
 
     /// <summary>
     /// One <see cref="AzureServiceBusAsyncResponseOptions.ShutdownTimeout"/> shared by the stop
@@ -459,7 +574,10 @@ internal abstract class AzureServiceBusSubscriberService : BackgroundService
 
         public void MarkSettled() => Interlocked.Increment(ref _settledCount);
 
-        /// <summary>Marks the message at <paramref name="index"/> as beyond renewal; the sweep leaves it alone.</summary>
+        /// <summary>
+        /// Marks the message at <paramref name="index"/> as beyond renewal — its lock lost, or its
+        /// handler settling it; the sweep leaves it alone.
+        /// </summary>
         public void SuppressRenewal(int index) => Volatile.Write(ref _renewalSuppressed[index], true);
 
         public bool IsRenewalSuppressed(int index) => Volatile.Read(ref _renewalSuppressed[index]);
@@ -475,10 +593,34 @@ internal sealed class AzureServiceBusWorkerSubscriber : AzureServiceBusSubscribe
         IOptions<AzureServiceBusAsyncResponseOptions> options,
         IAzureServiceBusClient client,
         IAsyncResponseIngress ingress,
-        ILogger<AzureServiceBusWorkerSubscriber> logger)
-        : base(options, client, logger)
+        ILogger<AzureServiceBusWorkerSubscriber> logger,
+        IHostApplicationLifetime? hostLifetime = null)
+        : base(options, client, logger, new WorkerIntakeGate(hostLifetime))
     {
         _ingress = ingress;
+    }
+
+    /// <summary>
+    /// Validates like every subscriber, then warns when the in-flight ceiling the worker transport
+    /// advertises to the durable-flow engine is only an upper bound (SQS parity; interim guidance,
+    /// see docs/transport-semantics.md). Unconditionally: every host registers a durable-flow store,
+    /// so durable-flow jobs can ride this queue in any app.
+    /// </summary>
+    public override Task StartAsync(CancellationToken cancellationToken)
+    {
+        var start = base.StartAsync(cancellationToken);
+        if (SubscriberOptions is { AckMode: AzureServiceBusAckMode.AckAfterHandlerCompletes, LockRenewalInterval: null })
+        {
+            // The transport cannot read the entity's LockDuration, so it advertises the 5-minute
+            // Service Bus maximum as the in-flight ceiling the engine plans in-process waits
+            // against — while Service Bus redelivers once the real lock lapses (60 s by default).
+            Logger.LogWarning(
+                "Durable-flow jobs ride the Azure Service Bus worker queue {Queue}, and its subscriber disables lock renewal ({RenewalInterval} = null): the queue's own LockDuration (60 seconds unless configured otherwise) decides when Service Bus redelivers an in-flight job — a value the transport cannot read, so it advertises the 5-minute Service Bus maximum to the durable-flow engine instead. An awaited step or long step that outlives the real LockDuration then runs a second copy of the job on a peer, without a warning. Keep lock renewal on (the default), or keep every flow step well under the queue's LockDuration.",
+                QueueName,
+                $"{nameof(AzureServiceBusAsyncResponseOptions.WorkerSubscriber)}.{nameof(AzureServiceBusSubscriberOptions.LockRenewalInterval)}");
+        }
+
+        return start;
     }
 
     protected override string QueueName

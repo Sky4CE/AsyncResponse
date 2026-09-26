@@ -2,6 +2,7 @@ using System.Diagnostics;
 using System.Reflection;
 using AsyncResponse.Testing;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Hosting;
 using Xunit;
 
 namespace AsyncResponse.Tests;
@@ -427,8 +428,11 @@ public sealed class TestingHarnessParkedRestartTests
     public sealed class BackoffWorkState
     {
         private int _queuedRuns;
+        private int _failRuns;
 
         public int QueuedRuns => Volatile.Read(ref _queuedRuns);
+        public int FailRuns => Volatile.Read(ref _failRuns);
+        public void RecordFailRun() => Interlocked.Increment(ref _failRuns);
         public TaskCompletionSource<IncarnationMarker> QueuedRanOn { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
         public TaskCompletionSource ReleaseQueued { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
@@ -441,7 +445,11 @@ public sealed class TestingHarnessParkedRestartTests
 
     public sealed class BackoffWork(BackoffWorkState _state, IncarnationMarker _incarnation) : IBackoffWork
     {
-        public Task FailAsync() => throw new InvalidOperationException("the job fails and sleeps its ordinary retry backoff");
+        public Task FailAsync()
+        {
+            _state.RecordFailRun();
+            throw new InvalidOperationException("the job fails and sleeps its ordinary retry backoff");
+        }
 
         public async Task QueuedAsync()
         {
@@ -450,8 +458,10 @@ public sealed class TestingHarnessParkedRestartTests
         }
     }
 
-    [Fact]
-    public async Task SimulateRestart_WithAJobAsleepInItsOrdinaryRetryBackoff_StillDrainsTheJobQueuedBehindIt()
+    [Theory]
+    [InlineData(5)] // the default: bounded attempts
+    [InlineData(0)] // unlimited
+    public async Task SimulateRestart_WithAJobAsleepInItsOrdinaryRetryBackoff_StillDrainsTheJobQueuedBehindIt(int maxDeliveryAttempts)
     {
         // Regression (fixpoint r1 pre-commit review): the stop watcher counted EVERY retry backoff
         // as a wait on the virtual clock. An ordinary backoff — taken before the stop — is bound
@@ -461,10 +471,19 @@ public sealed class TestingHarnessParkedRestartTests
         // had stopped: the queued job then ran beside the restart (which refused with "could not
         // establish quiescence" after no time at all), or never ran in the old incarnation. The
         // stop now ends the backoff, drops the failing job, and drains the queue.
+        //
+        // Pre-commit review (fixpoint r2, C1): with bounded attempts a production host stop now
+        // retries the interrupted job during the drain instead (S4#2). A simulated restart keeps
+        // crash semantics: the crashed attempt dies with the old incarnation — not re-run there,
+        // with the flow's next steps inside the restart — whatever the attempt budget.
         var state = new BackoffWorkState();
         var harness = await AsyncResponseTestHarness.StartAsync(options =>
         {
-            options.Transport = transport => transport.WorkerCount = 1;
+            options.Transport = transport =>
+            {
+                transport.WorkerCount = 1;
+                transport.MaxDeliveryAttempts = maxDeliveryAttempts;
+            };
             options.ConfigureServices = services => services
                 .AddSingleton(state)
                 .AddSingleton<IncarnationMarker>()
@@ -487,6 +506,7 @@ public sealed class TestingHarnessParkedRestartTests
 
         Assert.Same(oldIncarnation, ranOn);
         Assert.Equal(1, state.QueuedRuns);
+        Assert.Equal(1, state.FailRuns); // the crashed attempt was not retried inside the restart
     }
 
     public interface IDrainFailingWork
@@ -498,16 +518,20 @@ public sealed class TestingHarnessParkedRestartTests
     public sealed class DrainFailingWork : IDrainFailingWork
     {
         public InMemoryWorkerTransport? Transport { get; set; }
+        public FieldInfo? Draining { get; set; }
         public TaskCompletionSource Started { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        /// <summary>Whether the job's failure really happened during the drain — what the test is about.</summary>
+        public bool ThrewWhileDraining { get; private set; }
 
         public async Task RunAsync()
         {
             Started.TrySetResult();
-            var draining = typeof(InMemoryWorkerTransport).GetField("_draining", BindingFlags.Instance | BindingFlags.NonPublic)!;
             var guard = TimeProvider.System.GetUtcNow() + TimeSpan.FromSeconds(10);
-            while (!(bool)draining.GetValue(Transport)! && TimeProvider.System.GetUtcNow() < guard)
+            while (!(bool)Draining!.GetValue(Transport)! && TimeProvider.System.GetUtcNow() < guard)
                 await Task.Delay(TimeSpan.FromMilliseconds(1));
 
+            ThrewWhileDraining = (bool)Draining.GetValue(Transport)!;
             throw new InvalidOperationException("the job fails during the shutdown drain");
         }
     }
@@ -520,7 +544,11 @@ public sealed class TestingHarnessParkedRestartTests
         // restart. Counted as running user code (and with nothing parked, the stop never ended
         // early), it cost the whole real-time guard and then a false "still running user code"
         // refusal. The backoff is a wait on the clock, like a park.
-        var work = new DrainFailingWork();
+        // Resolved here, not inside the job: a renamed field threw NullReferenceException there,
+        // before the drain began, and the job's ordinary backoff still passed the timing check.
+        var draining = typeof(InMemoryWorkerTransport).GetField("_draining", BindingFlags.Instance | BindingFlags.NonPublic);
+        Assert.NotNull(draining);
+        var work = new DrainFailingWork { Draining = draining };
         var harness = await AsyncResponseTestHarness.StartAsync(options =>
             options.ConfigureServices = services => services.AddSingleton<IDrainFailingWork>(work));
         await using var _ = harness;
@@ -536,6 +564,272 @@ public sealed class TestingHarnessParkedRestartTests
         Assert.True(
             restart.Elapsed < _bound,
             $"restarting with a crashed job asleep in its drain backoff took {restart.Elapsed} of real time; the backoff is a wait on the virtual clock, not user code.");
+        Assert.True(work.ThrewWhileDraining, "the job failed before the drain began, so its backoff was not the drain's");
+    }
+
+    [Fact]
+    public async Task SimulateRestart_WithADeliveryPollingForAParkedFlowsLease_NeitherWaitsOutTheGuardNorRefuses()
+    {
+        // S4#4 (fixpoint r2): with two workers, a duplicate wake-up of a flow parked on an awaited
+        // step polls for the parked execution's lease on the virtual clock — which cannot move
+        // while the test awaits the restart. Counted as running user code, it burned the whole
+        // real-time guard and then refused with "could not establish quiescence"; in production
+        // host stop ends that poll with the engine's hand-back.
+        var harness = await FlowTestHarness.StartAsync(options =>
+        {
+            options.Transport = transport => transport.WorkerCount = 2;
+            options.ConfigureAsyncResponse = builder => builder.WithDurableFlow<ParkedOnReplyFlow, ParkedRestartInput>();
+        });
+        await using var _ = harness;
+
+        var run = await harness.StartFlowAsync<ParkedOnReplyFlow, ParkedRestartInput>(new ParkedRestartInput("contended"));
+        await run.WaitForAwaitingStepAsync("remote");
+
+        // A duplicate wake-up: the free worker takes it into the lease-contention poll.
+        await run.ResumeAsync();
+        var executor = Assert.IsType<DurableFlowExecutor>(harness.Engine.Services.GetRequiredService<IDurableFlowExecutor>());
+        await WaitUntilAsync(() => executor.LeaseContentionWaits == 1, "the duplicate delivery never reached the lease-contention poll");
+
+        var restart = Stopwatch.StartNew();
+        await harness.Engine.SimulateRestartAsync();
+        restart.Stop();
+
+        Assert.True(
+            restart.Elapsed < _bound,
+            $"restarting with a delivery polling for a lease took {restart.Elapsed} of real time; the poll is a wait on the virtual clock, not user code.");
+
+        // Taken over as after any restart.
+        await run.ResumeAsync();
+        await run.WaitForAwaitingStepAsync("remote");
+        await run.ReplyAsync(new OperationResult { Status = OperationStatus.Completed });
+        Assert.Equal(FlowRunStatus.Succeeded, await run.WaitForFinishedAsync());
+    }
+
+    [Fact]
+    public async Task SimulateRestart_CarriesAScheduledJobOver_UnderItsPublishersExecutionContext()
+    {
+        // S4#5 (fixpoint r2): the drain retained bare envelopes, so the restart re-scheduled each
+        // delayed job under the ambient context of the test that called SimulateRestartAsync — a
+        // job relying on its publisher's AsyncLocal state (a tenant, a principal) saw the test's
+        // instead, unlike an unstarted immediate job, which keeps its enqueuer's.
+        var recorder = new AmbientRecorder();
+        var harness = await AsyncResponseTestHarness.StartAsync(options =>
+            options.ConfigureServices = services => services
+                .AddSingleton(recorder)
+                .AddSingleton<IAmbientWork, AmbientWork>());
+        await using var _ = harness;
+
+        AmbientRecorder.Ambient.Value = "publisher";
+        await harness.Builder.EnqueueWorkerAsync<IAmbientWork>(work => work.RecordAsync(), TimeSpan.FromMinutes(5));
+        AmbientRecorder.Ambient.Value = "restart-caller";
+
+        await harness.SimulateRestartAsync();
+        await harness.AdvanceAsync(TimeSpan.FromMinutes(5));
+
+        // Hang guard only: the job is due once the clock has moved.
+        Assert.Equal("publisher", await recorder.Seen.Task.WaitAsync(TimeSpan.FromSeconds(10)));
+    }
+
+    [Fact]
+    public async Task Advance_WithAJobAsleepInItsRetryBackoff_DoesNotSpinTheSettleBudget()
+    {
+        // S4#9 (fixpoint r2): the settle counted a job asleep in a retry backoff armed before it
+        // began as busy user code, so every settle over it spun its whole 500 ms real-time budget —
+        // twice per advance (after CrashAfterStep, the documented pattern). The backoff is a wait on
+        // the virtual clock; advancing is exactly what it needs. Pinned by the settle's own lapse
+        // count, not a wall-clock bound (pre-commit review r2, C6): the old code lapses twice here.
+        var state = new BackoffWorkState();
+        var harness = await AsyncResponseTestHarness.StartAsync(options =>
+            options.ConfigureServices = services => services
+                .AddSingleton(state)
+                .AddSingleton<IncarnationMarker>()
+                .AddSingleton<IBackoffWork, BackoffWork>());
+        await using var _ = harness;
+        var transport = harness.Services.GetRequiredService<InMemoryWorkerTransport>();
+
+        await harness.Builder.EnqueueWorkerAsync<IBackoffWork>(target => target.FailAsync());
+        await WaitUntilAsync(() => transport.BackingOffJobs == 1, "the failing job never reached its retry backoff");
+
+        await harness.AdvanceAsync(TimeSpan.FromMilliseconds(10)); // short of the 100 ms backoff
+
+        Assert.Equal(0, harness.SettleBudgetLapses);
+        Assert.Equal(1, state.FailRuns);
+    }
+
+    [Fact]
+    public async Task AZombiesFailedAttempt_DoesNotEraseTheNewIncarnationsParkOfTheSameFlow()
+    {
+        // S4#7 (fixpoint r2): every incarnation registered the SAME quiesce probe, so an execution
+        // the restart abandoned — which keeps its executor and the observers it resolved — could
+        // fail its attempt after the restart and erase the new incarnation's park of the same flow
+        // (RemoveRun by flow id). Settles then spun their budget and a later restart refused.
+        await using var harness = await AsyncResponseTestHarness.StartAsync();
+        var zombie = QuiesceObserver(harness);
+
+        await harness.SimulateRestartAsync();
+        var live = QuiesceObserver(harness);
+
+        await live.OnStepWaitingAsync(new DurableFlowStepEvent("flow-z", "remote", DurableFlowStepKind.Awaited, CorrelationId: "cid-z"));
+        Assert.Equal(1, ParkedCount(harness));
+
+        await zombie.OnRunAttemptFailedAsync(new DurableFlowRunEvent("flow-z", FlowRunStatus.Running, "the abandoned attempt ended"));
+        Assert.Equal(1, ParkedCount(harness));
+
+        // The live incarnation's own failure still clears it.
+        await live.OnRunAttemptFailedAsync(new DurableFlowRunEvent("flow-z", FlowRunStatus.Running, "timed out"));
+        Assert.Equal(0, ParkedCount(harness));
+    }
+
+    [Fact]
+    public async Task QuiesceProbe_DecidesATimersParkAtItsStartingEvent_NotWhenTheWaitIsRecorded()
+    {
+        // S4#8 (fixpoint r2), the quiesce probe's twin of the flow probe's round-43 fix: the engine
+        // decides whether a timer parks in process on the remainder it measures right after the
+        // step's Starting event, and a first pass saves its breadcrumb before notifying Waiting. A
+        // clock advanced during that save made this suspended timer — 15 s against the 10 s
+        // threshold — look like a 9 s in-process park: a phantom park until its due time, which let
+        // the settle advance the clock under another busy job.
+        await using var harness = await AsyncResponseTestHarness.StartAsync();
+        var observer = QuiesceObserver(harness);
+
+        var suspended = new DurableFlowStepEvent("flow-t", "short-nap", DurableFlowStepKind.Timer, WakeAtUtc: harness.Clock.GetUtcNow().UtcDateTime + TimeSpan.FromSeconds(15));
+        await observer.OnStepStartingAsync(suspended);
+        harness.Clock.Advance(TimeSpan.FromSeconds(6));
+        await observer.OnStepWaitingAsync(suspended);
+        Assert.Equal(0, ParkedCount(harness));
+
+        // A timer the engine does park in process still counts.
+        var parked = new DurableFlowStepEvent("flow-p", "nap", DurableFlowStepKind.Timer, WakeAtUtc: harness.Clock.GetUtcNow().UtcDateTime + TimeSpan.FromSeconds(5));
+        await observer.OnStepStartingAsync(parked);
+        await observer.OnStepWaitingAsync(parked);
+        Assert.Equal(1, ParkedCount(harness));
+    }
+
+    public sealed class StartStopRecorder
+    {
+        private int _stops;
+
+        public int Stops => Volatile.Read(ref _stops);
+        public void RecordStop() => Interlocked.Increment(ref _stops);
+    }
+
+    /// <summary>A user hosted service that is neither a BackgroundService nor disposable: only StopAsync ends it.</summary>
+    public sealed class RecordingHostedService(StartStopRecorder _recorder) : IHostedService
+    {
+        public Task StartAsync(CancellationToken cancellationToken) => Task.CompletedTask;
+
+        public Task StopAsync(CancellationToken cancellationToken)
+        {
+            _recorder.RecordStop();
+            return Task.CompletedTask;
+        }
+    }
+
+    public sealed class FailingHostedService : IHostedService
+    {
+        public Task StartAsync(CancellationToken cancellationToken) => throw new InvalidOperationException("this service cannot start");
+
+        public Task StopAsync(CancellationToken cancellationToken) => Task.CompletedTask;
+    }
+
+    [Fact]
+    public async Task StartAsync_AServiceFailingToStart_StopsTheServicesThatAlreadyStarted()
+    {
+        // S4#15 (fixpoint r2): the harness recorded its started services only after ALL of them
+        // started, so a failing start left the earlier ones running — the disposal that followed
+        // stopped nothing.
+        var recorder = new StartStopRecorder();
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => AsyncResponseTestHarness.StartAsync(options =>
+        {
+            options.ConfigureServices = services => services
+                .AddSingleton(recorder)
+                .AddHostedService<RecordingHostedService>();
+            options.ConfigureAsyncResponse = builder => builder.Services.AddHostedService<FailingHostedService>();
+        }));
+
+        Assert.Contains("cannot start", ex.Message, StringComparison.Ordinal);
+        Assert.Equal(1, recorder.Stops);
+    }
+
+    /// <summary>Starts cleanly; its stop throws.</summary>
+    public sealed class ThrowingStopHostedService : IHostedService
+    {
+        public Task StartAsync(CancellationToken cancellationToken) => Task.CompletedTask;
+
+        public Task StopAsync(CancellationToken cancellationToken) => throw new NotSupportedException("this service cannot stop");
+    }
+
+    [Fact]
+    public async Task StartAsync_AServiceFailingToStart_SurfacesItsError_EvenWhenAStartedServiceFailsToStop()
+    {
+        // Pre-commit review (fixpoint r2, C2): once a partial start stopped the services that had
+        // started (S4#15), a StopAsync that threw anything but a cancellation escaped the
+        // teardown — the services stopped after it never were, and StartAsync reported that stop
+        // failure instead of the start failure the test needs to see.
+        var recorder = new StartStopRecorder();
+        var ex = await Assert.ThrowsAnyAsync<Exception>(() => AsyncResponseTestHarness.StartAsync(options =>
+        {
+            // Stopped in reverse: the throwing stop comes before the recording one.
+            options.ConfigureServices = services => services
+                .AddSingleton(recorder)
+                .AddHostedService<RecordingHostedService>()
+                .AddHostedService<ThrowingStopHostedService>();
+            options.ConfigureAsyncResponse = builder => builder.Services.AddHostedService<FailingHostedService>();
+        }));
+
+        Assert.IsType<InvalidOperationException>(ex);
+        Assert.Contains("cannot start", ex.Message, StringComparison.Ordinal);
+        Assert.Equal(1, recorder.Stops);
+    }
+
+    [Fact]
+    public async Task Dispose_AServiceFailingToStop_StillStopsTheOthers_AndReportsTheFailure()
+    {
+        // C2's other half: the failure still surfaces from an ordinary disposal — after every
+        // other service has stopped.
+        var recorder = new StartStopRecorder();
+        var harness = await AsyncResponseTestHarness.StartAsync(options =>
+            options.ConfigureServices = services => services
+                .AddSingleton(recorder)
+                .AddHostedService<RecordingHostedService>()
+                .AddHostedService<ThrowingStopHostedService>());
+
+        var ex = await Assert.ThrowsAsync<NotSupportedException>(async () => await harness.DisposeAsync());
+
+        Assert.Contains("cannot stop", ex.Message, StringComparison.Ordinal);
+        Assert.Equal(1, recorder.Stops);
+    }
+
+    [Fact]
+    public async Task SimulateRestart_ARebuildThatThrows_SurfacesItsError_AndDisposeStaysQuiet()
+    {
+        // S4#15 (fixpoint r2): a restart whose rebuild threw left the harness on the disposed
+        // provider of the incarnation before, and DisposeAsync — the test's `await using` — then
+        // resolved the transport from it: ObjectDisposedException, replacing the real failure.
+        var builds = 0;
+        var harness = await AsyncResponseTestHarness.StartAsync(options =>
+            options.ConfigureServices = _ =>
+            {
+                if (++builds == 2)
+                    throw new InvalidOperationException("the second build fails");
+            });
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => harness.SimulateRestartAsync());
+        Assert.Equal("the second build fails", ex.Message);
+
+        await harness.DisposeAsync();
+    }
+
+    /// <summary>The quiesce probe's observer of the harness's CURRENT incarnation: registered first in every incarnation.</summary>
+    private static IDurableFlowExecutionObserver QuiesceObserver(AsyncResponseTestHarness harness)
+        => harness.Services.GetServices<IDurableFlowExecutionObserver>().First();
+
+    private static int ParkedCount(AsyncResponseTestHarness harness)
+    {
+        var quiesce = typeof(AsyncResponseTestHarness)
+            .GetField("_quiesce", BindingFlags.Instance | BindingFlags.NonPublic)!
+            .GetValue(harness)!;
+        return (int)quiesce.GetType().GetProperty("ParkedCount")!.GetValue(quiesce)!;
     }
 
     /// <summary>Real-time bounded (a hang guard, not an assertion window).</summary>

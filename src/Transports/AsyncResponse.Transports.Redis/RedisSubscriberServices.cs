@@ -65,6 +65,22 @@ internal abstract class RedisSubscriberService : BackgroundService
     protected abstract RedisValue ConsumerGroup { get; }
     protected abstract RedisSubscriberOptions SubscriberOptions { get; }
     protected abstract RedisSubscriberRole SubscriberRole { get; }
+
+    /// <summary>
+    /// Whether this subscriber takes no new delivery any more because host stop has begun — the
+    /// worker role's <see cref="WorkerIntakeGate"/>. A response subscriber never closes: waiters
+    /// keep being served through a stop.
+    /// </summary>
+    protected virtual bool IntakeClosed => false;
+
+    /// <summary>
+    /// The flow engine handed a delivery back (<see cref="RedisMessageDispatcher.HandBackSignalled"/>),
+    /// or host stop has begun (<see cref="IntakeClosed"/>): either way the host IS stopping, so
+    /// read, claim and start nothing more. The hand-back latch stays the fallback when no host
+    /// lifetime is registered.
+    /// </summary>
+    private bool TakesNothingMore(RedisMessageDispatcher dispatcher) => dispatcher.HandBackSignalled || IntakeClosed;
+
     /// <summary>Handles the delivered message.</summary>
     protected abstract Task HandleMessageAsync(RedisStreamDelivery delivery, CancellationToken cancellationToken);
 
@@ -118,7 +134,7 @@ internal abstract class RedisSubscriberService : BackgroundService
                     Stream.ToString(),
                     SubscriberRole,
                     retryDelay),
-                healthyRunThreshold: Options.SubscriberRetryMaxDelay).ConfigureAwait(false);
+                healthyRunThreshold: AsyncResponseRetry.MaxAttainableDelay(Options.SubscriberRetryBaseDelay, Options.SubscriberRetryMaxDelay)).ConfigureAwait(false);
         }
         finally
         {
@@ -197,8 +213,11 @@ internal abstract class RedisSubscriberService : BackgroundService
             // this stopping consumer with an attempt spent, where no live peer could take it
             // before PendingMessageMinIdleTime — and past that, this host re-claimed its own
             // hand-backs every PendingClaimInterval, each claim another attempt. (Early ACK: every
-            // one of them was already ACKed, so each became a dead-letter copy.)
-            if (dispatcher.HandBackSignalled)
+            // one of them was already ACKed, so each became a dead-letter copy.) The worker's
+            // intake gate closes the same way at ApplicationStopping itself, before any hand-back:
+            // the wake-ups this host's own hand-overs publish are then left to a live replica
+            // instead of being taken here and handed back again.
+            if (TakesNothingMore(dispatcher))
             {
                 await Task.Delay(Timeout.InfiniteTimeSpan, stoppingToken).ConfigureAwait(false);
                 break;
@@ -223,9 +242,17 @@ internal abstract class RedisSubscriberService : BackgroundService
                 // the surplus into the PEL un-ACKed, every reclaim bumped its delivery count, and
                 // the pre-execution cap eventually dead-lettered healthy jobs whose handler never
                 // ran. The claim above may have taken the last slot.
-                var readCount = dispatcher.HandBackSignalled ? 0 : Math.Min(ReadBatchSize, dispatcher.FreeCapacity);
+                var readCount = TakesNothingMore(dispatcher) ? 0 : Math.Min(ReadBatchSize, dispatcher.FreeCapacity);
                 if (readCount > 0)
                 {
+                    // A stop that landed during the claim above ends the pass here: the adapter
+                    // queues XREADGROUP the moment it is called, so reading with the cancelled
+                    // token still moved an entry into this stopping consumer's pending list, where
+                    // it waited out PendingMessageMinIdleTime before a peer could take it — and the
+                    // peer's claim spent another attempt.
+                    if (stoppingToken.IsCancellationRequested)
+                        break;
+
                     var entries = await _database.StreamReadGroupAsync(
                         Stream,
                         ConsumerGroup,
@@ -243,7 +270,7 @@ internal abstract class RedisSubscriberService : BackgroundService
             }
 
             // Throttle when nothing advanced — an empty stream, or every entry deferred under backpressure.
-            if (processed == 0 && !dispatcher.HandBackSignalled)
+            if (processed == 0 && !TakesNothingMore(dispatcher))
                 await Task.Delay(SubscriberOptions.EmptyPollDelay, stoppingToken).ConfigureAwait(false);
         }
     }
@@ -332,7 +359,7 @@ internal abstract class RedisSubscriberService : BackgroundService
             minIdleMs,
             cancellationToken).ConfigureAwait(false);
 
-        if (pending.Length == 0)
+        if (pending.Length == 0 || cancellationToken.IsCancellationRequested || TakesNothingMore(dispatcher))
             return 0;
 
         if (!SettlesAfterHandler)
@@ -347,7 +374,7 @@ internal abstract class RedisSubscriberService : BackgroundService
         {
             // Stopping: claim nothing more — an unclaimed candidate keeps its count and stays
             // claimable by a peer.
-            if (cancellationToken.IsCancellationRequested)
+            if (cancellationToken.IsCancellationRequested || TakesNothingMore(dispatcher))
                 break;
 
             // The listing is as old as every earlier candidate's handler run — minutes, behind a
@@ -367,6 +394,12 @@ internal abstract class RedisSubscriberService : BackgroundService
                 cancellationToken).ConfigureAwait(false);
             if (current.Length == 0)
                 continue;
+
+            // The re-read took a round trip: a stop landing in it must not still claim (the
+            // adapter would queue the XCLAIM with the cancelled token, bumping the count of an
+            // entry that then sits in this stopping consumer's pending list).
+            if (cancellationToken.IsCancellationRequested || TakesNothingMore(dispatcher))
+                break;
 
             var result = await ClaimAndDispatchAsync(dispatcher, consumerName, current, minIdleMs, cancellationToken).ConfigureAwait(false);
             processed += result.Processed;
@@ -487,8 +520,9 @@ internal abstract class RedisSubscriberService : BackgroundService
                 // on, handler after handler, past the stop signal; left unstarted it stays pending
                 // (Redis has no NAK), its idle clock no longer reset, for a peer to reclaim. A
                 // hand-back from the flow engine — here, or in an early-ACK worker — is the same
-                // signal, arriving before the token.
-                if (stoppingToken.IsCancellationRequested || handedBack || dispatcher.HandBackSignalled)
+                // signal, arriving before the token, and so is the worker's intake gate closing at
+                // ApplicationStopping: an early-ACK entry is never enqueued and ACKed after it.
+                if (stoppingToken.IsCancellationRequested || handedBack || TakesNothingMore(dispatcher))
                     break;
 
                 try
@@ -542,13 +576,14 @@ internal abstract class RedisSubscriberService : BackgroundService
                 // clock unconditionally, and the races are harmless — an entry ACKed while this
                 // sweep is in flight has left the PEL (the claim simply skips it), and a failed
                 // entry is settled before MarkSettled runs, so its post-failure idle countdown is
-                // never stretched. Once stopping, only the entry in the handler is kept: the rest
-                // will not start here, so its idle clock is left to run for a peer's reclaim.
+                // never stretched. Once stopping — the token, or the worker's intake gate — only the
+                // entry in the handler is kept: the rest will not start here, so its idle clock is
+                // left to run for a peer's reclaim.
                 var settled = progress.SettledCount;
                 if (settled >= entries.Length)
                     return;
 
-                var end = stoppingToken.IsCancellationRequested ? settled + 1 : entries.Length;
+                var end = stoppingToken.IsCancellationRequested || IntakeClosed ? settled + 1 : entries.Length;
                 var remaining = new RedisValue[end - settled];
                 for (var i = settled; i < end; i++)
                     remaining[i - settled] = entries[i].Id;
@@ -661,34 +696,42 @@ internal sealed class RedisWorkerSubscriber : RedisSubscriberService
 {
     private readonly IAsyncResponseIngress _ingress;
     private readonly RedisTransportKeySchema _keys;
+    private readonly WorkerIntakeGate _intake;
 
     /// <summary>Runs the RedisWorkerSubscriber operation.</summary>
     public RedisWorkerSubscriber(
         IOptions<RedisAsyncResponseTransportOptions> options,
         IConnectionMultiplexer multiplexer,
         IAsyncResponseIngress ingress,
-        ILogger<RedisWorkerSubscriber> logger)
+        ILogger<RedisWorkerSubscriber> logger,
+        IHostApplicationLifetime? hostLifetime = null)
         : base(options, multiplexer, logger)
     {
         _ingress = ingress;
         _keys = new RedisTransportKeySchema(options.Value);
+        _intake = new WorkerIntakeGate(hostLifetime);
     }
 
     internal RedisWorkerSubscriber(
         IOptions<RedisAsyncResponseTransportOptions> options,
         IRedisStreamDatabase database,
         IAsyncResponseIngress ingress,
-        ILogger<RedisWorkerSubscriber> logger)
+        ILogger<RedisWorkerSubscriber> logger,
+        IHostApplicationLifetime? hostLifetime = null)
         : base(options, database, logger)
     {
         _ingress = ingress;
         _keys = new RedisTransportKeySchema(options.Value);
+        _intake = new WorkerIntakeGate(hostLifetime);
     }
 
     protected override RedisKey Stream => _keys.WorkerStream;
     protected override RedisValue ConsumerGroup => Options.WorkerConsumerGroup;
     protected override RedisSubscriberOptions SubscriberOptions => Options.WorkerSubscriber;
     protected override RedisSubscriberRole SubscriberRole => RedisSubscriberRole.Worker;
+
+    /// <inheritdoc />
+    protected override bool IntakeClosed => _intake.IsClosed;
 
     /// <summary>Handles the delivered message.</summary>
     protected override Task HandleMessageAsync(RedisStreamDelivery delivery, CancellationToken cancellationToken)

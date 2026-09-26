@@ -233,6 +233,86 @@ public sealed class KafkaRebalanceIntegrationTests(BrokersBatchFixture fixture) 
         Assert.Equal(6, CommittedOffset(c1Options, group, topic));
     }
 
+    [Fact]
+    public async Task AckAfterEnqueue_ABackpressurePauseLiftedWhileAnEagerRebalanceHadThePartitionAway_DoesNotStallIt()
+    {
+        // Round 2 (r2 S7#1): the early-ACK poll loop pauses the whole assignment while its queue is
+        // full. C2 joins; the eager protocol revokes P0 from C1 — librdkafka keeps C1's pause on it
+        // — and, while the group re-joins, nothing is assigned to C1. A queue slot frees in that
+        // window: the loop's resume covers the EMPTY assignment. P0 then comes straight back to C1
+        // (its client id sorts first) and must come back FETCHING: before the fix it stayed paused
+        // for the life of the consumer, since nothing was fetched to fill the queue and trip
+        // another pause-and-resume.
+        var prefix = NewId("r2-backpressure");
+        var group = $"{prefix}-workers";
+        var c1Options = Options(prefix, group, clientId: $"aa-{prefix}");
+        var c2Options = Options(prefix, group, clientId: $"zz-{prefix}");
+        var topic = new KafkaTransportTopicSchema(c1Options).WorkerTopic;
+        using var producer = await CreateTopicWithMessagesAsync(c1Options, topic, count: 3);
+
+        // Built exactly as KafkaConsumerClientFactory builds it, keeping the raw consumer at hand to
+        // see its assignment.
+        KafkaConsumerClientAdapter? c1 = null;
+        using var raw = new ConsumerBuilder<string?, byte[]>(KafkaConsumerClientFactory.BuildConfig(c1Options, KafkaSubscriberRole.Worker))
+            .SetPartitionsAssignedHandler((_, assigned) => c1!.OnPartitionsAssigned(assigned))
+            .SetPartitionsRevokedHandler((_, revoked) => c1!.OnPartitionsRemoved(revoked))
+            .SetPartitionsLostHandler((_, lost) => c1!.OnPartitionsRemoved(lost))
+            .Build();
+        c1 = new KafkaConsumerClientAdapter(raw);
+        c1.Subscribe(topic);
+
+        using var stopC2 = new CancellationTokenSource();
+        Task? c2Loop = null;
+        IKafkaConsumerClient? c2 = null;
+        try
+        {
+            // C1 owns P0 and is fetching; then its queue fills and the loop pauses the assignment.
+            await PollUntilAsync(() => c1.Consume(TimeSpan.FromMilliseconds(100)) is not null, "C1 never consumed P0");
+            c1.PauseAssignment();
+
+            c2 = new KafkaConsumerClientFactory(c2Options).Create(KafkaSubscriberRole.Worker);
+            c2.Subscribe(topic);
+            var c2Consumer = c2;
+            c2Loop = Task.Factory.StartNew(
+                () =>
+                {
+                    while (!stopC2.IsCancellationRequested)
+                        c2Consumer.Consume(TimeSpan.FromMilliseconds(100));
+                },
+                TaskCreationOptions.LongRunning);
+
+            // C1 serves the eager revoke. Polled with a zero wait, so the re-assignment — which needs
+            // the re-join round trips after the revoke callback returned — cannot be served in the
+            // same poll: C1 is left with nothing assigned.
+            await PollUntilAsync(
+                () =>
+                {
+                    c1.Consume(TimeSpan.Zero);
+                    return c1.GetAssignmentGeneration(topic, 0) > 0;
+                },
+                "the rebalance never revoked P0 from C1");
+            Assert.Empty(raw.Assignment);
+
+            // A queue slot frees while nothing is assigned.
+            c1.ResumeAssignment();
+
+            // P0 comes back to C1, and something of it must be fetched again.
+            await PollUntilAsync(
+                () => c1.Consume(TimeSpan.FromMilliseconds(100)) is not null,
+                "P0 came back to C1 still paused by the backpressure pause lifted while it was away");
+        }
+        finally
+        {
+            stopC2.Cancel();
+            if (c2Loop is not null)
+                await c2Loop;
+
+            c2?.Close();
+            c2?.Dispose();
+            c1.Close();
+        }
+    }
+
     private KafkaAsyncResponseTransportOptions Options(string prefix, string group, string clientId)
     {
         var options = new KafkaAsyncResponseTransportOptions

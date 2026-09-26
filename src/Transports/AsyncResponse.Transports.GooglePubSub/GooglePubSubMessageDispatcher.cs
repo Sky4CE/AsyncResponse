@@ -18,6 +18,7 @@ internal abstract class GooglePubSubMessageDispatcher : IAsyncDisposable
     private readonly GooglePubSubSubscriberOptions _subscriberOptions;
     private readonly string _subscriptionId;
     private readonly GooglePubSubSubscriberRole _role;
+    private readonly TaskCompletionSource _clientStopping = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
     /// <summary>Runs the GooglePubSubMessageDispatcher operation.</summary>
     protected GooglePubSubMessageDispatcher(
@@ -38,14 +39,19 @@ internal abstract class GooglePubSubMessageDispatcher : IAsyncDisposable
 
     protected ILogger Logger { get; }
 
-    /// <summary>Creates the configured dispatcher.</summary>
+    /// <summary>
+    /// Creates the configured dispatcher. <paramref name="intakeGate"/> is the worker role's
+    /// host-stop gate: from <c>ApplicationStopping</c> on, the early-ACK dispatcher holds every new
+    /// delivery for the client stop instead of acknowledging it.
+    /// </summary>
     public static GooglePubSubMessageDispatcher Create(
         Func<PubsubMessage, CancellationToken, Task> handler,
         GooglePubSubAsyncResponseOptions transportOptions,
         GooglePubSubSubscriberOptions subscriberOptions,
         ILogger logger,
         string subscriptionId,
-        GooglePubSubSubscriberRole role)
+        GooglePubSubSubscriberRole role,
+        WorkerIntakeGate? intakeGate = null)
     {
         ValidateOptions(transportOptions, subscriberOptions, role);
 
@@ -63,7 +69,8 @@ internal abstract class GooglePubSubMessageDispatcher : IAsyncDisposable
                 subscriberOptions,
                 logger,
                 subscriptionId,
-                role);
+                role,
+                intakeGate);
     }
 
     /// <summary>Validates the supplied options.</summary>
@@ -163,11 +170,35 @@ internal abstract class GooglePubSubMessageDispatcher : IAsyncDisposable
     public virtual Task DrainInFlightAsync(TimeSpan budget, TimeProvider clock) => Task.CompletedTask;
 
     /// <summary>
-    /// Hands back (Nack) every delivery held since <see cref="DrainInFlightAsync"/> began; called
-    /// immediately before the subscriber client is stopped. A no-op for the early-ACK dispatcher.
+    /// Hands back (Nack) every delivery held for the client stop — since
+    /// <see cref="DrainInFlightAsync"/> began, handed back by the flow engine, or (early ACK) taken
+    /// after the host stop began; called immediately before the subscriber client is stopped.
     /// </summary>
-    public virtual void ReleaseHeldDeliveries()
+    public void ReleaseHeldDeliveries() => _clientStopping.TrySetResult();
+
+    /// <summary>
+    /// Holds a delivery that must not start — it arrived during the stop's drain, the flow engine
+    /// handed it back at host stop, or (early ACK) it arrived after the host stop began — until the
+    /// client stop, then hands it back. The streaming pull runs until the client is stopped, so a
+    /// Nack returned at once freed its flow-control slot at once and Pub/Sub redelivered the
+    /// message straight away — often to this same stream — for the whole stop window: a Nack storm
+    /// that spent a DeadLetterPolicy's delivery attempts on healthy backlog and on the flow
+    /// wake-ups handed over at the stop. Held, the delivery keeps its slot (the SDK keeps extending
+    /// its lease), so the pull stalls once the slots are full, and the client stop's
+    /// NackImmediately hands it back exactly once — one delivery attempt.
+    /// </summary>
+    protected async Task<SubscriberClient.Reply> HoldUntilClientStopAsync(CancellationToken subscriberCancellationToken)
     {
+        try
+        {
+            await _clientStopping.Task.WaitAsync(subscriberCancellationToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (subscriberCancellationToken.IsCancellationRequested)
+        {
+            // The SDK's own hard stop: hand it back now.
+        }
+
+        return SubscriberClient.Reply.Nack;
     }
 
     /// <summary>Runs the ExecuteHandlerAsync operation.</summary>
@@ -203,9 +234,14 @@ internal abstract class GooglePubSubMessageDispatcher : IAsyncDisposable
         }
         catch (Exception ex)
         {
-            if (logFailures)
-                Logger.LogError(ex, "Pub/Sub message handling failed for message {MessageId}.", message.MessageId);
             AsyncResponseDiagnostics.SetError(activity, ex);
+            if (logFailures)
+            {
+                SafeLog.Try(
+                    (Logger, ex, message.MessageId),
+                    static state => state.Logger.LogError(state.ex, "Pub/Sub message handling failed for message {MessageId}.", state.MessageId));
+            }
+
             throw;
         }
     }
@@ -241,11 +277,13 @@ internal abstract class GooglePubSubMessageDispatcher : IAsyncDisposable
         }
         catch (Exception callbackException)
         {
-            Logger.LogError(
-                callbackException,
-                "Pub/Sub background failure callback failed for already-ACKed message {MessageId} on {SubscriptionId}.",
-                message.MessageId,
-                subscriptionId);
+            SafeLog.Try(
+                (Logger, callbackException, message.MessageId, subscriptionId),
+                static state => state.Logger.LogError(
+                    state.callbackException,
+                    "Pub/Sub background failure callback failed for already-ACKed message {MessageId} on {SubscriptionId}.",
+                    state.MessageId,
+                    state.subscriptionId));
         }
     }
 }
@@ -260,7 +298,6 @@ internal sealed class AwaitingGooglePubSubMessageDispatcher(
     : GooglePubSubMessageDispatcher(handler, transportOptions, subscriberOptions, logger, subscriptionId, role)
 {
     private readonly TaskCompletionSource _drained = new(TaskCreationOptions.RunContinuationsAsynchronously);
-    private readonly TaskCompletionSource _clientStopping = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private int _inFlight;
     private int _stopping;
 
@@ -321,30 +358,6 @@ internal sealed class AwaitingGooglePubSubMessageDispatcher(
     }
 
     /// <summary>
-    /// Holds a delivery that arrived during the stop's drain — or that the flow engine handed back
-    /// at host stop — until the client stop, then hands it back. The streaming pull runs until the
-    /// client is stopped, so a Nack returned at once freed
-    /// its flow-control slot at once and Pub/Sub redelivered the message straight away — often to
-    /// this same stream — for the whole drain: a Nack storm that spent a DeadLetterPolicy's
-    /// delivery attempts on healthy backlog and on the flow wake-ups handed over at the stop.
-    /// Held, the delivery keeps its slot (the SDK keeps extending its lease), so the pull stalls
-    /// once the slots are full, and the client stop's NackImmediately hands it back exactly once.
-    /// </summary>
-    private async Task<SubscriberClient.Reply> HoldUntilClientStopAsync(CancellationToken subscriberCancellationToken)
-    {
-        try
-        {
-            await _clientStopping.Task.WaitAsync(subscriberCancellationToken).ConfigureAwait(false);
-        }
-        catch (OperationCanceledException) when (subscriberCancellationToken.IsCancellationRequested)
-        {
-            // The SDK's own hard stop: hand it back now.
-        }
-
-        return SubscriberClient.Reply.Nack;
-    }
-
-    /// <summary>
     /// Waits, before the client is stopped, for the handlers already running. The SDK's stop hands
     /// every message still in leasing back at once — any stop timeout under its 30-second
     /// hard-stop window skips WaitForProcessing — so a job whose handler was still running lost its
@@ -359,29 +372,30 @@ internal sealed class AwaitingGooglePubSubMessageDispatcher(
         if (inFlight == 0)
             _drained.TrySetResult();
 
-        Logger.LogInformation(
-            "Pub/Sub subscriber is stopping: holding new deliveries for the client stop and waiting up to {Budget} for {InFlight} running handler(s) before stopping the client.",
-            budget,
-            inFlight);
+        SafeLog.Try(
+            (Logger, budget, inFlight),
+            static state => state.Logger.LogInformation(
+                "Pub/Sub subscriber is stopping: holding new deliveries for the client stop and waiting up to {Budget} for {InFlight} running handler(s) before stopping the client.",
+                state.budget,
+                state.inFlight));
         try
         {
             await _drained.Task.WaitAsync(budget, clock).ConfigureAwait(false);
         }
         catch (TimeoutException)
         {
-            Logger.LogWarning(
-                "Pub/Sub handlers still running on stop did not finish within {Budget} (BackgroundDrainTimeout, shortened to what the host shutdown budget leaves); stopping the subscriber client hands their messages back for redelivery.",
-                budget);
+            SafeLog.Try(
+                (Logger, budget),
+                static state => state.Logger.LogWarning(
+                    "Pub/Sub handlers still running on stop did not finish within {Budget} (BackgroundDrainTimeout, shortened to what the host shutdown budget leaves); stopping the subscriber client hands their messages back for redelivery.",
+                    state.budget));
         }
     }
-
-    /// <summary>Hands the deliveries held since the drain began back to the client, which is stopped next.</summary>
-    public override void ReleaseHeldDeliveries() => _clientStopping.TrySetResult();
 
     /// <summary>Releases anything still held, should the client stop never have been reached.</summary>
     public override ValueTask DisposeAsync()
     {
-        _clientStopping.TrySetResult();
+        ReleaseHeldDeliveries();
         return ValueTask.CompletedTask;
     }
 }
@@ -394,9 +408,11 @@ internal sealed class QueuedGooglePubSubMessageDispatcher : GooglePubSubMessageD
     private readonly TimeSpan _drainTimeout;
     private readonly string _subscriptionId;
     private readonly GooglePubSubSubscriberRole _role;
+    private readonly WorkerIntakeGate? _intakeGate;
     private int _pendingCount;
     private int _runningCount;
     private int _disposeStarted;
+    private int _intakeClosedLogged;
 
     /// <summary>Runs the QueuedGooglePubSubMessageDispatcher operation.</summary>
     public QueuedGooglePubSubMessageDispatcher(
@@ -405,19 +421,23 @@ internal sealed class QueuedGooglePubSubMessageDispatcher : GooglePubSubMessageD
         GooglePubSubSubscriberOptions subscriberOptions,
         ILogger logger,
         string subscriptionId,
-        GooglePubSubSubscriberRole role)
+        GooglePubSubSubscriberRole role,
+        WorkerIntakeGate? intakeGate = null)
         : base(handler, transportOptions, subscriberOptions, logger, subscriptionId, role)
     {
         _drainTimeout = subscriberOptions.BackgroundDrainTimeout;
         _subscriptionId = subscriptionId;
         _role = role;
+        _intakeGate = intakeGate;
         _queue = Channel.CreateBounded<PubsubMessage>(new BoundedChannelOptions(subscriberOptions.BackgroundQueueCapacity)
         {
             AllowSynchronousContinuations = false,
             // Wait powers the queue-full backpressure path in HandleAsync: WriteAsync parks the
             // subscriber callback until a worker frees a slot instead of dropping or NACKing.
             FullMode = BoundedChannelFullMode.Wait,
-            SingleReader = subscriberOptions.BackgroundWorkerCount == 1,
+            // Never single-reader: once the drain budget lapses, DisposeAsync reads the queue
+            // alongside the workers to surface what is still queued.
+            SingleReader = false,
             SingleWriter = false
         });
 
@@ -441,17 +461,29 @@ internal sealed class QueuedGooglePubSubMessageDispatcher : GooglePubSubMessageD
         PubsubMessage message,
         CancellationToken subscriberCancellationToken)
     {
+        // Host stop has begun (ApplicationStopping) and this is the worker: acknowledging now would
+        // settle a delivery this stopping host may no longer run — among them the flow wake-ups the
+        // engine's hand-overs had just published for a live replica, which reach their first timer
+        // here, are handed back, and (ACKed) are lost. The streaming pull cannot stop short of the
+        // client stop, so hold the delivery unstarted and hand it back then instead.
+        if (_intakeGate?.IsClosed == true)
+            return await HoldForHostStopAsync(message, subscriberCancellationToken).ConfigureAwait(false);
+
         try
         {
             Interlocked.Increment(ref _pendingCount);
             if (_queue.Writer.TryWrite(message))
             {
-                Logger.LogDebug(
-                    "Enqueued Pub/Sub message {MessageId} for background handling on {SubscriptionId}. Pending={PendingCount}, Running={RunningCount}.",
-                    message.MessageId,
-                    _subscriptionId,
-                    PendingCount,
-                    RunningCount);
+                // Enqueued: from here the reply is Ack whatever the log does — a throwing logger
+                // reaching the catch below would NACK a message a worker is already running.
+                SafeLog.Try(
+                    (Logger, message.MessageId, _subscriptionId, PendingCount, RunningCount),
+                    static state => state.Logger.LogDebug(
+                        "Enqueued Pub/Sub message {MessageId} for background handling on {SubscriptionId}. Pending={PendingCount}, Running={RunningCount}.",
+                        state.MessageId,
+                        state._subscriptionId,
+                        state.PendingCount,
+                        state.RunningCount));
                 return SubscriberClient.Reply.Ack;
             }
 
@@ -460,14 +492,28 @@ internal sealed class QueuedGooglePubSubMessageDispatcher : GooglePubSubMessageD
             // dead-letter healthy, never-executed messages. The streaming pull is flow-control-bounded
             // to the queue capacity, so at most capacity callbacks wait here; the await completes as
             // soon as a background worker frees a slot.
-            Logger.LogDebug(
-                "Pub/Sub background queue is full for {SubscriptionId}; waiting for capacity before ACKing message {MessageId}. Pending={PendingCount}, Running={RunningCount}.",
-                _subscriptionId,
-                message.MessageId,
-                PendingCount,
-                RunningCount);
-            await _queue.Writer.WriteAsync(message, subscriberCancellationToken).ConfigureAwait(false);
+            SafeLog.Try(
+                (Logger, _subscriptionId, message.MessageId, PendingCount, RunningCount),
+                static state => state.Logger.LogDebug(
+                    "Pub/Sub background queue is full for {SubscriptionId}; waiting for capacity before ACKing message {MessageId}. Pending={PendingCount}, Running={RunningCount}.",
+                    state._subscriptionId,
+                    state.MessageId,
+                    state.PendingCount,
+                    state.RunningCount));
+            // The wait also ends when the host stop begins (the intake gate), so a delivery parked
+            // here is never acknowledged after it: capacity freed by the drain would otherwise
+            // enqueue — and settle — it then.
+            using var intake = _intakeGate is { } gate
+                ? CancellationTokenSource.CreateLinkedTokenSource(subscriberCancellationToken, gate.HostStopping)
+                : null;
+            await _queue.Writer.WriteAsync(message, intake?.Token ?? subscriberCancellationToken).ConfigureAwait(false);
             return SubscriberClient.Reply.Ack;
+        }
+        catch (OperationCanceledException) when (!subscriberCancellationToken.IsCancellationRequested && _intakeGate?.IsClosed == true)
+        {
+            // The host stop began while this delivery waited for capacity: never written, so hold it.
+            Interlocked.Decrement(ref _pendingCount);
+            return await HoldForHostStopAsync(message, subscriberCancellationToken).ConfigureAwait(false);
         }
         catch (Exception ex)
         {
@@ -476,18 +522,47 @@ internal sealed class QueuedGooglePubSubMessageDispatcher : GooglePubSubMessageD
             Interlocked.Decrement(ref _pendingCount);
             if (ex is OperationCanceledException or ChannelClosedException)
             {
-                Logger.LogDebug(
-                    "Pub/Sub message {MessageId} for {SubscriptionId} could not be enqueued during shutdown; returning NACK.",
-                    message.MessageId,
-                    _subscriptionId);
+                SafeLog.Try(
+                    (Logger, message.MessageId, _subscriptionId),
+                    static state => state.Logger.LogDebug(
+                        "Pub/Sub message {MessageId} for {SubscriptionId} could not be enqueued during shutdown; returning NACK.",
+                        state.MessageId,
+                        state._subscriptionId));
             }
             else
             {
-                Logger.LogError(ex, "Failed to enqueue Pub/Sub message {MessageId} for {SubscriptionId}; returning NACK.", message.MessageId, _subscriptionId);
+                SafeLog.Try(
+                    (Logger, ex, message.MessageId, _subscriptionId),
+                    static state => state.Logger.LogError(state.ex, "Failed to enqueue Pub/Sub message {MessageId} for {SubscriptionId}; returning NACK.", state.MessageId, state._subscriptionId));
             }
 
             return SubscriberClient.Reply.Nack;
         }
+    }
+
+    /// <summary>
+    /// Holds a delivery taken after the host stop began, unstarted and unacknowledged, until the
+    /// client stop hands it back (one delivery attempt; see <see cref="GooglePubSubMessageDispatcher.HoldUntilClientStopAsync"/>).
+    /// </summary>
+    private Task<SubscriberClient.Reply> HoldForHostStopAsync(PubsubMessage message, CancellationToken subscriberCancellationToken)
+    {
+        if (Interlocked.Exchange(ref _intakeClosedLogged, 1) == 0)
+        {
+            SafeLog.Try(
+                (Logger, _role, _subscriptionId),
+                static state => state.Logger.LogInformation(
+                    "Pub/Sub {Role} subscriber for {SubscriptionId} stops taking deliveries: the host is stopping. Deliveries arriving from now on are held unstarted and handed back when the subscriber client stops.",
+                    state._role,
+                    state._subscriptionId));
+        }
+
+        SafeLog.Try(
+            (Logger, message.MessageId, _subscriptionId),
+            static state => state.Logger.LogDebug(
+                "Holding Pub/Sub message {MessageId} for {SubscriptionId} unstarted until the subscriber client stops: the host is stopping.",
+                state.MessageId,
+                state._subscriptionId));
+        return HoldUntilClientStopAsync(subscriberCancellationToken);
     }
 
     /// <summary>Releases resources held by this instance.</summary>
@@ -496,12 +571,17 @@ internal sealed class QueuedGooglePubSubMessageDispatcher : GooglePubSubMessageD
         if (Interlocked.Exchange(ref _disposeStarted, 1) != 0)
             return;
 
-        Logger.LogInformation(
-            "Draining Pub/Sub ACK-after-enqueue dispatcher for {SubscriptionId}. Pending={PendingCount}, Running={RunningCount}.",
-            _subscriptionId,
-            PendingCount,
-            RunningCount);
+        // Anything still held for a client stop that was never reached is handed back now.
+        ReleaseHeldDeliveries();
+
         _queue.Writer.TryComplete();
+        SafeLog.Try(
+            (Logger, _subscriptionId, PendingCount, RunningCount),
+            static state => state.Logger.LogInformation(
+                "Draining Pub/Sub ACK-after-enqueue dispatcher for {SubscriptionId}. Pending={PendingCount}, Running={RunningCount}.",
+                state._subscriptionId,
+                state.PendingCount,
+                state.RunningCount));
 
         // BackgroundDrainTimeout is the whole spend the shutdown-budget validator sums for this
         // dispatcher, so it is split rather than exceeded (database-transport parity): most of it
@@ -512,21 +592,25 @@ internal sealed class QueuedGooglePubSubMessageDispatcher : GooglePubSubMessageD
         {
             await Task.WhenAll(_workers).WaitAsync(_drainTimeout - surfacingReserve).ConfigureAwait(false);
             _drainCancellation.Dispose();
-            Logger.LogInformation(
-                "Drained Pub/Sub ACK-after-enqueue dispatcher for {SubscriptionId}. Pending={PendingCount}, Running={RunningCount}.",
-                _subscriptionId,
-                PendingCount,
-                RunningCount);
+            SafeLog.Try(
+                (Logger, _subscriptionId, PendingCount, RunningCount),
+                static state => state.Logger.LogInformation(
+                    "Drained Pub/Sub ACK-after-enqueue dispatcher for {SubscriptionId}. Pending={PendingCount}, Running={RunningCount}.",
+                    state._subscriptionId,
+                    state.PendingCount,
+                    state.RunningCount));
         }
         catch (TimeoutException ex)
         {
             _drainCancellation.Cancel();
-            Logger.LogWarning(
-                ex,
-                "Timed out while draining Pub/Sub ACK-after-enqueue dispatcher for {SubscriptionId}. Pending={PendingCount}, Running={RunningCount}. Already ACKed work may be interrupted by host shutdown.",
-                _subscriptionId,
-                PendingCount,
-                RunningCount);
+            SafeLog.Try(
+                (Logger, ex, _subscriptionId, PendingCount, RunningCount),
+                static state => state.Logger.LogWarning(
+                    state.ex,
+                    "Timed out while draining Pub/Sub ACK-after-enqueue dispatcher for {SubscriptionId}. Pending={PendingCount}, Running={RunningCount}. Already ACKed work may be interrupted by host shutdown.",
+                    state._subscriptionId,
+                    state.PendingCount,
+                    state.RunningCount));
 
             // The workers surface a lapsed entry only once one of them frees up — and with every
             // worker still inside a handler that ignores the token, none does before this returns,
@@ -548,8 +632,10 @@ internal sealed class QueuedGooglePubSubMessageDispatcher : GooglePubSubMessageD
             // A worker faulted outside its own handler guard (DB/NATS dispatcher parity). WhenAll
             // only completes once every worker has finished, so the source is safe to dispose here
             // — and the fault must not escape DisposeAsync and mask the real shutdown path.
-            Logger.LogDebug(ex, "Pub/Sub ACK-after-enqueue dispatcher drain for {SubscriptionId} ended with an error.", _subscriptionId);
             _drainCancellation.Dispose();
+            SafeLog.Try(
+                (Logger, ex, _subscriptionId),
+                static state => state.Logger.LogDebug(state.ex, "Pub/Sub ACK-after-enqueue dispatcher drain for {SubscriptionId} ended with an error.", state._subscriptionId));
         }
     }
 
@@ -585,21 +671,25 @@ internal sealed class QueuedGooglePubSubMessageDispatcher : GooglePubSubMessageD
         if (surfaced == 0 && lost == 0)
             return;
 
-        Logger.LogError(
-            "The Pub/Sub ACK-after-enqueue drain budget for {SubscriptionId} lapsed with {Count} already-ACKed message(s) never handled — Pub/Sub cannot redeliver them. Surfaced {Surfaced} via OnBackgroundFailure within the reserved {Reserve}; {Lost} could not be surfaced before shutdown.",
-            _subscriptionId,
-            surfaced + lost,
-            surfaced,
-            reserve,
-            lost);
+        SafeLog.Try(
+            (Logger, _subscriptionId, surfaced, lost, reserve),
+            static state => state.Logger.LogError(
+                "The Pub/Sub ACK-after-enqueue drain budget for {SubscriptionId} lapsed with {Count} already-ACKed message(s) never handled — Pub/Sub cannot redeliver them. Surfaced {Surfaced} via OnBackgroundFailure within the reserved {Reserve}; {Lost} could not be surfaced before shutdown.",
+                state._subscriptionId,
+                state.surfaced + state.lost,
+                state.surfaced,
+                state.reserve,
+                state.lost));
     }
 
     private ValueTask SurfaceLapsedAsync(PubsubMessage message)
     {
-        Logger.LogWarning(
-            "Pub/Sub background handler for already-ACKed message {MessageId} on {SubscriptionId} was not started: the dispatcher's drain budget had lapsed. Surfacing via OnBackgroundFailure.",
-            message.MessageId,
-            _subscriptionId);
+        SafeLog.Try(
+            (Logger, message.MessageId, _subscriptionId),
+            static state => state.Logger.LogWarning(
+                "Pub/Sub background handler for already-ACKed message {MessageId} on {SubscriptionId} was not started: the dispatcher's drain budget had lapsed. Surfacing via OnBackgroundFailure.",
+                state.MessageId,
+                state._subscriptionId));
 
         return NotifyBackgroundFailureAsync(
             message,
@@ -630,13 +720,15 @@ internal sealed class QueuedGooglePubSubMessageDispatcher : GooglePubSubMessageD
 
             try
             {
-                Logger.LogDebug(
-                    "Pub/Sub background worker {WorkerIndex} handling message {MessageId} for {SubscriptionId}. Pending={PendingCount}, Running={RunningCount}.",
-                    workerIndex,
-                    message.MessageId,
-                    _subscriptionId,
-                    PendingCount,
-                    RunningCount);
+                SafeLog.Try(
+                    (Logger, workerIndex, message.MessageId, _subscriptionId, PendingCount, RunningCount),
+                    static state => state.Logger.LogDebug(
+                        "Pub/Sub background worker {WorkerIndex} handling message {MessageId} for {SubscriptionId}. Pending={PendingCount}, Running={RunningCount}.",
+                        state.workerIndex,
+                        state.MessageId,
+                        state._subscriptionId,
+                        state.PendingCount,
+                        state.RunningCount));
                 await ExecuteHandlerAsync(
                     message,
                     _drainCancellation.Token,
@@ -645,12 +737,16 @@ internal sealed class QueuedGooglePubSubMessageDispatcher : GooglePubSubMessageD
             catch (DurableFlowInterruptedException ex)
             {
                 // The flow engine handed the job back because the host is stopping (Redis/NATS
-                // parity): not a handler failure, so no Error — but the message was ACKed at
-                // enqueue and Pub/Sub will not redeliver it, so surface the hand-back.
-                Logger.LogWarning(
-                    "Pub/Sub background handler for already-ACKed message {MessageId} on {SubscriptionId} was handed back by the flow engine because the host is stopping; Pub/Sub will not redeliver it. Surfacing via OnBackgroundFailure.",
-                    message.MessageId,
-                    _subscriptionId);
+                // parity): not a handler failure — but the message was ACKed at enqueue, Pub/Sub
+                // will not redeliver it, and the transport writes no dead-letter copy, so the
+                // wake-up is lost unless the report records it: an Error, as on every sibling
+                // transport that cannot write a copy.
+                SafeLog.Try(
+                    (Logger, message.MessageId, _subscriptionId),
+                    static state => state.Logger.LogError(
+                        "Pub/Sub background handler for already-ACKed message {MessageId} on {SubscriptionId} was handed back by the flow engine because the host is stopping; Pub/Sub will not redeliver it, and no dead-letter copy can be written for an ACKed message, so the wake-up is lost unless OnBackgroundFailure records it (resume the flow explicitly).",
+                        state.MessageId,
+                        state._subscriptionId));
                 await NotifyBackgroundFailureAsync(
                     message,
                     ex,
@@ -659,11 +755,15 @@ internal sealed class QueuedGooglePubSubMessageDispatcher : GooglePubSubMessageD
             }
             catch (Exception ex)
             {
-                Logger.LogError(
-                    ex,
-                    "Pub/Sub background handler failed for already-ACKed message {MessageId} on {SubscriptionId}.",
-                    message.MessageId,
-                    _subscriptionId);
+                // A throwing logger must not end this loop: the workers are the only thing that
+                // runs the already-ACKed jobs queued behind this one.
+                SafeLog.Try(
+                    (Logger, ex, message.MessageId, _subscriptionId),
+                    static state => state.Logger.LogError(
+                        state.ex,
+                        "Pub/Sub background handler failed for already-ACKed message {MessageId} on {SubscriptionId}.",
+                        state.MessageId,
+                        state._subscriptionId));
                 await NotifyBackgroundFailureAsync(
                     message,
                     ex,

@@ -735,6 +735,55 @@ public sealed class Round34RegressionTests
             Assert.Contains($"sched:per-minute:{occurrence}", attempted);
     }
 
+    /// <summary>
+    /// Fixpoint r2 (GS1#4): a host stop that lands while an occurrence's start is publishing
+    /// cancels the start through the scheduler's stopping token. The starter wrapped that
+    /// cancellation as <see cref="DurableFlowNotDispatchedException"/>, which slipped past the
+    /// loop's stop filter: two false Errors (the starter's "could not be started", the scheduler's
+    /// "will be re-driven") and a re-drive queued for a loop that was stopping. The real starter
+    /// runs here, its publish held until the stopping token fires.
+    /// </summary>
+    [Fact]
+    public async Task ScheduledFlow_HostStopDuringAnOccurrencesPublish_EndsQuietly_WithoutNotDispatchedErrors()
+    {
+        var time = new VirtualTimeProvider(new DateTimeOffset(2030, 1, 1, 0, 0, 30, TimeSpan.Zero));
+        var services = new ServiceCollection();
+        services.AddSingleton<IFlowStateStore>(new InMemoryFlowStateStore(time));
+        await using var provider = services.BuildServiceProvider();
+        var publishing = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var builder = new Mock<IAsyncResponseBuilder>();
+        builder
+            .Setup(instance => instance.EnqueueWorkerAsync(
+                It.IsAny<System.Linq.Expressions.Expression<Func<IDurableFlowExecutor, Task>>>(),
+                It.IsAny<CancellationToken>()))
+            .Returns((System.Linq.Expressions.Expression<Func<IDurableFlowExecutor, Task>> _, CancellationToken token) =>
+            {
+                publishing.TrySetResult();
+                return Task.Delay(Timeout.Infinite, token);
+            });
+        var starterLogger = new CollectingLogger();
+        var schedulerLogger = new CollectingLogger();
+        var flows = new DurableFlowService(
+            provider.GetRequiredService<IServiceScopeFactory>(),
+            builder.Object,
+            new AsyncResponseContextPropagation([]),
+            new DurableFlowOptions(),
+            starterLogger.For<DurableFlowService>(),
+            time);
+
+        using var scheduler = new ScheduledFlowService(flows, [HourlyRegistration()], schedulerLogger.For<ScheduledFlowService>(), time);
+        await scheduler.StartAsync(CancellationToken.None);
+        await WaitForArmedTimerAsync(time);
+        time.Advance(TimeSpan.FromMinutes(59) + TimeSpan.FromSeconds(35));
+        await publishing.Task.WaitAsync(TimeSpan.FromSeconds(30));
+
+        await scheduler.StopAsync(CancellationToken.None);
+
+        Assert.DoesNotContain(starterLogger.Messages, message => message.Contains("could not be started", StringComparison.Ordinal));
+        Assert.DoesNotContain(schedulerLogger.Messages, message => message.Contains("could not publish", StringComparison.Ordinal));
+        Assert.DoesNotContain(schedulerLogger.Messages, message => message.Contains("failed to start", StringComparison.Ordinal));
+    }
+
     private static async Task WaitForArmedTimerAsync(VirtualTimeProvider time)
     {
         var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(10);

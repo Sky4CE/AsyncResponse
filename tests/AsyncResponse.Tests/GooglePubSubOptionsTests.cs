@@ -89,6 +89,34 @@ public class GooglePubSubOptionsTests
             GooglePubSubSubscriberRole.Worker);
     }
 
+    [Theory]
+    [InlineData("googCorrelation")] // the reserved prefix
+    [InlineData("goog")]
+    [InlineData(null)]              // 257 bytes, built below
+    [InlineData("é")]               // 129 × 'é' = 258 bytes in UTF-8, although only 129 characters
+    public void CorrelationIdAttributePubSubWouldReject_FailsAtStartup(string? attribute)
+    {
+        // Red-on-old (fixpoint r2, GS5#5): only blankness was checked, so a key Pub/Sub rejects
+        // passed startup and then every correlated publish failed.
+        attribute = attribute switch
+        {
+            null => new string('a', 257),
+            "é" => new string('é', 129),
+            _ => attribute
+        };
+        var ex = Assert.Throws<InvalidOperationException>(() => GooglePubSubOptionsValidator.ValidateTimeouts(
+            new GooglePubSubAsyncResponseOptions { CorrelationIdAttribute = attribute }));
+        Assert.Contains(nameof(GooglePubSubAsyncResponseOptions.CorrelationIdAttribute), ex.Message, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData("correlationId")] // the default
+    [InlineData("x-correlation")]
+    [InlineData(null)]                 // 256 bytes, built below
+    public void CorrelationIdAttributePubSubAccepts_Starts(string? attribute)
+        => GooglePubSubOptionsValidator.ValidateTimeouts(
+            new GooglePubSubAsyncResponseOptions { CorrelationIdAttribute = attribute ?? new string('a', 256) });
+
     [Fact]
     public void WorkerTransport_Ctor_RequiresWorkerTopicId()
         => Assert.Throws<InvalidOperationException>(

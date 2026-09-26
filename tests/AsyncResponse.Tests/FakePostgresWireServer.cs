@@ -10,7 +10,8 @@ namespace AsyncResponse.Tests;
 /// A loopback server speaking just enough of the PostgreSQL wire protocol (v3) for Npgsql to open
 /// a connection and run parameterless statements, so a unit test can put a real
 /// <c>NpgsqlConnection</c> into states no container produces on cue: a statement the server never
-/// answers (a half-open socket), answers with an error, or answers and then drops the socket.
+/// answers (a half-open socket), answers with an error, or answers and then drops the socket — or
+/// a <c>NOTIFY</c> whose notification does or does not come back (<see cref="Reply.Notification"/>).
 /// Connect with <see cref="ConnectionString"/> (trust auth, no TLS, no type loading).
 /// <para>
 /// Each statement batch (everything up to a <c>Sync</c>) is answered by <see cref="Respond"/>,
@@ -146,7 +147,7 @@ internal sealed class FakePostgresWireServer : IAsyncDisposable
                         var reply = await Respond(session, statement).WaitAsync(token).ConfigureAwait(false);
                         if (reply.Kind == ReplyKind.Close)
                             return;
-                        await stream.WriteAsync(Answer(pending, reply), token).ConfigureAwait(false);
+                        await stream.WriteAsync(Answer(pending, reply, session), token).ConfigureAwait(false);
                         if (reply.CloseAfter)
                             return;
                         pending.Clear();
@@ -191,7 +192,7 @@ internal sealed class FakePostgresWireServer : IAsyncDisposable
         return buffer.ToArray();
     }
 
-    private static byte[] Answer(List<char> batch, Reply reply)
+    private static byte[] Answer(List<char> batch, Reply reply, int session)
     {
         var buffer = new MemoryStream();
         if (reply.Kind == ReplyKind.Error)
@@ -213,6 +214,15 @@ internal sealed class FakePostgresWireServer : IAsyncDisposable
                     case 'D': Write(buffer, 'n', []); break;               // NoData
                     case 'E': Write(buffer, 'C', CString(reply.Text)); break; // CommandComplete
                 }
+            }
+
+            // NotificationResponse, ahead of ReadyForQuery — where PostgreSQL delivers a
+            // session's own NOTIFY back to it at commit.
+            if (reply.Notification is { } notification)
+            {
+                var processId = new byte[4];
+                BinaryPrimitives.WriteInt32BigEndian(processId, session);
+                Write(buffer, 'A', [.. processId, .. CString(notification.Channel), .. CString(notification.Payload)]);
             }
         }
 
@@ -262,9 +272,26 @@ internal sealed class FakePostgresWireServer : IAsyncDisposable
     /// <summary>How the server answers one statement batch.</summary>
     public readonly record struct Reply(ReplyKind Kind, string Text, bool CloseAfter = false)
     {
+        /// <summary>A notification delivered to the session with this reply (a successful one only).</summary>
+        public (string Channel, string Payload)? Notification { get; init; }
+
         /// <summary>Success, tagged with the statement's first word (<c>LISTEN</c>, <c>UNLISTEN</c>, ...).</summary>
         public static Reply Complete(string sql, bool closeAfter = false)
             => new(ReplyKind.Complete, sql.Split(' ', ';')[0].Trim(), closeAfter);
+
+        /// <summary>
+        /// Success, and a <c>NOTIFY "channel", 'payload'</c> statement's notification delivered back
+        /// to the session that sent it — what PostgreSQL does for a session listening on that
+        /// channel. Any other statement is just completed.
+        /// </summary>
+        public static Reply CompleteEchoingNotify(string sql, bool closeAfter = false)
+        {
+            // Npgsql may send the statement without its trailing semicolon.
+            var notify = System.Text.RegularExpressions.Regex.Match(sql, "^NOTIFY \"(?<channel>[^\"]+)\", '(?<payload>[^']*)'");
+            return notify.Success
+                ? Complete(sql, closeAfter) with { Notification = (notify.Groups["channel"].Value, notify.Groups["payload"].Value) }
+                : Complete(sql, closeAfter);
+        }
 
         public static Reply Error(string message) => new(ReplyKind.Error, message);
 

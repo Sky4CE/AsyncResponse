@@ -1539,6 +1539,180 @@ public sealed class AzureServiceBusTransportTests
     }
 
     [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task Subscriber_PrefetchInAckAfterEnqueueMode_WarnsAtStartup(bool worker)
+    {
+        // Red-on-old (fixpoint r2, GS5#3): the prefetch warning covered ack-after-handler only, yet
+        // under early ACK the receive loop parks while the background queue is saturated and the
+        // buffered messages' locks — never renewed — lapse just the same.
+        var logger = new CollectingLogger();
+        var options = new AzureServiceBusAsyncResponseOptions
+        {
+            WorkerQueue = "workers",
+            ResponseQueue = "responses",
+            ReceiveWaitTime = TimeSpan.FromMilliseconds(10)
+        };
+        options.WorkerSubscriber.UseAckAfterEnqueue(1, 8, TimeSpan.FromSeconds(5)).PrefetchCount = 20;
+        options.ResponseSubscriber.UseAckAfterEnqueue(1, 8, TimeSpan.FromSeconds(5)).PrefetchCount = 20;
+        AzureServiceBusSubscriberService subscriber = worker
+            ? new AzureServiceBusWorkerSubscriber(Options.Create(options), new FakeServiceBusClient(), Mock.Of<IAsyncResponseIngress>(), logger.For<AzureServiceBusWorkerSubscriber>())
+            : new AzureServiceBusResponseIngressSubscriber(Options.Create(options), new FakeServiceBusClient(), Mock.Of<IAsyncResponseIngress>(), logger.For<AzureServiceBusResponseIngressSubscriber>());
+
+        await subscriber.StartAsync(CancellationToken.None);
+        await subscriber.StopAsync(CancellationToken.None);
+
+        Assert.Contains(logger.Messages, message => message.Contains("prefetches 20 message(s) in AckAfterEnqueue mode", StringComparison.Ordinal));
+    }
+
+    [Theory]
+    [InlineData(AzureServiceBusAckMode.AckAfterHandlerCompletes, false, true)]  // the 5-minute maximum is advertised, the real LockDuration unknown
+    [InlineData(AzureServiceBusAckMode.AckAfterHandlerCompletes, true, false)]  // renewal: no ceiling at all
+    [InlineData(AzureServiceBusAckMode.AckAfterEnqueue, false, false)]          // completed before the handler runs
+    public async Task WorkerSubscriber_RenewalOff_WarnsThatTheAdvertisedInFlightCeilingIsOnlyAnUpperBound(
+        AzureServiceBusAckMode ackMode,
+        bool renewal,
+        bool expectWarning)
+    {
+        // Red-on-old (fixpoint r2, S8#7): with renewal off the transport advertises the 5-minute
+        // LockDuration maximum to the durable-flow engine while the entity's own LockDuration
+        // (60 s by default) decides redelivery — and, unlike SQS's twin case, nothing said so.
+        var logger = new CollectingLogger();
+        var options = new AzureServiceBusAsyncResponseOptions
+        {
+            WorkerQueue = "workers",
+            ResponseQueue = "responses",
+            ReceiveWaitTime = TimeSpan.FromMilliseconds(10)
+        };
+        if (ackMode is AzureServiceBusAckMode.AckAfterEnqueue)
+            options.WorkerSubscriber.UseAckAfterEnqueue(1, 8, TimeSpan.FromSeconds(5));
+        options.WorkerSubscriber.LockRenewalInterval = renewal ? TimeSpan.FromSeconds(10) : null;
+        var subscriber = new AzureServiceBusWorkerSubscriber(
+            Options.Create(options),
+            new FakeServiceBusClient(),
+            Mock.Of<IAsyncResponseIngress>(),
+            logger.For<AzureServiceBusWorkerSubscriber>());
+
+        await subscriber.StartAsync(CancellationToken.None);
+        await subscriber.StopAsync(CancellationToken.None);
+
+        Assert.Equal(expectWarning, logger.Messages.Any(message => message.Contains("advertises the 5-minute Service Bus maximum", StringComparison.Ordinal)));
+    }
+
+    [Theory]
+    [InlineData(AzureServiceBusAckMode.AckAfterEnqueue)]
+    [InlineData(AzureServiceBusAckMode.AckAfterHandlerCompletes)]
+    public async Task WorkerSubscriber_HostStopBeginsMidReceive_AbandonsTheBatch_AndReceivesNothingMore(AzureServiceBusAckMode ackMode)
+    {
+        // Red-on-old (fixpoint r2, S8#1): the worker kept receiving from ApplicationStopping until
+        // its own stop — registered first, it stops last — and dispatched what it took there:
+        // under early ACK each message was COMPLETED at enqueue, so a flow wake-up the engine's
+        // hand-over had just published for a live replica reached its timer on this stopping host,
+        // was handed back and lost. The batch in hand when the stop begins is now abandoned
+        // instead of dispatched, and the loop receives nothing more.
+        using var host = new DurableFlowContextTestSupport.StoppingHost();
+        var receiver = new FakeReceiver { ReturnAllAvailable = true, OnBatchReceived = host.StopApplication };
+        var client = new FakeServiceBusClient { Receiver = receiver };
+        var logger = new CollectingLogger();
+        var ingress = new Mock<IAsyncResponseIngress>();
+        ingress.Setup(i => i.HandleWorkerMessageAsync(It.IsAny<string>())).Returns(Task.CompletedTask);
+        var options = new AzureServiceBusAsyncResponseOptions
+        {
+            WorkerQueue = "workers",
+            ResponseQueue = "responses",
+            ReceiveWaitTime = TimeSpan.FromMilliseconds(10)
+        };
+        if (ackMode is AzureServiceBusAckMode.AckAfterEnqueue)
+            options.WorkerSubscriber.UseAckAfterEnqueue(1, 8, TimeSpan.FromSeconds(5));
+        var firstCalls = new SettlementCalls();
+        var secondCalls = new SettlementCalls();
+        var subscriber = new AzureServiceBusWorkerSubscriber(
+            Options.Create(options),
+            client,
+            ingress.Object,
+            logger.For<AzureServiceBusWorkerSubscriber>(),
+            host);
+
+        receiver.Enqueue(Delivery(firstCalls, queue: "workers", messageId: "m1", body: "wake-up-1"));
+        receiver.Enqueue(Delivery(secondCalls, queue: "workers", messageId: "m2", body: "wake-up-2"));
+        await subscriber.StartAsync(CancellationToken.None);
+        try
+        {
+            await await Task.WhenAny(firstCalls.Completed.Task, logger.WaitForAsync("stops receiving: the host is stopping"));
+            Assert.False(firstCalls.Completed.Task.IsCompleted, "the worker settled a delivery it took after the host stop began");
+        }
+        finally
+        {
+            await subscriber.StopAsync(CancellationToken.None);
+        }
+
+        ingress.Verify(i => i.HandleWorkerMessageAsync(It.IsAny<string>()), Times.Never);
+        Assert.Equal(0, firstCalls.Complete + secondCalls.Complete);
+        Assert.Equal(1, firstCalls.Abandon);
+        Assert.Equal(1, secondCalls.Abandon);
+        Assert.Equal(1, receiver.ReceiveAttempts); // parked: nothing received after the batch in hand
+    }
+
+    [Fact]
+    public async Task RenewalSweep_RacingTheHandlersOwnComplete_DoesNotReportALostLock()
+    {
+        // Red-on-old (fixpoint r2, S8#11): settlement runs inside the handler call, MarkSettled only
+        // after it returns, so a renewal beat racing the Complete renewed a lock the Complete had
+        // just released — and the MessageLockLost it got back was logged as "lost … redelivers it
+        // while it is still being processed", a false alarm. Here the second renew is in flight
+        // when the handler returns; it fails only after the Complete went through.
+        var receiver = new FakeReceiver();
+        var client = new FakeServiceBusClient { Receiver = receiver };
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var renewInFlight = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var logger = new CollectingLogger();
+        var ingress = new Mock<IAsyncResponseIngress>();
+        ingress.Setup(i => i.HandleWorkerMessageAsync("slow")).Returns(async () => await release.Task);
+        var options = new AzureServiceBusAsyncResponseOptions
+        {
+            WorkerQueue = "workers",
+            ResponseQueue = "responses",
+            ReceiveWaitTime = TimeSpan.FromMilliseconds(10)
+        };
+        options.WorkerSubscriber.LockRenewalInterval = TimeSpan.FromMilliseconds(20);
+        var calls = new SettlementCalls();
+        calls.OnRenewLock = async attempt =>
+        {
+            if (attempt != 2)
+                return;
+
+            renewInFlight.TrySetResult();
+            await calls.Completed.Task; // the handler's Complete reaches the broker first ...
+            throw new ServiceBusException("lock lost", ServiceBusFailureReason.MessageLockLost); // ... so the renew finds no lock
+        };
+        var subscriber = new AzureServiceBusWorkerSubscriber(
+            Options.Create(options),
+            client,
+            ingress.Object,
+            logger.For<AzureServiceBusWorkerSubscriber>());
+
+        receiver.Enqueue(Delivery(calls, queue: "workers", messageId: "m1", body: "slow"));
+        await subscriber.StartAsync(CancellationToken.None);
+        try
+        {
+            await renewInFlight.Task.WaitAsync(TimeSpan.FromSeconds(10));
+            release.TrySetResult();
+            await calls.Completed.Task.WaitAsync(TimeSpan.FromSeconds(10));
+            // The batch joins its renewal task before it ends, so the renew's outcome is logged
+            // by the time the next receive goes out.
+            await WaitUntilAsync(() => receiver.ReceiveAttempts >= 2);
+        }
+        finally
+        {
+            await subscriber.StopAsync(CancellationToken.None);
+        }
+
+        Assert.Equal(1, calls.Complete);
+        Assert.DoesNotContain(logger.Messages, message => message.Contains("is lost and can no longer be renewed", StringComparison.Ordinal));
+        Assert.Contains(logger.Messages, message => message.Contains("failed after its settlement had begun", StringComparison.Ordinal));
+    }
+
+    [Theory]
     [InlineData(AzureServiceBusAckMode.AckAfterHandlerCompletes, false, 5)]
     [InlineData(AzureServiceBusAckMode.AckAfterHandlerCompletes, true, null)]
     [InlineData(AzureServiceBusAckMode.AckAfterEnqueue, false, null)]
@@ -1729,8 +1903,10 @@ public sealed class AzureServiceBusTransportTests
             },
             async cancellationToken =>
             {
-                Interlocked.Increment(ref calls.RenewLock);
+                var attempt = Interlocked.Increment(ref calls.RenewLock);
                 calls.RenewStarted.TrySetResult();
+                if (calls.OnRenewLock is { } onRenewLock)
+                    await onRenewLock(attempt);
                 if (calls.RenewLockException is not null)
                     throw calls.RenewLockException;
                 if (calls.RenewLockBlocksUntilCancelled)
@@ -1749,6 +1925,9 @@ public sealed class AzureServiceBusTransportTests
         public bool RenewLockBlocksUntilCancelled;
         public bool AbandonHangs;
         public Exception? RenewLockException;
+
+        /// <summary>Runs inside each renew with its 1-based attempt number, before RenewLockException applies.</summary>
+        public Func<int, Task>? OnRenewLock;
         public string? DeadLetterReason;
         public string? DeadLetterDescription;
         public TaskCompletionSource Completed { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -1895,6 +2074,9 @@ public sealed class AzureServiceBusTransportTests
         /// <summary>Makes CloseAsync hang past its token, like a link detach the SDK runs with CancellationToken.None.</summary>
         public bool CloseIgnoresToken { get; set; }
 
+        /// <summary>Runs just before a receive hands a non-empty batch over — e.g. the host stop beginning mid-receive.</summary>
+        public Action? OnBatchReceived { get; set; }
+
         public int ReceiveAttempts => Volatile.Read(ref _receiveAttempts);
         public int LastMaxMessages { get; private set; }
         public int CloseCalls => Volatile.Read(ref _closeCalls);
@@ -1939,6 +2121,8 @@ public sealed class AzureServiceBusTransportTests
             var messages = new List<AzureServiceBusTransportDelivery>(maxMessages);
             while ((ReturnAllAvailable || messages.Count < maxMessages) && _deliveries.Reader.TryRead(out var delivery))
                 messages.Add(delivery);
+            if (messages.Count > 0)
+                OnBatchReceived?.Invoke();
             return messages;
         }
 
