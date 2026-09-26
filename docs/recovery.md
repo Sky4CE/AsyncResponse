@@ -283,7 +283,15 @@ nothing published — reports `Degraded`, the same as a scan loop that stopped p
 first scan. Once scanning, `Degraded` also fires when a scan could not probe waiter liveness for
 some entries (a probe outage, or no `IActiveSubscriberProbe` registered): those entries' staleness
 is unknown and never flagged stale by themselves, so without this the check would attest a clean
-pass it never actually computed.
+pass it never actually computed. It fires, too, when the scan found stored registrations this build
+**cannot read** — malformed, an incomplete identity, or a schema version newer than this build
+(expected briefly during a rolling upgrade): its callback cannot run. A response whose
+registrations are all unreadable is refused and redelivered rather than acknowledged unread; one
+beside readable siblings is dispatched to those, and the unreadable one is skipped with a warning.
+Their count is in the `unreadable` stat and the `asyncresponse.recovery.unreadable` gauge, and the
+store logs a warning for each (with its key or correlation id wherever the record still yields
+one — a database row whose JSON will not parse does not). Deploy a build that can read them, or
+remove them.
 
 A scan that **fails** reports `Degraded` with the failure — and "could not read part of the store"
 is a failure, not an empty result. That is a contract on `IRecoveryStateScanner.ScanAsync`: a
@@ -297,6 +305,15 @@ disconnected servers silently: with Redis down the scan enumerated nothing, publ
 registrations, no error", and the health check went from `Degraded` to `Healthy` *because of* the
 outage. Expect the opposite now — a Redis outage shows up here as
 `Async-response watchdog scan failed: …` until the connection is back.
+
+Registrations a scanner can find but cannot interpret are not absence either. Every built-in
+scanner (Redis, NATS, PostgreSQL, SQL Server, MongoDB) yields everything it can read and then
+throws `RecoveryStateScanUnreadableException` with the count of unexpired unreadable
+registrations; the watchdog keeps the readable results — so one corrupt record never hides the
+staleness of the rest — and reports the count, which degrades the check as described above. Earlier
+versions skipped them: a store whose only registrations were unreadable scanned as empty and read
+`Healthy`. A custom `IRecoveryStateScanner` should follow the same contract; any other caller of
+`ScanAsync` sees such a scan fail.
 
 Every cluster scan asks a connected primary for the cluster's own node table (`CLUSTER NODES` —
 one small command next to a walk of the whole keyspace) and ignores any unreachable node the table
@@ -317,8 +334,11 @@ lists has been scanned.
 The Redis scan streams: keys come from `SCAN` asynchronously, and registration blobs are read in
 pipelined batches of 128 (individual `GET`s, so a cluster routes each to its shard) rather than
 one awaited round trip per key — a 100,000-registration keyspace at 2 ms per round trip used to
-spend over three minutes on latency alone before the first liveness probe. `ProbeConcurrency`
-still governs the probe phase that follows.
+spend over three minutes on latency alone before the first liveness probe. The NATS scan does the
+same over its key-value bucket: values are read in concurrent batches of 128 while the key listing
+streams (it used to await one read per key — 100,000 registrations at 5 ms took over eight
+minutes), and a read that fails fails the scan. `ProbeConcurrency` still governs the probe phase
+that follows either one.
 
 ## Recovery-state durability
 
@@ -330,6 +350,13 @@ Recovery state lives in the durable channel's store and survives a redeploy:
   longest-remaining registration — a fresh registration cannot keep a dead sibling recoverable, nor
   truncate a longer-lived one. Registration-list updates are optimistic (transaction-conditioned
   compare-and-set with retries), so concurrent registrations for one correlation id all survive.
+  A committed transaction is not taken as proof that its write landed: Redis runs every queued
+  command and reports each one's own error, so a save or delete whose write Redis rejects fails
+  instead of reporting success (a save that said "persisted" while nothing was written, or a
+  delete that said "removed" while the consumed registration stayed armed). The key's TTL is
+  rounded **up** to a whole millisecond — Redis's expiry precision — so a sub-millisecond
+  lifetime (a tiny `ttl`, or a surviving sibling about to lapse) is no longer sent as the invalid
+  `PX 0`.
   Waiter-liveness probing asks every endpoint `PUBSUB NUMSUB` concurrently: a positive count
   anywhere is proof of a live waiter, and a zero is conclusive once the nodes that could hold the
   subscription have answered. Every endpoint flagged as a primary must have answered, except one

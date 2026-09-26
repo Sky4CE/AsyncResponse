@@ -294,6 +294,9 @@ AsyncResponse.RecoveryState.ResumeCallback.set -> void
 AsyncResponse.RecoveryState.SchemaVersion.get -> int
 AsyncResponse.RecoveryState.SchemaVersion.set -> void
 AsyncResponse.RecoveryStateSchema
+AsyncResponse.RecoveryStateScanUnreadableException
+AsyncResponse.RecoveryStateScanUnreadableException.RecoveryStateScanUnreadableException(int unreadableCount) -> void
+AsyncResponse.RecoveryStateScanUnreadableException.UnreadableCount.get -> int
 AsyncResponse.RecoveryStateUnreadableException
 AsyncResponse.RecoveryStateUnreadableException.CorrelationId.get -> string?
 AsyncResponse.RecoveryStateUnreadableException.RecoveryStateUnreadableException(string? correlationId, int unreadableCount) -> void

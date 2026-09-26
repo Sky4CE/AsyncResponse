@@ -144,7 +144,54 @@ internal sealed class FakeNatsKvStore : INatsKvStore
         }
     }
 
+    /// <summary>Simulated round-trip latency of every <see cref="GetAsync"/> (none by default).</summary>
+    public TimeSpan GetLatency { get; set; }
+
+    /// <summary>When set, <see cref="GetAsync"/> throws the returned exception for a key it maps to one.</summary>
+    public Func<string, Exception?>? GetFailure { get; set; }
+
+    private int _getsInFlight;
+    private int _peakGetsInFlight;
+    private int _getCount;
+
+    /// <summary>The most <see cref="GetAsync"/> calls observed in flight at once.</summary>
+    public int PeakGetsInFlight => Volatile.Read(ref _peakGetsInFlight);
+
+    /// <summary>How many <see cref="GetAsync"/> calls were made.</summary>
+    public int GetCount => Volatile.Read(ref _getCount);
+
+    public void ResetGetStatistics()
+    {
+        Volatile.Write(ref _peakGetsInFlight, 0);
+        Volatile.Write(ref _getCount, 0);
+    }
+
     public async Task<NatsKvEntry?> GetAsync(string key, CancellationToken cancellationToken)
+    {
+        Interlocked.Increment(ref _getCount);
+        var inFlight = Interlocked.Increment(ref _getsInFlight);
+        try
+        {
+            int peak;
+            while (inFlight > (peak = Volatile.Read(ref _peakGetsInFlight))
+                   && Interlocked.CompareExchange(ref _peakGetsInFlight, inFlight, peak) != peak)
+            {
+            }
+
+            if (GetLatency > TimeSpan.Zero)
+                await Task.Delay(GetLatency, cancellationToken);
+            if (GetFailure?.Invoke(key) is { } failure)
+                throw failure;
+
+            return await GetEntryAsync(key);
+        }
+        finally
+        {
+            Interlocked.Decrement(ref _getsInFlight);
+        }
+    }
+
+    private async Task<NatsKvEntry?> GetEntryAsync(string key)
     {
         NatsKvEntry? result;
         lock (_gate)

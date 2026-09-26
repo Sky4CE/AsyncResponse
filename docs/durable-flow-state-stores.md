@@ -144,7 +144,9 @@ The required invariants are:
    — malformed JSON, an unrecognized schema version, a revision inside the JSON that disagrees
    with the stored one, a flow id inside the JSON that is not the key — is **not** absent: it
    throws `FlowStateUnreadableException`, because callers acknowledge a wake-up on `null` and an
-   acknowledged wake-up strands the run that is still in the table.
+   acknowledged wake-up strands the run that is still in the table. For the same reason `null`
+   must be authoritative: a store whose plain reads can miss a present record confirms the
+   absence before reporting it, and throws when it cannot.
 6. `ObserveLeaseAsync` reports the lease **as persisted** — owner and absolute UTC expiry — without
    judging whether it has lapsed: an expired lease nobody has re-acquired is still reported, a
    ledger nobody holds (or an absent one) is `FlowLeaseObservation.Unheld`, and `null` means only
@@ -494,7 +496,16 @@ linearizable read refuses there (a majority snapshot on that node is just as sta
 by `maxTimeMS` (10 s, the default write bound), so while the set is degraded it fails rather than
 blocking — the delivery is then retried, except that `IDurableFlows.ResumeAsync` surfaces the
 failure to its caller and the re-attach check falls through to the normal wait; a standalone
-server rejects the read concern and the store falls back to the plain read there. The MongoDB
+server rejects the read concern and the store falls back to the plain read there — as it does,
+from the first refusal on, on a Mongo-compatible service that refuses the `linearizable` level
+itself (Amazon DocumentDB does); a timeout, step-down or recovering node is never taken for such a
+refusal and fails the read instead. An ordinary
+`LoadAsync` that finds **no** live ledger repeats the read the same way before it answers
+"absent", because absence has no fence behind it either: the engine acknowledges a wake-up on it,
+and a recovered response whose ledger read as absent was consumed with the run still `Running`
+and its step never checkpointed (a deposed primary misses a ledger the new primary created or
+extended). A load that finds its ledger costs nothing extra, and one that cannot confirm absence —
+a degraded set, a deposed primary — fails, so the delivery is retried instead of acknowledged. The MongoDB
 channel pins the same bounded majority (a response or claim whose `wtimeout` lapsed was applied on
 the primary, so the channel reads it back by id with `local` read concern — a majority read,
 inherited from the database, could miss the very write it checks — and acts on what is stored),
@@ -888,6 +899,11 @@ a custom store in production, test all of these against the real backend:
   renewal; and the old owner, unchanged, for a lease that has expired but not been re-acquired.
   A decorator around a store must forward it — the interface default silently downgrades the
   inner store to "cannot report leases";
+- `LoadAsync` answers `null` only for a ledger that is authoritatively absent (or expired): the
+  engine acknowledges a wake-up — and a recovered response — on it. A backend whose plain reads
+  can miss a present record (replica or session reads, a deposed primary) confirms the absence
+  before reporting it and throws when it cannot, as the Cosmos DB (write-path probe) and MongoDB
+  (`linearizable` re-read) stores do;
 - `LoadCurrentAsync` reflects every write the backend acknowledged before the call, including
   another process's. The default (`LoadAsync`) is right for a backend whose reads cannot return an
   older copy of a present record; override it when they can (replica or session reads). A

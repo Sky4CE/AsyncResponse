@@ -234,13 +234,20 @@ public sealed class AsyncResponseWatchdogState
 /// exhausting the store — the counts and stale list then describe the buffered subset only, and
 /// the health check degrades rather than attesting a staleness verdict it cannot back.
 /// </param>
+/// <param name="UnreadableEntries">
+/// Stored, unexpired registrations the scanner found but this build cannot interpret (reported by
+/// <see cref="RecoveryStateScanUnreadableException"/>): malformed, an incomplete identity, or an
+/// unsupported schema version. Not part of the other counts. A response for one of them cannot be
+/// recovered, so the health check degrades rather than reading the store as clean.
+/// </param>
 public sealed record AsyncResponseWatchdogReport(
     int TotalEntries,
     int EntriesWithActiveWaiter,
     IReadOnlyList<RecoveryStateObservation> StaleEntries,
     int UnknownAgeEntries,
     int UnprobeableEntries = 0,
-    bool Truncated = false)
+    bool Truncated = false,
+    int UnreadableEntries = 0)
 {
     /// <summary>
     /// Pure evaluation: an entry is <em>stale</em> when nobody is subscribed to its channel
@@ -528,43 +535,55 @@ internal sealed class AsyncResponseWatchdog : BackgroundService
             Dictionary<string, (DateTime? RegisteredAtUtc, string? PayloadTypeFullName)>? byCorrelationId = null;
             List<(string? CorrelationId, DateTime? RegisteredAtUtc, string? PayloadTypeFullName)>? ungrouped = null;
             var truncated = false;
+            var unreadable = 0;
             int BufferedCount() => (byCorrelationId?.Count ?? 0) + (ungrouped?.Count ?? 0);
 
-            await foreach (var entry in _scanner!.ScanAsync(cancellationToken).ConfigureAwait(false))
+            try
             {
-                if (entry is null)
-                    continue;
-
-                if (string.IsNullOrEmpty(entry.CorrelationId))
+                await foreach (var entry in _scanner!.ScanAsync(cancellationToken).ConfigureAwait(false))
                 {
-                    // The cap gates growth only — replacing an already-buffered correlation id
-                    // with an older sibling costs nothing, so oldest-wins keeps working at the cap.
-                    if (BufferedCount() >= _options.MaxScanEntries)
+                    if (entry is null)
+                        continue;
+
+                    if (string.IsNullOrEmpty(entry.CorrelationId))
                     {
-                        truncated = true;
-                        break;
+                        // The cap gates growth only — replacing an already-buffered correlation id
+                        // with an older sibling costs nothing, so oldest-wins keeps working at the cap.
+                        if (BufferedCount() >= _options.MaxScanEntries)
+                        {
+                            truncated = true;
+                            break;
+                        }
+
+                        (ungrouped ??= []).Add((entry.CorrelationId, entry.RegisteredAtUtc, entry.PayloadTypeFullName));
+                        continue;
                     }
 
-                    (ungrouped ??= []).Add((entry.CorrelationId, entry.RegisteredAtUtc, entry.PayloadTypeFullName));
-                    continue;
-                }
+                    byCorrelationId ??= new Dictionary<string, (DateTime?, string?)>(StringComparer.Ordinal);
+                    if (byCorrelationId.TryGetValue(entry.CorrelationId, out var kept))
+                    {
+                        if (entry.RegisteredAtUtc is { } candidate && (kept.RegisteredAtUtc is not { } existing || candidate < existing))
+                            byCorrelationId[entry.CorrelationId] = (entry.RegisteredAtUtc, entry.PayloadTypeFullName);
+                    }
+                    else
+                    {
+                        if (BufferedCount() >= _options.MaxScanEntries)
+                        {
+                            truncated = true;
+                            break;
+                        }
 
-                byCorrelationId ??= new Dictionary<string, (DateTime?, string?)>(StringComparer.Ordinal);
-                if (byCorrelationId.TryGetValue(entry.CorrelationId, out var kept))
-                {
-                    if (entry.RegisteredAtUtc is { } candidate && (kept.RegisteredAtUtc is not { } existing || candidate < existing))
                         byCorrelationId[entry.CorrelationId] = (entry.RegisteredAtUtc, entry.PayloadTypeFullName);
-                }
-                else
-                {
-                    if (BufferedCount() >= _options.MaxScanEntries)
-                    {
-                        truncated = true;
-                        break;
                     }
-
-                    byCorrelationId[entry.CorrelationId] = (entry.RegisteredAtUtc, entry.PayloadTypeFullName);
                 }
+            }
+            catch (RecoveryStateScanUnreadableException ex)
+            {
+                // The scanner yielded every registration it could read and then reported the ones
+                // it could not: the enumeration is complete, so the readable results still get
+                // their verdict, and the unreadable count degrades the health check (it used to be
+                // dropped inside the scanner, and the check read Healthy).
+                unreadable = ex.UnreadableCount;
             }
 
             // Phase 2 — one liveness probe per unique correlation id, fanned out with bounded
@@ -602,6 +621,14 @@ internal sealed class AsyncResponseWatchdog : BackgroundService
 
             var report = AsyncResponseWatchdogReport.Evaluate(observations, _timeProvider.GetUtcNow().UtcDateTime, _options.StaleAfter);
 
+            if (unreadable > 0)
+            {
+                report = report with { UnreadableEntries = unreadable };
+                _logger.LogWarning(
+                    "Recovery watchdog scan found {Unreadable} stored recovery registration(s) this build cannot read (malformed, incomplete identity, or an unsupported schema version); their recovery callbacks cannot run until a build that can read them, or an operator, resolves them. The store logs a warning for each.",
+                    unreadable);
+            }
+
             if (truncated)
             {
                 // Carried on the report itself, not just telemetry: the health check and gauges
@@ -619,8 +646,9 @@ internal sealed class AsyncResponseWatchdog : BackgroundService
             activity?.SetTag("asyncresponse.watchdog.stale_entries", report.StaleEntries.Count);
             activity?.SetTag("asyncresponse.watchdog.unknown_age_entries", report.UnknownAgeEntries);
             activity?.SetTag("asyncresponse.watchdog.unprobeable_entries", report.UnprobeableEntries);
+            activity?.SetTag("asyncresponse.watchdog.unreadable_entries", report.UnreadableEntries);
 
-            _logger.LogInformation("Recovery watchdog scan complete. Outstanding registrations: {Total}, with live waiter: {Active}, stale (no waiter, older than {StaleAfter}): {Stale}, unknown age: {UnknownAge}, liveness unprobeable: {Unprobeable}.", report.TotalEntries, report.EntriesWithActiveWaiter, _options.StaleAfter, report.StaleEntries.Count, report.UnknownAgeEntries, report.UnprobeableEntries);
+            _logger.LogInformation("Recovery watchdog scan complete. Outstanding registrations: {Total}, with live waiter: {Active}, stale (no waiter, older than {StaleAfter}): {Stale}, unknown age: {UnknownAge}, liveness unprobeable: {Unprobeable}, unreadable: {Unreadable}.", report.TotalEntries, report.EntriesWithActiveWaiter, _options.StaleAfter, report.StaleEntries.Count, report.UnknownAgeEntries, report.UnprobeableEntries, report.UnreadableEntries);
 
             // The id and type name are store-written text (the store is a trust boundary): quoted
             // bounded and escaped like every other persisted name, so a CR/LF inside one cannot

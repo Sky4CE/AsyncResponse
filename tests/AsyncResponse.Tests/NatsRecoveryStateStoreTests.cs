@@ -505,10 +505,17 @@ public class NatsRecoveryStateStoreTests
         Assert.Equal("valid", Assert.Single(await _store.GetAllAsync("mixed-complete")).PayloadTypeFullName);
         Assert.Empty(await _store.GetAllAsync("empty"));
 
+        // The scan yields the readable registration and then reports the newer-schema one (round
+        // 45, F4); the row carrying ANOTHER correlation id is readable and belongs elsewhere — it is
+        // not counted, exactly as GetAllAsync does not count it.
         var scanned = new List<RecoveryState>();
-        await foreach (var state in _store.ScanAsync())
-            scanned.Add(state);
+        var unreadable = await Assert.ThrowsAsync<RecoveryStateScanUnreadableException>(async () =>
+        {
+            await foreach (var state in _store.ScanAsync())
+                scanned.Add(state);
+        });
         Assert.Equal("valid", Assert.Single(scanned).PayloadTypeFullName);
+        Assert.Equal(1, unreadable.UnreadableCount);
     }
 
     [Fact]
@@ -531,12 +538,60 @@ public class NatsRecoveryStateStoreTests
         _time.Advance(TimeSpan.FromMinutes(2));
 
         var states = new List<RecoveryState>();
-        await foreach (var state in _store.ScanAsync())
-            states.Add(state);
+        var unreadable = await Assert.ThrowsAsync<RecoveryStateScanUnreadableException>(async () =>
+        {
+            await foreach (var state in _store.ScanAsync())
+                states.Add(state);
+        });
 
         Assert.Single(states);
         Assert.Equal("corr-live", states[0].CorrelationId);
         Assert.False(_kv.Entries.ContainsKey(NatsSubjectSchema.RecoveryKey("corr-expired")));
+        // The corrupt envelope is not absence: reported once the live entries have been yielded.
+        Assert.Equal(1, unreadable.UnreadableCount);
+    }
+
+    /// <summary>
+    /// Regression (round 45, F2): the scan awaited each envelope before issuing the next read — one
+    /// KV round trip per key, a floor of entries × latency (100,000 entries at 5 ms: over eight
+    /// minutes) before the first liveness probe, which ProbeConcurrency could not shorten. Reads are
+    /// now issued in concurrent batches of <see cref="NatsRecoveryStateStore.ScanReadBatchSize"/>:
+    /// more than one in flight, never more than a batch, and every entry still enumerated.
+    /// </summary>
+    [Fact]
+    public async Task ScanAsync_ReadsEnvelopesInBoundedConcurrentBatches_AndEnumeratesEveryEntry()
+    {
+        const int entries = NatsRecoveryStateStore.ScanReadBatchSize * 2 + 44;
+        for (var i = 0; i < entries; i++)
+            await _store.SaveAsync($"corr-{i}", new RecoveryState { CorrelationId = $"corr-{i}" }, TimeSpan.FromMinutes(10));
+        _kv.ResetGetStatistics();
+        _kv.GetLatency = TimeSpan.FromMilliseconds(5);
+
+        var scanned = new HashSet<string>(StringComparer.Ordinal);
+        await foreach (var state in _store.ScanAsync())
+            Assert.True(scanned.Add(state.CorrelationId!));
+
+        Assert.Equal(entries, scanned.Count);
+        Assert.Equal(entries, _kv.GetCount);
+        Assert.InRange(_kv.PeakGetsInFlight, 2, NatsRecoveryStateStore.ScanReadBatchSize);
+    }
+
+    [Fact]
+    public async Task ScanAsync_AFailedRead_FailsTheScan_InsteadOfSkippingTheKey()
+    {
+        // A key whose value cannot be read is not absent: skipping it would report the
+        // registrations behind it as gone (the scanner contract — IRecoveryStateScanner).
+        await _store.SaveAsync("corr-ok", new RecoveryState { CorrelationId = "corr-ok" }, TimeSpan.FromMinutes(10));
+        await _store.SaveAsync("corr-down", new RecoveryState { CorrelationId = "corr-down" }, TimeSpan.FromMinutes(10));
+        var failedKey = NatsSubjectSchema.RecoveryKey("corr-down");
+        _kv.GetFailure = key => key == failedKey ? new TimeoutException("kv read timed out") : null;
+
+        await Assert.ThrowsAsync<TimeoutException>(async () =>
+        {
+            await foreach (var _ in _store.ScanAsync())
+            {
+            }
+        });
     }
 
     [Fact]

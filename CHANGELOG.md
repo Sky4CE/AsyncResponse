@@ -13,6 +13,53 @@ work that has landed on `main` but not yet shipped. Security reporters credited 
 
 ### Changed
 
+- **Round-45 review (2026-09-26, external review of `7142832`): a stale MongoDB read can no longer
+  consume a recovered response, Redis recovery writes that Redis rejects no longer report success,
+  unreadable recovery registrations degrade the health check, and the NATS recovery scan reads in
+  parallel.**
+  - *MongoDB flow store.* `LoadAsync` answered "absent" from a plain primary read, and a primary
+    that a partition had deposed without noticing still served those — missing a ledger the new
+    primary created or extended. The engine acknowledges on that answer: a lost subscriber's
+    response reached `RecoverAsync`, which logged "no state found" and returned, the dispatcher
+    deleted the registration, and the response was gone with the run still `Running` and its step
+    never checkpointed. A plain load that finds no live ledger now repeats the read with the same
+    bounded `linearizable` read concern `LoadCurrentAsync` uses (10 s `maxTimeMS`), and a set that
+    cannot confirm the absence fails the load, so the delivery is retried. A server that refuses the
+    read concern itself — a standalone, or a Mongo-compatible service without linearizable reads
+    such as Amazon DocumentDB (previously only a standalone was recognized) — makes the store read
+    plainly from then on, for `LoadCurrentAsync` as well; timeouts, step-downs and recovering nodes
+    never count as a refusal (the store logs the fallback once). A load that finds its ledger costs
+    nothing extra; one that finds none costs one linearizable read (a majority-confirmed round trip)
+    — every child flow's first start, `GetStateAsync` or `ResumeAsync` for an unknown id, the
+    explicit-id pre-publish check in `StartAsync`, the scheduler's startup probe of occurrences that
+    never ran. While the set cannot confirm a majority those fail after up to 10 s instead of
+    answering `null` (the scheduler's best-effort startup probe then stops, as on any failed load).
+    The `IFlowStateStore.LoadAsync` contract now states that `null` must be authoritative (the Cosmos DB
+    store already confirmed absence on its write path).
+  - *Redis recovery store.* A committed transaction was taken as proof that its write landed, but
+    Redis runs every queued command and reports each one's own error in the `EXEC` reply. A key
+    lifetime under 1 ms — a sub-millisecond `ttl`, or a surviving sibling about to lapse when a
+    registration was removed — went out as `PX 0`, which Redis rejects: `SaveAsync` reported a
+    registration persisted that was never written, and `TryDeleteAsync` reported a consumed
+    registration removed while it stayed armed. The queued command's outcome is now awaited after a
+    committed `EXEC` (a rejected write throws; the dispatcher logs a failed delete and leaves the
+    registration to its TTL), and the key TTL is rounded up to a whole millisecond.
+  - *Watchdog and health (operator-visible).* The recovery scanners (Redis, NATS, PostgreSQL, SQL
+    Server, MongoDB) skipped registrations they could not read — malformed, an incomplete identity,
+    or a newer schema version — so a store whose only registrations were unreadable scanned as
+    empty and the health check read `Healthy` while delivery refused every response for them. They
+    now yield everything readable and then throw the new
+    `RecoveryStateScanUnreadableException` with the count; the watchdog keeps the readable results
+    and reports `AsyncResponseWatchdogReport.UnreadableEntries`, the check reports **Degraded**
+    (stats `unreadable`), and the new `asyncresponse.recovery.unreadable` gauge carries the count.
+    Expect a brief `Degraded` on replicas still running the older build during a rolling upgrade
+    that raises the recovery schema version. A custom `IRecoveryStateScanner` should follow the
+    same contract; any other caller of `ScanAsync` sees such a scan fail.
+  - *NATS recovery scan.* Each envelope was awaited before the next read was issued — one KV round
+    trip per key, over eight minutes of latency alone for 100,000 registrations at 5 ms. Values
+    are now read in concurrent batches of 128 while the key listing streams; a failed read still
+    fails the scan.
+
 - **Round-44 review (2026-09-26, whole repository): worker intake stops at host stop, a MongoDB
   replication timeout no longer duplicates or strands a response, a rebalance can no longer park
   Kafka partitions for good, and a throwing logging provider no longer changes an outcome.**

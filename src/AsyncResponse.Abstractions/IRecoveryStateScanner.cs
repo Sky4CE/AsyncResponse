@@ -25,6 +25,16 @@ public interface IRecoveryStateScanner
     /// that enumerates as "no registrations" would clear the stuck-flow alarm exactly when the
     /// evidence became unavailable.
     /// </para>
+    /// <para>
+    /// A registration the implementation can find but cannot interpret (malformed, incomplete
+    /// identity, unsupported schema version) is not absence either. Yield every readable
+    /// registration, then throw <see cref="RecoveryStateScanUnreadableException"/> with the count of
+    /// unexpired unreadable ones: the watchdog keeps the readable results and reports the count, and
+    /// the health check degrades on it.
+    /// </para>
     /// </summary>
+    /// <exception cref="RecoveryStateScanUnreadableException">
+    /// Thrown after the enumeration completed, when some stored registrations could not be read.
+    /// </exception>
     IAsyncEnumerable<RecoveryState> ScanAsync(CancellationToken cancellationToken = default);
 }

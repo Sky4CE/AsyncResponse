@@ -1604,6 +1604,42 @@ public sealed class MongoDbChannelCoverageTests
             BsonSerializer.LookupSerializer<MongoChannelMessageDocument>(),
             BsonSerializer.SerializerRegistry)).ToJson();
 
+    /// <summary>
+    /// Regression (round 45, F4): the shared database scanner (PostgreSQL, SQL Server, MongoDB)
+    /// counted unreadable rows and then IGNORED the count, so a scan over corrupt or newer-schema
+    /// registrations completed as if they did not exist and the recovery health check read Healthy.
+    /// The readable rows are still yielded; the rest is reported once they have been.
+    /// </summary>
+    [Fact]
+    public async Task MongoDbRecoveryStateStore_Scan_ReportsUnreadableRows_AfterYieldingTheReadableOnes()
+    {
+        var fixture = new ChannelFixture();
+        var readable = System.Text.Json.JsonSerializer.Serialize(new RecoveryState { CorrelationId = "corr-ok", RegistrationId = Guid.NewGuid() });
+        var newerSchema = System.Text.Json.JsonSerializer.Serialize(new RecoveryState
+        {
+            CorrelationId = "corr-new",
+            RegistrationId = Guid.NewGuid(),
+            SchemaVersion = RecoveryStateSchema.Current + 1
+        });
+        fixture.Recovery
+            .Setup(c => c.FindAsync(
+                It.IsAny<FilterDefinition<MongoRecoveryStateDocument>>(),
+                It.IsAny<FindOptions<MongoRecoveryStateDocument, string>>(),
+                It.IsAny<CancellationToken>()))
+            .ReturnsAsync(() => new MongoListCursor<string>([readable, "{not-json", newerSchema]));
+        var recoveryStore = new MongoDbRecoveryStateStore(fixture.Store, NullLogger<MongoDbRecoveryStateStore>.Instance);
+
+        var scanned = new List<RecoveryState>();
+        var unreadable = await Assert.ThrowsAsync<RecoveryStateScanUnreadableException>(async () =>
+        {
+            await foreach (var state in recoveryStore.ScanAsync())
+                scanned.Add(state);
+        });
+
+        Assert.Equal("corr-ok", Assert.Single(scanned).CorrelationId);
+        Assert.Equal(2, unreadable.UnreadableCount);
+    }
+
     [Fact]
     public async Task MongoDbRecoveryStateStore_ThrowsOnMismatchedCorrelationId()
     {

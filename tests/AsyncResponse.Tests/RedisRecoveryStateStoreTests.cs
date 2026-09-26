@@ -834,9 +834,15 @@ public class RedisRecoveryStateStoreTests
             .ReturnsAsync("null");
 
         var states = new List<RecoveryState>();
-        await foreach (var state in _store.ScanAsync())
-            states.Add(state);
+        var unreadable = await Assert.ThrowsAsync<RecoveryStateScanUnreadableException>(async () =>
+        {
+            await foreach (var state in _store.ScanAsync())
+                states.Add(state);
+        });
 
+        // The corrupt blob is reported (round 45, F4), not skipped — and only once every readable
+        // registration has been yielded.
+        Assert.Equal(1, unreadable.UnreadableCount);
         Assert.Equal(2, states.Count);
         Assert.Contains(states, state => state.CorrelationId == "corr-a");
         Assert.Contains(states, state => state.CorrelationId == "corr-b");
@@ -1372,6 +1378,158 @@ public class RedisRecoveryStateStoreTests
         _multiplexer
             .Setup(m => m.GetServer(It.IsAny<EndPoint>(), It.IsAny<object?>()))
             .Returns<EndPoint, object?>((endPoint, _) => servers[Array.IndexOf(endPoints, endPoint)].Object);
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // Round 45, F3 — a Redis transaction reports EXEC's outcome, not the queued commands': Redis
+    // runs every queued command and returns each one's own error in the EXEC reply, so ExecuteAsync
+    // answered true while the SET had been rejected (a sub-millisecond TTL went out as PX 0,
+    // "invalid expire time"). SaveAsync reported a registration persisted that was never written,
+    // and TryDeleteAsync reported a consumed registration removed while it stayed armed.
+
+    /// <summary>A transaction whose EXEC commits and whose queued write faults with <paramref name="rejection"/>.</summary>
+    private Mock<ITransaction> SetupCommittedTransactionWhoseWriteFails(Exception rejection)
+    {
+        var transaction = new Mock<ITransaction>();
+        transaction
+            .Setup(t => t.StringSetAsync(It.IsAny<RedisKey>(), It.IsAny<RedisValue>(), It.IsAny<TimeSpan?>(), It.IsAny<When>(), It.IsAny<CommandFlags>()))
+            .Returns(Task.FromException<bool>(rejection));
+        transaction
+            .Setup(t => t.StringSetAsync(It.IsAny<RedisKey>(), It.IsAny<RedisValue>(), It.IsAny<Expiration>(), It.IsAny<ValueCondition>(), It.IsAny<CommandFlags>()))
+            .Returns(Task.FromException<bool>(rejection));
+        transaction
+            .Setup(t => t.KeyDeleteAsync(It.IsAny<RedisKey>(), It.IsAny<CommandFlags>()))
+            .Returns(Task.FromException<bool>(rejection));
+        transaction
+            .Setup(t => t.ExecuteAsync(It.IsAny<CommandFlags>()))
+            .ReturnsAsync(true);
+        _database
+            .Setup(d => d.CreateTransaction(It.IsAny<object?>()))
+            .Returns(transaction.Object);
+        return transaction;
+    }
+
+    private static RedisServerException InvalidExpireTime()
+        => new(RedisErrorKind.UnknownError, CommandFlags.None, "ERR invalid expire time in 'set' command");
+
+    [Fact]
+    public async Task SaveAsync_AWriteRedisRejectsInsideACommittedTransaction_FailsTheSave()
+    {
+        _database
+            .Setup(d => d.StringGetAsync((RedisKey)"ar:recovery:corr-a", It.IsAny<CommandFlags>()))
+            .ReturnsAsync(RedisValue.Null);
+        var rejection = InvalidExpireTime();
+        SetupCommittedTransactionWhoseWriteFails(rejection);
+
+        var error = await Assert.ThrowsAsync<RedisServerException>(() => _store.SaveAsync(
+            "corr-a",
+            new RecoveryState { RegistrationId = Guid.NewGuid(), CorrelationId = "corr-a" },
+            TimeSpan.FromMinutes(3)));
+
+        Assert.Same(rejection, error);
+    }
+
+    [Theory]
+    [InlineData(1)]   // the last registration: the key is deleted
+    [InlineData(2)]   // a survivor remains: the key is rewritten
+    public async Task TryDeleteAsync_AMutationRedisRejectsInsideACommittedTransaction_IsNotReportedAsDeleted(int registrations)
+    {
+        var targetId = Guid.NewGuid();
+        var states = new List<(RecoveryState State, DateTimeOffset ExpiresAtUtc)>
+        {
+            (new RecoveryState { RegistrationId = targetId, CorrelationId = "corr-a" }, _time.Now + TimeSpan.FromMinutes(5))
+        };
+        if (registrations == 2)
+            states.Add((new RecoveryState { RegistrationId = Guid.NewGuid(), CorrelationId = "corr-a" }, _time.Now + TimeSpan.FromMinutes(5)));
+        _database
+            .Setup(d => d.StringGetAsync((RedisKey)"ar:recovery:corr-a", It.IsAny<CommandFlags>()))
+            .ReturnsAsync(EnvelopeBlob(states.ToArray()));
+        var rejection = InvalidExpireTime();
+        SetupCommittedTransactionWhoseWriteFails(rejection);
+
+        var error = await Assert.ThrowsAsync<RedisServerException>(() => _store.TryDeleteAsync("corr-a", targetId));
+
+        Assert.Same(rejection, error);
+    }
+
+    /// <summary>
+    /// The cause of the rejection above: key expiry is milliseconds, and SE.Redis sends a TimeSpan
+    /// that is not whole seconds as <c>PX</c> with its milliseconds truncated — so any key lifetime
+    /// under 1 ms went out as <c>PX 0</c>. The key TTL is now rounded UP to a whole millisecond,
+    /// both for a save and for a delete whose surviving sibling is about to lapse.
+    /// </summary>
+    [Theory]
+    [InlineData(5_000L, "PX 1")]       // 0.5 ms
+    [InlineData(15_000L, "PX 2")]      // 1.5 ms: rounded up, never before the entry's own expiry
+    [InlineData(30_000_000L, "EX 3")]  // whole seconds are unchanged
+    public async Task SaveAsync_KeyTtl_IsRoundedUpToAWholeMillisecond(long ttlTicks, string expected)
+    {
+        _database
+            .Setup(d => d.StringGetAsync((RedisKey)"ar:recovery:corr-a", It.IsAny<CommandFlags>()))
+            .ReturnsAsync(RedisValue.Null);
+        SetupTransactions(true);
+
+        await _store.SaveAsync(
+            "corr-a",
+            new RecoveryState { RegistrationId = Guid.NewGuid(), CorrelationId = "corr-a" },
+            TimeSpan.FromTicks(ttlTicks));
+
+        var stringSet = Assert.Single(Assert.Single(_transactions).Invocations, invocation => invocation.Method.Name == nameof(IDatabase.StringSetAsync));
+        Assert.Equal(expected, stringSet.Arguments[2]!.ToString());
+    }
+
+    [Fact]
+    public async Task TryDeleteAsync_ASurvivorAboutToLapse_KeepsAWholeMillisecondKeyTtl()
+    {
+        var targetId = Guid.NewGuid();
+        _database
+            .Setup(d => d.StringGetAsync((RedisKey)"ar:recovery:corr-a", It.IsAny<CommandFlags>()))
+            .ReturnsAsync(EnvelopeBlob(
+                (new RecoveryState { RegistrationId = targetId, CorrelationId = "corr-a" }, _time.Now + TimeSpan.FromMinutes(5)),
+                (new RecoveryState { RegistrationId = Guid.NewGuid(), CorrelationId = "corr-a" }, _time.Now + TimeSpan.FromTicks(4_000))));
+        SetupTransactions(true);
+
+        Assert.True(await _store.TryDeleteAsync("corr-a", targetId));
+
+        var stringSet = Assert.Single(Assert.Single(_transactions).Invocations, invocation => invocation.Method.Name == nameof(IDatabase.StringSetAsync));
+        Assert.Equal("PX 1", stringSet.Arguments[2]!.ToString());
+    }
+
+    /// <summary>
+    /// Guard for the fix above: an ABORTED transaction (the CAS condition failed) cancels its queued
+    /// commands, and those tasks must not be awaited — the conflict is retried as before.
+    /// </summary>
+    [Fact]
+    public async Task SaveAsync_AConflictCancelsTheQueuedWrite_AndIsStillRetried()
+    {
+        _database
+            .Setup(d => d.StringGetAsync((RedisKey)"ar:recovery:corr-a", It.IsAny<CommandFlags>()))
+            .ReturnsAsync(RedisValue.Null);
+        var attempts = new List<Mock<ITransaction>>();
+        _database
+            .Setup(d => d.CreateTransaction(It.IsAny<object?>()))
+            .Returns(() =>
+            {
+                var committed = attempts.Count > 0;
+                var transaction = new Mock<ITransaction>();
+                var write = committed ? Task.FromResult(true) : Task.FromCanceled<bool>(new CancellationToken(canceled: true));
+                transaction
+                    .Setup(t => t.StringSetAsync(It.IsAny<RedisKey>(), It.IsAny<RedisValue>(), It.IsAny<TimeSpan?>(), It.IsAny<When>(), It.IsAny<CommandFlags>()))
+                    .Returns(write);
+                transaction
+                    .Setup(t => t.StringSetAsync(It.IsAny<RedisKey>(), It.IsAny<RedisValue>(), It.IsAny<Expiration>(), It.IsAny<ValueCondition>(), It.IsAny<CommandFlags>()))
+                    .Returns(write);
+                transaction.Setup(t => t.ExecuteAsync(It.IsAny<CommandFlags>())).ReturnsAsync(committed);
+                attempts.Add(transaction);
+                return transaction.Object;
+            });
+
+        await _store.SaveAsync(
+            "corr-a",
+            new RecoveryState { RegistrationId = Guid.NewGuid(), CorrelationId = "corr-a" },
+            TimeSpan.FromMinutes(3));
+
+        Assert.Equal(2, attempts.Count);
     }
 
     /// <summary>Arranges one keyspace for the asynchronous enumeration and both synchronous overloads.</summary>

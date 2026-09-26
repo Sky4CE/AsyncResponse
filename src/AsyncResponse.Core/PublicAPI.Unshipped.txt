@@ -20,8 +20,8 @@ AsyncResponse.AsyncResponseRecoveryHealthCheck.AsyncResponseRecoveryHealthCheck(
 AsyncResponse.AsyncResponseRecoveryHealthCheck.CheckHealthAsync(Microsoft.Extensions.Diagnostics.HealthChecks.HealthCheckContext! context, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task<Microsoft.Extensions.Diagnostics.HealthChecks.HealthCheckResult>!
 AsyncResponse.AsyncResponseRecoveryStats
 AsyncResponse.AsyncResponseRecoveryStats.<Clone>$() -> AsyncResponse.AsyncResponseRecoveryStats!
-AsyncResponse.AsyncResponseRecoveryStats.AsyncResponseRecoveryStats(int OutstandingRegistrations, int WithLiveWaiter, int Stale, int UnknownAge, int Unprobeable = 0) -> void
-AsyncResponse.AsyncResponseRecoveryStats.Deconstruct(out int OutstandingRegistrations, out int WithLiveWaiter, out int Stale, out int UnknownAge, out int Unprobeable) -> void
+AsyncResponse.AsyncResponseRecoveryStats.AsyncResponseRecoveryStats(int OutstandingRegistrations, int WithLiveWaiter, int Stale, int UnknownAge, int Unprobeable = 0, int Unreadable = 0) -> void
+AsyncResponse.AsyncResponseRecoveryStats.Deconstruct(out int OutstandingRegistrations, out int WithLiveWaiter, out int Stale, out int UnknownAge, out int Unprobeable, out int Unreadable) -> void
 AsyncResponse.AsyncResponseRecoveryStats.Equals(AsyncResponse.AsyncResponseRecoveryStats? other) -> bool
 AsyncResponse.AsyncResponseRecoveryStats.OutstandingRegistrations.get -> int
 AsyncResponse.AsyncResponseRecoveryStats.OutstandingRegistrations.init -> void
@@ -31,6 +31,8 @@ AsyncResponse.AsyncResponseRecoveryStats.UnknownAge.get -> int
 AsyncResponse.AsyncResponseRecoveryStats.UnknownAge.init -> void
 AsyncResponse.AsyncResponseRecoveryStats.Unprobeable.get -> int
 AsyncResponse.AsyncResponseRecoveryStats.Unprobeable.init -> void
+AsyncResponse.AsyncResponseRecoveryStats.Unreadable.get -> int
+AsyncResponse.AsyncResponseRecoveryStats.Unreadable.init -> void
 AsyncResponse.AsyncResponseRecoveryStats.WithLiveWaiter.get -> int
 AsyncResponse.AsyncResponseRecoveryStats.WithLiveWaiter.init -> void
 AsyncResponse.AsyncResponseStaleRecoveryEntry
@@ -63,8 +65,8 @@ AsyncResponse.AsyncResponseWatchdogOptions.StartupDelay.get -> System.TimeSpan
 AsyncResponse.AsyncResponseWatchdogOptions.StartupDelay.set -> void
 AsyncResponse.AsyncResponseWatchdogReport
 AsyncResponse.AsyncResponseWatchdogReport.<Clone>$() -> AsyncResponse.AsyncResponseWatchdogReport!
-AsyncResponse.AsyncResponseWatchdogReport.AsyncResponseWatchdogReport(int TotalEntries, int EntriesWithActiveWaiter, System.Collections.Generic.IReadOnlyList<AsyncResponse.RecoveryStateObservation!>! StaleEntries, int UnknownAgeEntries, int UnprobeableEntries = 0, bool Truncated = false) -> void
-AsyncResponse.AsyncResponseWatchdogReport.Deconstruct(out int TotalEntries, out int EntriesWithActiveWaiter, out System.Collections.Generic.IReadOnlyList<AsyncResponse.RecoveryStateObservation!>! StaleEntries, out int UnknownAgeEntries, out int UnprobeableEntries, out bool Truncated) -> void
+AsyncResponse.AsyncResponseWatchdogReport.AsyncResponseWatchdogReport(int TotalEntries, int EntriesWithActiveWaiter, System.Collections.Generic.IReadOnlyList<AsyncResponse.RecoveryStateObservation!>! StaleEntries, int UnknownAgeEntries, int UnprobeableEntries = 0, bool Truncated = false, int UnreadableEntries = 0) -> void
+AsyncResponse.AsyncResponseWatchdogReport.Deconstruct(out int TotalEntries, out int EntriesWithActiveWaiter, out System.Collections.Generic.IReadOnlyList<AsyncResponse.RecoveryStateObservation!>! StaleEntries, out int UnknownAgeEntries, out int UnprobeableEntries, out bool Truncated, out int UnreadableEntries) -> void
 AsyncResponse.AsyncResponseWatchdogReport.EntriesWithActiveWaiter.get -> int
 AsyncResponse.AsyncResponseWatchdogReport.EntriesWithActiveWaiter.init -> void
 AsyncResponse.AsyncResponseWatchdogReport.Equals(AsyncResponse.AsyncResponseWatchdogReport? other) -> bool
@@ -78,6 +80,8 @@ AsyncResponse.AsyncResponseWatchdogReport.UnknownAgeEntries.get -> int
 AsyncResponse.AsyncResponseWatchdogReport.UnknownAgeEntries.init -> void
 AsyncResponse.AsyncResponseWatchdogReport.UnprobeableEntries.get -> int
 AsyncResponse.AsyncResponseWatchdogReport.UnprobeableEntries.init -> void
+AsyncResponse.AsyncResponseWatchdogReport.UnreadableEntries.get -> int
+AsyncResponse.AsyncResponseWatchdogReport.UnreadableEntries.init -> void
 AsyncResponse.AsyncResponseWatchdogSnapshot
 AsyncResponse.AsyncResponseWatchdogSnapshot.<Clone>$() -> AsyncResponse.AsyncResponseWatchdogSnapshot!
 AsyncResponse.AsyncResponseWatchdogSnapshot.AsyncResponseWatchdogSnapshot(System.DateTime ScanCompletedUtc, System.TimeSpan ScanInterval, AsyncResponse.AsyncResponseWatchdogReport? Report, string? Error) -> void

@@ -402,6 +402,9 @@ public static class AsyncResponseDiagnostics
         Meter.CreateObservableGauge("asyncresponse.recovery.unprobeable",
             static () => (long)(Volatile.Read(ref _watchdogState)?.Latest?.Report?.UnprobeableEntries ?? 0), unit: "{entry}",
             description: "Recovery registrations whose waiter liveness could not be probed at the last watchdog scan — staleness is unknown for these.");
+        Meter.CreateObservableGauge("asyncresponse.recovery.unreadable",
+            static () => (long)(Volatile.Read(ref _watchdogState)?.Latest?.Report?.UnreadableEntries ?? 0), unit: "{entry}",
+            description: "Stored recovery registrations the last watchdog scan found but this build cannot read — responses for them cannot be recovered.");
     }
 
     /// <summary>

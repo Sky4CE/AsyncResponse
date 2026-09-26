@@ -15,7 +15,8 @@ public sealed record AsyncResponseRecoveryStats(
     [property: JsonPropertyName("withLiveWaiter")] int WithLiveWaiter,
     [property: JsonPropertyName("stale")] int Stale,
     [property: JsonPropertyName("unknownAge")] int UnknownAge,
-    [property: JsonPropertyName("unprobeable")] int Unprobeable = 0);
+    [property: JsonPropertyName("unprobeable")] int Unprobeable = 0,
+    [property: JsonPropertyName("unreadable")] int Unreadable = 0);
 
 /// <summary>
 /// One stale recovery registration listed under the <c>staleEntries</c> key of the recovery
@@ -42,7 +43,8 @@ public sealed record AsyncResponseStaleRecoveryEntry(
 /// the watchdog is inside its first-scan budget (it starts with a delay, and readiness must not
 /// block on it); or this host's watchdog is deliberately idle (disabled, or the channel has no
 /// scanner — the multi-host pattern), reported as explicit data rather than an alert.</description></item>
-/// <item><description><b>Degraded</b> — stale entries exist, the last scan failed, the last scan
+/// <item><description><b>Degraded</b> — stale entries exist, stored registrations are unreadable by
+/// this build (their recovery callbacks cannot run), the last scan failed, the last scan
 /// was truncated at the buffer cap (its verdict covers a subset only), waiter liveness could not
 /// be probed for some entries (their staleness is unknown), or the watchdog stopped publishing
 /// (snapshot older than twice the scan interval plus the interval jitter, or no first snapshot
@@ -91,6 +93,16 @@ public sealed class AsyncResponseRecoveryHealthCheck(AsyncResponseWatchdogState 
         {
             return HealthCheckResult.Degraded(
                 $"{report.StaleEntries.Count} async-response flow(s) look stuck: persisted recovery state with no live waiter and no response. Investigate and resume or fail them.",
+                data: BuildData(snapshot));
+        }
+
+        if (report.UnreadableEntries > 0)
+        {
+            // Unreadable registrations are not in any other count, so without this a store whose
+            // only registrations were corrupt or newer-schema read as a clean, empty pass while
+            // every response for them would be refused at delivery.
+            return HealthCheckResult.Degraded(
+                $"{report.UnreadableEntries} stored async-response recovery registration(s) are unreadable by this build (malformed, incomplete identity, or an unsupported schema version); their recovery callbacks cannot run. Deploy a build that can read them, or remove them (the store logs a warning for each).",
                 data: BuildData(snapshot));
         }
 
@@ -186,7 +198,8 @@ public sealed class AsyncResponseRecoveryHealthCheck(AsyncResponseWatchdogState 
             report.EntriesWithActiveWaiter,
             report.StaleEntries.Count,
             report.UnknownAgeEntries,
-            report.UnprobeableEntries);
+            report.UnprobeableEntries,
+            report.UnreadableEntries);
 
         if (report.StaleEntries.Count > 0)
         {

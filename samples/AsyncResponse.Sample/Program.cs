@@ -2546,13 +2546,21 @@ app.MapDelete("/test/recovery/{correlationId}", async (IRecoveryStateStore store
 app.MapPost("/test/reset", async (IRecoveryStateScanner scanner, IRecoveryStateStore store, FlowRecorder recorder, CancellationToken cancellationToken) =>
 {
     var deleted = 0;
-    await foreach (var state in scanner.ScanAsync(cancellationToken))
+    try
     {
-        if (!string.IsNullOrWhiteSpace(state.CorrelationId)
-            && await store.TryDeleteAsync(state.CorrelationId, state.RegistrationId, cancellationToken))
+        await foreach (var state in scanner.ScanAsync(cancellationToken))
         {
-            deleted++;
+            if (!string.IsNullOrWhiteSpace(state.CorrelationId)
+                && await store.TryDeleteAsync(state.CorrelationId, state.RegistrationId, cancellationToken))
+            {
+                deleted++;
+            }
         }
+    }
+    catch (RecoveryStateScanUnreadableException)
+    {
+        // Thrown after every readable registration was yielded (and deleted above); the
+        // unreadable rest has no registration id this build can delete by, as before.
     }
 
     recorder.Clear();

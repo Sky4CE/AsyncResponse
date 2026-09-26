@@ -34,6 +34,56 @@ public class WatchdogScanAttestationTests
         Assert.Contains("probe", result.Description!, StringComparison.OrdinalIgnoreCase);
     }
 
+    /// <summary>
+    /// Regression (round 45, F4), end to end: a recovery store holding a corrupt registration
+    /// refused it at delivery (RecoveryStateUnreadableException), but its scan skipped it — the scan
+    /// completed with zero registrations and the health check read Healthy, while the response it
+    /// guards could not be recovered. The store is the real NATS scanner over an in-memory bucket.
+    /// </summary>
+    [Fact]
+    public async Task ACorruptStoredRegistration_DegradesTheHealthCheck_InsteadOfReadingAsAnEmptyStore()
+    {
+        var kv = new FakeNatsKvStore();
+        kv.Entries[AsyncResponse.Channels.NATS.NatsSubjectSchema.RecoveryKey("corrupt-cid")] = "{not-json";
+        var scanner = new AsyncResponse.Channels.NATS.NatsRecoveryStateStore(
+            kv,
+            Microsoft.Extensions.Options.Options.Create(new AsyncResponse.Channels.NATS.NatsAsyncResponseChannelOptions()),
+            NullLogger<AsyncResponse.Channels.NATS.NatsRecoveryStateStore>.Instance);
+        var state = new AsyncResponseWatchdogState();
+
+        var snapshot = await RunUntilPublishedAsync(Build(state, Options(), scanner, new FakeProbe(0)), state);
+
+        Assert.Null(snapshot.Error);
+        Assert.Equal(1, snapshot.Report!.UnreadableEntries);
+        var result = await new AsyncResponseRecoveryHealthCheck(state).CheckHealthAsync(new HealthCheckContext());
+        Assert.Equal(HealthStatus.Degraded, result.Status);
+        Assert.Contains("unreadable", result.Description!, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The reason the count is reported at the END of the enumeration rather than by failing the
+    /// scan at the first unreadable record: one corrupt record must not blind the staleness verdict
+    /// for every readable registration.
+    /// </summary>
+    [Fact]
+    public async Task UnreadableRegistrations_DoNotHideTheReadableOnesStaleness()
+    {
+        var state = new AsyncResponseWatchdogState();
+        var watchdog = Build(state, Options(), new UnreadableTailScanner(2, StaleEntry("stuck-cid")), new FakeProbe(0));
+
+        var snapshot = await RunUntilPublishedAsync(watchdog, state);
+
+        Assert.Null(snapshot.Error);
+        Assert.Equal(2, snapshot.Report!.UnreadableEntries);
+        Assert.Equal(1, snapshot.Report.TotalEntries);
+        Assert.Equal("stuck-cid", Assert.Single(snapshot.Report.StaleEntries).CorrelationId);
+        var result = await new AsyncResponseRecoveryHealthCheck(state).CheckHealthAsync(new HealthCheckContext());
+        Assert.Equal(HealthStatus.Degraded, result.Status);
+        var stats = Assert.IsType<AsyncResponseRecoveryStats>(result.Data["stats"]);
+        Assert.Equal(1, stats.Stale);
+        Assert.Equal(2, stats.Unreadable);
+    }
+
     [Fact]
     public async Task DisabledHost_HealthCheckReportsThisHostDoesNotScan()
     {
@@ -307,6 +357,19 @@ public class WatchdogScanAttestationTests
             foreach (var state in states)
                 yield return state;
             await Task.CompletedTask;
+        }
+    }
+
+    /// <summary>Yields <paramref name="states"/>, then reports <paramref name="unreadable"/> registrations it could not read.</summary>
+    private sealed class UnreadableTailScanner(int unreadable, params RecoveryState[] states) : IRecoveryStateScanner
+    {
+        public async IAsyncEnumerable<RecoveryState> ScanAsync(
+            [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken cancellationToken = default)
+        {
+            foreach (var state in states)
+                yield return state;
+            await Task.CompletedTask;
+            throw new RecoveryStateScanUnreadableException(unreadable);
         }
     }
 

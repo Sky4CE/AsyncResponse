@@ -1,4 +1,6 @@
 using AsyncResponse.DurableFlows.MongoDB;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
 using MongoDB.Bson;
 using MongoDB.Bson.Serialization;
@@ -262,15 +264,152 @@ public sealed class MongoDbFlowStateStoreTests
                 It.IsAny<CancellationToken>()),
             Times.Never);
 
-        // The plain load keeps the inherited read concern: it is revision- or lease-fenced downstream.
+        // The plain load reads with the inherited read concern, and confirms an absence with the
+        // same bounded linearizable read before reporting it (see the stale-absence facts below).
+        currentOptions = null;
         Assert.Null(await harness.Store.LoadAsync("flow"));
-        harness.Current.Verify(
+        harness.Collection.Verify(
             item => item.FindAsync(
                 It.IsAny<FilterDefinition<MongoFlowStateDocument>>(),
                 It.IsAny<FindOptions<MongoFlowStateDocument, MongoFlowStateDocument>>(),
                 It.IsAny<CancellationToken>()),
             Times.Once);
+        harness.VerifyLinearizableReads(Times.Exactly(2));
+        Assert.Equal(TimeSpan.FromSeconds(10), currentOptions!.MaxTime);
     }
+
+    /// <summary>
+    /// Regression (round 45, F1): LoadAsync answered "absent" from a plain primary read. A primary
+    /// that a partition has deposed without its noticing still serves such reads and misses a
+    /// ledger the new primary created or extended — and null is the one answer callers acknowledge
+    /// a wake-up on (the recovery path deleted its registration on it, consuming the response). An
+    /// absence is now confirmed with the linearizable read before it is reported: the ledger the
+    /// plain read missed is returned, and a set that cannot confirm fails the load instead of
+    /// answering null. A load whose plain read finds the ledger pays nothing extra.
+    /// </summary>
+    [Fact]
+    public async Task Load_APlainReadThatMissesTheLedger_ConfirmsLinearizably_BeforeReportingAbsence()
+    {
+        using var harness = new MongoHarness(new BsonDocument { ["ok"] = 1 });
+        var document = LedgerDocument(PendingRun("flow", "corr"));
+        harness.OnlyTheLinearizableReadFinds(document);
+
+        var loaded = await harness.Store.LoadAsync("flow");
+
+        Assert.NotNull(loaded);
+        Assert.Equal(document.Revision, loaded!.Revision);
+        Assert.Equal("corr", loaded.Steps!["step"].PendingCorrelationId);
+
+        // A set that cannot confirm the absence (degraded, or this node was deposed) fails the load.
+        var connectionId = new ConnectionId(new ServerId(new ClusterId(), new DnsEndPoint("localhost", 27017)));
+        harness.Current
+            .Setup(item => item.FindAsync(
+                It.IsAny<FilterDefinition<MongoFlowStateDocument>>(),
+                It.IsAny<FindOptions<MongoFlowStateDocument, MongoFlowStateDocument>>(),
+                It.IsAny<CancellationToken>()))
+            .ThrowsAsync(new MongoExecutionTimeoutException(connectionId, "operation exceeded time limit"));
+        await Assert.ThrowsAsync<MongoExecutionTimeoutException>(() => harness.Store.LoadAsync("flow"));
+
+        // A plain read that finds the ledger never asks for the confirmation.
+        harness.Collection
+            .Setup(item => item.FindAsync(
+                It.IsAny<FilterDefinition<MongoFlowStateDocument>>(),
+                It.IsAny<FindOptions<MongoFlowStateDocument, MongoFlowStateDocument>>(),
+                It.IsAny<CancellationToken>()))
+            .ReturnsAsync(() => new MongoListCursor<MongoFlowStateDocument>([document]));
+        harness.Current.Invocations.Clear();
+        Assert.NotNull(await harness.Store.LoadAsync("flow"));
+        harness.VerifyLinearizableReads(Times.Never());
+    }
+
+    /// <summary>
+    /// Regression (round 45, F1), end to end: a lost subscriber's response reaches
+    /// <see cref="DurableFlowExecutor.RecoverAsync"/> on a process whose plain reads miss the
+    /// Running ledger that holds the matching breadcrumb. RecoverAsync used to log "no state found"
+    /// and RETURN — the dispatcher reads a normal return as a settled callback and deletes the
+    /// registration, so the response was gone and the pending step never checkpointed. The step is
+    /// now checkpointed and the run woken; and when the absence cannot be confirmed either way, the
+    /// callback throws, which leaves the registration for redelivery.
+    /// </summary>
+    [Fact]
+    public async Task RecoverAsync_OnAStaleAbsentPlainRead_CheckpointsTheResponse_InsteadOfConsumingIt()
+    {
+        using var harness = new MongoHarness(new BsonDocument { ["ok"] = 1 });
+        harness.OnlyTheLinearizableReadFinds(LedgerDocument(PendingRun("flow", "corr")));
+        UpdateDefinition<MongoFlowStateDocument>? checkpoint = null;
+        harness.Collection
+            .Setup(item => item.UpdateOneAsync(
+                It.IsAny<FilterDefinition<MongoFlowStateDocument>>(),
+                It.IsAny<UpdateDefinition<MongoFlowStateDocument>>(),
+                It.IsAny<UpdateOptions>(),
+                It.IsAny<CancellationToken>()))
+            .Callback((FilterDefinition<MongoFlowStateDocument> _, UpdateDefinition<MongoFlowStateDocument> update, UpdateOptions _, CancellationToken _) => checkpoint = update)
+            .ReturnsAsync(new UpdateResult.Acknowledged(1, 1, BsonNull.Value));
+
+        var services = new ServiceCollection();
+        services.AddSingleton<IFlowStateStore>(harness.Store);
+        await using var provider = services.BuildServiceProvider();
+        var builder = new Mock<IAsyncResponseBuilder>();
+        builder
+            .Setup(instance => instance.EnqueueWorkerAsync(
+                It.IsAny<System.Linq.Expressions.Expression<Func<IDurableFlowExecutor, Task>>>(),
+                It.IsAny<CancellationToken>()))
+            .Returns(Task.CompletedTask);
+        var executor = new DurableFlowExecutor(
+            provider.GetRequiredService<IServiceScopeFactory>(),
+            builder.Object,
+            Mock.Of<IAsyncResponseSubscriber>(),
+            recoverableSubscriber: null,
+            new AsyncResponseContextPropagation([]),
+            new DurableFlowOptions(),
+            NullLogger<DurableFlowExecutor>.Instance);
+
+        await executor.RecoverAsync("flow", new TestFlowInput(7), "corr");
+
+        Assert.NotNull(checkpoint);
+        var stages = checkpoint!.Render(new RenderArgs<MongoFlowStateDocument>(
+            BsonSerializer.LookupSerializer<MongoFlowStateDocument>(), BsonSerializer.SerializerRegistry)).AsBsonArray;
+        var written = FlowStateJson.Deserialize(stages[0]["$set"]["state_json"]["$literal"].AsString, "flow");
+        var step = written.Steps!["step"];
+        Assert.True(step.Completed);
+        Assert.Null(step.PendingCorrelationId);
+        Assert.NotNull(step.ResultJson);
+        builder.Verify(
+            instance => instance.EnqueueWorkerAsync(
+                It.IsAny<System.Linq.Expressions.Expression<Func<IDurableFlowExecutor, Task>>>(),
+                It.IsAny<CancellationToken>()),
+            Times.Once);
+
+        // No confirmation possible: the callback fails, so the dispatcher keeps the registration.
+        var connectionId = new ConnectionId(new ServerId(new ClusterId(), new DnsEndPoint("localhost", 27017)));
+        harness.Current
+            .Setup(item => item.FindAsync(
+                It.IsAny<FilterDefinition<MongoFlowStateDocument>>(),
+                It.IsAny<FindOptions<MongoFlowStateDocument, MongoFlowStateDocument>>(),
+                It.IsAny<CancellationToken>()))
+            .ThrowsAsync(new MongoNotPrimaryException(connectionId, new BsonDocument("find", "flows"), new BsonDocument { ["ok"] = 0, ["code"] = 10107 }));
+        await Assert.ThrowsAsync<MongoNotPrimaryException>(() => executor.RecoverAsync("flow", new TestFlowInput(7), "corr"));
+    }
+
+    private static FlowState PendingRun(string flowId, string correlationId) => new()
+    {
+        FlowId = flowId,
+        Status = FlowRunStatus.Running,
+        Revision = 3,
+        Steps = new Dictionary<string, FlowStepState>
+        {
+            ["step"] = new() { PendingCorrelationId = correlationId, PendingPayloadTypeFullName = typeof(TestFlowInput).FullName }
+        }
+    };
+
+    private static MongoFlowStateDocument LedgerDocument(FlowState state) => new()
+    {
+        FlowId = state.FlowId!,
+        StateJson = FlowStateJson.Serialize(state),
+        Revision = state.Revision,
+        ExpiresAtUtc = DateTime.UtcNow.AddHours(1),
+        UpdatedAtUtc = DateTime.UtcNow
+    };
 
     /// <summary>
     /// A standalone server — supported, and with no second primary to be stale against — rejects
@@ -295,6 +434,8 @@ public sealed class MongoDbFlowStateStoreTests
 
         Assert.Null(await ((IFlowStateStore)harness.Store).LoadCurrentAsync("flow"));
         Assert.Null(await ((IFlowStateStore)harness.Store).LoadCurrentAsync("flow"));
+        // Nor does a plain load that finds nothing ask again to confirm the absence.
+        Assert.Null(await harness.Store.LoadAsync("flow"));
 
         harness.Current.Verify(
             item => item.FindAsync(
@@ -307,8 +448,93 @@ public sealed class MongoDbFlowStateStoreTests
                 It.IsAny<FilterDefinition<MongoFlowStateDocument>>(),
                 It.IsAny<FindOptions<MongoFlowStateDocument, MongoFlowStateDocument>>(),
                 It.IsAny<CancellationToken>()),
-            Times.Exactly(2));
+            Times.Exactly(3));
     }
+
+    /// <summary>
+    /// Every load that finds no ledger now confirms the absence linearizably (round 45, F1), so a
+    /// server that refuses the read concern ITSELF — a standalone, or a Mongo-compatible service
+    /// without linearizable reads (Amazon DocumentDB answers with its own "unsupported" error) —
+    /// would otherwise fail each one, a child flow's first start included. Such a refusal is a fixed
+    /// answer: the store reads plainly and remembers.
+    /// </summary>
+    [Theory]
+    [InlineData(123, "node needs to be a replica set member to use read concern")]
+    [InlineData(72, "readConcern level not supported")]
+    [InlineData(115, "command not supported")]
+    [InlineData(238, "not implemented")]
+    [InlineData(2, "Unsupported read concern level: linearizable")]
+    public async Task Load_OnAServerThatRefusesTheReadConcern_ReadsPlainly_AndRemembers(int code, string message)
+    {
+        var logger = new CollectingLogger();
+        using var harness = new MongoHarness(new BsonDocument { ["ok"] = 1 }, logger: logger.For<MongoDbFlowStateStore>());
+        harness.FindsNothing();
+        harness.Current
+            .Setup(item => item.FindAsync(
+                It.IsAny<FilterDefinition<MongoFlowStateDocument>>(),
+                It.IsAny<FindOptions<MongoFlowStateDocument, MongoFlowStateDocument>>(),
+                It.IsAny<CancellationToken>()))
+            .ThrowsAsync(CommandFailure(code, message));
+
+        Assert.Null(await harness.Store.LoadAsync("flow"));
+        Assert.Null(await harness.Store.LoadAsync("flow"));
+        Assert.Null(await ((IFlowStateStore)harness.Store).LoadCurrentAsync("flow"));
+
+        harness.VerifyLinearizableReads(Times.Once());
+        // A permanent, process-wide downgrade of the check: said once.
+        Assert.Single(logger.Messages, entry => entry.Contains("refused the linearizable read concern", StringComparison.Ordinal));
+    }
+
+    /// <summary>
+    /// The other side of the fact above: what a replica set answers while it CANNOT confirm — a
+    /// step-down, a recovering node, an exceeded time limit, majority reads not available yet — is
+    /// never taken for "unsupported". It fails the load (null would acknowledge a wake-up on a
+    /// ledger that may exist) and is not remembered: the next load asks again.
+    /// </summary>
+    [Theory]
+    [MemberData(nameof(TransientLinearizableFailures))]
+    public async Task Load_ATransientLinearizableFailure_FailsTheLoad_AndIsNotRemembered(Exception failure)
+    {
+        using var harness = new MongoHarness(new BsonDocument { ["ok"] = 1 });
+        harness.FindsNothing();
+        harness.Current
+            .Setup(item => item.FindAsync(
+                It.IsAny<FilterDefinition<MongoFlowStateDocument>>(),
+                It.IsAny<FindOptions<MongoFlowStateDocument, MongoFlowStateDocument>>(),
+                It.IsAny<CancellationToken>()))
+            .ThrowsAsync(failure);
+
+        await Assert.ThrowsAsync(failure.GetType(), () => harness.Store.LoadAsync("flow"));
+        await Assert.ThrowsAsync(failure.GetType(), () => harness.Store.LoadAsync("flow"));
+
+        harness.VerifyLinearizableReads(Times.Exactly(2));
+    }
+
+    public static TheoryData<Exception> TransientLinearizableFailures()
+    {
+        var connectionId = new ConnectionId(new ServerId(new ClusterId(), new DnsEndPoint("localhost", 27017)));
+        var command = new BsonDocument("find", "flows");
+        return
+        [
+            new MongoNotPrimaryException(connectionId, command, new BsonDocument { ["ok"] = 0, ["code"] = 10107, ["errmsg"] = "not primary; cannot satisfy linearizable read concern" }),
+            new MongoNodeIsRecoveringException(connectionId, command, new BsonDocument { ["ok"] = 0, ["code"] = 11602, ["errmsg"] = "operation was interrupted" }),
+            new MongoExecutionTimeoutException(connectionId, "operation exceeded time limit"),
+            CommandFailure(134, "Read concern majority reads are currently not possible; linearizable read failed"),
+            CommandFailure(262, "linearizable read exceeded time limit"),
+            // MongoDB's own "could not confirm" answer (LinearizableReadConcernError) mentions the
+            // level without refusing it, as does a parse error about an incompatible option —
+            // neither is an "unsupported" answer (precommit critic, round 45).
+            CommandFailure(187, "Failed to confirm that read was linearizable."),
+            CommandFailure(9, "afterOpTime not compatible with linearizable read concern")
+        ];
+    }
+
+    private static MongoCommandException CommandFailure(int code, string message)
+        => new(
+            new ConnectionId(new ServerId(new ClusterId(), new DnsEndPoint("localhost", 27017))),
+            "find failed",
+            new BsonDocument("find", "flows"),
+            new BsonDocument { ["ok"] = 0, ["code"] = code, ["errmsg"] = message });
 
     /// <summary>
     /// Regression (r2 GS6#2): nothing checked the collection's collation, while the docs promise
@@ -508,7 +734,7 @@ public sealed class MongoDbFlowStateStoreTests
 
     private sealed class MongoHarness : IDisposable
     {
-        public MongoHarness(BsonDocument helloReply, bool autoCreateIndexes = false)
+        public MongoHarness(BsonDocument helloReply, bool autoCreateIndexes = false, Microsoft.Extensions.Logging.ILogger<MongoDbFlowStateStore>? logger = null)
         {
             Database
                 .Setup(item => item.GetCollection<MongoFlowStateDocument>("flows", It.IsAny<MongoCollectionSettings>()))
@@ -553,7 +779,7 @@ public sealed class MongoDbFlowStateStoreTests
             {
                 CollectionName = "flows",
                 AutoCreateIndexes = autoCreateIndexes
-            }));
+            }), ownedClient: null, namespaceRegistry: null, logger);
         }
 
         /// <summary>CreateOne fails with <paramref name="code"/>; the listing then shows <paramref name="listed"/>.</summary>
@@ -580,7 +806,7 @@ public sealed class MongoDbFlowStateStoreTests
             return indexes;
         }
 
-        /// <summary>The live-filter read finds no document.</summary>
+        /// <summary>The live-filter read finds no document — the plain read and the linearizable one alike.</summary>
         public void FindsNothing()
         {
             var cursor = new Mock<IAsyncCursor<MongoFlowStateDocument>>();
@@ -591,7 +817,33 @@ public sealed class MongoDbFlowStateStoreTests
                     It.IsAny<FindOptions<MongoFlowStateDocument, MongoFlowStateDocument>>(),
                     It.IsAny<CancellationToken>()))
                 .ReturnsAsync(cursor.Object);
+            Current
+                .Setup(item => item.FindAsync(
+                    It.IsAny<FilterDefinition<MongoFlowStateDocument>>(),
+                    It.IsAny<FindOptions<MongoFlowStateDocument, MongoFlowStateDocument>>(),
+                    It.IsAny<CancellationToken>()))
+                .ReturnsAsync(cursor.Object);
         }
+
+        /// <summary>The linearizable read — and only it — finds <paramref name="document"/>.</summary>
+        public void OnlyTheLinearizableReadFinds(MongoFlowStateDocument document)
+        {
+            FindsNothing();
+            Current
+                .Setup(item => item.FindAsync(
+                    It.IsAny<FilterDefinition<MongoFlowStateDocument>>(),
+                    It.IsAny<FindOptions<MongoFlowStateDocument, MongoFlowStateDocument>>(),
+                    It.IsAny<CancellationToken>()))
+                .ReturnsAsync(() => new MongoListCursor<MongoFlowStateDocument>([document]));
+        }
+
+        public void VerifyLinearizableReads(Times times)
+            => Current.Verify(
+                item => item.FindAsync(
+                    It.IsAny<FilterDefinition<MongoFlowStateDocument>>(),
+                    It.IsAny<FindOptions<MongoFlowStateDocument, MongoFlowStateDocument>>(),
+                    It.IsAny<CancellationToken>()),
+                times);
 
         public Mock<IMongoDatabase> Database { get; } = new();
         public Mock<IMongoCollection<MongoFlowStateDocument>> Collection { get; } = new();

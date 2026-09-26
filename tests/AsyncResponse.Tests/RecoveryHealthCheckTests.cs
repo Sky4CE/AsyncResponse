@@ -47,6 +47,23 @@ public class RecoveryHealthCheckTests
         Assert.True(result.Data.ContainsKey("staleEntries"));
     }
 
+    /// <summary>
+    /// Regression (round 45, F4): unreadable registrations are in no other count, so a store whose
+    /// only registrations were corrupt or newer-schema read as a clean, empty pass — Healthy — while
+    /// every response for them was refused at delivery.
+    /// </summary>
+    [Fact]
+    public async Task UnreadableRegistrations_ReportDegradedWithTheirCount()
+    {
+        var report = new AsyncResponseWatchdogReport(0, 0, [], 0, UnreadableEntries: 3);
+
+        var result = await CheckAsync(state => state.Publish(Snapshot(report)));
+
+        Assert.Equal(HealthStatus.Degraded, result.Status);
+        Assert.Contains("3 stored async-response recovery registration(s) are unreadable", result.Description, StringComparison.Ordinal);
+        Assert.Equal(3, Assert.IsType<AsyncResponseRecoveryStats>(result.Data["stats"]).Unreadable);
+    }
+
     [Fact]
     public async Task ScanFailure_ReportsDegraded()
     {

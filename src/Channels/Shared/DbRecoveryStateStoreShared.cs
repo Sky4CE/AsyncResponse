@@ -66,13 +66,20 @@ internal abstract class DbRecoveryStateStoreBase(
     /// <inheritdoc />
     public async IAsyncEnumerable<RecoveryState> ScanAsync([EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
+        // Unreadable rows used to be dropped here with their count ignored: the scan completed
+        // over the readable subset and the recovery health check read Healthy while those
+        // registrations could not be recovered. They are counted and reported once the readable
+        // ones have all been yielded (see RecoveryStateScanUnreadableException).
+        var unreadable = 0;
         await foreach (var json in store.ScanRecoveryStateJsonAsync(cancellationToken).ConfigureAwait(false))
         {
-            var ignored = 0;
-            var state = DeserializeState(json, correlationId: null, ref ignored);
+            var state = DeserializeState(json, correlationId: null, ref unreadable);
             if (state is not null)
                 yield return state;
         }
+
+        if (unreadable > 0)
+            throw new RecoveryStateScanUnreadableException(unreadable);
     }
 
     private IReadOnlyList<RecoveryState> DeserializeStates(IReadOnlyList<string> jsonStates, string correlationId)

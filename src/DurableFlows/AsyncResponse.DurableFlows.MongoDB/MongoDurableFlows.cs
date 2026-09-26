@@ -3,6 +3,7 @@ using AsyncResponse.DurableFlows.Internal;
 using AsyncResponse.DurableFlows.MongoDB;
 using AsyncResponse.Internal;
 using Microsoft.Extensions.DependencyInjection.Extensions;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using MongoDB.Bson;
 using MongoDB.Bson.Serialization;
@@ -36,20 +37,20 @@ namespace Microsoft.Extensions.DependencyInjection
 
                 var database = provider.GetService<IMongoDatabase>();
                 if (database is not null)
-                    return new MongoDbFlowStateStore(database, options, ownedClient: null, provider.GetRequiredService<IMongoNamespaceRegistry>());
+                    return new MongoDbFlowStateStore(database, options, ownedClient: null, provider.GetRequiredService<IMongoNamespaceRegistry>(), provider.GetService<ILogger<MongoDbFlowStateStore>>());
 
                 if (string.IsNullOrWhiteSpace(options.Value.DatabaseName))
                     throw new InvalidOperationException($"{nameof(MongoDbDurableFlowOptions)}.{nameof(MongoDbDurableFlowOptions.DatabaseName)} must be configured when no IMongoDatabase is registered.");
 
                 var sharedClient = provider.GetService<IMongoClient>();
                 if (sharedClient is not null)
-                    return new MongoDbFlowStateStore(sharedClient.GetDatabase(options.Value.DatabaseName), options, ownedClient: null, provider.GetRequiredService<IMongoNamespaceRegistry>());
+                    return new MongoDbFlowStateStore(sharedClient.GetDatabase(options.Value.DatabaseName), options, ownedClient: null, provider.GetRequiredService<IMongoNamespaceRegistry>(), provider.GetService<ILogger<MongoDbFlowStateStore>>());
 
                 if (string.IsNullOrWhiteSpace(options.Value.ConnectionString))
                     throw new InvalidOperationException($"{nameof(MongoDbDurableFlowOptions)}.{nameof(MongoDbDurableFlowOptions.ConnectionString)} must be configured when no IMongoDatabase or IMongoClient is registered.");
 
                 var ownedClient = new MongoClient(options.Value.ConnectionString);
-                return new MongoDbFlowStateStore(ownedClient.GetDatabase(options.Value.DatabaseName), options, ownedClient, provider.GetRequiredService<IMongoNamespaceRegistry>());
+                return new MongoDbFlowStateStore(ownedClient.GetDatabase(options.Value.DatabaseName), options, ownedClient, provider.GetRequiredService<IMongoNamespaceRegistry>(), provider.GetService<ILogger<MongoDbFlowStateStore>>());
             });
             return builder.WithDurableFlows<MongoDbFlowStateStore, MongoDbDurableFlowOptions>(configure);
         }
@@ -119,6 +120,8 @@ public sealed class MongoDbFlowStateStore : IFlowStateStore, IDisposable
     private readonly IMongoClient? _ownedClient;
     private volatile bool _created;
     private volatile bool _linearizableUnsupported;
+    private int _linearizableFallbackReported;
+    private readonly ILogger<MongoDbFlowStateStore>? _logger;
 
     /// <summary>
     /// DI construction path: also claims the collection in the container's cross-component
@@ -129,9 +132,11 @@ public sealed class MongoDbFlowStateStore : IFlowStateStore, IDisposable
         IMongoDatabase database,
         IOptions<MongoDbDurableFlowOptions> options,
         IMongoClient? ownedClient,
-        IMongoNamespaceRegistry? namespaceRegistry)
+        IMongoNamespaceRegistry? namespaceRegistry,
+        ILogger<MongoDbFlowStateStore>? logger = null)
         : this(database, options, ownedClient)
     {
+        _logger = logger;
         namespaceRegistry?.Claim(
             MongoNamespaceRegistry.ClusterKey(database),
             database.DatabaseNamespace.DatabaseName,
@@ -169,7 +174,8 @@ public sealed class MongoDbFlowStateStore : IFlowStateStore, IDisposable
         // concern stays inherited on purpose: primary reads already see every write this store
         // had acknowledged (read-your-writes needs nothing more), and a majority snapshot could
         // only hide a competitor's newer write, which the revision/lease filters reject anyway —
-        // except on the no-write paths, which read linearizably (see LoadCurrentAsync).
+        // except on the no-write paths and wherever a load would answer "absent", which read
+        // linearizably (see LoadCurrentAsync and LoadCoreAsync).
         // Majority with a BOUND (see MongoWriteConcerns): a bare WMajority carried no wtimeout, so
         // on a primary-secondary-arbiter set with its secondary down every checkpoint blocked
         // indefinitely — and it discarded the operator's own wtimeoutMS/journal besides.
@@ -195,8 +201,10 @@ public sealed class MongoDbFlowStateStore : IFlowStateStore, IDisposable
     /// primary, so it carries the same bound as the store's writes
     /// (<see cref="MongoWriteConcerns.DefaultMajorityTimeout"/>, as <c>maxTimeMS</c>) and fails
     /// rather than blocking while the set is degraded. A standalone server, which has no second
-    /// primary to be stale against, rejects the read concern (<c>NotAReplicaSet</c>); the store
-    /// then uses the plain read from that point on.
+    /// primary to be stale against, rejects the read concern (<c>NotAReplicaSet</c>), and so does a
+    /// Mongo-compatible service without linearizable reads (see <see cref="RejectsLinearizableReads"/>);
+    /// the store then uses the plain read from that point on. <see cref="LoadAsync"/> reads plainly and
+    /// confirms only absence this way (a document the plain read finds is fenced downstream).
     /// </remarks>
     public Task<FlowState?> LoadCurrentAsync(string flowId, CancellationToken cancellationToken = default)
         => LoadCoreAsync(flowId, current: true, cancellationToken);
@@ -212,6 +220,19 @@ public sealed class MongoDbFlowStateStore : IFlowStateStore, IDisposable
         var document = current
             ? await FindLinearizableAsync(flowId, cancellationToken).ConfigureAwait(false)
             : await _collection.Find(BuildLiveFilter(flowId)).FirstOrDefaultAsync(cancellationToken).ConfigureAwait(false);
+
+        // Callers acknowledge a wake-up on null, so "absent" must not come from a plain read
+        // alone. A primary that a partition has deposed without its noticing still answers plain
+        // reads, and misses a ledger the new primary created or extended: the recovery callback
+        // then returned "no state found", the dispatcher deleted its registration, and the only
+        // copy of the response was gone with the run still Running. Absence (and expiry, which the
+        // live filter folds into it) is confirmed by the same bounded linearizable read
+        // LoadCurrentAsync uses, and a set that cannot confirm fails the load rather than
+        // answering null. A load that finds a document costs nothing extra — like the Cosmos
+        // store, which asks its write path before reporting absence.
+        if (document is null && !current && !_linearizableUnsupported)
+            document = await FindLinearizableAsync(flowId, cancellationToken).ConfigureAwait(false);
+
         if (document is null)
         {
             // A document whose expiry is missing or not a BSON date also misses the live filter —
@@ -252,9 +273,10 @@ public sealed class MongoDbFlowStateStore : IFlowStateStore, IDisposable
                     .FirstOrDefaultAsync(cancellationToken)
                     .ConfigureAwait(false);
             }
-            catch (MongoCommandException ex) when (ex.Code == NotAReplicaSet)
+            catch (MongoCommandException ex) when (RejectsLinearizableReads(ex))
             {
                 _linearizableUnsupported = true;
+                ReportLinearizableFallback(ex);
             }
         }
 
@@ -263,6 +285,71 @@ public sealed class MongoDbFlowStateStore : IFlowStateStore, IDisposable
 
     /// <summary>The server's rejection of a replica-set-only read concern on a standalone node.</summary>
     private const int NotAReplicaSet = 123;
+
+    /// <summary>
+    /// Says once that the store stopped reading linearizably — a process-wide, permanent downgrade
+    /// of the absence and no-write checks, which an operator should see. Informational on a
+    /// standalone (no second primary to be stale against), a warning anywhere else.
+    /// </summary>
+    private void ReportLinearizableFallback(MongoCommandException exception)
+    {
+        if (_logger is null || Interlocked.Exchange(ref _linearizableFallbackReported, 1) != 0)
+            return;
+
+        _logger.Log(
+            exception.Code == NotAReplicaSet ? LogLevel.Information : LogLevel.Warning,
+            "MongoDB flow store collection {Collection}: the server refused the linearizable read concern (code {Code}); ledger loads that would report a run absent, and the engine's no-write checks, use plain primary reads from now on. Expected on a standalone server or a Mongo-compatible service without linearizable reads; on a replica set it means a deposed primary's stale answer is no longer caught.",
+            _options.CollectionName,
+            exception.Code);
+    }
+
+    /// <summary>
+    /// Whether the server refused the <c>linearizable</c> read concern ITSELF — a fixed answer about
+    /// what it supports, which the store may remember and read plainly from then on: a standalone
+    /// (<c>NotAReplicaSet</c>), or a Mongo-compatible service without linearizable reads (Amazon
+    /// DocumentDB rejects the level; its primary reads are current anyway). Since every load that
+    /// finds no ledger now confirms the absence this way, a service like that otherwise failed each
+    /// one — a child flow's first start included. A replica set's transient answers are never taken
+    /// for it: a step-down or recovering node, an exceeded time limit, majority reads not available
+    /// yet, a network error — those mean "cannot confirm now" and fail the load.
+    /// </summary>
+    internal static bool RejectsLinearizableReads(MongoCommandException exception)
+    {
+        if (exception is MongoNotPrimaryException or MongoNodeIsRecoveringException)
+            return false;
+
+        return exception.Code switch
+        {
+            NotAReplicaSet or InvalidOptions or CommandNotSupported or NotImplemented => true,
+            MaxTimeMsExpired or ExceededTimeLimit or ReadConcernMajorityNotAvailableYet or LinearizableReadConcernError
+                or HostUnreachable or HostNotFound or NetworkTimeout or SocketException => false,
+            // Any other code only when the server says the linearizable level is UNSUPPORTED (a
+            // service's own answer, e.g. BadValue "unsupported read concern level: linearizable").
+            // Merely mentioning the level is not enough: MongoDB's own "failed to confirm that read
+            // was linearizable" is a replica set that cannot confirm right now, and remembering it
+            // as a refusal would switch the check off for the life of the process.
+            _ => SaysLinearizableIsUnsupported(exception.ErrorMessage)
+        };
+    }
+
+    private static bool SaysLinearizableIsUnsupported(string? message)
+        => message is not null
+           && message.Contains("linearizable", StringComparison.OrdinalIgnoreCase)
+           && (message.Contains("not supported", StringComparison.OrdinalIgnoreCase)
+               || message.Contains("unsupported", StringComparison.OrdinalIgnoreCase)
+               || message.Contains("not implemented", StringComparison.OrdinalIgnoreCase));
+
+    private const int HostUnreachable = 6;
+    private const int HostNotFound = 7;
+    private const int MaxTimeMsExpired = 50;
+    private const int InvalidOptions = 72;
+    private const int NetworkTimeout = 89;
+    private const int CommandNotSupported = 115;
+    private const int ReadConcernMajorityNotAvailableYet = 134;
+    private const int NotImplemented = 238;
+    private const int LinearizableReadConcernError = 187;
+    private const int ExceededTimeLimit = 262;
+    private const int SocketException = 9001;
 
     /// <inheritdoc />
     public void ValidateCreate(string flowId, FlowState state, TimeSpan ttl)

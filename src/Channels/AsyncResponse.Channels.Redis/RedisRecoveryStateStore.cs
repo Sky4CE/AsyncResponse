@@ -93,9 +93,17 @@ internal sealed class RedisRecoveryStateStore : IRecoveryStateStore, IRecoverySt
                 : Condition.StringEqual(recoveryKey, previous));
             // The key must outlive its longest-lived entry and no more: a fresh full TTL here
             // would re-extend every co-located registration's physical lifetime on each save.
-            _ = transaction.StringSetAsync(recoveryKey, SerializeEntries(entries), MaxRemaining(entries, nowUtc));
+            var write = transaction.StringSetAsync(recoveryKey, SerializeEntries(entries), MaxRemaining(entries, nowUtc));
             if (await transaction.ExecuteAsync().ConfigureAwait(false))
+            {
+                // EXEC succeeding says the condition held, not that the SET did: Redis runs every
+                // queued command and reports each one's own error in the reply, so a rejected
+                // write left the registration unsaved while this method returned success. The
+                // command's task carries that outcome. (Only after a committed EXEC: an aborted
+                // transaction cancels its queued commands.)
+                await write.ConfigureAwait(false);
                 return;
+            }
         }
 
         throw new InvalidOperationException(
@@ -140,15 +148,16 @@ internal sealed class RedisRecoveryStateStore : IRecoveryStateStore, IRecoverySt
 
             var transaction = _database.CreateTransaction();
             transaction.AddCondition(Condition.StringEqual(recoveryKey, previous));
+            Task mutation;
             if (entries.Count == 0)
             {
-                _ = transaction.KeyDeleteAsync(recoveryKey);
+                mutation = transaction.KeyDeleteAsync(recoveryKey);
             }
             else if (legacy)
             {
                 // Legacy blobs keep their shape and key TTL here: only SaveAsync migrates to the
                 // enveloped shape, because it alone has a TTL to stamp the survivors with.
-                _ = transaction.StringSetAsync(
+                mutation = transaction.StringSetAsync(
                     recoveryKey,
                     AsyncResponseJson.Serialize(entries.ConvertAll(entry => entry.State!).FindAll(static state => state is not null)),
                     Expiration.KeepTtl,
@@ -159,10 +168,15 @@ internal sealed class RedisRecoveryStateStore : IRecoveryStateStore, IRecoverySt
                 // Shrink the key to its longest surviving entry: keeping the previous TTL would
                 // hold the key alive long after the removed registration — possibly the only
                 // long-lived one — is gone.
-                _ = transaction.StringSetAsync(recoveryKey, SerializeEntries(entries), MaxRemaining(entries, nowUtc));
+                mutation = transaction.StringSetAsync(recoveryKey, SerializeEntries(entries), MaxRemaining(entries, nowUtc));
             }
             if (await transaction.ExecuteAsync().ConfigureAwait(false))
+            {
+                // Same as SaveAsync: a committed EXEC does not mean the write succeeded. Reporting
+                // "deleted" over a rejected one left the consumed registration armed.
+                await mutation.ConfigureAwait(false);
                 return true;
+            }
         }
 
         // Leave the registration for expiry rather than risking a lost concurrent registration
@@ -178,6 +192,7 @@ internal sealed class RedisRecoveryStateStore : IRecoveryStateStore, IRecoverySt
     {
         var seenKeys = new HashSet<string>(StringComparer.Ordinal);
         var batch = new List<string>(ScanReadBatchSize);
+        var unreadable = 0;
 
         foreach (var server in await ResolveScanTargetsAsync().ConfigureAwait(false))
         {
@@ -197,7 +212,9 @@ internal sealed class RedisRecoveryStateStore : IRecoveryStateStore, IRecoverySt
                 if (batch.Count < ScanReadBatchSize)
                     continue;
 
-                foreach (var state in await ReadScanBatchAsync(batch, cancellationToken).ConfigureAwait(false))
+                var (states, batchUnreadable) = await ReadScanBatchAsync(batch, cancellationToken).ConfigureAwait(false);
+                unreadable += batchUnreadable;
+                foreach (var state in states)
                     yield return state;
                 batch.Clear();
             }
@@ -205,10 +222,19 @@ internal sealed class RedisRecoveryStateStore : IRecoveryStateStore, IRecoverySt
             if (batch.Count == 0)
                 continue;
 
-            foreach (var state in await ReadScanBatchAsync(batch, cancellationToken).ConfigureAwait(false))
+            var (remaining, remainingUnreadable) = await ReadScanBatchAsync(batch, cancellationToken).ConfigureAwait(false);
+            unreadable += remainingUnreadable;
+            foreach (var state in remaining)
                 yield return state;
             batch.Clear();
         }
+
+        // Registrations this build cannot read are not absence: skipped silently, a corrupt or
+        // newer-schema blob left the scan "complete" and the recovery health check Healthy while
+        // the responses it guards could not be recovered (delivery refuses them). Reported after
+        // every readable registration has been yielded, so the rest of the scan still counts.
+        if (unreadable > 0)
+            throw new RecoveryStateScanUnreadableException(unreadable);
     }
 
     private const int ScanPageSize = 250;
@@ -224,7 +250,7 @@ internal sealed class RedisRecoveryStateStore : IRecoveryStateStore, IRecoverySt
     /// </summary>
     private const int ScanReadBatchSize = 128;
 
-    private async Task<List<RecoveryState>> ReadScanBatchAsync(List<string> recoveryKeys, CancellationToken cancellationToken)
+    private async Task<(List<RecoveryState> States, int Unreadable)> ReadScanBatchAsync(List<string> recoveryKeys, CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
 
@@ -237,6 +263,7 @@ internal sealed class RedisRecoveryStateStore : IRecoveryStateStore, IRecoverySt
         var values = await Task.WhenAll(reads).ConfigureAwait(false);
 
         var states = new List<RecoveryState>(values.Length);
+        var unreadable = 0;
         var nowUtc = _timeProvider.GetUtcNow();
         for (var i = 0; i < values.Length; i++)
         {
@@ -245,12 +272,13 @@ internal sealed class RedisRecoveryStateStore : IRecoveryStateStore, IRecoverySt
 
             var recoveryKey = recoveryKeys[i];
             var correlationId = _keys.CorrelationIdFromRecoveryKey(recoveryKey);
-            var (entries, _) = DeserializeEntries(values[i], recoveryKey, correlationId, logAsError: false, nowUtc);
+            var (entries, _) = DeserializeEntriesCore(values[i], recoveryKey, correlationId, logAsError: false, nowUtc, preserveUnreadable: false, throwOnUnreadableEnvelope: false, out var blobUnreadable);
+            unreadable += blobUnreadable;
             foreach (var entry in entries)
                 states.Add(entry.State!);
         }
 
-        return states;
+        return (states, unreadable);
     }
 
     /// <summary>
@@ -473,6 +501,14 @@ internal sealed class RedisRecoveryStateStore : IRecoveryStateStore, IRecoverySt
             new StoredRecoveryState { Registrations = entries },
             _envelopeTypeInfo);
 
+    /// <summary>
+    /// The key TTL: the longest remaining entry lifetime, rounded UP to a whole millisecond.
+    /// Redis keeps key expiry in milliseconds, and a TimeSpan that is not a whole number of
+    /// seconds goes out as <c>PX</c> with its milliseconds truncated — so a remaining lifetime
+    /// under 1 ms (a sub-millisecond TTL, or a surviving sibling about to lapse) was sent as
+    /// <c>PX 0</c>, which Redis rejects as an invalid expire time inside the transaction. Rounding
+    /// up also keeps the key from ever lapsing before its longest entry.
+    /// </summary>
     private static TimeSpan MaxRemaining(List<StoredRegistration> entries, DateTimeOffset nowUtc)
     {
         var maxExpiresAtUtc = DateTimeOffset.MinValue;
@@ -482,7 +518,11 @@ internal sealed class RedisRecoveryStateStore : IRecoveryStateStore, IRecoverySt
                 maxExpiresAtUtc = entry.ExpiresAtUtc;
         }
 
-        return maxExpiresAtUtc - nowUtc;
+        var remaining = maxExpiresAtUtc - nowUtc;
+        var partial = remaining.Ticks % TimeSpan.TicksPerMillisecond;
+        return partial > 0 && remaining.Ticks <= TimeSpan.MaxValue.Ticks - TimeSpan.TicksPerMillisecond
+            ? TimeSpan.FromTicks(remaining.Ticks - partial + TimeSpan.TicksPerMillisecond)
+            : remaining;
     }
 
     /// <summary>
@@ -501,7 +541,24 @@ internal sealed class RedisRecoveryStateStore : IRecoveryStateStore, IRecoverySt
         DateTimeOffset nowUtc,
         bool preserveUnreadable = false,
         bool throwOnUnreadableEnvelope = false)
+        => DeserializeEntriesCore(value, recoveryKey, correlationId, logAsError, nowUtc, preserveUnreadable, throwOnUnreadableEnvelope, out _);
+
+    /// <summary>
+    /// <see cref="DeserializeEntries"/>, also reporting how many unexpired registrations the read
+    /// dropped as unreadable — a blob that will not parse at all counts once. The write paths
+    /// ignore it: they carry unreadable entries through instead of dropping them.
+    /// </summary>
+    private (List<StoredRegistration> Entries, bool Legacy) DeserializeEntriesCore(
+        RedisValue value,
+        string recoveryKey,
+        string correlationId,
+        bool logAsError,
+        DateTimeOffset nowUtc,
+        bool preserveUnreadable,
+        bool throwOnUnreadableEnvelope,
+        out int unreadable)
     {
+        unreadable = 0;
         var json = value.ToString();
         try
         {
@@ -517,6 +574,8 @@ internal sealed class RedisRecoveryStateStore : IRecoveryStateStore, IRecoverySt
                     // always did (SaveAsync stamps one when it rewrites the blob enveloped).
                     if (preserveUnreadable || IsStateReadable(state, recoveryKey, correlationId))
                         legacyEntries.Add(new StoredRegistration { State = state });
+                    else
+                        unreadable++;
                 }
 
                 return (legacyEntries, true);
@@ -524,11 +583,13 @@ internal sealed class RedisRecoveryStateStore : IRecoveryStateStore, IRecoverySt
 
             var stored = JsonSafety.SafeDeserialize(json, _envelopeTypeInfo);
             var entries = stored?.Registrations ?? [];
-            entries.RemoveAll(entry => entry is null || (!preserveUnreadable && !IsStateReadable(entry.State, recoveryKey, correlationId)));
             // An entry past its per-entry expiry is logically gone even while a longer-lived
             // sibling keeps the key alive; surfacing it would fire recovery callbacks for a
-            // registration that lapsed long ago.
-            entries.RemoveAll(entry => entry.ExpiresAtUtc <= nowUtc);
+            // registration that lapsed long ago. Dropped BEFORE the readability check, so a lapsed
+            // entry is gone rather than counted (or logged) as unreadable.
+            entries.RemoveAll(entry => entry is null || entry.ExpiresAtUtc <= nowUtc);
+            if (!preserveUnreadable)
+                unreadable = entries.RemoveAll(entry => !IsStateReadable(entry.State, recoveryKey, correlationId));
             return (entries, false);
         }
         catch (Exception ex) when (ex is JsonException or InvalidDataException)
@@ -549,6 +610,7 @@ internal sealed class RedisRecoveryStateStore : IRecoveryStateStore, IRecoverySt
             if (throwOnUnreadableEnvelope)
                 throw new RecoveryStateUnreadableException(correlationId, 1);
 
+            unreadable = 1;
             return ([], false);
         }
     }

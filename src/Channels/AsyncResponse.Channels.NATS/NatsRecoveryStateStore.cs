@@ -237,39 +237,102 @@ internal sealed class NatsRecoveryStateStore : IRecoveryStateStore, IRecoverySta
     {
         StartDeleteMarkerPurge(cancellationToken);
 
+        var batch = new List<string>(ScanReadBatchSize);
+        var unreadable = 0;
         await foreach (var key in _store.GetKeysAsync(cancellationToken).ConfigureAwait(false))
         {
             cancellationToken.ThrowIfCancellationRequested();
 
-            var loaded = await LoadStoredAsync(key, cancellationToken).ConfigureAwait(false);
-
-            // The watchdog scan reports; it does not settle a delivery, so an unreadable envelope
-            // is skipped here rather than thrown (TryDeserialize already logged it). GetAllAsync —
-            // the path whose answer decides whether a terminal response is acknowledged — refuses.
-            if (loaded.Stored is not { } storedState)
+            batch.Add(key);
+            if (batch.Count < ScanReadBatchSize)
                 continue;
 
-            var found = (Stored: storedState, loaded.Revision);
+            var (states, batchUnreadable) = await ReadScanBatchAsync(batch, cancellationToken).ConfigureAwait(false);
+            unreadable += batchUnreadable;
+            foreach (var state in states)
+                yield return state;
+            batch.Clear();
+        }
 
-            if (IsExpired(found.Stored))
+        if (batch.Count > 0)
+        {
+            var (states, batchUnreadable) = await ReadScanBatchAsync(batch, cancellationToken).ConfigureAwait(false);
+            unreadable += batchUnreadable;
+            foreach (var state in states)
+                yield return state;
+        }
+
+        // The watchdog scan reports; it does not settle a delivery, so an unreadable envelope or
+        // registration does not stop the scan — but it is not absence either. Skipped silently, it
+        // left the scan "complete" and the recovery health check Healthy while GetAllAsync — the
+        // path whose answer decides whether a terminal response is acknowledged — refused those
+        // registrations. Reported once every readable registration has been yielded.
+        if (unreadable > 0)
+            throw new RecoveryStateScanUnreadableException(unreadable);
+    }
+
+    /// <summary>
+    /// Values read concurrently per scan batch. Each envelope used to be awaited before the next
+    /// read was even issued — one KV round trip per key, so a 100,000-key bucket at 5 ms spent
+    /// over eight minutes on latency alone before the first liveness probe (and ProbeConcurrency,
+    /// which applies to the probes after the scan, could not help). The reads are independent
+    /// requests on one connection, so a batch is issued together and awaited together; the bound
+    /// keeps the scan streaming instead of holding the bucket's values in memory (the Redis
+    /// scanner's batch, for the same reason).
+    /// </summary>
+    internal const int ScanReadBatchSize = 128;
+
+    private async Task<(List<RecoveryState> States, int Unreadable)> ReadScanBatchAsync(List<string> keys, CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+
+        var reads = new Task<(StoredRecoveryState? Stored, ulong Revision, bool Unreadable)>[keys.Count];
+        for (var i = 0; i < reads.Length; i++)
+            reads[i] = LoadStoredAsync(keys[i], cancellationToken);
+
+        // A failed read fails the scan: skipping the key would report the registrations behind it
+        // as absent (the scanner contract — see IRecoveryStateScanner).
+        var loaded = await Task.WhenAll(reads).ConfigureAwait(false);
+
+        var states = new List<RecoveryState>(loaded.Length);
+        var unreadable = 0;
+        for (var i = 0; i < loaded.Length; i++)
+        {
+            var key = keys[i];
+            var (stored, revision, envelopeUnreadable) = loaded[i];
+
+            // An envelope this build cannot parse (TryDeserialize already logged it): its
+            // registrations cannot even be enumerated, so it counts once.
+            if (envelopeUnreadable)
             {
-                await TryDeleteSilentlyAsync(key, found.Revision, cancellationToken).ConfigureAwait(false);
+                unreadable++;
+                continue;
+            }
+
+            if (stored is null)
+                continue;
+
+            if (IsExpired(stored))
+            {
+                await TryDeleteSilentlyAsync(key, revision, cancellationToken).ConfigureAwait(false);
                 continue;
             }
 
             var now = _timeProvider.GetUtcNow();
-            foreach (var (state, expiresAtUtc) in EntriesFrom(found.Stored))
+            foreach (var (state, expiresAtUtc) in EntriesFrom(stored))
             {
                 if (expiresAtUtc <= now)
                     continue;
 
                 var correlationId = NatsSubjectSchema.CorrelationIdFromRecoveryKey(key);
-                if (!IsStateReadable(state, key, correlationId))
+                if (!IsStateReadable(state, key, correlationId, ref unreadable))
                     continue;
 
-                yield return state!;
+                states.Add(state!);
             }
         }
+
+        return (states, unreadable);
     }
 
     /// <summary>
@@ -384,13 +447,6 @@ internal sealed class NatsRecoveryStateStore : IRecoveryStateStore, IRecoverySta
     }
 
     private bool IsExpired(StoredRecoveryState stored) => stored.ExpiresAtUtc <= _timeProvider.GetUtcNow();
-
-    /// <summary>Readability check for paths that prune without judging a read.</summary>
-    private bool IsStateReadable(RecoveryState? state, string key, string correlationId)
-    {
-        var ignored = 0;
-        return IsStateReadable(state, key, correlationId, ref ignored);
-    }
 
     /// <summary>
     /// Readability check that also counts rows this build could not INTERPRET. A row carrying

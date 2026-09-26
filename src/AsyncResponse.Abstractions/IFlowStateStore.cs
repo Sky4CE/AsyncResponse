@@ -30,6 +30,14 @@ public interface IFlowStateStore
     /// flow id inside the JSON that is not the key — is <em>not</em> absence and must throw
     /// <see cref="FlowStateUnreadableException"/>: callers acknowledge a wake-up on <c>null</c>,
     /// so reporting a live-but-unreadable ledger that way strands the run.
+    /// <para>
+    /// For the same reason <c>null</c> must be authoritative even in a store whose plain reads can
+    /// miss a present ledger: such a store confirms absence (and expiry) before reporting it, and
+    /// throws when it cannot. The Cosmos DB store asks the container's write path; the MongoDB store
+    /// repeats the read with <c>linearizable</c> read concern. A load that finds a ledger may still be
+    /// an older copy — the revision and lease fences correct that, and
+    /// <see cref="LoadCurrentAsync"/> covers the decisions that have no fence behind them.
+    /// </para>
     /// </summary>
     /// <exception cref="FlowStateUnreadableException">The ledger exists but is uninterpretable or inconsistent.</exception>
     Task<FlowState?> LoadAsync(string flowId, CancellationToken cancellationToken = default);
