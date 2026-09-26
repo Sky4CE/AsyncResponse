@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1790444425837,
+  "lastUpdate": 1790444461517,
   "repoUrl": "https://github.com/Sky4CE/AsyncResponse",
   "entries": {
     "AsyncResponse Microbenchmarks": [
@@ -116248,6 +116248,140 @@ window.BENCHMARK_DATA = {
           {
             "name": "durable-flow-storm throughput",
             "value": 1260.4773397434153,
+            "unit": "flows/s"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "tyunisov@gmail.com",
+            "name": "Sky4CE",
+            "username": "Sky4CE"
+          },
+          "committer": {
+            "email": "tyunisov@gmail.com",
+            "name": "Sky4CE",
+            "username": "Sky4CE"
+          },
+          "distinct": true,
+          "id": "4ee3ad8809278ce275a2a601f295087a97f74af0",
+          "message": "fix: NATS waiter disposal joins the timeout drain's in-flight registration delete\n\nThe disposal drain is not latched: cleanupStarted stays 0 while the timeout's drain waits on the\nrecovery-registration delete, so a DisposeAsync arriving in that window ran its own drain and\nissued a second TryDeleteAsync beside the first (only the cleanup core reused an in-flight\nattempt). Slow macOS runners hit the window every run, failing\nWaiterTimeout_RegistrationDeleteWaitingOnAReconnectingConnection_StillSettlesWithinTheDrainBudget\n(2 deletes, expected 1). Every path now goes through DeleteRegistrationOnceAsync, which joins\nthe attempt in flight; a new deterministic test disposes inside the window (red 3/3 on the old\ncode).",
+          "timestamp": "2026-09-26T19:25:44+02:00",
+          "tree_id": "1040dae9d1e2aaba6e5fea2dfe21816b3c0dcaf8",
+          "url": "https://github.com/Sky4CE/AsyncResponse/commit/4ee3ad8809278ce275a2a601f295087a97f74af0"
+        },
+        "date": 1790444460542,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "waiter-storm throughput",
+            "value": 79627.29330586086,
+            "unit": "ops/s"
+          },
+          {
+            "name": "progress-storm throughput",
+            "value": 33845.80393261165,
+            "unit": "ops/s"
+          },
+          {
+            "name": "worker-storm throughput",
+            "value": 27983.619061008543,
+            "unit": "jobs/s"
+          },
+          {
+            "name": "google-pubsub-ack-after-enqueue-dispatch-storm throughput",
+            "value": 148314.26011948197,
+            "unit": "ops/s"
+          },
+          {
+            "name": "rabbitmq-ack-after-enqueue-dispatch-storm throughput",
+            "value": 248862.69747255047,
+            "unit": "ops/s"
+          },
+          {
+            "name": "redis-ack-after-enqueue-dispatch-storm throughput",
+            "value": 224696.88390361404,
+            "unit": "ops/s"
+          },
+          {
+            "name": "nats-ack-after-receive-dispatch-storm throughput",
+            "value": 178387.94382920425,
+            "unit": "ops/s"
+          },
+          {
+            "name": "postgresql-ack-after-receive-dispatch-storm throughput",
+            "value": 160259.49216972123,
+            "unit": "ops/s"
+          },
+          {
+            "name": "sqlserver-ack-after-enqueue-dispatch-storm throughput",
+            "value": 170525.0808288883,
+            "unit": "ops/s"
+          },
+          {
+            "name": "mongodb-ack-after-enqueue-dispatch-storm throughput",
+            "value": 189471.4504418474,
+            "unit": "ops/s"
+          },
+          {
+            "name": "azure-servicebus-ack-after-receive-dispatch-storm throughput",
+            "value": 173348.68046984426,
+            "unit": "ops/s"
+          },
+          {
+            "name": "sqs-ack-after-enqueue-dispatch-storm throughput",
+            "value": 260886.8064324251,
+            "unit": "ops/s"
+          },
+          {
+            "name": "kafka-ack-after-enqueue-dispatch-storm throughput",
+            "value": 271408.7198193504,
+            "unit": "ops/s"
+          },
+          {
+            "name": "race-burst throughput",
+            "value": 99540.12462423602,
+            "unit": "ops/s"
+          },
+          {
+            "name": "raw-ingress-storm throughput",
+            "value": 80465.12705765423,
+            "unit": "ops/s"
+          },
+          {
+            "name": "shared-response-fanout throughput",
+            "value": 31929.93193560269,
+            "unit": "ops/s"
+          },
+          {
+            "name": "exception-fanout throughput",
+            "value": 17418.946853260284,
+            "unit": "ops/s"
+          },
+          {
+            "name": "timeout-storm throughput",
+            "value": 4770.143481145769,
+            "unit": "ops/s"
+          },
+          {
+            "name": "dispose-cleanup-storm throughput",
+            "value": 234530.376374348,
+            "unit": "ops/s"
+          },
+          {
+            "name": "context-isolation-storm throughput",
+            "value": 67953.98699632505,
+            "unit": "ops/s"
+          },
+          {
+            "name": "watchdog-scan-storm throughput",
+            "value": 1591368.4177023822,
+            "unit": "entries/s"
+          },
+          {
+            "name": "durable-flow-storm throughput",
+            "value": 1271.1880350493998,
             "unit": "flows/s"
           }
         ]
