@@ -510,51 +510,6 @@ public sealed class Round27RegressionTests
             => inner.TryDeleteAsync(flowId, cancellationToken);
     }
 
-    // -----------------------------------------------------------------------------------------
-    // Finding — a resolver registration was process-static with no way to remove it, so
-    // RegisterAssembly pinned a collectible AssemblyLoadContext for the life of the process,
-    // contradicting this type's own "never pins a collectible AssemblyLoadContext".
-    // -----------------------------------------------------------------------------------------
-
-    [Fact]
-    public void DisposingAResolverRegistration_LetsItsCollectibleContextUnload()
-    {
-        var weakContext = RegisterPluginAssemblyAndDisposeTheHandle();
-
-        for (var i = 0; i < 10 && weakContext.IsAlive; i++)
-        {
-            GC.Collect();
-            GC.WaitForPendingFinalizers();
-        }
-
-        Assert.False(
-            weakContext.IsAlive,
-            "The registration held the plugin's AssemblyLoadContext after its handle was disposed.");
-    }
-
-    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
-    private static WeakReference RegisterPluginAssemblyAndDisposeTheHandle()
-    {
-        var context = new System.Runtime.Loader.AssemblyLoadContext($"r27-plugin-{Guid.NewGuid():N}", isCollectible: true);
-        var assembly = context.LoadFromAssemblyPath(typeof(Round27RegressionTests).Assembly.Location);
-
-#pragma warning disable IL2026 // Plugin scenario; the test asserts lifetime, not trimmability.
-        var registration = AsyncResponseTypeResolution.RegisterAssembly(assembly);
-#pragma warning restore IL2026
-
-        // The registration is live and answering...
-        Assert.NotNull(AsyncResponseTypeResolution.Resolve(typeof(PluginProbeMarker).FullName!));
-
-        // ...and disposing it must both stop that and let go of the assembly.
-        registration.Dispose();
-        Assert.Null(AsyncResponseTypeResolution.Resolve(typeof(PluginProbeMarker).FullName!));
-        registration.Dispose(); // idempotent
-
-        var weak = new WeakReference(context);
-        context.Unload();
-        return weak;
-    }
-
     /// <summary>A type loaded into the collectible twin, so the resolver has something to answer.</summary>
     public sealed class PluginProbeMarker;
 
@@ -724,5 +679,60 @@ public sealed class Round27RegressionTests
         clock.Advance(TimeSpan.FromMinutes(2));
 
         Assert.Null(await store.LoadAsync("flow-expiring"));
+    }
+}
+
+/// <summary>
+/// The round-27 unload proof, in the resolver registry's non-parallel collection (see
+/// <see cref="AsyncResponseTypeResolutionRegistryCollection"/>): it registers into the
+/// process-global registry, and a GC loop running beside another test's <c>GetAssemblies()</c> rescan
+/// can see the collectible context briefly alive although nothing pins it.
+/// </summary>
+[Collection("AsyncResponseTypeResolutionRegistry")]
+public sealed class Round27CollectibleUnloadTests
+{
+    // -----------------------------------------------------------------------------------------
+    // Finding — a resolver registration was process-static with no way to remove it, so
+    // RegisterAssembly pinned a collectible AssemblyLoadContext for the life of the process,
+    // contradicting this type's own "never pins a collectible AssemblyLoadContext".
+    // -----------------------------------------------------------------------------------------
+
+    [Fact]
+    public void DisposingAResolverRegistration_LetsItsCollectibleContextUnload()
+    {
+        var weakContext = RegisterPluginAssemblyAndDisposeTheHandle();
+
+        for (var i = 0; i < 10 && weakContext.IsAlive; i++)
+        {
+            GC.Collect();
+            GC.WaitForPendingFinalizers();
+        }
+
+        Assert.False(
+            weakContext.IsAlive,
+            "The registration held the plugin's AssemblyLoadContext after its handle was disposed.");
+    }
+
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+    private static WeakReference RegisterPluginAssemblyAndDisposeTheHandle()
+    {
+        var context = new System.Runtime.Loader.AssemblyLoadContext($"r27-plugin-{Guid.NewGuid():N}", isCollectible: true);
+        var assembly = context.LoadFromAssemblyPath(typeof(Round27RegressionTests).Assembly.Location);
+
+#pragma warning disable IL2026 // Plugin scenario; the test asserts lifetime, not trimmability.
+        var registration = AsyncResponseTypeResolution.RegisterAssembly(assembly);
+#pragma warning restore IL2026
+
+        // The registration is live and answering...
+        Assert.NotNull(AsyncResponseTypeResolution.Resolve(typeof(Round27RegressionTests.PluginProbeMarker).FullName!));
+
+        // ...and disposing it must both stop that and let go of the assembly.
+        registration.Dispose();
+        Assert.Null(AsyncResponseTypeResolution.Resolve(typeof(Round27RegressionTests.PluginProbeMarker).FullName!));
+        registration.Dispose(); // idempotent
+
+        var weak = new WeakReference(context);
+        context.Unload();
+        return weak;
     }
 }

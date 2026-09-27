@@ -54,6 +54,18 @@ public sealed class ResolvedTypeCacheBoundTests
 }
 
 /// <summary>
+/// The process-global resolver registry's collection, run with parallelization disabled (after
+/// every parallel collection, never beside one). Its members mutate the registry, and it holds the
+/// collectible-context unload proofs: loading the collectible twin raises
+/// <c>AppDomain.AssemblyLoad</c>, which invalidates the unresolvable-name cache, so any test running
+/// in parallel that misses a name next rescans <c>GetAssemblies()</c> — and that scan's local
+/// snapshot holds the collectible assembly for its duration. A GC loop that lands inside such a scan
+/// saw the context alive (a windows-latest CI failure) although nothing pins it.
+/// </summary>
+[CollectionDefinition("AsyncResponseTypeResolutionRegistry", DisableParallelization = true)]
+public sealed class AsyncResponseTypeResolutionRegistryCollection;
+
+/// <summary>
 /// Collection-serialized with <c>TypeResolutionTests</c> (CallbackSecurityTests.cs): both classes
 /// mutate the process-global resolver registry, and this class's per-test <c>Reset()</c> wiped the
 /// other's just-registered resolver under parallel execution.
