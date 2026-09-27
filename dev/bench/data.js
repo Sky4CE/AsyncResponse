@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1790506871433,
+  "lastUpdate": 1790506907002,
   "repoUrl": "https://github.com/Sky4CE/AsyncResponse",
   "entries": {
     "AsyncResponse Microbenchmarks": [
@@ -119858,6 +119858,140 @@ window.BENCHMARK_DATA = {
           {
             "name": "durable-flow-storm throughput",
             "value": 2927.5122211925186,
+            "unit": "flows/s"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "tyunisov@gmail.com",
+            "name": "Sky4CE",
+            "username": "Sky4CE"
+          },
+          "committer": {
+            "email": "tyunisov@gmail.com",
+            "name": "Sky4CE",
+            "username": "Sky4CE"
+          },
+          "distinct": false,
+          "id": "e9ff9a2ba229c822d4939d00453921a0349fb3fe",
+          "message": "fix: apply round-48 review — Cosmos refuses accounts it cannot keep its contract on, recovery confirms terminal reads, telemetry cannot change an outcome, checkpoint sizes are measured\n\nExternal review of ba8e8e70 (3 HIGH, 1 MEDIUM); all four findings were real.\n\nCosmos DB flow store (behaviour change). The store reads the account\nbefore it creates anything and throws for reads below Session\nconsistency, for more than one write region, and for an account it can\nestablish neither on. It used to warn, and only with a logger that had\nwarnings enabled. The startup validator asks the store the same question,\nso a refusal fails the host start; an account that cannot be read does\nnot. CosmosDurableFlowOptions.AllowUnsafeAccountConfiguration restores the\nwarn-only behaviour for the emulator (Eventual) and tests.\n\nDurable flows. Every decision that acknowledges a delivery without writing\nlooks again through LoadCurrentAsync whatever status the first read\nreported, terminal included: RecoverAsync, FailAsync, and a wake-up that\nreads the run as not Running (under the lease or waiting for it). With a\nfinished run's id reused, a lagging copy of the previous run consumed the\nnew run's response.\n\nTelemetry. Every measurement goes through a guarded recorder in\nAsyncResponseDiagnostics, a span whose listener throws while it starts is\nskipped, and DurableFlowService and the recovery dispatcher log through\nSafeLog: StartAsync returns the id of the run it published when the\nlogging provider throws, and a KeepWaiting response keeps its\nregistration.\n\nLedger cost. New histogram asyncresponse.flow_state.checkpoint.size,\nrecorded by every store for each ledger it serializes for a write.\n\n59 regression tests, red on ba8e8e70. Docs and CHANGELOG updated.",
+          "timestamp": "2026-09-27T11:12:39+02:00",
+          "tree_id": "21372f7ee68c3f3e2733d8412c1b2600949cc9cf",
+          "url": "https://github.com/Sky4CE/AsyncResponse/commit/e9ff9a2ba229c822d4939d00453921a0349fb3fe"
+        },
+        "date": 1790506906007,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "waiter-storm throughput",
+            "value": 63177.13250620147,
+            "unit": "ops/s"
+          },
+          {
+            "name": "progress-storm throughput",
+            "value": 29300.972557881138,
+            "unit": "ops/s"
+          },
+          {
+            "name": "worker-storm throughput",
+            "value": 29040.40286705443,
+            "unit": "jobs/s"
+          },
+          {
+            "name": "google-pubsub-ack-after-enqueue-dispatch-storm throughput",
+            "value": 160836.8663831649,
+            "unit": "ops/s"
+          },
+          {
+            "name": "rabbitmq-ack-after-enqueue-dispatch-storm throughput",
+            "value": 296820.4592406145,
+            "unit": "ops/s"
+          },
+          {
+            "name": "redis-ack-after-enqueue-dispatch-storm throughput",
+            "value": 218925.68786451127,
+            "unit": "ops/s"
+          },
+          {
+            "name": "nats-ack-after-receive-dispatch-storm throughput",
+            "value": 206785.88562259095,
+            "unit": "ops/s"
+          },
+          {
+            "name": "postgresql-ack-after-receive-dispatch-storm throughput",
+            "value": 177976.47862858445,
+            "unit": "ops/s"
+          },
+          {
+            "name": "sqlserver-ack-after-enqueue-dispatch-storm throughput",
+            "value": 236460.2841306774,
+            "unit": "ops/s"
+          },
+          {
+            "name": "mongodb-ack-after-enqueue-dispatch-storm throughput",
+            "value": 207984.95852779926,
+            "unit": "ops/s"
+          },
+          {
+            "name": "azure-servicebus-ack-after-receive-dispatch-storm throughput",
+            "value": 214048.42631596973,
+            "unit": "ops/s"
+          },
+          {
+            "name": "sqs-ack-after-enqueue-dispatch-storm throughput",
+            "value": 282955.8702024832,
+            "unit": "ops/s"
+          },
+          {
+            "name": "kafka-ack-after-enqueue-dispatch-storm throughput",
+            "value": 276668.03156228905,
+            "unit": "ops/s"
+          },
+          {
+            "name": "race-burst throughput",
+            "value": 103064.81787622163,
+            "unit": "ops/s"
+          },
+          {
+            "name": "raw-ingress-storm throughput",
+            "value": 68791.23346533913,
+            "unit": "ops/s"
+          },
+          {
+            "name": "shared-response-fanout throughput",
+            "value": 32545.608113385777,
+            "unit": "ops/s"
+          },
+          {
+            "name": "exception-fanout throughput",
+            "value": 22879.99461130367,
+            "unit": "ops/s"
+          },
+          {
+            "name": "timeout-storm throughput",
+            "value": 4792.310833114484,
+            "unit": "ops/s"
+          },
+          {
+            "name": "dispose-cleanup-storm throughput",
+            "value": 236605.74857326734,
+            "unit": "ops/s"
+          },
+          {
+            "name": "context-isolation-storm throughput",
+            "value": 70406.0740728224,
+            "unit": "ops/s"
+          },
+          {
+            "name": "watchdog-scan-storm throughput",
+            "value": 1654013.4636695944,
+            "unit": "entries/s"
+          },
+          {
+            "name": "durable-flow-storm throughput",
+            "value": 1258.3008851089753,
             "unit": "flows/s"
           }
         ]
