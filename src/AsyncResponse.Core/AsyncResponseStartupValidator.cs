@@ -426,7 +426,16 @@ internal sealed class AsyncResponseStartupValidator(
         if (_serviceProvider is not null)
         {
             await using var scope = _serviceProvider.CreateAsyncScope();
-            _ = scope.ServiceProvider.GetRequiredService<IFlowStateStore>();
+            var store = scope.ServiceProvider.GetRequiredService<IFlowStateStore>();
+
+            // The one I/O a start makes on a store's behalf, and only for a store that asks for
+            // it: a backend configuration the store REFUSES (the Cosmos DB store on an account
+            // below Session consistency) otherwise surfaced nowhere a deploy would see it —
+            // StartAsync publishes first and tolerates store faults after the publish, so every
+            // start was accepted and its job failed in the workers until it dead-lettered. The
+            // probe throws for the refusal only; an unreachable backend never fails the start.
+            if (store is IFlowStateStoreStartupProbe probe)
+                await probe.VerifyConfigurationAsync(cancellationToken).ConfigureAwait(false);
         }
     }
 

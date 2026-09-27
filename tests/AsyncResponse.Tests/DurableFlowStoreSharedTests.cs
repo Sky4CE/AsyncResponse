@@ -122,6 +122,77 @@ public sealed class DurableFlowStoreSharedTests
     }
 
     /// <summary>
+    /// Round 48, F3: every write serializes the WHOLE ledger, so a run's cumulative serialization
+    /// grows with the square of its retained steps — a documented cost nothing measured. Each
+    /// store now records the size of every ledger it serializes for a write, so a workload's
+    /// budgets (LedgerSizeWarningBytes, MaxRetainedSteps, MaxStateBytes) can be set from its own
+    /// distribution. The preflight writes nothing and records nothing.
+    /// </summary>
+    [Theory]
+    [MemberData(nameof(ProviderOptionTypes))]
+    public void EveryLedgerSerializedForAWrite_RecordsItsSize_AndThePreflightDoesNot(Type providerOptionsType)
+    {
+        var shared = providerOptionsType.Assembly.GetType(SharedTypeName, throwOnError: true)!;
+
+        // Only this fact's provider tag counts: the meter is process-wide.
+        var provider = $"checkpoint-size-{providerOptionsType.Name}";
+        var sizes = new List<long>();
+        using var listener = new System.Diagnostics.Metrics.MeterListener
+        {
+            InstrumentPublished = (instrument, l) =>
+            {
+                if (instrument.Meter.Name == AsyncResponseDiagnostics.MeterName && instrument.Name == "asyncresponse.flow_state.checkpoint.size")
+                {
+                    Assert.Equal("By", instrument.Unit);
+                    l.EnableMeasurementEvents(instrument);
+                }
+            }
+        };
+        listener.SetMeasurementEventCallback<long>((_, value, tags, _) =>
+        {
+            foreach (var tag in tags)
+            {
+                if (tag.Key == "provider" && Equals(tag.Value, provider))
+                    lock (sizes) sizes.Add(value);
+            }
+        });
+        listener.Start();
+
+        // A run that retains one ~1 KiB result per step, checkpointed after each: what the
+        // instrument sums to is the cost the run actually paid.
+        var state = CreateState("flow");
+        state.Steps = [];
+        long expected = 0;
+        for (var step = 0; step < 16; step++)
+        {
+            state.Steps[$"step-{step}"] = new FlowStepState { Completed = true, ResultJson = $"\"{new string('r', 1024)}\"" };
+
+            // With and without a budget: the size is measured either way.
+            var json = Assert.IsType<string>(Invoke(shared, "SerializeBounded", "flow", state, step % 2 == 0 ? null : (long?)10_000_000, provider));
+            expected += Encoding.UTF8.GetByteCount(json);
+        }
+
+        long[] recorded;
+        lock (sizes) recorded = [.. sizes];
+        Assert.Equal(16, recorded.Length);
+        Assert.Equal(expected, recorded.Sum());
+        Assert.True(recorded.SequenceEqual(recorded.Order()), "Each checkpoint rewrites a ledger at least as large as the one before it.");
+
+        // The cumulative cost is what grows quadratically: sixteen ~1 KiB results are a ~17 KiB
+        // ledger, and cost more than eight times that to checkpoint.
+        Assert.True(recorded.Sum() > 8 * recorded[^1], $"cumulative {recorded.Sum()} vs final {recorded[^1]}");
+
+        // The preflight serializes and bounds, and is not a write.
+        Assert.IsType<string>(Invoke(shared, "PreflightBounded", "flow", state, null, provider));
+        var tooLarge = AssertInnerAssignable<InvalidOperationException>(shared, "PreflightBounded", "flow", state, (long?)1, provider);
+        Assert.Equal("FlowStateTooLargeException", tooLarge.GetType().Name);
+
+        // Nor is a write that was refused for its size.
+        AssertInnerAssignable<InvalidOperationException>(shared, "SerializeBounded", "flow", state, (long?)1, provider);
+        lock (sizes) Assert.Equal(16, sizes.Count);
+    }
+
+    /// <summary>
     /// The size guard, the read-side identity mirror and the saturating clock helpers, exercised in
     /// every store assembly. The shared source is compiled per package, so a helper only some
     /// providers happen to call is otherwise dead code in the rest of them — this walks all nine.

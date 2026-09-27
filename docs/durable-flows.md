@@ -557,6 +557,21 @@ only a compact snapshot of each child), and lower the threshold on DynamoDB, who
 ledger past 350 KB by default (`MaxStateBytes`, headroom under the service's 400 KB item cap) —
 below the 512 KiB threshold.
 
+Measured with the production serializer, retaining about 1 KiB per step and serializing once
+after each step — four times the steps cost about sixteen times the bytes:
+
+| Retained steps | Cumulative bytes serialized | Mean bytes per checkpoint |
+|---:|---:|---:|
+| 64 | 2,286,541 | 35,727 |
+| 128 | 9,066,755 | 70,834 |
+| 256 (the default `MaxRetainedSteps`) | 36,118,147 | 141,087 |
+
+These exclude the engine's own checkpoints (attempt counters, breadcrumbs) and the provider's
+document envelope, so a real run pays somewhat more. To see what *your* workload pays, read the
+`asyncresponse.flow_state.checkpoint.size` histogram ([observability](observability.md#instruments)):
+every store records the size of each ledger it serializes for a write, so the histogram's sum is
+the cumulative cost and its largest bucket the ledger size to set budgets against.
+
 **Start acceptance and size errors.** `IFlowStateStore.ValidateCreate` checks deterministic
 creation constraints without I/O before the start job is published. Every bundled durable store
 implements it; Cosmos checks the complete escaped document. `FlowStateTooLargeException` is a
@@ -577,7 +592,7 @@ outside them the persistence cost arrives well before the size cap does:
 | Budget | Supported | What happens past it |
 |---|---|---|
 | Ledger size | ≤ `LedgerSizeWarningBytes` (512 KiB by default; ≤ 350 KB on DynamoDB) | The warning fires at the threshold and each doubling. A checkpoint over `MaxStateBytes` is refused with `FlowStateTooLargeException`: the attempt fails and is retried under the transport's redelivery bound, and the wake-up is dead-lettered where the transport has a dead-letter destination configured (the run stays `Running`, and a step body whose checkpoint was refused runs again on each redelivery) — the dead-letter queue is the alarm. RabbitMQ's default is unlimited requeues on classic queues, and the in-memory transport drops the job after `MaxDeliveryAttempts`, so bound the attempts and configure a dead-letter destination wherever this alarm matters. |
-| Retained steps per run | 256 by default (`MaxRetainedSteps`) | A new step fails before side effects. Explicitly raising the budget increases serialization and write amplification. |
+| Retained steps per run | 256 by default (`MaxRetainedSteps`) | A new step fails before side effects. Explicitly raising the budget increases serialization and write amplification: the cumulative cost grows with the square of the step count (~36 MB serialized for 256 steps of 1 KiB), so measure `asyncresponse.flow_state.checkpoint.size` on the workload first. |
 | Size of one step result | a few KiB | One large result is paid again on every later checkpoint of the run. |
 | Flow input | Must fit both the worker-envelope budget and the selected store's `MaxStateBytes`, including provider document overhead | Built-in stores reject oversized initial state with `FlowStateTooLargeException` before publication; oversized envelopes throw `WorkerJobTooLargeException`. Nothing is persisted. |
 

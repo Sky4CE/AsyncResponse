@@ -152,6 +152,9 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
         }
 
         if (state.Status != FlowRunStatus.Running)
+            state = await ConfirmNotRunningAsync(store, flowId, state).ConfigureAwait(false);
+
+        if (state.Status != FlowRunStatus.Running)
         {
             _logger.LogDebug("Durable flow {FlowId} is already {Status}; skipping execution.", flowId, state.Status);
             // Re-notify terminal runs on duplicate deliveries: the ORIGINAL delivery's
@@ -270,6 +273,19 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
         await NotifyParentAsync(state).ConfigureAwait(false);
     }
 
+    /// <summary>
+    /// The authoritative look behind a wake-up that is about to be acknowledged because the run
+    /// does not read <see cref="FlowRunStatus.Running"/>. Skipping the execution writes nothing, so
+    /// no revision or lease fence corrects a stale read behind it (see
+    /// <see cref="IFlowStateStore.LoadCurrentAsync"/>): under a reused id a lagging copy can still
+    /// show the previous run's terminal ledger while the new run's only wake-up is this delivery.
+    /// A <c>null</c> look falls back to <paramref name="read"/> — a ledger that vanished in between
+    /// makes skipping harmless, and a test double mocking the store (Moq answers the default
+    /// interface member with <c>null</c>) keeps skipping a finished run.
+    /// </summary>
+    private static async Task<FlowState> ConfirmNotRunningAsync(IFlowStateStore store, string flowId, FlowState read)
+        => await store.LoadCurrentAsync(flowId).ConfigureAwait(false) ?? read;
+
     private int _leaseContentionWaits;
 
     /// <summary>
@@ -378,6 +394,9 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
                     _logger.LogWarning("Durable flow {FlowId} has no state (unknown, expired, or unreadable); nothing to execute.", flowId);
                     return null;
                 }
+
+                if (state.Status != FlowRunStatus.Running)
+                    state = await ConfirmNotRunningAsync(store, flowId, state).ConfigureAwait(false);
 
                 if (state.Status != FlowRunStatus.Running)
                 {
@@ -847,13 +866,19 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
         var found = await FlowStateConcurrency.MutateAsync(store, flowId, _options.StateExpiry, _timeProvider, CheckpointRecovered)
             .ConfigureAwait(false);
 
-        // No pending step matched on a run that could take the payload. That conclusion writes
-        // NOTHING — no revision fence stands behind it to correct a stale read — and the callback
-        // is acknowledged with the payload gone. A store whose loads can serve an older copy of a
-        // present ledger (Cosmos session reads from a process that never received the holder's
-        // session token) may simply not show this process the breadcrumb yet: look again,
-        // authoritatively, before concluding.
-        if (found && !checkpointed && (running || lastStatus == FlowRunStatus.Suspended))
+        // Nothing was checkpointed. That conclusion writes NOTHING — no revision fence stands
+        // behind it to correct a stale read — and the callback is acknowledged with the payload
+        // gone. A store whose loads can serve an older copy of a present ledger (Cosmos session
+        // reads from a process that never received the holder's session token) may simply not show
+        // this process the breadcrumb yet: look again, authoritatively, before concluding.
+        //
+        // Whatever status the first look reported, terminal ones included. A finished run's id can
+        // be reused — its ledger deleted, a new run started under the same id — and a lagging copy
+        // then still shows the PREVIOUS run, Succeeded or Failed, while the new one waits on this
+        // very response. Trusting that copy consumed the response against the wrong generation of
+        // the ledger: the registration was deleted and the new run stayed pending until its
+        // timeout.
+        if (found && !checkpointed)
         {
             found = await FlowStateConcurrency.MutateAsync(
                     new CurrentReadFlowStateStore(store), flowId, _options.StateExpiry, _timeProvider, CheckpointRecovered)
@@ -988,16 +1013,29 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
         var found = await FlowStateConcurrency.MutateAsync(store, flowId, _options.StateExpiry, _timeProvider, MarkFailed)
             .ConfigureAwait(false);
 
-        // "Stale" is concluded without a write, so nothing fences it: a store whose loads can serve
-        // an older copy of a present ledger may not show this process the step now pending on
-        // this id (RecoverAsync parity). Look again, authoritatively, before ignoring the failure.
-        // Likewise a run that reads Suspended — not terminal, so an operator may just have set it
-        // back to Running, and a lagging copy would drop the failure its resumed run still waits on.
-        if (found && (stale || updated is { Status: not (FlowRunStatus.Running or FlowRunStatus.Succeeded or FlowRunStatus.Failed) }))
+        // Ignoring the signal is concluded without a write, so nothing fences it: a store whose
+        // loads can serve an older copy of a present ledger may not show this process the step now
+        // pending on this id (RecoverAsync parity). Look again, authoritatively, before ignoring
+        // the failure. Likewise a run that reads Suspended — an operator may just have set it back
+        // to Running, and a lagging copy would drop the failure its resumed run still waits on —
+        // and one that reads Succeeded or Failed: under a reused id that copy can be the PREVIOUS
+        // run's, and acting on it both dropped the failure the new run waits on and re-notified
+        // observers and the parent of an outcome that belongs to a ledger already deleted.
+        if (found && !failedNow)
         {
-            found = await FlowStateConcurrency.MutateAsync(
+            var confirmed = await FlowStateConcurrency.MutateAsync(
                     new CurrentReadFlowStateStore(store), flowId, _options.StateExpiry, _timeProvider, MarkFailed)
                 .ConfigureAwait(false);
+
+            // A ledger that is gone by the second look leaves a terminal first look standing: the
+            // run did finish, and the at-least-once re-notify below is all that is left to do for
+            // it. It also keeps a test double mocking the store — Moq answers the default
+            // interface member with null — re-notifying a finished run instead of reporting it
+            // unknown. Not when the second pass marked the run failed and then lost the ledger
+            // under its write (failedNow): that status was never persisted, and notifying it told
+            // observers and the parent of a failure that exists nowhere.
+            found = confirmed
+                || (!failedNow && updated is { Status: FlowRunStatus.Succeeded or FlowRunStatus.Failed });
         }
 
         if (!found || updated is null)

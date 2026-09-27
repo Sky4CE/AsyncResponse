@@ -273,7 +273,16 @@ internal sealed class InMemoryFlowStateStore : IFlowStateStore
         DateTime expiresAtUtc,
         string? leaseId = null,
         DateTime? leaseExpiresAtUtc = null)
-        => new(FlowStateJson.Serialize(state), state.Revision, expiresAtUtc, leaseId, leaseExpiresAtUtc);
+    {
+        var stateJson = FlowStateJson.Serialize(state);
+
+        // The same measurement the durable stores record (DurableFlowStoreShared.SerializeBounded),
+        // so a workload's checkpoint sizes can be read off a test or a development host.
+        if (AsyncResponseDiagnostics.FlowStateCheckpointsMeasured)
+            AsyncResponseDiagnostics.RecordFlowStateCheckpoint("InMemory", System.Text.Encoding.UTF8.GetByteCount(stateJson));
+
+        return new(stateJson, state.Revision, expiresAtUtc, leaseId, leaseExpiresAtUtc);
+    }
 
     private static void ValidateWrite(string flowId, FlowState state, TimeSpan ttl)
     {

@@ -70,6 +70,15 @@ public static class AsyncResponseDiagnostics
         Meter.CreateCounter<long>("asyncresponse.flow_state.prune_budget_exhausted", unit: "{prune}",
             description: "Opportunistic durable-flow prunes that stopped at PruneBudget with expired rows still remaining — the expired backlog is outgrowing the prune, tagged by provider.");
 
+    // The cost model of the full-ledger checkpoint, measured where it is paid: every create and
+    // checkpoint serializes the WHOLE ledger, so a run's cumulative serialization grows with the
+    // square of its retained steps. The histogram's sum is that cumulative cost and its count
+    // the number of writes; operators set LedgerSizeWarningBytes, MaxRetainedSteps and
+    // MaxStateBytes from the distribution their own workload produces, not from a guess.
+    private static readonly Histogram<long> FlowStateCheckpointSize =
+        Meter.CreateHistogram<long>("asyncresponse.flow_state.checkpoint.size", unit: "By",
+            description: "Serialized size (UTF-8 bytes) of each durable-flow ledger a store serialized for a write — a create or a checkpoint, whether or not the write then won its revision check — tagged by provider. Every write serializes the whole ledger: the sum is the cumulative serialization cost, the count the number of writes.");
+
     private static readonly Counter<long> OverloadedWaitsCounter =
         Meter.CreateCounter<long>("asyncresponse.channel.overloaded_waits", unit: "{wait}",
             description: "Waits faulted as indeterminate because responses for their correlation id arrived faster than the wait could process them and the bounded per-wait buffer was full (fire-and-forget channels), tagged by channel.");
@@ -96,11 +105,79 @@ public static class AsyncResponseDiagnostics
     private static int _watchdogGaugesRegistered;
     private static AsyncResponseWatchdogState? _watchdogState;
 
+    // Every measurement below is recorded through Emit/Record, never on the instrument directly.
+    // A MeterListener's measurement callback runs on the recording thread, inside Counter.Add, and
+    // whatever it throws comes out of the Add — into code that has just DECIDED something: a worker
+    // job that ran and was then reported failed (and redelivered, running its side effects again),
+    // a non-terminal checkpoint whose dispatch "failed" after it was routed (escalated through
+    // SetException to the failure callback, consuming the registration the terminal response
+    // needed). A measurement is the one part of those paths that is optional, so a metrics
+    // pipeline that fails costs the measurement and nothing else. Guarded here, once, rather than
+    // at each of the call sites that happen to have been bitten.
+    private static void Emit(Counter<long> counter, long value)
+    {
+        try
+        {
+            counter.Add(value);
+        }
+        catch
+        {
+            // The metrics pipeline is what is failing; there is nowhere left to report to.
+        }
+    }
+
+    private static void Emit(Counter<long> counter, long value, KeyValuePair<string, object?> tag)
+    {
+        try
+        {
+            counter.Add(value, tag);
+        }
+        catch
+        {
+            // See Emit(Counter<long>, long).
+        }
+    }
+
+    private static void Emit(
+        Counter<long> counter,
+        long value,
+        KeyValuePair<string, object?> tag1,
+        KeyValuePair<string, object?> tag2,
+        KeyValuePair<string, object?> tag3)
+    {
+        try
+        {
+            counter.Add(value, tag1, tag2, tag3);
+        }
+        catch
+        {
+            // See Emit(Counter<long>, long).
+        }
+    }
+
+    /// <summary>
+    /// Records <paramref name="value"/> on a histogram — this class's own, or one a provider
+    /// package created on <see cref="Meter"/> — swallowing anything a metrics listener throws: the
+    /// same guarantee the counters above give (see the note on <c>Emit</c>).
+    /// </summary>
+    internal static void Record<T>(Histogram<T> histogram, T value, KeyValuePair<string, object?> tag)
+        where T : struct
+    {
+        try
+        {
+            histogram.Record(value, tag);
+        }
+        catch
+        {
+            // See Emit(Counter<long>, long).
+        }
+    }
+
     /// <summary>Records one follow-up publish the in-memory transport rejected at its in-job overflow capacity.</summary>
     internal static void RecordInMemoryOverflowRejection()
     {
         if (InMemoryOverflowRejections.Enabled)
-            InMemoryOverflowRejections.Add(1);
+            Emit(InMemoryOverflowRejections, 1);
     }
 
     /// <summary>
@@ -110,14 +187,14 @@ public static class AsyncResponseDiagnostics
     internal static void RecordFlowOwnJobRedelivery(string resolution)
     {
         if (FlowOwnJobRedeliveries.Enabled)
-            FlowOwnJobRedeliveries.Add(1, new KeyValuePair<string, object?>("resolution", resolution));
+            Emit(FlowOwnJobRedeliveries, 1, new KeyValuePair<string, object?>("resolution", resolution));
     }
 
     /// <summary>Records one in-job delayed publish the in-memory transport rejected at its delayed-job capacity.</summary>
     internal static void RecordInMemoryDelayedRejection()
     {
         if (InMemoryDelayedRejections.Enabled)
-            InMemoryDelayedRejections.Add(1);
+            Emit(InMemoryDelayedRejections, 1);
     }
 
     /// <summary>
@@ -168,7 +245,41 @@ public static class AsyncResponseDiagnostics
         if (!ActivitySource.HasListeners())
             return null;
 
-        var activity = ActivitySource.StartActivity(name, kind);
+        var ambient = Activity.Current;
+        Activity? activity;
+        try
+        {
+            activity = ActivitySource.StartActivity(name, kind);
+        }
+        catch
+        {
+            // An ActivityListener's sampling and started callbacks run inside StartActivity. One
+            // that throws costs the span, not the operation it would have described.
+            //
+            // A sampling callback runs before the span exists. A STARTED callback runs after the
+            // span became the ambient one: left as it is, it would stay the parent of every span
+            // the operation starts and never be exported itself, so it is ended here.
+            var orphan = Activity.Current;
+            if (orphan is not null && !ReferenceEquals(orphan, ambient))
+            {
+                try
+                {
+                    orphan.Dispose();
+                }
+                catch
+                {
+                    // Its stopped callback is failing too.
+                }
+
+                // Whatever the stop got to before it threw, the operation runs under the span it
+                // started under.
+                if (ReferenceEquals(Activity.Current, orphan))
+                    Activity.Current = ambient;
+            }
+
+            return null;
+        }
+
         if (correlationId is not null)
             SetCorrelationId(activity, correlationId);
 
@@ -275,7 +386,8 @@ public static class AsyncResponseDiagnostics
         if (!LostSubscriberDispatches.Enabled)
             return;
 
-        LostSubscriberDispatches.Add(
+        Emit(
+            LostSubscriberDispatches,
             1,
             new KeyValuePair<string, object?>("kind", kind),
             new KeyValuePair<string, object?>("route", LostSubscriberRouteName(action, mixed)),
@@ -291,14 +403,14 @@ public static class AsyncResponseDiagnostics
     internal static void RecordWaiterOverload(string channel)
     {
         if (OverloadedWaitsCounter.Enabled)
-            OverloadedWaitsCounter.Add(1, new KeyValuePair<string, object?>("channel", channel));
+            Emit(OverloadedWaitsCounter, 1, new KeyValuePair<string, object?>("channel", channel));
     }
 
     /// <summary>Records one waiter timeout on the given channel kind.</summary>
     internal static void RecordWaiterTimeout(string channel)
     {
         if (WaiterTimeoutsCounter.Enabled)
-            WaiterTimeoutsCounter.Add(1, new KeyValuePair<string, object?>("channel", channel));
+            Emit(WaiterTimeoutsCounter, 1, new KeyValuePair<string, object?>("channel", channel));
     }
 
     /// <summary>
@@ -310,7 +422,7 @@ public static class AsyncResponseDiagnostics
     internal static void RecordWorkerOutcome(string outcome)
     {
         if (WorkerJobsCounter.Enabled)
-            WorkerJobsCounter.Add(1, new KeyValuePair<string, object?>("outcome", outcome));
+            Emit(WorkerJobsCounter, 1, new KeyValuePair<string, object?>("outcome", outcome));
     }
 
     /// <summary>
@@ -322,7 +434,7 @@ public static class AsyncResponseDiagnostics
     internal static void RecordTypeResolutionFailure(string kind)
     {
         if (TypeResolutionFailures.Enabled)
-            TypeResolutionFailures.Add(1, new KeyValuePair<string, object?>("kind", kind));
+            Emit(TypeResolutionFailures, 1, new KeyValuePair<string, object?>("kind", kind));
     }
 
     /// <summary>
@@ -332,7 +444,7 @@ public static class AsyncResponseDiagnostics
     internal static void RecordUnroutableResponse()
     {
         if (UnroutableResponsesCounter.Enabled)
-            UnroutableResponsesCounter.Add(1);
+            Emit(UnroutableResponsesCounter, 1);
     }
 
     /// <summary>
@@ -343,28 +455,42 @@ public static class AsyncResponseDiagnostics
     internal static void RecordOversizedInboundMessage(string route)
     {
         if (OversizedInboundCounter.Enabled)
-            OversizedInboundCounter.Add(1, new KeyValuePair<string, object?>("route", route));
+            Emit(OversizedInboundCounter, 1, new KeyValuePair<string, object?>("route", route));
     }
 
     /// <summary>Records the rows one opportunistic durable-flow prune deleted (zero is not recorded).</summary>
     internal static void RecordFlowStatePruned(string provider, long rows)
     {
         if (rows > 0 && FlowStatePrunedRows.Enabled)
-            FlowStatePrunedRows.Add(rows, new KeyValuePair<string, object?>("provider", provider));
+            Emit(FlowStatePrunedRows, rows, new KeyValuePair<string, object?>("provider", provider));
+    }
+
+    /// <summary>
+    /// Whether anything is listening to <c>asyncresponse.flow_state.checkpoint.size</c>. Asked
+    /// before measuring: a store with no <c>MaxStateBytes</c> has no other reason to count the
+    /// serialized ledger's bytes.
+    /// </summary>
+    internal static bool FlowStateCheckpointsMeasured => FlowStateCheckpointSize.Enabled;
+
+    /// <summary>Records the serialized size of one ledger a store serialized for a create or a checkpoint.</summary>
+    internal static void RecordFlowStateCheckpoint(string provider, long bytes)
+    {
+        if (FlowStateCheckpointSize.Enabled)
+            Record(FlowStateCheckpointSize, bytes, new KeyValuePair<string, object?>("provider", provider));
     }
 
     /// <summary>Records one failed opportunistic durable-flow prune (the create it rode on succeeded).</summary>
     internal static void RecordFlowStatePruneFailure(string provider)
     {
         if (FlowStatePruneFailures.Enabled)
-            FlowStatePruneFailures.Add(1, new KeyValuePair<string, object?>("provider", provider));
+            Emit(FlowStatePruneFailures, 1, new KeyValuePair<string, object?>("provider", provider));
     }
 
     /// <summary>Records one prune that hit its budget with a full last batch — expired rows remain.</summary>
     internal static void RecordFlowStatePruneBudgetExhausted(string provider)
     {
         if (FlowStatePruneBudgetExhausted.Enabled)
-            FlowStatePruneBudgetExhausted.Add(1, new KeyValuePair<string, object?>("provider", provider));
+            Emit(FlowStatePruneBudgetExhausted, 1, new KeyValuePair<string, object?>("provider", provider));
     }
 
     /// <summary>

@@ -258,7 +258,10 @@ owns the full story — this page is the map, not the territory.
   eventually hits the store's `MaxStateBytes` cap.
 - **Fix:** keep large results out of the ledger (persist them yourself and pass references),
   partition a long history into child flows, or — if the sizes are expected — raise
-  `DurableFlowOptions.LedgerSizeWarningBytes` (set `null` to disable). On DynamoDB lower it: the
+  `DurableFlowOptions.LedgerSizeWarningBytes` (set `null` to disable). Read what the workload
+  actually pays off the `asyncresponse.flow_state.checkpoint.size` histogram (its sum is the
+  cumulative bytes serialized, see [observability](observability.md#instruments)) before moving a
+  budget. On DynamoDB lower it: the
   store's 350 KB `MaxStateBytes` default (headroom under DynamoDB's 400 KB item cap) sits under the
   512 KiB default. See
   [ledger growth](durable-flows.md#storage-where-flow-state-lives).
@@ -277,6 +280,27 @@ owns the full story — this page is the map, not the territory.
   → `Fail`, progress/checkpoint payloads → `KeepWaiting` (which is what keeps a progress message
   from consuming the registration the terminal response still needs). See
   [recovery.md](recovery.md).
+
+### The Cosmos DB store throws `cannot run on this account configuration`
+
+- **Symptom:** the host fails to start with an `InvalidOperationException` starting
+  `The Cosmos DB durable-flow store cannot run on this account configuration:` and naming
+  `its reads run at … consistency` and/or `the account accepts writes in N regions`. After an
+  upgrade, a store that used to start (with, at most, a warning) no longer does. In a process
+  that does not run the hosted services the same exception comes from the store's operations
+  instead — `GetStateAsync`, `ResumeAsync`, every worker job — while `StartAsync` still returns
+  a flow id (it publishes first and tolerates store faults afterwards): look for its
+  `start job is published but the starter could not write the ledger` warning and for start jobs
+  in the dead-letter queue.
+- **Cause:** the store acknowledges deliveries on reads it needs to be current, and takes
+  execution leases through ETag-fenced writes. Neither holds below Session consistency or across
+  several write regions, so the store refuses the configuration instead of running without the
+  guarantee.
+- **Fix:** run the account (or the `CosmosClient`'s `ConsistencyLevel`) at Session or Strong, and
+  use an account with a single write region. Against the **emulator**, whose account default is
+  Eventual, set `CosmosDurableFlowOptions.AllowUnsafeAccountConfiguration = true` for development
+  and tests only. See
+  [account requirements](durable-flow-state-stores.md#account-requirements).
 
 ### Flow state exceeds the store's size limit
 

@@ -1446,7 +1446,9 @@ internal abstract class DbAsyncResponseChannelBase :
 
     private void ReportFullSweep(TimeSpan duration, int correlationIds)
     {
-        FullSweepDuration.Record(duration.TotalSeconds, new KeyValuePair<string, object?>("asyncresponse.channel", _activityTag));
+        // Through the guarded recorder: a metrics listener that throws must not end the dispatch
+        // loop this sweep belongs to.
+        AsyncResponseDiagnostics.Record(FullSweepDuration, duration.TotalSeconds, new KeyValuePair<string, object?>("asyncresponse.channel", _activityTag));
 
         // Half the confirmation budget: past it, a response the sweep reaches last is claimed for
         // recovery before its waiter is handed it. Rate-limited — a persistently slow sweep runs

@@ -130,7 +130,7 @@ Configure these on the selected store, for example:
 | `Sqlite` | `ConnectionString`, `TableName`, `AutoCreateSchema`, `PruneInterval`, `PruneBudget` |
 | `Oracle` | `ConnectionString`, `TableName`, `AutoCreateSchema`, `PruneInterval`, `PruneBudget` |
 | `MongoDB` | `ConnectionString` or registered `IMongoDatabase`/`IMongoClient`, `DatabaseName`, `CollectionName`, `AutoCreateIndexes` |
-| `Cosmos` | `ConnectionString` or registered `CosmosClient`, `DatabaseName`, `ContainerName`, `PartitionKeyPath`, `AutoCreateContainer`, `Throughput` |
+| `Cosmos` | `ConnectionString` or registered `CosmosClient`, `DatabaseName`, `ContainerName`, `PartitionKeyPath`, `AutoCreateContainer`, `Throughput`, `AllowUnsafeAccountConfiguration` (default `false`: the store refuses an account whose reads run below Session consistency or that has more than one write region; set it only for the emulator and tests — see [account requirements](durable-flow-state-stores.md#account-requirements)) |
 | `DynamoDB` | registered/default `IAmazonDynamoDB`, `TableName`, `AutoCreateTable`, `EnableTimeToLive`, `TimeToLiveAttributeName` |
 | `EFCore` | application `DbContext` mapping via `ConfigureAsyncResponseDurableFlows(...)`, `PruneInterval`, `PruneBudget`; schema changes are owned by your EF migrations |
 

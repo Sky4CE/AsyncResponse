@@ -67,8 +67,9 @@ left unset for a raw payload with no registration.
 
 ## Metrics
 
-AsyncResponse publishes counters and observable gauges through a `System.Diagnostics.Metrics.Meter`
-named `"AsyncResponse"` (constant `AsyncResponseDiagnostics.MeterName`). Subscribe with
+AsyncResponse publishes counters, histograms and observable gauges through a
+`System.Diagnostics.Metrics.Meter` named `"AsyncResponse"` (constant
+`AsyncResponseDiagnostics.MeterName`). Subscribe with
 OpenTelemetry's `AddMeter`:
 
 ```csharp
@@ -106,6 +107,7 @@ builder.Services.AddOpenTelemetry()
 | `asyncresponse.flow_state.pruned_rows` | counter | `provider` | Expired durable-flow ledger rows deleted by the relational stores' opportunistic prune (PostgreSQL, SQL Server, MySQL, SQLite, Oracle, EF Core). |
 | `asyncresponse.flow_state.prune_failures` | counter | `provider` | Opportunistic prunes that failed; the flow creation they rode on still succeeded and the next `PruneInterval` retries. Alert on a sustained rate: expired rows are accumulating. |
 | `asyncresponse.flow_state.prune_budget_exhausted` | counter | `provider` | Prunes that stopped at `PruneBudget` with a full last batch — expired rows remain and the backlog is outgrowing the prune. Raise `PruneBudget` or shorten `PruneInterval`. |
+| `asyncresponse.flow_state.checkpoint.size` | histogram (By) | `provider` | Serialized size, in UTF-8 bytes, of every durable-flow ledger a store serialized for a write — a create or a checkpoint, whether or not the write then won its revision check. Recorded by every bundled store, the in-memory one included (`provider` = `InMemory`), once per serialization: a write the store retries serializes — and records — again. `ValidateCreate`'s preflight is not a write and is not recorded, nor is a ledger refused by `MaxStateBytes` (the Cosmos DB store's second check, on the complete escaped document, runs after the ledger was measured). Every write serializes the **whole** ledger, so the histogram's **sum** is the cumulative serialization cost (it grows with the square of a run's retained steps) and its **count** the number of writes. Use the distribution to set `LedgerSizeWarningBytes`, `MaxRetainedSteps` and `MaxStateBytes` for the workload; see [supported ledger budgets](durable-flows.md#supported-ledger-budgets). Measuring costs one pass over the serialized ledger, and only while something listens. |
 
 The lost-subscriber counter is the one to alert on: a nonzero `route=failure` or
 `route=unclassified` rate means flows are dying mid-wait and being failed on recovery (a
@@ -113,6 +115,25 @@ The lost-subscriber counter is the one to alert on: a nonzero `route=failure` or
 listens — but pair it with the watchdog: a registration that keeps waiting and never resumes is a
 stuck flow), and a rising
 `asyncresponse.recovery.stale` gauge is your earliest signal of stuck flows.
+
+### A telemetry failure never decides an outcome
+
+Metrics and spans are recorded on the library's decision paths — after a worker job ran, after a
+lost response was routed — and a listener's callback runs on the recording thread. A
+`MeterListener` measurement callback or an `ActivityListener` sampling/started callback that
+throws costs **that measurement or span** and nothing else: the library records every measurement
+through a guarded recorder and starts every span through a guarded helper. Before that guard a
+failing metrics pipeline could report a job that had run as failed (so the transport redelivered
+it and its side effects ran again), or turn a routed non-terminal checkpoint into a failed
+publish that was escalated to the failure callback.
+
+The same holds for log lines on those paths — the worker executor, the ingress, the recovery
+dispatcher, and `IDurableFlows.StartAsync`, which returns the id of the run it published even
+when the logging provider throws (Microsoft.Extensions.Logging rethrows a provider's failure).
+
+Two things remain the host's to keep healthy: an `ActivityListener`'s **stopped** callback runs
+when a span is disposed, outside the helper, and observable gauges are read on the listener's own
+thread.
 
 > **Not emitted:** broker/store-native queue depth and size (Redis key count, JetStream stream
 > backlog, Service Bus queue length, Pub/Sub subscription depth, PostgreSQL table row counts) are *not* surfaced by

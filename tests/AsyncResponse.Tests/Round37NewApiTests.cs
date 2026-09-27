@@ -159,6 +159,9 @@ public sealed class Round37NewApiTests
     [Fact]
     public void RecordWaiterOverload_IncrementsTheOverloadedWaitsCounter_TaggedByChannel()
     {
+        // This flow's measurements only: the meter is process-wide and other tests record on the
+        // same instrument alongside.
+        var thisFlow = new AsyncLocal<bool> { Value = true };
         var measurements = new List<(string Instrument, long Value, string? Channel)>();
         using var listener = new MeterListener
         {
@@ -170,6 +173,9 @@ public sealed class Round37NewApiTests
         };
         listener.SetMeasurementEventCallback<long>((instrument, value, tags, _) =>
         {
+            if (!thisFlow.Value)
+                return;
+
             string? channel = null;
             foreach (var tag in tags)
             {

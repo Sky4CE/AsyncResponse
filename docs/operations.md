@@ -144,7 +144,7 @@ containers dominate everything else, so the split is mostly about keeping them a
 | Batch | Collection | Containers | Apps | Tests | What's in it |
 | --- | --- | --- | --- | --- | --- |
 | `data` | `DataCollection` | 8 | 9 | 380 | Everything database-backed: channel conformance, store contracts, the "direct" driver tests, and the database channel/transport SUTs |
-| `oracle-cosmos` | `OracleCosmosCollection` | 2 | 0 | 16 | Oracle and Cosmos store contracts, isolated — the two largest containers in the suite |
+| `oracle-cosmos` | `OracleCosmosCollection` | 2 | 0 | 17 | Oracle and Cosmos store contracts, isolated — the two largest containers in the suite |
 | `brokers` | `BrokersCollection` | 5 | 10 | 65 | Message brokers proper (Redis, Pub/Sub, RabbitMQ, NATS, Kafka) |
 | `cloud` | `CloudCollection` | 4 | 4 | 18 | Azure Service Bus + SQS emulators. Service Bus brings its own SQL Server |
 | `matrix-*` | nine collections | 5–10 | 0 | 2,121 | The provider cross product and the transport contract — see [The provider cross product](#the-provider-cross-product) — plus the Pub/Sub emulator's stop-drain test (`matrix-cloud-light`) |

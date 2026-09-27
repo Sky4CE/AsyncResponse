@@ -25,7 +25,7 @@ namespace AsyncResponse.IntegrationTests;
 // split is mostly about keeping those apart. Oracle and SQL Server are also capped in the AppHost.
 //
 //   data           8 containers,  9 apps, 380 tests   every database-backed test
-//   oracle-cosmos  2 containers,  0 apps,  16 tests   the two heavyweight stores, isolated
+//   oracle-cosmos  2 containers,  0 apps,  17 tests   the two heavyweight stores, isolated
 //   brokers        5 containers, 10 apps,  65 tests   message brokers (all small)
 //   cloud          4 containers,  4 apps,  18 tests   Service Bus + SQS emulators
 //
@@ -194,7 +194,7 @@ public sealed class DataBatchFixture : DriverOnlyBatchFixture
 
 /// <summary>
 /// Oracle and Cosmos, alone. Together they measured 3.2 GiB — more than half a default Docker VM —
-/// against only 16 tests (OracleCosmosStoreContractTests), so they get a batch to themselves rather
+/// against only 17 tests (OracleCosmosStoreContractTests), so they get a batch to themselves rather
 /// than making every other store test share a fleet that cannot reliably start.
 /// </summary>
 public sealed class OracleCosmosBatchFixture : IntegrationFixture

@@ -1,5 +1,7 @@
 #nullable enable
 AsyncResponse.DurableFlows.Cosmos.CosmosDurableFlowOptions
+AsyncResponse.DurableFlows.Cosmos.CosmosDurableFlowOptions.AllowUnsafeAccountConfiguration.get -> bool
+AsyncResponse.DurableFlows.Cosmos.CosmosDurableFlowOptions.AllowUnsafeAccountConfiguration.set -> void
 AsyncResponse.DurableFlows.Cosmos.CosmosDurableFlowOptions.AutoCreateContainer.get -> bool
 AsyncResponse.DurableFlows.Cosmos.CosmosDurableFlowOptions.AutoCreateContainer.set -> void
 AsyncResponse.DurableFlows.Cosmos.CosmosDurableFlowOptions.ConnectionString.get -> string?

@@ -487,8 +487,8 @@ the retry safe. Restore the secondary — or remove the arbiter — rather than 
 concern. The read concern is left as registered for ordinary loads — primary reads see every
 write the store had acknowledged, and the revision and lease fences reject whatever a stale read
 would otherwise decide. `LoadCurrentAsync`, which the engine uses where it acts on a load with no
-fence behind it (a recovered response matching no pending step, a failure or resume for a run
-that is not running, the read-back after a start's create lost, a re-attaching step checking
+fence behind it (a recovered response that was not checkpointed, a failure, wake-up or resume for
+a run that is not running, the read-back after a start's create lost, a re-attaching step checking
 whether recovery already completed it, and settling whether a checkpoint cancelled mid-write
 committed), reads with `linearizable` read concern instead: a primary that a network partition
 has deposed without its noticing still serves reads for up to an election timeout, and only a
@@ -570,6 +570,46 @@ builder.Services.AddAsyncResponse()
 An application-registered `CosmosClient` is reused automatically; omit `ConnectionString` in that
 case. Existing containers must already use the configured partition key and have TTL enabled.
 
+#### Account requirements
+
+The store's first operation reads the account, before it creates or validates anything on it,
+and **refuses to run** — every operation throws `InvalidOperationException` naming the cause,
+until the configuration is fixed — unless both hold:
+
+| Requirement | Why | How to meet it |
+|---|---|---|
+| Reads run at **Session** or **Strong** consistency: the `CosmosClient`'s own `ConsistencyLevel` override when it sets one, else the account default | Below Session a read carries no session token, so the read behind `LoadCurrentAsync` can still be served by a lagging replica. The engine acknowledges deliveries on that read without writing: a recovered response, a failure signal or a resume is then dropped against an older copy of the ledger. | Run the account at Session (the Cosmos DB default) or Strong. On a Bounded Staleness account set `CosmosClientOptions.ConsistencyLevel = ConsistencyLevel.Session`; a client can weaken the account's level, never strengthen it. |
+| The account has **one write region** | An ETag-fenced write that succeeds in one region does not exclude the same write succeeding in another. Two workers can each acquire the same execution lease and run the same flow; the account resolves the conflict last-writer-wins after both have run. | Use an account with a single write region (read regions are fine). |
+
+The check does not depend on logging, and an account that cannot be read establishes neither
+requirement: the account read's own exception fails the operation, provisioning is not latched,
+and the next operation asks again. Before this check existed the store only logged a warning, and
+only when it had a logger with warnings enabled.
+
+The same question is asked **when the host starts**, and there a refusal fails the start. That is
+where a deploy sees it: `IDurableFlows.StartAsync` publishes its start job first and tolerates
+store faults after the publish, so in a process that never runs the hosted services (or on a
+custom host that skips them) a start on a refused account is still accepted — it returns the flow
+id with a warning, and the job then fails in the workers until the transport dead-letters it.
+Only the refusal fails a start: an account that cannot be read within ten seconds is logged at
+Warning and left to the store's first operation, so an unreachable Cosmos DB does not keep a host
+from starting.
+
+`CosmosDurableFlowOptions.AllowUnsafeAccountConfiguration` (default `false`) turns the refusal back
+into that warning. It exists for the **Cosmos DB emulator**, whose account default is Eventual and
+cannot be raised by the client, and for tests. With it set the store provisions on any account and
+gives none of the guarantees above — do not set it for a production account.
+
+```csharp
+.WithCosmosDurableFlows(options =>
+{
+    options.DatabaseName = "orders";
+
+    // Local development against the emulator only.
+    options.AllowUnsafeAccountConfiguration = builder.Environment.IsDevelopment();
+});
+```
+
 `MaxStateBytes` (1.9 MB by default) bounds the **document** Cosmos receives, measured through the
 registered client's serializer: the ledger JSON travels inside it as the `stateJson` string, so
 every quote and backslash in the ledger is escaped a second time and a 1.2 MB ledger of escaped
@@ -607,14 +647,17 @@ authoritative "no such ledger" and its `412` means the ledger exists; the SDK al
   extra bodiless request per poll (every two seconds, or each `ExecutionLeaseRenewInterval` when
   that is shorter) while a delivery waits behind a held lease.
 - `LoadCurrentAsync` does it before every read. The engine calls it where a load's answer would
-  let it acknowledge a delivery **without writing** — a recovered response that matches no pending
-  step, a correlation-scoped failure for an id no step is pending on, a failure signal for a run
-  that reads `Suspended` (an operator may just have set it back to `Running`), and a resume of a
-  run that does not read `Running` — and only after a plain `LoadAsync` has already reached that
-  conclusion. A decision that ends in a revision- or lease-fenced write is corrected by the fence
-  when its read was stale; these are not, and an older copy of a present ledger (the holder
-  checkpointed the breadcrumb, this process's replica has not applied it) dropped the recovered
-  payload, the failure, or the operator's resume for good. A start job whose create reported an
+  let it acknowledge a delivery **without writing** — a recovered response that was not
+  checkpointed (it matches no pending step, or the run reads finished), a failure signal that did
+  not fail the run (no step pending on its correlation id, or a run that does not read `Running`),
+  and a wake-up or a resume of a run that does not read `Running` — and only after a plain
+  `LoadAsync` has already reached that conclusion. A decision that ends in a revision- or
+  lease-fenced write is corrected by the fence when its read was stale; these are not, and an
+  older copy of a present ledger (the holder checkpointed the breadcrumb, this process's replica
+  has not applied it) dropped the recovered payload, the failure, or the operator's resume for
+  good. Finished statuses are confirmed like any other: when a finished run's ledger is deleted
+  and its id reused, an older copy still shows the *previous* run — `Succeeded` or `Failed` —
+  while the new run waits on the very response being delivered. A start job whose create reported an
   existing ledger also reads it back this way when its plain load finds no ledger, or one bound to
   different work, so the starter's fresh create is not missed and the start is not dropped. Two
   more reads go through it: a re-attaching awaited step checking whether a recovery already
@@ -626,13 +669,11 @@ What that guarantees depends on the client's effective consistency level: **Stro
 Staleness** read from the write region, were already current; **Session** (the account default)
 is made current by the recorded token; **Bounded Staleness** read from another region,
 **Consistent Prefix**, and **Eventual** send no session token on reads, so only the absence answer
-is authoritative there and an observation can still lag — run the store at Session or Strong.
-When the store has a logger with warnings enabled (it gets the host's through
-`WithCosmosDurableFlows`), provisioning resolves the effective level once and logs a warning when it
-is neither Session nor Strong (Bounded Staleness included); it does not refuse to run, since the
-emulator defaults to Eventual.
-An account with **multiple write regions** has no single authoritative write path (two regions can
-both win the same ETag-fenced lease write), so none of these guarantees hold on one.
+is authoritative there and an observation can still lag. An account with **multiple write
+regions** has no single authoritative write path (two regions can both win the same ETag-fenced
+lease write), so none of these guarantees hold on one. Provisioning therefore refuses both —
+everything below Session, Bounded Staleness included, and more than one write region — see
+[account requirements](#account-requirements).
 
 Document instants are normalized to UTC as they are read: a registered serializer with local time
 zone handling (Newtonsoft `DateTimeZoneHandling.Local`) hands them back as `DateTimeKind.Local`
@@ -907,7 +948,12 @@ a custom store in production, test all of these against the real backend:
 - `LoadCurrentAsync` reflects every write the backend acknowledged before the call, including
   another process's. The default (`LoadAsync`) is right for a backend whose reads cannot return an
   older copy of a present record; override it when they can (replica or session reads). A
-  decorator must forward it for the same reason as `ObserveLeaseAsync`;
+  decorator must forward it for the same reason as `ObserveLeaseAsync`. The engine asks for it
+  behind every decision that acknowledges a delivery without writing, whatever status the plain
+  load reported — a finished status included, since a deleted ledger's id can be reused. A store
+  that cannot deliver the guarantee on some configuration of its backend should refuse that
+  configuration when it provisions, as the Cosmos DB store does, rather than serve a weaker read
+  under the same name;
 - TTL refresh and expired-record replacement are atomic;
 - **unreadable is not missing:** malformed JSON, an unknown schema version, a revision inside
   the JSON that disagrees with the stored one, and a stored `flowId` that is not the key all throw

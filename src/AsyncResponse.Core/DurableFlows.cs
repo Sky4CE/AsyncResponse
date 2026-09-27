@@ -107,6 +107,10 @@ internal sealed class DurableFlowService : IDurableFlows
         // Past the publish nothing is interruptible (CancellationToken.None) and no store failure
         // costs the caller the id: the run WILL execute, and a StartAsync that threw after its job
         // was published handed a caller retrying with a generated id a second, independent run.
+        // Nor does a logging failure: every line from here on goes through SafeLog, because a
+        // provider that throws (MEL's aggregate logger rethrows a provider's failure) did exactly
+        // that — the start was published, the ledger created, and the caller got the logger's
+        // exception instead of the id.
         bool created;
         try
         {
@@ -119,16 +123,17 @@ internal sealed class DurableFlowService : IDurableFlows
         }
         catch (Exception ex) when (ex is not (FlowStateTooLargeException or ArgumentException))
         {
-            _logger.LogWarning(
-                ex,
+            SafeLog.Try((Logger: _logger, Error: ex, FlowId: flowId), static s => s.Logger.LogWarning(
+                s.Error,
                 "Durable flow {FlowId} start job is published but the starter could not write the ledger; the executor creates it when the job is picked up.",
-                flowId);
+                s.FlowId));
             return flowId;
         }
 
         if (created)
         {
-            _logger.LogInformation("Started durable flow {FlowId} ({FlowType}).", flowId, typeof(TFlow).Name);
+            SafeLog.Try((Logger: _logger, FlowId: flowId, FlowType: typeof(TFlow).Name), static s => s.Logger.LogInformation(
+                "Started durable flow {FlowId} ({FlowType}).", s.FlowId, s.FlowType));
             return flowId;
         }
 
@@ -139,10 +144,10 @@ internal sealed class DurableFlowService : IDurableFlows
         }
         catch (Exception ex)
         {
-            _logger.LogWarning(
-                ex,
+            SafeLog.Try((Logger: _logger, Error: ex, FlowId: flowId), static s => s.Logger.LogWarning(
+                s.Error,
                 "Durable flow {FlowId} start job is published but the existing ledger could not be read to confirm it is the same start; the executor runs the job, or drops it loudly if the id is bound to different work.",
-                flowId);
+                s.FlowId));
             return flowId;
         }
 
@@ -150,7 +155,8 @@ internal sealed class DurableFlowService : IDurableFlows
         {
             // Lost the create to a ledger that has since expired: the published job's create wins
             // the next time round. Nothing for the caller to do.
-            _logger.LogWarning("Durable flow {FlowId} start job is published; the existing ledger is expired and the executor re-creates it.", flowId);
+            SafeLog.Try((Logger: _logger, FlowId: flowId), static s => s.Logger.LogWarning(
+                "Durable flow {FlowId} start job is published; the existing ledger is expired and the executor re-creates it.", s.FlowId));
             return flowId;
         }
 
@@ -160,7 +166,8 @@ internal sealed class DurableFlowService : IDurableFlows
 
         // A semantically identical retry: the published job re-enqueues the existing run
         // (completed steps skip) instead of creating a duplicate.
-        _logger.LogInformation("Durable flow {FlowId} already exists; the start job re-enqueues the existing run instead of creating a duplicate.", flowId);
+        SafeLog.Try((Logger: _logger, FlowId: flowId), static s => s.Logger.LogInformation(
+            "Durable flow {FlowId} already exists; the start job re-enqueues the existing run instead of creating a duplicate.", s.FlowId));
         return flowId;
     }
 
@@ -210,13 +217,14 @@ internal sealed class DurableFlowService : IDurableFlows
             // Not a dispatch failure to retry: the start job carries the initial ledger, and this
             // input serializes past what the consuming ingress accepts — it would be acknowledged
             // there without ever executing. Surfaced as itself (nothing was persisted) so the
-            // caller can shrink the input or move it behind a claim check.
-            _logger.LogError(
-                ex,
+            // caller can shrink the input or move it behind a claim check. Logged through SafeLog
+            // so that what the caller catches is this exception, not a logging provider's.
+            SafeLog.Try((Logger: _logger, Error: ex, FlowId: flowId), static s => s.Logger.LogError(
+                s.Error,
                 "Durable flow {FlowId} could not be started: its start job ({SerializedLength} UTF-16 code units) exceeds the ingress budget of {Limit}. Nothing was persisted.",
-                flowId,
-                ex.SerializedLength,
-                ex.Limit);
+                s.FlowId,
+                s.Error.SerializedLength,
+                s.Error.Limit));
             throw;
         }
         catch (OperationCanceledException ex) when (cancellationToken.IsCancellationRequested)
@@ -241,10 +249,13 @@ internal sealed class DurableFlowService : IDurableFlows
         }
         catch (Exception ex)
         {
-            _logger.LogError(
-                ex,
+            // Through SafeLog: a failed attempt may have landed all the same, and the exception
+            // below is the only thing that hands the caller the id to retry with — a logging
+            // provider that throws here replaced it with its own.
+            SafeLog.Try((Logger: _logger, Error: ex, FlowId: flowId), static s => s.Logger.LogError(
+                s.Error,
                 "Durable flow {FlowId} could not be started: its worker job was not published after retries. Nothing was persisted; retry the start (idempotent with this id).",
-                flowId);
+                s.FlowId));
             throw new DurableFlowNotDispatchedException(flowId, ex);
         }
     }
@@ -275,7 +286,8 @@ internal sealed class DurableFlowService : IDurableFlows
 
         if (state.Status != FlowRunStatus.Running)
         {
-            _logger.LogDebug("Durable flow {FlowId} is already {Status}; ignoring resume.", flowId, state.Status);
+            SafeLog.Try((Logger: _logger, FlowId: flowId, state.Status), static s => s.Logger.LogDebug(
+                "Durable flow {FlowId} is already {Status}; ignoring resume.", s.FlowId, s.Status));
             return;
         }
 
@@ -304,7 +316,8 @@ internal sealed class DurableFlowService : IDurableFlows
         }
         catch (Exception ex) when (ex is not OperationCanceledException || !cancellationToken.IsCancellationRequested)
         {
-            _logger.LogDebug(ex, "Durable flow {FlowId} could not be read before its start was published; publishing anyway.", flowId);
+            SafeLog.Try((Logger: _logger, Error: ex, FlowId: flowId), static s => s.Logger.LogDebug(
+                s.Error, "Durable flow {FlowId} could not be read before its start was published; publishing anyway.", s.FlowId));
             return null;
         }
     }

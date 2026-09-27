@@ -169,7 +169,7 @@ public sealed class DynamoDbFlowStateStore : IFlowStateStore, IDisposable
     {
         DurableFlowStoreShared.ValidateCreate(flowId, state, ttl);
         if (_options.MaxStateBytes is not null)
-            _ = DurableFlowStoreShared.SerializeBounded(flowId, state, _options.MaxStateBytes, "DynamoDB");
+            _ = DurableFlowStoreShared.PreflightBounded(flowId, state, _options.MaxStateBytes, "DynamoDB");
     }
 
     public async Task<bool> TryCreateAsync(string flowId, FlowState state, TimeSpan ttl, CancellationToken cancellationToken = default)

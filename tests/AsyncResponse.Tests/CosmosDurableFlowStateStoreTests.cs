@@ -184,6 +184,7 @@ public sealed class CosmosDurableFlowStateStoreTests
                 It.IsAny<CancellationToken>()))
             .ReturnsAsync(response.Object);
         client.Setup(item => item.GetContainer("flows", "states")).Returns(container.Object);
+        client.Setup(item => item.ReadAccountAsync()).ReturnsAsync(Account(ConsistencyLevel.Session));
         container
             .Setup(item => item.ReadItemAsync<CosmosFlowStateDocument>(
                 It.IsAny<string>(),
@@ -399,6 +400,7 @@ public sealed class CosmosDurableFlowStateStoreTests
         var provisioningStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var completeProvisioning = new TaskCompletionSource<ContainerResponse>(TaskCreationOptions.RunContinuationsAsynchronously);
         client.Setup(item => item.GetContainer("flows", "states")).Returns(container.Object);
+        client.Setup(item => item.ReadAccountAsync()).ReturnsAsync(Account(ConsistencyLevel.Session));
         container
             .Setup(item => item.ReadContainerAsync(
                 It.IsAny<ContainerRequestOptions>(), It.IsAny<CancellationToken>()))
@@ -945,8 +947,9 @@ public sealed class CosmosDurableFlowStateStoreTests
     {
         // An Eventual / Consistent Prefix client sends no session token, so the 412 cannot make
         // its reads current. A delete can win the race between the two calls once — not every
-        // time — so repeated disagreement is refused rather than acknowledged.
-        using var harness = new CosmosHarness();
+        // time — so repeated disagreement is refused rather than acknowledged. (Reached only with
+        // AllowUnsafeAccountConfiguration: provisioning refuses such a client otherwise.)
+        using var harness = new CosmosHarness(allowUnsafeAccount: true);
         harness.Client.SetupGet(client => client.ClientOptions).Returns(new CosmosClientOptions { ConsistencyLevel = ConsistencyLevel.Eventual });
         harness.WritePathSeesTheLedger();
         harness.ReadsException(HttpStatusCode.NotFound);
@@ -987,7 +990,8 @@ public sealed class CosmosDurableFlowStateStoreTests
     /// The same decision when the client sets no consistency override: the ACCOUNT default decides,
     /// read once. A Session or Strong account reads the ttl-hidden ledger as absent; Bounded Staleness
     /// (stronger than Session, but reads outside the write region lag with no session token to pin
-    /// them) and Eventual — the emulator's default — refuse it, naming what the store needs.
+    /// them) and Eventual — the emulator's default — refuse it, naming what the store needs. Those
+    /// two are reached only with AllowUnsafeAccountConfiguration: provisioning refuses them otherwise.
     /// </summary>
     [Theory]
     [InlineData(ConsistencyLevel.Session, true)]
@@ -996,7 +1000,7 @@ public sealed class CosmosDurableFlowStateStoreTests
     [InlineData(ConsistencyLevel.Eventual, false)]
     public async Task Load_PresentForWritesButHiddenFromReads_FollowsTheAccountDefault_WhenTheClientSetsNoLevel(ConsistencyLevel accountDefault, bool absent)
     {
-        using var harness = new CosmosHarness();
+        using var harness = new CosmosHarness(allowUnsafeAccount: !absent);
         harness.Client.SetupGet(client => client.ClientOptions).Returns(new CosmosClientOptions());
         harness.Client.Setup(client => client.ReadAccountAsync()).ReturnsAsync(Account(accountDefault));
         harness.WritePathSeesTheLedger();
@@ -1018,11 +1022,10 @@ public sealed class CosmosDurableFlowStateStoreTests
     }
 
     /// <summary>
-    /// Regression: below Session a read carries no session token, so LoadCurrentAsync — recovery,
-    /// failure signals, resumes — can act on a ledger older than the last acknowledged write, and
-    /// nothing said so: the level was only ever consulted on the rare "present for writes, absent
-    /// for reads" path. Provisioning now resolves it once and warns (it does not refuse: the
-    /// emulator defaults to Eventual, and a client override can only weaken the account level).
+    /// The accommodation (AllowUnsafeAccountConfiguration, for the emulator and tests): below
+    /// Session a read carries no session token, so LoadCurrentAsync — recovery, failure signals,
+    /// resumes — can act on a ledger older than the last acknowledged write. Provisioning resolves
+    /// the level once and, where it would otherwise refuse, warns.
     /// </summary>
     [Theory]
     [InlineData(ConsistencyLevel.Eventual, true)]
@@ -1033,7 +1036,7 @@ public sealed class CosmosDurableFlowStateStoreTests
     public async Task Provisioning_WarnsOnce_WhenReadsRunBelowSessionConsistency(ConsistencyLevel accountDefault, bool warns)
     {
         var logger = new CollectingLogger();
-        using var harness = new CosmosHarness(logger: logger.For<CosmosFlowStateStore>());
+        using var harness = new CosmosHarness(logger: logger.For<CosmosFlowStateStore>(), allowUnsafeAccount: true);
         harness.Client.SetupGet(client => client.ClientOptions).Returns(new CosmosClientOptions());
         harness.Client.Setup(client => client.ReadAccountAsync()).ReturnsAsync(Account(accountDefault));
         harness.Reads(Document(CreateState("flow"), DateTime.UtcNow.AddMinutes(5)));
@@ -1058,12 +1061,13 @@ public sealed class CosmosDurableFlowStateStoreTests
     }
 
     [Fact]
-    public async Task Provisioning_ThatCannotResolveTheConsistencyLevel_StillProvisions()
+    public async Task Provisioning_ThatCannotResolveTheConsistencyLevel_StillProvisions_WhenTheAccommodationIsSet()
     {
-        // The warning is best effort: an account read the credentials may not allow never fails
-        // the store's first operation, and the rare absence path asks again later.
+        // With AllowUnsafeAccountConfiguration the check is best effort, as it was before the
+        // refusal existed: an account read that fails never fails the store's first operation,
+        // and the rare absence path asks again later.
         var logger = new CollectingLogger();
-        using var harness = new CosmosHarness(logger: logger.For<CosmosFlowStateStore>());
+        using var harness = new CosmosHarness(logger: logger.For<CosmosFlowStateStore>(), allowUnsafeAccount: true);
         harness.Client.SetupGet(client => client.ClientOptions).Returns(new CosmosClientOptions());
         harness.Client.SetupSequence(client => client.ReadAccountAsync())
             .ThrowsAsync(CosmosError(HttpStatusCode.Forbidden))
@@ -1079,16 +1083,291 @@ public sealed class CosmosDurableFlowStateStoreTests
         harness.Client.Verify(client => client.ReadAccountAsync(), Times.Exactly(2));
     }
 
-    [Fact]
-    public async Task Provisioning_WithWarningsDisabled_SkipsTheAccountRead()
+    // ---------------------------------------------------------------------------------------
+    // Round 48, F1: the store promised LoadCurrentAsync's "every acknowledged write" on accounts
+    // that cannot deliver it. Below Session a read carries no session token, so the read that
+    // follows the write-path round trip can still be served by a lagging replica; with several
+    // write regions an ETag-fenced lease write excludes nobody in the other region. Provisioning
+    // only WARNED — and only when the store had a logger with warnings enabled; with none the
+    // check was skipped altogether. It now refuses, whatever the logging configuration.
+    // ---------------------------------------------------------------------------------------
+
+    public enum StoreLogging
     {
-        // No account round trip for a warning nobody would see.
-        using var harness = new CosmosHarness(logger: Microsoft.Extensions.Logging.Abstractions.NullLogger<CosmosFlowStateStore>.Instance);
+        None,
+        Disabled,
+        Enabled
+    }
+
+    private static ILogger<CosmosFlowStateStore>? LoggerFor(StoreLogging logging, CollectingLogger collected) => logging switch
+    {
+        StoreLogging.None => null,
+        StoreLogging.Disabled => Microsoft.Extensions.Logging.Abstractions.NullLogger<CosmosFlowStateStore>.Instance,
+        _ => collected.For<CosmosFlowStateStore>()
+    };
+
+    [Theory]
+    [InlineData(ConsistencyLevel.Eventual, StoreLogging.None)]
+    [InlineData(ConsistencyLevel.Eventual, StoreLogging.Disabled)]
+    [InlineData(ConsistencyLevel.Eventual, StoreLogging.Enabled)]
+    [InlineData(ConsistencyLevel.ConsistentPrefix, StoreLogging.Disabled)]
+    [InlineData(ConsistencyLevel.BoundedStaleness, StoreLogging.None)]
+    public async Task Provisioning_RefusesAnAccountBelowSessionConsistency_WhateverTheLoggingConfiguration(ConsistencyLevel accountDefault, StoreLogging logging)
+    {
+        using var harness = new CosmosHarness(logger: LoggerFor(logging, new CollectingLogger()));
         harness.Client.SetupGet(client => client.ClientOptions).Returns(new CosmosClientOptions());
+        harness.Client.Setup(client => client.ReadAccountAsync()).ReturnsAsync(Account(accountDefault));
+        harness.WritePathSeesTheLedger();
+        harness.Reads(Document(CreateState("flow"), DateTime.UtcNow.AddMinutes(5)));
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => harness.Store.LoadCurrentAsync("flow"));
+
+        Assert.Contains($"its reads run at {accountDefault} consistency", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("needs Session or Strong", ex.Message, StringComparison.Ordinal);
+        Assert.Contains(nameof(CosmosDurableFlowOptions.AllowUnsafeAccountConfiguration), ex.Message, StringComparison.Ordinal);
+
+        // Refused before any flow was processed: nothing was asked of the container's items.
+        Assert.Equal(0, harness.WritePathCalls);
+        harness.Container.Verify(
+            item => item.ReadItemAsync<CosmosFlowStateDocument>(It.IsAny<string>(), It.IsAny<PartitionKey>(), It.IsAny<ItemRequestOptions>(), It.IsAny<CancellationToken>()),
+            Times.Never);
+
+        // A refusal is not remembered as a provisioned store: every operation refuses.
+        await Assert.ThrowsAsync<InvalidOperationException>(() => harness.Store.LoadAsync("flow"));
+        await Assert.ThrowsAsync<InvalidOperationException>(() => harness.Store.TryAcquireLeaseAsync("flow", "owner", TimeSpan.FromMinutes(1)));
+        await Assert.ThrowsAsync<InvalidOperationException>(
+            () => harness.Store.TryCreateAsync("flow", CreateState("flow"), TimeSpan.FromMinutes(5)));
+    }
+
+    [Fact]
+    public async Task Provisioning_RefusesAClientThatWeakensASessionAccount()
+    {
+        // The client's own override decides what its reads run at; the account default does not.
+        using var harness = new CosmosHarness();
+        harness.Client.SetupGet(client => client.ClientOptions).Returns(new CosmosClientOptions { ConsistencyLevel = ConsistencyLevel.Eventual });
+        harness.Reads(Document(CreateState("flow"), DateTime.UtcNow.AddMinutes(5)));
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => harness.Store.LoadAsync("flow"));
+
+        Assert.Contains("its reads run at Eventual consistency", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task LoadCurrent_OnAnEventualClient_IsRefused_InsteadOfReturningALaggingReplicasCopy()
+    {
+        // The reviewer's reproduction: the write path answers 412 (the ledger exists), and the read
+        // that follows is served by a replica still holding revision 1, Suspended — which an
+        // Eventual client, sending no session token, is entitled to be handed. LoadCurrentAsync
+        // returned it as current.
+        using var harness = new CosmosHarness();
+        harness.Client.SetupGet(client => client.ClientOptions).Returns(new CosmosClientOptions { ConsistencyLevel = ConsistencyLevel.Eventual });
+        harness.WritePathSeesTheLedger();
+        var stale = CreateState("flow");
+        stale.Status = FlowRunStatus.Suspended;
+        harness.Reads(Document(stale, DateTime.UtcNow.AddMinutes(5)));
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() => harness.Store.LoadCurrentAsync("flow"));
+    }
+
+    [Theory]
+    [InlineData(StoreLogging.None)]
+    [InlineData(StoreLogging.Enabled)]
+    public async Task Provisioning_RefusesAnAccountWithSeveralWriteRegions(StoreLogging logging)
+    {
+        using var harness = new CosmosHarness(logger: LoggerFor(logging, new CollectingLogger()));
+        harness.Client.Setup(client => client.ReadAccountAsync()).ReturnsAsync(Account(ConsistencyLevel.Session, "West Europe", "East US"));
+        harness.Reads(Document(CreateState("flow"), DateTime.UtcNow.AddMinutes(5)));
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => harness.Store.LoadAsync("flow"));
+
+        Assert.Contains("accepts writes in 2 regions (West Europe, East US)", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("single write region", ex.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("needs Session or Strong", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Provisioning_NamesEveryDefect_WhenTheAccountHasBoth()
+    {
+        using var harness = new CosmosHarness();
+        harness.Client.Setup(client => client.ReadAccountAsync()).ReturnsAsync(Account(ConsistencyLevel.Eventual, "West Europe", "East US"));
+        harness.Reads(Document(CreateState("flow"), DateTime.UtcNow.AddMinutes(5)));
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => harness.Store.LoadAsync("flow"));
+
+        Assert.Contains("needs Session or Strong", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("single write region", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Provisioning_ThatCannotReadTheAccount_FailsTheOperation_AndAsksAgainOnTheNext()
+    {
+        // "Could not be determined" used to provision anyway. An account read that fails now fails
+        // the operation with its own exception — the caller's retry policy sees what it would see
+        // for any other store fault — and nothing is cached, so the next operation asks again.
+        using var harness = new CosmosHarness();
+        harness.Client.SetupSequence(client => client.ReadAccountAsync())
+            .ThrowsAsync(CosmosError(HttpStatusCode.ServiceUnavailable))
+            .ReturnsAsync(Account(ConsistencyLevel.Session));
+        harness.Reads(Document(CreateState("flow"), DateTime.UtcNow.AddMinutes(5)));
+
+        var ex = await Assert.ThrowsAsync<CosmosException>(() => harness.Store.LoadAsync("flow"));
+        Assert.Equal(HttpStatusCode.ServiceUnavailable, ex.StatusCode);
+
+        Assert.NotNull(await harness.Store.LoadAsync("flow"));
+        Assert.NotNull(await harness.Store.LoadAsync("flow"));
+        harness.Client.Verify(client => client.ReadAccountAsync(), Times.Exactly(2));
+    }
+
+    [Fact]
+    public async Task Provisioning_WithoutAccountProperties_Refuses()
+    {
+        using var harness = new CosmosHarness();
+        harness.Client.Setup(client => client.ReadAccountAsync()).ReturnsAsync((AccountProperties)null!);
+        harness.Client.SetupGet(client => client.ClientOptions).Returns(new CosmosClientOptions { ConsistencyLevel = ConsistencyLevel.Session });
+        harness.Reads(Document(CreateState("flow"), DateTime.UtcNow.AddMinutes(5)));
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => harness.Store.LoadAsync("flow"));
+
+        Assert.Contains("returned no account properties", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData(ConsistencyLevel.Session)]
+    [InlineData(ConsistencyLevel.Strong)]
+    public async Task Provisioning_AcceptsASessionOrStrongAccountWithOneWriteRegion_AndReadsItOnce(ConsistencyLevel accountDefault)
+    {
+        var logger = new CollectingLogger();
+        using var harness = new CosmosHarness(logger: logger.For<CosmosFlowStateStore>());
+        harness.Client.SetupGet(client => client.ClientOptions).Returns(new CosmosClientOptions());
+        harness.Client.Setup(client => client.ReadAccountAsync()).ReturnsAsync(Account(accountDefault));
+        harness.WritePathSeesTheLedger();
         harness.Reads(Document(CreateState("flow"), DateTime.UtcNow.AddMinutes(5)));
 
         Assert.NotNull(await harness.Store.LoadAsync("flow"));
-        harness.Client.Verify(client => client.ReadAccountAsync(), Times.Never);
+        Assert.NotNull(await harness.Store.LoadCurrentAsync("flow"));
+
+        harness.Client.Verify(client => client.ReadAccountAsync(), Times.Once);
+        Assert.DoesNotContain(logger.Messages, message => message.Contains("refuses by default", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task TheAccommodation_TurnsTheWriteRegionRefusalIntoAWarning()
+    {
+        var logger = new CollectingLogger();
+        using var harness = new CosmosHarness(logger: logger.For<CosmosFlowStateStore>(), allowUnsafeAccount: true);
+        harness.Client.Setup(client => client.ReadAccountAsync()).ReturnsAsync(Account(ConsistencyLevel.Session, "West Europe", "East US"));
+        harness.Reads(Document(CreateState("flow"), DateTime.UtcNow.AddMinutes(5)));
+
+        Assert.NotNull(await harness.Store.LoadAsync("flow"));
+        Assert.NotNull(await harness.Store.LoadAsync("flow"));
+
+        var warning = Assert.Single(logger.Messages, message => message.Contains("refuses by default", StringComparison.Ordinal));
+        Assert.Contains("single write region", warning, StringComparison.Ordinal);
+        Assert.Contains(nameof(CosmosDurableFlowOptions.AllowUnsafeAccountConfiguration), warning, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task TheAccommodation_WithAThrowingLogger_StillProvisions()
+    {
+        // The warning is the optional part of the accommodation; a provider that throws must not
+        // fail the store's first operation.
+        using var harness = new CosmosHarness(logger: new RecordingThrowingLogger<CosmosFlowStateStore> { ThrowOnMessageContaining = "refuses by default" }, allowUnsafeAccount: true);
+        harness.Client.Setup(client => client.ReadAccountAsync()).ReturnsAsync(Account(ConsistencyLevel.Eventual));
+        harness.Reads(Document(CreateState("flow"), DateTime.UtcNow.AddMinutes(5)));
+
+        Assert.NotNull(await harness.Store.LoadAsync("flow"));
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Round 48, F1 (host start). The starter publishes first and tolerates store faults after the
+    // publish, so a refusal that only the store's first operation raised reached no one who was
+    // deploying: every start was accepted, and its job failed in the workers until it
+    // dead-lettered. The startup validator now asks the store, and a refusal fails the start.
+    // ---------------------------------------------------------------------------------------
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task HostStart_FailsOnAnAccountTheStoreRefuses_UnlessTheAccommodationIsSet(bool accommodated)
+    {
+        var logger = new CollectingLogger();
+        using var harness = new CosmosHarness();
+        harness.Client.Setup(client => client.ReadAccountAsync()).ReturnsAsync(Account(ConsistencyLevel.Eventual));
+        var services = new ServiceCollection();
+        services.AddSingleton(typeof(ILogger<>), typeof(Microsoft.Extensions.Logging.Abstractions.NullLogger<>));
+        services.AddSingleton(logger.For<CosmosFlowStateStore>());
+        services.AddSingleton(harness.Client.Object);
+        services.AddAsyncResponse()
+            .WithInMemoryChannel()
+            .WithInMemoryTransport()
+            .WithCosmosDurableFlows(options =>
+            {
+                options.DatabaseName = "flows";
+                options.ContainerName = "states";
+                options.AutoCreateContainer = false;
+                options.AllowUnsafeAccountConfiguration = accommodated;
+            });
+        await using var provider = services.BuildServiceProvider();
+        var validator = provider.GetServices<Microsoft.Extensions.Hosting.IHostedService>().OfType<AsyncResponseStartupValidator>().Single();
+
+        if (accommodated)
+        {
+            await validator.StartAsync(CancellationToken.None);
+            Assert.Single(logger.Messages, message => message.Contains("refuses by default", StringComparison.Ordinal));
+        }
+        else
+        {
+            var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => validator.StartAsync(CancellationToken.None));
+            Assert.Contains("its reads run at Eventual consistency", ex.Message, StringComparison.Ordinal);
+        }
+
+        // Asked of the account alone: the host start provisions nothing.
+        harness.Container.Verify(
+            item => item.ReadContainerAsync(It.IsAny<ContainerRequestOptions>(), It.IsAny<CancellationToken>()),
+            Times.Never);
+    }
+
+    [Fact]
+    public async Task HostStart_WithAnAccountThatCannotBeRead_Starts_AndLeavesTheCheckToTheFirstOperation()
+    {
+        // Only the refusal fails a start: an unreachable Cosmos DB must not keep a host down.
+        var logger = new CollectingLogger();
+        using var harness = new CosmosHarness(logger: logger.For<CosmosFlowStateStore>());
+        harness.Client.Setup(client => client.ReadAccountAsync()).ThrowsAsync(CosmosError(HttpStatusCode.ServiceUnavailable));
+        IFlowStateStoreStartupProbe probe = harness.Store;
+
+        await probe.VerifyConfigurationAsync(CancellationToken.None);
+
+        Assert.Single(logger.Messages, message => message.Contains("could not read its account while the host started", StringComparison.Ordinal));
+        await Assert.ThrowsAsync<CosmosException>(() => harness.Store.LoadAsync("flow"));
+
+        // The caller's own cancellation is not a fault to swallow.
+        using var cancelled = new CancellationTokenSource();
+        await cancelled.CancelAsync();
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => probe.VerifyConfigurationAsync(cancelled.Token));
+    }
+
+    [Fact]
+    public async Task TheAccommodation_WarnsOnce_AcrossTheHostStartAndEveryProvisioningAttempt()
+    {
+        // The account check runs at host start and again with each provisioning attempt until one
+        // succeeds; a container that cannot be read yet must not repeat the warning every time.
+        var logger = new CollectingLogger();
+        using var harness = new CosmosHarness(logger: logger.For<CosmosFlowStateStore>(), allowUnsafeAccount: true);
+        harness.Client.Setup(client => client.ReadAccountAsync()).ReturnsAsync(Account(ConsistencyLevel.Eventual));
+        harness.Container
+            .SetupSequence(item => item.ReadContainerAsync(It.IsAny<ContainerRequestOptions>(), It.IsAny<CancellationToken>()))
+            .ThrowsAsync(CosmosError(HttpStatusCode.ServiceUnavailable))
+            .ThrowsAsync(CosmosError(HttpStatusCode.ServiceUnavailable))
+            .ReturnsAsync(ContainerResult(new ContainerProperties("states", "/flowId") { DefaultTimeToLive = -1 }).Object);
+        harness.Reads(Document(CreateState("flow"), DateTime.UtcNow.AddMinutes(5)));
+
+        await ((IFlowStateStoreStartupProbe)harness.Store).VerifyConfigurationAsync(CancellationToken.None);
+        await Assert.ThrowsAsync<CosmosException>(() => harness.Store.LoadAsync("flow"));
+        await Assert.ThrowsAsync<CosmosException>(() => harness.Store.LoadAsync("flow"));
+        Assert.NotNull(await harness.Store.LoadAsync("flow"));
+
+        Assert.Single(logger.Messages, message => message.Contains("refuses by default", StringComparison.Ordinal));
     }
 
     [Fact]
@@ -1109,6 +1388,7 @@ public sealed class CosmosDurableFlowStateStoreTests
                 options.DatabaseName = "flows";
                 options.ContainerName = "states";
                 options.AutoCreateContainer = false;
+                options.AllowUnsafeAccountConfiguration = true;
             });
         await using var provider = services.BuildServiceProvider();
 
@@ -1117,11 +1397,18 @@ public sealed class CosmosDurableFlowStateStoreTests
     }
 
     // AccountProperties has no public constructor: built from the account JSON the SDK itself parses.
-    private static AccountProperties Account(ConsistencyLevel level)
+    // One write region unless the test names several.
+    private static AccountProperties Account(ConsistencyLevel level, params string[] writeRegions)
     {
+        if (writeRegions.Length == 0)
+            writeRegions = ["West Europe"];
+
+        var regions = string.Join(",", writeRegions.Select(region =>
+            $$$"""{"name":"{{{region}}}","databaseAccountEndpoint":"https://account-{{{region.Replace(" ", string.Empty).ToLowerInvariant()}}}.documents.azure.com:443/"}"""));
         var account = Newtonsoft.Json.JsonConvert.DeserializeObject<AccountProperties>(
-            $$$"""{"id":"account","userConsistencyPolicy":{"defaultConsistencyLevel":"{{{level}}}"}}""")!;
+            $$$"""{"id":"account","userConsistencyPolicy":{"defaultConsistencyLevel":"{{{level}}}"},"writableLocations":[{{{regions}}}],"readableLocations":[{{{regions}}}]}""")!;
         Assert.Equal(level, account.Consistency.DefaultConsistencyLevel);
+        Assert.Equal(writeRegions, account.WritableRegions.Select(region => region.Name));
         return account;
     }
 
@@ -1503,10 +1790,13 @@ public sealed class CosmosDurableFlowStateStoreTests
     {
         private readonly Mock<ContainerResponse> _containerResponse;
 
-        public CosmosHarness(ContainerProperties? properties = null, ILogger<CosmosFlowStateStore>? logger = null)
+        public CosmosHarness(ContainerProperties? properties = null, ILogger<CosmosFlowStateStore>? logger = null, bool allowUnsafeAccount = false)
         {
             Client = new Mock<CosmosClient>();
             Container = new Mock<Container>();
+
+            // The account every test runs on unless it says otherwise: Session, one write region.
+            Client.Setup(item => item.ReadAccountAsync()).ReturnsAsync(Account(ConsistencyLevel.Session));
             _containerResponse = ContainerResult(properties ?? new ContainerProperties("states", "/flowId")
             {
                 DefaultTimeToLive = -1
@@ -1522,7 +1812,8 @@ public sealed class CosmosDurableFlowStateStoreTests
             {
                 DatabaseName = "flows",
                 ContainerName = "states",
-                AutoCreateContainer = false
+                AutoCreateContainer = false,
+                AllowUnsafeAccountConfiguration = allowUnsafeAccount
             }), logger: logger);
         }
 

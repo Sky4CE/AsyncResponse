@@ -287,6 +287,252 @@ public sealed class DurableFlowExecutorCoverageTests
         Assert.Equal(2, store.CurrentLoads);
     }
 
+    // ---------------------------------------------------------------------------------------
+    // Round 48, F2: the authoritative second look was taken only when the first one read Running
+    // or Suspended. A finished run's id can be reused — its ledger deleted, a new run started
+    // under the same id — and a lagging copy then still shows the PREVIOUS run, Succeeded or
+    // Failed, while the new run is live. Every decision below writes nothing, so no fence
+    // corrected it: the response, the failure or the wake-up was acknowledged against the wrong
+    // generation of the ledger.
+    // ---------------------------------------------------------------------------------------
+
+    [Theory]
+    [InlineData(FlowRunStatus.Succeeded)]
+    [InlineData(FlowRunStatus.Failed)]
+    public async Task ARecoveredResponse_ReadingThePreviousRunsTerminalLedger_UnderAReusedId_IsCheckpointedOnTheNewRun(FlowRunStatus previousRun)
+    {
+        var flowId = $"recover-reused-{previousRun}";
+        var current = new InMemoryFlowStateStore();
+        await CreateAsync(current, PendingOn(flowId, "new-correlation"));
+        var store = new LaggingReadStore(current)
+        {
+            Stale = { [flowId] = () => PreviousRun(flowId, previousRun) }
+        };
+        var observer = new RecordingObserver();
+        await using var harness = CreateHarness(store, observers: [observer]);
+
+        await harness.Executor.RecoverAsync(flowId, new object(), "new-correlation");
+
+        var recovered = (await current.LoadAsync(flowId))!.Steps!["step"];
+        Assert.True(recovered.Completed);
+        Assert.NotNull(recovered.ResultJson);
+        Assert.Null(recovered.PendingCorrelationId);
+        Assert.Equal(1, store.CurrentLoads);
+        Assert.Equal("new-correlation", Assert.Single(observer.Completed).CorrelationId);
+        harness.Builder.Verify(instance => instance.EnqueueWorkerAsync(
+            It.IsAny<Expression<Func<IDurableFlowExecutor, Task>>>(),
+            It.IsAny<CancellationToken>()), Times.Once);
+
+        // A run that really is finished still ignores the response — after the one current look.
+        var finishedId = $"recover-finished-{previousRun}";
+        await CreateAsync(current, FinishedRun(finishedId, previousRun));
+        await harness.Executor.RecoverAsync(finishedId, new object(), "new-correlation");
+
+        Assert.Equal(2, store.CurrentLoads);
+        Assert.Equal(previousRun, (await current.LoadAsync(finishedId))!.Status);
+        harness.Builder.Verify(instance => instance.EnqueueWorkerAsync(
+            It.IsAny<Expression<Func<IDurableFlowExecutor, Task>>>(),
+            It.IsAny<CancellationToken>()), Times.Once);
+    }
+
+    [Theory]
+    [InlineData(FlowRunStatus.Succeeded, true)]
+    [InlineData(FlowRunStatus.Succeeded, false)]
+    [InlineData(FlowRunStatus.Failed, true)]
+    [InlineData(FlowRunStatus.Failed, false)]
+    public async Task AFailureSignal_ReadingThePreviousRunsTerminalLedger_UnderAReusedId_FailsTheNewRun(FlowRunStatus previousRun, bool correlationScoped)
+    {
+        var flowId = $"fail-reused-{previousRun}-{correlationScoped}";
+        var current = new InMemoryFlowStateStore();
+        await CreateAsync(current, PendingOn(flowId, "new-correlation"));
+        var store = new LaggingReadStore(current)
+        {
+            Stale = { [flowId] = () => PreviousRun(flowId, previousRun) }
+        };
+        var observer = new AttemptFailureObserver();
+        await using var harness = CreateHarness(store, observers: [observer]);
+
+        if (correlationScoped)
+            await harness.Executor.FailAsync(flowId, new InvalidOperationException("remote failure"), "new-correlation");
+        else
+            await harness.Executor.FailAsync(flowId, new InvalidOperationException("remote failure"));
+
+        var failed = (await current.LoadAsync(flowId))!;
+        Assert.Equal(FlowRunStatus.Failed, failed.Status);
+        Assert.Equal("remote failure", failed.LastMessage);
+        Assert.Equal(1, store.CurrentLoads);
+
+        // Observers hear the NEW run fail — not the previous run's outcome a second time.
+        var finished = Assert.Single(observer.Finished);
+        Assert.Equal(FlowRunStatus.Failed, finished.Status);
+        Assert.Equal("remote failure", finished.Message);
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task AFailureSignal_ForAFinishedRun_StillReNotifies_AfterTheCurrentLook(bool ledgerGoneByTheSecondLook)
+    {
+        // The at-least-once re-notify of a finished run survives the second look — also when the
+        // ledger is gone by then (deleted or expired in between; and a test double mocking the
+        // store answers the default interface member with null).
+        const string flowId = "fail-finished";
+        var current = new InMemoryFlowStateStore();
+        if (!ledgerGoneByTheSecondLook)
+            await CreateAsync(current, FinishedRun(flowId, FlowRunStatus.Succeeded));
+        var store = new LaggingReadStore(current)
+        {
+            Stale = { [flowId] = () => PreviousRun(flowId, FlowRunStatus.Succeeded) }
+        };
+        var observer = new AttemptFailureObserver();
+        await using var harness = CreateHarness(store, observers: [observer]);
+
+        await harness.Executor.FailAsync(flowId, new InvalidOperationException("late failure"));
+
+        Assert.Equal(1, store.CurrentLoads);
+        Assert.Equal(FlowRunStatus.Succeeded, Assert.Single(observer.Finished).Status);
+    }
+
+    [Fact]
+    public async Task AFailureSignal_WhoseSecondLookLosesTheLedgerUnderItsWrite_NotifiesNothing()
+    {
+        // Pre-commit review of round 48. The second look finds the run live and marks it failed —
+        // in memory; the write is refused and the ledger is gone by the next read (deleted, or
+        // expired, under it). The failure was never persisted, so nobody is told of it: the
+        // terminal status on the in-memory copy must not pass for a finished first look.
+        const string flowId = "fail-lost-write";
+        var looks = 0;
+        var store = new Mock<IFlowStateStore>();
+        store.Setup(instance => instance.LoadAsync(flowId, It.IsAny<CancellationToken>()))
+            .ReturnsAsync(() => PreviousRun(flowId, FlowRunStatus.Succeeded));
+        store.Setup(instance => instance.LoadCurrentAsync(flowId, It.IsAny<CancellationToken>()))
+            .ReturnsAsync(() => Interlocked.Increment(ref looks) == 1 ? PendingOn(flowId, "new-correlation") : null);
+        store.Setup(instance => instance.TryUpdateAsync(
+                flowId, It.IsAny<FlowState>(), It.IsAny<long>(), It.IsAny<TimeSpan>(), It.IsAny<string?>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(false);
+        var observer = new AttemptFailureObserver();
+        await using var harness = CreateHarness(store.Object, observers: [observer]);
+
+        await harness.Executor.FailAsync(flowId, new InvalidOperationException("remote failure"), "new-correlation");
+
+        Assert.Equal(2, looks);
+        Assert.Empty(observer.Finished);
+        harness.Builder.Verify(instance => instance.EnqueueWorkerAsync(
+            It.IsAny<Expression<Func<IDurableFlowExecutor, Task>>>(),
+            It.IsAny<CancellationToken>()), Times.Never);
+    }
+
+    [Theory]
+    [InlineData(FlowRunStatus.Succeeded)]
+    [InlineData(FlowRunStatus.Failed)]
+    [InlineData(FlowRunStatus.Suspended)]
+    public async Task AWakeUp_ReadingThePreviousRunsLedger_UnderAReusedId_ExecutesTheNewRun(FlowRunStatus previousRun)
+    {
+        var flowId = $"execute-reused-{previousRun}";
+        var current = new InMemoryFlowStateStore();
+        await CreateAsync(current, Round40FlowLeaseTestSupport.RunnableState(flowId), withSteps: false);
+        var store = new LaggingReadStore(current)
+        {
+            Stale = { [flowId] = () => PreviousRun(flowId, previousRun) }
+        };
+        var observer = new AttemptFailureObserver();
+        await using var harness = CreateHarness(
+            store,
+            services => services.AddSingleton<Round40FlowLeaseTestSupport.CountingFlow>(),
+            observers: [observer]);
+
+        // Only the first plain load lags: once the second look has found the new run, the run's
+        // own reads are its own writes.
+        store.StaleReadsLeft = 1;
+        await harness.Executor.ExecuteAsync(flowId);
+
+        Assert.Equal(1, harness.Provider.GetRequiredService<Round40FlowLeaseTestSupport.CountingFlow>().Executions);
+        Assert.Equal(FlowRunStatus.Succeeded, (await current.LoadAsync(flowId))!.Status);
+        Assert.Equal(1, store.CurrentLoads);
+        Assert.Equal("Flow completed.", Assert.Single(observer.Finished).Message);
+    }
+
+    [Fact]
+    public async Task AWakeUp_ForARunThatReallyIsFinished_IsStillSkipped_AndReNotified()
+    {
+        const string flowId = "execute-finished";
+        var current = new InMemoryFlowStateStore();
+        await CreateAsync(current, FinishedRun(flowId, FlowRunStatus.Succeeded), withSteps: false);
+        var store = new LaggingReadStore(current);
+        var observer = new AttemptFailureObserver();
+        await using var harness = CreateHarness(
+            store,
+            services => services.AddSingleton<Round40FlowLeaseTestSupport.CountingFlow>(),
+            observers: [observer]);
+
+        await harness.Executor.ExecuteAsync(flowId);
+
+        Assert.Equal(0, harness.Provider.GetRequiredService<Round40FlowLeaseTestSupport.CountingFlow>().Executions);
+        Assert.Equal(1, store.CurrentLoads);
+        Assert.Equal(FlowRunStatus.Succeeded, Assert.Single(observer.Finished).Status);
+    }
+
+    [Fact]
+    public async Task AContendedWakeUp_ReadingThePreviousRunsTerminalLedger_UnderAReusedId_IsNotAcknowledgedAsFinished()
+    {
+        // The wake-up cannot take the lease (a holder that died inside its window) and, without
+        // it, reads the previous run's ledger. Acknowledging it as "already Succeeded" dropped
+        // what may be the new run's only wake-up and re-notified the old run's outcome. It keeps
+        // waiting on the lease instead, and hands the delivery back when the wait runs out.
+        const string flowId = "contended-reused";
+        var current = new InMemoryFlowStateStore();
+        await CreateAsync(current, Round40FlowLeaseTestSupport.RunnableState(flowId), withSteps: false);
+        var store = new LaggingReadStore(current)
+        {
+            Stale = { [flowId] = () => PreviousRun(flowId, FlowRunStatus.Succeeded) },
+            HeldBy = new FlowLeaseObservation("dead-holder", DateTime.UtcNow)
+        };
+        var observer = new AttemptFailureObserver();
+        await using var harness = CreateHarness(
+            store,
+            services => services.AddSingleton<Round40FlowLeaseTestSupport.CountingFlow>(),
+            observers: [observer],
+            options: new DurableFlowOptions
+            {
+                ExecutionLeaseDuration = TimeSpan.FromMilliseconds(200),
+                ExecutionLeaseRenewInterval = TimeSpan.FromMilliseconds(50)
+            });
+
+        await Assert.ThrowsAsync<DurableFlowLeaseContendedException>(
+            () => harness.Executor.ExecuteAsync(flowId).WaitAsync(TimeSpan.FromSeconds(30)));
+
+        Assert.Empty(observer.Finished);
+        Assert.True(store.CurrentLoads >= 1);
+        Assert.Equal(FlowRunStatus.Running, (await current.LoadAsync(flowId))!.Status);
+    }
+
+    private static FlowState PendingOn(string flowId, string correlationId)
+    {
+        var state = State(flowId);
+        state.Steps = new Dictionary<string, FlowStepState> { ["step"] = new() { PendingCorrelationId = correlationId } };
+        return state;
+    }
+
+    /// <summary>
+    /// The ledger the id's PREVIOUS run left behind, as a lagging copy still shows it: finished,
+    /// its step long settled, ten checkpoints in.
+    /// </summary>
+    private static FlowState PreviousRun(string flowId, FlowRunStatus status)
+    {
+        var state = FinishedRun(flowId, status);
+        state.Revision = 10;
+        return state;
+    }
+
+    /// <summary>A finished run as the store itself holds it (a ledger is created at revision zero).</summary>
+    private static FlowState FinishedRun(string flowId, FlowRunStatus status)
+    {
+        var state = State(flowId, status);
+        state.LastMessage = "previous run";
+        state.Steps = new Dictionary<string, FlowStepState> { ["step"] = new() { Completed = true, ResultJson = "{}" } };
+        return state;
+    }
+
     /// <summary>
     /// Plain loads served by a replica that has not applied the holder's latest checkpoint for the
     /// ids in <see cref="Stale"/>; <see cref="LoadCurrentAsync"/> and every write go to the
@@ -298,8 +544,19 @@ public sealed class DurableFlowExecutorCoverageTests
 
         public int CurrentLoads;
 
+        /// <summary>Plain loads that still lag; afterwards they are current. Unbounded by default.</summary>
+        public int StaleReadsLeft = int.MaxValue;
+
+        /// <summary>When set, the lease is held by this holder and cannot be acquired.</summary>
+        public FlowLeaseObservation? HeldBy { get; init; }
+
         public Task<FlowState?> LoadAsync(string flowId, CancellationToken cancellationToken = default)
-            => Stale.TryGetValue(flowId, out var stale) ? Task.FromResult<FlowState?>(stale()) : current.LoadAsync(flowId, cancellationToken);
+            => Stale.TryGetValue(flowId, out var stale) && Interlocked.Decrement(ref StaleReadsLeft) >= 0
+                ? Task.FromResult<FlowState?>(stale())
+                : current.LoadAsync(flowId, cancellationToken);
+
+        public Task<FlowLeaseObservation?> ObserveLeaseAsync(string flowId, CancellationToken cancellationToken = default)
+            => HeldBy is not null ? Task.FromResult<FlowLeaseObservation?>(HeldBy) : current.ObserveLeaseAsync(flowId, cancellationToken);
 
         public Task<FlowState?> LoadCurrentAsync(string flowId, CancellationToken cancellationToken = default)
         {
@@ -314,7 +571,7 @@ public sealed class DurableFlowExecutorCoverageTests
             => current.TryUpdateAsync(flowId, state, expectedRevision, ttl, leaseId, cancellationToken);
 
         public Task<bool> TryAcquireLeaseAsync(string flowId, string leaseId, TimeSpan leaseDuration, CancellationToken cancellationToken = default)
-            => current.TryAcquireLeaseAsync(flowId, leaseId, leaseDuration, cancellationToken);
+            => HeldBy is not null ? Task.FromResult(false) : current.TryAcquireLeaseAsync(flowId, leaseId, leaseDuration, cancellationToken);
 
         public Task<bool> TryRenewLeaseAsync(string flowId, string leaseId, TimeSpan leaseDuration, CancellationToken cancellationToken = default)
             => current.TryRenewLeaseAsync(flowId, leaseId, leaseDuration, cancellationToken);
@@ -561,6 +818,7 @@ public sealed class DurableFlowExecutorCoverageTests
 
         public DurableFlowExecutor Executor { get; }
         public Mock<IAsyncResponseBuilder> Builder { get; }
+        public IServiceProvider Provider => _provider;
 
         public ValueTask DisposeAsync() => _provider.DisposeAsync();
     }
@@ -568,7 +826,8 @@ public sealed class DurableFlowExecutorCoverageTests
     private static Harness CreateHarness(
         IFlowStateStore store,
         Action<IServiceCollection>? configure = null,
-        IEnumerable<IDurableFlowExecutionObserver>? observers = null)
+        IEnumerable<IDurableFlowExecutionObserver>? observers = null,
+        DurableFlowOptions? options = null)
     {
         var services = new ServiceCollection();
         services.AddSingleton(store);
@@ -585,7 +844,7 @@ public sealed class DurableFlowExecutorCoverageTests
             Mock.Of<IAsyncResponseSubscriber>(),
             recoverableSubscriber: null,
             new AsyncResponseContextPropagation([]),
-            new DurableFlowOptions(),
+            options ?? new DurableFlowOptions(),
             NullLogger<DurableFlowExecutor>.Instance,
             observers: observers);
 

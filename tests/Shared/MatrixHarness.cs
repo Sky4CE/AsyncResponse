@@ -852,6 +852,9 @@ public sealed class MatrixHarness : IAsyncDisposable
                 {
                     options.DatabaseName = Names.CosmosDatabase;
                     options.ContainerName = "flow_state";
+                    // The emulator's account default is Eventual, which the store refuses; a real
+                    // account runs the matrix under the store's own rules.
+                    options.AllowUnsafeAccountConfiguration = IsCosmosEmulator(backends.Require(backends.Cosmos, "cosmos"));
                     configure?.Invoke(options);
                 });
                 break;
@@ -1184,14 +1187,15 @@ public sealed class MatrixHarness : IAsyncDisposable
         }
     }
 
+    private static bool IsCosmosEmulator(string connectionString)
+        => connectionString.Contains("localhost", StringComparison.OrdinalIgnoreCase)
+           || connectionString.Contains("127.0.0.1", StringComparison.Ordinal);
+
     private static CosmosClientOptions CosmosClientOptionsFor(string connectionString)
     {
         var options = new CosmosClientOptions();
-        if (!connectionString.Contains("localhost", StringComparison.OrdinalIgnoreCase) &&
-            !connectionString.Contains("127.0.0.1", StringComparison.Ordinal))
-        {
+        if (!IsCosmosEmulator(connectionString))
             return options;
-        }
 
         // The emulator serves a self-signed certificate and advertises addresses that only resolve
         // inside its own container, so gateway mode pinned to the endpoint is the only usable shape.

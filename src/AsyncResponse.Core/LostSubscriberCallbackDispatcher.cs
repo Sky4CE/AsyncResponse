@@ -288,14 +288,17 @@ internal sealed class LostSubscriberCallbackDispatcher(
                 continue;
             }
 
+            // Every line of this dispatcher goes through SafeLog: it is the decision path of every
+            // lost response, and a logging provider that throws (MEL rethrows a provider's
+            // failure) must not decide whether a registration is kept, consumed, or failed.
             if (IsPermanentCallbackFailure(residual))
             {
-                _logger.LogError(
-                    residual,
+                SafeLog.Try((Logger: _logger, Error: residual, Kind: kind, CorrelationId: correlationId, Channel: channel), static state => state.Logger.LogError(
+                    state.Error,
                     "Lost-{Kind} dispatch for correlationId {CorrelationId} on {Channel} failed with a deterministic fault for one registration after another registration's callback succeeded; redelivery cannot fix it, so that registration stays registered for watchdog visibility.",
-                    kind,
-                    correlationId,
-                    channel);
+                    state.Kind,
+                    state.CorrelationId,
+                    state.Channel));
                 continue;
             }
 
@@ -307,20 +310,20 @@ internal sealed class LostSubscriberCallbackDispatcher(
 
         if (transient is null)
         {
-            _logger.LogError(
+            SafeLog.Try((Logger: _logger, Kind: kind, CorrelationId: correlationId, Channel: channel), static state => state.Logger.LogError(
                 "Lost-{Kind} dispatch for correlationId {CorrelationId} on {Channel} partially failed with deterministic faults only; the message is acknowledged.",
-                kind,
-                correlationId,
-                channel);
+                state.Kind,
+                state.CorrelationId,
+                state.Channel));
             return;
         }
 
-        _logger.LogError(
-            transient,
+        SafeLog.Try((Logger: _logger, Error: transient, Kind: kind, CorrelationId: correlationId, Channel: channel), static state => state.Logger.LogError(
+            state.Error,
             "Lost-{Kind} dispatch for correlationId {CorrelationId} on {Channel} partially failed transiently after another registration's callback succeeded; the consumed registrations are deleted, the failed ones stay armed, and the message is left unacknowledged so the transport redelivers it to those registrations alone.",
-            kind,
-            correlationId,
-            channel);
+            state.Kind,
+            state.CorrelationId,
+            state.Channel));
         throw new RecoveryCallbackFailedException(correlationId, attempts: 1, transient);
     }
 
@@ -351,10 +354,10 @@ internal sealed class LostSubscriberCallbackDispatcher(
             if (recoveryState?.PayloadTypeFullName is { } payloadTypeName
                 && !AsyncResponseTypeResolution.IsWithinResolutionLimits(payloadTypeName))
             {
-                _logger.LogError(
+                SafeLog.Try((Logger: _logger, Channel: channel, PayloadTypeName: payloadTypeName), static state => state.Logger.LogError(
                     "The recovery registration for channel {Channel} names a payload type that is not resolved: {PayloadType}. The response is treated as unclassifiable (do not resume).",
-                    channel,
-                    AsyncResponseTypeResolution.DescribeForDiagnostics(payloadTypeName));
+                    state.Channel,
+                    AsyncResponseTypeResolution.DescribeForDiagnostics(state.PayloadTypeName)));
             }
 
             var classification = recoveryState is null
@@ -373,10 +376,12 @@ internal sealed class LostSubscriberCallbackDispatcher(
                 // leave the REAL terminal response with nothing to route against (the flow then
                 // deadlocks re-attached to a correlation id nothing can answer). Invoke nothing;
                 // the caller keeps the registration armed, bounded by its TTL and visible to the
-                // watchdog.
-                _logger.LogInformation(
+                // watchdog. Guarded, above all here: a logging provider that threw on this line
+                // failed the dispatch, and the ingress escalated the checkpoint through
+                // SetException — to the failure callback this branch exists to keep it from.
+                SafeLog.Try((Logger: _logger, Channel: channel), static state => state.Logger.LogInformation(
                     "No subscribers for channel {Channel}; payload is a non-terminal checkpoint (KeepWaiting) — recovery registration retained.",
-                    channel);
+                    state.Channel));
                 activity?.SetTag("asyncresponse.recovery.callback_invoked", false);
                 return new LostSubscriberDispatchResult(action, false);
             }
@@ -385,7 +390,8 @@ internal sealed class LostSubscriberCallbackDispatcher(
             {
                 if (recoveryState is null)
                 {
-                    _logger.LogWarning("No subscribers and no recovery state for channel {Channel}.", channel);
+                    SafeLog.Try((Logger: _logger, Channel: channel), static state => state.Logger.LogWarning(
+                        "No subscribers and no recovery state for channel {Channel}.", state.Channel));
                     activity?.SetTag("asyncresponse.recovery.callback_invoked", false);
                     return new LostSubscriberDispatchResult(action, false);
                 }
@@ -405,18 +411,21 @@ internal sealed class LostSubscriberCallbackDispatcher(
                 // registration with NEITHER callback keeps the old warn-and-retain behavior.
                 if (recoveryState.FailureCallback != null)
                 {
-                    _logger.LogWarning("No subscribers for channel {Channel}; payload is resumable but no resume callback is registered — routing to the failure callback.", channel);
+                    SafeLog.Try((Logger: _logger, Channel: channel), static state => state.Logger.LogWarning(
+                        "No subscribers for channel {Channel}; payload is resumable but no resume callback is registered — routing to the failure callback.", state.Channel));
                     var fallbackInvoked = await DispatchToFailureCallback(recoveryState, callbackPayload, response, channel, activity).ConfigureAwait(false);
                     activity?.SetTag("asyncresponse.recovery.callback_invoked", fallbackInvoked);
                     return new LostSubscriberDispatchResult(action, fallbackInvoked);
                 }
 
-                _logger.LogWarning("No subscribers for channel {Channel}; no resume callback available.", channel);
+                SafeLog.Try((Logger: _logger, Channel: channel), static state => state.Logger.LogWarning(
+                    "No subscribers for channel {Channel}; no resume callback available.", state.Channel));
                 activity?.SetTag("asyncresponse.recovery.callback_invoked", false);
                 return new LostSubscriberDispatchResult(action, false);
             }
 
-            _logger.LogWarning("No subscribers for channel {Channel}; invoking resume callback.", channel);
+            SafeLog.Try((Logger: _logger, Channel: channel), static state => state.Logger.LogWarning(
+                "No subscribers for channel {Channel}; invoking resume callback.", state.Channel));
 
             var invocation = ReflectionExtensions.ResolveCallback(
                 recoveryState.ResumeCallback,
@@ -459,12 +468,14 @@ internal sealed class LostSubscriberCallbackDispatcher(
         {
             if (recoveryState?.FailureCallback == null)
             {
-                _logger.LogWarning("No subscribers for channel {Channel}; no failure callback available.", channel);
+                SafeLog.Try((Logger: _logger, Channel: channel), static state => state.Logger.LogWarning(
+                    "No subscribers for channel {Channel}; no failure callback available.", state.Channel));
                 activity?.SetTag("asyncresponse.recovery.callback_invoked", false);
                 return false;
             }
 
-            _logger.LogWarning("No subscribers for channel {Channel}; invoking failure callback.", channel);
+            SafeLog.Try((Logger: _logger, Channel: channel), static state => state.Logger.LogWarning(
+                "No subscribers for channel {Channel}; invoking failure callback.", state.Channel));
 
             // The same ladder and the same settlement as the response route's failure callback:
             // a deterministic fault (unauthorized, unresolvable, malformed, no longer binding) is
@@ -526,11 +537,13 @@ internal sealed class LostSubscriberCallbackDispatcher(
         // exception logging.
         if (recoveryState.FailureCallback == null)
         {
-            _logger.LogError("No subscribers for channel {Channel} and the response declined to resume, but no failure callback is available; the response is NOT routed to resume. Payload: {PayloadLength} UTF-16 code units.", channel, payloadJson?.Length ?? 0);
+            SafeLog.Try((Logger: _logger, Channel: channel, Length: payloadJson?.Length ?? 0), static state => state.Logger.LogError(
+                "No subscribers for channel {Channel} and the response declined to resume, but no failure callback is available; the response is NOT routed to resume. Payload: {PayloadLength} UTF-16 code units.", state.Channel, state.Length));
             return false;
         }
 
-        _logger.LogWarning("No subscribers for channel {Channel}; response declined to resume, invoking failure callback. Payload: {PayloadLength} UTF-16 code units.", channel, payloadJson?.Length ?? 0);
+        SafeLog.Try((Logger: _logger, Channel: channel, Length: payloadJson?.Length ?? 0), static state => state.Logger.LogWarning(
+            "No subscribers for channel {Channel}; response declined to resume, invoking failure callback. Payload: {PayloadLength} UTF-16 code units.", state.Channel, state.Length));
 
         // The type name goes into the exception's MESSAGE, which generic exception logging
         // sweeps up: bounded and escaped like every other quote of a persisted name. An ordinary

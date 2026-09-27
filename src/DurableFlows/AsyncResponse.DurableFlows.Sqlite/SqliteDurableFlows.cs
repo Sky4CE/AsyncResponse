@@ -134,7 +134,7 @@ public sealed class SqliteFlowStateStore : IFlowStateStore
     {
         DurableFlowStoreShared.ValidateCreate(flowId, state, ttl);
         if (_options.MaxStateBytes is not null)
-            _ = DurableFlowStoreShared.SerializeBounded(flowId, state, _options.MaxStateBytes, "SQLite");
+            _ = DurableFlowStoreShared.PreflightBounded(flowId, state, _options.MaxStateBytes, "SQLite");
     }
 
     public async Task<bool> TryCreateAsync(

@@ -139,7 +139,7 @@ public sealed class OracleFlowStateStore : IFlowStateStore
     {
         DurableFlowStoreShared.ValidateCreate(flowId, state, ttl);
         if (_options.MaxStateBytes is not null)
-            _ = DurableFlowStoreShared.SerializeBounded(flowId, state, _options.MaxStateBytes, "Oracle");
+            _ = DurableFlowStoreShared.PreflightBounded(flowId, state, _options.MaxStateBytes, "Oracle");
     }
 
     public async Task<bool> TryCreateAsync(string flowId, FlowState state, TimeSpan ttl, CancellationToken cancellationToken = default)

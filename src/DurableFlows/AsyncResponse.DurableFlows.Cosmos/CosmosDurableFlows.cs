@@ -82,6 +82,30 @@ public sealed class CosmosDurableFlowOptions : DurableFlowOptions
     /// </summary>
     public long? MaxStateBytes { get; set; } = 1_900_000;
 
+    /// <summary>
+    /// Lets the store run on an account or client configuration that cannot honour its contract,
+    /// turning provisioning's refusal into a warning. Off by default: the store's first operation
+    /// reads the account and throws <see cref="InvalidOperationException"/> when
+    /// <list type="bullet">
+    /// <item>reads run below <b>Session</b> consistency (the <see cref="CosmosClient"/>'s own
+    /// <c>ConsistencyLevel</c> override, else the account default, is Bounded Staleness, Consistent
+    /// Prefix or Eventual): a read then carries no session token, so
+    /// <see cref="IFlowStateStore.LoadCurrentAsync"/> can hand recovery, a failure signal or a
+    /// resume a ledger older than the last acknowledged write — and the response, failure or resume
+    /// is dropped on it;</item>
+    /// <item>the account accepts writes in <b>more than one region</b>: an ETag-fenced write that
+    /// succeeds in one region does not exclude the same write succeeding in another, so two
+    /// workers can hold the same execution lease at once;</item>
+    /// <item>the client returns no account properties, so neither can be established (an account
+    /// read that FAILS surfaces its own exception instead, and the next operation asks again).</item>
+    /// </list>
+    /// The same check runs when the host starts, where a refusal fails the start.
+    /// Set it only for the Cosmos DB emulator (whose account default is Eventual) and for tests.
+    /// With it set the store provisions as it did before the refusal existed, without the
+    /// guarantees above. Default: <c>false</c>.
+    /// </summary>
+    public bool AllowUnsafeAccountConfiguration { get; set; }
+
     /// <summary>Validates option values and throws on misconfiguration.</summary>
     public void Validate()
     {
@@ -110,7 +134,7 @@ public sealed class CosmosDurableFlowOptions : DurableFlowOptions
 }
 
 /// <summary>Azure Cosmos DB implementation of <see cref="IFlowStateStore"/>.</summary>
-public sealed class CosmosFlowStateStore : IFlowStateStore, IDisposable
+public sealed class CosmosFlowStateStore : IFlowStateStore, IFlowStateStoreStartupProbe, IDisposable
 {
     // Time authority: this store keeps the app clock (DateTime.UtcNow) for expiry and lease
     // comparisons. Cosmos conditional writes (ETag preconditions) evaluate client-supplied
@@ -125,13 +149,16 @@ public sealed class CosmosFlowStateStore : IFlowStateStore, IDisposable
     private readonly ILogger<CosmosFlowStateStore>? _logger;
     private volatile bool _created;
     private int _sessionConsistentReads; // 0 = not yet known, 1 = yes, 2 = no
+    private int _unsafeConfigurationWarned;
 
     /// <param name="client">The Cosmos client the store runs on.</param>
     /// <param name="options">Store options; validated here.</param>
     /// <param name="ownsClient">Whether <see cref="Dispose"/> disposes <paramref name="client"/>.</param>
     /// <param name="logger">
-    /// Optional. With one, provisioning resolves the client's effective consistency level and warns
-    /// once when it is weaker than the Session or Strong level the store needs.
+    /// Optional. Receives the warning that replaces provisioning's refusal of an unsupported
+    /// account configuration when
+    /// <see cref="CosmosDurableFlowOptions.AllowUnsafeAccountConfiguration"/> is set. The check
+    /// itself never depends on it.
     /// </param>
     public CosmosFlowStateStore(CosmosClient client, IOptions<CosmosDurableFlowOptions> options, bool ownsClient = false, ILogger<CosmosFlowStateStore>? logger = null)
     {
@@ -232,9 +259,11 @@ public sealed class CosmosFlowStateStore : IFlowStateStore, IDisposable
 
     /// <summary>
     /// Whether a read that follows a write-path round trip is current: the client's own consistency
-    /// override, else the account default, is Session or Strong. Asked once: at provisioning when
-    /// the store has a logger to warn on (<see cref="WarnUnlessReadsAreSessionConsistentAsync"/>),
-    /// otherwise on the rare "present for writes, absent for reads" path.
+    /// override, else the account default, is Session or Strong. Established at provisioning
+    /// (<see cref="EnsureAccountConfigurationAsync"/>); asked here only when provisioning was
+    /// allowed to go ahead without the answer
+    /// (<see cref="CosmosDurableFlowOptions.AllowUnsafeAccountConfiguration"/> and an account that
+    /// could not be read), on the rare "present for writes, absent for reads" path.
     /// </summary>
     private async Task<bool> ReadsAreSessionConsistentAsync(CancellationToken cancellationToken)
     {
@@ -267,57 +296,150 @@ public sealed class CosmosFlowStateStore : IFlowStateStore, IDisposable
     }
 
     /// <summary>
-    /// Provisioning's one-time check of the level <see cref="ReadsAreSessionConsistentAsync"/>
-    /// decides on, surfaced as a warning instead of left to the rare path that needs it. Below
-    /// Session a read carries no session token, so after the write-path round trip only ABSENCE is
-    /// authoritative: <see cref="LoadCurrentAsync"/> can hand recovery, a failure signal or a resume
-    /// a ledger older than the last acknowledged write (missing the breadcrumb a response matches,
-    /// or still Suspended), and a ledger its server ttl hides fails as unreadable instead of reading
-    /// as absent. Warned, not refused: a client override can only weaken the account level, the
-    /// emulator defaults to Eventual, and refusing would make the store unusable on such accounts.
-    /// Best effort — failing to resolve the level never fails provisioning (the rare path asks
-    /// again).
+    /// Provisioning's check that the account and the client can honour the store's contract,
+    /// made once and whatever the logging configuration. Two things are established, both from the
+    /// account's own properties:
+    /// <list type="bullet">
+    /// <item>reads run at Session or Strong consistency (the level
+    /// <see cref="ReadsAreSessionConsistentAsync"/> decides on). Below Session a read carries no
+    /// session token, so after the write-path round trip only ABSENCE is authoritative:
+    /// <see cref="LoadCurrentAsync"/> can hand recovery, a failure signal or a resume a ledger
+    /// older than the last acknowledged write (missing the breadcrumb a response matches, or still
+    /// Suspended), and a ledger its server ttl hides fails as unreadable instead of reading as
+    /// absent;</item>
+    /// <item>the account has one write region. With several there is no single authoritative
+    /// write path: two regions can each accept the same ETag-fenced lease write, and the account
+    /// resolves them last-writer-wins after both workers have run.</item>
+    /// </list>
+    /// A configuration that fails either — or an account that cannot be read, which establishes
+    /// neither — is REFUSED: the store's first operation throws, and so does every later one until
+    /// the configuration is fixed (provisioning is not latched by a refusal, so each operation
+    /// reads the account again). The host start asks the same question first
+    /// (<see cref="IFlowStateStoreStartupProbe"/>). It used to be a warning, and
+    /// only when the store had a logger with warnings enabled; with none, the check was skipped
+    /// and the store served a stronger contract than the account could deliver.
+    /// <see cref="CosmosDurableFlowOptions.AllowUnsafeAccountConfiguration"/> keeps that old
+    /// behaviour for the emulator (its account default is Eventual, and a client override can only
+    /// weaken an account's level) and for tests: a warning, best effort.
     /// </summary>
-    private async Task WarnUnlessReadsAreSessionConsistentAsync(CancellationToken cancellationToken)
+    private async Task EnsureAccountConfigurationAsync(CancellationToken cancellationToken)
     {
-        if (_logger is not { } logger)
-            return;
+        if (await FindAccountDefectAsync(cancellationToken).ConfigureAwait(false) is { } refusal)
+            throw new InvalidOperationException(refusal);
+    }
 
-        // No account round trip for a warning nobody would see. A provider that throws from
-        // IsEnabled must not fail provisioning either.
+    /// <summary>
+    /// The host-start half of <see cref="EnsureAccountConfigurationAsync"/>. The flow starter
+    /// publishes first and tolerates store faults after the publish, so on an account the store
+    /// refuses every start was still accepted, and its job then failed in the workers until it
+    /// dead-lettered: the refusal reached no one who was deploying. Asked at host start, it fails
+    /// the start. Only the refusal does — an account that cannot be read within
+    /// <see cref="StartupProbeBudget"/> is logged and left to the store's first operation, so an
+    /// unreachable Cosmos DB never keeps a host from starting.
+    /// </summary>
+    async Task IFlowStateStoreStartupProbe.VerifyConfigurationAsync(CancellationToken cancellationToken)
+    {
+        string? refusal;
         try
         {
-            if (!logger.IsEnabled(LogLevel.Warning))
-                return;
-        }
-        catch
-        {
-            return;
-        }
-
-        ConsistencyLevel? level;
-        try
-        {
-            level = await ResolveConsistencyLevelAsync(cancellationToken).ConfigureAwait(false);
+            refusal = await FindAccountDefectAsync(cancellationToken)
+                .WaitAsync(StartupProbeBudget, cancellationToken)
+                .ConfigureAwait(false);
         }
         catch (Exception ex) when (!cancellationToken.IsCancellationRequested)
         {
-            SafeLog.Try(() => logger.LogDebug(
+            SafeLog.Try(() => _logger?.LogWarning(
                 ex,
-                "Could not resolve the consistency level the Cosmos DB durable-flow store's reads run at; it is resolved again when a read needs it."));
+                "The Cosmos DB durable-flow store could not read its account while the host started; the account configuration is verified by the store's first operation instead."));
             return;
         }
 
-        if (RecordReadConsistency(level))
-            return;
-
-        SafeLog.Try(() => logger.LogWarning(
-            "The Cosmos DB durable-flow store's reads run at {ConsistencyLevel} consistency, but the store needs Session or Strong. " +
-            "Below Session a read can lag the store's own acknowledged writes: recovery, failure signals and resumes may act on an " +
-            "older copy of a flow's ledger, and a ledger hidden by its server TTL fails as unreadable instead of reading as absent. " +
-            "Run the account, or the CosmosClient's ConsistencyLevel, at Session or Strong.",
-            level?.ToString() ?? "an unknown"));
+        if (refusal is not null)
+            throw new InvalidOperationException(refusal);
     }
+
+    /// <summary>Longest the host start waits for the account read before leaving the check to the first operation.</summary>
+    internal static readonly TimeSpan StartupProbeBudget = TimeSpan.FromSeconds(10);
+
+    /// <summary>
+    /// Reads the account and returns why the store refuses it, or <c>null</c> when it does not —
+    /// because the configuration is supported, or because
+    /// <see cref="CosmosDurableFlowOptions.AllowUnsafeAccountConfiguration"/> turned the refusal
+    /// into a warning (logged once per store). An account read that fails throws, unless that
+    /// option is set.
+    /// </summary>
+    private async Task<string?> FindAccountDefectAsync(CancellationToken cancellationToken)
+    {
+        var allowUnsafe = _options.AllowUnsafeAccountConfiguration;
+
+        AccountProperties? account = null;
+        try
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            account = await _client.ReadAccountAsync().ConfigureAwait(false);
+        }
+        catch (Exception ex) when (allowUnsafe && !cancellationToken.IsCancellationRequested)
+        {
+            SafeLog.Try(() => _logger?.LogDebug(
+                ex,
+                "Could not read the account the Cosmos DB durable-flow store runs on; its consistency level is resolved again when a read needs it."));
+        }
+
+        if (account is null && !allowUnsafe)
+        {
+            return
+                "The Cosmos DB durable-flow store could not establish the account configuration it depends on: the CosmosClient " +
+                "returned no account properties, so neither the consistency level its reads run at nor the account's write regions " +
+                $"are known. {UnsafeConfigurationHint}";
+        }
+
+        var level = _client.ClientOptions?.ConsistencyLevel ?? account?.Consistency?.DefaultConsistencyLevel;
+        var writeRegions = account?.WritableRegions?.Select(static region => region.Name).ToArray() ?? [];
+
+        List<string>? defects = null;
+        if (level is not null || account is not null)
+        {
+            if (!RecordReadConsistency(level))
+            {
+                (defects ??= []).Add(
+                    $"its reads run at {level?.ToString() ?? "an unknown"} consistency, but the store needs Session or Strong. " +
+                    "Below Session a read can lag the store's own acknowledged writes: recovery, failure signals and resumes may act on an " +
+                    "older copy of a flow's ledger, and a ledger hidden by its server TTL fails as unreadable instead of reading as absent. " +
+                    "Run the account, or the CosmosClient's ConsistencyLevel, at Session or Strong");
+            }
+        }
+
+        if (writeRegions.Length > 1)
+        {
+            (defects ??= []).Add(
+                $"the account accepts writes in {writeRegions.Length} regions ({string.Join(", ", writeRegions)}), but the store needs a single write region. " +
+                "An ETag-fenced write that succeeds in one region does not exclude the same write succeeding in another, so two workers can " +
+                "hold the same execution lease and run the same flow at once. Use an account with one write region");
+        }
+
+        if (defects is null)
+            return null;
+
+        var description = string.Join("; and ", defects);
+        if (!allowUnsafe)
+            return $"The Cosmos DB durable-flow store cannot run on this account configuration: {description}. {UnsafeConfigurationHint}";
+
+        // Once per store: the check runs at host start and again with every provisioning attempt
+        // until one succeeds, and a container that cannot be read yet would repeat the line.
+        if (Interlocked.Exchange(ref _unsafeConfigurationWarned, 1) == 0)
+        {
+            SafeLog.Try(() => _logger?.LogWarning(
+                "The Cosmos DB durable-flow store is running on an account configuration it refuses by default ({Option} is set): {Defects}.",
+                $"{nameof(CosmosDurableFlowOptions)}.{nameof(CosmosDurableFlowOptions.AllowUnsafeAccountConfiguration)}",
+                description));
+        }
+
+        return null;
+    }
+
+    private const string UnsafeConfigurationHint =
+        $"{nameof(CosmosDurableFlowOptions)}.{nameof(CosmosDurableFlowOptions.AllowUnsafeAccountConfiguration)} turns this refusal into a " +
+        "warning; it is meant for the Cosmos DB emulator and for tests, and leaves the store without the guarantee it names.";
 
     private static async Task<CosmosFlowStateDocument?> ReadDocumentAsync(Container container, string flowId, CancellationToken cancellationToken)
     {
@@ -365,7 +487,7 @@ public sealed class CosmosFlowStateStore : IFlowStateStore, IDisposable
     public void ValidateCreate(string flowId, FlowState state, TimeSpan ttl)
     {
         DurableFlowStoreShared.ValidateCreate(flowId, state, ttl);
-        var stateJson = DurableFlowStoreShared.SerializeBounded(flowId, state, _options.MaxStateBytes, "Cosmos DB");
+        var stateJson = DurableFlowStoreShared.PreflightBounded(flowId, state, _options.MaxStateBytes, "Cosmos DB");
         ThrowIfDocumentTooLarge(flowId, CreateDocument(flowId, stateJson, state.Revision, ttl, DateTime.UtcNow));
     }
 
@@ -625,7 +747,10 @@ public sealed class CosmosFlowStateStore : IFlowStateStore, IDisposable
     /// answer is authoritative there and the following read can still lag. An account with
     /// multiple WRITE regions has no single authoritative write path (it already lets two regions
     /// win the same ETag-fenced lease write and resolves them last-writer-wins), so none of this
-    /// holds on one. The cost is one extra bodiless request, on the three decision paths only
+    /// holds on one. Provisioning therefore refuses both — everything below Session, and more than
+    /// one write region (<see cref="EnsureAccountConfigurationAsync"/>) — unless
+    /// <see cref="CosmosDurableFlowOptions.AllowUnsafeAccountConfiguration"/> says otherwise. The
+    /// cost is one extra bodiless request, on the three decision paths only
     /// (absence or expiry in <see cref="LoadAsync"/>, every <see cref="ObserveLeaseAsync"/>, every
     /// <see cref="LoadCurrentAsync"/>) — never on a plain load that found a live document.
     /// </para>
@@ -768,6 +893,9 @@ public sealed class CosmosFlowStateStore : IFlowStateStore, IDisposable
             if (_created)
                 return;
 
+            // First: an account the store refuses gets no database or container created on it.
+            await EnsureAccountConfigurationAsync(cancellationToken).ConfigureAwait(false);
+
             ContainerResponse container;
             if (_options.AutoCreateContainer)
             {
@@ -803,7 +931,6 @@ public sealed class CosmosFlowStateStore : IFlowStateStore, IDisposable
                     "Enable container TTL (DefaultTimeToLive = -1) before using it for durable flows.");
 
             ValidateHostSerializer();
-            await WarnUnlessReadsAreSessionConsistentAsync(cancellationToken).ConfigureAwait(false);
             _created = true;
         }
         finally

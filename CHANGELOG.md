@@ -13,6 +13,58 @@ work that has landed on `main` but not yet shipped. Security reporters credited 
 
 ### Changed
 
+- **Round-48 review (2026-09-27, external review of `ba8e8e7`): the Cosmos DB flow store refuses
+  an account it cannot keep its contract on, a recovered response is no longer consumed against a
+  previous run's ledger, telemetry that throws no longer changes an outcome, and checkpoint sizes
+  are measured.**
+  - *Cosmos DB flow store — behaviour change.* `LoadCurrentAsync` promises every acknowledged
+    write, which the store cannot deliver when reads run below Session consistency (a read then
+    carries no session token, so the read behind the write-path round trip can still lag) or when
+    the account has several write regions (an ETag-fenced lease write in one region excludes
+    nobody in another). Provisioning only warned — and only when the store had a logger with
+    warnings enabled; with none, the check was skipped. The store's first operation now reads the
+    account, before it creates a database or container on it, and throws
+    `InvalidOperationException` for Bounded Staleness, Consistent Prefix or
+    Eventual reads (the client's own `ConsistencyLevel` override, else the account default), for
+    more than one write region, and for an account whose properties cannot be established; an
+    account read that fails surfaces its own exception and is asked again by the next operation.
+    The startup validator asks the store the same question, so the refusal **fails the host
+    start** — `StartAsync` alone would not have shown it, since it publishes first and tolerates
+    store faults after the publish. Only the refusal does: an account that cannot be read within
+    ten seconds is logged and left to the first operation.
+    **Upgrading:** a host whose store started with a warning — or silently — on such an account
+    no longer starts. Run the account or the client at Session or Strong, with one write region.
+    For the emulator (account default Eventual) and tests, the new
+    `CosmosDurableFlowOptions.AllowUnsafeAccountConfiguration` restores the warn-only behaviour.
+  - *Durable flows.* The authoritative second look behind a decision that writes nothing was
+    taken only when the first one read `Running` or `Suspended`. When a finished run's ledger is
+    deleted and its id reused, a lagging copy still shows the previous run as `Succeeded` or
+    `Failed`: `RecoverAsync` returned on that copy, the dispatcher deleted the registration, and
+    the new run's response was gone with its step still pending. `RecoverAsync` now confirms every
+    outcome that checkpointed nothing, `FailAsync` every signal that failed nothing (it had also
+    re-notified observers and the parent of the previous run's outcome), and a wake-up that reads
+    a run as not `Running` — under the lease or waiting for it — looks again before it is
+    acknowledged. When the ledger is gone by the second look, a finished first look stands for
+    `FailAsync` (the at-least-once re-notify) and for a wake-up; `RecoverAsync` reports "no state".
+  - *Telemetry.* A `MeterListener` callback that throws came out of `Counter.Add` into code that
+    had just decided something: a worker job that had run was reported failed and redelivered, and
+    a non-terminal (`KeepWaiting`) response was escalated through `SetException` to the failure
+    callback, consuming the registration its terminal response needed. Every measurement is now
+    recorded through a guarded recorder in `AsyncResponseDiagnostics` (the database channels'
+    sweep histogram included), and a span whose listener throws while it starts is skipped instead
+    of failing the operation. The recovery dispatcher's log lines *before* a decision were
+    unguarded (the ones after a callback already were): a logging provider that threw on the
+    `KeepWaiting` line had the same effect as the throwing metrics listener. All of them go
+    through `SafeLog` now. `IDurableFlows.StartAsync` returns the id of the run it published
+    when the logging provider throws — it used to surface the provider's exception, with no id
+    for the caller to dedupe a retry against — and a publish that fails still surfaces
+    `DurableFlowNotDispatchedException` / `WorkerJobTooLargeException` rather than the logger's.
+  - *Ledger cost.* Every write serializes the whole ledger, so cumulative serialization grows with
+    the square of a run's retained steps (36 MB for 256 steps of 1 KiB). That stays the design; it
+    is now measurable: every store records `asyncresponse.flow_state.checkpoint.size` (histogram,
+    bytes, tagged by provider) for each ledger it serializes for a write. `docs/durable-flows.md`
+    carries the measured table.
+
 - **Round-47 review (2026-09-26, fixpoint-light round 2 of `8ab4d04`): Redis message dispatch settles
   despite a throwing logger, a timeout that loses the drain race no longer reports a timeout, and the
   in-memory channel and RabbitMQ lapse burials match their twins.**

@@ -469,6 +469,7 @@ public sealed class OracleCosmosStoreContractTests(OracleCosmosBatchFixture fixt
                 client,
                 Options.Create(new CosmosDurableFlowOptions
                 {
+                    AllowUnsafeAccountConfiguration = IsLocalCosmosEndpoint(connectionString),
                     DatabaseName = databaseName,
                     ContainerName = "flow_state"
                 }));
@@ -481,6 +482,7 @@ public sealed class OracleCosmosStoreContractTests(OracleCosmosBatchFixture fixt
                 client,
                 Options.Create(new CosmosDurableFlowOptions
                 {
+                    AllowUnsafeAccountConfiguration = IsLocalCosmosEndpoint(connectionString),
                     DatabaseName = databaseName,
                     ContainerName = "flow_state_without_ttl",
                     AutoCreateContainer = false
@@ -525,7 +527,7 @@ public sealed class OracleCosmosStoreContractTests(OracleCosmosBatchFixture fixt
         {
             IFlowStateStore store = new CosmosFlowStateStore(
                 client,
-                Options.Create(new CosmosDurableFlowOptions { DatabaseName = databaseName, ContainerName = "flow_state" }));
+                Options.Create(new CosmosDurableFlowOptions { DatabaseName = databaseName, ContainerName = "flow_state", AllowUnsafeAccountConfiguration = IsLocalCosmosEndpoint(connectionString) }));
             Assert.True(await store.TryCreateAsync("ttl-lapsed", CreateState("ttl-lapsed"), TimeSpan.FromSeconds(1)));
 
             // Wait for the SERVER ttl to hide the item from reads — not merely for the logical expiry.
@@ -578,6 +580,58 @@ public sealed class OracleCosmosStoreContractTests(OracleCosmosBatchFixture fixt
     }
 
     [Fact]
+    public async Task CosmosPackageStore_RefusesAnAccountBelowSessionConsistency_UnlessTheAccommodationIsSet()
+    {
+        // Round 48: below Session a read carries no session token, so LoadCurrentAsync cannot
+        // promise every acknowledged write — and the store only warned about it (or, without a
+        // logger, said nothing). It now refuses such an account before it creates anything on it.
+        // The emulator is one (its account default is Eventual), which is what
+        // AllowUnsafeAccountConfiguration exists for.
+        var connectionString = Environment.GetEnvironmentVariable("ASYNCRESPONSE_ITEST_COSMOS_CONNECTION_STRING");
+        if (string.IsNullOrWhiteSpace(connectionString))
+            Assert.Skip("Set ASYNCRESPONSE_ITEST_COSMOS_CONNECTION_STRING to run the Cosmos DB durable-flow store contract test.");
+
+        using var client = new CosmosClient(connectionString, GetCosmosClientOptions(connectionString));
+        await WaitForCosmosAsync(client);
+        var account = await client.ReadAccountAsync();
+        if (account.Consistency.DefaultConsistencyLevel is ConsistencyLevel.Session or ConsistencyLevel.Strong)
+            Assert.Skip("This account's reads are session-consistent; the refusal is exercised against an account below Session (the emulator).");
+
+        var databaseName = NewIdentifier("df_cosmos_refused", 63);
+        try
+        {
+            IFlowStateStore strict = new CosmosFlowStateStore(
+                client,
+                Options.Create(new CosmosDurableFlowOptions { DatabaseName = databaseName, ContainerName = "flow_state" }));
+
+            var refusal = await Assert.ThrowsAsync<InvalidOperationException>(() => strict.LoadAsync("refused"));
+            Assert.Contains($"its reads run at {account.Consistency.DefaultConsistencyLevel} consistency", refusal.Message, StringComparison.Ordinal);
+            Assert.Contains("needs Session or Strong", refusal.Message, StringComparison.Ordinal);
+            await Assert.ThrowsAsync<InvalidOperationException>(
+                () => strict.TryCreateAsync("refused", CreateState("refused"), TimeSpan.FromMinutes(5)));
+
+            // Refused before provisioning: nothing was created on the account.
+            var missing = await Assert.ThrowsAsync<CosmosException>(() => client.GetDatabase(databaseName).ReadAsync());
+            Assert.Equal(System.Net.HttpStatusCode.NotFound, missing.StatusCode);
+
+            IFlowStateStore accommodated = new CosmosFlowStateStore(
+                client,
+                Options.Create(new CosmosDurableFlowOptions
+                {
+                    DatabaseName = databaseName,
+                    ContainerName = "flow_state",
+                    AllowUnsafeAccountConfiguration = true
+                }));
+            Assert.True(await accommodated.TryCreateAsync("accommodated", CreateState("accommodated"), TimeSpan.FromMinutes(5)));
+            Assert.NotNull(await accommodated.LoadAsync("accommodated"));
+        }
+        finally
+        {
+            await DeleteCosmosDatabaseAsync(client, databaseName);
+        }
+    }
+
+    [Fact]
     public async Task CosmosPackageStore_ServesLeasesFromAContainerWithoutIndexing()
     {
         // The lease paths read through a projection query filtered on `id`, which only the
@@ -617,6 +671,7 @@ public sealed class OracleCosmosStoreContractTests(OracleCosmosBatchFixture fixt
                 client,
                 Options.Create(new CosmosDurableFlowOptions
                 {
+                    AllowUnsafeAccountConfiguration = IsLocalCosmosEndpoint(connectionString),
                     DatabaseName = databaseName,
                     ContainerName = "flow_state_kv",
                     AutoCreateContainer = false
@@ -651,7 +706,7 @@ public sealed class OracleCosmosStoreContractTests(OracleCosmosBatchFixture fixt
         {
             IFlowStateStore store = new CosmosFlowStateStore(
                 client,
-                Options.Create(new CosmosDurableFlowOptions { DatabaseName = databaseName, ContainerName = "flow_state" }));
+                Options.Create(new CosmosDurableFlowOptions { DatabaseName = databaseName, ContainerName = "flow_state", AllowUnsafeAccountConfiguration = IsLocalCosmosEndpoint(connectionString) }));
             Assert.Null(await store.LoadAsync("provisioning")); // creates the database and container
 
             var json = System.Text.Json.JsonSerializer.Serialize(new
@@ -718,6 +773,9 @@ public sealed class OracleCosmosStoreContractTests(OracleCosmosBatchFixture fixt
         return options;
     }
 
+    // Also what decides CosmosDurableFlowOptions.AllowUnsafeAccountConfiguration in these tests:
+    // the emulator's account default is Eventual, which the store refuses. A real account is
+    // tested under the store's own rules.
     private static bool IsLocalCosmosEndpoint(string connectionString)
     {
         foreach (var segment in connectionString.Split(';', StringSplitOptions.RemoveEmptyEntries))

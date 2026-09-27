@@ -203,16 +203,38 @@ internal static class DurableFlowStoreShared
     /// into the dead-letter queue with no hint at the real cause. Throwing here keeps the same
     /// at-least-once semantics (run fails → retries → DLQ = operator alarm) but names the cause.
     /// </summary>
+    /// <remarks>
+    /// Also where the write's size is measured (<c>asyncresponse.flow_state.checkpoint.size</c>):
+    /// this is the one place every store serializes a ledger it is about to write, and the whole
+    /// ledger is what each write serializes. <see cref="PreflightBounded"/> is the same check for
+    /// a caller that writes nothing.
+    /// </remarks>
     /// <exception cref="FlowStateTooLargeException">The serialized state exceeds <paramref name="maxStateBytes"/>.</exception>
     public static string SerializeBounded(string flowId, FlowState state, long? maxStateBytes, string providerName)
+        => SerializeBoundedCore(flowId, state, maxStateBytes, providerName, measured: true);
+
+    /// <summary>
+    /// <see cref="SerializeBounded(string, FlowState, long?, string)"/> for
+    /// <see cref="IFlowStateStore.ValidateCreate"/>: the same serialization and the same budget,
+    /// but no write follows, so nothing is recorded as one.
+    /// </summary>
+    /// <exception cref="FlowStateTooLargeException">The serialized state exceeds <paramref name="maxStateBytes"/>.</exception>
+    public static string PreflightBounded(string flowId, FlowState state, long? maxStateBytes, string providerName)
+        => SerializeBoundedCore(flowId, state, maxStateBytes, providerName, measured: false);
+
+    private static string SerializeBoundedCore(string flowId, FlowState state, long? maxStateBytes, string providerName, bool measured)
     {
         var json = Serialize(state);
-        if (maxStateBytes is { } limit)
-        {
-            long size = Encoding.UTF8.GetByteCount(json);
-            if (size > limit)
-                throw new FlowStateTooLargeException(flowId, size, limit, providerName);
-        }
+        measured = measured && AsyncResponseDiagnostics.FlowStateCheckpointsMeasured;
+        if (maxStateBytes is null && !measured)
+            return json;
+
+        long size = Encoding.UTF8.GetByteCount(json);
+        if (maxStateBytes is { } limit && size > limit)
+            throw new FlowStateTooLargeException(flowId, size, limit, providerName);
+
+        if (measured)
+            AsyncResponseDiagnostics.RecordFlowStateCheckpoint(providerName, size);
 
         return json;
     }
