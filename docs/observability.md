@@ -2,15 +2,14 @@
 
 [← Back to README](../README.md)
 
-AsyncResponse emits both **traces** (`System.Diagnostics.Activity`) and **metrics**
-(`System.Diagnostics.Metrics`) from a single source/meter named `"AsyncResponse"`. The library takes
-no OpenTelemetry dependency; your host connects the source and meter to OpenTelemetry, Datadog, or
-any other listener.
+AsyncResponse emits **traces** (`System.Diagnostics.Activity`) and **metrics**
+(`System.Diagnostics.Metrics`) from one `ActivitySource` and one `Meter`, both named
+`"AsyncResponse"`. The library takes no OpenTelemetry dependency; your host connects them to
+OpenTelemetry, Datadog, or any other listener.
 
 ## Tracing
 
-AsyncResponse emits spans from one source, `AsyncResponseDiagnostics.ActivitySourceName`
-(`"AsyncResponse"`):
+Subscribe to `AsyncResponseDiagnostics.ActivitySourceName` (`"AsyncResponse"`):
 
 ```csharp
 using AsyncResponse;
@@ -22,8 +21,6 @@ builder.Services.AddOpenTelemetry()
         .AddAspNetCoreInstrumentation()
         .AddHttpClientInstrumentation());
 ```
-
-Spans cover the whole library path, not only Redis:
 
 | Span | What it represents |
 |---|---|
@@ -42,35 +39,33 @@ Spans cover the whole library path, not only Redis:
 | `asyncresponse.postgresql.receive` | PostgreSQL transport subscriber message handling |
 | `asyncresponse.sqlserver.receive` | SQL Server transport subscriber message handling |
 | `asyncresponse.mongodb.receive` | MongoDB transport subscriber message handling |
-| `asyncresponse.lost_subscriber.dispatch` | recovery callback routing when no waiter is alive |
-| `asyncresponse.watchdog.scan` | recovery watchdog scans |
+| `asyncresponse.lost_subscriber.dispatch` | recovery callback routing when no waiter is alive, tagged `asyncresponse.lost_subscriber.kind` (`response`\|`exception`) and `asyncresponse.lost_subscriber_route` |
+| `asyncresponse.watchdog.scan` | one recovery watchdog scan, tagged with its counts (`asyncresponse.watchdog.total_entries`, `stale_entries`, `unprobeable_entries`, `unreadable_entries`, …) |
 | `asyncresponse.flow.execute` | one durable-flow run execution, tagged `asyncresponse.flow_id` and `asyncresponse.flow_type` (see [durable-flows.md](durable-flows.md)) |
 
-Every transport emits an `asyncresponse.worker.publish` producer span on publish and a consumer
-receive span on consume (for both ACK modes). Each receive span carries the standard messaging
-attributes (`messaging.system`, `messaging.destination.name`, and `messaging.message.id` where the
-broker exposes one) plus the transport, role, ACK mode, and the AsyncResponse correlation id.
-Transports that count delivery attempts also tag them on the receive span: PostgreSQL and
-SQL Server use the standard `messaging.message.delivery_attempt`, Redis uses
-`asyncresponse.redis.delivery_attempt`, and Kafka uses `asyncresponse.kafka.delivery_attempt`.
+Every transport, the in-memory one included, emits an `asyncresponse.worker.publish` producer
+span on publish; every broker and database transport also emits its consumer receive span on
+consume (both ACK modes). A receive span carries the standard messaging attributes
+(`messaging.system`, `messaging.destination.name`, and `messaging.message.id` where the broker
+exposes one), the transport (`asyncresponse.transport`), role and ACK mode
+(`asyncresponse.<transport>.role` / `.ack_mode`), and the correlation id. Transports that count
+delivery attempts tag them too: PostgreSQL, SQL Server and MongoDB use the standard
+`messaging.message.delivery_attempt`; Redis and Kafka use `asyncresponse.redis.delivery_attempt` and
+`asyncresponse.kafka.delivery_attempt`.
 
 Common tags include `asyncresponse.correlation_id`, `asyncresponse.channel`,
 `asyncresponse.transport`, `asyncresponse.payload_type`, `asyncresponse.subscribers`,
-`asyncresponse.lost_subscriber_route`, and worker/reply-target details. Values that come off a
-stream or a store before anything has validated them — the correlation id, the reply target's name
-and transport, the worker service and method — are bounded and escaped (control characters,
-line/paragraph separators, bidi controls and backslashes become `\uXXXX`; overlong values are cut
-with an ellipsis), so an ordinary value is tagged unchanged but a hostile one cannot flood the
-trace backend. On `asyncresponse.lost_subscriber.dispatch`, `asyncresponse.payload_type` is the
-payload's real type — the materialized type, else the registration's persisted type name — and is
-left unset for a raw payload with no registration.
+`asyncresponse.worker.service` / `.method`, `asyncresponse.reply_target.name` / `.transport`, and
+`error.type` on failures. Values read off a stream or store before validation (the correlation id,
+reply target, worker service and method) are bounded and escaped — control characters, line and
+paragraph separators, bidi controls and backslashes become `\uXXXX`, overlong values are cut with an
+ellipsis — so an ordinary value is tagged unchanged but a hostile one cannot flood the trace backend.
+On `asyncresponse.lost_subscriber.dispatch`, `asyncresponse.payload_type` is the materialized type,
+else the registration's persisted type name, and is unset for a raw payload with no registration.
 
 ## Metrics
 
-AsyncResponse publishes counters, histograms and observable gauges through a
-`System.Diagnostics.Metrics.Meter` named `"AsyncResponse"` (constant
-`AsyncResponseDiagnostics.MeterName`). Subscribe with
-OpenTelemetry's `AddMeter`:
+Subscribe to `AsyncResponseDiagnostics.MeterName` (`"AsyncResponse"`):
 
 ```csharp
 using AsyncResponse;
@@ -84,58 +79,57 @@ builder.Services.AddOpenTelemetry()
 
 ### Instruments
 
-| Instrument | Type | Tags | What it tells you |
+| Instrument | Type (unit) | Tags | What it tells you |
 |---|---|---|---|
-| `asyncresponse.lost_subscriber.dispatches` | counter | `kind` = `response`\|`exception`, `route` = `resume`\|`failure`\|`keep_waiting`\|`mixed`\|`unclassified`, `invoked` = bool | The core "how often does recovery fire" SLO — every late response that found nobody listening, classified by how it was routed and whether a callback was actually invoked. `mixed` means shared-correlation registrations legitimately took different routes in one dispatch; each registration's own dispatch span carries its true route. |
-| `asyncresponse.waiter.timeouts` | counter | `channel` | Waiters that hit their timeout before a terminal response. |
-| `asyncresponse.channel.overloaded_waits` | counter | `channel` = `redis`\|`nats` | Waits faulted as indeterminate because responses for their correlation id arrived faster than the wait could process them and the bounded per-wait buffer was full — 1,024 on Redis; on NATS the NATS.Net subscription buffer (the connection's `SubPendingChannelCapacity`, 16,384 by default) dropped a message. Redis and NATS channels only (the database channels keep a backlog server-side). Alert on any sustained rate: a consumer is saturated — speed up the completion predicate, publish fewer progress messages, or move the wait to a database channel. |
-| `asyncresponse.channel.sweep.duration` | histogram (s) | `asyncresponse.channel` | Duration of one full dispatch sweep of a database response channel (PostgreSQL, SQL Server, MongoDB) across every locally subscribed correlation id. Only sweeps that visited a waiter and completed without a failed correlation id are recorded (a sweep that failed, or that the outage breaker broke off, measured the outage, not the sweep). A sweep longer than half of `DeliveryConfirmationTimeout` also logs a warning (at most once a minute): cross-process responses then risk being claimed for recovery before the sweep reaches their waiter — reduce local waiters per process, raise `DeliveryConfirmationTimeout`, or check database latency. |
-| `asyncresponse.worker.jobs` | counter | `outcome` = `executed`\|`failed`\|`rejected`\|`redelayed`\|`dropped` | Worker job dispatch outcomes. `failed` counts individual attempts; `rejected` is an envelope refused without dispatching — an unusable correlation id or a body no build can parse, both acknowledged rather than redelivered forever, or an envelope stamped with a schema version this build cannot read or a target the callback authorizer refuses, both of which throw instead and take the transport's ordinary failure path (redelivery — a newer build, or a replica configured to allow the target, can run it — then dead-letter); `redelayed` is a job delivered before its due time and re-published for the remainder (one per hop of a chunked or early delayed delivery — not an execution); `dropped` is the in-memory transport's terminal outcome after `MaxDeliveryAttempts` (broker transports dead-letter instead). Alert on `rejected`: every one is a producer-side contract violation, a producer ahead of this build, or a target outside the allowlist. |
-| `asyncresponse.worker.inmemory_overflow_depth` | observable gauge | — | Follow-up jobs the in-memory worker transport currently holds past `QueueCapacity` (summed over the process's transports), bounded by `InJobOverflowCapacity`. A depth that stays near the bound means a handler fans out faster than the workers drain. |
-| `asyncresponse.worker.inmemory_overflow_rejections` | counter | — | Follow-up publishes the in-memory transport refused at `InJobOverflowCapacity`; the publishing job failed and is redelivered by the in-process retry ladder. Alert on any sustained rate: raise the capacities or add workers. |
-| `asyncresponse.worker.inmemory_delayed_jobs` | observable gauge | — | Delayed jobs the in-memory worker transport currently holds — waiting on their due time, or fired and waiting for queue room (summed over the process's transports), bounded by `DelayedJobCapacity`. A count that stays near the bound means more flows are sleeping at once than the capacity was sized for. |
-| `asyncresponse.worker.inmemory_delayed_rejections` | counter | — | Delayed publishes made from inside a running job (a flow parking on a timer) that the in-memory transport refused at `DelayedJobCapacity`; the publishing job failed and is redelivered by the in-process retry ladder. Alert on any sustained rate: raise `DelayedJobCapacity`. |
-| `asyncresponse.ingress.unroutable_responses` | counter | — | Inbound responses acknowledged without routing because they carry no correlation id (deliberate poison guard — redelivery could never route them). Alert on any non-zero rate: each one is a producer-side contract violation. |
-| `asyncresponse.ingress.oversized_messages` | counter | `route` = `response`\|`worker` | Inbound messages acknowledged without processing because they exceed `AsyncResponseOptions.MaxInboundMessageChars`. Alert on any non-zero rate: the message is gone, and either a producer is sending more than the deployment allows or the cap is set too low. |
-| `asyncresponse.recovery.outstanding` | observable gauge | — | Persisted recovery-state entries (from the watchdog scan). |
-| `asyncresponse.recovery.active_waiters` | observable gauge | — | Entries that still have a live waiter. |
-| `asyncresponse.recovery.stale` | observable gauge | — | Entries that are old and have no live waiter — probably stuck flows. |
-| `asyncresponse.recovery.unprobeable` | observable gauge | — | Entries whose waiter liveness could not be probed (a probe outage, or no `IActiveSubscriberProbe` registered) — their staleness is unknown and they are never flagged stale. A non-zero value also degrades the recovery health check. |
-| `asyncresponse.recovery.unreadable` | observable gauge | — | Stored recovery registrations the last watchdog scan found but this build cannot read (malformed, incomplete identity, or a newer schema version). Their callbacks cannot run — a response for their correlation id is refused and redelivered, readable siblings included (none of them is dispatched until every registration can be read) — so a non-zero value degrades the recovery health check. Expect a brief non-zero value during a rolling upgrade that raised the schema version; anything else needs an operator (the store logs a warning for each). |
-| `asyncresponse.recovery.scan_truncated` | observable gauge | — | `1` when the last watchdog scan stopped at the `MaxScanEntries` buffer cap: `outstanding`/`stale` then describe the buffered subset only, and the recovery health check reports **Degraded**. Alert on it — a capped scan cannot attest staleness. |
-| `asyncresponse.type_resolution.unresolved` | counter | `kind` = `service`\|`payload`\|`resolver` | Callback/payload type names that could not be resolved (see [security.md](security.md)). `resolver` counts a registered `AsyncResponseTypeResolution` resolver that threw — once per throw, even when a later resolver then resolved the name — so a broken resolver is visible apart from a name nothing knows. |
-| `asyncresponse.flow_state.pruned_rows` | counter | `provider` | Expired durable-flow ledger rows deleted by the relational stores' opportunistic prune (PostgreSQL, SQL Server, MySQL, SQLite, Oracle, EF Core). |
-| `asyncresponse.flow_state.prune_failures` | counter | `provider` | Opportunistic prunes that failed; the flow creation they rode on still succeeded and the next `PruneInterval` retries. Alert on a sustained rate: expired rows are accumulating. |
-| `asyncresponse.flow_state.prune_budget_exhausted` | counter | `provider` | Prunes that stopped at `PruneBudget` with a full last batch — expired rows remain and the backlog is outgrowing the prune. Raise `PruneBudget` or shorten `PruneInterval`. |
-| `asyncresponse.flow_state.checkpoint.size` | histogram (By) | `provider` | Serialized size, in UTF-8 bytes, of every durable-flow ledger a store serialized for a write — a create or a checkpoint, whether or not the write then won its revision check. Recorded by every bundled store, the in-memory one included (`provider` = `InMemory`), once per serialization: a write the store retries serializes — and records — again. `ValidateCreate`'s preflight is not a write and is not recorded, nor is a ledger refused by `MaxStateBytes` (the Cosmos DB store's second check, on the complete escaped document, runs after the ledger was measured). Every write serializes the **whole** ledger, so the histogram's **sum** is the cumulative serialization cost (it grows with the square of a run's retained steps) and its **count** the number of writes. Use the distribution to set `LedgerSizeWarningBytes`, `MaxRetainedSteps` and `MaxStateBytes` for the workload; see [supported ledger budgets](durable-flows.md#supported-ledger-budgets). Measuring costs one pass over the serialized ledger, and only while something listens. |
+| `asyncresponse.lost_subscriber.dispatches` | counter (`{dispatch}`) | `kind` = `response`\|`exception`, `route` = `resume`\|`failure`\|`keep_waiting`\|`mixed`\|`unclassified`, `invoked` = bool | The core "how often does recovery fire" SLO: every response or exception published with nobody listening, by route and whether a callback actually ran. `mixed` means shared-correlation registrations took different routes in one dispatch; each registration's own span carries its true route. |
+| `asyncresponse.waiter.timeouts` | counter (`{timeout}`) | `channel` = `inmemory`\|`redis`\|`nats`\|`postgresql`\|`sqlserver`\|`mongodb` | Waiters that hit their timeout before a terminal response. |
+| `asyncresponse.channel.overloaded_waits` | counter (`{wait}`) | `channel` = `redis`\|`nats` | Waits faulted as indeterminate because responses for their correlation id arrived faster than the wait could process them and the bounded per-wait buffer was full — 1,024 on Redis; on NATS the subscription buffer (the connection's `SubPendingChannelCapacity`, 16,384 by default) dropped a message. The database channels keep their backlog server-side. Alert on any sustained rate: speed up the completion predicate, publish fewer progress messages, or move the wait to a database channel. |
+| `asyncresponse.channel.sweep.duration` | histogram (`s`) | `asyncresponse.channel` = `postgresql`\|`sqlserver`\|`mongodb` | One full dispatch sweep of a database response channel across every locally subscribed correlation id. Recorded only for sweeps that visited a waiter and had no failed correlation id (a failed sweep measures the outage, not the sweep). A sweep longer than half of `DeliveryConfirmationTimeout` also logs a warning (at most once a minute): cross-process responses then risk being claimed for recovery before the sweep reaches their waiter — reduce waiters per process, raise `DeliveryConfirmationTimeout`, or check database latency. |
+| `asyncresponse.worker.jobs` | counter (`{job}`) | `outcome` = `executed`\|`failed`\|`rejected`\|`redelayed`\|`dropped` | Worker job outcomes. `failed` counts individual attempts. `rejected` is an envelope refused without dispatch: an unusable correlation id or an unparseable body (both acknowledged), or a newer schema version or a target the callback authorizer refuses (both thrown, so the transport redelivers — a newer or differently configured replica can run it — then dead-letters). `redelayed` is a delayed job delivered early and re-published for the remainder (one per hop, not an execution). `dropped` is the in-memory transport's terminal outcome after `MaxDeliveryAttempts` (broker transports dead-letter instead). Alert on `rejected`: each is a producer-side contract violation, a producer ahead of this build, or a target outside the allowlist. |
+| `asyncresponse.worker.inmemory_overflow_depth` | observable gauge (`{job}`) | — | Follow-up jobs the in-memory worker transport holds past `QueueCapacity` (summed over the process's transports), bounded by `InJobOverflowCapacity`. Staying near the bound means a handler fans out faster than the workers drain. |
+| `asyncresponse.worker.inmemory_overflow_rejections` | counter (`{job}`) | — | Follow-up publishes the in-memory transport refused at `InJobOverflowCapacity`; the publishing job failed and is retried by the in-process retry ladder. Alert on any sustained rate: raise the capacities or add workers. |
+| `asyncresponse.worker.inmemory_delayed_jobs` | observable gauge (`{job}`) | — | Delayed jobs the in-memory worker transport holds — waiting on their due time, or fired and waiting for queue room (summed over the process's transports), bounded by `DelayedJobCapacity`. Staying near the bound means more flows sleep at once than the capacity was sized for. |
+| `asyncresponse.worker.inmemory_delayed_rejections` | counter (`{job}`) | — | Delayed publishes made from inside a running job (a flow parking on a timer) that the in-memory transport refused at `DelayedJobCapacity`; the publishing job failed and is retried by the in-process retry ladder. Alert on any sustained rate: raise `DelayedJobCapacity`. |
+| `asyncresponse.flow.own_job_redeliveries` | counter (`{delivery}`) | `resolution` = `redelayed`\|`waiting` | Durable-flow wake-ups that found the execution lease held by a live execution of their **own** job: a broker in-flight ceiling lapsed under a running handler. Never acknowledged as duplicates — `redelayed`: re-published as the same job past the holder's lease; `waiting`: handed back to the transport (`DurableFlowLeaseContendedException`). Shorten the park (`DurableFlowOptions.MaxInProcessParkDuration`) or raise the broker ceiling (see [durable-flows.md](durable-flows.md#what-happens-when-things-die)). |
+| `asyncresponse.ingress.unroutable_responses` | counter (`{message}`) | — | Inbound responses acknowledged without routing because their correlation id is missing or outside the portable contract (see [security.md](security.md#explicit-correlation-id)) — redelivery could never route them. Alert on any non-zero rate: each is a producer-side contract violation. |
+| `asyncresponse.ingress.oversized_messages` | counter (`{message}`) | `route` = `response`\|`worker` | Inbound messages acknowledged without processing because they exceed `AsyncResponseOptions.MaxInboundMessageChars`. Alert on any non-zero rate: the message is gone, and either a producer sends more than the deployment allows or the cap is too low. |
+| `asyncresponse.recovery.outstanding` | observable gauge (`{entry}`) | — | Persisted recovery registrations at the last watchdog scan. |
+| `asyncresponse.recovery.active_waiters` | observable gauge (`{entry}`) | — | Registrations that still have a live waiter. |
+| `asyncresponse.recovery.stale` | observable gauge (`{entry}`) | — | Registrations that are old and have no live waiter — probably stuck flows. |
+| `asyncresponse.recovery.unprobeable` | observable gauge (`{entry}`) | — | Registrations whose waiter liveness could not be probed (a probe outage, or no `IActiveSubscriberProbe` registered); their staleness is unknown and never flagged. Non-zero degrades the recovery health check. |
+| `asyncresponse.recovery.unreadable` | observable gauge (`{entry}`) | — | Stored registrations the last scan found but this build cannot read (malformed, incomplete identity, or a newer schema version). A response for their correlation id is refused and redelivered, readable siblings included. Non-zero degrades the health check; expect it briefly during a rolling upgrade that raised the schema version — otherwise it needs an operator (the store logs a warning for each). |
+| `asyncresponse.recovery.scan_truncated` | observable gauge (`{scan}`) | — | `1` when the last scan stopped at `Watchdog.MaxScanEntries`: `outstanding`/`stale` describe the buffered subset only and the health check reports **Degraded**. Alert on it — a capped scan cannot attest staleness. |
+| `asyncresponse.type_resolution.unresolved` | counter (`{failure}`) | `kind` = `service`\|`payload`\|`resolver` | Persisted callback/payload type names that could not be resolved (see [security.md](security.md#type-resolution-for-plugins--assemblyloadcontext)). `resolver` counts a registered resolver that threw — once per throw, even when a later resolver then answered — so a broken resolver is visible apart from a name nothing knows. |
+| `asyncresponse.flow_state.pruned_rows` | counter (`{row}`) | `provider` | Expired durable-flow ledger rows deleted by the relational stores' opportunistic prune (PostgreSQL, SQL Server, MySQL, SQLite, Oracle, EF Core). |
+| `asyncresponse.flow_state.prune_failures` | counter (`{failure}`) | `provider` | Opportunistic prunes that failed; the flow creation they rode on still succeeded and the next `PruneInterval` retries. Alert on a sustained rate: expired rows are accumulating. |
+| `asyncresponse.flow_state.prune_budget_exhausted` | counter (`{prune}`) | `provider` | Prunes that stopped at `PruneBudget` with a full last batch — the expired backlog is outgrowing the prune. Raise `PruneBudget` or shorten `PruneInterval`. |
+| `asyncresponse.flow_state.checkpoint.size` | histogram (`By`) | `provider` | UTF-8 size of every durable-flow ledger a store serialized for a write (a create or a checkpoint, whether or not it then won its revision check), recorded by every bundled store (`provider` = `InMemory` for the in-memory one) once per serialization — a retried write records again. Not recorded: `ValidateCreate`'s preflight, or a ledger refused by `MaxStateBytes`. Every write serializes the **whole** ledger, so the **sum** is the cumulative serialization cost (it grows with the square of a run's retained steps) and the **count** the number of writes. Use the distribution to set `LedgerSizeWarningBytes`, `MaxRetainedSteps` and `MaxStateBytes`; see [supported ledger budgets](durable-flows.md#supported-ledger-budgets). Measured only while something listens. |
 
-The lost-subscriber counter is the one to alert on: a nonzero `route=failure` or
-`route=unclassified` rate means flows are dying mid-wait and being failed on recovery (a
-`route=keep_waiting` rate is benign by itself — non-terminal checkpoints arriving while nobody
-listens — but pair it with the watchdog: a registration that keeps waiting and never resumes is a
-stuck flow), and a rising
-`asyncresponse.recovery.stale` gauge is your earliest signal of stuck flows.
+Alert on the lost-subscriber counter: a non-zero `route=failure` or `route=unclassified` rate means
+flows are dying mid-wait and being failed on recovery. `route=keep_waiting` is benign by itself
+(checkpoints arriving while nobody listens), but a registration that keeps waiting and never resumes
+is a stuck flow — pair it with the watchdog. A rising `asyncresponse.recovery.stale` gauge is your
+earliest signal of stuck flows.
 
 ### A telemetry failure never decides an outcome
 
-Metrics and spans are recorded on the library's decision paths — after a worker job ran, after a
-lost response was routed — and a listener's callback runs on the recording thread. A
-`MeterListener` measurement callback or an `ActivityListener` sampling/started callback that
-throws costs **that measurement or span** and nothing else: the library records every measurement
-through a guarded recorder and starts every span through a guarded helper. Before that guard a
-failing metrics pipeline could report a job that had run as failed (so the transport redelivered
-it and its side effects ran again), or turn a routed non-terminal checkpoint into a failed
-publish that was escalated to the failure callback.
+Metrics and spans are recorded on the library's decision paths (after a worker job ran, after a lost
+response was routed), and a listener's callback runs on the recording thread. A `MeterListener`
+measurement callback, or an `ActivityListener` sampling or started callback, that throws costs
+**that measurement or span** and nothing else: every measurement goes through a guarded recorder and
+every span starts through a guarded helper. The waiter's `asyncresponse.wait` span is also stopped
+through a guarded helper, so a throwing stopped callback cannot fault the waiter's cleanup.
 
 The same holds for log lines on those paths — the worker executor, the ingress, the recovery
-dispatcher, and `IDurableFlows.StartAsync`, which returns the id of the run it published even
-when the logging provider throws (Microsoft.Extensions.Logging rethrows a provider's failure).
+dispatcher, and `IDurableFlows.StartAsync`, which returns the id of
+the run it published even when the logging provider throws (Microsoft.Extensions.Logging rethrows a
+provider's failure).
 
-Two things remain the host's to keep healthy: an `ActivityListener`'s **stopped** callback runs
-when a span is disposed, outside the helper, and observable gauges are read on the listener's own
+Two things remain the host's to keep healthy: the **stopped** callback of every other span (it runs
+when the span is disposed, unguarded), and observable gauges, which are read on the listener's own
 thread.
 
 > **Not emitted:** broker/store-native queue depth and size (Redis key count, JetStream stream
-> backlog, Service Bus queue length, Pub/Sub subscription depth, PostgreSQL table row counts) are *not* surfaced by
-> AsyncResponse — read those from your broker or database metrics. AsyncResponse only measures what
-> happens inside the library.
+> backlog, Service Bus queue length, Pub/Sub subscription depth, database table row counts) — read
+> those from your broker or database metrics. AsyncResponse measures only what happens inside the
+> library.

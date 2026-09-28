@@ -1,26 +1,25 @@
-## Summary of Changes
-Provide a brief summary of the changes introduced by this Pull Request, including any new features, bug fixes, or enhancements.
+## Summary
+What this PR changes and why.
 
-## Related Issues
-Fixes # (issue number) or relates to # (issue number).
+## Related issues
+Fixes # / relates to #
 
-## Type of Change
-Please delete options that are not relevant:
-- [ ] Bug fix (non-breaking change which fixes an issue)
-- [ ] New feature (non-breaking change which adds functionality)
-- [ ] Breaking change (fix or feature that would cause existing functionality to not work as expected)
-- [ ] Refactoring / Performance optimization (no functional changes)
-- [ ] Documentation update
+## Type of change
+Delete the options that do not apply:
+- [ ] Bug fix (non-breaking)
+- [ ] New feature (non-breaking)
+- [ ] Breaking change (existing behavior or public API changes)
+- [ ] Refactoring / performance (no functional change)
+- [ ] Documentation
 
-## Verification Details
-Describe the tests that you ran to verify your changes. Provide instructions so we can reproduce.
-- Run command: `dotnet test`
-- Specific unit or integration tests added/modified:
+## Verification
+Tests added or changed, and the commands you ran (e.g.
+`dotnet test --project tests/AsyncResponse.Tests/AsyncResponse.Tests.csproj`; add the
+integration batch you ran, if any).
 
 ## Checklist
-Before submitting this PR, please check if your code satisfies the following requirements:
-- [ ] My code follows the code style of this project.
-- [ ] I have verified that all existing and new unit/integration tests pass locally.
-- [ ] I have added tests to cover my changes.
-- [ ] I have updated the documentation accordingly (if applicable).
-- [ ] I have preserved all existing comments and docstrings.
+- [ ] Bug fixes include a regression test that fails without the fix; new behavior is covered by tests.
+- [ ] The build has no warnings and the relevant unit/integration tests pass locally.
+- [ ] Public API changes are recorded in the package's `PublicAPI.Unshipped.txt`.
+- [ ] User-visible changes are noted under `[Unreleased]` in `CHANGELOG.md`.
+- [ ] Affected docs (`docs/`, README) are updated.

@@ -6,14 +6,16 @@ labels: ['enhancement']
 assignees: ''
 ---
 
-## Is your feature request related to a problem?
-A clear and concise description of what the problem is. (e.g., "I find it difficult to correlate response messages when...")
+<!-- Check docs/roadmap.md first: it lists what is planned and what was deliberately declined, and why. -->
 
-## Describe the solution you'd like
-A clear and concise description of what you want to happen. Explain how the proposed feature would work and its expected API usage (e.g. extension methods, configuration options).
+## Problem
+What you are trying to do and what makes it hard today.
 
-## Describe alternatives you've considered
-A clear and concise description of any alternative solutions or workarounds you've considered.
+## Proposed solution
+How the feature would work, including the API you would expect (extension methods, options).
+
+## Alternatives considered
+Other solutions or workarounds you have tried.
 
 ## Additional context
-Add any other context, code examples, or diagrams about the feature request here.
+Code examples, diagrams, or links.

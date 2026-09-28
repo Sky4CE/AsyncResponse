@@ -51,7 +51,7 @@ around them.
   replay-determinism rules or a generated workflow DSL.
 - **Time is a first-class citizen.** Flows sleep durably for minutes or months
   (`flow.DelayAsync`), worker jobs can be scheduled with native broker delays, and flows start on
-  cron schedules with replica-safe, exactly-once occurrences — then all of it runs instantly in
+  replica-safe cron schedules with one run per occurrence — then all of it runs instantly in
   tests on the `AsyncResponse.Testing` virtual clock.
 - **Duplicate work is fenced across replicas.** Built-in flow stores combine atomic idempotent
   start, optimistic revisions, and renewable execution leases, so duplicate worker deliveries do
@@ -156,7 +156,7 @@ Three layers, one decision each, made exactly where its deciding fact is knowabl
 
 | Layer | Knowable fact | Decision |
 |---|---|---|
-| **Ingress** (`IAsyncResponseIngress`) | "Does the message parse?" | Parses → deliver as payload, untyped and uninterpreted. Doesn't parse → report as exception. |
+| **Ingress** (`IAsyncResponseIngress`) | "Does the message parse?" | Parses → deliver as payload, untyped and uninterpreted. Doesn't parse → report as exception. Unusable correlation id or over the size budget → acknowledge without dispatch, log, and count. |
 | **Response channel** (`SetResponse`/`SetException`) | "Did any subscriber receive it?" | Delivered → the active waiter's `Until` and flow code interpret it. Nobody listening → hand to the dispatcher. |
 | **Lost-subscriber dispatcher** | "What should this late response do to the flow?" | `OnRecovery()` Resume → resume callback. Fail (or unclassifiable) → failure callback. KeepWaiting (non-terminal checkpoint) → nothing fires; the registration stays armed for the terminal response. Callbacks receive the materialized payload. |
 
@@ -178,9 +178,10 @@ somebody has to make the call. Full model: [docs/recovery.md](docs/recovery.md).
   interval instead of scheduling one timer and write per waiter.
 - A durable channel persists waiter recovery metadata. It does **not** make every response path
   exactly-once: Redis pub/sub is at-most-once, while broker and queue transports can redeliver.
-- Handlers, worker jobs, durable-flow steps, and outbound triggers should therefore be idempotent.
+- Handlers, worker jobs, recovery callbacks (at-least-once), durable-flow steps, and outbound
+  triggers should therefore be idempotent.
   Provider-specific ACK, retry, ordering, and dead-letter behavior is documented in
-  [configuration](docs/configuration.md) and [operations](docs/operations.md).
+  [transport semantics](docs/transport-semantics.md).
 
 ## Durable flows
 
@@ -207,20 +208,18 @@ public sealed class TenantProvisioningFlow(
         if (migration.Status == MigrationStatus.Failed)
             throw new DurableFlowFailedException(migration.Message!);      // terminal, no retry
 
-        await flow.DelayAsync("settle", TimeSpan.FromDays(1));             // durable timer: suspends —
-                                                                           // no worker, lease, or memory
-                                                                           // held; crashes resume the
-                                                                           // remainder, never restart it
+        await flow.DelayAsync("settle", TimeSpan.FromDays(1));             // durable timer: crashes
+                                                                           // resume the remainder, never
+                                                                           // restart it
 
         await flow.StepAsync("notify", () => _notifier.SendAsync(input.TenantId));
     }
 }
 
-// Durable flows are explicit: register the flow class and exactly one atomic state store.
+// Durable flows are explicit: register the flow and exactly one atomic state store.
 var sqlServerConnectionString = builder.Configuration.GetConnectionString("SqlServer")
     ?? throw new InvalidOperationException("ConnectionStrings:SqlServer is required.");
 
-builder.Services.AddScoped<TenantProvisioningFlow>();
 builder.Services.AddAsyncResponse()
     .WithSqlServerChannel(options =>
         options.ConnectionString = sqlServerConnectionString)
@@ -228,12 +227,14 @@ builder.Services.AddAsyncResponse()
         options.ConnectionString = sqlServerConnectionString)
     .WithSqlServerDurableFlows(options =>
         options.ConnectionString = sqlServerConnectionString)
+    .WithDurableFlow<TenantProvisioningFlow, ProvisioningInput>() // registers the flow (AOT-safe)
     // Optional: start a flow on a schedule — replica-safe, exactly one run per occurrence,
     // no leader election (deterministic ids dedup through the store's atomic create).
     .WithScheduledFlow<TenantProvisioningFlow, ProvisioningInput>(
         "nightly-reprovision", "0 6 * * *", occurrence => new ProvisioningInput(TenantId: 0));
 
-var flowId = await _flows.StartAsync<TenantProvisioningFlow, ProvisioningInput>(new(tenantId));
+// Start a run from any service that injects IDurableFlows:
+var flowId = await flows.StartAsync<TenantProvisioningFlow, ProvisioningInput>(new(tenantId));
 ```
 
 - **Checkpointed resume** — completed steps are skipped, pending waits re-attach before retry
@@ -241,14 +242,15 @@ var flowId = await _flows.StartAsync<TenantProvisioningFlow, ProvisioningInput>(
   received while the process is down is checkpointed directly into its pending step before the run
   resumes; it is not discarded and then waited for again.
 - **Replica-safe execution** — a caller-supplied flow id is created atomically, every checkpoint is
-  compare-and-swap protected, and one renewable lease owns execution. Duplicate deliveries become
-  cheap no-ops while a worker is active; an expired lease lets another replica take over. Retrying
+  compare-and-swap protected, and one renewable lease owns execution. A duplicate delivery is
+  acknowledged without running once the store shows the lease is live; an expired lease lets
+  another replica take over. Retrying
   `StartAsync` is idempotent only for the same flow and input; conflicting id reuse fails fast.
 - **Durable timers and cron schedules** — `await flow.DelayAsync("payment-window",
-  TimeSpan.FromDays(3))` sleeps as a checkpoint (crashes resume the remainder), and on
-  delayed-capable transports a sleeping run suspends entirely — no worker, lease, or memory
-  while it sleeps. `WithScheduledFlow<TFlow, TInput>("nightly", "0 6 * * *", …)` starts flows on
-  cron with exactly-once occurrences across replicas and no leader election. See
+  TimeSpan.FromDays(3))` sleeps as a checkpoint (crashes resume the remainder); on transports
+  with native delayed delivery, a sleep longer than `TimerInProcessThreshold` (10 s) suspends the
+  run entirely — no worker, lease, or memory while it sleeps. `WithScheduledFlow<TFlow, TInput>("nightly", "0 6 * * *", …)` starts flows on
+  cron with one run per occurrence across replicas and no leader election. See
   [docs/timers-and-scheduling.md](docs/timers-and-scheduling.md).
 - **Edit flows like code** — insert, reorder, or branch steps with ordinary C#; in-flight runs
   pick up compatible changes on resume. Stable step keys preserve existing checkpoints; changing
@@ -261,13 +263,16 @@ var flowId = await _flows.StartAsync<TenantProvisioningFlow, ProvisioningInput>(
   integration runs against every durable channel, and a concurrent-flow stress scenario gating CI.
 - **And testable by *your* tests** — the `AsyncResponse.Testing` package runs the complete
   engine in-process on a virtual clock: script replies to awaited steps, skip a three-day timer
-  in a microsecond, inject a crash at any checkpoint, and simulate a restart with real
+  in milliseconds, inject a crash at any checkpoint, and simulate a restart with real
   lost-subscriber recovery — no brokers, no sleeps, no instrumentation in your flow classes. See
   [docs/testing.md](docs/testing.md).
 
 ```csharp
 await using var harness = await FlowTestHarness.StartAsync(o =>
-    o.ConfigureAsyncResponse = b => b.WithDurableFlow<TenantProvisioningFlow, ProvisioningInput>());
+{
+    o.ConfigureServices = s => s.AddFakeProvisioningServices();   // your flow's dependencies
+    o.ConfigureAsyncResponse = b => b.WithDurableFlow<TenantProvisioningFlow, ProvisioningInput>();
+});
 
 harness.CrashAfterStep("create-workspace");            // die between checkpoint and next step
 var run = await harness.StartFlowAsync<TenantProvisioningFlow, ProvisioningInput>(new(7));
@@ -310,7 +315,8 @@ rewriting the whole flow ledger for every progress tick; set
 `ProgressPersistenceInterval = TimeSpan.Zero` when every report must be written immediately.
 
 There is one atomic `IFlowStateStore` contract for every store: insert-if-absent start,
-revision-checked checkpoints, and acquire/renew/release execution leases. Custom stores do not get
+revision-checked checkpoints, current (non-stale) reads, and acquire/renew/release/observe
+execution leases. Custom stores do not get
 an unsafe local-lock fallback. This keeps the correctness model identical from development through
 multi-replica production; only the explicit in-memory store is process-local.
 
@@ -369,27 +375,26 @@ execution leases. They are independent axes — combine any one of each.
 | SQL Server | queue table claimed with `UPDLOCK, ROWLOCK, READPAST` (the `SKIP LOCKED` equivalent), idempotent publish, dead-lettering |
 | MongoDB | queue collection claimed atomically with `findOneAndUpdate` (server-clock leases, `lock_id` fences), idempotent publish, deterministic dead-letter ids; change-stream wake on replica sets |
 
-Every transport ships hosted subscribers for worker jobs and response ingress with two ACK modes:
-the default acknowledges only after your handler completes; opt-in **early ACK** trades that
-guarantee for throughput, with an explicitly bounded in-process queue, a drain budget validated
-against host shutdown, and post-ACK failures surfaced through `OnBackgroundFailure`. Per-transport
-semantics: [docs/configuration.md](docs/configuration.md). Copy/paste registration for every
-channel and transport: [provider examples](docs/provider-examples.md).
+Every broker and database transport ships hosted subscribers for worker jobs and response
+ingress with two ACK modes: the default acknowledges only after your handler completes; opt-in
+**early ACK** trades that guarantee for throughput, with an explicitly bounded in-process queue, a
+drain budget validated against host shutdown, and post-ACK failures surfaced through
+`OnBackgroundFailure`. Per-transport semantics: [transport semantics](docs/transport-semantics.md).
+Copy/paste registration for every channel and transport: [provider examples](docs/provider-examples.md).
 
 **Redis-compatible servers.** The Redis channel and transport speak RESP through
 `StackExchange.Redis`, so they run unchanged on Redis-compatible servers. **Valkey** is validated
-end-to-end as both channel and transport, rechecked by a weekly CI matrix; **Dragonfly** is
-validated as both against a live server (its container entrypoint differs from the redis image, so
-it runs outside the Aspire CI harness); **Garnet** implements the pub/sub + string + `SCAN` surface
-the channel needs but has no stream commands, so it works as a channel but not as this transport. That covers the managed options too — Amazon ElastiCache /
-MemoryDB and Azure Managed Redis. Details in [docs/configuration.md](docs/configuration.md#redis-compatible-servers).
+as both channel and transport on every CI run; **Dragonfly** is validated as both against a live
+server; **Garnet** has no stream commands, so it works as a channel only. Managed offerings
+(Amazon ElastiCache / MemoryDB, Azure Managed Redis) are covered the same way. Details in
+[configuration](docs/configuration.md#redis-compatible-servers).
 
 ## Production setup
 
-The registration shape is always the same: engine + one channel + one transport. The examples
-below show complete, representative combinations. The
-[provider examples](docs/provider-examples.md) page has one registration for every channel and
-transport; the [configuration guide](docs/configuration.md) covers every option and default.
+The registration shape is always the same: engine + one channel + one transport + one flow store.
+The examples below show complete, representative combinations. The
+[provider examples](docs/provider-examples.md) page has one registration for every provider; the
+[configuration guide](docs/configuration.md) covers every option and default.
 
 ### Durable recovery — Redis channel
 
@@ -578,9 +583,9 @@ is reused automatically; otherwise the AWS SDK credential and region chain is us
 | AWS | Redis/PostgreSQL channel + `.WithSqsTransport(...)` + `.WithDynamoDbDurableFlows(...)` | Native visibility-timeout redelivery and redrive-policy dead letters; FIFO queues order by correlation id (uncorrelated jobs, durable-flow jobs among them, share one serial group). |
 | NATS | `.WithNatsChannel(...)` + `.WithNatsTransport(...)` + one flow store | Core request/reply for responses and JetStream explicit ACKs for worker jobs. |
 
-See [configuration](docs/configuration.md) for every registration and option,
+See [configuration](docs/configuration.md) for every option,
 [PostgreSQL](docs/postgresql.md) and [SQL Server](docs/sqlserver.md) for database-specific tuning,
-and [operations](docs/operations.md) for ACK-mode and delivery trade-offs.
+and [transport semantics](docs/transport-semantics.md) for ACK-mode and delivery trade-offs.
 
 ## Define a payload and await it
 
@@ -661,7 +666,7 @@ the Native AOT gate, `ASYNCRESPONSE_ITEST_SKIP_ORACLE_COSMOS` for the Oracle/Cos
 unit suite dogfoods the shipped
 [`AsyncResponse.Testing`](docs/testing.md) harness: durable timers, cron schedules,
 production-sized timeouts, crash-at-every-checkpoint matrices, and restart-recovery scenarios all
-run on its virtual clock — multi-day sleeps and seven-day timeouts elapse in microseconds, so the
+run on its virtual clock — multi-day sleeps and seven-day timeouts elapse in milliseconds, so the
 suite runs in seconds, not hours, with no timing flakiness to chase.
 
 A channel, a worker transport, and a durable-flow store are chosen independently, so "each provider
@@ -678,14 +683,12 @@ builds a host exactly the way an application does,
 `AddAsyncResponse().With…Channel().With…Transport().With…DurableFlows()`, and drives a real flow
 through it.
 
-Enumerating the product rather than sampling it is the point: a PostgreSQL channel paired with a Kafka
-transport and an Oracle ledger is a combination nobody writes a test for by hand, and it is precisely
-where two providers stop composing. The cells are sharded across nine CI legs by container footprint,
-because the whole fleet at once is ~9 GiB and the two heavyweight stores cannot share a runner:
-`database-light` 288 cells, `cloud-light` 144, `broker-light` 96, then 36/18/12 for each Oracle and
-Cosmos shard. `MatrixCompletenessTests` reflects over the shipped `With…Channel`, `With…Transport`,
-and `With…DurableFlows` registrations and fails when one has no place in the product — a new provider
-package cannot ship without cross-product coverage.
+Enumerating the product rather than sampling it is the point: a PostgreSQL channel with a Kafka
+transport and an Oracle ledger is a combination nobody tests by hand, and exactly where two providers
+stop composing. The cells are sharded across nine CI legs by container footprint.
+`MatrixCompletenessTests` reflects over the shipped `With…Channel`, `With…Transport`, and
+`With…DurableFlows` registrations, so a new provider package cannot ship without cross-product
+coverage.
 
 ### Behavioral contracts, one per axis
 
@@ -695,7 +698,7 @@ runs instead of 660:
 | Contract | Facts | Providers | Cases |
 | --- | ---: | ---: | ---: |
 | Channel conformance | 34 | 6 channels | 222 |
-| Transport conformance | 13 | 11 transports | 143 |
+| Transport conformance | 14 | 11 transports | 154 |
 | Durable-flow store contract | one composed contract | 10 stores | 10 |
 
 The channel contract pins live delivery, `Until` predicates, timeouts, correlation-id isolation and
@@ -706,19 +709,10 @@ early-ACK execution, large payloads, concurrency, durability across a consumer o
 idle-shutdown latency. The store contract pins the atomic revision/lease protocol, TTL expiry, lease
 expiry and steal after a worker dies, large state, and rejection of a newer schema version.
 
-Transports differ in *where* a guarantee comes from, and the suite records that rather than letting
-the difference become an untested gap. Every transport bounds redelivery — via a subscriber knob on
-eight of them, the in-process retry budget on the in-memory queue, the queue's redrive policy on SQS,
-and the subscription's `DeadLetterPolicy` on Google Pub/Sub. Two constrain the bound itself: RabbitMQ
-cannot count past two without an application-owned TTL-retry cycle (a plain `basic.nack` requeue does
-not increment `x-death`), and a Pub/Sub dead-letter policy rejects anything under five. Payload
-ceilings differ by two orders of magnitude — Service Bus standard tier rejects messages over 256 KB,
-and SQS over 1 MiB (since August 2025; a queue's `MaximumMessageSize` may be set lower, and LocalStack
-and older queues still apply 256 KiB) — so the payload fact is sized per transport. Where a capability is genuinely absent, a
-dedicated fact asserts the absence — every transport is pinned for or against native delayed
-delivery, so gaining or losing `IDelayedWorkerTransport` later fails the test — while the
-delayed-delivery *timing* facts skip, capability-gated, on the five transports that lack it (there,
-durable-flow timers wait in process on the engine's timer path instead).
+Transports differ in *where* a guarantee comes from — a subscriber knob, a redrive policy, a
+subscription `DeadLetterPolicy` — and in payload ceilings, so the suite sizes and gates each fact per
+transport and asserts genuine absences (every transport is pinned for or against native delayed
+delivery). The per-transport details are in [transport semantics](docs/transport-semantics.md).
 
 ### Real servers, and the shipped app
 
@@ -726,8 +720,8 @@ Everything above runs against real servers orchestrated by .NET Aspire: Redis, N
 SQL Server, MongoDB (single-node replica set), MySQL, Oracle, RabbitMQ, and Kafka containers, plus the
 official Azure Service Bus and Google Pub/Sub emulators, the Cosmos DB emulator, and LocalStack for
 AWS SQS and DynamoDB. A separate app-driven suite exercises the **shipped sample black-box over
-HTTP** — 137 scenarios with a dedicated early-ACK app instance per transport — so the packages are
-proven through a real host boundary as well as through in-process wiring.
+HTTP**, with a dedicated early-ACK app instance per transport, so the packages are proven through
+a real host boundary as well as through in-process wiring.
 
 ### Beyond the providers
 
@@ -752,93 +746,51 @@ proven through a real host boundary as well as through in-process wiring.
 
 **Reach for AsyncResponse when**
 
-- a flow needs the *answer* to a specific request that arrives asynchronously — job results,
-  payment confirmations, ML/batch completions, DAG runs, provisioning callbacks, webhook
-  round-trips. If any code anywhere ends with "…and then we wait for the outcome", that wait is
-  what this library makes safe;
-- you're **orchestrating a multi-step process across async services** — implement
-  `IDurableFlow<TInput>` and write the steps as plain sequential `await`s
-  (`flow.StepAsync(...)`, `flow.AwaitStepAsync<T>(...)`). The library checkpoints successful
-  steps, re-attaches in-flight waits after a crash or redeploy, and wires the recovery callbacks —
-  no replay-determinism rules, no workflow DSL, no engine cluster to operate —
-  [durable flows](docs/durable-flows.md);
-- the process involves **time**: "give the customer three days to pay" (`flow.DelayAsync`
-  suspends without holding a worker), "retry the export in an hour" (delayed worker jobs with
-  native broker delays), "run reconciliation nightly at 06:00" (replica-safe cron flows with
-  exactly-once occurrences) — no separate scheduler to deploy or keep consistent —
-  [timers & scheduling](docs/timers-and-scheduling.md);
-- a **human is in the loop**: an approval is just an awaited step whose response your UI
-  publishes — the flow sleeps durably until the click, whether it comes in seconds or weeks;
-- users watch the work happen — `Until(...)` streams progress messages through the same wait
-  that delivers the terminal result, no side-channel state machine;
-- you're maintaining a hand-rolled `TaskCompletionSource` registry, a polling loop, or a
-  timeout-and-reconcile job today — that is exactly the plumbing this library deletes;
-- waits must **survive redeploys**, and a late *failure* must never be resumed as a success —
-  domain-aware recovery is the part teams get subtly wrong by hand;
-- you want all of the above **on infrastructure you already run** — it rides your existing
-  broker, queue, or database (or starts fully in-memory with zero infrastructure), swappable per
-  axis through DI without touching application code;
-- and you want it **provable in CI** — `AsyncResponse.Testing` runs real flows, timers, and
-  recovery on a virtual clock, so the hardest async behavior in your system becomes the easiest
-  to test.
+- code needs the *answer* to a request that arrives asynchronously — job results, payment
+  confirmations, ML/batch completions, DAG runs, provisioning callbacks, webhook round-trips;
+- you maintain a hand-rolled `TaskCompletionSource` registry, polling loop, or
+  timeout-and-reconcile job — the plumbing this library deletes;
+- users watch the work happen — `Until(...)` streams progress through the same wait that
+  delivers the result;
+- waits must **survive redeploys**, and a late *failure* must never resume as a success;
+- you're **orchestrating a multi-step process across async services** — plain sequential C# with
+  checkpointed steps, re-attached waits, durable timers, cron starts, and human-in-the-loop
+  approvals as awaited steps; no replay-determinism rules, workflow DSL, or engine cluster —
+  [durable flows](docs/durable-flows.md), [timers & scheduling](docs/timers-and-scheduling.md);
+- you want it **on infrastructure you already run**, swappable per axis through DI, and
+  **provable in CI** on a virtual clock with [`AsyncResponse.Testing`](docs/testing.md).
 
 **When something else fits better**
 
-The honest list is short. Pure fire-and-forget fan-out where genuinely nobody ever awaits an
-outcome is your message bus's job — AsyncResponse coexists with it happily, and the moment any
-consumer *does* need the result, you're back in its sweet spot. And if you specifically want a
-workflow *engine* to own the ledger — auto-derived compensation graphs, replayable audit
-histories — Temporal or Durable Task trade those in for replay rules, version patching, and a
-cluster to run; durable flows with timers, cron, and explicit compensation cover most of that
-ground without the ceremony. In practice: if anything in your system waits for an asynchronous
-answer, you're better off with AsyncResponse than without it.
+Pure fire-and-forget fan-out, where nobody ever awaits an outcome, is your message bus's job —
+AsyncResponse coexists with it, and takes over the moment a consumer needs the result. If you want
+a workflow *engine* to own the ledger — auto-derived compensation graphs, replayable audit
+histories — Temporal or Durable Task provide that in exchange for replay rules, version patching,
+and a cluster to run; durable flows with timers, cron, and explicit compensation cover most of that
+ground without the ceremony.
 
 ## Documentation
 
-Looking for something specific? The **[docs index](docs/README.md)** maps "I want to…" tasks to
-the right page. The pages:
+The **[docs index](docs/README.md)** maps "I want to…" tasks to the right page.
 
-- **[Configuration](docs/configuration.md)** — `AddAsyncResponse` wiring and a consolidated options
-  reference (engine, channel, and transport options).
-- **[Transport semantics](docs/transport-semantics.md)** — the per-transport matrix: ack modes, attempt counting, dead-letter destinations, early-ACK failure handling, shutdown drain budgets, and lock/lease renewal.
-- **[Provider examples](docs/provider-examples.md)** — copy/paste registration for every channel and
-  every worker transport, plus links to every durable-flow store example.
-- **[Recovery](docs/recovery.md)** — lost-subscriber recovery, `OnRecovery`, non-terminal
-  checkpoints, payload materialization, the watchdog and health check, recovery-state durability,
-  wire/schema versioning, and the shared-correlation recovery limitation.
-- **[Durable flows](docs/durable-flows.md)** — first-class multi-step orchestration:
-  `IDurableFlow<TInput>` with automatically checkpointed steps, crash-resume and re-attach,
-  progress streaming, pluggable flow-state storage, explicit compensation, and an honest
-  comparison with workflow engines.
-- **[Durable timers & scheduling](docs/timers-and-scheduling.md)** — `flow.DelayAsync` sleeps
-  that suspend without holding a worker, delayed worker jobs with the per-transport
-  native-delivery matrix, and replica-safe cron-scheduled flows (syntax, DST, occurrence ids).
-- **[Testing](docs/testing.md)** — the `AsyncResponse.Testing` package: virtual clock,
-  flow-test harness with scripted replies and crash injection at checkpoints, and simulated
-  restarts with real lost-subscriber recovery.
-- **[Durable-flow state stores](docs/durable-flow-state-stores.md)** — a complete registration for
-  every store provider, the atomic contract, schema ownership, client lifetimes, and expiry.
-- **[Observability](docs/observability.md)** — tracing (`ActivitySource`) and metrics
-  (`System.Diagnostics.Metrics`) for the `"AsyncResponse"` source/meter.
-- **[Security & hardening](docs/security.md)** — callback authorization allowlist, securing the
-  store/transport, the remote stack-trace policy, strict correlation id, and type resolution for
-  plugin/ALC scenarios.
-- **[Operations](docs/operations.md)** — best practices, building and testing, and benchmarking and
-  load testing.
-- **[Troubleshooting](docs/troubleshooting.md)** — symptom → cause → fix for the common gotchas:
-  broker lock/visibility budgets, MongoDB replica sets, stuck flows, AOT registration, and more.
-- **[Trimming & Native AOT](docs/aot.md)** — what to register in a trimmed/AOT app (one JSON
-  context line plus `WithDurableFlow` per flow), how the metadata seam works, and the annotated
-  dynamic surface.
-- **[PostgreSQL](docs/postgresql.md)** — channel/transport architecture, schema, delivery
-  confirmation, ACK modes, and operational tuning.
-- **[SQL Server](docs/sqlserver.md)** — channel/transport architecture, adaptive polling wake,
-  `UPDLOCK/READPAST` claims, schema, ACK modes, and operational tuning.
-- **[Sample app](docs/sample.md)** — the runnable Aspire testbed and curl walkthroughs for every
-  scenario.
-- **[Roadmap](docs/roadmap.md)** — durable timers and the testing kit have shipped; next up:
-  claim-check payloads and a flow operations API — then Hangfire, Storage Queues, MQTT and
-  more, with priorities and design sketches.
+| Page | Covers |
+|---|---|
+| [Configuration](docs/configuration.md) | Wiring and every engine, channel, transport, and flow-store option with defaults |
+| [Provider examples](docs/provider-examples.md) | Copy/paste registration for every channel and transport |
+| [Transport semantics](docs/transport-semantics.md) | Per-transport ACK modes, attempt counting, dead letters, early ACK, shutdown drain, lock renewal |
+| [Recovery](docs/recovery.md) | Lost-subscriber recovery, `OnRecovery`, the watchdog and health check, schema versioning |
+| [Durable flows](docs/durable-flows.md) | Steps, child flows, failure modes, compensation, ledger size, comparison with workflow engines |
+| [Durable-flow state stores](docs/durable-flow-state-stores.md) | Every store's registration, the atomic contract, schema ownership, expiry |
+| [Timers & scheduling](docs/timers-and-scheduling.md) | `flow.DelayAsync`, delayed worker jobs, cron-scheduled flows |
+| [Testing](docs/testing.md) | Virtual clock, flow harness, crash injection, simulated restarts |
+| [Observability](docs/observability.md) | Span names, metric instruments, tags |
+| [Security & hardening](docs/security.md) | Callback authorization, stack-trace policy, correlation-id rules, type resolution |
+| [Operations](docs/operations.md) | Best practices, building and testing, benchmarks and load tests |
+| [Troubleshooting](docs/troubleshooting.md) | Symptom → cause → fix |
+| [Trimming & Native AOT](docs/aot.md) | What a trimmed/AOT app registers, vendor matrix |
+| [PostgreSQL](docs/postgresql.md) · [SQL Server](docs/sqlserver.md) | Database channel/transport internals and tuning |
+| [Sample app](docs/sample.md) | The runnable Aspire testbed and curl walkthroughs |
+| [Roadmap](docs/roadmap.md) | What shipped, next priorities, what was declined |
 
 ## License
 

@@ -10,8 +10,8 @@ AsyncResponse has three independent infrastructure choices:
 
 Choose exactly one of each. Even applications that do not yet start durable flows select a store;
 `.WithInMemoryDurableFlows()` is the zero-infrastructure choice. The provider snippets below are
-deliberately small and copyable; option defaults and delivery semantics remain in
-[configuration.md](configuration.md).
+deliberately small and copyable; option defaults live in [configuration.md](configuration.md) and
+delivery semantics in [transport-semantics.md](transport-semantics.md).
 
 **On this page**
 
@@ -178,11 +178,9 @@ builder.Services.AddAsyncResponse()
     .WithInMemoryDurableFlows();
 ```
 
-Change-stream wake requires a replica set; a single-node replica set is enough. On a standalone
-server (or with `UseChangeStreams = false`) the channel falls back to `ListenerPollInterval`
-polling with the full sweep on every tick — `FullSweepInterval` is ignored there. While a stream
-is down between re-opens the full sweep runs every
-`min(FullSweepInterval, DeliveryConfirmationTimeout / 4)` until it is back. The channel requires MongoDB 4.4 or newer. A registered
+The channel requires MongoDB 4.4 or newer. Change-stream wake needs a replica set (a single-node
+replica set is enough); on a standalone server, or with `UseChangeStreams = false`, it falls back
+to polling (see [`UseChangeStreams`](configuration.md#channel-options)). A registered
 `IMongoDatabase`, or an `IMongoClient` plus `DatabaseName`, is reused automatically.
 
 ## Transport examples
@@ -241,20 +239,14 @@ builder.Services.AddAsyncResponse()
 ```
 
 The transport uses consumer groups, pending-entry reclaim, and a dead-letter stream. It requires
-Redis 6.2 or later (the reclaim uses `XPENDING … IDLE`), or a compatible server that implements the
-Streams command set.
+Redis 6.2 or later, or a [compatible server](configuration.md#redis-compatible-servers) that
+implements the Streams command set. Reuse the same multiplexer when the Redis channel is selected.
 
-`StreamMaxLength` trims the worker stream by length alone: past the cap Redis deletes the oldest
-entries whether or not a worker has read or finished them, with no dead-letter copy. Size it well
-above the deepest backlog a worker outage can build, or set `null`. Response producers trim the
-response stream themselves (`XADD … MAXLEN ~`); the library only ACKs it.
-
-Each process joins its groups under a generated consumer name, `{machine}-{pid}-{guid}` plus the
-subscriber role, kept within 64 characters by shortening the machine name only: the process id and
-the GUID are what keep two processes on one host apart, and consumers that share a name share one
-pending-entry list. A stopping subscriber deletes its generated consumer from the group when it has
-no pending entries left. Set `ConsumerName` yourself only when your orchestrator guarantees a unique
-value per running process.
+`StreamMaxLength` trims the worker stream by length alone — past the cap Redis deletes the oldest
+entries, unread and pending ones included, with no dead-letter copy — so size it well above the
+deepest backlog a worker outage can build, or set `null`. Leave `ConsumerName` unset (a unique name
+is generated per process, and a stopping subscriber removes it from the group once it has no
+pending entries) unless your orchestrator guarantees a unique value per running process.
 
 ### RabbitMQ transport
 
@@ -278,8 +270,11 @@ builder.Services.AddAsyncResponse()
     .WithInMemoryDurableFlows();
 ```
 
-`DeclareTopology = true` creates durable exchanges, queues, bindings, and the configured retry/DLQ
-topology. Set it to `false` when infrastructure tooling owns those resources.
+`DeclareTopology = true` creates the durable exchanges, queues, and bindings, plus the configured
+`DeadLetterExchange`, `DeadLetterQueue`, and `ParkQueue`. Set it to `false` when infrastructure
+tooling owns those resources. `WorkerSubscriber.MaxDeliveryAttempts` defaults to `0` (unlimited
+requeues) on RabbitMQ; a cap above 2 also needs a TTL-retry dead-letter cycle, which the library
+never declares (see [RabbitMQ semantics](transport-semantics.md#rabbitmq)).
 
 ### Azure Service Bus transport
 
@@ -353,6 +348,8 @@ builder.Services.AddAsyncResponse()
     {
         options.BootstrapServers = bootstrapServers;
         options.TopicPrefix = "orders";
+        options.WorkerConsumerGroup = "orders-workers";     // groups are not derived from TopicPrefix
+        options.ResponseConsumerGroup = "orders-responses";
         options.TopicNumPartitions = 12;
         options.CreateTopics = true;
     })
@@ -361,7 +358,8 @@ builder.Services.AddAsyncResponse()
 
 The package speaks the Kafka protocol and also works with Redpanda, Amazon MSK, WarpStream, Aiven,
 and Confluent Cloud. Correlation ids are message keys, so ordering and head-of-line blocking are
-per partition.
+per partition. Give each deployment sharing a cluster its own consumer groups, or a member change
+in one rebalances the others.
 
 ### NATS JetStream transport
 
@@ -451,8 +449,8 @@ builder.Services.AddAsyncResponse()
     .WithInMemoryDurableFlows();
 ```
 
-Messages are claimed atomically with `findOneAndUpdate`. Change-stream wake uses a replica set and
-falls back to polling on standalone MongoDB.
+Messages are claimed atomically with `findOneAndUpdate`. Change-stream wake needs a replica set
+and falls back to polling on a standalone server.
 
 ## Durable-flow store examples
 
@@ -518,10 +516,9 @@ builder.Services.AddAsyncResponse()
     })
     .WithPostgreSqlDurableFlows(options =>
     {
-        // Must EXCEED the channel's effective default waiter timeout (DefaultTimeout, or
-        // RecoveryStateExpiry = 14 days above when DefaultTimeout is unset): a timeout-less
-        // awaited step waits out that default, and startup validation rejects a ledger TTL that
-        // does not out-live the wait.
+        // Must exceed the channel's effective default waiter timeout (DefaultTimeout, else
+        // RecoveryStateExpiry = 14 days above); startup rejects a ledger TTL shorter than the
+        // wait a timeout-less awaited step can make.
         options.StateExpiry = TimeSpan.FromDays(30);
         options.ExecutionLeaseDuration = TimeSpan.FromMinutes(1);
         options.ExecutionLeaseRenewInterval = TimeSpan.FromSeconds(20);

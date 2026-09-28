@@ -15,25 +15,28 @@ of proof run in CI:
    exactly which, and why the rest stay JIT). Set `ASYNCRESPONSE_ITEST_SUT=aot` and
    `ASYNCRESPONSE_ITEST_SUT_PATH=<published binary>` to run it locally.
 
-The first two layers also run in every **local** full test run:
-`NativeAotPublishGateTests` (in the integration test project, no Docker needed) publishes the
-sample with `-warnaserror` and then boots the native binary and drives a request/response round
-trip plus a durable flow. It exists because two defect classes are invisible to build + unit
-runs — ILC-only trim errors (e.g. anonymous-type LINQ projections lower to the trim-unsafe
-`Expression.New` overload that Roslyn's analyzer never flags) and runtime-only AOT breaks — and
-it makes them fail in the IDE instead of the pipeline. Set `ASYNCRESPONSE_SKIP_AOT_GATE=1` to
-skip it while iterating.
+A local equivalent runs in every full test run (and in CI's plain integration job):
+`NativeAotPublishGateTests` (integration test project, no Docker needed) publishes
+[samples/AsyncResponse.Sample](../samples/AsyncResponse.Sample) with `-warnaserror`, boots the
+native binary on the in-memory providers, and drives a request/response round trip plus a durable
+flow. It catches two defect classes a build + unit run cannot see — ILC-only trim errors (e.g.
+anonymous-type LINQ projections lower to the trim-unsafe `Expression.New` overload that Roslyn's
+analyzer never flags) and runtime-only AOT breaks — in the IDE instead of the pipeline. It skips
+itself when the platform's native toolchain is missing; set `ASYNCRESPONSE_SKIP_AOT_GATE=1` to skip
+it while iterating.
 
 ## What you do in a trimmed / Native AOT app
 
 Two startup lines, and one registration per flow:
 
 ```csharp
-// 1) Register JSON metadata for the types AsyncResponse serializes on your behalf:
-//    response payloads, flow inputs, step results, and values-bag entries.
+// 1) Before the host starts (metadata is cached per type on first use), register JSON metadata
+//    for the types AsyncResponse serializes on your behalf: response payloads, flow inputs,
+//    step results, values-bag entries, and literal worker-call arguments.
 AsyncResponseJsonSerialization.RegisterResolver(MyAppJsonContext.Default);
 
-// 2) Register each durable flow so the executor never needs its persisted type name:
+// 2) Register each durable flow (this also adds it to DI, scoped) so the executor never
+//    needs its persisted type name:
 builder.Services.AddAsyncResponse()
     .WithRedisChannel(...)
     .WithRabbitMqTransport(...)
@@ -49,24 +52,20 @@ where `MyAppJsonContext` is an ordinary source-generated context listing your ty
 internal sealed partial class MyAppJsonContext : JsonSerializerContext;
 ```
 
-Non-trimmed (JIT) apps need neither line: everything falls back to reflection-based
-`System.Text.Json` exactly as before, and `WithDurableFlow` is optional (flows then resolve by
-their persisted type name through DI, as they always have).
+Non-trimmed (JIT) apps need neither: unregistered types fall back to reflection-based
+`System.Text.Json`, and an unregistered flow resolves by its persisted type name through DI.
 
 ## How it works
 
 - **Library wire types** (envelopes, `FlowState`, `RecoveryState`, `WorkerJobEnvelope`, callback
-  descriptors) use source-generated metadata compiled into the packages. The wire format is
-  byte-identical to previous releases; the schema-version stamps are unchanged. Where a provider
-  package has its own source-generated context (the Redis and NATS recovery stores wrap
-  registrations in a package-local envelope), that context is **chained in front of** the library
-  chain below rather than used alone — a callback argument is `CallbackParam.Value`, typed
-  `object`, so it serializes by runtime type, and a context that only emitted what its envelope
-  references transitively would reject an ordinary `bool`/`long` literal on that channel only.
-  The envelope's own metadata still resolves first, so the wire format is unchanged. Enum literals
-  are the one scalar the library chain cannot pre-register (enums are open-ended types): declare
-  each enum used as a worker-call argument in one of your own registered contexts, or the enqueue
-  fails with guidance naming the type to register.
+  descriptors) use source-generated metadata compiled into the packages; the JSON is
+  byte-identical to the reflection-based output (pinned by wire-compatibility tests). Provider
+  packages with their own context (the Redis and NATS recovery stores' registration envelope)
+  chain it **in front of** the library chain rather than using it alone: a callback argument
+  (`CallbackParam.Value`, typed `object`) serializes by runtime type, so an envelope-only context
+  would reject an ordinary `bool`/`long` literal. Enums are the one scalar the library cannot
+  pre-register: declare each enum used as a worker-call argument in one of your own registered
+  contexts, or the enqueue fails with guidance naming the type.
 - **Your payload types** resolve through a chain: the library's own metadata → resolvers you
   register via `AsyncResponseJsonSerialization.RegisterResolver(...)` (process-wide and additive,
   like `AsyncResponseTypeResolution`) → the runtime's reflection resolver when the app has it
@@ -74,8 +73,9 @@ their persisted type name through DI, as they always have).
   removed by the feature switch, and an unregistered type fails with an error naming the type and
   the registration call to make.
 - **Registered flows** execute through a statically-typed route (no `MakeGenericType`, no
-  `MethodInfo.Invoke`); unregistered flows fall back to the historical reflection path, which in a
-  trimmed app fails closed with guidance to add `WithDurableFlow`.
+  `MethodInfo.Invoke`); unregistered flows fall back to the reflection path, which in a trimmed app
+  fails closed with guidance to add `WithDurableFlow`. `WithScheduledFlow` registers its flow the
+  same way.
 
 ## The annotated dynamic surface
 
@@ -123,21 +123,20 @@ driver underneath. Current state, as exercised by the AOT integration run:
 | --- | --- | --- |
 | Verified natively in CI | NATS (NATS.Net), PostgreSQL (Npgsql) | Channel + transport pairs run as Native AOT SUTs against the real servers. |
 | JIT-only today (driver defect, observed empirically in this harness) | Redis (StackExchange.Redis 3.x), SQL Server (Microsoft.Data.SqlClient), MongoDB (MongoDB.Driver) | SE.Redis's net8+ `Delegates` helper reads CoreCLR's `MulticastDelegate._invocationList` via `UnsafeAccessor`; that private field does not exist in the Native AOT runtime, so pub/sub completion throws `MissingFieldException` (no upstream guard as of 3.0.17). SqlClient fails the TDS pre-login handshake in a native binary. MongoDB.Driver serializes BSON through reflection. All three run as JIT SUTs in the AOT pass, so their tests still execute. |
-| Not yet verified natively (harness pairing) | RabbitMQ, Kafka, SQS, Google Pub/Sub, Azure Service Bus, Redis Streams transport | These transport SUTs pair with the Redis *channel*, so the SE.Redis defect keeps them JIT for now. The transports themselves carry no known AOT blockers (librdkafka is native code; AWS SDK v4, gRPC/protobuf, RabbitMQ.Client v7 and Azure.Messaging.ServiceBus are trim-friendly); a channel-remap mode (PostgreSQL channel under each broker transport) can verify them natively before the SE.Redis fix lands. |
+| Not yet verified natively (harness pairing) | RabbitMQ, Kafka, SQS, Google Pub/Sub, Azure Service Bus, Redis Streams transport | These transport SUTs pair with the Redis *channel*, so the SE.Redis defect keeps them JIT for now. The broker SDKs carry no known AOT blockers (librdkafka is native code; AWS SDK v4, gRPC/protobuf, RabbitMQ.Client v7 and Azure.Messaging.ServiceBus are trim-friendly); a channel-remap mode (PostgreSQL channel under each broker transport) could verify them natively before the SE.Redis fix lands. |
 
 The AOT smoke app additionally proves the in-memory channel, transport, and durable-flow store
 natively on every CI run.
 
 Vendor SDKs without trim annotations produce publish-time rollup warnings (IL2104/IL3053); the
-sample suppresses exactly those two codes, while its own code stays gated by the Roslyn analyzers
-on every build.
+sample app suppresses exactly those two codes, while its own code stays gated by the Roslyn
+analyzers on every build.
 
 ## Verifying your own app
 
 `dotnet publish /p:PublishAot=true` and run it — or, for a fast signal without ILC, run your app
 with the trimmed-JSON semantics enabled: `dotnet run -p:JsonSerializerIsReflectionEnabledByDefault=false`.
-Any payload type you forgot to register fails immediately with the register-a-context error —
-on every channel, including where the payload type is only resolved while a response envelope is
-being read. (With reflection-based `System.Text.Json` enabled, the same wrapper says so instead:
-a type the serializer refuses in every mode, such as `System.Type`, is not a missing
-registration.)
+Any payload type you forgot to register fails immediately with the register-a-context error, on
+every channel — including where the type is only resolved while a response envelope is read. (With
+reflection enabled, a type the serializer refuses in every mode, such as `System.Type`, is reported
+as such, not as a missing registration.)

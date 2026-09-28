@@ -22,12 +22,23 @@ owns the full story — this page is the map, not the territory.
 - **Cause:** MongoDB change streams require a **replica set**. Against a standalone server the
   channel falls back to `ListenerPollInterval` polling (the transport to `EmptyPollDelay`), which
   is correct but slower. In that mode — and with `UseChangeStreams = false` — the channel sweeps
-  on every tick, ignoring `FullSweepInterval`: the throttled sweep would be its only cross-process
-  wake, and the 5 s default equalled `DeliveryConfirmationTimeout`, so a cross-process response
-  could route to recovery before its waiter had even looked.
+  on every tick, ignoring `FullSweepInterval`, because polling is its only cross-process wake.
 - **Fix:** run a replica set — single-node is sufficient — and include `directConnection=true` in
   the connection string when connecting to a single-node replica set. See the MongoDB rows in
   [channel options](configuration.md#channel-options).
+
+### PostgreSQL: cross-process responses arrive late and `PostgreSQL LISTEN loop failed` repeats
+
+- **Symptom:** the channel logs `PostgreSQL LISTEN loop failed; retrying in …` every reconnect
+  cycle; responses published by another process arrive up to ~1.25 s late, and some route to
+  lost-subscriber recovery under a live waiter.
+- **Cause:** the channel's data source connects through a transaction- or statement-mode pooler
+  (PgBouncer `pool_mode = transaction`, most serverless proxies). Its `LISTEN` lands on a server
+  connection that goes straight back to the pool, the self-sent delivery probe never returns, and
+  the channel runs on its safety sweep alone.
+- **Fix:** give the channel an `NpgsqlDataSource` that connects directly or through a session-mode
+  pool; the rest of the app can keep the transaction-mode pooler. See
+  [PostgreSQL operational notes](postgresql.md#operational-notes).
 
 ### Garnet returns `unknown command` for `XADD` / `XREADGROUP`
 
@@ -48,8 +59,8 @@ owns the full story — this page is the map, not the territory.
   locked while they wait in the client buffer, where no renewal reaches them.
 - **Fix:** keep `WorkerSubscriber.LockRenewalInterval` on (the default) for long handlers, or keep
   handler latency well under the lock duration; leave `PrefetchCount` at 0 unless handlers are fast.
-  (In ack-after-handler mode the worker subscriber receives one message at a time, so batch size no longer
-  adds to the budget.) See [transport options](configuration.md#transport-options).
+  In ack-after-handler mode the worker subscriber receives one message at a time, so batch size does
+  not add to the budget. See [transport options](configuration.md#transport-options).
 
 ### SQS: duplicate executions, or FIFO settings that don't apply
 
@@ -59,8 +70,8 @@ owns the full story — this page is the map, not the territory.
   `WorkerSubscriber.VisibilityTimeout` is unset). FIFO behavior is opt-in by **queue naming**, not
   an option flag.
 - **Fix:** keep handler latency under the visibility timeout (raise
-  `WorkerSubscriber.VisibilityTimeout`, or use visibility renewal for long handlers — up to the
-  12-hour SQS in-flight maximum), and name the queue `*.fifo` to opt into FIFO publishing. When
+  `WorkerSubscriber.VisibilityTimeout`, or set `WorkerSubscriber.VisibilityRenewalInterval` for
+  long handlers — up to the 12-hour SQS in-flight maximum), and name the queue `*.fifo` to opt into FIFO publishing. When
   durable flows run on SQS, set `VisibilityTimeout` explicitly (the startup warning says so) and
   prefer a standard worker queue: on FIFO every uncorrelated job shares one serial message group.
   See [transport options](configuration.md#transport-options).
@@ -70,18 +81,18 @@ owns the full story — this page is the map, not the territory.
 - **Symptom:** `Application maximum poll interval (…ms) exceeded` from librdkafka, rebalances, and
   a worker job or flow step that ran twice — once here and once on the peer the partition moved
   to — while a handler was still running.
-- **Cause:** a consumer that stops polling for `max.poll.interval.ms` (default 5 minutes) is
-  evicted from its group. Before round 37 the poll thread awaited the whole handler, so a
-  durable-flow step awaiting a remote response or sleeping on a timer for longer than the
-  interval — or a long in-process retry ladder — did exactly that. Now a handler still running
-  after `WorkerSubscriber.DetachHandlerAfter` (default 1 s) is detached: its partition is paused,
-  the handler runs on, and the poll thread keeps polling; the offset is stored once the handler
-  settles. The symptom can therefore only remain when the inline budget itself is raised toward
-  the interval (validation allows up to half of it, minus `PollTimeout`), or when a
-  `ConfigureConsumer` hook overrides `MaxPollIntervalMs` below what the library configured.
-- **Fix:** leave `DetachHandlerAfter` at its default and do not override `MaxPollIntervalMs` in
-  `ConfigureConsumer`; set `MaxPollInterval` on the subscriber options instead, which validates
-  the inline budget against it. See [transport options](configuration.md#transport-options) and
+- **Cause:** a consumer that stops polling for `max.poll.interval.ms` (`MaxPollInterval`, default
+  5 minutes) is evicted from its group, and its partitions — with any in-flight message — move to a
+  peer. A handler still running after `WorkerSubscriber.DetachHandlerAfter` (default 1 s) is
+  detached: its partition is paused, the handler runs on, the poll thread keeps polling, and the
+  offset is stored once the handler settles. Startup validation requires `DetachHandlerAfter` plus
+  `PollTimeout` to fit within half of the effective interval (a `ConfigureConsumer` override
+  included), so handler duration alone does not cause eviction; a rebalance from scaling or a
+  session timeout still redelivers in-flight messages.
+- **Fix:** leave `DetachHandlerAfter` at its default, set `MaxPollInterval` on the subscriber
+  options rather than overriding `max.poll.interval.ms` in `ConfigureConsumer`, and keep handlers
+  idempotent — redelivery on rebalance is the at-least-once contract. See
+  [transport options](configuration.md#transport-options) and
   [transport semantics](transport-semantics.md#kafka).
 
 ### Kafka: `Abandoning detached Kafka handler …` after a broker failure
@@ -93,9 +104,8 @@ owns the full story — this page is the map, not the territory.
 - **Cause:** the consume failed (a dropped connection, a burial that failed for good) and the
   fault teardown waited `WorkerSubscriber.FaultDrainTimeout` (default 5 s) for the detached
   handlers; this one did not settle in time, so its offset was left unstored and the rebuilt
-  consumer re-consumed it. The handler's eventual outcome is logged (`Abandoned Kafka handler …
-  completed/failed/stopped …`). Before the bound, the reconnect waited for every detached handler
-  with no limit and a transient broker failure parked the subscriber behind one long step.
+  consumer re-consumed it. The handler's eventual outcome is logged when it settles
+  (`Abandoned Kafka handler for …`). The bound keeps one long step from parking the reconnect.
 - **Fix:** nothing, if the handler is idempotent — this is the transport's at-least-once
   contract. Raise `FaultDrainTimeout` when handlers reliably settle within a known window and
   you would rather delay the reconnect than redeliver; make plain worker jobs idempotent
@@ -108,27 +118,24 @@ owns the full story — this page is the map, not the territory.
 - **Cause:** the serialized worker envelope — arguments, captured context, and for a flow start
   the whole initial ledger, input included — exceeds what the consuming ingress accepts. The
   ingress acknowledges such a message *without executing it* (an oversized message never gets
-  smaller, so redelivering it would hot-loop), so before this check the transport took the job,
-  the ingress dropped it, and the caller held a flow id for a `Running` run nothing would ever
-  execute. JSON escaping counts: quotes, non-ASCII and control characters serialize to several
-  times their length. A delayed job is measured as its largest re-published hop: when an early
-  delivery is re-published for the remaining delay, the stamped remainder makes the envelope up
-  to 24 characters longer.
+  smaller, so redelivering it would hot-loop), so the publish refuses it up front. JSON escaping
+  counts: quotes, non-ASCII and control characters serialize to several times their length. The
+  envelope is measured with up to 50 characters of headroom for the due-time and remaining-delay
+  stamps a re-published hop can add, so a job just under the limit is refused too.
 - **Fix:** put the large argument behind a claim check — persist it yourself and pass a reference
   (see the [durable-flows ledger budgets](durable-flows.md#supported-ledger-budgets)) — rather
   than raising the limit; if you do raise it, raise it identically on every producer and consumer
   of the deployment.
 
-### Redis: a wait faults with `AsyncResponseIndeterminateDeliveryException` saying responses "arrived faster than the wait could process them"
+### Redis or NATS: a wait faults with `AsyncResponseIndeterminateDeliveryException` saying responses "arrived faster than the wait could process them"
 
 - **Symptom:** the waiter faults with the overload form of the exception (`BufferedMessages` =
-  1,024), the log carries `Wait for correlationId … is overloaded`, and
-  `asyncresponse.channel.overloaded_waits` counts up for `channel=redis`.
+  1,024 on Redis), the log carries `Wait for correlationId … is overloaded`, and
+  `asyncresponse.channel.overloaded_waits` counts up for `channel=redis` or `channel=nats`.
 - **Cause:** responses for one correlation id — typically a progress-message flood — arrived
   faster than the wait's serial processing (its `Until` predicate) consumed them, and the bounded
-  per-wait buffer filled. Redis pub/sub cannot backpressure the publisher, and the SDK queue
-  behind the subscription is unbounded, so the channel refuses the next response instead of
-  buffering it without bound. The refused or queued responses may include the terminal one, which
+  per-wait buffer filled. Pub/sub cannot backpressure the publisher, so the channel refuses (Redis)
+  or the client drops (NATS) the next response instead of buffering it without bound. The refused or queued responses may include the terminal one, which
   is why the wait is faulted as indeterminate rather than completed or timed out.
 - **Fix:** make the predicate cheap (no I/O per progress message), publish fewer progress
   messages, or move the wait to a database channel, whose backlog stays server-side and is
@@ -200,6 +207,21 @@ owns the full story — this page is the map, not the territory.
   stop, a delivery prefetched but not yet started when host stop began, a channel closed under a
   running handler — comes back `redelivered`, resolves to attempt 2 and is rejected before its
   handler runs, so a flow's wake-up can be lost on a routine deploy. Use 2 or more (or 0).
+
+### PostgreSQL or SQL Server: transport operations fail at once, naming a startup-DDL lock wait
+
+- **Symptom:** after a deploy, the transport's publishes and claims fail immediately with an error
+  (and a warning) saying its startup DDL could not take a lock within 5 s and will be retried in
+  30–60 s.
+- **Cause:** the store needed one-time table work — building a missing dequeue index, or the
+  PostgreSQL `jsonb` → `text` conversion — and another session holds a conflicting lock (a
+  long-running or idle-in-transaction writer, a manual `VACUUM`, an index rebuild, a bulk load).
+  Each attempt waits at most 5 s, changes nothing, and latches a jittered retry window.
+- **Fix:** find the holder (`pg_locks` joined to `pg_stat_activity`; `sys.dm_tran_locks` joined to
+  `sys.dm_exec_sessions`) and end it, or build the index yourself ahead of the rollout
+  (`CREATE INDEX CONCURRENTLY` / `WITH (ONLINE = ON)`). See
+  [PostgreSQL upgrades](postgresql.md#upgrading-a-manually-managed-schema) and
+  [SQL Server upgrades](sqlserver.md#upgrading-a-manually-managed-schema).
 
 ## Durable flows
 
@@ -274,8 +296,7 @@ owns the full story — this page is the map, not the territory.
 - **Cause:** durable flows register lost-subscriber recovery callbacks on *every* awaited step, and
   a payload that does not override `IAsyncResponsePayload.OnRecovery()` cannot be classified when
   it arrives with no live waiter — so waiter creation fails fast rather than guessing. Every
-  channel enforces this, the in-memory one included; code written before that was uniform can hit
-  it the first time it runs in-memory.
+  channel enforces this, the in-memory one included.
 - **Fix:** override `OnRecovery()` on the payload — terminal success → `Resume`, terminal failure
   → `Fail`, progress/checkpoint payloads → `KeepWaiting` (which is what keeps a progress message
   from consuming the registration the terminal response still needs). See
@@ -285,8 +306,7 @@ owns the full story — this page is the map, not the territory.
 
 - **Symptom:** the host fails to start with an `InvalidOperationException` starting
   `The Cosmos DB durable-flow store cannot run on this account configuration:` and naming
-  `its reads run at … consistency` and/or `the account accepts writes in N regions`. After an
-  upgrade, a store that used to start (with, at most, a warning) no longer does. In a process
+  `its reads run at … consistency` and/or `the account accepts writes in N regions`. In a process
   that does not run the hosted services the same exception comes from the store's operations
   instead — `GetStateAsync`, `ResumeAsync`, every worker job — while `StartAsync` still returns
   a flow id (it publishes first and tolerates store faults afterwards): look for its
@@ -304,7 +324,8 @@ owns the full story — this page is the map, not the territory.
 
 ### Flow state exceeds the store's size limit
 
-- **Symptom:** a checkpoint fails with an error naming the flow, its state size, and the limit.
+- **Symptom:** a checkpoint fails with `FlowStateTooLargeException` naming the flow, its state size,
+  and the limit.
 - **Cause:** step results and values-bag entries are persisted in the flow ledger; large payloads
   grow the state past the store's `MaxStateBytes` cap.
 - **Fix:** keep large payloads in your own storage and pass **references** (ids, URIs) through
@@ -332,4 +353,4 @@ owns the full story — this page is the map, not the territory.
   new public members must be recorded in that package's `PublicAPI.Unshipped.txt`.
 - **Fix:** apply the IDE's "Add to public API" code fix, or run `dotnet format analyzers`. This is
   the API-review gate, not a broken build. See
-  [CONTRIBUTING.md](../CONTRIBUTING.md#adding-public-api).
+  [CONTRIBUTING.md](../CONTRIBUTING.md#public-api-changes).

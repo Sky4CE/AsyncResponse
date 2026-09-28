@@ -31,7 +31,7 @@ recipes; come back here to go deeper.
 |---|---|
 | Look up any option: engine, flow-store, channel, or transport | [configuration.md](configuration.md) |
 | Compare and copy every provider registration | [provider-examples.md](provider-examples.md) |
-| Understand a transport's ACK, redelivery, and dead-letter semantics | [Transport options](configuration.md#transport-options) |
+| Understand a transport's ACK, redelivery, dead-letter, and shutdown-drain semantics | [transport-semantics.md](transport-semantics.md) |
 | Run the Redis pair on Valkey / Dragonfly / Garnet or managed Redis | [Redis-compatible servers](configuration.md#redis-compatible-servers) |
 | Connect traces and metrics (span names, instruments, tags) | [observability.md](observability.md) |
 | Ship a trimmed / Native AOT app | [aot.md](aot.md) |

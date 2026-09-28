@@ -1,90 +1,100 @@
 # Contributing to AsyncResponse
 
-First off, thank you for taking the time to contribute! Contributions of all kinds (bug reports, feature requests, documentation improvements, code changes) are highly welcome.
+Thank you for taking the time to contribute! Bug reports, feature requests, documentation
+improvements, and code changes are all welcome.
 
-The following is a set of guidelines for contributing to AsyncResponse.
-
----
-
-## Code of Conduct
-
-By participating in this project, you agree to abide by our [Code of Conduct](CODE_OF_CONDUCT.md). Please report any unacceptable behavior to `tyunisov@gmail.com`.
+By participating in this project, you agree to abide by our [Code of Conduct](CODE_OF_CONDUCT.md).
+Report unacceptable behavior to `tyunisov@gmail.com`. Report security vulnerabilities privately as
+described in the [security policy](SECURITY.md), not in a public issue.
 
 ---
 
-## How to Contribute
+## Reporting bugs and requesting features
 
-### 1. Reporting Bugs
+Check the [existing issues](https://github.com/Sky4CE/AsyncResponse/issues) first, then open an
+issue with the **Bug Report** or **Feature Request** template.
 
-Before submitting a bug report, please check the [existing issues](https://github.com/Sky4CE/AsyncResponse/issues) to make sure it hasn't been reported yet.
+A useful bug report includes steps to reproduce, expected vs. actual behavior, the AsyncResponse
+version, the channel / transport / durable-flow store in use, the .NET version and OS, and any
+stack traces or logs. A feature request describes the problem, the proposed solution, and the
+alternatives you considered — [docs/roadmap.md](docs/roadmap.md) shows what is already planned or
+deliberately declined.
 
-When creating a bug report, please use our **Bug Report Template** and provide as much context as possible:
-* A clear and descriptive title.
-* Steps to reproduce the behavior.
-* Expected vs. actual behavior.
-* Environment details (.NET version, OS, OS version, transport/channel used).
-* Stack traces, error logs, or code snippets reproducing the issue.
+## Submitting pull requests
 
-### 2. Requesting Features
-
-If you want to suggest a new feature or improvement, please check the [existing issues](https://github.com/Sky4CE/AsyncResponse/issues) first. 
-
-When requesting a feature, please use our **Feature Request Template** and describe:
-* The problem you are trying to solve.
-* The proposed solution.
-* Alternative solutions or workarounds you've considered.
-
-### 3. Submitting Pull Requests (PRs)
-
-We welcome PRs for bug fixes, performance improvements, and new features. To make the process smooth:
-
-1. **Fork the Repository**: Create a fork of `Sky4CE/AsyncResponse`.
-2. **Create a Branch**: Branch off `main` with a descriptive name (e.g., `fix/redis-timeout-issue` or `feature/kafka-transport`).
-3. **Write Code & Tests**: 
-   * Write clean, readable code following standard C#/.NET guidelines.
-   * Preserve all existing comments and docstrings unless they are outdated.
-   * Write unit/integration tests for your changes.
-4. **Format Your Code**: Ensure your files are formatted properly and contain no compiler warnings or lint errors.
-5. **Run the Test Suite**: Ensure all existing and new tests pass locally before committing.
-6. **Open the PR**: Push your branch to GitHub and open a Pull Request against our `main` branch. Use the provided Pull Request template and fill in all the details.
+1. Fork `Sky4CE/AsyncResponse` and branch off `main` with a descriptive name (e.g.
+   `fix/redis-timeout` or `feature/hangfire-transport`).
+2. Make the change with tests — every bug fix carries a regression test that fails without the
+   fix, and every feature is covered by unit or integration tests.
+3. Build with no warnings and run the tests (see below).
+4. Record public API changes and add a `CHANGELOG.md` entry (see below).
+5. Open the PR against `main` and fill in the pull request template.
 
 ---
 
-## Local Development Setup
+## Local development
 
-To set up your local development environment:
+Prerequisites: the .NET SDK pinned in [global.json](global.json) (10.0.100 or a later 10.0
+feature band) plus the .NET 8 runtime, because packages and the unit suite target both
+`net8.0` and `net10.0`. Integration tests also need a running Docker daemon.
 
-1. Clone your fork of the repository:
-   ```bash
-   git clone https://github.com/<your-username>/AsyncResponse.git
-   ```
-2. Open the solution file `AsyncResponse.slnx` using your favorite IDE (JetBrains Rider, Visual Studio, or VS Code).
-3. To run all tests from the command line:
-   ```bash
-   dotnet test
-   ```
-   The integration tests boot real brokers (Redis, RabbitMQ, PostgreSQL, …) through .NET Aspire, so they need a **running Docker daemon** (images are pulled on first run). The unit suite and the in-process integration level run without it. See [docs/operations.md](docs/operations.md#building-and-testing) for the full testing layout.
+```bash
+git clone https://github.com/<your-username>/AsyncResponse.git
+cd AsyncResponse
+dotnet build AsyncResponse.slnx
+```
 
-### Adding public API
+Tests run on **Microsoft.Testing.Platform** (xUnit.net v3). With that runner, pass a project with
+`--project` — a positional project path is not supported:
 
-Every shipped package tracks its public surface with `Microsoft.CodeAnalysis.PublicApiAnalyzers`. If your change adds (or removes) a public type or member, the build fails with `RS0016`/`RS0017` until you record it in that package's `PublicAPI.Unshipped.txt` — most IDEs offer a code fix ("Add to public API"), or run `dotnet format analyzers` to apply it in bulk. This is expected on first PRs; it is the API-review gate, not a broken build.
+```bash
+# Unit suite — no Docker needed:
+dotnet test --project tests/AsyncResponse.Tests/AsyncResponse.Tests.csproj
+
+# Integration tests that boot no containers (in-process sample plus the Native AOT
+# publish gate; ASYNCRESPONSE_SKIP_AOT_GATE=1 skips the gate):
+dotnet test --project tests/AsyncResponse.IntegrationTests/AsyncResponse.IntegrationTests.csproj --filter-trait "batch=none"
+
+# One Docker-backed batch (Aspire starts the containers; images are pulled on first run):
+dotnet test --project tests/AsyncResponse.IntegrationTests/AsyncResponse.IntegrationTests.csproj --filter-trait "batch=data"
+
+# Everything, including every Docker-backed batch:
+dotnet test
+```
+
+[docs/operations.md](docs/operations.md#building-and-testing) describes the full test layout,
+the integration batches, and running against the Native AOT sample.
+
+### Public API changes
+
+Every shipped package tracks its public surface with `Microsoft.CodeAnalysis.PublicApiAnalyzers`.
+A change that adds or removes a public type or member fails the build with `RS0016` / `RS0017`
+until it is recorded in that package's `PublicAPI.Unshipped.txt` — use the IDE code fix ("Add to
+public API") or `dotnet format analyzers`. This is the API-review gate, not a broken build.
+
+### Changelog
+
+[GitHub Releases](https://github.com/Sky4CE/AsyncResponse/releases) carry the published release
+notes. `CHANGELOG.md` tracks work that has landed on `main` but not shipped: add user-visible
+changes under `[Unreleased]`.
 
 ---
 
-## Assembly signing and AOT expectations
+## Conventions
 
-- All assemblies are strong-named with the checked-in `asyncresponse.snk`. The key is
-  intentionally public (strong naming is identity, not a security boundary) — nothing to
-  configure locally. `InternalsVisibleTo` entries carry the matching public key; test doubles
-  over internal seams additionally befriend Moq's `DynamicProxyGenAssembly2`.
-- Every shipped package builds with the trim/Native AOT analyzers enabled
-  (`IsAotCompatible=true`) and CI treats warnings as errors. New serialization goes through the
-  source-generated seam (`AsyncResponseJson` / `AsyncResponseJsonContext`); new reflection needs
-  an explicit annotation story — see [docs/aot.md](docs/aot.md) before adding either.
-
-## Coding Guidelines
-
-* **Code Style**: We follow standard .NET coding conventions (PascalCase for public API, camelCase/prefix-underscore for private fields, etc.).
-* **Aesthetics and Structure**: Keep formatting consistent with existing files.
-* **Testing First**: Never submit code changes without accompanying automated unit or integration tests verifying them.
-* **Documentation**: If your change modifies configuration options, behaviors, or introduces a new transport/channel, make sure to update the relevant documentation in the `docs/` folder.
+- **Style** — standard .NET conventions, enforced by `.editorconfig` in the build
+  (`EnforceCodeStyleInBuild`); CI builds with warnings as errors. Keep formatting consistent with
+  the surrounding code.
+- **Comments** — keep existing comments and XML docs unless your change makes them outdated; then
+  update them.
+- **Strong naming** — all assemblies are signed with the checked-in `asyncresponse.snk`. The key
+  is intentionally public (strong naming is identity, not security), so there is nothing to
+  configure. `InternalsVisibleTo` entries carry the matching public key; test doubles over
+  internal seams also befriend Moq's `DynamicProxyGenAssembly2`.
+- **Trimming and Native AOT** — every shipped package sets `IsAotCompatible=true`. New
+  serialization goes through the source-generated seam (`AsyncResponseJson` /
+  `AsyncResponseJsonContext`), and new reflection needs an explicit annotation story; read
+  [docs/aot.md](docs/aot.md) before adding either.
+- **Documentation** — a change to options, behavior, or providers updates the relevant pages in
+  `docs/` and the README. A new provider package also meets the checklist in
+  [docs/roadmap.md](docs/roadmap.md#2-the-bar-for-a-new-package).

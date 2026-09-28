@@ -4,43 +4,47 @@
 
 AsyncResponse invokes serializable method descriptors (recovery callbacks and worker jobs) that are
 **persisted in your store and resolved through DI by whatever process reads them** — possibly a
-different deployment. That makes the store a trust boundary. The features below are opt-in
-defense-in-depth; defaults preserve existing behavior.
+different deployment. That makes the store a trust boundary. The controls below are defense in
+depth; the callback allowlist and custom type resolution are opt-in.
 
 ## Secure your store and transport first
 
 The single most important control is the obvious one: **a persisted callback/worker descriptor is
 only as trustworthy as the store and transport it travels through.** Recovery state and worker jobs
-name a service interface and method that the receiving process will resolve from its DI container and
-invoke. Anyone who can write to the recovery store or worker stream can therefore ask a consuming
-process to invoke any registered (service, method) pair with attacker-influenced arguments.
-Persisted type names are resolved only against assemblies already loaded into the process — a
-name never makes the process load a file its author supplies — so that reach is bounded to what the
-consuming process has itself loaded. One exception is outside the library's control: the framework
-facades nearly every process has loaded (`netstandard`, `mscorlib`, `System.Runtime`) forward to
-most of the framework, and asking one for a forwarded name makes the runtime load the framework
-assembly that defines it. The resolution that caused the load refuses the result, but the
-assembly stays loaded, so a later resolution of the same name (a redelivery) finds it — the reach
-extends to the framework's own assemblies, never beyond. Such a type still has to pass the
-caller's own gate (the payload marker interface, a DI registration, the flow contract) before
-anything uses it. A persisted name is also bounded in **shape** before it is resolved at all
-(length, generic nesting, total bracket count; by-ref and pointer decorations are refused): the
-runtime's type-name parser recurses per generic argument, and a few hundred kilobytes of
-`A\`1[[A\`1[[…` — comfortably inside the message budget — overflows the parsing thread's stack.
-A `StackOverflowException` cannot be caught, so the process would exit with the message still
-unacknowledged and take every worker it was redelivered to down the same way. The check runs
-before the caches in front of the resolvers, and before any callback is chosen or authorized —
-the recovery path resolves the payload's type name first, so no authorizer could stand in front
-of it. A name outside the limits is simply unresolvable, the same outcome a renamed type has.
+name a service interface and method that the receiving process resolves from its DI container and
+invokes, so anyone who can write to the recovery store or worker stream can ask a consuming process
+to invoke any registered (service, method) pair with attacker-influenced arguments.
+
+What bounds that reach:
+
+- **Loaded assemblies only.** A persisted type name resolves only against assemblies already loaded
+  into the process; a name never makes the process load a file its author supplies. One exception
+  is outside the library's control: the framework facades nearly every process has loaded
+  (`netstandard`, `mscorlib`, `System.Runtime`) forward to most of the framework, and asking one for
+  a forwarded name makes the runtime load the defining framework assembly. The resolution that
+  caused the load refuses the result, but the assembly stays loaded, so a later resolution (a
+  redelivery) finds it — the reach extends to the framework's own assemblies, never beyond. Such a
+  type still has to pass the caller's own gate (the payload marker interface, a DI registration, the
+  flow contract) before anything uses it.
+- **Bounded name shape.** Before any cache, resolver, or callback authorization, a persisted name is
+  held to at most 4,096 characters, 16 levels of `[` nesting and 64 `[` in total, with by-ref (`&`)
+  and pointer (`*`) decorations refused. The runtime's type-name parser recurses per generic
+  argument, so a few hundred kilobytes of `A\`1[[A\`1[[…` would overflow the parsing thread's stack
+  — an uncatchable `StackOverflowException` that would take down every worker the message was
+  redelivered to. The recovery path resolves the payload's type name before any callback is chosen,
+  so no authorizer could stand in front of it. A name outside the limits is simply unresolvable,
+  like a renamed type.
+
+What you must do:
 
 - Authenticate and authorize access to your channel store and transport broker — Redis (or Valkey /
-  Dragonfly / Garnet), NATS, PostgreSQL, SQL Server, Azure Service Bus, AWS SQS, Google Pub/Sub,
-  RabbitMQ, Kafka — and isolate it from untrusted networks. On the managed clouds prefer IAM/managed
+  Dragonfly / Garnet), NATS, PostgreSQL, SQL Server, MongoDB, Azure Service Bus, AWS SQS, Google
+  Pub/Sub, RabbitMQ, Kafka — and isolate it from untrusted networks. On the managed clouds prefer IAM/managed
   identity (SQS IAM roles, Azure Service Bus Azure AD, Pub/Sub service accounts) over static keys.
 - Use a dedicated namespace per app/tenant/environment so they can't read or write each other's
-  recovery state and jobs: a `KeyPrefix` (Redis), subject prefix (NATS), schema/table set (PostgreSQL /
-  SQL Server), distinct queues (Azure Service Bus, SQS, RabbitMQ), or topic/consumer-group names (Kafka,
-  Google Pub/Sub).
+  recovery state and jobs: a `KeyPrefix` (Redis), subject prefix and recovery bucket (NATS),
+  schema/table set (PostgreSQL / SQL Server), database/collection set (MongoDB), distinct queues
+  (Azure Service Bus, SQS, RabbitMQ), or topic/consumer-group names (Kafka, Google Pub/Sub).
 - Enable transport-level TLS and credentials end to end.
 - Mind local conveniences too: the repository's `docker-compose.yml` binds its Redis to
   `127.0.0.1` on purpose — an unqualified `6379:6379` publishes on every host interface, and the
@@ -53,14 +57,13 @@ The callback authorizer below is a second layer on top of this — not a replace
 
 ## Callback authorization (opt-in allowlist)
 
-By default there is **no authorizer**: every registered callback/worker target is invokable, exactly
-as before — zero boilerplate. When you register an authorizer, only the allowed (service, method)
-pairs are invokable by persisted callbacks and worker jobs; everything else is refused. This is
-**type-level** authorization — you allow a service type (and optionally narrow by method name), not
-per-method attributes on your flow classes. A type-level allowance admits only the type's ordinary
-methods: property and event accessors (`get_`/`set_`/`add_`/`remove_`) and `object`'s own members
-are never callback candidates, so a descriptor aimed at `set_ApiKey` on an allowed DI singleton is
-refused rather than executed.
+By default there is **no authorizer**: every DI-registered callback/worker target is invokable. When
+you register one, only the allowed (service, method) pairs are invokable by persisted callbacks and
+worker jobs; everything else is refused rather than executed. Authorization is **type-level** — you
+allow a service type, or supply a predicate over service and method names; it does **not** read
+per-method attributes. A type allowance admits only the type's ordinary methods: property and event
+accessors (`get_`/`set_`/`add_`/`remove_`) and `object`'s own members are never callback candidates,
+so a descriptor aimed at `set_ApiKey` on an allowed DI singleton is refused.
 
 ```csharp
 builder.Services.AddAsyncResponse()
@@ -93,9 +96,11 @@ therefore fails to start when more than one authorizer is registered. Combine th
 (`a => a.Allow<IModuleService>().Allow<IAppService>()`), or merge the rules in one custom
 authorizer.
 
-When an incoming descriptor names a (service, method) pair the authorizer rejects, the invocation is
-refused rather than executed. Use this as defense-in-depth: even if a malicious or corrupted entry
-reaches the store, only an explicitly allowlisted surface can be driven.
+Even if a malicious or corrupted entry reaches the store, only the allowlisted surface can be
+driven. A refused worker job is counted as `rejected` on `asyncresponse.worker.jobs` and thrown, so
+the transport redelivers it (a replica configured to allow the target can run it) and then
+dead-letters it; a refused recovery callback is a deterministic fault, logged and acknowledged with
+its registration kept for the watchdog (see [recovery.md](recovery.md#when-the-failure-callback-cannot-be-invoked)).
 
 ### The durable-flow executor and the allowlist
 
@@ -119,24 +124,20 @@ invocation. If you do not use durable flows, or want to gate the executor yourse
 
 A **custom** `IAsyncResponseCallbackAuthorizer` gets no implicit entries: when durable flows are
 enabled it must allow `IDurableFlowExecutor` itself, or flow recovery callbacks will be refused.
-Register it as a singleton, as `AuthorizeCallbacks` does. The startup check resolves the
-authorizer in a scope of its own, so a scoped registration no longer fails there — but with a
-broker transport the ingress, a singleton, still takes the authorizer directly, so a scoped
-authorizer still fails scope validation (`ValidateScopes`/`ValidateOnBuild`) there.
-
-> Default = no authorizer = allow all = unchanged behavior. The authorizer is type-level; it does
-> **not** read per-method attributes.
+Register it as a singleton, as `AuthorizeCallbacks` does: with a broker transport the ingress (a
+singleton) takes the authorizer directly, so a scoped authorizer fails scope validation
+(`ValidateScopes`/`ValidateOnBuild`).
 
 ## Remote stack-trace policy
 
 When a remote side fails technically (`SetException`), the exception's stack trace can travel on the
-wire and is surfaced on the receiving side via `Exception.Data["RemoteStackTrace"]`. Two channel
-options (on the durable channels — Redis, NATS, PostgreSQL, SQL Server, MongoDB) bound this:
+wire and is surfaced on the receiving side via `Exception.Data["RemoteStackTrace"]`. Two options on
+every bundled channel — in-memory, Redis, NATS, PostgreSQL, SQL Server, MongoDB — bound this:
 
 | Option | Default | Effect |
 |---|---|---|
 | `IncludeRemoteStackTrace` | `true` | When `false`, the remote stack trace is omitted from the wire entirely. |
-| `MaxRemoteStackTraceLength` | `16384` | Length cap (chars) applied to the stack trace on **both** publish and receive, so an oversized or hostile trace can't bloat your payloads or logs. `0` disables the cap; a negative value is rejected at startup by every channel, the in-memory one included. |
+| `MaxRemoteStackTraceLength` | `16384` | Length cap (chars) applied on **both** publish and receive, so an oversized or hostile trace can't bloat your payloads or logs. `0` disables the cap; a negative value is rejected at startup. |
 
 ```csharp
 .WithRedisChannel(options =>
@@ -147,88 +148,78 @@ options (on the durable channels — Redis, NATS, PostgreSQL, SQL Server, MongoD
 })
 ```
 
-Related: the domain payload JSON is **no longer embedded in
-`AsyncResponseDomainFailureException.Message`** — it stays on the `PayloadJson` property — so a
-payload (which may contain PII) does not leak into generic exception logs that print `ex.Message`.
-Log `PayloadJson` deliberately, where you intend to.
+Related: a domain failure's payload JSON is carried on
+`AsyncResponseDomainFailureException.PayloadJson`, **not** in its `Message`, so a payload (which may
+contain PII) does not leak into generic exception logs that print `ex.Message`. Log `PayloadJson`
+deliberately, where you intend to.
 
 ### The library never logs a message body
 
-At every log level, including `Debug`. This matters most at the ingress, where every inbound
-response and every worker job passes through: a worker envelope carries the job's arguments and
-whatever the context propagators captured (tenant, auth, trace baggage), so logging it whole would
-put all of that in the application log the moment someone turned Debug on to diagnose something
-else. What is logged instead is a size, plus routing metadata that is safe by construction: the
-correlation id, the reply target, and the target service and method.
+At any log level, `Debug` included. This matters most at the ingress, which every inbound response
+and worker job passes through: a worker envelope carries the job's arguments and whatever the
+context propagators captured (tenant, auth, trace baggage). What is logged instead is a size plus
+routing metadata that is safe by construction — the correlation id, the reply target, and the target
+service and method.
 
-**Nor the JSON reader's own message.** A `System.Text.Json` parse failure looks like bounded
-metadata and is not: it appends `Path: $.<name>` built from the *inbound* property names —
-dictionary keys read straight off the wire, such as a worker envelope's propagated `Context` — and
-for a malformed literal it quotes several raw body characters. Both the message and the chained
-inner exception the ingress logs (and, on the response path, republishes to the waiter through
-`SetException`) are rebuilt from position only: line, byte position, and size. The reader's own
-message and path are dropped, not chained.
+**Nor a hash of one.** A content digest is deterministic: equal digests prove two payloads identical
+across messages, hosts and days, and a payload drawn from a small set (a status enum, an account id,
+a yes/no result) can be confirmed by hashing the candidates. The correlation id and trace id already
+tie a log entry to its conversation.
 
-`NotSupportedException` from the reader is scrubbed too: missing polymorphic discriminators
-also cause the serializer to append inbound dictionary keys to that exception. Its original
-message and inner exception are discarded; size and a safe failure category remain. Metadata
-resolution errors keep their configuration guidance — both those raised before reading the body
-and the library's own register-your-type guidance raised while the reader resolves the payload
-type mid-read (how the Redis, NATS, and database channels read a response envelope), which names
-the type and never a byte of the body.
+**Nor the JSON reader's own message.** A `System.Text.Json` failure is not bounded metadata: it
+appends `Path: $.<name>` built from *inbound* property names — dictionary keys read straight off the
+wire, such as a worker envelope's propagated `Context` — and for a malformed literal it quotes raw
+body characters. The library rebuilds such failures from position only (line, byte position, size)
+and drops the reader's message and path rather than chaining them. `NotSupportedException` from the
+reader (e.g. a missing polymorphic discriminator, which also appends inbound keys) is scrubbed the
+same way, keeping only size and a safe failure category. Metadata-resolution errors keep their
+configuration guidance, including the library's own register-your-type message raised mid-read,
+which names the type and never a byte of the body.
 
-The same scrubbing covers the **second** reader pass —
-converting an already-parsed worker-job argument or recovery payload into the callback's
-parameter type, which walks the payload's own property names and dictionary keys — because the
-exception that escapes it is logged by the worker ingress too. The same contract covers every
-reader that materializes a body the library did not write itself: the Redis, NATS, and database
-(PostgreSQL, SQL Server, MongoDB) channels' response readers, whose parse failure is both logged
-and handed to the waiter (as `InvalidDataException`), the durable-flow ledger reader, whether
-it reads a stored ledger or the initial state a start job carries — the
-`FlowStateUnreadableException` it raises chains the rebuilt, position-only failure, never the
-reader's own — and the recovery-state readers (Redis, NATS, PostgreSQL, SQL Server, MongoDB),
-on the delivery path and the watchdog scan alike: a stored registration's `Context` carries the
-same propagated tenant and auth keys a worker envelope does, and the reader's `Path` names them.
-The in-memory channel's typed delivery is covered too: every waiter re-materializes the published
-payload from its wire bytes, and a payload that does not fit the waiter's type (a string-valued
-dictionary published to an int-valued waiter) fails *inside* the payload, where the reader's own
-message would name the offending dictionary key — into the waiter's exception and, through the
-wait activity's error status, into telemetry. It faults the waiter with the same body-free
-`InvalidDataException` the broker channels use.
+This applies to every reader that materializes a body the library did not write itself:
 
-**But not our own diagnostics.** The distinction is who wrote the message. `System.Text.Json`'s
-messages quote the body, so they are dropped; the envelope reader's own contract violations —
-`SchemaVersion is required.`, `Success is required.`, `Payload is null or absent on a Success
-envelope`, `Success must be a boolean.` — name only the wire contract's own property names and are preserved verbatim. They
-are the primary operator diagnosis for the commonest malformed-envelope cause in production, a
-foreign or mismatched producer writing to the response channel, and scrubbing them to "failed at
-line 0, byte position 2" would cost the diagnosis while protecting nothing. Such a failure stays
-a plain `JsonException` (the ingress classifies it as permanent, so it is never retried).
+- the ingress, for both the log line and the exception it republishes to the waiter through
+  `SetException`;
+- the **second** pass that converts an already-parsed worker-job argument or recovery payload into
+  the callback's parameter type (it walks the payload's own property names and keys);
+- the Redis, NATS, and database channels' response readers, whose parse failure is logged and handed
+  to the waiter as `InvalidDataException`;
+- the in-memory channel's typed delivery: each waiter re-materializes the published payload from its
+  wire bytes, and a payload that does not fit the waiter's type faults it with the same body-free
+  `InvalidDataException`, so the offending key never reaches the waiter's exception or the wait
+  span's error status;
+- the durable-flow ledger reader, for a stored ledger and for the initial state a start job carries
+  (`FlowStateUnreadableException` chains the position-only failure);
+- the recovery-state readers (Redis, NATS, PostgreSQL, SQL Server, MongoDB), on delivery and during
+  the watchdog scan — a registration's `Context` carries the same tenant and auth keys.
 
-**Nor a hash of one.** A content digest reads like harmless metadata and is not: it is
-deterministic, so two log entries showing the same prefix prove the two payloads were identical —
-across messages, hosts, and days — and a payload drawn from a small set (a status enum, an account
-id, a yes/no result) can be confirmed outright by hashing the candidates until one matches. The
-correlation id and the trace id already tie an entry to its conversation, which is what the digest
-was there for.
+**But not our own diagnostics.** `System.Text.Json`'s messages can quote the body, so they are
+dropped; the envelope reader's own contract violations — `SchemaVersion is required.`,
+`Success is required.`, `Payload is null or absent on a Success envelope…`,
+`Success must be a boolean.` — name only wire-contract property names and are kept verbatim. They
+diagnose the commonest malformed-envelope cause, a foreign or mismatched producer writing to the
+response channel. Such a failure stays a plain `JsonException`, which the ingress treats as permanent
+(never retried).
 
 ### The sample's test-only routes are gated
 
-The sample application (the integration suite's system under test) exposes unauthenticated routes
-that exist for tests and demos, in two groups: the **mutation** routes — `/seed-recovery`,
-`DELETE /test/recovery/{correlationId}`, and `POST /test/reset`, which erases every recovery
-registration the scanner can see — and the **simulation, injection, and observability** routes —
-`/arm`, `/crash` (drops every local subscription on the shared channel; with Redis it calls
-`UnsubscribeAll` on the shared multiplexer), `/publish` and `/emit-response` (inject a response or
-exception for any correlation id), `/lost-subscriber-flow` (composes all three), `/calls` (recorded
-call data), and `GET /durable-flow/{flowId}` / `POST /durable-flow/{flowId}/resume` (a run's full
-ledger, input JSON included, and an operator kick). All of them are mapped only in the Development
-environment or when `Sample:EnableTestEndpoints=true` is configured (the integration AppHost, the
-in-process test factory, the load-test launcher, and the Native AOT gate set it); a Production
-instance answers 404 for every one and logs that they are disabled, and an integration test pins
-the exact Production route inventory. If you fork the sample into a service, keep them behind that
-switch — and put flow reads/resumes behind real authorization and ownership checks — rather than on
-a shared backend.
+The sample application (the integration suite's system under test) exposes unauthenticated
+test/demo routes:
+
+- **mutation** — `/seed-recovery`, `DELETE /test/recovery/{correlationId}`, and `POST /test/reset`
+  (erases every recovery registration the scanner can see);
+- **simulation and injection** — `/arm`, `/crash` (drops every local subscription on the shared
+  channel; with Redis, `UnsubscribeAll` on the shared multiplexer), `/publish` and `/emit-response`
+  (inject a response or exception for any correlation id), `/lost-subscriber-flow` (all three);
+- **observability** — `/calls` (recorded call data), `GET /durable-flow/{flowId}` (a run's full
+  ledger, input JSON included) and `POST /durable-flow/{flowId}/resume` (an operator kick).
+
+They are mapped only in the Development environment or when `Sample:EnableTestEndpoints=true` (set
+by the integration AppHost, the in-process test factory, the load-test launcher, and the Native AOT
+gate). A Production instance answers 404 for every one and logs that they are disabled; an
+integration test pins the exact Production route inventory. If you fork the sample into a service,
+keep them behind that switch — and put flow reads/resumes behind real authorization and ownership
+checks.
 
 ## Explicit correlation id
 
@@ -247,22 +238,32 @@ await asyncResponse
 await publisher.SetResponse(result, correlationId);
 ```
 
-A blank/whitespace correlation id (e.g. from a malformed broker header) is a no-op: the publish is
-logged and skipped rather than throwing, so bad input cannot crash ingress.
+Correlation ids follow one **portable contract** on every channel: at most 400 UTF-16 code units
+(`AsyncResponseChannelOptions.MaxCorrelationIdLength`), no leading or trailing space, well-formed
+UTF-16, and no control characters. An id outside it would be truncated or rejected at its first
+database write, or — space-padded — match its trimmed form in SQL Server and surface at another
+waiter. How each case is handled:
+
+| Id | Wait (`For<T>(id)`) | `SetResponse`/`SetException` | Broker ingress |
+|---|---|---|---|
+| blank / whitespace | throws `ArgumentNullException` | no-op: logged and skipped | acknowledged without routing |
+| non-blank, outside the contract | throws `ArgumentException` | throws `ArgumentException` | acknowledged without routing |
+
+The ingress acknowledges rather than throws because such a message can never route, so redelivery
+would loop; each drop is logged at error level and counted on
+`asyncresponse.ingress.unroutable_responses`.
 
 ## Type resolution for plugins / AssemblyLoadContext
 
 Recovery callbacks and worker payloads are persisted as **type name strings** and resolved on the
-receiving side — by default against the assemblies **already loaded** into the process only, every
-component of the name included: a generic argument naming an assembly the process has not loaded
-resolves the whole name to unresolved rather than forcing that assembly to load (a registered
-assembly or resolver, below, is not held to this). "Loaded" spans every
-`AssemblyLoadContext`: a plugin's types resolve once its context has loaded them, and a name
-defined in several loaded assemblies (the same plugin in two contexts) resolves to the first one
-loaded. If your callback/payload types may not be loaded yet when a persisted name arrives
-(plugins, add-ins, dynamically loaded modules), register them explicitly (opt-in) — registered
-resolvers are consulted only when the default scan finds nothing, so they cannot pick between
-copies the scan already sees:
+receiving side — by default against the assemblies **already loaded** into the process, every
+component of the name included: a generic argument naming an unloaded assembly makes the whole name
+unresolved rather than loading it. "Loaded" spans every `AssemblyLoadContext`: a plugin's types
+resolve once its context has loaded them, and a name defined in several loaded assemblies (the same
+plugin in two contexts) resolves to the first one loaded. If your callback/payload types may not be
+loaded yet when a persisted name arrives (plugins, add-ins, dynamically loaded modules), register
+them explicitly. Registered resolvers are consulted only when the default scan finds nothing, so
+they cannot pick between copies the scan already sees:
 
 ```csharp
 using AsyncResponse;
@@ -276,16 +277,15 @@ IDisposable resolverRegistration = AsyncResponseTypeResolution.RegisterResolver(
     PluginCatalog.TryFind(name, out var t) ? t : null);
 ```
 
-**A registered assembly may load what the name asks for.** `RegisterAssembly` resolves a name with
-the runtime's own type-name parser (`Assembly.GetType`), which is not confined to loaded
-assemblies: when a generic argument names an assembly that is not loaded yet, the registered
-assembly's `AssemblyLoadContext` loads it — from the plugin's dependencies or the application's
-trusted platform assemblies — on the way to a verdict, and that name is written by whoever can
-write the recovery store or the worker stream. Only files the application or plugin deploys can
-load this way (never one the name's author supplies), and the resolved type must still pass the
-payload marker gate, the DI registration, and the callback authorizer before anything uses it. If
-even the load is unacceptable, register a `RegisterResolver` delegate that answers only the names
-you expect (as `PluginCatalog` above) instead of the whole assembly.
+**A registered assembly may load what the name asks for.** `RegisterAssembly` resolves with the
+runtime's own parser (`Assembly.GetType`), which is not confined to loaded assemblies: a generic
+argument naming an unloaded assembly makes the registered assembly's `AssemblyLoadContext` load it
+(from the plugin's dependencies or the application's trusted platform assemblies) — and that name is
+written by whoever can write the recovery store or worker stream. Only files the application or
+plugin deploys can load this way, never one the name's author supplies, and the resolved type must
+still pass the payload marker gate, the DI registration, and the callback authorizer. If even the
+load is unacceptable, register a `RegisterResolver` delegate that answers only the names you expect
+(as `PluginCatalog` above).
 
 **Keep the returned handle and dispose it when the plugin goes away.** A registration lives in a
 process-wide list, and `RegisterAssembly` holds the assembly strongly — so an undisposed
@@ -303,14 +303,13 @@ using (AsyncResponseTypeResolution.RegisterAssembly(pluginAssembly))
 context.Unload();
 ```
 
-Type names that still can't be resolved are surfaced via the
-`asyncresponse.type_resolution.unresolved` metric (tag `kind = service|payload`) — see
-[observability.md](observability.md) — so an unresolved plugin type shows up as an observable signal
-rather than a silent drop. A registered resolver that **throws** is skipped and counted under
-`kind = resolver`, once per throw — even when a later resolver then answers the name. Unresolvable names are negatively cached (bounded), and the cache is
-invalidated automatically when a new assembly loads or a resolver registers — a plugin that
-registers late is picked up immediately, while a poisoned/renamed type name stops costing a full
-assembly scan per redelivery.
+Names that still can't be resolved are counted on `asyncresponse.type_resolution.unresolved`
+(`kind` = `service`|`payload`; see [observability.md](observability.md#instruments)), so an
+unresolved plugin type is an observable signal rather than a silent drop. A registered resolver that
+**throws** is skipped and counted under `kind = resolver`, once per throw, even when a later resolver
+answers. Unresolvable names are negatively cached (bounded); the cache is invalidated when an
+assembly loads or a resolver registers, so a late plugin is picked up immediately while a poisoned or
+renamed name stops costing a full assembly scan per redelivery.
 
 ### Unloadable (collectible) plugin contexts
 
