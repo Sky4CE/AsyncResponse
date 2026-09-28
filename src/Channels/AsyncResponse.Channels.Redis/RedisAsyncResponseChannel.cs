@@ -898,7 +898,7 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
 
                 await _timeoutRegistration.DisposeAsync().ConfigureAwait(false);
                 _cancellationTokenSource.Dispose();
-                _activity?.Dispose();
+                AsyncResponseDiagnostics.StopActivity(_activity);
             }
         }
 

@@ -1094,11 +1094,13 @@ public class NatsAsyncResponseChannelTests
     }
 
     [Fact]
-    public async Task WaiterTimeout_WhenTimeoutHandlingThrows_LogsInsteadOfLeavingAnUnobservedFault()
+    public async Task WaiterTimeout_WithALoggerThatThrowsOnTheTimeoutWarning_StillTimesTheWaiterOut()
     {
-        // The timeout body runs on a fire-and-forget Task.Run; an exception escaping it (here a
-        // logger provider that throws on the timeout warning) must be caught and logged through
-        // the error path, not die as an unobserved task fault.
+        // The timeout body runs on a fire-and-forget Task.Run. Its warning used to be unguarded: a
+        // logger provider throwing there skipped the drain that settles the waiter, and the fault
+        // was only logged as "Error handling waiter timeout" — the one backstop that ends a wait
+        // was gone, and the waiter stayed pending forever. Logging cannot change an outcome.
+        var time = new VirtualTimeProvider();
         var logger = new RecordingThrowingLogger<NatsAsyncResponseChannel> { ThrowOnMessageContaining = "Timed out waiting" };
         var channel = new NatsAsyncResponseChannel(
             _services.GetRequiredService<IServiceScopeFactory>(),
@@ -1111,13 +1113,16 @@ public class NatsAsyncResponseChannelTests
                 DisposalDrainTimeout = TimeSpan.FromSeconds(30)
             }),
             new AsyncResponseContextPropagation([]),
-            logger);
+            logger,
+            time);
 
         await using var waiter = await channel.CreateResponseWaiter<OperationResult>(
             "corr-timeout-throws",
-            timeout: TimeSpan.FromMilliseconds(5));
+            timeout: TimeSpan.FromSeconds(30));
+        time.Advance(TimeSpan.FromSeconds(31));
 
-        await Eventually(() => logger.HasEntry(LogLevel.Error, "Error handling waiter timeout"));
+        await Assert.ThrowsAsync<TimeoutException>(() => waiter.ResponseTask.WaitAsync(TimeSpan.FromSeconds(10)));
+        Assert.False(logger.HasEntry(LogLevel.Error, "Error handling waiter timeout"));
     }
 
     [Fact]

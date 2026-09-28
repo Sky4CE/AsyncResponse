@@ -2887,7 +2887,7 @@ internal abstract class DbAsyncResponseChannelBase :
                 if (TimeoutRegistration is not null)
                     await TimeoutRegistration().ConfigureAwait(false);
                 TimeoutCancellation?.Dispose();
-                _activity?.Dispose();
+                AsyncResponseDiagnostics.StopActivity(_activity);
             }
         }
 

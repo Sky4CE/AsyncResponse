@@ -52,7 +52,7 @@ namespace AsyncResponse.Tests;
 /// assemblies for nothing in return.
 /// </para>
 /// </summary>
-public sealed class DbChannelSharedCoverageTests
+public sealed partial class DbChannelSharedCoverageTests
 {
     /// <summary>
     /// Both background loops swallow-and-retry a store failure rather than dying, and the teardown
@@ -2981,7 +2981,7 @@ public sealed class DbChannelSharedCoverageTests
         /// <summary>Mongo harness only: the messages-collection mock, for arranging what the store's upsert and claim return.</summary>
         public Mock<IMongoCollection<MongoChannelMessageDocument>>? MongoMessages { get; private set; }
 
-        public static Harness Create(Provider provider, bool failing, TimeSpan pollInterval, TimeSpan? fullSweepInterval = null, bool useChangeStreams = false, int? pendingMessageBatchSize = null, TimeProvider? timeProvider = null, string? postgreSqlConnectionString = null)
+        public static Harness Create(Provider provider, bool failing, TimeSpan pollInterval, TimeSpan? fullSweepInterval = null, bool useChangeStreams = false, int? pendingMessageBatchSize = null, TimeProvider? timeProvider = null, string? postgreSqlConnectionString = null, string? sqlServerConnectionString = null)
         {
             var logger = new CollectingLogger();
             var recoveryState = new Mock<IRecoveryStateStore>();
@@ -3005,8 +3005,9 @@ public sealed class DbChannelSharedCoverageTests
                     var options = Options.Create(new SqlServerAsyncResponseChannelOptions
                     {
                         // Port 1 is closed, so every command faults fast without a container.
-                        ConnectionString = "Server=localhost,1;Database=unused;User Id=sa;Password=unused;Encrypt=False;Connect Timeout=1",
+                        ConnectionString = sqlServerConnectionString ?? "Server=localhost,1;Database=unused;User Id=sa;Password=unused;Encrypt=False;Connect Timeout=1",
                         AutoCreateSchema = false,
+                        PendingMessageBatchSize = pendingMessageBatchSize ?? 64,
                         ActivePollInterval = pollInterval,
                         IdlePollInterval = pollInterval,
                         FullSweepInterval = fullSweepInterval,
@@ -3041,6 +3042,7 @@ public sealed class DbChannelSharedCoverageTests
                         AutoCreateSchema = false,
                         ListenerPollInterval = pollInterval,
                         FullSweepInterval = fullSweepInterval,
+                        PendingMessageBatchSize = pendingMessageBatchSize ?? 64,
                         SubscriberHeartbeatInterval = heartbeat,
                         SubscriberHeartbeatTimeout = TimeSpan.FromSeconds(5),
                         DeliveryConfirmationTimeout = TimeSpan.FromMilliseconds(2),
@@ -3249,6 +3251,9 @@ public sealed class DbChannelSharedCoverageTests
 
         /// <summary>Overwrites one of the shared base's fields (a background loop's task, say).</summary>
         public void SetChannelField(string name, object? value) => Field(name).SetValue(Channel, value);
+
+        /// <summary>Reads one of the channel's fields (a background loop's task, say).</summary>
+        public object? ChannelField(string name) => Field(name).GetValue(Channel);
 
         /// <summary>
         /// Holds the correlation id's late-commit lookback window open for the next hour, as if

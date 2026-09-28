@@ -1126,7 +1126,7 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
                 _owner.RemoveSubscription(CorrelationId, Id);
                 if (Volatile.Read(ref _timeoutTimer) is { } timer)
                     await timer.DisposeAsync().ConfigureAwait(false);
-                _activity?.Dispose();
+                AsyncResponseDiagnostics.StopActivity(_activity);
             }
         }
 
@@ -1158,7 +1158,7 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
                 await timer.DisposeAsync().ConfigureAwait(false);
 
             TrySetCanceled();
-            _activity?.Dispose();
+            AsyncResponseDiagnostics.StopActivity(_activity);
         }
 
         /// <summary>Stores the timeout exception on the concrete waiter task.</summary>

@@ -1159,6 +1159,32 @@ internal sealed class QueuedRabbitMqMessageDispatcher : RabbitMqMessageDispatche
         CancellationToken cancellationToken = default,
         string? reasonCode = null)
     {
+        // Best-effort, like Kafka's TryDeadLetterAfterCommitAsync: the delivery is ACKed either
+        // way. Building the copy reads user code — the handler exception's Message — outside the
+        // publish's own catch; unguarded, a throw there ended the worker loop, and every
+        // already-ACKed delivery queued behind it was never run, copied or reported.
+        try
+        {
+            return await TryDeadLetterAlreadyAckedCoreAsync(delivery, exception, handlerFailure, cancellationToken, reasonCode).ConfigureAwait(false);
+        }
+        catch (Exception deadLetterException)
+        {
+            SafeLog.Try(() => Logger.LogError(
+                deadLetterException,
+                "Failed to dead-letter already-ACKed RabbitMQ delivery {DeliveryTag} on {Queue}; the failure is only observable via logs and OnBackgroundFailure.",
+                delivery.DeliveryTag,
+                _queueName));
+            return false;
+        }
+    }
+
+    private async Task<bool> TryDeadLetterAlreadyAckedCoreAsync(
+        RabbitMqDelivery delivery,
+        Exception exception,
+        bool handlerFailure,
+        CancellationToken cancellationToken,
+        string? reasonCode)
+    {
         if (string.IsNullOrWhiteSpace(TransportOptions.DeadLetterExchange))
             return false;
 

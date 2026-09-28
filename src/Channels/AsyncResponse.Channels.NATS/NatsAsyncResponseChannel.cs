@@ -546,7 +546,7 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
 
                 cancellationTokenSource.Dispose();
                 subscriptionLifetime.Dispose();
-                activity?.Dispose();
+                AsyncResponseDiagnostics.StopActivity(activity);
             }
         }
 
@@ -560,7 +560,8 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
                 if (string.IsNullOrEmpty(payload))
                 {
                     // A non-probe message with no body cannot be a response; ignore it rather than fault.
-                    _logger.LogWarning("Received empty response message for correlationId {CorrelationId}; ignoring.", correlationId);
+                    SafeLog.Try((Logger: _logger, CorrelationId: correlationId), static state => state.Logger.LogWarning(
+                        "Received empty response message for correlationId {CorrelationId}; ignoring.", state.CorrelationId));
                     return;
                 }
 
@@ -571,12 +572,13 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
 
                 if (envelope == null)
                 {
-                    _logger.LogError("Failed to deserialize envelope for correlationId {CorrelationId}.", correlationId);
+                    SafeLog.Try((Logger: _logger, CorrelationId: correlationId), static state => state.Logger.LogError(
+                        "Failed to deserialize envelope for correlationId {CorrelationId}.", state.CorrelationId));
                     finished = true;
                     var deserializationError = new JsonException($"Failed to deserialize envelope for correlationId {correlationId}.");
                     AsyncResponseDiagnostics.SetError(activity, "deserialize_failure", deserializationError.Message);
                     if (!tcs.TrySetException(deserializationError))
-                        _logger.LogWarning(deserializationError, "TaskCompletionSource already completed for correlationId {CorrelationId}.", correlationId);
+                        SafeLog.Try(() => _logger.LogWarning(deserializationError, "TaskCompletionSource already completed for correlationId {CorrelationId}.", correlationId));
                 }
                 else if (!AsyncResponseEnvelopeSchema.IsReadable(envelope.SchemaVersion))
                 {
@@ -586,7 +588,7 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
                         $"which this build does not support (current: {AsyncResponseEnvelopeSchema.Current}).");
                     AsyncResponseDiagnostics.SetError(activity, "schema_mismatch", schemaError.Message);
                     if (!tcs.TrySetException(schemaError))
-                        _logger.LogWarning(schemaError, "TaskCompletionSource already completed for correlationId {CorrelationId}.", correlationId);
+                        SafeLog.Try(() => _logger.LogWarning(schemaError, "TaskCompletionSource already completed for correlationId {CorrelationId}.", correlationId));
                 }
                 else if (!envelope.Success)
                 {
@@ -601,29 +603,33 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
                     // status only as a capped, escaped excerpt: like the stack trace above, it is
                     // text a remote we do not control chose — up to the whole inbound budget, with
                     // line breaks that forge log entries. The waiter's exception still carries it.
-                    _logger.LogWarning("Received error response for correlationId {CorrelationId}.", correlationId);
+                    SafeLog.Try((Logger: _logger, CorrelationId: correlationId), static state => state.Logger.LogWarning(
+                        "Received error response for correlationId {CorrelationId}.", state.CorrelationId));
                     AsyncResponseDiagnostics.SetError(activity, "remote_failure", DiagnosticText.EscapedExcerpt(remoteFailure.Message, MaxRemoteFailureStatusLength));
                     // Nor is it attached here: a duplicate or late error envelope would put the same
                     // remote-chosen text into the log after all (Redis parity).
                     if (!tcs.TrySetException(remoteFailure))
-                        _logger.LogWarning("TaskCompletionSource already completed for correlationId {CorrelationId}; the error response was dropped.", correlationId);
+                        SafeLog.Try(() => _logger.LogWarning("TaskCompletionSource already completed for correlationId {CorrelationId}; the error response was dropped.", correlationId));
                 }
                 else
                 {
-                    if (_logger.IsEnabled(LogLevel.Debug))
-                        _logger.LogDebug("Received response for correlationId {CorrelationId}.", correlationId);
+                    SafeLog.Try((Logger: _logger, CorrelationId: correlationId), static state =>
+                    {
+                        if (state.Logger.IsEnabled(LogLevel.Debug))
+                            state.Logger.LogDebug("Received response for correlationId {CorrelationId}.", state.CorrelationId);
+                    });
                     finished = await completionPredicate(envelope.Payload!).ConfigureAwait(false);
                     if (finished && !tcs.TrySetResult(envelope.Payload!))
-                        _logger.LogWarning("TaskCompletionSource already completed for correlationId {CorrelationId}.", correlationId);
+                        SafeLog.Try(() => _logger.LogWarning("TaskCompletionSource already completed for correlationId {CorrelationId}.", correlationId));
                 }
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "Error processing message on subject {Subject} for correlationId {CorrelationId}.", subject, correlationId);
+                SafeLog.Try(() => _logger.LogError(ex, "Error processing message on subject {Subject} for correlationId {CorrelationId}.", subject, correlationId));
                 finished = true;
                 AsyncResponseDiagnostics.SetError(activity, ex);
                 if (!tcs.TrySetException(ex))
-                    _logger.LogWarning(ex, "TaskCompletionSource already completed for correlationId {CorrelationId}.", correlationId);
+                    SafeLog.Try(() => _logger.LogWarning(ex, "TaskCompletionSource already completed for correlationId {CorrelationId}.", correlationId));
             }
             finally
             {
@@ -679,7 +685,10 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "Response subscription loop failed for subject {Subject}.", subject);
+                // Every log line on this path goes through SafeLog: a throwing logging provider here
+                // ended the loop before it failed the waiter, so a dead subscription surfaced only
+                // at the timeout, as indeterminate.
+                SafeLog.Try(() => _logger.LogError(ex, "Response subscription loop failed for subject {Subject}.", subject));
                 AsyncResponseDiagnostics.SetError(activity, ex);
                 // The settlement itself carries its source: a loop death is a TRANSPORT failure,
                 // not a delivered response, and the registration path must tell the two kinds of
@@ -690,7 +699,7 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
                 // loses to a terminal payload changes nothing. The wrapper never escapes: the
                 // public ResponseTask unwraps it back to the original exception.
                 if (!tcs.TrySetException(new NatsConsumeLoopException(ex)))
-                    _logger.LogWarning(ex, "TaskCompletionSource already completed for correlationId {CorrelationId}.", correlationId);
+                    SafeLog.Try(() => _logger.LogWarning(ex, "TaskCompletionSource already completed for correlationId {CorrelationId}.", correlationId));
                 await CleanupOnceAsync().ConfigureAwait(false);
             }
         }
@@ -741,7 +750,9 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
             {
                 try
                 {
-                    _logger.LogWarning("Timed out waiting for response for correlationId {CorrelationId}.", correlationId);
+                    // Guarded (Redis parity): a throwing logging provider here skipped the drain
+                    // below, and a waiter whose timeout never settles it waits forever.
+                    SafeLog.Try(() => _logger.LogWarning("Timed out waiting for response for correlationId {CorrelationId}.", correlationId));
                     AsyncResponseDiagnostics.SetError(activity, "timeout", $"Timed out waiting for response for correlationId {correlationId}.");
                     AsyncResponseDiagnostics.RecordWaiterTimeout("nats");
                     await DrainThenCleanupAsync(
@@ -751,7 +762,7 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
                 catch (Exception ex)
                 {
                     // Fire-and-forget: nothing awaits this task, so an escaped fault would vanish.
-                    _logger.LogError(ex, "Error handling waiter timeout for correlationId {CorrelationId}.", correlationId);
+                    SafeLog.Try(() => _logger.LogError(ex, "Error handling waiter timeout for correlationId {CorrelationId}.", correlationId));
                 }
             });
         });

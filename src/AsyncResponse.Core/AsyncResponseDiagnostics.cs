@@ -287,6 +287,30 @@ public static class AsyncResponseDiagnostics
     }
 
     /// <summary>
+    /// Ends a span that outlives the call that started it (a waiter's <c>asyncresponse.wait</c>,
+    /// ended in its one-shot cleanup). An ActivityListener's stopped callback runs inside the stop;
+    /// one that throws costs the span's export, not the cleanup that ends it — a fault there was
+    /// cached by the cleanup and rethrown by every later dispose of the waiter.
+    /// </summary>
+    internal static void StopActivity(Activity? activity)
+    {
+        if (activity is null)
+            return;
+
+        try
+        {
+            activity.Dispose();
+        }
+        catch
+        {
+            // The stopped callback runs before the stop restores the parent span; left as it is,
+            // the ended span would stay the ambient parent of whatever this flow starts next.
+            if (ReferenceEquals(Activity.Current, activity))
+                Activity.Current = activity.Parent;
+        }
+    }
+
+    /// <summary>
     /// Tags the correlation id. On the consuming side it is stream-written text tagged before any
     /// validation (the response ingress tags the id as extracted, ahead of its routability check;
     /// the worker ingress tags the envelope's id, which only the executor checks later), so it is

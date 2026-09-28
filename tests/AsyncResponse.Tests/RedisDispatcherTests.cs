@@ -1380,16 +1380,22 @@ public class RedisDispatcherTests
         };
 
     [Fact]
-    public async Task QueuedDispose_SurvivesAWorkerFaultingOutsideItsHandlerGuard()
+    public async Task QueuedWorker_WithAThrowingErrorLogger_KeepsDrainingTheQueue_AndDisposesCleanly()
     {
-        // Regression: the drain join caught only TimeoutException (the shared DB base and NATS
-        // also carry a general arm). A worker faulting outside its handler guard — here the log
-        // sink throwing from the "handler failed" entry inside the catch arm — rethrew from
-        // Task.WhenAll, escaped DisposeAsync into the subscriber's `await using` and leaked the
-        // drain token source.
+        // The "handler failed" entry is logged inside the worker's catch arm. Before it went
+        // through SafeLog, a log sink throwing there faulted the worker outside its handler guard:
+        // every entry queued behind it was stranded, and the fault escaped DisposeAsync into the
+        // subscriber's `await using`. Guarded, the sink's failure costs the log line only.
         var logger = new ErrorThrowingLogger();
+        var secondRan = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var dispatcher = RedisMessageDispatcher.Create(
-            (_, _) => throw new InvalidOperationException("handler boom"),
+            (delivery, _) =>
+            {
+                if (delivery.MessageId == "1-0")
+                    throw new InvalidOperationException("handler boom");
+                secondRan.TrySetResult();
+                return Task.CompletedTask;
+            },
             new RedisTransportTests.FakeRedisStreamDatabase(),
             new RedisAsyncResponseTransportOptions(),
             EnqueueSubscriber(),
@@ -1399,8 +1405,10 @@ public class RedisDispatcherTests
             RedisSubscriberRole.Worker);
 
         await dispatcher.HandleAsync(Delivery("1-0", attempt: 1), CancellationToken.None);
-        await logger.ErrorThrown.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await dispatcher.HandleAsync(Delivery("2-0", attempt: 1), CancellationToken.None);
 
+        await logger.ErrorThrown.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await secondRan.Task.WaitAsync(TimeSpan.FromSeconds(5));
         await dispatcher.DisposeAsync();
     }
 
