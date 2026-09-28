@@ -8,6 +8,13 @@ namespace AsyncResponse.Tests;
 
 public class KafkaSubscriberTests
 {
+    // The bound on a wait for something that must happen, never a timing under test. Since
+    // Microsoft.Extensions.Hosting 10.0.10, BackgroundService.StartAsync queues ExecuteAsync to the
+    // thread pool instead of running it inline, so on net10 a subscriber's first poll waits for a
+    // pool thread, and on a loaded CI runner that took longer than the 5 s these waits used
+    // to allow. A generous bound costs nothing when the message arrives; a real hang still fails.
+    private static readonly TimeSpan HangGuard = TimeSpan.FromSeconds(30);
+
     [Fact]
     public async Task WorkerSubscriber_ForwardsPayloadAndStoresOffset()
     {
@@ -30,7 +37,7 @@ public class KafkaSubscriberTests
         });
 
         await subscriber.StartAsync(CancellationToken.None);
-        await handled.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await handled.Task.WaitAsync(HangGuard);
         await KafkaTestData.WaitUntilAsync(() => consumer.StoredOffsets.Count == 1);
         await subscriber.StopAsync(CancellationToken.None);
 
@@ -59,7 +66,7 @@ public class KafkaSubscriberTests
         var subscriber = CreateResponseSubscriber(consumer, ingress.Object, options => options.ResponseTopic = "responses");
 
         await subscriber.StartAsync(CancellationToken.None);
-        Assert.Equal("corr-header", await handled.Task.WaitAsync(TimeSpan.FromSeconds(5)));
+        Assert.Equal("corr-header", await handled.Task.WaitAsync(HangGuard));
         await subscriber.StopAsync(CancellationToken.None);
 
         ingress.Verify(i => i.HandleResponseMessageAsync("""{"State":"ok"}""", "corr-header"), Times.Once);
@@ -84,7 +91,7 @@ public class KafkaSubscriberTests
         var subscriber = CreateResponseSubscriber(consumer, ingress.Object, options => options.ResponseTopic = "responses");
 
         await subscriber.StartAsync(CancellationToken.None);
-        Assert.Equal("corr-body", await handled.Task.WaitAsync(TimeSpan.FromSeconds(5)));
+        Assert.Equal("corr-body", await handled.Task.WaitAsync(HangGuard));
         await subscriber.StopAsync(CancellationToken.None);
     }
 
@@ -164,7 +171,7 @@ public class KafkaSubscriberTests
             adminClient: adminClient);
 
         await subscriber.StartAsync(CancellationToken.None);
-        await subscribed.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await subscribed.Task.WaitAsync(HangGuard);
         await subscriber.StopAsync(CancellationToken.None);
 
         Assert.Empty(adminClient.EnsureTopicsCalls);
@@ -219,7 +226,7 @@ public class KafkaSubscriberTests
             NullLogger<KafkaWorkerSubscriber>.Instance);
 
         await subscriber.StartAsync(CancellationToken.None);
-        await handled.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await handled.Task.WaitAsync(HangGuard);
         await subscriber.StopAsync(CancellationToken.None);
 
         Assert.Equal(2, factory.CreatedRoles.Count);
@@ -261,7 +268,7 @@ public class KafkaSubscriberTests
         await subscriber.StartAsync(CancellationToken.None);
 
         // Worker blocks on job-1 while job-2 fills the single-slot queue → the subscriber pauses.
-        await handlerStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await handlerStarted.Task.WaitAsync(HangGuard);
         await KafkaTestData.WaitUntilAsync(() => consumer.PauseCount >= 1);
 
         // Freeing the worker drains the queue → the subscriber resumes and consumes job-3.
@@ -308,7 +315,7 @@ public class KafkaSubscriberTests
         });
 
         await subscriber.StartAsync(CancellationToken.None);
-        await handlerStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await handlerStarted.Task.WaitAsync(HangGuard);
 
         // Reach a steady saturated state (paused, handler parked, queue full)...
         await KafkaTestData.WaitUntilAsync(() => consumer.Paused);
@@ -425,7 +432,7 @@ public class KafkaSubscriberTests
         await subscriber.StartAsync(CancellationToken.None);
         try
         {
-            await handlerStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            await handlerStarted.Task.WaitAsync(HangGuard);
 
             // Past the inline budget: with the handler still parked, the poll count must keep
             // climbing. The old loop was blocked inside the handler and froze it here.
@@ -480,10 +487,10 @@ public class KafkaSubscriberTests
         await subscriber.StartAsync(CancellationToken.None);
         try
         {
-            await slowStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            await slowStarted.Task.WaitAsync(HangGuard);
 
             // Partition 1's message is handled while partition 0's handler is still running.
-            await quickHandled.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            await quickHandled.Task.WaitAsync(HangGuard);
             await KafkaTestData.WaitUntilAsync(() => consumer.StoredOffsets.Count == 1);
             Assert.Equal(new FakeKafkaConsumerClient.StoredOffset("workers", 1, 1), Assert.Single(consumer.StoredOffsets));
             Assert.False(releaseSlow.Task.IsCompleted);
@@ -532,7 +539,7 @@ public class KafkaSubscriberTests
         await subscriber.StartAsync(CancellationToken.None);
         try
         {
-            await slowStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            await slowStarted.Task.WaitAsync(HangGuard);
             await KafkaTestData.WaitUntilAsync(() => consumer.IsPartitionPaused(3));
 
             // Paused: the next message on the partition is NOT consumed behind the running one.
@@ -583,7 +590,7 @@ public class KafkaSubscriberTests
             options.WorkerSubscriber.DetachHandlerAfter = TimeSpan.FromMilliseconds(20);
         });
         await subscriber.StartAsync(CancellationToken.None);
-        await slowStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await slowStarted.Task.WaitAsync(HangGuard);
         await KafkaTestData.WaitUntilAsync(() => consumer.IsPartitionPaused(0));
 
         var stopping = subscriber.StopAsync(CancellationToken.None);
@@ -695,7 +702,7 @@ public class KafkaSubscriberTests
         await subscriber.StartAsync(CancellationToken.None);
         try
         {
-            await started.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            await started.Task.WaitAsync(HangGuard);
             await KafkaTestData.WaitUntilAsync(() => first.StoredOffsets.Count == 2); // job-2 committed and queued
 
             first.NextConsumeException = new InvalidOperationException("broker hiccup");
@@ -802,7 +809,7 @@ public class KafkaSubscriberTests
             // job-1 runs, job-2 fills the one-slot queue: the loop pauses the assignment (steady —
             // job-2 consumed and the pause taken after it; a pause taken before job-2 was consumed
             // is lifted again at once).
-            await started.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            await started.Task.WaitAsync(HangGuard);
             await KafkaTestData.WaitUntilAsync(() => librdkafka.PendingMessages == 1 && librdkafka.IsPaused(0));
 
             librdkafka.RevokeAll();
@@ -928,7 +935,7 @@ public class KafkaSubscriberTests
         await subscriber.StartAsync(CancellationToken.None);
         try
         {
-            await slowStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            await slowStarted.Task.WaitAsync(HangGuard);
             // @6 consumed and held: holding it re-asserts the partition's pause (the detach paused it first).
             await KafkaTestData.WaitUntilAsync(() => consumer.PartitionPauses.Count >= 2);
 

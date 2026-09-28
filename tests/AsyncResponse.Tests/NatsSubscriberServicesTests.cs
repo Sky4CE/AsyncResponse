@@ -8,6 +8,10 @@ namespace AsyncResponse.Tests;
 
 public class NatsSubscriberServicesTests
 {
+    // The bound on a wait for something that must happen, never a timing under test: a hosted
+    // subscriber's first delivery waits for a thread-pool thread on net10 (see KafkaSubscriberTests).
+    private static readonly TimeSpan HangGuard = TimeSpan.FromSeconds(30);
+
     private readonly FakeNatsJetStreamTransport _jetStream = new();
     private readonly FakeAsyncResponseIngress _ingress = new();
 
@@ -111,7 +115,7 @@ public class NatsSubscriberServicesTests
         await subscriber.StartAsync(CancellationToken.None);
         try
         {
-            await ingress.Started.Task.WaitAsync(TimeSpan.FromSeconds(5)); // p1 is wedged in the handler
+            await ingress.Started.Task.WaitAsync(HangGuard); // p1 is wedged in the handler
 
             // While p1 sits in the handler the ~AckWait/3 heartbeat signals in-progress for it.
             await Eventually(() => first.Progresses >= 1);
@@ -154,7 +158,7 @@ public class NatsSubscriberServicesTests
         await subscriber.StartAsync(CancellationToken.None);
         try
         {
-            await ingress.Started.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            await ingress.Started.Task.WaitAsync(HangGuard);
 
             // p1 is in the handler; p2 has NOT been fetched, so it is still the server's to give
             // to an idle peer — and its delivery count is untouched by p1's fate.
@@ -214,7 +218,7 @@ public class NatsSubscriberServicesTests
         await subscriber.StartAsync(CancellationToken.None);
         try
         {
-            await ingress.Started.Task.WaitAsync(TimeSpan.FromSeconds(5)); // p1 is wedged in the handler
+            await ingress.Started.Task.WaitAsync(HangGuard); // p1 is wedged in the handler
             await Eventually(() => clock.NextTimerDueAt is not null);     // the heartbeat is armed
 
             Assert.Equal(clock.GetUtcNow() + TimeSpan.FromSeconds(1), clock.NextTimerDueAt);
@@ -254,7 +258,7 @@ public class NatsSubscriberServicesTests
         await subscriber.StartAsync(CancellationToken.None);
         try
         {
-            await ingress.Started.Task.WaitAsync(TimeSpan.FromSeconds(5)); // p1 is wedged in the handler
+            await ingress.Started.Task.WaitAsync(HangGuard); // p1 is wedged in the handler
             await Eventually(() => clock.NextTimerDueAt is not null);
             clock.Advance(TimeSpan.FromSeconds(1));
             await Eventually(() => first.Progresses >= 1); // this renewal failed with the SDK's cancellation
@@ -350,7 +354,7 @@ public class NatsSubscriberServicesTests
         Task? stop = null;
         try
         {
-            await ingress.Started.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            await ingress.Started.Task.WaitAsync(HangGuard);
             await Eventually(() => deliveries[1].Acks == 1); // p2 accepted into the full queue
 
             stop = subscriber.StopAsync(CancellationToken.None);
@@ -403,7 +407,7 @@ public class NatsSubscriberServicesTests
         await subscriber.StartAsync(CancellationToken.None);
         try
         {
-            await ingress.Started.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            await ingress.Started.Task.WaitAsync(HangGuard);
             await Eventually(() => deliveries[1].Acks == 1); // p2 accepted into the full queue
 
             ingress.Release.TrySetResult(); // p1 is handed back
@@ -448,7 +452,7 @@ public class NatsSubscriberServicesTests
             await Eventually(() => _jetStream.FetchSizes.Count >= 2); // the no-wait drain, then the long poll now waiting
             host.StopApplication();
 
-            await _jetStream.LongPollCancelled.Task.WaitAsync(TimeSpan.FromSeconds(5)); // not its 30 s expiry
+            await _jetStream.LongPollCancelled.Task.WaitAsync(HangGuard); // not its 30 s expiry
             fetchesAtHostStop = _jetStream.FetchSizes.Count;
             _jetStream.EnqueueDelivery(late.Create("late", numDelivered: 1));
         }
@@ -492,7 +496,7 @@ public class NatsSubscriberServicesTests
         await subscriber.StartAsync(CancellationToken.None);
         try
         {
-            await ingress.Started.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            await ingress.Started.Task.WaitAsync(HangGuard);
             await Eventually(() => deliveries[1].Acks == 1); // p2 accepted into the full queue
 
             host.StopApplication();
@@ -625,7 +629,7 @@ public class NatsSubscriberServicesTests
         await subscriber.StartAsync(CancellationToken.None);
         try
         {
-            await ingress.Started.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            await ingress.Started.Task.WaitAsync(HangGuard);
             await Eventually(() => first.Progresses >= 1); // the heartbeat is now wedged
             ingress.Release.TrySetResult();
             await Eventually(() => first.Acks == 1);
@@ -665,7 +669,7 @@ public class NatsSubscriberServicesTests
         await subscriber.StartAsync(CancellationToken.None);
         try
         {
-            await ingress.Started.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            await ingress.Started.Task.WaitAsync(HangGuard);
             await Eventually(() => first.Progresses >= 1);
             ingress.Release.TrySetResult();
             await Eventually(() => first.Acks == 1);

@@ -15,6 +15,10 @@ namespace AsyncResponse.Tests;
 
 public class GooglePubSubSubscriberTests
 {
+    // The bound on a wait for something that must happen, never a timing under test: a hosted
+    // subscriber's first delivery waits for a thread-pool thread on net10 (see KafkaSubscriberTests).
+    private static readonly TimeSpan HangGuard = TimeSpan.FromSeconds(30);
+
     [Fact]
     public async Task WorkerSubscriberService_DefaultAckMode_WaitsForHandlerBeforeAck()
     {
@@ -130,7 +134,7 @@ public class GooglePubSubSubscriberTests
             });
 
         await subscriber.StartAsync(CancellationToken.None);
-        await secondBuild.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await secondBuild.Task.WaitAsync(HangGuard);
 
         // The faulted first client was stopped before its replacement went live.
         Assert.True(Volatile.Read(ref stops) >= 1, "the faulted subscriber client was never stopped");
@@ -434,7 +438,7 @@ public class GooglePubSubSubscriberTests
         Assert.Equal(1, Volatile.Read(ref calls));
 
         releaseFirst.TrySetResult();
-        Assert.Equal(SubscriberClient.Reply.Ack, await thirdHandle.WaitAsync(TimeSpan.FromSeconds(5)));
+        Assert.Equal(SubscriberClient.Reply.Ack, await thirdHandle.WaitAsync(HangGuard));
         await WaitForCallsAsync(() => Volatile.Read(ref calls) == 3);
     }
 
@@ -468,7 +472,7 @@ public class GooglePubSubSubscriberTests
         stopping.Cancel();
 
         // A message caught waiting when the subscriber stops is NACKed so Pub/Sub redelivers it.
-        Assert.Equal(SubscriberClient.Reply.Nack, await thirdHandle.WaitAsync(TimeSpan.FromSeconds(5)));
+        Assert.Equal(SubscriberClient.Reply.Nack, await thirdHandle.WaitAsync(HangGuard));
 
         releaseFirst.TrySetResult();
     }
@@ -762,14 +766,14 @@ public class GooglePubSubSubscriberTests
         var secondHandler = await WaitForHandlerAsync(second);
 
         releaseFirst.TrySetResult();
-        var outcome = await Task.WhenAny(secondHandled.Task, failureReported.Task).WaitAsync(TimeSpan.FromSeconds(5));
+        var outcome = await Task.WhenAny(secondHandled.Task, failureReported.Task).WaitAsync(HangGuard);
         Assert.True(
             ReferenceEquals(outcome, secondHandled.Task),
             "the already-ACKed queued job was refused after a streaming-pull fault instead of being handled");
 
         // The rebuilt client feeds the very same queue.
         Assert.Equal(SubscriberClient.Reply.Ack, await secondHandler(Body("third"), CancellationToken.None));
-        await thirdHandled.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await thirdHandled.Task.WaitAsync(HangGuard);
         Assert.False(failureReported.Task.IsCompleted);
         Assert.DoesNotContain(logger.Entries, entry => entry.Message.StartsWith("Draining", StringComparison.Ordinal));
 
@@ -1046,7 +1050,7 @@ public class GooglePubSubSubscriberTests
 
         Assert.Equal(SubscriberClient.Reply.Ack, await dispatcher.HandleAsync(new PubsubMessage { MessageId = "wake-up" }, CancellationToken.None));
 
-        var surfaced = await failure.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        var surfaced = await failure.Task.WaitAsync(HangGuard);
         Assert.IsType<DurableFlowInterruptedException>(surfaced.Exception);
         var handBack = Assert.Single(logger.Entries, entry => entry.Message.Contains("handed back by the flow engine", StringComparison.Ordinal));
         Assert.Equal(LogLevel.Error, handBack.Level);
@@ -1092,7 +1096,7 @@ public class GooglePubSubSubscriberTests
 
         await subscriber.StopAsync(CancellationToken.None);
 
-        Assert.Equal(SubscriberClient.Reply.Nack, await late.WaitAsync(TimeSpan.FromSeconds(5)));
+        Assert.Equal(SubscriberClient.Reply.Nack, await late.WaitAsync(HangGuard));
         Assert.Equal(1, client.StopCalls);
         ingress.Verify(i => i.HandleWorkerMessageAsync("before"), Times.Once);
         ingress.Verify(i => i.HandleWorkerMessageAsync("wake-up"), Times.Never);
@@ -1133,7 +1137,7 @@ public class GooglePubSubSubscriberTests
         await subscriber.StartAsync(CancellationToken.None);
         var handler = await WaitForHandlerAsync(client);
         Assert.Equal(SubscriberClient.Reply.Ack, await handler(Message("running", "running"), CancellationToken.None));
-        await handlerStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await handlerStarted.Task.WaitAsync(HangGuard);
         Assert.Equal(SubscriberClient.Reply.Ack, await handler(Message("queued", "queued"), CancellationToken.None)); // fills the one slot
         var waiting = handler(Message("waiting", "waiting"), CancellationToken.None);
         Assert.False(waiting.IsCompleted, "the queue-full delivery should wait for capacity");
@@ -1144,7 +1148,7 @@ public class GooglePubSubSubscriberTests
 
         await subscriber.StopAsync(CancellationToken.None);
 
-        Assert.Equal(SubscriberClient.Reply.Nack, await waiting.WaitAsync(TimeSpan.FromSeconds(5)));
+        Assert.Equal(SubscriberClient.Reply.Nack, await waiting.WaitAsync(HangGuard));
         ingress.Verify(i => i.HandleWorkerMessageAsync("waiting"), Times.Never);
         ingress.Verify(i => i.HandleWorkerMessageAsync("queued"), Times.Once);
     }
@@ -1182,7 +1186,7 @@ public class GooglePubSubSubscriberTests
         await subscriber.StartAsync(CancellationToken.None);
         var handler = await WaitForHandlerAsync(client);
         Assert.Equal(SubscriberClient.Reply.Ack, await handler(Message("response", "{}"), CancellationToken.None));
-        await handled.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await handled.Task.WaitAsync(HangGuard);
         await subscriber.StopAsync(CancellationToken.None);
     }
 
@@ -1221,8 +1225,8 @@ public class GooglePubSubSubscriberTests
         Assert.Equal(SubscriberClient.Reply.Ack, await dispatcher.HandleAsync(Message("poison"), CancellationToken.None));
         Assert.Equal(SubscriberClient.Reply.Ack, await dispatcher.HandleAsync(Message("healthy"), CancellationToken.None));
 
-        Assert.Equal("poison", (await reported.Task.WaitAsync(TimeSpan.FromSeconds(5))).Message.MessageId);
-        await healthyRan.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal("poison", (await reported.Task.WaitAsync(HangGuard)).Message.MessageId);
+        await healthyRan.Task.WaitAsync(HangGuard);
     }
 
     [Fact]
@@ -1250,7 +1254,7 @@ public class GooglePubSubSubscriberTests
         await subscriber.StartAsync(CancellationToken.None);
         await buildStarted.Task.WaitAsync(TimeSpan.FromSeconds(2));
 
-        await subscriber.StopAsync(CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(5));
+        await subscriber.StopAsync(CancellationToken.None).WaitAsync(HangGuard);
     }
 
     [Fact]
@@ -1275,11 +1279,11 @@ public class GooglePubSubSubscriberTests
         Assert.False(reply.IsCompleted, "the interrupted delivery was Nacked back into the live pull");
 
         // Not counted as running: the stop's drain does not wait for it.
-        await dispatcher.DrainInFlightAsync(TimeSpan.FromMinutes(1), TimeProvider.System).WaitAsync(TimeSpan.FromSeconds(5));
+        await dispatcher.DrainInFlightAsync(TimeSpan.FromMinutes(1), TimeProvider.System).WaitAsync(HangGuard);
         Assert.False(reply.IsCompleted);
 
         dispatcher.ReleaseHeldDeliveries(); // immediately before the client stop
-        Assert.Equal(SubscriberClient.Reply.Nack, await reply.WaitAsync(TimeSpan.FromSeconds(5)));
+        Assert.Equal(SubscriberClient.Reply.Nack, await reply.WaitAsync(HangGuard));
         Assert.DoesNotContain(logger.Entries, entry => entry.Level >= LogLevel.Error);
     }
 
@@ -1357,7 +1361,7 @@ public class GooglePubSubSubscriberTests
             GooglePubSubSubscriberRole.Worker);
 
         Assert.Equal(SubscriberClient.Reply.Ack, await dispatcher.HandleAsync(Message("message-fault"), CancellationToken.None));
-        await logger.ErrorThrown.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await logger.ErrorThrown.Task.WaitAsync(HangGuard);
 
         await dispatcher.DisposeAsync();
     }

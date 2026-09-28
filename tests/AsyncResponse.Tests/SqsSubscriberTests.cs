@@ -12,6 +12,10 @@ namespace AsyncResponse.Tests;
 
 public sealed class SqsSubscriberTests
 {
+    // The bound on a wait for something that must happen, never a timing under test: a hosted
+    // subscriber's first delivery waits for a thread-pool thread on net10 (see KafkaSubscriberTests).
+    private static readonly TimeSpan HangGuard = TimeSpan.FromSeconds(30);
+
     [Fact]
     public async Task WorkerSubscriber_ForwardsBodyAndDeletesMessage()
     {
@@ -210,7 +214,7 @@ public sealed class SqsSubscriberTests
         Assert.Equal(1, client.LastReceiveRequest!.MaxMessages);
 
         release.TrySetResult();
-        await thirdCalls.Deleted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await thirdCalls.Deleted.Task.WaitAsync(HangGuard);
         await subscriber.StopAsync(CancellationToken.None);
 
         // No message was released with zero visibility or abandoned; all three were processed.
@@ -267,7 +271,7 @@ public sealed class SqsSubscriberTests
         Assert.All(secondCalls.VisibilityChanges, delay => Assert.Equal(TimeSpan.FromSeconds(45), delay));
 
         release.TrySetResult();
-        await secondCalls.Deleted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await secondCalls.Deleted.Task.WaitAsync(HangGuard);
         await subscriber.StopAsync(CancellationToken.None);
 
         Assert.Equal(1, firstCalls.Delete);
@@ -333,7 +337,7 @@ public sealed class SqsSubscriberTests
             }));
         client.Enqueue(Delivery(secondCalls, body: "m2-body", messageId: "m2"));
         await subscriber.StartAsync(CancellationToken.None);
-        await sweepBlocked.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await sweepBlocked.Task.WaitAsync(HangGuard);
 
         // Shutdown fires while the sweep is parked in m1's renew and m1's handler is still live.
         var stopping = subscriber.StopAsync(CancellationToken.None);
@@ -415,7 +419,7 @@ public sealed class SqsSubscriberTests
         await WaitUntilAsync(() => secondCalls.VisibilityChanges.Count >= 2);
 
         release.TrySetResult();
-        await secondCalls.Deleted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await secondCalls.Deleted.Task.WaitAsync(HangGuard);
         await subscriber.StopAsync(CancellationToken.None);
 
         Assert.Contains(
@@ -478,14 +482,14 @@ public sealed class SqsSubscriberTests
                 await new TaskCompletionSource().Task;
             }));
         await subscriber.StartAsync(CancellationToken.None);
-        await sweepBlocked.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await sweepBlocked.Task.WaitAsync(HangGuard);
 
         // The batch finishes; the finally must give up on the wedged renewal task within the
         // bound and keep receiving — a follow-up batch's message still gets processed.
         releaseFirstHandler.TrySetResult();
-        await firstCalls.Deleted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await firstCalls.Deleted.Task.WaitAsync(HangGuard);
         client.Enqueue(Delivery(secondCalls, body: "m2-body", messageId: "m2"));
-        await secondCalls.Deleted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await secondCalls.Deleted.Task.WaitAsync(HangGuard);
         await subscriber.StopAsync(CancellationToken.None);
 
         Assert.Contains(
@@ -549,7 +553,7 @@ public sealed class SqsSubscriberTests
         client.Enqueue(Delivery(secondCalls, body: "m2-body", messageId: "m2"));
         await subscriber.StartAsync(CancellationToken.None);
 
-        await sweepBlocked.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await sweepBlocked.Task.WaitAsync(HangGuard);
         releaseFirstHandler.TrySetResult();
         // The failure path must have applied the redelivery delay before the sweep gets to move on
         // toward m2.
@@ -603,11 +607,11 @@ public sealed class SqsSubscriberTests
         await subscriber.StartAsync(default);
         try
         {
-            await failed.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            await failed.Task.WaitAsync(HangGuard);
             // The old implementation applies the retry here while the renewal is still blocked.
             Assert.False(await Task.WhenAny(appliedRetry.Task, Task.Delay(100)) == appliedRetry.Task);
             release.TrySetResult();
-            await appliedRetry.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            await appliedRetry.Task.WaitAsync(HangGuard);
             Assert.Equal(new[] { TimeSpan.FromSeconds(45), TimeSpan.FromSeconds(3) }, applied.ToArray());
         }
         finally
@@ -645,7 +649,7 @@ public sealed class SqsSubscriberTests
         client.Enqueue(Delivery(firstCalls, messageId: "m1"));
         client.Enqueue(Delivery(secondCalls, messageId: "m2"));
         await subscriber.StartAsync(CancellationToken.None);
-        await secondCalls.Deleted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await secondCalls.Deleted.Task.WaitAsync(HangGuard);
         await subscriber.StopAsync(CancellationToken.None);
 
         Assert.Equal(1, client.LastReceiveRequest!.MaxMessages);
@@ -694,7 +698,7 @@ public sealed class SqsSubscriberTests
         client.Enqueue(Delivery(firstCalls, body: "m1-body", messageId: "m1"));
         client.Enqueue(Delivery(secondCalls, body: "m2-body", messageId: "m2"));
         await subscriber.StartAsync(CancellationToken.None);
-        await firstStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await firstStarted.Task.WaitAsync(HangGuard);
 
         var stopping = subscriber.StopAsync(CancellationToken.None);
         releaseFirst.TrySetResult();
@@ -738,7 +742,7 @@ public sealed class SqsSubscriberTests
         client.Enqueue(Delivery(firstCalls, body: "m1-body", messageId: "m1"));
         client.Enqueue(Delivery(secondCalls, body: "m2-body", messageId: "m2"));
         await subscriber.StartAsync(CancellationToken.None);
-        await firstStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await firstStarted.Task.WaitAsync(HangGuard);
 
         var stopping = subscriber.StopAsync(CancellationToken.None);
         releaseFirst.TrySetResult();
@@ -781,7 +785,7 @@ public sealed class SqsSubscriberTests
 
         client.Enqueue(Delivery(calls, messageId: "m1"));
         await subscriber.StartAsync(CancellationToken.None);
-        await started.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await started.Task.WaitAsync(HangGuard);
 
         var stopping = subscriber.StopAsync(CancellationToken.None);
         release.TrySetResult();
@@ -836,14 +840,14 @@ public sealed class SqsSubscriberTests
         client.Enqueue(Delivery(firstCalls, body: "first", messageId: "m1"));
         client.Enqueue(Delivery(secondCalls, body: "second", messageId: "m2"));
         await subscriber.StartAsync(CancellationToken.None);
-        await firstStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
-        await secondCalls.Deleted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await firstStarted.Task.WaitAsync(HangGuard);
+        await secondCalls.Deleted.Task.WaitAsync(HangGuard);
 
         // The supervisor rebuilt the attempt after the faulted receive: the host did not stop.
         await WaitUntilAsync(() => client.ReceiveAttempts >= 3);
 
         releaseFirst.TrySetResult();
-        var outcome = await Task.WhenAny(secondHandled.Task, failureReported.Task).WaitAsync(TimeSpan.FromSeconds(5));
+        var outcome = await Task.WhenAny(secondHandled.Task, failureReported.Task).WaitAsync(HangGuard);
         await subscriber.StopAsync(CancellationToken.None);
 
         Assert.True(
@@ -888,7 +892,7 @@ public sealed class SqsSubscriberTests
         await WaitUntilAsync(() => logger.Snapshot().Any(entry => entry.Message.Contains("12-hour SQS in-flight ceiling", StringComparison.Ordinal)));
 
         release.TrySetResult();
-        await calls.Deleted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await calls.Deleted.Task.WaitAsync(HangGuard);
         await subscriber.StopAsync(CancellationToken.None);
 
         Assert.Equal(afterCeiling, calls.VisibilityChanges.Count);
@@ -1357,7 +1361,7 @@ public sealed class SqsSubscriberTests
 
         client.Enqueue(Delivery(calls, body: "response-json"));
         await subscriber.StartAsync(CancellationToken.None);
-        await calls.Deleted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await calls.Deleted.Task.WaitAsync(HangGuard);
         await subscriber.StopAsync(CancellationToken.None);
 
         Assert.Equal(10, client.LastReceiveRequest!.MaxMessages);
@@ -1514,7 +1518,7 @@ public sealed class SqsSubscriberTests
         try
         {
             await await Task.WhenAny(workerCalls.Deleted.Task, logger.WaitForAsync("stops receiving: the host is stopping"));
-            await responseCalls.Deleted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            await responseCalls.Deleted.Task.WaitAsync(HangGuard);
         }
         finally
         {
