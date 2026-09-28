@@ -502,7 +502,12 @@ public class NatsRecoveryStateStoreTests
                 ExpiresAtUtc = _time.Now + TimeSpan.FromMinutes(5)
             });
 
-        Assert.Equal("valid", Assert.Single(await _store.GetAllAsync("mixed-complete")).PayloadTypeFullName);
+        // Round 49: the newer-schema registration refuses the whole lookup, readable sibling and
+        // all — returning "valid" alone let the dispatcher consume the response the unreadable one
+        // still needed. The row carrying ANOTHER correlation id is readable and belongs elsewhere:
+        // it is not counted.
+        var refused = await Assert.ThrowsAsync<RecoveryStateUnreadableException>(() => _store.GetAllAsync("mixed-complete"));
+        Assert.Equal(1, refused.UnreadableCount);
         Assert.Empty(await _store.GetAllAsync("empty"));
 
         // The scan yields the readable registration and then reports the newer-schema one (round

@@ -6,9 +6,9 @@ namespace AsyncResponse;
 /// cannot interpret: malformed JSON, an incomplete identity, or a schema version outside
 /// <see cref="RecoveryStateSchema.IsReadable"/>.
 /// <para>
-/// Unreadable is not absent. The callback of such a registration cannot run — a response whose
-/// registrations are all unreadable is refused with <see cref="RecoveryStateUnreadableException"/>,
-/// one beside readable siblings is dispatched to those only — so a scan that silently skipped them
+/// Unreadable is not absent. The callback of such a registration cannot run — a response for its
+/// correlation id is refused with <see cref="RecoveryStateUnreadableException"/>, readable siblings
+/// included, and redelivered or dead-lettered — so a scan that silently skipped them
 /// attested a clean store: the recovery health check read <c>Healthy</c> while callbacks could not
 /// run. Thrown at the end rather than at the first unreadable record, so one corrupt record
 /// never hides the staleness of every readable one: the watchdog keeps what the scan yielded and

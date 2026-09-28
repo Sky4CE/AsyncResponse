@@ -1,5 +1,6 @@
 using AsyncResponse.Channels.Redis;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Options;
 using StackExchange.Redis;
 using Xunit;
 
@@ -94,6 +95,39 @@ public sealed class RedisRecoveryScanIntegrationTests(DataBatchFixture fixture)
         Assert.True(await store.TryDeleteAsync("lapsing", consumed.RegistrationId));
 
         Assert.DoesNotContain(await store.GetAllAsync("lapsing"), state => state.RegistrationId == consumed.RegistrationId);
+    }
+
+    /// <summary>
+    /// Round 49 (F2), against the real server: a fan-out's consumed registrations are removed in ONE
+    /// conditional rewrite that keeps the survivor — with its own expiry, which the key's TTL then
+    /// tracks instead of the consumed registrations' longer one.
+    /// </summary>
+    [Fact]
+    public async Task BatchDelete_RemovesTheConsumedRegistrationsInOneRewrite_AndTheKeyTracksTheSurvivor()
+    {
+        await using var multiplexer = await ConnectionMultiplexer.ConnectAsync(fixture.RedisConnectionString);
+        await using var provider = BuildProvider(multiplexer);
+        var store = provider.GetRequiredService<IRecoveryStateStore>();
+        var prefix = provider.GetRequiredService<IOptions<RedisAsyncResponseOptions>>().Value.KeyPrefix;
+        var survivor = new RecoveryState { RegistrationId = Guid.NewGuid(), CorrelationId = "batch", RegisteredAtUtc = DateTime.UtcNow };
+        await store.SaveAsync("batch", survivor, TimeSpan.FromSeconds(20));
+        var consumed = new List<Guid>();
+        for (var i = 0; i < 40; i++)
+        {
+            var registration = new RecoveryState { RegistrationId = Guid.NewGuid(), CorrelationId = "batch", RegisteredAtUtc = DateTime.UtcNow };
+            await store.SaveAsync("batch", registration, TimeSpan.FromMinutes(2));
+            consumed.Add(registration.RegistrationId);
+        }
+
+        Assert.Equal(40, await ((IRecoveryStateBatchDeletion)store).TryDeleteManyAsync("batch", consumed));
+
+        Assert.Equal(survivor.RegistrationId, Assert.Single(await store.GetAllAsync("batch")).RegistrationId);
+        var ttl = await multiplexer.GetDatabase().KeyTimeToLiveAsync($"{prefix}:recovery:batch");
+        Assert.NotNull(ttl);
+        Assert.InRange(ttl.Value, TimeSpan.FromMilliseconds(1), TimeSpan.FromSeconds(20));
+
+        Assert.Equal(1, await ((IRecoveryStateBatchDeletion)store).TryDeleteManyAsync("batch", [survivor.RegistrationId]));
+        Assert.False(await multiplexer.GetDatabase().KeyExistsAsync($"{prefix}:recovery:batch"));
     }
 
     private sealed class SteppedClock(DateTimeOffset now) : TimeProvider

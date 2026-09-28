@@ -50,9 +50,13 @@ public interface IFlowStateStore
     /// a failure signal that did not fail the run (no step pending on its correlation id, or a run
     /// that does not read <see cref="FlowRunStatus.Running"/>), a wake-up or a resume of a run that
     /// does not read <see cref="FlowRunStatus.Running"/>, a re-attaching awaited step deciding that
-    /// no recovery completed it. A decision that ends in a revision- or lease-fenced write is
+    /// no recovery completed it, a parked child's ancestor walk deciding an ancestor needs no longer
+    /// retention. A parent awaiting a child flow reads the CHILD through it too: the parent validates
+    /// what it reads and memoizes a terminal child into its own ledger, and that write's fences cover
+    /// the parent's ledger, not the child's. A decision that ends in a revision- or lease-fenced write is
     /// corrected by the fence when its read was stale; these have no fence behind them, and a stale
-    /// copy drops the payload, the failure, the wake-up or the resume for good. Terminal statuses
+    /// copy drops the payload, the failure, the wake-up or the resume for good — or, for a child,
+    /// settles the parent's step on the previous run's outcome. Terminal statuses
     /// are no exception: a finished run's id can be reused (its ledger deleted, a new run started
     /// under the same id), and an older copy then shows the previous run while the new one waits. A start
     /// job whose create reported an existing ledger also re-reads through it when its plain load

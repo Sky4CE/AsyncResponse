@@ -1021,6 +1021,12 @@ public sealed class SqlServerDirectIntegrationTests(DataBatchFixture fixture) : 
             // terminal response. Failing the delivery is what keeps the response recoverable.
             await Assert.ThrowsAsync<RecoveryStateUnreadableException>(() => store.GetAllAsync("future-state"));
 
+            // Round 49: a readable sibling does not unlock the lookup. Returning it alone let the
+            // dispatcher consume the response the newer-schema registration still needed.
+            await store.SaveAsync("future-state", new RecoveryState { CorrelationId = "future-state" }, TimeSpan.FromSeconds(30));
+            var mixed = await Assert.ThrowsAsync<RecoveryStateUnreadableException>(() => store.GetAllAsync("future-state"));
+            Assert.Equal(1, mixed.UnreadableCount);
+
             await InsertUnreadableRecoveryStateAsync(schema, options.RecoveryStateTable, "bad-state");
             await Assert.ThrowsAsync<RecoveryStateUnreadableException>(() => store.GetAllAsync("bad-state"));
 

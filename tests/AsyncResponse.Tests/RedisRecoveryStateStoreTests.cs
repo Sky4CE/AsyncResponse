@@ -325,7 +325,7 @@ public class RedisRecoveryStateStoreTests
     }
 
     [Fact]
-    public async Task GetAllAsync_FiltersUnreadableSchemaAndRequiresMatchingCorrelationId()
+    public async Task GetAllAsync_AnUnreadableSchemaBesideAReadableRegistration_RefusesTheWholeLookup()
     {
         _database
             .Setup(d => d.StringGetAsync((RedisKey)"ar:recovery:corr-a", It.IsAny<CommandFlags>()))
@@ -346,9 +346,12 @@ public class RedisRecoveryStateStoreTests
                 }
             }));
 
-        var state = Assert.Single(await _store.GetAllAsync("corr-a"));
+        // Round 49: returning the readable registration alone let the dispatcher consume the
+        // response the newer-schema one still needed; the lookup is refused before any callback.
+        var refused = await Assert.ThrowsAsync<RecoveryStateUnreadableException>(() => _store.GetAllAsync("corr-a"));
 
-        Assert.Equal("corr-a", state.CorrelationId);
+        Assert.Equal("corr-a", refused.CorrelationId);
+        Assert.Equal(1, refused.UnreadableCount);
     }
 
     [Fact]
@@ -371,7 +374,11 @@ public class RedisRecoveryStateStoreTests
             .Setup(d => d.StringGetAsync((RedisKey)"ar:recovery:corr-a", It.IsAny<CommandFlags>()))
             .ReturnsAsync(JsonSerializer.Serialize(stored));
 
-        Assert.Equal(valid.PayloadTypeFullName, Assert.Single(await _store.GetAllAsync("corr-a")).PayloadTypeFullName);
+        // Redis keys are exact, so an entry naming another correlation id under this key is
+        // corrupt rather than somebody else's: with the null and id-less entries, three
+        // registrations are unreadable, and they refuse the lookup beside the valid one (round 49).
+        var refused = await Assert.ThrowsAsync<RecoveryStateUnreadableException>(() => _store.GetAllAsync("corr-a"));
+        Assert.Equal(3, refused.UnreadableCount);
     }
 
     [Fact]

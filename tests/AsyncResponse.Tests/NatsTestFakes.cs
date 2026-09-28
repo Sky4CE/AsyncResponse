@@ -91,6 +91,9 @@ internal sealed class FakeNatsKvStore : INatsKvStore
     public Func<Task>? PurgeGate { get; set; }
 
     public int PutCount, DeleteCount;
+
+    /// <summary>Total characters of every value written by a create or an update.</summary>
+    public long WrittenChars;
     public int ForcedCreateConflicts { get; set; }
     public int ForcedUpdateConflicts { get; set; }
     public int ForcedDeleteConflicts { get; set; }
@@ -117,6 +120,7 @@ internal sealed class FakeNatsKvStore : INatsKvStore
                 return Task.FromResult(false);
 
             PutCount++;
+            WrittenChars += value.Length;
             Entries[key] = value;
             DeleteMarkers.Remove(key);
             _revisions[key] = ++_revisionCounter;
@@ -138,6 +142,7 @@ internal sealed class FakeNatsKvStore : INatsKvStore
                 return Task.FromResult(false);
 
             PutCount++;
+            WrittenChars += value.Length;
             Entries[key] = value;
             _revisions[key] = ++_revisionCounter;
             return Task.FromResult(true);

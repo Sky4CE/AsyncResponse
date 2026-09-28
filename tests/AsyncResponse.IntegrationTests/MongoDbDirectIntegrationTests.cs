@@ -69,6 +69,12 @@ public sealed class MongoDbDirectIntegrationTests(DataBatchFixture fixture) : In
         // terminal response. Failing the delivery is what keeps the response recoverable.
         await Assert.ThrowsAsync<RecoveryStateUnreadableException>(() => recovery.GetAllAsync("future-state"));
 
+        // Round 49: a readable sibling does not unlock the lookup. Returning it alone let the
+        // dispatcher consume the response the newer-schema registration still needed.
+        await recovery.SaveAsync("future-state", new RecoveryState { CorrelationId = "future-state" }, TimeSpan.FromSeconds(30));
+        var mixed = await Assert.ThrowsAsync<RecoveryStateUnreadableException>(() => recovery.GetAllAsync("future-state"));
+        Assert.Equal(1, mixed.UnreadableCount);
+
         // An unreadable persisted document fails the read rather than masquerading as absence.
         await database.GetCollection<BsonDocument>(options.RecoveryStateCollection).InsertOneAsync(new BsonDocument
         {

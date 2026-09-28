@@ -13,6 +13,52 @@ work that has landed on `main` but not yet shipped. Security reporters credited 
 
 ### Changed
 
+- **Round-49 review (2026-09-28, external review of `b483b65`): a parent no longer settles on a
+  stale child outcome, a response is not acknowledged while any of its recovery registrations is
+  unreadable, and a recovery fan-out on Redis or NATS removes what it consumed in one write.**
+  - *Durable flows — child flows.* `AwaitChildFlowAsync` read the child's ledger with a plain
+    `LoadAsync`, which may return an older copy of a present ledger. Under a reused child id that
+    copy is the previous run, and the parent memoized its outcome into its own ledger — a write
+    whose revision and lease fences cover the parent, not the child: a previous `Failed` failed
+    the parent for good (every replay answered from the memo) while the current child was still
+    running, a previous `Succeeded` let the parent continue on the old result, and a copy bound to
+    another parent failed the ownership check as an id collision. Both child reads — the lookup,
+    and the read-back after a create that lost to a concurrent creator — now go through
+    `LoadCurrentAsync`. A parked child's ancestor walk, which stopped without writing at an
+    ancestor that read finished or already covered, confirms that read the same way first: an
+    older copy of a reused ancestor id left the current run to expire under the park.
+  - *Recovery — behaviour change.* A recovery store that found a live registration this build
+    cannot interpret (malformed, an incomplete identity, a newer schema version) beside readable
+    ones returned the readable ones: the dispatcher invoked and consumed them, the transport
+    acknowledged the response, and the unreadable registration stayed armed with no payload left
+    to deliver — a compatible build or an operator's repair then recovered nothing. Every store
+    (PostgreSQL, SQL Server, MongoDB, Redis, NATS) now throws `RecoveryStateUnreadableException`
+    for any live unreadable registration, before a callback runs, so the delivery is redelivered
+    or dead-lettered with its payload until a build that can read every registration settles all
+    of them. On the database channels and NATS a registration carrying another correlation id
+    still counts as absent (a legacy collation's match); Redis keys are exact, so there such an
+    entry was already corrupt and counts as unreadable.
+    **Upgrading:** during a rolling upgrade that raises the recovery-state schema version, a
+    response whose correlation id has registrations from both versions is now refused by
+    old-version hosts instead of being delivered to the registrations they can read; it is
+    settled once a new-version host receives it. The watchdog's `unreadable` count and health
+    degradation are unchanged. A custom `IRecoveryStateStore` should adopt the same rule (now
+    documented on `GetAllAsync`).
+  - *Recovery — Redis and NATS.* The dispatcher deleted each consumed registration on its own,
+    and these stores keep a correlation id's registrations in one value, so every delete read,
+    parsed, filtered and rewrote the whole remainder: N registrations cost N + (N−1) + … + 1
+    entries rewritten and N + 1 round trips while the delivery stayed open (64 registrations
+    rewrote about 0.75 M characters, 256 about 12 M). The registrations one fan-out consumed are
+    now removed together in one conditional rewrite, after every registration has been dispatched
+    and before the dispatch settles (a transient sibling failure still redelivers to the failed
+    registration alone), keeping concurrently added and unreadable registrations and every
+    survivor's own expiry. Consumed registrations therefore stay stored until the fan-out ends —
+    across a sibling's failure-callback retries too — so a concurrent redelivery or a racing
+    publisher in that window can re-invoke a callback that already ran (callbacks are
+    at-least-once; they must already be idempotent). A lookup the store refuses as unreadable
+    still yields to a live subscriber that appeared in the snapshot race. The database and in-memory stores, and application-owned stores, keep
+    one delete per registration.
+
 - **Round-48 review (2026-09-27, external review of `ba8e8e7`): the Cosmos DB flow store refuses
   an account it cannot keep its contract on, a recovered response is no longer consumed against a
   previous run's ledger, telemetry that throws no longer changes an outcome, and checkpoint sizes

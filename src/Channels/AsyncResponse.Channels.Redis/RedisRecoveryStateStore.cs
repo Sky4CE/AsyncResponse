@@ -18,7 +18,7 @@ namespace AsyncResponse.Channels.Redis;
 /// never keep a dead sibling registration recoverable (nor truncate a longer-lived one).
 /// </para>
 /// </summary>
-internal sealed class RedisRecoveryStateStore : IRecoveryStateStore, IRecoveryStateScanner
+internal sealed class RedisRecoveryStateStore : IRecoveryStateStore, IRecoveryStateScanner, IRecoveryStateBatchDeletion
 {
     private readonly IConnectionMultiplexer _multiplexer;
     private readonly IDatabase _database;
@@ -128,9 +128,52 @@ internal sealed class RedisRecoveryStateStore : IRecoveryStateStore, IRecoverySt
             throw new ArgumentException("Registration id cannot be empty.", nameof(registrationId));
         cancellationToken.ThrowIfCancellationRequested();
 
+        var removed = await RemoveRegistrationsAsync(correlationId, candidate => candidate == registrationId, cancellationToken).ConfigureAwait(false);
+        if (removed is not null)
+            return removed > 0;
+
+        // Leave the registration for expiry rather than risking a lost concurrent registration
+        // with an unconditional rewrite; the caller treats false as "nothing deleted".
+        _logger.LogWarning(
+            "Recovery-state delete for correlationId {CorrelationId} registration {RegistrationId} exhausted {Attempts} optimistic attempts; leaving the registration for expiry.",
+            correlationId, registrationId, MaxCasAttempts);
+        return false;
+    }
+
+    /// <inheritdoc />
+    public async Task<int> TryDeleteManyAsync(string correlationId, IReadOnlyCollection<Guid> registrationIds, CancellationToken cancellationToken = default)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(correlationId);
+        ArgumentNullException.ThrowIfNull(registrationIds);
+        var targets = new HashSet<Guid>(registrationIds);
+        if (targets.Contains(Guid.Empty))
+            throw new ArgumentException("Registration ids cannot be empty.", nameof(registrationIds));
+        cancellationToken.ThrowIfCancellationRequested();
+        if (targets.Count == 0)
+            return 0;
+
+        // One read and one conditional rewrite for the whole set: deleting the registrations one
+        // at a time re-read, re-parsed and re-wrote everything that remained each time.
+        var removed = await RemoveRegistrationsAsync(correlationId, targets.Contains, cancellationToken).ConfigureAwait(false);
+        if (removed is not null)
+            return removed.Value;
+
+        _logger.LogWarning(
+            "Recovery-state delete for correlationId {CorrelationId} of {RegistrationCount} registration(s) exhausted {Attempts} optimistic attempts; leaving the registrations for expiry.",
+            correlationId, targets.Count, MaxCasAttempts);
+        return 0;
+    }
+
+    /// <summary>
+    /// Removes the registrations <paramref name="isTarget"/> selects in one conditional rewrite of
+    /// the shared value; returns how many were removed, or <c>null</c> when every optimistic
+    /// attempt lost to a concurrent writer.
+    /// </summary>
+    private async Task<int?> RemoveRegistrationsAsync(string correlationId, Func<Guid, bool> isTarget, CancellationToken cancellationToken)
+    {
         var recoveryKey = _keys.RecoveryKey(correlationId);
 
-        // Optimistic removal: deleting one registration must not clobber a registration that a
+        // Optimistic removal: deleting registrations must not clobber a registration that a
         // concurrent writer appended between our read and our write.
         for (var attempt = 0; attempt < MaxCasAttempts; attempt++)
         {
@@ -139,12 +182,12 @@ internal sealed class RedisRecoveryStateStore : IRecoveryStateStore, IRecoverySt
             var nowUtc = _timeProvider.GetUtcNow();
             var previous = await _database.StringGetAsync(recoveryKey).ConfigureAwait(false);
             if (previous.IsNullOrEmpty)
-                return false;
+                return 0;
 
             var (entries, legacy) = DeserializeEntries(previous, recoveryKey, correlationId, logAsError: true, nowUtc, preserveUnreadable: true);
-            var removed = entries.RemoveAll(entry => entry.State?.RegistrationId == registrationId) > 0;
-            if (!removed)
-                return false;
+            var removed = entries.RemoveAll(entry => entry.State is { } state && isTarget(state.RegistrationId));
+            if (removed == 0)
+                return 0;
 
             var transaction = _database.CreateTransaction();
             transaction.AddCondition(Condition.StringEqual(recoveryKey, previous));
@@ -175,16 +218,11 @@ internal sealed class RedisRecoveryStateStore : IRecoveryStateStore, IRecoverySt
                 // Same as SaveAsync: a committed EXEC does not mean the write succeeded. Reporting
                 // "deleted" over a rejected one left the consumed registration armed.
                 await mutation.ConfigureAwait(false);
-                return true;
+                return removed;
             }
         }
 
-        // Leave the registration for expiry rather than risking a lost concurrent registration
-        // with an unconditional rewrite; the caller treats false as "nothing deleted".
-        _logger.LogWarning(
-            "Recovery-state delete for correlationId {CorrelationId} registration {RegistrationId} exhausted {Attempts} optimistic attempts; leaving the registration for expiry.",
-            correlationId, registrationId, MaxCasAttempts);
-        return false;
+        return null;
     }
 
     /// <inheritdoc />
@@ -409,68 +447,21 @@ internal sealed class RedisRecoveryStateStore : IRecoveryStateStore, IRecoverySt
             return [];
 
         var now = _timeProvider.GetUtcNow();
-        var (entries, _) = DeserializeEntries(value, recoveryKey, correlationId, logAsError: true, now);
-        if (entries.Count > 0)
-            return entries.ConvertAll(entry => entry.State!);
+        var (entries, _) = DeserializeEntriesCore(value, recoveryKey, correlationId, logAsError: true, now, preserveUnreadable: false, throwOnUnreadableEnvelope: false, out var unreadable);
 
-        // The key held a blob and nothing readable came out of it. That must not read as "no
-        // registration was ever armed" — the dispatcher acknowledges the response on that answer,
-        // consuming a terminal response whose callback never ran.
-        //
-        // Expiry is the exception and has to be told apart here, because DeserializeEntries drops
-        // lapsed entries by the same route it drops unreadable ones: a registration past its expiry
-        // is legitimately gone, and failing on it would redeliver forever against a record that is
-        // supposed to disappear.
-        if (CountStoredRegistrations(value, out var stored) && stored > 0)
-            throw new RecoveryStateUnreadableException(correlationId, stored);
+        // A live registration this build cannot interpret — or a blob that will not parse at all,
+        // counted once — refuses the whole lookup, readable siblings or not. An empty list reads
+        // as "no registration was ever armed" and the readable rest as "these are all of them":
+        // either way the dispatcher consumed the response and the transport acknowledged it while
+        // the unreadable registration stayed armed with no payload left to deliver. Refused before
+        // any callback runs, redelivery or dead-lettering keeps the payload for a build or an
+        // operator that can resolve it (see RecoveryStateUnreadableException). Lapsed entries are
+        // dropped before the readability check, so a registration past its expiry is gone rather
+        // than counted: failing on it would redeliver against a record that is meant to disappear.
+        if (unreadable > 0)
+            throw new RecoveryStateUnreadableException(correlationId, unreadable);
 
-        return [];
-    }
-
-    /// <summary>
-    /// Counts the registrations physically present in the blob that are NOT past their expiry,
-    /// without applying the readability rules. The gap between this and what
-    /// <see cref="DeserializeEntries"/> returned is exactly the unreadable set. Returns
-    /// <c>false</c> when the blob itself will not parse at all — in which case every registration it
-    /// held is unreadable by definition, and the caller is told so via <paramref name="stored"/>.
-    /// </summary>
-    private bool CountStoredRegistrations(RedisValue value, out int stored)
-    {
-        var json = value.ToString();
-        var now = _timeProvider.GetUtcNow();
-        try
-        {
-            if (IsLegacyShape(json))
-            {
-                // Legacy blobs carry no per-entry expiry; every element is a live registration.
-                stored = JsonSafety.SafeDeserialize(json, _legacyTypeInfo)?.Count ?? 0;
-                return true;
-            }
-
-            var parsed = JsonSafety.SafeDeserialize(json, _envelopeTypeInfo);
-            var registrations = parsed?.Registrations;
-            if (registrations is null)
-            {
-                stored = 0;
-                return true;
-            }
-
-            stored = 0;
-            foreach (var entry in registrations)
-            {
-                if (entry is not null && entry.ExpiresAtUtc > now)
-                    stored++;
-            }
-
-            return true;
-        }
-        catch (Exception ex) when (ex is JsonException or InvalidDataException)
-        {
-            // Unparseable at the top level: the blob exists and holds an unknown number of
-            // registrations, all of them unreadable. One is enough to fail the delivery.
-            stored = 1;
-            return true;
-        }
+        return entries.ConvertAll(entry => entry.State!);
     }
 
     /// <summary>

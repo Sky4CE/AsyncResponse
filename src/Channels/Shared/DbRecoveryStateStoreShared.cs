@@ -96,18 +96,20 @@ internal abstract class DbRecoveryStateStoreBase(
                 states.Add(state);
         }
 
-        // Rows existed and none of them survived materialization. Returning an empty list here told
-        // the dispatcher "no recovery callback was ever armed", which it answers by acknowledging
-        // the response — so a corrupt or newer-schema registration silently consumed a terminal
-        // response its callback never saw. Fail instead, and let redelivery reach a build that can
-        // read it. A PARTIALLY readable batch deliberately does not throw: see
-        // RecoveryStateUnreadableException.
+        // A row this build cannot interpret is a registration whose callback cannot run, not an
+        // absent one. Returning the readable rest — or, with none, an empty list ("no recovery
+        // callback was ever armed") — let the dispatcher consume the response and the transport
+        // acknowledge it, while the unreadable registration stayed armed with no payload left to
+        // deliver: deploying a build that can read it, or repairing the row, recovered nothing.
+        // The whole lookup is refused instead, before any callback runs (so no readable sibling
+        // is invoked twice), and redelivery or dead-lettering keeps the payload for a build or an
+        // operator that can resolve it (see RecoveryStateUnreadableException).
         // Only rows this build could not INTERPRET count. A row rejected for belonging to another
         // correlation id is perfectly readable — it surfaced because a legacy case-insensitive
         // collation matched the wrong key, and refusing it is the ordinal re-check doing its job.
         // For the id actually asked about, that is absence, not corruption, and absence must stay
         // an empty list.
-        if (states.Count == 0 && unreadable > 0)
+        if (unreadable > 0)
             throw new RecoveryStateUnreadableException(correlationId, unreadable);
 
         return states;

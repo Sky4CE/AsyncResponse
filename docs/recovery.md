@@ -188,7 +188,12 @@ a resume callback) instead of being discarded.
 
 Recovery callbacks are **at-least-once**. Two publishers racing on the same orphaned correlation id
 can each load the registration before either deletes it, and a crash between "callback invoked" and
-"registration deleted" re-invokes the callback on the next publish. There is deliberately no
+"registration deleted" re-invokes the callback on the next publish (on Redis and NATS, where the
+registrations a fan-out consumed are removed together once every registration has been
+dispatched — see [shared-correlation recovery](#shared-correlation-recovery) — a crash part-way
+re-invokes every callback that fan-out had run, and so can a concurrent redelivery or a racing
+publisher while the fan-out is still running, a sibling's failure-callback retries included).
+There is deliberately no
 distributed claim step in front of the callback — resume must already be re-attach-safe, so the
 extra store round-trip per recovery would buy nothing. Treat both callbacks as idempotent: key side
 effects on the correlation id, not on the invocation.
@@ -217,9 +222,21 @@ retry ladder.
 A direct caller of `SetResponse`/`SetException` (an HTTP callback endpoint) sees the same
 exception; answer the remote system with a retriable status.
 
-**When the stored registrations cannot be read.** A recovery store holding registrations for the
-correlation id that this build cannot interpret — none of them — throws
-`RecoveryStateUnreadableException` rather than reporting "no registration". The broker ingress
+**When the stored registrations cannot be read.** A recovery store holding a live registration for
+the correlation id that this build cannot interpret — malformed, an incomplete identity, or a newer
+schema version — throws `RecoveryStateUnreadableException` rather than reporting "no registration",
+and it does so even when the correlation id's other registrations are readable: **no registration
+is dispatched, the readable ones included**. Returning the readable ones used to let the dispatcher
+invoke and consume them and the transport acknowledge the response, while the unreadable
+registration stayed armed with no payload left to deliver — a compatible build deployed later, or
+an operator's repair, then had nothing to recover (fixed in round 49). Refusing before any callback
+runs also means nothing is invoked twice: the redelivery that a build able to read every
+registration receives — the newer one a rolling upgrade is bringing up — settles all of them at
+once. On the database channels and NATS a registration that carries *another* correlation id (a
+legacy case-insensitive collation's match) is readable and belongs elsewhere; it counts as absent.
+Redis keys are exact, so there such an entry is corrupt and counts as unreadable. A lookup refused
+this way still yields to a live waiter that subscribed in the snapshot race: the response is handed
+back for live delivery rather than failed. The broker ingress
 propagates it without a `SetException` escalation (its dispatch reads the same rows first and fails
 identically), so the transport redelivers or dead-letters the message for a build, or an
 operator, that can resolve it. It still runs the ingress's retry ladder (4 attempts, about 1.75 s)
@@ -286,8 +303,9 @@ is unknown and never flagged stale by themselves, so without this the check woul
 pass it never actually computed. It fires, too, when the scan found stored registrations this build
 **cannot read** — malformed, an incomplete identity, or a schema version newer than this build
 (expected briefly during a rolling upgrade): its callback cannot run. A response whose
-registrations are all unreadable is refused and redelivered rather than acknowledged unread; one
-beside readable siblings is dispatched to those, and the unreadable one is skipped with a warning.
+correlation id holds an unreadable registration is refused and redelivered rather than
+acknowledged — its readable siblings are not dispatched either, so the payload survives for the
+build or operator that resolves the unreadable one.
 Their count is in the `unreadable` stat and the `asyncresponse.recovery.unreadable` gauge, and the
 store logs a warning for each (with its key or correlation id wherever the record still yields
 one — a database row whose JSON will not parse does not). Deploy a build that can read them, or
@@ -463,11 +481,12 @@ worker with a shape it does not understand.
 correlation id share a single stored blob, and updating one is a read-modify-write of the whole
 thing. A registration a newer host wrote — one this build cannot interpret — is carried through
 those rewrites untouched rather than pruned to the readable subset: dropping it would silently
-delete a live sibling's recovery callback mid-rolling-upgrade. Reads still filter it out (this
-build cannot dispatch it), but a *whole* stored value this build cannot parse fails the read
-instead of reporting "no registration", so the terminal response is redelivered to a host that
-can read it rather than acknowledged away. The durable-flow ledger applies the same rule
-(`FlowStateUnreadableException`).
+delete a live sibling's recovery callback mid-rolling-upgrade. A read that meets one — or a
+*whole* stored value this build cannot parse — fails instead of reporting "no registration" or the
+readable rest, so the terminal response is redelivered to a host that can read every registration
+rather than acknowledged away (see *When the stored registrations cannot be read* under
+[Make resume callbacks re-entrant](#make-resume-callbacks-re-entrant)). The
+durable-flow ledger applies the same rule (`FlowStateUnreadableException`).
 
 ## Shared-correlation recovery
 
@@ -488,7 +507,15 @@ late response/exception dispatches to every stored callback for that correlation
 completes normally removes only its own registration, so a still-active sibling remains recoverable.
 
 Each registration keeps its own delivery guarantee. A successful callback consumes only its own
-registration. **Any transient callback failure** throws `RecoveryCallbackFailedException`,
+registration. On Redis and NATS, which keep a correlation id's registrations together in one
+stored value, the registrations one fan-out consumed are removed **together, in one conditional
+rewrite**, after every registration has been dispatched and before the dispatch settles: deleting
+them one at a time re-read, re-parsed and re-wrote everything that remained each time, so N
+registrations cost N + (N−1) + … + 1 entries rewritten while the delivery stayed open. The rewrite
+removes exactly the consumed registrations — a registration added concurrently, one this build
+cannot read, and one whose callback failed all stay, each with its own expiry. The database and
+in-memory stores keep one delete per registration, as each callback succeeds; an
+application-owned `IRecoveryStateStore` needs nothing new. **Any transient callback failure** throws `RecoveryCallbackFailedException`,
 including a single registration and a fan-out in which no callback succeeded. Ingress propagates
 it without `SetException` escalation; broker redelivery and the configured dead-letter policy own
 the retry. This matters when `RecoverAsync` has saved a successful response but cannot publish its

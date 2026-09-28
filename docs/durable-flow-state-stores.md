@@ -489,8 +489,9 @@ write the store had acknowledged, and the revision and lease fences reject whate
 would otherwise decide. `LoadCurrentAsync`, which the engine uses where it acts on a load with no
 fence behind it (a recovered response that was not checkpointed, a failure, wake-up or resume for
 a run that is not running, the read-back after a start's create lost, a re-attaching step checking
-whether recovery already completed it, and settling whether a checkpoint cancelled mid-write
-committed), reads with `linearizable` read concern instead: a primary that a network partition
+whether recovery already completed it, settling whether a checkpoint cancelled mid-write
+committed, a parent reading the child flow it awaits, and a parked child's ancestor walk deciding
+an ancestor needs no longer retention), reads with `linearizable` read concern instead: a primary that a network partition
 has deposed without its noticing still serves reads for up to an election timeout, and only a
 linearizable read refuses there (a majority snapshot on that node is just as stale). It is bounded
 by `maxTimeMS` (10 s, the default write bound), so while the set is degraded it fails rather than
@@ -663,7 +664,12 @@ authoritative "no such ledger" and its `412` means the ledger exists; the SDK al
   more reads go through it: a re-attaching awaited step checking whether a recovery already
   completed it (a stale "no" would wait out the step's whole deadline), and an execution whose
   caller cancelled a checkpoint mid-write, which settles once, before its next step, whether that
-  write committed.
+  write committed. A parent awaiting a child flow reads the **child** through it every time, not
+  only after a plain load: whatever it reads is validated and, once finished, memoized into the
+  parent's own ledger, and that write's fences cover the parent, not the child — an older copy of
+  a reused child id would settle the parent's step on the previous run's outcome for good. A parked
+  child's ancestor walk also looks again this way before it stops at an ancestor that reads
+  finished or already covered, since stopping writes nothing.
 
 What that guarantees depends on the client's effective consistency level: **Strong**, and **Bounded
 Staleness** read from the write region, were already current; **Session** (the account default)
@@ -950,7 +956,9 @@ a custom store in production, test all of these against the real backend:
   older copy of a present record; override it when they can (replica or session reads). A
   decorator must forward it for the same reason as `ObserveLeaseAsync`. The engine asks for it
   behind every decision that acknowledges a delivery without writing, whatever status the plain
-  load reported — a finished status included, since a deleted ledger's id can be reused. A store
+  load reported — a finished status included, since a deleted ledger's id can be reused — and for
+  every read a parent makes of a child flow it awaits, since the parent memoizes that outcome into
+  its own ledger under fences that cover only its own. A store
   that cannot deliver the guarantee on some configuration of its backend should refuse that
   configuration when it provisions, as the Cosmos DB store does, rather than serve a weaker read
   under the same name;

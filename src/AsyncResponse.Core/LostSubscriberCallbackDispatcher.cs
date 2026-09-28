@@ -82,7 +82,9 @@ internal sealed class LostSubscriberCallbackDispatcher(
         CancellationToken cancellationToken,
         Func<ValueTask<bool>>? hasLiveSubscriber = null)
     {
-        var recoveryStates = await recoveryStateStore.GetAllAsync(correlationId, cancellationToken).ConfigureAwait(false);
+        var recoveryStates = await LoadRegistrationsAsync(recoveryStateStore, correlationId, hasLiveSubscriber, cancellationToken).ConfigureAwait(false);
+        if (recoveryStates is null)
+            return new LostSubscriberDispatchResult(null, false) { RetryLive = true };
 
         // A waiter registers its subscription before saving its recovery state, so the snapshot
         // race has two shapes — and the re-check must run before the empty-state early return:
@@ -109,38 +111,53 @@ internal sealed class LostSubscriberCallbackDispatcher(
         var routeSet = false;
         var routeMixed = false;
         List<ExceptionDispatchInfo>? failures = null;
+        var batchDeletion = recoveryStateStore as IRecoveryStateBatchDeletion;
+        List<Guid>? consumed = null;
 
-        foreach (var recoveryState in recoveryStates)
+        try
         {
-            try
+            foreach (var recoveryState in recoveryStates)
             {
-                var result = await DispatchLostResponse(recoveryState, wirePayload, channel).ConfigureAwait(false);
-                if (!routeSet)
+                try
                 {
-                    action = result.Action;
-                    routeSet = true;
+                    var result = await DispatchLostResponse(recoveryState, wirePayload, channel).ConfigureAwait(false);
+                    if (!routeSet)
+                    {
+                        action = result.Action;
+                        routeSet = true;
+                    }
+                    else if (action != result.Action)
+                    {
+                        routeMixed = true;
+                    }
+
+                    if (!result.CallbackInvoked)
+                        continue;
+
+                    callbackInvoked = true;
+                    if (batchDeletion is not null)
+                        (consumed ??= []).Add(recoveryState.RegistrationId);
+                    else
+                        await DeleteConsumedRegistrationAsync(recoveryStateStore, correlationId, recoveryState.RegistrationId).ConfigureAwait(false);
                 }
-                else if (action != result.Action)
+                catch (Exception ex)
                 {
-                    routeMixed = true;
+                    if (ex is OperationCanceledException && cancellationToken.IsCancellationRequested)
+                        throw;
+
+                    // Capture rather than re-throw a bare variable so the original throw site's stack
+                    // trace survives the dispatch to the remaining registrations. EVERY failure is
+                    // kept: settlement below classifies the whole set, not the first one.
+                    (failures ??= []).Add(ExceptionDispatchInfo.Capture(ex));
                 }
-
-                if (!result.CallbackInvoked)
-                    continue;
-
-                callbackInvoked = true;
-                await DeleteConsumedRegistrationAsync(recoveryStateStore, correlationId, recoveryState.RegistrationId).ConfigureAwait(false);
             }
-            catch (Exception ex)
-            {
-                if (ex is OperationCanceledException && cancellationToken.IsCancellationRequested)
-                    throw;
-
-                // Capture rather than re-throw a bare variable so the original throw site's stack
-                // trace survives the dispatch to the remaining registrations. EVERY failure is
-                // kept: settlement below classifies the whole set, not the first one.
-                (failures ??= []).Add(ExceptionDispatchInfo.Capture(ex));
-            }
+        }
+        finally
+        {
+            // Before settlement, and on a cancellation too: the consumed registrations are gone by
+            // the time a residual failure propagates, exactly as with per-registration deletes.
+            if (consumed is not null)
+                await DeleteConsumedRegistrationsAsync(batchDeletion!, correlationId, consumed).ConfigureAwait(false);
         }
 
         if (failures is not null)
@@ -166,7 +183,9 @@ internal sealed class LostSubscriberCallbackDispatcher(
         CancellationToken cancellationToken,
         Func<ValueTask<bool>>? hasLiveSubscriber = null)
     {
-        var recoveryStates = await recoveryStateStore.GetAllAsync(correlationId, cancellationToken).ConfigureAwait(false);
+        var recoveryStates = await LoadRegistrationsAsync(recoveryStateStore, correlationId, hasLiveSubscriber, cancellationToken).ConfigureAwait(false);
+        if (recoveryStates is null)
+            return new LostSubscriberDispatchResult(RecoveryAction.Fail, false) { RetryLive = true };
 
         // Same snapshot-race re-check as DispatchLostResponses, and for the same reason it must
         // precede the empty-state early return: an empty snapshot may mean the waiter registered
@@ -180,27 +199,41 @@ internal sealed class LostSubscriberCallbackDispatcher(
 
         var callbackInvoked = false;
         List<ExceptionDispatchInfo>? failures = null;
+        var batchDeletion = recoveryStateStore as IRecoveryStateBatchDeletion;
+        List<Guid>? consumed = null;
 
-        foreach (var recoveryState in recoveryStates)
+        try
         {
-            try
+            foreach (var recoveryState in recoveryStates)
             {
-                if (!await DispatchLostException(recoveryState, exception, channel).ConfigureAwait(false))
-                    continue;
+                try
+                {
+                    if (!await DispatchLostException(recoveryState, exception, channel).ConfigureAwait(false))
+                        continue;
 
-                callbackInvoked = true;
-                await DeleteConsumedRegistrationAsync(recoveryStateStore, correlationId, recoveryState.RegistrationId).ConfigureAwait(false);
-            }
-            catch (Exception ex)
-            {
-                if (ex is OperationCanceledException && cancellationToken.IsCancellationRequested)
-                    throw;
+                    callbackInvoked = true;
+                    if (batchDeletion is not null)
+                        (consumed ??= []).Add(recoveryState.RegistrationId);
+                    else
+                        await DeleteConsumedRegistrationAsync(recoveryStateStore, correlationId, recoveryState.RegistrationId).ConfigureAwait(false);
+                }
+                catch (Exception ex)
+                {
+                    if (ex is OperationCanceledException && cancellationToken.IsCancellationRequested)
+                        throw;
 
-                // Capture rather than re-throw a bare variable so the original throw site's stack
-                // trace survives the dispatch to the remaining registrations. EVERY failure is
-                // kept: settlement below classifies the whole set, not the first one.
-                (failures ??= []).Add(ExceptionDispatchInfo.Capture(ex));
+                    // Capture rather than re-throw a bare variable so the original throw site's stack
+                    // trace survives the dispatch to the remaining registrations. EVERY failure is
+                    // kept: settlement below classifies the whole set, not the first one.
+                    (failures ??= []).Add(ExceptionDispatchInfo.Capture(ex));
+                }
             }
+        }
+        finally
+        {
+            // Same as DispatchLostResponses: consumed registrations are removed before settlement.
+            if (consumed is not null)
+                await DeleteConsumedRegistrationsAsync(batchDeletion!, correlationId, consumed).ConfigureAwait(false);
         }
 
         if (failures is not null)
@@ -213,6 +246,34 @@ internal sealed class LostSubscriberCallbackDispatcher(
 
         // Exception envelopes always take the failure route, so the action is fixed at Fail.
         return new LostSubscriberDispatchResult(RecoveryAction.Fail, callbackInvoked);
+    }
+
+    /// <summary>
+    /// The registrations of <paramref name="correlationId"/>, or <c>null</c> when the store refused
+    /// them as unreadable (<see cref="RecoveryStateUnreadableException"/>) while a live subscriber
+    /// has appeared: the snapshot-race re-check below must still win over the refusal. Once any
+    /// registration is unreadable the store refuses the whole lookup, readable siblings included,
+    /// and failing a response that a waiter subscribed in time to take live — a direct
+    /// <c>SetResponse</c> caller saw the store's exception — would be a regression of that re-check.
+    /// With no live subscriber the refusal propagates, so the delivery is not acknowledged.
+    /// </summary>
+    private static async Task<IReadOnlyList<RecoveryState>?> LoadRegistrationsAsync(
+        IRecoveryStateStore recoveryStateStore,
+        string correlationId,
+        Func<ValueTask<bool>>? hasLiveSubscriber,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            return await recoveryStateStore.GetAllAsync(correlationId, cancellationToken).ConfigureAwait(false);
+        }
+        catch (RecoveryStateUnreadableException) when (hasLiveSubscriber is not null)
+        {
+            if (await hasLiveSubscriber().ConfigureAwait(false))
+                return null;
+
+            throw;
+        }
     }
 
     /// <summary>
@@ -706,6 +767,31 @@ internal sealed class LostSubscriberCallbackDispatcher(
                 "Recovery callback for correlationId {CorrelationId} succeeded but deleting its registration {RegistrationId} failed; the registration remains until its TTL or the next delivery.",
                 state.CorrelationId,
                 state.RegistrationId));
+        }
+    }
+
+    /// <summary>
+    /// Removes every registration one fan-out consumed in a single store operation (see
+    /// <see cref="IRecoveryStateBatchDeletion"/>): in a store that keeps a correlation id's
+    /// registrations in one value, a delete per registration rewrote the whole remainder each
+    /// time, quadratic in the fan-out. Best-effort like <see cref="DeleteConsumedRegistrationAsync"/>.
+    /// </summary>
+    private async Task DeleteConsumedRegistrationsAsync(
+        IRecoveryStateBatchDeletion batchDeletion,
+        string correlationId,
+        List<Guid> registrationIds)
+    {
+        try
+        {
+            await batchDeletion.TryDeleteManyAsync(correlationId, registrationIds, CancellationToken.None).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            SafeLog.Try((Logger: _logger, Error: ex, CorrelationId: correlationId, registrationIds.Count), static state => state.Logger.LogWarning(
+                state.Error,
+                "Recovery callbacks for correlationId {CorrelationId} succeeded but deleting their {RegistrationCount} registration(s) failed; the registrations remain until their TTL or the next delivery.",
+                state.CorrelationId,
+                state.Count));
         }
     }
 

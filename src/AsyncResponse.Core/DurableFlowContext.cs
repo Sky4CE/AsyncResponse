@@ -791,6 +791,21 @@ internal sealed class DurableFlowContext : IDurableFlowContext
             var now = UtcNow;
             var ttl = retainUntil - now > _options.StateExpiry ? retainUntil - now : _options.StateExpiry;
             var ancestor = await _store.LoadAsync(ancestorId, cancellationToken).ConfigureAwait(false);
+
+            // Stopping here writes nothing, so no revision fence corrects a stale read behind it
+            // (see IFlowStateStore.LoadCurrentAsync): under a reused ancestor id a lagging copy
+            // still shows the previous run — finished, or carrying its own retention floor — and
+            // the walk left the CURRENT run, which is waiting on this very chain, with its plain
+            // expiry, to lapse mid-park. Look again, currently, before stopping. A null second
+            // look is the authoritative answer and ends the walk here: falling back to the lagging
+            // copy would follow a covered previous run's ParentFlowId up a chain that is not this
+            // one's and raise the floors of ledgers this park has nothing to do with.
+            if (ancestor is not null
+                && (ancestor.Status != FlowRunStatus.Running || FlowStateRetention.Covers(ancestor, retainUntil)))
+            {
+                ancestor = await _store.LoadCurrentAsync(ancestorId, cancellationToken).ConfigureAwait(false);
+            }
+
             if (ancestor is null)
             {
                 _logger.LogWarning(
@@ -954,7 +969,14 @@ internal sealed class DurableFlowContext : IDurableFlowContext
         await _lease.ResolveUncertainSaveAsync(_state).ConfigureAwait(false);
         await NotifyStepAsync(static (o, e) => o.OnStepStartingAsync(e), name, DurableFlowStepKind.ChildFlow).ConfigureAwait(false);
 
-        var child = await _store.LoadAsync(childFlowId, cancellationToken).ConfigureAwait(false);
+        // Both child reads are current (IFlowStateStore.LoadCurrentAsync). What they return is
+        // validated and, when terminal, memoized into THIS parent's ledger — a write fenced by the
+        // parent's revision and lease, neither of which covers the child's ledger. A lagging copy
+        // under a reused child id showed the previous run: its failure was memoized and failed the
+        // parent for good while the current child was still running (its success let the parent
+        // go on without the child's result), and a copy bound to different work failed the
+        // ownership check terminally. Every replay answered from that memo.
+        var child = await _store.LoadCurrentAsync(childFlowId, cancellationToken).ConfigureAwait(false);
         if (child is null)
         {
             if (breadcrumb is not null)
@@ -985,7 +1007,7 @@ internal sealed class DurableFlowContext : IDurableFlowContext
             }
             else
             {
-                child = await _store.LoadAsync(childFlowId, cancellationToken).ConfigureAwait(false)
+                child = await _store.LoadCurrentAsync(childFlowId, cancellationToken).ConfigureAwait(false)
                     ?? throw new InvalidOperationException($"Child flow '{childFlowId}' was created concurrently but could not be loaded.");
                 ThrowIfChildMismatched<TFlow, TInput>(child, childFlowId, name, inputJson);
             }

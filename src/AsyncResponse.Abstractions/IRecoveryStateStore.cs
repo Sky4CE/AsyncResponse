@@ -18,7 +18,17 @@ public interface IRecoveryStateStore
         TimeSpan ttl,
         CancellationToken cancellationToken = default);
 
-    /// <summary>Loads every live recovery registration for <paramref name="correlationId"/>.</summary>
+    /// <summary>
+    /// Loads every live recovery registration for <paramref name="correlationId"/>. The answer is
+    /// all of them or none: the lost-subscriber dispatcher consumes what it returns and lets the
+    /// response be acknowledged, so a registration left out is a registration whose response is
+    /// gone.
+    /// </summary>
+    /// <exception cref="RecoveryStateUnreadableException">
+    /// A live registration for <paramref name="correlationId"/> — even one beside readable
+    /// siblings — cannot be interpreted by this build (malformed, an incomplete identity, or a
+    /// schema version outside <see cref="RecoveryStateSchema.IsReadable"/>).
+    /// </exception>
     Task<IReadOnlyList<RecoveryState>> GetAllAsync(
         string correlationId,
         CancellationToken cancellationToken = default);

@@ -18,7 +18,7 @@ namespace AsyncResponse.Channels.NATS;
 /// best-effort, while the bucket's <c>MaxAge</c> acts as a garbage-collection ceiling for orphans.
 /// </para>
 /// </summary>
-internal sealed class NatsRecoveryStateStore : IRecoveryStateStore, IRecoveryStateScanner
+internal sealed class NatsRecoveryStateStore : IRecoveryStateStore, IRecoveryStateScanner, IRecoveryStateBatchDeletion
 {
     private readonly INatsKvStore _store;
     private readonly ILogger<NatsRecoveryStateStore> _logger;
@@ -157,14 +157,16 @@ internal sealed class NatsRecoveryStateStore : IRecoveryStateStore, IRecoverySta
             states.Add(state!);
         }
 
-        // Registrations existed and none this build could INTERPRET survived. An empty list reads
-        // as "no recovery callback was ever armed", which the dispatcher answers by acknowledging
-        // the response — so a corrupt or newer-schema registration would consume a terminal response
-        // its callback never saw. A partially readable batch deliberately does not throw (see
-        // RecoveryStateUnreadableException), and neither does a row rejected for carrying ANOTHER
-        // correlation id: that row is readable and simply belongs elsewhere, so for the id actually
-        // asked about it is absence, not corruption.
-        if (unreadable > 0 && states.Count == 0)
+        // A live registration this build cannot INTERPRET refuses the whole lookup, readable
+        // siblings or not. An empty list reads as "no recovery callback was ever armed" and the
+        // readable rest as "these are all of them": either way the dispatcher consumed the response
+        // and the transport acknowledged it while the unreadable registration stayed armed with no
+        // payload left to deliver. Refused before any callback runs, redelivery or dead-lettering
+        // keeps the payload for a build or an operator that can resolve it (see
+        // RecoveryStateUnreadableException). A row rejected for carrying ANOTHER correlation id
+        // does not count: it is readable and simply belongs elsewhere, so for the id actually asked
+        // about it is absence, not corruption.
+        if (unreadable > 0)
             throw new RecoveryStateUnreadableException(correlationId, unreadable);
 
         return states;
@@ -178,9 +180,51 @@ internal sealed class NatsRecoveryStateStore : IRecoveryStateStore, IRecoverySta
             throw new ArgumentException("Registration id cannot be empty.", nameof(registrationId));
         cancellationToken.ThrowIfCancellationRequested();
 
+        var removed = await RemoveRegistrationsAsync(correlationId, candidate => candidate == registrationId, cancellationToken).ConfigureAwait(false);
+        if (removed is not null)
+            return removed > 0;
+
+        _logger.LogWarning(
+            "Recovery-state delete for correlationId {CorrelationId} registration {RegistrationId} exhausted {Attempts} optimistic attempts; leaving the registration for expiry.",
+            correlationId, registrationId, MaxCasAttempts);
+        return false;
+    }
+
+    /// <inheritdoc />
+    public async Task<int> TryDeleteManyAsync(string correlationId, IReadOnlyCollection<Guid> registrationIds, CancellationToken cancellationToken = default)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(correlationId);
+        ArgumentNullException.ThrowIfNull(registrationIds);
+        var targets = new HashSet<Guid>(registrationIds);
+        if (targets.Contains(Guid.Empty))
+            throw new ArgumentException("Registration ids cannot be empty.", nameof(registrationIds));
+        cancellationToken.ThrowIfCancellationRequested();
+        if (targets.Count == 0)
+            return 0;
+
+        // One read and one revision-conditioned rewrite for the whole set: deleting the
+        // registrations one at a time re-read, re-parsed and re-wrote everything that remained
+        // each time.
+        var removed = await RemoveRegistrationsAsync(correlationId, targets.Contains, cancellationToken).ConfigureAwait(false);
+        if (removed is not null)
+            return removed.Value;
+
+        _logger.LogWarning(
+            "Recovery-state delete for correlationId {CorrelationId} of {RegistrationCount} registration(s) exhausted {Attempts} optimistic attempts; leaving the registrations for expiry.",
+            correlationId, targets.Count, MaxCasAttempts);
+        return 0;
+    }
+
+    /// <summary>
+    /// Removes the registrations <paramref name="isTarget"/> selects in one revision-conditioned
+    /// rewrite of the shared envelope; returns how many were removed, or <c>null</c> when every
+    /// optimistic attempt lost to a concurrent writer.
+    /// </summary>
+    private async Task<int?> RemoveRegistrationsAsync(string correlationId, Func<Guid, bool> isTarget, CancellationToken cancellationToken)
+    {
         var key = NatsSubjectSchema.RecoveryKey(correlationId);
 
-        // Revision-conditioned removal: deleting one registration must not clobber a registration
+        // Revision-conditioned removal: deleting registrations must not clobber a registration
         // that another writer appended between our read and our write.
         for (var attempt = 0; attempt < MaxCasAttempts; attempt++)
         {
@@ -188,26 +232,26 @@ internal sealed class NatsRecoveryStateStore : IRecoveryStateStore, IRecoverySta
 
             var entry = await _store.GetAsync(key, cancellationToken).ConfigureAwait(false);
             if (entry is not { } existing)
-                return false;
+                return 0;
 
             var stored = TryDeserialize(existing.Value, key);
             if (stored is null)
-                return false;
+                return 0;
 
             if (IsExpired(stored))
             {
                 await TryDeleteSilentlyAsync(key, existing.Revision, cancellationToken).ConfigureAwait(false);
-                return false;
+                return 0;
             }
 
             var entries = EntriesFrom(stored);
-            // Same rule as SaveAsync: remove only the targeted registration, never a sibling this
+            // Same rule as SaveAsync: remove only the targeted registrations, never a sibling this
             // build merely cannot read — dropping those here also let the key be deleted outright
             // when they were the only survivors. Entries past their own expiry go too (they are
             // already invisible to every read), and the survivors keep their own stamps.
-            var removed = entries.RemoveAll(candidate => candidate.State is { } candidateState && candidateState.RegistrationId == registrationId) > 0;
-            if (!removed)
-                return false;
+            var removed = entries.RemoveAll(candidate => candidate.State is { } candidateState && isTarget(candidateState.RegistrationId));
+            if (removed == 0)
+                return 0;
 
             entries.RemoveAll(candidate => candidate.ExpiresAtUtc <= _timeProvider.GetUtcNow());
 
@@ -215,13 +259,10 @@ internal sealed class NatsRecoveryStateStore : IRecoveryStateStore, IRecoverySta
                 ? await _store.TryDeleteAsync(key, existing.Revision, cancellationToken).ConfigureAwait(false)
                 : await _store.TryUpdateAsync(key, SerializeStates(entries), existing.Revision, cancellationToken).ConfigureAwait(false);
             if (succeeded)
-                return true;
+                return removed;
         }
 
-        _logger.LogWarning(
-            "Recovery-state delete for correlationId {CorrelationId} registration {RegistrationId} exhausted {Attempts} optimistic attempts; leaving the registration for expiry.",
-            correlationId, registrationId, MaxCasAttempts);
-        return false;
+        return null;
     }
 
     /// <summary>
