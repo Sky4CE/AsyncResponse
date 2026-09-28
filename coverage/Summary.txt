@@ -1,6 +1,6 @@
 Summary - AsyncResponse (Release / net8.0+net10.0 / unit+integration)
-  Generated on: 09/28/2026 - 11:53:38
-  Coverage date: 09/28/2026 - 11:37:15 - 09/28/2026 - 11:53:10
+  Generated on: 09/28/2026 - 12:17:55
+  Coverage date: 09/28/2026 - 12:01:54 - 09/28/2026 - 12:17:28
   Parser: MultiReport (16x Cobertura)
   Assemblies: 27
   Classes: 506
@@ -10,13 +10,13 @@ Summary - AsyncResponse (Release / net8.0+net10.0 / unit+integration)
   Uncovered lines: 376
   Coverable lines: 37486
   Total lines: 75617
-  Branch coverage: 94.2% (14507 of 15391)
-  Covered branches: 14507
+  Branch coverage: 94.2% (14508 of 15391)
+  Covered branches: 14508
   Total branches: 15391
   Method coverage: 99.8% (4974 of 4979)
-  Full method coverage: 97.3% (4847 of 4979)
+  Full method coverage: 97.2% (4843 of 4979)
   Covered methods: 4974
-  Fully covered methods: 4847
+  Fully covered methods: 4843
   Total methods: 4979
 
 AsyncResponse.Abstractions                                                                                100%
@@ -89,7 +89,7 @@ AsyncResponse.Channels.NATS                                                     
   Microsoft.Extensions.DependencyInjection.NatsAsyncResponseChannelServiceCollectionExtensions            100%
 
 AsyncResponse.Channels.PostgreSQL                                                                        98.9%
-  AsyncResponse.Channels.DbAsyncResponseChannelBase                                                      98.2%
+  AsyncResponse.Channels.DbAsyncResponseChannelBase                                                      98.1%
   AsyncResponse.Channels.DbRecoveryStateStoreBase                                                         100%
   AsyncResponse.Channels.PostgreSQL.PostgreSqlAsyncResponseChannel                                        100%
   AsyncResponse.Channels.PostgreSQL.PostgreSqlAsyncResponseChannelOptions                                 100%
@@ -117,7 +117,7 @@ AsyncResponse.Channels.Redis                                                    
   Microsoft.Extensions.DependencyInjection.RedisAsyncResponseServiceCollectionExtensions                  100%
 
 AsyncResponse.Channels.SqlServer                                                                         99.3%
-  AsyncResponse.Channels.DbAsyncResponseChannelBase                                                      98.7%
+  AsyncResponse.Channels.DbAsyncResponseChannelBase                                                      98.8%
   AsyncResponse.Channels.DbRecoveryStateStoreBase                                                         100%
   AsyncResponse.Channels.SqlServer.SqlServerAsyncResponseChannel                                          100%
   AsyncResponse.Channels.SqlServer.SqlServerAsyncResponseChannelOptions                                   100%
@@ -292,14 +292,14 @@ AsyncResponse.DurableFlows.SqlServer                                            
   Microsoft.Extensions.DependencyInjection.SqlServerDurableFlowServiceCollectionExtensions                100%
 
 AsyncResponse.Testing                                                                                    99.7%
-  AsyncResponse.Testing.AsyncResponseTestHarness                                                         99.6%
+  AsyncResponse.Testing.AsyncResponseTestHarness                                                         99.3%
   AsyncResponse.Testing.AsyncResponseTestHarnessOptions                                                   100%
   AsyncResponse.Testing.FlowProbe                                                                         100%
   AsyncResponse.Testing.FlowProbeEvent                                                                    100%
   AsyncResponse.Testing.FlowRunHandle                                                                     100%
   AsyncResponse.Testing.FlowTestHarness                                                                   100%
   AsyncResponse.Testing.SimulatedCrashException                                                           100%
-  AsyncResponse.Testing.VirtualTimeProvider                                                              99.1%
+  AsyncResponse.Testing.VirtualTimeProvider                                                               100%
 
 AsyncResponse.Transports.AzureServiceBus                                                                 99.6%
   AsyncResponse.Transports.AzureServiceBus.AwaitingAzureServiceBusMessageDispatcher                       100%
