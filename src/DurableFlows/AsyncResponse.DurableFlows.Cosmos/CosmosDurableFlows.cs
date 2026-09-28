@@ -50,7 +50,7 @@ namespace Microsoft.Extensions.DependencyInjection
 namespace AsyncResponse.DurableFlows.Cosmos
 {
 /// <summary>Options for the Azure Cosmos DB durable-flow state store.</summary>
-public sealed class CosmosDurableFlowOptions : DurableFlowOptions
+public sealed class CosmosDurableFlowOptions : DurableFlowOptions, IFlowStateSizeCap
 {
     /// <summary>Optional Cosmos DB connection string used when no <see cref="CosmosClient"/> is registered.</summary>
     public string? ConnectionString { get; set; }
@@ -130,6 +130,7 @@ public sealed class CosmosDurableFlowOptions : DurableFlowOptions
         if (Throughput is <= 0)
             throw new InvalidOperationException($"{nameof(CosmosDurableFlowOptions)}.{nameof(Throughput)} must be positive when configured.");
         DurableFlowStoreShared.ValidateMaxStateBytes(MaxStateBytes, nameof(CosmosDurableFlowOptions));
+        DurableFlowStoreShared.ValidateLedgerWarningBelowCap(this, MaxStateBytes, nameof(CosmosDurableFlowOptions));
     }
 }
 

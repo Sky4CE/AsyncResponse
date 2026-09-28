@@ -115,19 +115,23 @@ earliest signal of stuck flows.
 
 Metrics and spans are recorded on the library's decision paths (after a worker job ran, after a lost
 response was routed), and a listener's callback runs on the recording thread. A `MeterListener`
-measurement callback, or an `ActivityListener` sampling or started callback, that throws costs
-**that measurement or span** and nothing else: every measurement goes through a guarded recorder and
-every span starts through a guarded helper. The waiter's `asyncresponse.wait` span is also stopped
-through a guarded helper, so a throwing stopped callback cannot fault the waiter's cleanup.
+measurement callback, or an `ActivityListener` sampling, started or **stopped** callback, that throws
+costs **that measurement or span** and nothing else: every measurement goes through a guarded
+recorder, and every span starts and ends through guarded helpers. A span's stopped callback runs
+when the span ends — after the work it describes is done — so an unguarded end turned a worker job
+that ran, a response that was published, or a recovery callback that was invoked into a failed
+delivery the transport redelivered, and the work ran again. Every operation span (publish, receive,
+ingress, worker execution, recovery dispatch, flow execution, watchdog scan) and the waiter's
+`asyncresponse.wait` span now end without letting that callback's exception escape, and the ambient
+span is restored to the one the operation started under.
 
 The same holds for log lines on those paths — the worker executor, the ingress, the recovery
 dispatcher, and `IDurableFlows.StartAsync`, which returns the id of
 the run it published even when the logging provider throws (Microsoft.Extensions.Logging rethrows a
 provider's failure).
 
-Two things remain the host's to keep healthy: the **stopped** callback of every other span (it runs
-when the span is disposed, unguarded), and observable gauges, which are read on the listener's own
-thread.
+One thing remains the host's to keep healthy: observable gauges, which are read on the listener's
+own thread.
 
 > **Not emitted:** broker/store-native queue depth and size (Redis key count, JetStream stream
 > backlog, Service Bus queue length, Pub/Sub subscription depth, database table row counts) — read

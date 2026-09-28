@@ -47,7 +47,9 @@ public sealed class NatsAsyncResponseChannelOptions : DurableAsyncResponseChanne
 
     /// <summary>
     /// Replica count for the recovery Key-Value bucket. Use a value greater than <c>1</c> on a NATS
-    /// cluster so recovery state survives a single node loss. Default: <c>1</c>.
+    /// cluster so recovery state survives a single node loss. Registrations are always read from the
+    /// bucket stream's leader, never through Direct Get, which any replica — one that has not applied
+    /// the latest write included — may answer. Default: <c>1</c>.
     /// </summary>
     public int RecoveryBucketReplicas { get; set; } = 1;
 

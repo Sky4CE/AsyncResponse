@@ -123,19 +123,60 @@ public class DurableFlowOptions
     public TimeSpan? MaxInProcessParkDuration { get; set; }
 
     /// <summary>
-    /// Ledger size, in bytes (estimated from the serialized input, step results, values, and
-    /// context), past which the executor logs a warning naming the flow — once when the threshold
-    /// is first crossed and again at each doubling, so a long run logs a handful of times, not once
-    /// per step. Every checkpoint rewrites the <em>whole</em> ledger, so persistence cost grows
-    /// with each completed step: a run of N steps with similar result sizes serializes about N²/2
-    /// step-results over its lifetime, and the store's <c>MaxStateBytes</c> (or the provider's
-    /// item cap) is the hard limit. The warning is the early signal to keep step results small
-    /// (persist large data yourself and pass references) or to partition a long history into child
-    /// flows. <c>null</c> disables it. Default: 512 KiB — under the smallest bundled hard cap (the
-    /// DynamoDB store's <c>MaxStateBytes</c>, 350 000 by default, below DynamoDB's 400 KB item cap)
-    /// users should lower it accordingly.
+    /// Ledger size, in bytes, past which the executor logs a warning naming the flow — once when the
+    /// threshold is first crossed and again at each doubling, so a long run logs a handful of times,
+    /// not once per step. The size is the UTF-8 length of the ledger as the store serialized it for
+    /// the write, the same bytes its <c>MaxStateBytes</c> judges; a custom store that does not
+    /// measure it is judged by a lower-bound estimate. Every checkpoint rewrites the <em>whole</em>
+    /// ledger, so persistence cost grows with each completed step: a run of N steps with similar
+    /// result sizes serializes about N²/2 step-results over its lifetime, and the store's
+    /// <c>MaxStateBytes</c> (or the provider's item cap) is the hard limit. The warning is the early
+    /// signal to keep step results small (persist large data yourself and pass references) or to
+    /// partition a long history into child flows. <c>null</c> disables it. Must be positive. Default:
+    /// 512 KiB; the DynamoDB store's options default it to 256 KiB, under that store's 350 000-byte
+    /// <c>MaxStateBytes</c>.
+    /// <para>
+    /// A threshold at or above the store's <c>MaxStateBytes</c> could never fire before the cap
+    /// refuses a checkpoint. Left at its default, it is lowered to three quarters of the cap; set
+    /// explicitly, the bundled stores refuse it when they validate their options.
+    /// </para>
     /// </summary>
-    public long? LedgerSizeWarningBytes { get; set; } = 512 * 1024;
+    public long? LedgerSizeWarningBytes
+    {
+        get => _ledgerSizeWarningBytes;
+        set
+        {
+            _ledgerSizeWarningBytes = value;
+            LedgerSizeWarningBytesConfigured = true;
+        }
+    }
+
+    private long? _ledgerSizeWarningBytes = 512 * 1024;
+
+    /// <summary>
+    /// Whether the application chose <see cref="LedgerSizeWarningBytes"/>: a value it set is
+    /// validated against the store's cap, a default is fitted under it (see
+    /// <see cref="EffectiveLedgerSizeWarningBytes"/>).
+    /// </summary>
+    internal bool LedgerSizeWarningBytesConfigured { get; private set; }
+
+    /// <summary>A store's own default for <see cref="LedgerSizeWarningBytes"/>, which does not count as the application's choice.</summary>
+    internal void SetLedgerSizeWarningBytesDefault(long? value) => _ledgerSizeWarningBytes = value;
+
+    /// <summary>
+    /// The threshold the ledger-growth warning uses: <see cref="LedgerSizeWarningBytes"/>, except
+    /// that a default at or above the store's <see cref="IFlowStateSizeCap.MaxStateBytes"/> is
+    /// lowered to three quarters of the cap. The 512 KiB default sat above the DynamoDB store's
+    /// 350 000-byte cap, and above any smaller cap an application configured on another store, so
+    /// a growing ledger was refused before it was ever warned about.
+    /// </summary>
+    internal long? EffectiveLedgerSizeWarningBytes
+        => _ledgerSizeWarningBytes is { } warning
+            && !LedgerSizeWarningBytesConfigured
+            && this is IFlowStateSizeCap { MaxStateBytes: { } cap }
+            && warning >= cap
+                ? cap - cap / 4
+                : _ledgerSizeWarningBytes;
 
     /// <summary>
     /// Maximum distinct steps retained in one run. Default: 256. A new step beyond this budget
@@ -174,4 +215,14 @@ public class DurableFlowOptions
         if (MaxInProcessParkDuration is { } park)
             AsyncResponseChannelOptions.EnsureTimerBacked(park, nameof(DurableFlowOptions), nameof(MaxInProcessParkDuration));
     }
+}
+
+/// <summary>
+/// Options of a durable-flow store that refuses a ledger over a serialized size, so the ledger-growth
+/// warning can be fitted under that cap (see <see cref="DurableFlowOptions.EffectiveLedgerSizeWarningBytes"/>).
+/// </summary>
+internal interface IFlowStateSizeCap
+{
+    /// <summary>The store's serialized-ledger budget in bytes; <c>null</c> when unlimited.</summary>
+    long? MaxStateBytes { get; }
 }

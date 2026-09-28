@@ -167,7 +167,8 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
             return;
         }
 
-        using var activity = AsyncResponseDiagnostics.StartActivity("asyncresponse.flow.execute");
+        var activity = AsyncResponseDiagnostics.StartActivity("asyncresponse.flow.execute");
+        using var spanStop = AsyncResponseDiagnostics.StopOnExit(activity);
         activity?.SetTag("asyncresponse.flow_id", flowId);
         activity?.SetTag("asyncresponse.flow_type", AsyncResponseTypeResolution.DescribeForDiagnostics(state.FlowTypeName));
 
@@ -825,7 +826,7 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
         var lastStatus = FlowRunStatus.Running;
         string? recoveredStep = null;
         FlowState? checkpointedState = null;
-        long estimateBefore = 0;
+        long sizeBefore = 0;
 
         bool CheckpointRecovered(FlowState state)
         {
@@ -848,7 +849,7 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
             if (pending.Value is null)
                 return false;
 
-            estimateBefore = FlowStateJson.EstimateLedgerChars(state);
+            sizeBefore = FlowStateSize.Take(state);
             pending.Value.Completed = true;
             pending.Value.ResultJson = SerializeRecoveredResult(payload, pending.Value.PendingPayloadTypeFullName);
             pending.Value.PendingCorrelationId = null;
@@ -910,7 +911,7 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
 
         // A recovered response can be the write that takes the ledger past a warning band, and no
         // context saw it: the next execution seeds its warning above the ledger's new size.
-        DurableFlowContext.WarnIfWriteCrossedLedgerWarning(_logger, _options, checkpointedState!, estimateBefore);
+        DurableFlowContext.WarnIfWriteCrossedLedgerWarning(_logger, _options, checkpointedState!, sizeBefore);
 
         // The completion recorded here is the ONLY chance observers get to see this step finish:
         // the replayed execution short-circuits the now-memoized step without notifying. Notified

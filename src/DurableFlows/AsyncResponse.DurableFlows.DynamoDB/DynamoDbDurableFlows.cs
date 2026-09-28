@@ -42,8 +42,15 @@ namespace Microsoft.Extensions.DependencyInjection
 namespace AsyncResponse.DurableFlows.DynamoDB
 {
 /// <summary>Options for the DynamoDB durable-flow state store.</summary>
-public sealed class DynamoDbDurableFlowOptions : DurableFlowOptions
+public sealed class DynamoDbDurableFlowOptions : DurableFlowOptions, IFlowStateSizeCap
 {
+    /// <summary>
+    /// Creates the options with this store's defaults. <see cref="DurableFlowOptions.LedgerSizeWarningBytes"/>
+    /// defaults to 256 KiB here rather than the general 512 KiB, which sits above
+    /// <see cref="MaxStateBytes"/>: a growing ledger was refused before its first warning.
+    /// </summary>
+    public DynamoDbDurableFlowOptions() => SetLedgerSizeWarningBytesDefault(256 * 1024);
+
     /// <summary>Table storing one durable-flow ledger item per flow id.</summary>
     public string TableName { get; set; } = "AsyncResponseFlowState";
 
@@ -93,6 +100,7 @@ public sealed class DynamoDbDurableFlowOptions : DurableFlowOptions
                 $"'{DynamoDbFlowStateStore.LeaseIdAttribute}', '{DynamoDbFlowStateStore.LeaseExpiresAtAttribute}').");
         }
         DurableFlowStoreShared.ValidateMaxStateBytes(MaxStateBytes, nameof(DynamoDbDurableFlowOptions));
+        DurableFlowStoreShared.ValidateLedgerWarningBelowCap(this, MaxStateBytes, nameof(DynamoDbDurableFlowOptions));
     }
 }
 

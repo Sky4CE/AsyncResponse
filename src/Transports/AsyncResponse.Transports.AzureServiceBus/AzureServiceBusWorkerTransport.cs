@@ -109,10 +109,11 @@ public sealed class AzureServiceBusWorkerTransport : IWorkerTransport, IDelayedW
     {
         ArgumentNullException.ThrowIfNull(job);
 
-        using var activity = AsyncResponseDiagnostics.StartActivity(
+        var activity = AsyncResponseDiagnostics.StartActivity(
             "asyncresponse.worker.publish",
             ActivityKind.Producer,
             job.CorrelationId);
+        using var spanStop = AsyncResponseDiagnostics.StopOnExit(activity);
         activity?.SetTag("asyncresponse.transport", "azure_service_bus");
         activity?.SetTag("messaging.system", "azure_service_bus");
         activity?.SetTag("messaging.destination.name", _options.WorkerQueue);

@@ -392,29 +392,18 @@ public class NatsKvStoreAdapterTests
     [Fact]
     public async Task GetAsync_ReturnsValue_OrNullWhenMissingOrDeleted()
     {
-        _store.Setup(s => s.GetEntryAsync<string>("hit", It.IsAny<ulong>(), It.IsAny<INatsDeserialize<string>>(), It.IsAny<CancellationToken>()))
-            .ReturnsAsync(new NatsKVEntry<string>("bucket", "hit") { Value = "value" });
-        _store.Setup(s => s.GetEntryAsync<string>("missing", It.IsAny<ulong>(), It.IsAny<INatsDeserialize<string>>(), It.IsAny<CancellationToken>()))
-            .ThrowsAsync(new NatsKVKeyNotFoundException());
-        _store.Setup(s => s.GetEntryAsync<string>("deleted", It.IsAny<ulong>(), It.IsAny<INatsDeserialize<string>>(), It.IsAny<CancellationToken>()))
-            .ThrowsAsync(new NatsKVKeyDeletedException(revision: 1));
+        var leader = new NatsKvLeaderStream().Attach(_context);
+        leader.Value("hit", "value", revision: 5);
+        leader.Nothing("missing");
+        leader.Marker("deleted", revision: 1, "KV-Operation: DEL");
         var adapter = CreateAdapter();
 
         var hit = await adapter.GetAsync("hit", CancellationToken.None);
         Assert.NotNull(hit);
         Assert.Equal("value", hit.Value.Value);
+        Assert.Equal(5UL, hit.Value.Revision);
         Assert.Null(await adapter.GetAsync("missing", CancellationToken.None));
         Assert.Null(await adapter.GetAsync("deleted", CancellationToken.None));
-    }
-
-    [Fact]
-    public async Task GetAsync_NullEntryValue_ReturnsNull()
-    {
-        _store.Setup(s => s.GetEntryAsync<string>("null", It.IsAny<ulong>(), It.IsAny<INatsDeserialize<string>>(), It.IsAny<CancellationToken>()))
-            .ReturnsAsync(new NatsKVEntry<string>("bucket", "null") { Value = null });
-        var adapter = CreateAdapter();
-
-        Assert.Null(await adapter.GetAsync("null", CancellationToken.None));
     }
 
     private static NatsResult<ulong> WrongLastRevision()
@@ -427,8 +416,7 @@ public class NatsKvStoreAdapterTests
             .ReturnsAsync(new NatsResult<ulong>(1UL));
         _store.Setup(s => s.TryUpdateAsync("existing", "v", 0UL, It.IsAny<INatsSerialize<string>>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync(WrongLastRevision());
-        _store.Setup(s => s.TryGetEntryAsync<string>("existing", It.IsAny<ulong>(), It.IsAny<INatsDeserialize<string>>(), It.IsAny<CancellationToken>()))
-            .ReturnsAsync(new NatsResult<NatsKVEntry<string>>(new NatsKVEntry<string>("bucket", "existing") { Value = "live", Revision = 3 }));
+        new NatsKvLeaderStream().Attach(_context).Value("existing", "live", revision: 3);
         _store.Setup(s => s.TryUpdateAsync("hit", "v2", 3UL, It.IsAny<INatsSerialize<string>>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync(new NatsResult<ulong>(2UL));
         _store.Setup(s => s.TryUpdateAsync("stale", "v2", 3UL, It.IsAny<INatsSerialize<string>>(), It.IsAny<CancellationToken>()))
@@ -448,8 +436,7 @@ public class NatsKvStoreAdapterTests
         // it; like the SDK's own create, the value is written over the marker at its revision.
         _store.Setup(s => s.TryUpdateAsync("reused", "v", 0UL, It.IsAny<INatsSerialize<string>>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync(WrongLastRevision());
-        _store.Setup(s => s.TryGetEntryAsync<string>("reused", It.IsAny<ulong>(), It.IsAny<INatsDeserialize<string>>(), It.IsAny<CancellationToken>()))
-            .ReturnsAsync(new NatsResult<NatsKVEntry<string>>(new NatsKVKeyDeletedException(revision: 7)));
+        new NatsKvLeaderStream().Attach(_context).Marker("reused", revision: 7, "KV-Operation: DEL");
         _store.Setup(s => s.TryUpdateAsync("reused", "v", 7UL, It.IsAny<INatsSerialize<string>>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync(new NatsResult<ulong>(8UL));
         var adapter = CreateAdapter();

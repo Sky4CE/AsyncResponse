@@ -1007,7 +1007,8 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
 
     private async Task SetResponseCore<T>(T response, string correlationId, CancellationToken cancellationToken)
     {
-        using var activity = AsyncResponseDiagnostics.StartActivity("asyncresponse.set_response", ActivityKind.Producer);
+        var activity = AsyncResponseDiagnostics.StartActivity("asyncresponse.set_response", ActivityKind.Producer);
+        using var spanStop = AsyncResponseDiagnostics.StopOnExit(activity);
         activity?.SetTag("asyncresponse.channel", "nats");
         AsyncResponseDiagnostics.SetPayloadType(activity, typeof(T));
 
@@ -1099,7 +1100,8 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
 
     private async Task SetRawResponseJsonCore(string responseJson, string correlationId, CancellationToken cancellationToken)
     {
-        using var activity = AsyncResponseDiagnostics.StartActivity("asyncresponse.ingress.raw_response", ActivityKind.Producer);
+        var activity = AsyncResponseDiagnostics.StartActivity("asyncresponse.ingress.raw_response", ActivityKind.Producer);
+        using var spanStop = AsyncResponseDiagnostics.StopOnExit(activity);
         activity?.SetTag("asyncresponse.channel", "nats");
 
         AsyncResponseDiagnostics.SetCorrelationId(activity, correlationId);
@@ -1192,7 +1194,8 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
     {
         ArgumentNullException.ThrowIfNull(exception);
 
-        using var activity = AsyncResponseDiagnostics.StartActivity("asyncresponse.set_exception", ActivityKind.Producer);
+        var activity = AsyncResponseDiagnostics.StartActivity("asyncresponse.set_exception", ActivityKind.Producer);
+        using var spanStop = AsyncResponseDiagnostics.StopOnExit(activity);
         activity?.SetTag("asyncresponse.channel", "nats");
         activity?.SetTag("asyncresponse.exception_type", exception.GetType().FullName ?? exception.GetType().Name);
 

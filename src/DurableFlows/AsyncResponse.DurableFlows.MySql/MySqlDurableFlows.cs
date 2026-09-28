@@ -28,7 +28,7 @@ namespace Microsoft.Extensions.DependencyInjection
 namespace AsyncResponse.DurableFlows.MySql
 {
 /// <summary>Options for the MySQL/MariaDB durable-flow state store.</summary>
-public sealed class MySqlDurableFlowOptions : DurableFlowOptions
+public sealed class MySqlDurableFlowOptions : DurableFlowOptions, IFlowStateSizeCap
 {
     /// <summary>MySQL or MariaDB connection string. Required.</summary>
     public string? ConnectionString { get; set; }
@@ -72,6 +72,7 @@ public sealed class MySqlDurableFlowOptions : DurableFlowOptions
         DurableFlowStoreShared.ValidateConnectionString(ConnectionString, nameof(MySqlDurableFlowOptions));
         DurableFlowStoreShared.ValidateIdentifier(TableName, $"{nameof(MySqlDurableFlowOptions)}.{nameof(TableName)}", "MySQL", identifierCap: 64);
         DurableFlowStoreShared.ValidateMaxStateBytes(MaxStateBytes, nameof(MySqlDurableFlowOptions));
+        DurableFlowStoreShared.ValidateLedgerWarningBelowCap(this, MaxStateBytes, nameof(MySqlDurableFlowOptions));
         DurableFlowStoreShared.ValidatePruneBudget(PruneBudget, nameof(MySqlDurableFlowOptions));
     }
 }

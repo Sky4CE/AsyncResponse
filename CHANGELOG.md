@@ -13,6 +13,50 @@ work that has landed on `main` but not yet shipped. Security reporters credited 
 
 ### Changed
 
+- **Round-50 review (2026-09-28, external review of `8e7420f`): NATS recovery reads come from
+  the bucket's leader, a DynamoDB ledger is warned about before its cap refuses it, and a
+  telemetry listener's stopped callback can no longer fail work that already happened.**
+  - *Recovery — NATS channel.* NATS.Net creates every KV bucket with Direct Get enabled and its
+    `GetEntryAsync` reads through it, and on a replicated bucket any replica may answer a Direct
+    Get — including a follower that has not applied a registration the leader already
+    acknowledged. Recovery reads decide whether a response is acknowledged: a lagging follower's
+    "not found" read as "no recovery callback was armed", the dispatcher ran nothing, the transport
+    acknowledged the response, and the registration stayed armed with no payload left to deliver.
+    Every registration read (the lookup, a save's read-modify-write, the conflict check of a create)
+    now goes through JetStream's message-get API, which only the stream leader answers, with the
+    client's interpretation of the entry kept: the revision is the message's stream sequence, and
+    a `KV-Operation` of `DEL`/`PURGE` or a server `Nats-Marker-Reason` is a deleted key. A read
+    that cannot reach the leader fails, so the delivery is retried instead of acknowledged; a
+    present but empty value is refused as unreadable rather than read as absent.
+    **Upgrading:** a NATS user with restricted permissions needs
+    `$JS.API.STREAM.MSG.GET.KV_{RecoveryBucket}` (Direct Get's `$JS.API.DIRECT.GET.…` is no longer
+    used); without it every registration read times out. Recovery reads now all land on the
+    bucket's leader.
+  - *Durable flows — ledger growth warning — behaviour change.* `LedgerSizeWarningBytes` defaulted
+    to 512 KiB for every store, above the DynamoDB store's 350 000-byte `MaxStateBytes`, so a
+    gradually growing DynamoDB ledger was refused before its first warning. And the warning judged
+    a character count of the strings the ledger carries, while the cap judges the UTF-8 bytes of
+    the serialized ledger — JSON escaping of step results made the stored size several times the
+    estimate. `DynamoDbDurableFlowOptions` now defaults `LedgerSizeWarningBytes` to 256 KiB; every
+    bundled store records the UTF-8 size of each ledger it reads or serializes for a write, and the
+    warning judges that measurement (a custom store that measures nothing is still judged by the
+    estimate). A threshold at or above a store's `MaxStateBytes` could never fire before the cap:
+    left at its default it is now lowered to three quarters of the cap (so a small
+    `MaxStateBytes` on any store keeps a working warning), and set explicitly it is refused when
+    the store validates its options. **Upgrading:** an application that sets
+    `LedgerSizeWarningBytes` at or above its store's `MaxStateBytes` now fails validation at
+    startup — lower it below the cap, leave it unset, or set it to `null`. Warnings now report, and
+    are triggered by, stored bytes, so a ledger heavy in escaped text warns earlier than before.
+  - *Telemetry.* Operation spans were ended by a raw `Activity.Dispose()`, which runs every
+    `ActivityListener`'s stopped callback inline, after the work the span describes: a callback
+    that threw turned a worker job that ran, a response that was published, an enqueue that was
+    queued, or a recovery callback that was invoked into a failure — the transport redelivered and
+    the work ran again (for a recovery dispatch, the registration was kept and its callback invoked
+    a second time). Every operation span — the transports' publish and receive spans, the ingress,
+    worker execution, recovery dispatch, the channels' publish spans, flow execution and the
+    watchdog scan — now ends through the same guarded stop as the waiter's span, which swallows the
+    callback's exception and restores the ambient span the operation started under.
+
 - **Round-49 review (2026-09-28, external review of `b483b65`): a parent no longer settles on a
   stale child outcome, a response is not acknowledged while any of its recovery registrations is
   unreadable, and a recovery fan-out on Redis or NATS removes what it consumed in one write.**

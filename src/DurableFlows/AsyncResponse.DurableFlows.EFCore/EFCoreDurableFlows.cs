@@ -43,7 +43,7 @@ namespace Microsoft.Extensions.DependencyInjection
 namespace AsyncResponse.DurableFlows.EFCore
 {
 /// <summary>Options for the Entity Framework Core durable-flow state store.</summary>
-public sealed class EFCoreDurableFlowOptions : DurableFlowOptions
+public sealed class EFCoreDurableFlowOptions : DurableFlowOptions, IFlowStateSizeCap
 {
     /// <summary>
     /// How often <see cref="EFCoreFlowStateStore{TContext}.TryCreateAsync"/> opportunistically runs a
@@ -274,6 +274,7 @@ public sealed class EFCoreFlowStateStore<[DynamicallyAccessedMembers(Dynamically
         _options = options.Value;
         _logger = logger;
         DurableFlowStoreShared.ValidateMaxStateBytes(_options.MaxStateBytes, nameof(EFCoreDurableFlowOptions));
+        DurableFlowStoreShared.ValidateLedgerWarningBelowCap(_options, _options.MaxStateBytes, nameof(EFCoreDurableFlowOptions));
         DurableFlowStoreShared.ValidatePruneBudget(_options.PruneBudget, nameof(EFCoreDurableFlowOptions));
     }
 

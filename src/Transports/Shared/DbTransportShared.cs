@@ -458,9 +458,10 @@ internal abstract class DbMessageDispatcherBase : IAsyncDisposable
     // Single choke point for handler execution so both ACK modes emit the consumer receive span.
     private async Task ExecuteHandlerAsync(DbTransportDelivery delivery, CancellationToken cancellationToken)
     {
-        using var activity = AsyncResponseDiagnostics.StartActivity(
+        var activity = AsyncResponseDiagnostics.StartActivity(
             _receiveActivityName,
             System.Diagnostics.ActivityKind.Consumer);
+        using var spanStop = AsyncResponseDiagnostics.StopOnExit(activity);
         activity?.SetTag("asyncresponse.transport", _transportTag);
         activity?.SetTag(_roleTagName, _role.ToString());
         activity?.SetTag(_ackModeTagName, _subscriberOptions.AckMode.ToString());

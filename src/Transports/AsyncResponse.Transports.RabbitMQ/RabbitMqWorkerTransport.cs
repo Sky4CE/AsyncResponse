@@ -185,10 +185,11 @@ public sealed class RabbitMqWorkerTransport : IWorkerTransport, IWorkerTransport
     {
         ArgumentNullException.ThrowIfNull(job);
 
-        using var activity = AsyncResponseDiagnostics.StartActivity(
+        var activity = AsyncResponseDiagnostics.StartActivity(
             "asyncresponse.worker.publish",
             ActivityKind.Producer,
             job.CorrelationId);
+        using var spanStop = AsyncResponseDiagnostics.StopOnExit(activity);
         activity?.SetTag("asyncresponse.transport", "rabbitmq");
         activity?.SetTag("messaging.system", "rabbitmq");
         activity?.SetTag("messaging.destination.name", _options.WorkerExchange);

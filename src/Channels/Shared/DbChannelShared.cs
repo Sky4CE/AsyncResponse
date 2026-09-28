@@ -373,7 +373,8 @@ internal abstract class DbAsyncResponseChannelBase :
 
     private async Task SetResponseCore<T>(T response, string correlationId, CancellationToken cancellationToken)
     {
-        using var activity = AsyncResponseDiagnostics.StartActivity("asyncresponse.set_response", ActivityKind.Producer);
+        var activity = AsyncResponseDiagnostics.StartActivity("asyncresponse.set_response", ActivityKind.Producer);
+        using var spanStop = AsyncResponseDiagnostics.StopOnExit(activity);
         activity?.SetTag("asyncresponse.channel", _activityTag);
         AsyncResponseDiagnostics.SetPayloadType(activity, typeof(T));
         AsyncResponseDiagnostics.SetCorrelationId(activity, correlationId);
@@ -409,7 +410,8 @@ internal abstract class DbAsyncResponseChannelBase :
 
     private async Task SetRawResponseJsonCore(string responseJson, string correlationId, CancellationToken cancellationToken)
     {
-        using var activity = AsyncResponseDiagnostics.StartActivity("asyncresponse.ingress.raw_response", ActivityKind.Producer);
+        var activity = AsyncResponseDiagnostics.StartActivity("asyncresponse.ingress.raw_response", ActivityKind.Producer);
+        using var spanStop = AsyncResponseDiagnostics.StopOnExit(activity);
         activity?.SetTag("asyncresponse.channel", _activityTag);
         AsyncResponseDiagnostics.SetCorrelationId(activity, correlationId);
 
@@ -518,7 +520,8 @@ internal abstract class DbAsyncResponseChannelBase :
     {
         ArgumentNullException.ThrowIfNull(exception);
 
-        using var activity = AsyncResponseDiagnostics.StartActivity("asyncresponse.set_exception", ActivityKind.Producer);
+        var activity = AsyncResponseDiagnostics.StartActivity("asyncresponse.set_exception", ActivityKind.Producer);
+        using var spanStop = AsyncResponseDiagnostics.StopOnExit(activity);
         activity?.SetTag("asyncresponse.channel", _activityTag);
         activity?.SetTag("asyncresponse.exception_type", exception.GetType().FullName ?? exception.GetType().Name);
         AsyncResponseDiagnostics.SetCorrelationId(activity, correlationId);

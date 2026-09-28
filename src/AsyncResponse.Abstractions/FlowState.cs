@@ -109,6 +109,13 @@ public sealed class FlowState
     /// expiry. Ignored once the run is terminal.
     /// </summary>
     public DateTime? RetainUntilUtc { get; set; }
+
+    /// <summary>
+    /// The UTF-8 size of the JSON a store last read for, or serialized from, this instance, until
+    /// the ledger-growth warning takes it (Core's <c>FlowStateSize</c>). Never persisted.
+    /// </summary>
+    [JsonIgnore]
+    internal long? MeasuredUtf8Bytes { get; set; }
 }
 
 /// <summary>One step's checkpoint inside <see cref="FlowState"/>.</summary>

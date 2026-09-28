@@ -60,7 +60,7 @@ namespace Microsoft.Extensions.DependencyInjection
 namespace AsyncResponse.DurableFlows.MongoDB
 {
 /// <summary>Options for the MongoDB durable-flow state store.</summary>
-public sealed class MongoDbDurableFlowOptions : DurableFlowOptions
+public sealed class MongoDbDurableFlowOptions : DurableFlowOptions, IFlowStateSizeCap
 {
     /// <summary>Optional MongoDB connection string used when no <see cref="IMongoDatabase"/> is registered.</summary>
     public string? ConnectionString { get; set; }
@@ -106,6 +106,7 @@ public sealed class MongoDbDurableFlowOptions : DurableFlowOptions
             throw new InvalidOperationException(
                 $"{nameof(MongoDbDurableFlowOptions)}.{nameof(CollectionName)} '{CollectionName}' is reserved for the cross-component ownership ledger.");
         DurableFlowStoreShared.ValidateMaxStateBytes(MaxStateBytes, nameof(MongoDbDurableFlowOptions));
+        DurableFlowStoreShared.ValidateLedgerWarningBelowCap(this, MaxStateBytes, nameof(MongoDbDurableFlowOptions));
     }
 }
 

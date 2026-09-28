@@ -369,7 +369,12 @@ Recovery state lives in the durable channel's store and survives a redeploy:
   concurrent registrations for one correlation id all survive. Registrations are keyed by
   correlation id only, not by `SubjectPrefix`, so deployments sharing one NATS system each need their
   own `RecoveryBucket`. The bucket is created on first use only if it does not exist; an existing one
-  is used as is, with drift reported when first opened. Each completed waiter leaves a KV delete
+  is used as is, with drift reported when first opened. Every read goes to the bucket stream's
+  **leader** (JetStream's message-get API), not NATS.Net's Direct Get: the client creates KV buckets
+  with Direct Get enabled, and on a replicated bucket any replica may answer one — including a
+  follower that has not yet applied a registration the leader already acknowledged, whose "not
+  found" would let the response be acknowledged with no callback run. A read that cannot reach the
+  leader fails, and the delivery is retried. Each completed waiter leaves a KV delete
   marker, which the watchdog scan purges once it is 30 minutes old (bounded by the marker's own
   sequence, so it never removes a registration written after it).
 

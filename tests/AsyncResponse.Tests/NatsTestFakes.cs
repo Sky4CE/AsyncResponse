@@ -1,8 +1,13 @@
 using AsyncResponse.Channels.NATS;
 using AsyncResponse.Transports.NATS;
 using Microsoft.Extensions.Logging;
+using Moq;
+using NATS.Client.JetStream;
+using NATS.Client.JetStream.Models;
+using NATS.Client.KeyValueStore;
 using System.Collections.Concurrent;
 using System.Runtime.CompilerServices;
+using System.Text;
 using System.Threading.Channels;
 
 namespace AsyncResponse.Tests;
@@ -59,6 +64,70 @@ internal sealed class TestTimeProvider : TimeProvider
     public DateTimeOffset Now { get; set; } = new DateTimeOffset(2026, 1, 1, 0, 0, 0, TimeSpan.Zero);
     public override DateTimeOffset GetUtcNow() => Now;
     public void Advance(TimeSpan by) => Now += by;
+}
+
+/// <summary>
+/// The recovery bucket's backing stream as <see cref="NatsKvStoreAdapter"/> reads it: every read is
+/// a message get (<c>$JS.API.STREAM.MSG.GET</c>, answered by the stream leader) for the key's
+/// subject, never the client's Direct Get. <see cref="Attach"/> wires it into a mocked KV context;
+/// then script what the leader holds per key.
+/// </summary>
+internal sealed class NatsKvLeaderStream
+{
+    private string _bucket = "asyncresponse-recovery";
+
+    public Mock<INatsJSContext> JetStream { get; } = new();
+
+    public Mock<INatsJSStream> Stream { get; } = new();
+
+    public NatsKvLeaderStream Attach(Mock<INatsKVContext> context, string bucket = "asyncresponse-recovery")
+    {
+        _bucket = bucket;
+        context.SetupGet(c => c.JetStreamContext).Returns(JetStream.Object);
+        JetStream.Setup(j => j.GetStreamAsync("KV_" + bucket, It.IsAny<StreamInfoRequest?>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(Stream.Object);
+        return this;
+    }
+
+    /// <summary>The key's latest message is a value written at <paramref name="revision"/>.</summary>
+    public void Value(string key, string value, ulong revision)
+        => Latest(key, revision, Encoding.UTF8.GetBytes(value), headers: null);
+
+    /// <summary>The key's latest message is a marker carrying <paramref name="headers"/> (e.g. <c>KV-Operation: DEL</c>).</summary>
+    public void Marker(string key, ulong revision, params string[] headers)
+        => Latest(key, revision, default, EncodeHeaders(headers));
+
+    /// <summary>The key's subject has no message at all: JetStream answers 404 / 10037 "no message found".</summary>
+    public void Nothing(string key)
+        => Stream.Setup(s => s.GetAsync(ForKey(key), It.IsAny<CancellationToken>()))
+            .ThrowsAsync(new NatsJSApiException(new ApiError { Code = 404, ErrCode = 10037, Description = "no message found" }));
+
+    public void Fails(string key, Exception error)
+        => Stream.Setup(s => s.GetAsync(ForKey(key), It.IsAny<CancellationToken>())).ThrowsAsync(error);
+
+    public void Latest(string key, ulong revision, ReadOnlyMemory<byte> data, string? headers)
+        => Stream.Setup(s => s.GetAsync(ForKey(key), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new StreamMsgGetResponse
+            {
+                Message = new StoredMessage
+                {
+                    Subject = $"$KV.{_bucket}.{key}",
+                    Seq = revision,
+                    Data = data,
+                    Time = DateTimeOffset.UtcNow,
+                    Hdrs = headers
+                }
+            });
+
+    /// <summary>A NATS header block as the message-get API returns it: base64 of <c>NATS/1.0</c> plus the header lines.</summary>
+    public static string EncodeHeaders(params string[] headers)
+        => Convert.ToBase64String(Encoding.UTF8.GetBytes("NATS/1.0\r\n" + string.Concat(headers.Select(h => h + "\r\n")) + "\r\n"));
+
+    private StreamMsgGetRequest ForKey(string key)
+    {
+        var subject = $"$KV.{_bucket}.{key}";
+        return It.Is<StreamMsgGetRequest>(r => r.LastBySubj == subject && r.Seq == 0 && r.NextBySubj == null);
+    }
 }
 
 /// <summary>

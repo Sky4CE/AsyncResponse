@@ -207,9 +207,10 @@ internal abstract class GooglePubSubMessageDispatcher : IAsyncDisposable
         CancellationToken cancellationToken,
         bool logFailures = true)
     {
-        using var activity = AsyncResponseDiagnostics.StartActivity(
+        var activity = AsyncResponseDiagnostics.StartActivity(
             "asyncresponse.pubsub.receive",
             ActivityKind.Consumer);
+        using var spanStop = AsyncResponseDiagnostics.StopOnExit(activity);
         activity?.SetTag("asyncresponse.transport", "google_pubsub");
         activity?.SetTag("asyncresponse.pubsub.role", _role.ToString());
         activity?.SetTag("asyncresponse.pubsub.ack_mode", _subscriberOptions.AckMode.ToString());

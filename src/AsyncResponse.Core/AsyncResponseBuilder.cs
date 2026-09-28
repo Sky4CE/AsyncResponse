@@ -179,10 +179,11 @@ internal abstract class AsyncResponseBuilderBase(
         ReflectionCallDtoGuard.ThrowIfMalformed(work, nameof(work));
         cancellationToken.ThrowIfCancellationRequested();
 
-        using var activity = AsyncResponseDiagnostics.StartActivity(
+        var activity = AsyncResponseDiagnostics.StartActivity(
             "asyncresponse.enqueue_worker",
             ActivityKind.Producer,
             AsyncResponseContext.CorrelationId);
+        using var spanStop = AsyncResponseDiagnostics.StopOnExit(activity);
         AsyncResponseDiagnostics.SetWorker(activity, work);
         AsyncResponseDiagnostics.SetReplyTarget(activity, AsyncResponseContext.ReplyTarget);
 

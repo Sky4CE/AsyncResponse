@@ -52,7 +52,7 @@ namespace Microsoft.Extensions.DependencyInjection
 namespace AsyncResponse.DurableFlows.PostgreSQL
 {
 /// <summary>Options for the PostgreSQL durable-flow state store.</summary>
-public sealed class PostgreSqlDurableFlowOptions : DurableFlowOptions
+public sealed class PostgreSqlDurableFlowOptions : DurableFlowOptions, IFlowStateSizeCap
 {
     /// <summary>Optional PostgreSQL connection string used when no <see cref="NpgsqlDataSource"/> is registered.</summary>
     public string? ConnectionString { get; set; }
@@ -106,6 +106,7 @@ public sealed class PostgreSqlDurableFlowOptions : DurableFlowOptions
             throw new InvalidOperationException(
                 $"{nameof(PostgreSqlDurableFlowOptions)}.{nameof(TableName)} '{TableName}' collides with its derived expiry-index name; rename the table.");
         DurableFlowStoreShared.ValidateMaxStateBytes(MaxStateBytes, nameof(PostgreSqlDurableFlowOptions));
+        DurableFlowStoreShared.ValidateLedgerWarningBelowCap(this, MaxStateBytes, nameof(PostgreSqlDurableFlowOptions));
         DurableFlowStoreShared.ValidatePruneBudget(PruneBudget, nameof(PostgreSqlDurableFlowOptions));
     }
 }

@@ -287,10 +287,29 @@ public static class AsyncResponseDiagnostics
     }
 
     /// <summary>
-    /// Ends a span that outlives the call that started it (a waiter's <c>asyncresponse.wait</c>,
-    /// ended in its one-shot cleanup). An ActivityListener's stopped callback runs inside the stop;
-    /// one that throws costs the span's export, not the cleanup that ends it — a fault there was
-    /// cached by the cleanup and rethrown by every later dispose of the waiter.
+    /// Ends an operation's span when the scope that started it exits, through
+    /// <see cref="StopActivity"/>: <c>var activity = StartActivity(...);</c> followed by
+    /// <c>using var spanStop = StopOnExit(activity);</c>. Never <c>using var activity =
+    /// StartActivity(...)</c>: a raw <see cref="Activity.Dispose()"/> runs every ActivityListener's
+    /// stopped callback inline, and one that threw escaped after the operation had finished — a
+    /// worker job that ran, a response that was published, a recovery callback that was invoked
+    /// all reported as failed, and the transport redelivered work that had already happened.
+    /// </summary>
+    internal static ActivityStopScope StopOnExit(Activity? activity) => new(activity);
+
+    /// <summary>The <c>using</c> handle <see cref="StopOnExit"/> returns.</summary>
+    internal readonly struct ActivityStopScope(Activity? activity) : IDisposable
+    {
+        public void Dispose() => StopActivity(activity);
+    }
+
+    /// <summary>
+    /// Ends a span without letting telemetry change the outcome: an ActivityListener's stopped
+    /// callback runs inside the stop, and one that throws costs the span's export, not the
+    /// operation or the cleanup that ends it. Operation spans end here through
+    /// <see cref="StopOnExit"/>; a span that outlives the call that started it (a waiter's
+    /// <c>asyncresponse.wait</c>, ended in its one-shot cleanup) is passed here directly — a fault
+    /// there was cached by the cleanup and rethrown by every later dispose of the waiter.
     /// </summary>
     internal static void StopActivity(Activity? activity)
     {

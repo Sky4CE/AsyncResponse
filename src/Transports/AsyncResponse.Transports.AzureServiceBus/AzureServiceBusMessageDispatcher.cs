@@ -135,9 +135,10 @@ internal abstract class AzureServiceBusMessageDispatcher : IAsyncDisposable
         CancellationToken cancellationToken,
         bool logFailures = true)
     {
-        using var activity = AsyncResponseDiagnostics.StartActivity(
+        var activity = AsyncResponseDiagnostics.StartActivity(
             "asyncresponse.azure_service_bus.receive",
             ActivityKind.Consumer);
+        using var spanStop = AsyncResponseDiagnostics.StopOnExit(activity);
         activity?.SetTag("asyncresponse.transport", "azure_service_bus");
         activity?.SetTag("asyncresponse.azure_service_bus.role", _role.ToString());
         activity?.SetTag("asyncresponse.azure_service_bus.ack_mode", _subscriberOptions.AckMode.ToString());

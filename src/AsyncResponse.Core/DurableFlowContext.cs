@@ -58,9 +58,10 @@ internal sealed class DurableFlowContext : IDurableFlowContext
     private static readonly AsyncLocal<StepToken?> ActiveStepOwner = new();
     private DateTime _lastPersistenceUtc;
 
-    // The next ledger-size estimate (in chars) that logs the growth warning; long.MaxValue when
-    // the warning is disabled. Doubles after every warning so a long run logs O(log n) times.
-    private long _nextLedgerSizeWarningChars;
+    // The next ledger size (in bytes, as FlowStateSize reports it) that logs the growth warning;
+    // long.MaxValue when the warning is disabled. Doubles after every warning so a long run logs
+    // O(log n) times.
+    private long _nextLedgerSizeWarning;
 
     /// <summary>
     /// The deepest child-flow nesting a long park supports (see
@@ -95,7 +96,7 @@ internal sealed class DurableFlowContext : IDurableFlowContext
         _builder = builder;
         _propagation = propagation;
         _options = options;
-        _nextLedgerSizeWarningChars = InitialLedgerWarningChars(options.LedgerSizeWarningBytes, state);
+        _nextLedgerSizeWarning = InitialLedgerWarningSize(options.EffectiveLedgerSizeWarningBytes, state);
         _subscriber = subscriber;
         _recoverableSubscriber = recoverableSubscriber;
         _logger = logger;
@@ -109,7 +110,7 @@ internal sealed class DurableFlowContext : IDurableFlowContext
 
         // A ledger its start already made large (a 600 KiB input against the 512 KiB default) is
         // past the threshold before anything is saved: warned here, on the run's first execution,
-        // or not at all — later executions start at the next doubling (see InitialLedgerWarningChars).
+        // or not at all — later executions start at the next doubling (see InitialLedgerWarningSize).
         if (state.Attempts <= 1)
             WarnIfLedgerLarge();
     }
@@ -1826,7 +1827,7 @@ internal sealed class DurableFlowContext : IDurableFlowContext
         var applied = false;
         string? skipReason = null;
         FlowState? written = null;
-        long estimateBefore = 0;
+        long sizeBefore = 0;
 
         try
         {
@@ -1869,7 +1870,7 @@ internal sealed class DurableFlowContext : IDurableFlowContext
                         return false;
                     }
 
-                    estimateBefore = FlowStateJson.EstimateLedgerChars(state);
+                    sizeBefore = FlowStateSize.Take(state);
                     current.Completed = true;
                     current.ResultJson = resultJson;
                     current.PendingCorrelationId = null;
@@ -1885,7 +1886,7 @@ internal sealed class DurableFlowContext : IDurableFlowContext
 
             if (applied)
             {
-                WarnIfWriteCrossedLedgerWarning(_logger, _options, written!, estimateBefore);
+                WarnIfWriteCrossedLedgerWarning(_logger, _options, written!, sizeBefore);
                 _logger.LogWarning(
                     "Flow {FlowId} lost its execution lease while step '{Step}' held a claimed response for correlationId {CorrelationId}; the response was checkpointed without the lease so the takeover resumes from it.",
                     FlowId,
@@ -1965,7 +1966,7 @@ internal sealed class DurableFlowContext : IDurableFlowContext
     /// executions, by a write outside any context's saves, is warned by that write
     /// (<see cref="WarnIfWriteCrossedLedgerWarning"/>).
     /// </summary>
-    private static long InitialLedgerWarningChars(long? threshold, FlowState state)
+    private static long InitialLedgerWarningSize(long? threshold, FlowState state)
     {
         if (threshold is not { } next)
             return long.MaxValue;
@@ -1973,7 +1974,7 @@ internal sealed class DurableFlowContext : IDurableFlowContext
         if (state.Attempts <= 1)
             return next;
 
-        return NextLedgerWarningBand(next, FlowStateJson.EstimateLedgerChars(state));
+        return NextLedgerWarningBand(next, FlowStateSize.Take(state));
     }
 
     /// <summary>The first doubling of <paramref name="threshold"/> above <paramref name="estimate"/>, saturating.</summary>
@@ -1994,24 +1995,24 @@ internal sealed class DurableFlowContext : IDurableFlowContext
     /// The growth warning for a ledger write made outside a context's own saves: a lease-less
     /// checkpoint (a recovered response, a response won after the lease was lost). The next
     /// execution seeds its first warning at the
-    /// next doubling above the ledger's size (see <see cref="InitialLedgerWarningChars"/>), so a
+    /// next doubling above the ledger's size (see <see cref="InitialLedgerWarningSize"/>), so a
     /// crossing such a write makes is logged here or never: when the write took the estimate from
     /// below a doubling of the threshold to at or past it.
     /// </summary>
-    internal static void WarnIfWriteCrossedLedgerWarning(ILogger logger, DurableFlowOptions options, FlowState written, long estimateBefore)
+    internal static void WarnIfWriteCrossedLedgerWarning(ILogger logger, DurableFlowOptions options, FlowState written, long sizeBefore)
     {
-        if (options.LedgerSizeWarningBytes is not { } threshold)
+        if (options.EffectiveLedgerSizeWarningBytes is not { } threshold)
             return;
 
-        var estimate = FlowStateJson.EstimateLedgerChars(written);
-        if (estimate >= NextLedgerWarningBand(threshold, estimateBefore))
-            LogLedgerLarge(logger, written, estimate, threshold);
+        var size = FlowStateSize.Take(written);
+        if (size >= NextLedgerWarningBand(threshold, sizeBefore))
+            LogLedgerLarge(logger, written, size, threshold);
     }
 
     /// <summary>
     /// The growth warning for the executor's own save of this execution's ledger — a retriable
     /// failure's message — judged exactly like this context's saves: against the band seeded from
-    /// the ledger as this execution loaded it (see <see cref="InitialLedgerWarningChars"/>) and
+    /// the ledger as this execution loaded it (see <see cref="InitialLedgerWarningSize"/>) and
     /// raised by every warning since. A crossing only that message makes is warned once, by the
     /// attempt that first persists it; a redelivery that fails the same way writes the same message
     /// back and loads a ledger already that large, so it does not repeat the warning. Measuring the
@@ -2029,18 +2030,20 @@ internal sealed class DurableFlowContext : IDurableFlowContext
     /// </summary>
     private void WarnIfLedgerLarge()
     {
-        if (_nextLedgerSizeWarningChars == long.MaxValue)
+        if (_nextLedgerSizeWarning == long.MaxValue)
             return;
 
-        var estimate = FlowStateJson.EstimateLedgerChars(_state);
-        if (estimate < _nextLedgerSizeWarningChars)
+        // The size the store measured for the write that just happened (see FlowStateSize) — the
+        // same bytes its MaxStateBytes cap judges, so the warning fires before the cap does.
+        var size = FlowStateSize.Take(_state);
+        if (size < _nextLedgerSizeWarning)
             return;
 
-        LogLedgerLarge(_logger, _state, estimate, _options.LedgerSizeWarningBytes);
+        LogLedgerLarge(_logger, _state, size, _options.EffectiveLedgerSizeWarningBytes);
 
         // Next warning at the next doubling of the CURRENT size (a single huge result may have
         // skipped several thresholds at once), saturating instead of overflowing.
-        _nextLedgerSizeWarningChars = estimate > long.MaxValue / 2 ? long.MaxValue - 1 : estimate * 2;
+        _nextLedgerSizeWarning = size > long.MaxValue / 2 ? long.MaxValue - 1 : size * 2;
     }
 
     private static void LogLedgerLarge(ILogger logger, FlowState state, long estimate, long? threshold)

@@ -219,10 +219,11 @@ internal abstract class RedisMessageDispatcher : IAsyncDisposable
         CancellationToken cancellationToken,
         bool logFailures = true)
     {
-        using var activity = AsyncResponseDiagnostics.StartActivity(
+        var activity = AsyncResponseDiagnostics.StartActivity(
             "asyncresponse.redis.receive",
             ActivityKind.Consumer,
             delivery.CorrelationId);
+        using var spanStop = AsyncResponseDiagnostics.StopOnExit(activity);
         activity?.SetTag("asyncresponse.transport", "redis");
         activity?.SetTag("asyncresponse.redis.role", _role.ToString());
         activity?.SetTag("asyncresponse.redis.ack_mode", _subscriberOptions.AckMode.ToString());

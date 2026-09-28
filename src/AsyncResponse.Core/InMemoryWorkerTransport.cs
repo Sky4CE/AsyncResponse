@@ -591,10 +591,11 @@ public sealed class InMemoryWorkerTransport : IWorkerTransport, IDelayedWorkerTr
         ArgumentNullException.ThrowIfNull(job);
         job = MaterializeFromWire(job);
 
-        using var activity = AsyncResponseDiagnostics.StartActivity(
+        var activity = AsyncResponseDiagnostics.StartActivity(
             "asyncresponse.worker.publish",
             ActivityKind.Producer,
             job.CorrelationId);
+        using var spanStop = AsyncResponseDiagnostics.StopOnExit(activity);
         activity?.SetTag("asyncresponse.transport", "inmemory");
         AsyncResponseDiagnostics.SetReplyTarget(activity, job.ReplyTarget);
         AsyncResponseDiagnostics.SetWorker(activity, job.Call);
@@ -717,10 +718,11 @@ public sealed class InMemoryWorkerTransport : IWorkerTransport, IDelayedWorkerTr
     private void ScheduleDelayed(QueuedJob queued, TimeSpan delay, bool holdsSlot = true)
     {
         var job = queued.Job;
-        using var activity = AsyncResponseDiagnostics.StartActivity(
+        var activity = AsyncResponseDiagnostics.StartActivity(
             "asyncresponse.worker.publish",
             ActivityKind.Producer,
             job.CorrelationId);
+        using var spanStop = AsyncResponseDiagnostics.StopOnExit(activity);
         activity?.SetTag("asyncresponse.transport", "inmemory");
         activity?.SetTag("asyncresponse.worker.delay_seconds", delay.TotalSeconds);
         AsyncResponseDiagnostics.SetReplyTarget(activity, job.ReplyTarget);

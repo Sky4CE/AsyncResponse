@@ -205,10 +205,11 @@ internal sealed class WorkerJobExecutor(
             }
         }
 
-        using var activity = AsyncResponseDiagnostics.StartActivity(
+        var activity = AsyncResponseDiagnostics.StartActivity(
             "asyncresponse.worker.execute",
             ActivityKind.Consumer,
             job.CorrelationId);
+        using var spanStop = AsyncResponseDiagnostics.StopOnExit(activity);
         AsyncResponseDiagnostics.SetReplyTarget(activity, job.ReplyTarget);
         AsyncResponseDiagnostics.SetWorker(activity, job.Call);
 

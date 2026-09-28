@@ -6,6 +6,7 @@ using NATS.Client.KeyValueStore;
 using NATS.Net;
 using System.Collections.Concurrent;
 using System.Runtime.CompilerServices;
+using System.Text;
 using System.Threading.Channels;
 
 namespace AsyncResponse.Channels.NATS;
@@ -324,6 +325,7 @@ internal sealed class NatsKvStoreAdapter(INatsKVContext _kvContext, NatsAsyncRes
 
     private readonly SemaphoreSlim _initGate = new(1, 1);
     private INatsKVStore? _store;
+    private INatsJSStream? _stream;
 
     /// <summary>
     /// Creates <paramref name="key"/> only when absent: a revision-0 conditional write, made here
@@ -344,18 +346,15 @@ internal sealed class NatsKvStoreAdapter(INatsKVContext _kvContext, NatsAsyncRes
 
         // The key's subject already has a last revision: a live value (the conflict), or the
         // delete marker a removal left behind, which — as the SDK's create does — is written over
-        // at the marker's own revision.
-        var current = await store.TryGetEntryAsync<string>(key, cancellationToken: cancellationToken).ConfigureAwait(false);
-        if (current.Success)
-            return false;
-        if (current.Error is NatsKVKeyDeletedException deleted)
-            return ConditionalWriteSucceeded(await store.TryUpdateAsync(key, value, deleted.Revision, cancellationToken: cancellationToken).ConfigureAwait(false));
+        // at the marker's own revision. Read from the leader (see ReadLatestAsync): a replica
+        // lagging behind the conflict would report "not found" and the save would retry blind.
+        var current = await ReadLatestAsync(key, cancellationToken).ConfigureAwait(false);
+        if (current.Deleted)
+            return ConditionalWriteSucceeded(await store.TryUpdateAsync(key, value, current.Revision, cancellationToken: cancellationToken).ConfigureAwait(false));
 
-        // Purged between the write and the read: a conflict the caller's re-read resolves.
-        if (current.Error is NatsKVKeyNotFoundException)
-            return false;
-
-        throw current.Error;
+        // A live value is the conflict; nothing at all means the key was purged between the write
+        // and the read — a conflict the caller's re-read resolves.
+        return false;
     }
 
     /// <summary>Runs the TryUpdateAsync operation.</summary>
@@ -382,24 +381,119 @@ internal sealed class NatsKvStoreAdapter(INatsKVContext _kvContext, NatsAsyncRes
         throw result.Error;
     }
 
-    /// <summary>Runs the GetAsync operation.</summary>
+    /// <summary>
+    /// The key's current entry, read from the bucket stream's leader (see
+    /// <see cref="ReadLatestAsync"/>); <c>null</c> when the key has no message or its latest
+    /// message is a delete or purge marker.
+    /// </summary>
     public async Task<NatsKvEntry?> GetAsync(string key, CancellationToken cancellationToken)
     {
-        var store = await GetStoreAsync(cancellationToken).ConfigureAwait(false);
+        var latest = await ReadLatestAsync(key, cancellationToken).ConfigureAwait(false);
+        return latest.Value is { } value ? new NatsKvEntry(value, latest.Revision) : null;
+    }
+
+    // JetStream ApiError.ErrCode for "no message found" — the subject has no message at all.
+    private const int NoMessageFoundErrCode = 10037;
+
+    private const string OperationHeader = "KV-Operation";
+    private const string MarkerReasonHeader = "Nats-Marker-Reason";
+
+    /// <summary>
+    /// The latest message on the key's subject, fetched with JetStream's message-get API
+    /// (<c>$JS.API.STREAM.MSG.GET</c>), which only the stream's leader answers.
+    /// <para>
+    /// Not NATS.Net's <c>GetEntryAsync</c>: the client creates every KV stream with
+    /// <c>AllowDirect</c> and reads it with Direct Get, which ANY replica of a replicated bucket
+    /// may answer — including a follower that has not applied a write the leader already
+    /// acknowledged. Recovery reads decide whether a delivery is acknowledged: a follower that
+    /// had not seen a registration yet answered "absent", the dispatcher found no callback to run,
+    /// and the transport acknowledged the response while the registration stayed armed with no
+    /// payload left to deliver. Every read here is current or it fails, and a failure propagates,
+    /// so the delivery stays retryable. The client's reading of the entry is kept: its revision is
+    /// the message's stream sequence, and a <c>KV-Operation</c> of <c>DEL</c> or <c>PURGE</c> — or,
+    /// without one, a server <c>Nats-Marker-Reason</c> — marks the key deleted.
+    /// </para>
+    /// </summary>
+    private async Task<LatestEntry> ReadLatestAsync(string key, CancellationToken cancellationToken)
+    {
+        var stream = await GetStreamAsync(cancellationToken).ConfigureAwait(false);
+        StreamMsgGetResponse response;
         try
         {
-            var entry = await store.GetEntryAsync<string>(key, cancellationToken: cancellationToken).ConfigureAwait(false);
-            return entry.Value is null ? null : new NatsKvEntry(entry.Value, entry.Revision);
+            response = await stream.GetAsync(
+                new StreamMsgGetRequest { LastBySubj = "$KV." + _options.RecoveryBucket + "." + key },
+                cancellationToken).ConfigureAwait(false);
         }
-        catch (NatsKVKeyNotFoundException)
+        catch (NatsJSApiException ex) when (ex.Error.ErrCode == NoMessageFoundErrCode)
         {
-            return null;
+            return default;
         }
-        catch (NatsKVKeyDeletedException)
-        {
-            return null;
-        }
+
+        var message = response.Message;
+        return IsDeleteMarker(message.Hdrs)
+            ? new LatestEntry(null, message.Seq, Deleted: true)
+            : new LatestEntry(Encoding.UTF8.GetString(message.Data.Span), message.Seq, Deleted: false);
     }
+
+    /// <summary>
+    /// Whether the headers of a stored message (base64 of the raw <c>NATS/1.0</c> header block, as
+    /// the message-get API returns them) mark a KV delete — interpreted as NATS.Net interprets a
+    /// Direct Get's headers. A marker this build cannot interpret (an unknown value, or a
+    /// <c>KV-Operation</c> header repeated, which the client rejects too) throws rather than
+    /// reading as a value or as absence.
+    /// </summary>
+    internal static bool IsDeleteMarker(string? encodedHeaders)
+    {
+        if (string.IsNullOrEmpty(encodedHeaders))
+            return false;
+
+        string? operation = null;
+        string? markerReason = null;
+        var block = Encoding.UTF8.GetString(Convert.FromBase64String(encodedHeaders));
+        foreach (var line in block.Split("\r\n").Skip(1))
+        {
+            var colon = line.IndexOf(':');
+            if (colon <= 0)
+                continue;
+
+            var name = line.AsSpan(0, colon).Trim();
+            if (name.Equals(OperationHeader, StringComparison.OrdinalIgnoreCase))
+            {
+                if (operation is not null)
+                    throw new InvalidOperationException($"The NATS KV entry carries more than one {OperationHeader} header.");
+
+                operation = line[(colon + 1)..].Trim();
+            }
+            else if (name.Equals(MarkerReasonHeader, StringComparison.OrdinalIgnoreCase))
+                markerReason = line[(colon + 1)..].Trim();
+        }
+
+        if (operation is not null)
+        {
+            if (operation.Equals("DEL", StringComparison.OrdinalIgnoreCase) || operation.Equals("PURGE", StringComparison.OrdinalIgnoreCase))
+                return true;
+            if (operation.Equals("PUT", StringComparison.OrdinalIgnoreCase))
+                return false;
+
+            throw new InvalidOperationException($"The NATS KV entry carries an unknown {OperationHeader} header value '{DiagnosticText.EscapedExcerpt(operation, 64)}'.");
+        }
+
+        if (markerReason is not null)
+        {
+            if (markerReason is "MaxAge" or "Purge" or "Remove")
+                return true;
+
+            throw new InvalidOperationException($"The NATS KV entry carries an unknown {MarkerReasonHeader} header value '{DiagnosticText.EscapedExcerpt(markerReason, 64)}'.");
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// A key's latest message: a value (<see cref="Value"/> set), a delete marker
+    /// (<see cref="Deleted"/>) — both at the message's revision — or neither (no message at all).
+    /// </summary>
+    private readonly record struct LatestEntry(string? Value, ulong Revision, bool Deleted);
 
     /// <summary>Runs the TryDeleteAsync operation.</summary>
     public async Task<bool> TryDeleteAsync(string key, ulong expectedRevision, CancellationToken cancellationToken)
@@ -511,6 +605,30 @@ internal sealed class NatsKvStoreAdapter(INatsKVContext _kvContext, NatsAsyncRes
         }
 
         return _store;
+    }
+
+    /// <summary>
+    /// The bucket's backing stream (<c>KV_{RecoveryBucket}</c>), for the leader-served reads of
+    /// <see cref="ReadLatestAsync"/>. Resolved after the bucket is opened or created, and only once
+    /// that succeeded: a failed lookup is retried by the next read.
+    /// </summary>
+    private async ValueTask<INatsJSStream> GetStreamAsync(CancellationToken cancellationToken)
+    {
+        if (_stream is not null)
+            return _stream;
+
+        await GetStoreAsync(cancellationToken).ConfigureAwait(false);
+        await _initGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            _stream ??= await _kvContext.JetStreamContext.GetStreamAsync("KV_" + _options.RecoveryBucket, cancellationToken: cancellationToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            _initGate.Release();
+        }
+
+        return _stream;
     }
 
     /// <summary>

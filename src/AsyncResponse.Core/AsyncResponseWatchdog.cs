@@ -523,7 +523,8 @@ internal sealed class AsyncResponseWatchdog : BackgroundService
 
     private async Task<AsyncResponseWatchdogReport> ScanOnceAsync(CancellationToken cancellationToken)
     {
-        using var activity = AsyncResponseDiagnostics.StartActivity("asyncresponse.watchdog.scan");
+        var activity = AsyncResponseDiagnostics.StartActivity("asyncresponse.watchdog.scan");
+        using var spanStop = AsyncResponseDiagnostics.StopOnExit(activity);
 
         try
         {

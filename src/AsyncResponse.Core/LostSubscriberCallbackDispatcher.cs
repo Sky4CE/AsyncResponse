@@ -391,9 +391,10 @@ internal sealed class LostSubscriberCallbackDispatcher(
     /// <summary>Dispatches a successfully published payload that no subscriber received.</summary>
     public async Task<LostSubscriberDispatchResult> DispatchLostResponse<T>(RecoveryState? recoveryState, T response, string channel)
     {
-        using var activity = AsyncResponseDiagnostics.StartActivity(
+        var activity = AsyncResponseDiagnostics.StartActivity(
             "asyncresponse.lost_subscriber.dispatch",
             correlationId: recoveryState?.CorrelationId);
+        using var spanStop = AsyncResponseDiagnostics.StopOnExit(activity);
         activity?.SetTag("asyncresponse.lost_subscriber.kind", "response");
         activity?.SetTag("asyncresponse.channel_name", channel);
 
@@ -517,9 +518,10 @@ internal sealed class LostSubscriberCallbackDispatcher(
     /// <summary>Dispatches an exception envelope that no subscriber received.</summary>
     public async Task<bool> DispatchLostException(RecoveryState? recoveryState, Exception exception, string channel)
     {
-        using var activity = AsyncResponseDiagnostics.StartActivity(
+        var activity = AsyncResponseDiagnostics.StartActivity(
             "asyncresponse.lost_subscriber.dispatch",
             correlationId: recoveryState?.CorrelationId);
+        using var spanStop = AsyncResponseDiagnostics.StopOnExit(activity);
         activity?.SetTag("asyncresponse.lost_subscriber.kind", "exception");
         activity?.SetTag("asyncresponse.channel_name", channel);
         activity?.SetTag("asyncresponse.exception_type", exception.GetType().FullName ?? exception.GetType().Name);

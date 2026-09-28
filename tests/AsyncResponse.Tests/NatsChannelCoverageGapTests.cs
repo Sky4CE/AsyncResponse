@@ -276,11 +276,10 @@ public sealed class NatsChannelCoverageGapTests
     [Fact]
     public async Task KvAdapter_TryCreate_AKeyPurgedBetweenTheWriteAndTheRead_IsAConflict()
     {
-        var (adapter, store) = KvAdapter();
+        var (adapter, store, leader) = KvAdapter();
         store.Setup(s => s.TryUpdateAsync("k", "v", 0UL, It.IsAny<INatsSerialize<string>>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync(WrongLastRevision());
-        store.Setup(s => s.TryGetEntryAsync<string>("k", It.IsAny<ulong>(), It.IsAny<INatsDeserialize<string>>(), It.IsAny<CancellationToken>()))
-            .ReturnsAsync(new NatsResult<NatsKVEntry<string>>(new NatsKVKeyNotFoundException()));
+        leader.Nothing("k");
 
         Assert.False(await adapter.TryCreateAsync("k", "v", CancellationToken.None));
     }
@@ -288,14 +287,13 @@ public sealed class NatsChannelCoverageGapTests
     [Fact]
     public async Task KvAdapter_TryCreate_AReReadRejection_IsThrownNotReadAsAConflict()
     {
-        var (adapter, store) = KvAdapter();
-        var rejection = new NatsKVException("permission denied");
+        var (adapter, store, leader) = KvAdapter();
+        var rejection = new NatsJSApiException(new ApiError { Code = 403, ErrCode = 10000, Description = "permission denied" });
         store.Setup(s => s.TryUpdateAsync("k", "v", 0UL, It.IsAny<INatsSerialize<string>>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync(WrongLastRevision());
-        store.Setup(s => s.TryGetEntryAsync<string>("k", It.IsAny<ulong>(), It.IsAny<INatsDeserialize<string>>(), It.IsAny<CancellationToken>()))
-            .ReturnsAsync(new NatsResult<NatsKVEntry<string>>(rejection));
+        leader.Fails("k", rejection);
 
-        Assert.Same(rejection, await Assert.ThrowsAsync<NatsKVException>(() => adapter.TryCreateAsync("k", "v", CancellationToken.None)));
+        Assert.Same(rejection, await Assert.ThrowsAsync<NatsJSApiException>(() => adapter.TryCreateAsync("k", "v", CancellationToken.None)));
     }
 
     [Fact]
@@ -409,12 +407,13 @@ public sealed class NatsChannelCoverageGapTests
             },
             AsyncResponseEnvelopeOptions<OperationResult>.Instance);
 
-    private static (NatsKvStoreAdapter Adapter, Mock<INatsKVStore> Store) KvAdapter()
+    private static (NatsKvStoreAdapter Adapter, Mock<INatsKVStore> Store, NatsKvLeaderStream Leader) KvAdapter()
     {
         var context = new Mock<INatsKVContext>();
         var store = new Mock<INatsKVStore>();
         context.Setup(c => c.GetStoreAsync(It.IsAny<string>(), It.IsAny<CancellationToken>())).ReturnsAsync(store.Object);
-        return (new NatsKvStoreAdapter(context.Object, new NatsAsyncResponseChannelOptions()), store);
+        var leader = new NatsKvLeaderStream().Attach(context);
+        return (new NatsKvStoreAdapter(context.Object, new NatsAsyncResponseChannelOptions()), store, leader);
     }
 
     private static NatsResult<ulong> WrongLastRevision()

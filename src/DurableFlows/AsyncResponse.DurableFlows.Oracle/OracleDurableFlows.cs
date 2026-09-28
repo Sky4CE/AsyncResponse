@@ -28,7 +28,7 @@ namespace Microsoft.Extensions.DependencyInjection
 namespace AsyncResponse.DurableFlows.Oracle
 {
 /// <summary>Options for the Oracle durable-flow state store.</summary>
-public sealed class OracleDurableFlowOptions : DurableFlowOptions
+public sealed class OracleDurableFlowOptions : DurableFlowOptions, IFlowStateSizeCap
 {
     /// <summary>Oracle connection string. Required.</summary>
     public string? ConnectionString { get; set; }
@@ -81,6 +81,7 @@ public sealed class OracleDurableFlowOptions : DurableFlowOptions
             throw new InvalidOperationException(
                 $"{nameof(OracleDurableFlowOptions)}.{nameof(TableName)} '{TableName}' collides with its derived expiry-index name; rename the table.");
         DurableFlowStoreShared.ValidateMaxStateBytes(MaxStateBytes, nameof(OracleDurableFlowOptions));
+        DurableFlowStoreShared.ValidateLedgerWarningBelowCap(this, MaxStateBytes, nameof(OracleDurableFlowOptions));
         DurableFlowStoreShared.ValidatePruneBudget(PruneBudget, nameof(OracleDurableFlowOptions));
     }
 }

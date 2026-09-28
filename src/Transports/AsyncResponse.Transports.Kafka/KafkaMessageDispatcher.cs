@@ -367,10 +367,11 @@ internal abstract class KafkaMessageDispatcher : IAsyncDisposable
         CancellationToken cancellationToken,
         bool logFailures = true)
     {
-        using var activity = AsyncResponseDiagnostics.StartActivity(
+        var activity = AsyncResponseDiagnostics.StartActivity(
             "asyncresponse.kafka.receive",
             ActivityKind.Consumer,
             delivery.CorrelationId);
+        using var spanStop = AsyncResponseDiagnostics.StopOnExit(activity);
         activity?.SetTag("asyncresponse.transport", "kafka");
         activity?.SetTag("asyncresponse.kafka.role", _role.ToString());
         activity?.SetTag("asyncresponse.kafka.ack_mode", _subscriberOptions.AckMode.ToString());

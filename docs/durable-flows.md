@@ -527,8 +527,12 @@ lifetime (100 steps of 1 KiB: ~6 MB written for a 115 KB final ledger; 400 steps
   step's side effects or trigger; replays of existing checkpoints stay valid, including ledgers
   already past the limit. Raise it (or set `null`) only after measuring; never delete checkpoints
   to make room — that replays their side effects.
-- **`DurableFlowOptions.LedgerSizeWarningBytes`** (default 512 KiB, `null` disables) logs a warning
-  naming the flow when its estimated size first crosses the threshold and again at each doubling.
+- **`DurableFlowOptions.LedgerSizeWarningBytes`** (default 512 KiB — 256 KiB on DynamoDB — `null`
+  disables) logs a warning naming the flow when its size first crosses the threshold and again at
+  each doubling. The size is what the store measured for the write: the UTF-8 bytes of the
+  serialized ledger, the same bytes `MaxStateBytes` judges. (It used to be a character count of the
+  strings the ledger carries, which JSON escaping can leave far below the stored size.) A custom
+  store that does not measure is judged by that lower-bound estimate.
   The warning comes from whichever write first records the crossing — the first execution for an
   initial ledger already past it, the recovery write for a response checkpointed without the lease,
   the first failing attempt for a retried failure's message.
@@ -537,8 +541,10 @@ lifetime (100 steps of 1 KiB: ~6 MB written for a 115 KB final ledger; 400 steps
   under Cosmos DB's 2 MB, 15 000 000 under MongoDB's 16 MB); the relational and EF Core stores
   leave it unset (`null`) unless you configure one. An oversized write fails with
   `FlowStateTooLargeException` (`FlowId`, `SerializedSizeBytes`, `MaxStateBytes`) instead of a raw
-  provider error. On DynamoDB the 350 KB cap is below the 512 KiB warning, so lower the warning
-  threshold there.
+  provider error. A `LedgerSizeWarningBytes` at or above a store's `MaxStateBytes` could never fire
+  before the cap refused a checkpoint: left at its default it is lowered to three quarters of the
+  cap (and the DynamoDB store's default is 256 KiB, under its 350 KB cap), while a value you set
+  there is refused when the store validates its options at startup.
 
 Measured with the production serializer, retaining about 1 KiB per step and serializing once after
 each step — four times the steps cost about sixteen times the bytes:
@@ -567,7 +573,7 @@ built and tested for — outside them the persistence cost arrives well before t
 
 | Budget | Supported | What happens past it |
 |---|---|---|
-| Ledger size | ≤ `LedgerSizeWarningBytes` (512 KiB by default; ≤ 350 KB on DynamoDB) | The warning fires at the threshold and each doubling. A checkpoint over `MaxStateBytes` is refused with `FlowStateTooLargeException`: the attempt fails and is retried under the transport's redelivery bound, then dead-lettered where the transport has a dead-letter destination (the run stays `Running`, and a step body whose checkpoint was refused runs again on each redelivery) — the dead-letter queue is the alarm. RabbitMQ classic queues requeue without limit by default and the in-memory transport drops the job after `MaxDeliveryAttempts`, so bound the attempts and configure a dead-letter destination wherever this alarm matters. |
+| Ledger size | ≤ `LedgerSizeWarningBytes` (512 KiB by default; 256 KiB on DynamoDB, whose cap is 350 KB) | The warning fires at the threshold and each doubling. A checkpoint over `MaxStateBytes` is refused with `FlowStateTooLargeException`: the attempt fails and is retried under the transport's redelivery bound, then dead-lettered where the transport has a dead-letter destination (the run stays `Running`, and a step body whose checkpoint was refused runs again on each redelivery) — the dead-letter queue is the alarm. RabbitMQ classic queues requeue without limit by default and the in-memory transport drops the job after `MaxDeliveryAttempts`, so bound the attempts and configure a dead-letter destination wherever this alarm matters. |
 | Retained steps per run | 256 by default (`MaxRetainedSteps`) | A new step fails before side effects. Raising the budget grows the cumulative cost with the square of the step count (~36 MB serialized for 256 steps of 1 KiB), so measure `asyncresponse.flow_state.checkpoint.size` first. |
 | Size of one step result | a few KiB | One large result is paid again on every later checkpoint of the run. |
 | Flow input | Must fit both the worker-envelope budget and the store's `MaxStateBytes`, including provider document overhead | Built-in stores reject oversized initial state with `FlowStateTooLargeException` before publication; oversized envelopes throw `WorkerJobTooLargeException`. Nothing is persisted. |

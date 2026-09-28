@@ -446,9 +446,10 @@ internal abstract class RabbitMqMessageDispatcher : IAsyncDisposable
         CancellationToken cancellationToken,
         bool logFailures = true)
     {
-        using var activity = AsyncResponseDiagnostics.StartActivity(
+        var activity = AsyncResponseDiagnostics.StartActivity(
             "asyncresponse.rabbitmq.receive",
             ActivityKind.Consumer);
+        using var spanStop = AsyncResponseDiagnostics.StopOnExit(activity);
         activity?.SetTag("asyncresponse.transport", "rabbitmq");
         activity?.SetTag("asyncresponse.rabbitmq.role", _role.ToString());
         activity?.SetTag("asyncresponse.rabbitmq.ack_mode", _subscriberOptions.AckMode.ToString());

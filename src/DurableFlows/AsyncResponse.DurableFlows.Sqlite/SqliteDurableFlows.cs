@@ -28,7 +28,7 @@ namespace Microsoft.Extensions.DependencyInjection
 namespace AsyncResponse.DurableFlows.Sqlite
 {
 /// <summary>Options for the SQLite durable-flow state store.</summary>
-public sealed class SqliteDurableFlowOptions : DurableFlowOptions
+public sealed class SqliteDurableFlowOptions : DurableFlowOptions, IFlowStateSizeCap
 {
     /// <summary>SQLite connection string. Default: <c>Data Source=asyncresponse-flow-state.db</c>.</summary>
     public string ConnectionString { get; set; } = "Data Source=asyncresponse-flow-state.db";
@@ -72,6 +72,7 @@ public sealed class SqliteDurableFlowOptions : DurableFlowOptions
         DurableFlowStoreShared.ValidateConnectionString(ConnectionString, nameof(SqliteDurableFlowOptions));
         DurableFlowStoreShared.ValidateIdentifier(TableName, $"{nameof(SqliteDurableFlowOptions)}.{nameof(TableName)}", "SQLite");
         DurableFlowStoreShared.ValidateMaxStateBytes(MaxStateBytes, nameof(SqliteDurableFlowOptions));
+        DurableFlowStoreShared.ValidateLedgerWarningBelowCap(this, MaxStateBytes, nameof(SqliteDurableFlowOptions));
         DurableFlowStoreShared.ValidatePruneBudget(PruneBudget, nameof(SqliteDurableFlowOptions));
     }
 }

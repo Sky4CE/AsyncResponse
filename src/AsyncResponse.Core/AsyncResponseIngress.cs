@@ -58,10 +58,11 @@ internal sealed class AsyncResponseIngress(
     /// <summary>Handles the delivered message.</summary>
     public async Task HandleResponseMessageAsync(string messageJson, string? correlationId)
     {
-        using var activity = AsyncResponseDiagnostics.StartActivity(
+        var activity = AsyncResponseDiagnostics.StartActivity(
             "asyncresponse.ingress.response",
             ActivityKind.Consumer,
             correlationId);
+        using var spanStop = AsyncResponseDiagnostics.StopOnExit(activity);
 
         // An id extracted from an untrusted broker message is unroutable in two ways — missing
         // outright, or present but outside the portable contract (over-long, or space-padded, which
@@ -174,9 +175,10 @@ internal sealed class AsyncResponseIngress(
     /// <summary>Handles the delivered message.</summary>
     public async Task HandleWorkerMessageAsync(string messageJson)
     {
-        using var activity = AsyncResponseDiagnostics.StartActivity(
+        var activity = AsyncResponseDiagnostics.StartActivity(
             "asyncresponse.ingress.worker",
             ActivityKind.Consumer);
+        using var spanStop = AsyncResponseDiagnostics.StopOnExit(activity);
 
         // Before the parse, so an oversized envelope never becomes a DOM.
         if (RejectIfOversized(messageJson, "worker", activity))

@@ -214,9 +214,10 @@ internal sealed class NatsMessageDispatcher : IAsyncDisposable
     // Single choke point for handler execution so both ACK modes emit the consumer receive span.
     private async Task ExecuteHandlerAsync(NatsJobDelivery delivery, CancellationToken cancellationToken)
     {
-        using var activity = AsyncResponseDiagnostics.StartActivity(
+        var activity = AsyncResponseDiagnostics.StartActivity(
             "asyncresponse.nats.receive",
             ActivityKind.Consumer);
+        using var spanStop = AsyncResponseDiagnostics.StopOnExit(activity);
         activity?.SetTag("asyncresponse.transport", "nats");
         activity?.SetTag("asyncresponse.nats.role", _role.ToString());
         activity?.SetTag("asyncresponse.nats.ack_mode", _subscriberOptions.AckMode.ToString());

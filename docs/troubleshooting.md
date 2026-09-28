@@ -274,7 +274,8 @@ owns the full story — this page is the map, not the territory.
 ### A flow logs a `LedgerSizeWarningBytes` warning
 
 - **Symptom:** `Durable flow {id} ledger is roughly N bytes over K step(s), past the … threshold`,
-  once and then again each time the size doubles.
+  once and then again each time the size doubles. N is the size the store measured for the write —
+  the bytes its `MaxStateBytes` cap judges.
 - **Cause:** step results (and values) accumulate in the ledger, and every checkpoint rewrites the
   whole ledger — a run of N similar steps serializes about N²/2 step-results over its lifetime and
   eventually hits the store's `MaxStateBytes` cap.
@@ -283,9 +284,10 @@ owns the full story — this page is the map, not the territory.
   `DurableFlowOptions.LedgerSizeWarningBytes` (set `null` to disable). Read what the workload
   actually pays off the `asyncresponse.flow_state.checkpoint.size` histogram (its sum is the
   cumulative bytes serialized, see [observability](observability.md#instruments)) before moving a
-  budget. On DynamoDB lower it: the
-  store's 350 KB `MaxStateBytes` default (headroom under DynamoDB's 400 KB item cap) sits under the
-  512 KiB default. See
+  budget. The DynamoDB store defaults the threshold to 256 KiB, under its 350 KB `MaxStateBytes`
+  (headroom under DynamoDB's 400 KB item cap). A default threshold at or above a store's
+  `MaxStateBytes` is lowered to three quarters of the cap; one you set there is refused at startup,
+  because it could never fire before the cap. See
   [ledger growth](durable-flows.md#storage-where-flow-state-lives).
 
 ### Every attempt of an awaited step fails with an `OnRecovery` error

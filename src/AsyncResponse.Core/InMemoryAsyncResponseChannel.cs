@@ -257,7 +257,8 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
     // regressed latency and throughput, so keep the typed path inline unless benchmarks prove out.
     private async Task SetResponseCore<T>(T response, string correlationId, CancellationToken cancellationToken)
     {
-        using var activity = AsyncResponseDiagnostics.StartActivity("asyncresponse.set_response", ActivityKind.Producer);
+        var activity = AsyncResponseDiagnostics.StartActivity("asyncresponse.set_response", ActivityKind.Producer);
+        using var spanStop = AsyncResponseDiagnostics.StopOnExit(activity);
         activity?.SetTag("asyncresponse.channel", "inmemory");
         AsyncResponseDiagnostics.SetPayloadType(activity, typeof(T));
 
@@ -353,7 +354,8 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
     // recovery materialization costs, and keeping the branch inline avoids hot-path indirection.
     private async Task SetRawResponseJsonCore(RawJsonResponse response, string correlationId, CancellationToken cancellationToken)
     {
-        using var activity = AsyncResponseDiagnostics.StartActivity("asyncresponse.ingress.raw_response", ActivityKind.Producer);
+        var activity = AsyncResponseDiagnostics.StartActivity("asyncresponse.ingress.raw_response", ActivityKind.Producer);
+        using var spanStop = AsyncResponseDiagnostics.StopOnExit(activity);
         activity?.SetTag("asyncresponse.channel", "inmemory");
 
         AsyncResponseDiagnostics.SetCorrelationId(activity, correlationId);
@@ -434,7 +436,8 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
     {
         ArgumentNullException.ThrowIfNull(exception);
 
-        using var activity = AsyncResponseDiagnostics.StartActivity("asyncresponse.set_exception", ActivityKind.Producer);
+        var activity = AsyncResponseDiagnostics.StartActivity("asyncresponse.set_exception", ActivityKind.Producer);
+        using var spanStop = AsyncResponseDiagnostics.StopOnExit(activity);
         activity?.SetTag("asyncresponse.channel", "inmemory");
         activity?.SetTag("asyncresponse.exception_type", exception.GetType().FullName ?? exception.GetType().Name);
 

@@ -986,7 +986,8 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
 
     private async Task SetResponseCore<T>(T response, string correlationId, CancellationToken cancellationToken)
     {
-        using var activity = AsyncResponseDiagnostics.StartActivity("asyncresponse.set_response", ActivityKind.Producer);
+        var activity = AsyncResponseDiagnostics.StartActivity("asyncresponse.set_response", ActivityKind.Producer);
+        using var spanStop = AsyncResponseDiagnostics.StopOnExit(activity);
         activity?.SetTag("asyncresponse.channel", "redis");
         AsyncResponseDiagnostics.SetPayloadType(activity, typeof(T));
 
@@ -1092,7 +1093,8 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
     // and a different lost-subscriber materialization path, so avoiding shared indirection matters.
     private async Task SetRawResponseJsonCore(string responseJson, string correlationId, CancellationToken cancellationToken)
     {
-        using var activity = AsyncResponseDiagnostics.StartActivity("asyncresponse.ingress.raw_response", ActivityKind.Producer);
+        var activity = AsyncResponseDiagnostics.StartActivity("asyncresponse.ingress.raw_response", ActivityKind.Producer);
+        using var spanStop = AsyncResponseDiagnostics.StopOnExit(activity);
         activity?.SetTag("asyncresponse.channel", "redis");
 
         AsyncResponseDiagnostics.SetCorrelationId(activity, correlationId);
@@ -1190,7 +1192,8 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
     {
         ArgumentNullException.ThrowIfNull(exception);
 
-        using var activity = AsyncResponseDiagnostics.StartActivity("asyncresponse.set_exception", ActivityKind.Producer);
+        var activity = AsyncResponseDiagnostics.StartActivity("asyncresponse.set_exception", ActivityKind.Producer);
+        using var spanStop = AsyncResponseDiagnostics.StopOnExit(activity);
         activity?.SetTag("asyncresponse.channel", "redis");
         activity?.SetTag("asyncresponse.exception_type", exception.GetType().FullName ?? exception.GetType().Name);
 

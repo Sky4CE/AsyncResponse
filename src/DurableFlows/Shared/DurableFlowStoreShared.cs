@@ -211,7 +211,7 @@ internal static class DurableFlowStoreShared
     /// </remarks>
     /// <exception cref="FlowStateTooLargeException">The serialized state exceeds <paramref name="maxStateBytes"/>.</exception>
     public static string SerializeBounded(string flowId, FlowState state, long? maxStateBytes, string providerName)
-        => SerializeBoundedCore(flowId, state, maxStateBytes, providerName, measured: true);
+        => SerializeBoundedCore(flowId, state, maxStateBytes, providerName, write: true);
 
     /// <summary>
     /// <see cref="SerializeBounded(string, FlowState, long?, string)"/> for
@@ -220,21 +220,23 @@ internal static class DurableFlowStoreShared
     /// </summary>
     /// <exception cref="FlowStateTooLargeException">The serialized state exceeds <paramref name="maxStateBytes"/>.</exception>
     public static string PreflightBounded(string flowId, FlowState state, long? maxStateBytes, string providerName)
-        => SerializeBoundedCore(flowId, state, maxStateBytes, providerName, measured: false);
+        => SerializeBoundedCore(flowId, state, maxStateBytes, providerName, write: false);
 
-    private static string SerializeBoundedCore(string flowId, FlowState state, long? maxStateBytes, string providerName, bool measured)
+    private static string SerializeBoundedCore(string flowId, FlowState state, long? maxStateBytes, string providerName, bool write)
     {
         var json = Serialize(state);
-        measured = measured && AsyncResponseDiagnostics.FlowStateCheckpointsMeasured;
-        if (maxStateBytes is null && !measured)
-            return json;
-
         long size = Encoding.UTF8.GetByteCount(json);
         if (maxStateBytes is { } limit && size > limit)
             throw new FlowStateTooLargeException(flowId, size, limit, providerName);
 
-        if (measured)
-            AsyncResponseDiagnostics.RecordFlowStateCheckpoint(providerName, size);
+        if (write)
+        {
+            // The ledger-growth warning judges the size the write really has, not an estimate of
+            // it (see FlowStateSize): measured against the same cap, so it can fire before the cap.
+            FlowStateSize.Record(state, size);
+            if (AsyncResponseDiagnostics.FlowStateCheckpointsMeasured)
+                AsyncResponseDiagnostics.RecordFlowStateCheckpoint(providerName, size);
+        }
 
         return json;
     }
@@ -273,6 +275,7 @@ internal static class DurableFlowStoreShared
         if (!string.Equals(state.FlowId, flowId, StringComparison.Ordinal))
             throw new FlowStateUnreadableException(flowId, "the flow id inside its JSON is not the id it is stored under");
 
+        FlowStateSize.Record(state, stateJson);
         return state;
     }
 
@@ -369,6 +372,24 @@ internal static class DurableFlowStoreShared
     {
         if (maxStateBytes is <= 0)
             throw new InvalidOperationException($"{optionsTypeName}.MaxStateBytes must be positive when configured.");
+    }
+
+    /// <summary>
+    /// A <c>LedgerSizeWarningBytes</c> the application set must sit below <c>MaxStateBytes</c> when
+    /// both are set. The warning is the early signal of a growing ledger and the cap refuses the
+    /// write: a threshold at or above the cap can never fire before the checkpoint that fails. A
+    /// threshold left at its default is not refused — it is fitted under the cap instead (see
+    /// <c>DurableFlowOptions.EffectiveLedgerSizeWarningBytes</c>).
+    /// </summary>
+    public static void ValidateLedgerWarningBelowCap(DurableFlowOptions options, long? maxStateBytes, string optionsTypeName)
+    {
+        if (options.LedgerSizeWarningBytesConfigured && options.LedgerSizeWarningBytes is { } warning && maxStateBytes is { } cap && warning >= cap)
+        {
+            throw new InvalidOperationException(
+                $"{optionsTypeName}.LedgerSizeWarningBytes ({warning}) must be below {optionsTypeName}.MaxStateBytes ({cap}): " +
+                "the ledger-growth warning could never fire before the cap refuses a checkpoint. Lower LedgerSizeWarningBytes, " +
+                "leave it unset (its default is fitted under the cap), or set it to null to disable the warning.");
+        }
     }
 
     /// <summary>

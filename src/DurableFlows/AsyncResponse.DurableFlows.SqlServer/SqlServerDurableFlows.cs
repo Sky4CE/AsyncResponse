@@ -29,7 +29,7 @@ namespace Microsoft.Extensions.DependencyInjection
 namespace AsyncResponse.DurableFlows.SqlServer
 {
 /// <summary>Options for the SQL Server durable-flow state store.</summary>
-public sealed class SqlServerDurableFlowOptions : DurableFlowOptions
+public sealed class SqlServerDurableFlowOptions : DurableFlowOptions, IFlowStateSizeCap
 {
     /// <summary>SQL Server connection string. Required.</summary>
     public string? ConnectionString { get; set; }
@@ -77,6 +77,7 @@ public sealed class SqlServerDurableFlowOptions : DurableFlowOptions
         DurableFlowStoreShared.ValidateIdentifier(SchemaName, $"{nameof(SqlServerDurableFlowOptions)}.{nameof(SchemaName)}", "SQL Server", identifierCap: 128);
         DurableFlowStoreShared.ValidateIdentifier(TableName, $"{nameof(SqlServerDurableFlowOptions)}.{nameof(TableName)}", "SQL Server", identifierCap: 128);
         DurableFlowStoreShared.ValidateMaxStateBytes(MaxStateBytes, nameof(SqlServerDurableFlowOptions));
+        DurableFlowStoreShared.ValidateLedgerWarningBelowCap(this, MaxStateBytes, nameof(SqlServerDurableFlowOptions));
         DurableFlowStoreShared.ValidatePruneBudget(PruneBudget, nameof(SqlServerDurableFlowOptions));
     }
 }

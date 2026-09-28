@@ -87,6 +87,7 @@ internal sealed class InMemoryFlowStateStore : IFlowStateStore
             if (!string.Equals(state.FlowId, flowId, StringComparison.Ordinal))
                 throw new FlowStateUnreadableException(flowId, "the flow id inside its JSON is not the id it is stored under");
 
+            FlowStateSize.Record(state, entry.StateJson);
             return Task.FromResult<FlowState?>(state);
         }
 
@@ -276,10 +277,13 @@ internal sealed class InMemoryFlowStateStore : IFlowStateStore
     {
         var stateJson = FlowStateJson.Serialize(state);
 
-        // The same measurement the durable stores record (DurableFlowStoreShared.SerializeBounded),
-        // so a workload's checkpoint sizes can be read off a test or a development host.
+        // The same measurements the durable stores record (DurableFlowStoreShared.SerializeBounded),
+        // so a workload's checkpoint sizes — and the ledger-growth warning — read the same off a
+        // test or a development host.
+        long size = System.Text.Encoding.UTF8.GetByteCount(stateJson);
+        FlowStateSize.Record(state, size);
         if (AsyncResponseDiagnostics.FlowStateCheckpointsMeasured)
-            AsyncResponseDiagnostics.RecordFlowStateCheckpoint("InMemory", System.Text.Encoding.UTF8.GetByteCount(stateJson));
+            AsyncResponseDiagnostics.RecordFlowStateCheckpoint("InMemory", size);
 
         return new(stateJson, state.Revision, expiresAtUtc, leaseId, leaseExpiresAtUtc);
     }

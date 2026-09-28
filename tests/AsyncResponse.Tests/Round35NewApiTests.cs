@@ -219,7 +219,10 @@ public sealed class Round35NewApiTests
         var store = provider.GetRequiredService<IFlowStateStore>();
         var options = DurableFlowContextTestSupport.Options(o => o.LedgerSizeWarningBytes = 512);
         var state = DurableFlowContextTestSupport.State($"large-from-its-start-{attempts}");
-        state.InputJson = System.Text.Json.JsonSerializer.Serialize(new ChattyInput(new string('x', 600)));
+        // Sized so the ledger's stored bytes (round 50: the warning judges what the store measured,
+        // property names included) sit well inside a doubling band of the threshold: past 512, and
+        // far enough under 2048 that the small step below cannot cross it.
+        state.InputJson = System.Text.Json.JsonSerializer.Serialize(new ChattyInput(new string('x', 1300)));
         state.Attempts = attempts;
         Assert.True(await store.TryCreateAsync(state.FlowId!, state, options.StateExpiry));
         await using var lease = await DurableFlowContextTestSupport.AcquireAsync(store, state.FlowId!, options, clock);
