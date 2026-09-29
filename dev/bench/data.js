@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1790677865850,
+  "lastUpdate": 1790677870169,
   "repoUrl": "https://github.com/Sky4CE/AsyncResponse",
   "entries": {
     "AsyncResponse Microbenchmarks": [
@@ -166884,6 +166884,240 @@ window.BENCHMARK_DATA = {
           {
             "name": "durable-flow-storm allocations",
             "value": 51978.7456,
+            "unit": "B/flow"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "tyunisov@gmail.com",
+            "name": "Sky4CE",
+            "username": "Sky4CE"
+          },
+          "committer": {
+            "email": "tyunisov@gmail.com",
+            "name": "Sky4CE",
+            "username": "Sky4CE"
+          },
+          "distinct": true,
+          "id": "1fc2b20843fd13ceec604d8c1531eb3e69f72e7c",
+          "message": "fix: apply round-51 review — a MongoDB recovery lookup settles only on a majority-confirmed view (otherwise RecoveryStateUnconfirmedException, which the ingress redelivers instead of escalating), Redis/NATS fan-out is bounded by MaxRecoveryRegistrationsPerCorrelationId (default 64) and a concurrent burst commits with jittered backoff, a registration whose expiry cannot be established is refused instead of read as expired",
+          "timestamp": "2026-09-29T12:10:51+02:00",
+          "tree_id": "4bb8f8c86f3a9686e58cbb26a357ab8eb0277c44",
+          "url": "https://github.com/Sky4CE/AsyncResponse/commit/1fc2b20843fd13ceec604d8c1531eb3e69f72e7c"
+        },
+        "date": 1790677869314,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "waiter-storm p99 latency",
+            "value": 0.0502,
+            "unit": "ms"
+          },
+          {
+            "name": "waiter-storm allocations",
+            "value": 1669.3824,
+            "unit": "B/op"
+          },
+          {
+            "name": "progress-storm p99 latency",
+            "value": 2.1733,
+            "unit": "ms"
+          },
+          {
+            "name": "progress-storm allocations",
+            "value": 3387.5872,
+            "unit": "B/op"
+          },
+          {
+            "name": "worker-storm allocations",
+            "value": 4287.19392,
+            "unit": "B/op"
+          },
+          {
+            "name": "google-pubsub-ack-after-enqueue-dispatch-storm p99 latency",
+            "value": 0.0026,
+            "unit": "ms"
+          },
+          {
+            "name": "google-pubsub-ack-after-enqueue-dispatch-storm allocations",
+            "value": 463.5648,
+            "unit": "B/op"
+          },
+          {
+            "name": "rabbitmq-ack-after-enqueue-dispatch-storm p99 latency",
+            "value": 0.0025,
+            "unit": "ms"
+          },
+          {
+            "name": "rabbitmq-ack-after-enqueue-dispatch-storm allocations",
+            "value": 470.7872,
+            "unit": "B/op"
+          },
+          {
+            "name": "redis-ack-after-enqueue-dispatch-storm p99 latency",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "redis-ack-after-enqueue-dispatch-storm allocations",
+            "value": 517.968,
+            "unit": "B/op"
+          },
+          {
+            "name": "nats-ack-after-receive-dispatch-storm p99 latency",
+            "value": 0.0035,
+            "unit": "ms"
+          },
+          {
+            "name": "nats-ack-after-receive-dispatch-storm allocations",
+            "value": 541.7376,
+            "unit": "B/op"
+          },
+          {
+            "name": "postgresql-ack-after-receive-dispatch-storm p99 latency",
+            "value": 0.0045,
+            "unit": "ms"
+          },
+          {
+            "name": "postgresql-ack-after-receive-dispatch-storm allocations",
+            "value": 492.1408,
+            "unit": "B/op"
+          },
+          {
+            "name": "sqlserver-ack-after-enqueue-dispatch-storm p99 latency",
+            "value": 0.0048,
+            "unit": "ms"
+          },
+          {
+            "name": "sqlserver-ack-after-enqueue-dispatch-storm allocations",
+            "value": 489.9168,
+            "unit": "B/op"
+          },
+          {
+            "name": "mongodb-ack-after-enqueue-dispatch-storm p99 latency",
+            "value": 0.0058,
+            "unit": "ms"
+          },
+          {
+            "name": "mongodb-ack-after-enqueue-dispatch-storm allocations",
+            "value": 495.8752,
+            "unit": "B/op"
+          },
+          {
+            "name": "azure-servicebus-ack-after-receive-dispatch-storm p99 latency",
+            "value": 0.0055,
+            "unit": "ms"
+          },
+          {
+            "name": "azure-servicebus-ack-after-receive-dispatch-storm allocations",
+            "value": 637.248,
+            "unit": "B/op"
+          },
+          {
+            "name": "sqs-ack-after-enqueue-dispatch-storm p99 latency",
+            "value": 0.0037,
+            "unit": "ms"
+          },
+          {
+            "name": "sqs-ack-after-enqueue-dispatch-storm allocations",
+            "value": 573.9264,
+            "unit": "B/op"
+          },
+          {
+            "name": "kafka-ack-after-enqueue-dispatch-storm p99 latency",
+            "value": 0.0017,
+            "unit": "ms"
+          },
+          {
+            "name": "kafka-ack-after-enqueue-dispatch-storm allocations",
+            "value": 301.6768,
+            "unit": "B/op"
+          },
+          {
+            "name": "race-burst p99 latency",
+            "value": 0.0371,
+            "unit": "ms"
+          },
+          {
+            "name": "race-burst allocations",
+            "value": 1486.36416,
+            "unit": "B/op"
+          },
+          {
+            "name": "raw-ingress-storm p99 latency",
+            "value": 0.0411,
+            "unit": "ms"
+          },
+          {
+            "name": "raw-ingress-storm allocations",
+            "value": 1866.35968,
+            "unit": "B/op"
+          },
+          {
+            "name": "shared-response-fanout p99 latency",
+            "value": 0.0766,
+            "unit": "ms"
+          },
+          {
+            "name": "shared-response-fanout allocations",
+            "value": 4908.19712,
+            "unit": "B/op"
+          },
+          {
+            "name": "exception-fanout p99 latency",
+            "value": 0.2812,
+            "unit": "ms"
+          },
+          {
+            "name": "exception-fanout allocations",
+            "value": 9021.19296,
+            "unit": "B/op"
+          },
+          {
+            "name": "timeout-storm p99 latency",
+            "value": 56.6645,
+            "unit": "ms"
+          },
+          {
+            "name": "timeout-storm allocations",
+            "value": 3509.308,
+            "unit": "B/op"
+          },
+          {
+            "name": "dispose-cleanup-storm p99 latency",
+            "value": 0.0189,
+            "unit": "ms"
+          },
+          {
+            "name": "dispose-cleanup-storm allocations",
+            "value": 1167.9744,
+            "unit": "B/op"
+          },
+          {
+            "name": "context-isolation-storm p99 latency",
+            "value": 0.0531,
+            "unit": "ms"
+          },
+          {
+            "name": "context-isolation-storm allocations",
+            "value": 2792.2272,
+            "unit": "B/op"
+          },
+          {
+            "name": "watchdog-scan-storm elapsed",
+            "value": 5.3839,
+            "unit": "ms"
+          },
+          {
+            "name": "watchdog-scan-storm allocations",
+            "value": 63.5576,
+            "unit": "B/entry"
+          },
+          {
+            "name": "durable-flow-storm allocations",
+            "value": 51759.9232,
             "unit": "B/flow"
           }
         ]
