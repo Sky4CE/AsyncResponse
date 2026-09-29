@@ -1,23 +1,23 @@
 Summary - AsyncResponse (Release / net8.0+net10.0 / unit+integration)
-  Generated on: 09/28/2026 - 17:49:55
-  Coverage date: 09/28/2026 - 17:33:54 - 09/28/2026 - 17:48:52
+  Generated on: 09/29/2026 - 10:32:05
+  Coverage date: 09/29/2026 - 10:15:20 - 09/29/2026 - 10:31:34
   Parser: MultiReport (16x Cobertura)
   Assemblies: 27
-  Classes: 507
-  Files: 250
-  Line coverage: 98.9%
-  Covered lines: 37282
-  Uncovered lines: 380
-  Coverable lines: 37662
-  Total lines: 75940
-  Branch coverage: 94.2% (14577 of 15471)
-  Covered branches: 14577
-  Total branches: 15471
-  Method coverage: 99.8% (4994 of 5004)
-  Full method coverage: 97.2% (4866 of 5004)
-  Covered methods: 4994
-  Fully covered methods: 4866
-  Total methods: 5004
+  Classes: 510
+  Files: 253
+  Line coverage: 99%
+  Covered lines: 37399
+  Uncovered lines: 372
+  Coverable lines: 37771
+  Total lines: 76371
+  Branch coverage: 94.2% (14630 of 15521)
+  Covered branches: 14630
+  Total branches: 15521
+  Method coverage: 99.9% (5014 of 5019)
+  Full method coverage: 97.4% (4889 of 5019)
+  Covered methods: 5014
+  Fully covered methods: 4889
+  Total methods: 5019
 
 AsyncResponse.Abstractions                                                                                100%
   AsyncResponse.AsyncResponseContext                                                                      100%
@@ -48,6 +48,7 @@ AsyncResponse.Abstractions                                                      
   AsyncResponse.RecoveryState                                                                             100%
   AsyncResponse.RecoveryStateScanUnreadableException                                                      100%
   AsyncResponse.RecoveryStateSchema                                                                       100%
+  AsyncResponse.RecoveryStateUnconfirmedException                                                         100%
   AsyncResponse.RecoveryStateUnreadableException                                                          100%
   AsyncResponse.ReflectionCallDto                                                                         100%
   AsyncResponse.ReflectionInvocationDto                                                                   100%
@@ -89,7 +90,7 @@ AsyncResponse.Channels.NATS                                                     
   Microsoft.Extensions.DependencyInjection.NatsAsyncResponseChannelServiceCollectionExtensions            100%
 
 AsyncResponse.Channels.PostgreSQL                                                                        98.9%
-  AsyncResponse.Channels.DbAsyncResponseChannelBase                                                      98.1%
+  AsyncResponse.Channels.DbAsyncResponseChannelBase                                                      98.2%
   AsyncResponse.Channels.DbRecoveryStateStoreBase                                                         100%
   AsyncResponse.Channels.PostgreSQL.PostgreSqlAsyncResponseChannel                                        100%
   AsyncResponse.Channels.PostgreSQL.PostgreSqlAsyncResponseChannelOptions                                 100%
@@ -131,7 +132,7 @@ AsyncResponse.Channels.SqlServer                                                
   AsyncResponse.Internal.SqlServerTransientFaults                                                         100%
   Microsoft.Extensions.DependencyInjection.SqlServerAsyncResponseChannelServiceCollectionExtensions       100%
 
-AsyncResponse.Core                                                                                       99.1%
+AsyncResponse.Core                                                                                       99.2%
   AsyncResponse.AsyncResponseBuilder                                                                      100%
   AsyncResponse.AsyncResponseBuilder<T>                                                                   100%
   AsyncResponse.AsyncResponseBuilderBase                                                                  100%
@@ -152,9 +153,9 @@ AsyncResponse.Core                                                              
   AsyncResponse.AsyncResponsePackageVersionGate                                                           100%
   AsyncResponse.AsyncResponsePackageVersions                                                              100%
   AsyncResponse.AsyncResponseRecoveryHealthCheck                                                          100%
-  AsyncResponse.AsyncResponseRecoveryStats                                                               57.1%
+  AsyncResponse.AsyncResponseRecoveryStats                                                                100%
   AsyncResponse.AsyncResponseRetry                                                                        100%
-  AsyncResponse.AsyncResponseStaleRecoveryEntry                                                            50%
+  AsyncResponse.AsyncResponseStaleRecoveryEntry                                                           100%
   AsyncResponse.AsyncResponseStartupValidator                                                             100%
   AsyncResponse.AsyncResponseTransportMarker                                                              100%
   AsyncResponse.AsyncResponseTypeResolution                                                              98.9%
@@ -187,7 +188,7 @@ AsyncResponse.Core                                                              
   AsyncResponse.InMemoryAsyncResponseChannel                                                             95.7%
   AsyncResponse.InMemoryAsyncResponseOptions                                                              100%
   AsyncResponse.InMemoryAsyncResponseWaiter<T>                                                            100%
-  AsyncResponse.InMemoryFlowStateStore                                                                   99.2%
+  AsyncResponse.InMemoryFlowStateStore                                                                    100%
   AsyncResponse.InMemoryRecoveryStateStore                                                               97.8%
   AsyncResponse.InMemoryWorkerHost                                                                        100%
   AsyncResponse.InMemoryWorkerTransport                                                                   100%
@@ -202,6 +203,8 @@ AsyncResponse.Core                                                              
   AsyncResponse.RecoverableAsyncResponseBuilder<T>                                                        100%
   AsyncResponse.RecoveryCallbackFailedException                                                           100%
   AsyncResponse.RecoveryClassification                                                                    100%
+  AsyncResponse.RecoveryRegistrationLimit                                                                 100%
+  AsyncResponse.RecoveryStateContention                                                                   100%
   AsyncResponse.RecoveryStateObservation                                                                  100%
   AsyncResponse.ReflectionCallDtoGuard                                                                    100%
   AsyncResponse.ReflectionExtensions                                                                      100%
