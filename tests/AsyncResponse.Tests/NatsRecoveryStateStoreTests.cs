@@ -276,7 +276,8 @@ public class NatsRecoveryStateStoreTests
     [Fact]
     public async Task SaveAsync_WhenCasKeepsFailing_ThrowsWithoutOverwriting()
     {
-        _kv.ForcedCreateConflicts = 4;
+        _kv.ForcedCreateConflicts = RecoveryStateContention.MaxAttempts;
+        using var noPauses = RecoveryStateContention.SuppressPauses();
         var state = new RecoveryState { CorrelationId = "corr-fallback", RegistrationId = Guid.NewGuid() };
 
         await Assert.ThrowsAsync<InvalidOperationException>(
@@ -439,7 +440,8 @@ public class NatsRecoveryStateStoreTests
         var secondId = Guid.NewGuid();
         await _store.SaveAsync("corr-a", new RecoveryState { RegistrationId = firstId, CorrelationId = "corr-a" }, TimeSpan.FromMinutes(5));
         await _store.SaveAsync("corr-a", new RecoveryState { RegistrationId = secondId, CorrelationId = "corr-a" }, TimeSpan.FromMinutes(5));
-        _kv.ForcedUpdateConflicts = 4;
+        _kv.ForcedUpdateConflicts = RecoveryStateContention.MaxAttempts;
+        using var noPauses = RecoveryStateContention.SuppressPauses();
 
         Assert.False(await _store.TryDeleteAsync("corr-a", firstId));
 
@@ -498,7 +500,9 @@ public class NatsRecoveryStateStoreTests
         _kv.Entries[NatsSubjectSchema.RecoveryKey("empty")] = JsonSerializer.Serialize(
             new NatsRecoveryStateStore.StoredRecoveryState
             {
-                States = null,
+                // An empty list, not a missing one: an envelope without its registration list is
+                // refused as unreadable since round 51 (see Round51RegressionTests).
+                States = [],
                 ExpiresAtUtc = _time.Now + TimeSpan.FromMinutes(5)
             });
 

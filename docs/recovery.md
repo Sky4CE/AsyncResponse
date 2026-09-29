@@ -215,9 +215,9 @@ ladder.
 ### When the stored registrations cannot be read
 
 If any live registration for the correlation id cannot be interpreted by this build — malformed, an
-incomplete identity, or a newer schema version — the store throws
-`RecoveryStateUnreadableException` instead of reporting "no registration", and **no registration is
-dispatched, the readable ones included**. Dispatching the readable subset would consume them and let
+incomplete identity, a newer schema version, or (on Redis and NATS) expiry metadata that is missing
+or inconsistent — the store throws `RecoveryStateUnreadableException` instead of reporting "no
+registration", and **no registration is dispatched, the readable ones included**. Dispatching the readable subset would consume them and let
 the transport acknowledge the response, leaving the unreadable one armed with no payload left to
 deliver. Refusing up front also means nothing runs twice: the redelivery that reaches a build able
 to read every registration (the newer one a rolling upgrade is bringing up) settles them all at once.
@@ -225,6 +225,22 @@ to read every registration (the newer one a rolling upgrade is bringing up) sett
 - On the database channels and NATS, a registration carrying *another* correlation id (a legacy
   case-insensitive collation's match) is readable but belongs elsewhere, so it counts as absent. Redis
   keys are exact, so there such an entry is corrupt and counts as unreadable.
+- On Redis and NATS a registration's expiry is part of its structure, checked before anything is
+  filtered as expired. A Redis entry without its stamp, a NATS envelope without its shared stamp or
+  its registration list, a NATS per-registration expiry list whose length does not match the
+  registrations, and a NATS shared stamp earlier than one of the registrations' own are refused as
+  unreadable: a missing stamp used to read as `DateTimeOffset.MinValue`, long expired, so the lookup
+  answered "no registration" (and on NATS deleted the key) while the registrations' own expiries were
+  still in the future. The watchdog scan counts such a record as unreadable (health goes
+  `Degraded`), a save onto it throws, a delete leaves it, and nothing rewrites or deletes it as
+  expired; the key's own TTL (Redis) or the bucket's `MaxAge` (NATS) still removes it in the end. A
+  legacy record in a shape an older build wrote — a Redis bare array, a NATS envelope without
+  per-registration expiries — is read as before, and a well-formed record whose stamps have lapsed
+  is still absence.
+- A lookup the store cannot confirm — the MongoDB channel's majority barrier failed (see
+  [recovery-state durability](#recovery-state-durability)) — throws
+  `RecoveryStateUnconfirmedException` and is handled the same way: nothing dispatched, the
+  ingress's ladder, then redelivery without `SetException` escalation.
 - A refused lookup still yields to a live waiter that subscribed in the snapshot race: the response
   is handed back for live delivery rather than failed.
 - The broker ingress propagates the exception without `SetException` escalation (that dispatch would
@@ -341,7 +357,8 @@ Recovery state lives in the durable channel's store and survives a redeploy:
   (Redis's expiry precision). Updates are optimistic (transaction-conditioned compare-and-set with
   retries), so concurrent registrations for one correlation id all survive, and each queued
   command's own result is checked: a save or delete Redis rejects fails rather than reporting
-  success.
+  success. A writer that loses the race pauses for a randomized, growing interval before it tries
+  again (see [shared-correlation recovery](#shared-correlation-recovery)).
 
   **Waiter-liveness probing** asks every endpoint `PUBSUB NUMSUB` concurrently. A positive count
   anywhere proves a live waiter; a zero is conclusive only once every endpoint that could hold the
@@ -365,8 +382,8 @@ Recovery state lives in the durable channel's store and survives a redeploy:
     defaults (5 attempts × 5 s) do not, nor do Kafka's in-process retries or Service Bus's immediate
     redeliveries; a response still unrecovered when the budget runs out is dead-lettered.
 - **NATS** — a JetStream key-value bucket (`RecoveryBucket`), with a per-entry expiry layered over
-  the bucket's `MaxAge`. Updates are revision-conditioned (KV compare-and-set with retries), so
-  concurrent registrations for one correlation id all survive. Registrations are keyed by
+  the bucket's `MaxAge`. Updates are revision-conditioned (KV compare-and-set with retries, paced
+  like Redis's), so concurrent registrations for one correlation id all survive. Registrations are keyed by
   correlation id only, not by `SubjectPrefix`, so deployments sharing one NATS system each need their
   own `RecoveryBucket`. The bucket is created on first use only if it does not exist; an existing one
   is used as is, with drift reported when first opened. Every read goes to the bucket stream's
@@ -395,7 +412,27 @@ Recovery state lives in the durable channel's store and survives a redeploy:
   registration; rows expire by database clock (`SYSUTCDATETIME()`) and are pruned opportunistically
   during channel operations.
 - **MongoDB** — `RecoveryStateCollection` (default `asyncresponse_recovery_state`), one document per
-  waiter registration; documents expire natively via a TTL index.
+  waiter registration; documents expire natively via a TTL index. The lost-subscriber lookup — the
+  read whose answer decides whether a response is acknowledged — is **authoritative**: it first
+  makes a small majority write (an `$inc` on a `recovery_read_barrier_*` document in
+  `{MessageCollection}_counters`, under the channel's bounded `wtimeout`), then reads the
+  registrations at `majority` read concern in the same causally consistent session, bounded by
+  `maxTimeMS` (10 s). A primary that a partition has deposed keeps serving plain reads until it
+  notices, and a publisher that could reach only it used to see none — or only some — of the
+  registrations the new primary had taken, run no callback for the missing ones, and let the
+  transport acknowledge the response. Such a primary cannot acknowledge the barrier, so the lookup
+  now fails with `RecoveryStateUnconfirmedException` (the driver's error inside) and nothing is
+  dispatched (verified against a partitioned three-node replica set); so does a lookup whose majority
+  read fails after an acknowledged barrier (a step-down in between). The broker ingress retries it
+  on its ladder — usually enough, since the driver finds the new primary — and then propagates it
+  without `SetException` escalation, whose own lookup could otherwise succeed on a set that had just
+  recovered and run the failure callback for a response the worker produced successfully; the
+  transport redelivers the original response. While the set has no majority each attempt waits out
+  the write's `wtimeout` (10 s by default), so one delivery can take about 40 s before it is handed
+  back. The cost in normal operation is that one write per lookup: about 2.3 ms instead of 0.4 ms
+  on a local three-node set. `linearizable` read concern, which the durable-flow store uses, is not used here:
+  MongoDB guarantees it only for a read whose filter selects one document. The watchdog scan, which
+  settles nothing, reads plainly.
 
 Propagated ambient context (trace id, principal, tenant) is persisted alongside the recovery state
 as a `string`→`string` bag, so it survives the redeploy too. Don't set `RecoveryStateExpiry` below
@@ -442,8 +479,9 @@ worker with a shape it does not understand.
 value, and updating one rewrites the whole value. A registration this build cannot interpret (e.g.
 written by a newer host) is carried through those rewrites untouched — pruning it would silently
 delete a live sibling's recovery callback mid-rolling-upgrade. A read that meets one, or a whole
-value this build cannot parse, fails rather than reporting "no registration" or the readable rest, so
-the terminal response is redelivered to a host that can read every registration (see
+value this build cannot parse — or one whose expiry metadata is missing or inconsistent — fails
+rather than reporting "no registration" or the readable rest, so the terminal response is
+redelivered to a host that can read every registration (see
 [When the stored registrations cannot be read](#when-the-stored-registrations-cannot-be-read)). The
 durable-flow ledger applies the same rule (`FlowStateUnreadableException`).
 
@@ -474,6 +512,36 @@ registration.
   all stay, each with its own expiry.
 - **Database and in-memory stores** delete each registration as its callback succeeds. A custom
   `IRecoveryStateStore` needs no batch support.
+
+**Fan-out on Redis and NATS is bounded.** Because every new waiter reads and rewrites the id's whole
+stored value, registering N waiters on one correlation id writes 1 + 2 + … + N registrations.
+Measured with registrations of about 750 bytes (both callbacks, one argument, a trace context — see
+`RecoveryRegistrationGrowthBenchmarks`):
+
+| Waiters on one id | Written in total | Final value | Store CPU, all registrations | Allocated (gen-2 GCs) |
+|---:|---:|---:|---:|---:|
+| 16 | 0.1 MB | 12 KB | 0.3 ms | 0.5 MB (none) |
+| 64 | 1.5 MB | 47 KB | 5 ms | 8 MB (one every few fan-outs) |
+| 256 | 24 MB | 190 KB | 100 ms | 124 MB (11 per fan-out) |
+| 1024 | 380 MB | 760 KB | — | — (near NATS's default 1 MB payload) |
+
+`MaxRecoveryRegistrationsPerCorrelationId` (Redis and NATS channel options, default **64**) caps
+how many live registrations an id may hold. A waiter that would exceed it fails at creation — before
+its trigger runs, so no work is dispatched for it — with an `InvalidOperationException` naming the
+option; expired registrations and a re-save of the same registration do not count. Raise it
+knowingly, or use a database channel (PostgreSQL, SQL Server, MongoDB), which stores one row per
+registration and has no such bound.
+
+The waiters of a fan-out typically register, and complete, together, so the writes race on that one
+value. A writer that loses pauses for a randomized interval that grows with each loss (full jitter,
+2 ms doubling up to 250 ms, at most 30 attempts, so at most about 6 s of pauses) before retrying; a
+save that still cannot commit throws, and a delete leaves its registration for expiry. Retried at once, as before this pacing,
+only about four writers of a burst ever committed: 25 to 28 of 32 concurrent registrations on one id
+failed against Redis 7 and NATS 2.15. Paced, bursts of 64 and 128 concurrent registrations all
+commit against local servers, and an event simulation of slower servers — 5 to 20 ms from read to
+commit, as over TLS or on a replicated NATS bucket — loses no writer of a 64-way burst either,
+which then takes up to about 2 s. A lone or lightly contended
+writer never waits long: the pause only grows with consecutive losses.
 
 **Any transient callback failure** throws `RecoveryCallbackFailedException` — for a single
 registration too, and for a fan-out in which no callback succeeded. The ingress propagates it

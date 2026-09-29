@@ -24,6 +24,17 @@ public sealed class RedisAsyncResponseOptions : DurableAsyncResponseChannelOptio
     public string KeyPrefix { get; set; } = "asyncresponse";
 
     /// <summary>
+    /// The most recovery registrations one correlation id may hold at a time — how many recoverable
+    /// waiters can share it. Every registration of an id lives in one key that each new waiter
+    /// reads and rewrites whole, so registering N waiters writes 1 + 2 + … + N registrations. A
+    /// waiter that would exceed the limit fails at creation, before its trigger runs, with an
+    /// <see cref="InvalidOperationException"/>; re-saving a registration and expired registrations
+    /// do not count. For wider fan-out use a database channel (PostgreSQL, SQL Server, MongoDB),
+    /// which stores one row per registration. Default: 64.
+    /// </summary>
+    public int MaxRecoveryRegistrationsPerCorrelationId { get; set; } = RecoveryRegistrationLimit.Default;
+
+    /// <summary>
     /// Validates the options, throwing <see cref="InvalidOperationException"/> on a
     /// misconfiguration. Called by the channel so a bad configuration fails fast rather than at
     /// first use.
@@ -40,5 +51,7 @@ public sealed class RedisAsyncResponseOptions : DurableAsyncResponseChannelOptio
         // reject it at startup; Redis was the only one that accepted it.
         if (MaxRemoteStackTraceLength < 0)
             throw new InvalidOperationException($"{nameof(RedisAsyncResponseOptions)}.{nameof(MaxRemoteStackTraceLength)} must not be negative.");
+
+        RecoveryRegistrationLimit.Validate(MaxRecoveryRegistrationsPerCorrelationId, nameof(RedisAsyncResponseOptions));
     }
 }

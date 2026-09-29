@@ -134,6 +134,14 @@ internal sealed class AsyncResponseIngress(
             // otherwise requeued it at broker speed, while capped ones (Service Bus, Pub/Sub) spent
             // their attempts in milliseconds — dead-lettering it before the newer build a rolling
             // deploy is bringing up could ever receive it.
+            //
+            // RecoveryStateUnconfirmedException is treated the same way, and for a sharper reason:
+            // the store could not confirm its lookup (the MongoDB channel's majority barrier failed —
+            // a deposed primary, a set with no majority). The ladder is a real retry there (the
+            // driver finds the new primary), but the escalation is not: its own dispatch makes the
+            // same lookup, and on a set that had just recovered it would run the FAILURE callback,
+            // with the store's error, for a response the worker produced successfully. Propagated,
+            // the transport redelivers the original response instead.
             await AsyncResponseRetry.ExecuteAsync(
                 async _ =>
                 {
@@ -148,7 +156,7 @@ internal sealed class AsyncResponseIngress(
                 CancellationToken.None,
                 _timeProvider).ConfigureAwait(false);
         }
-        catch (Exception ex) when (ex is not (OperationCanceledException or RecoveryCallbackFailedException or RecoveryStateUnreadableException))
+        catch (Exception ex) when (ex is not (OperationCanceledException or RecoveryCallbackFailedException or RecoveryStateUnreadableException or RecoveryStateUnconfirmedException))
         {
             // Guarded: a throwing provider here skipped the escalation, so the waiter was never
             // told and the delivery was redelivered instead.

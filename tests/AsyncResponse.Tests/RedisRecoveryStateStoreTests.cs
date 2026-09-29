@@ -321,7 +321,12 @@ public class RedisRecoveryStateStoreTests
             .ReturnsAsync(JsonSerializer.Serialize(new RecoveryState { CorrelationId = "legacy" }));
 
         Assert.Equal(2, (await _store.GetAllAsync("corr-a")).Count);
-        Assert.Empty(await _store.GetAllAsync("legacy"));
+
+        // A bare object is neither shape a supported build writes (the first builds stored one
+        // state per key this way; no build has read it since). Round 51: it is refused as
+        // unreadable, not read as "no registrations" — that answer acknowledged the response any
+        // registration inside it was waiting for.
+        await Assert.ThrowsAsync<RecoveryStateUnreadableException>(() => _store.GetAllAsync("legacy"));
     }
 
     [Fact]
@@ -740,6 +745,7 @@ public class RedisRecoveryStateStoreTests
     [Fact]
     public async Task SaveAsync_ExhaustedOptimisticAttempts_ThrowsWithoutOverwriting()
     {
+        using var noPauses = RecoveryStateContention.SuppressPauses();
         _database
             .Setup(d => d.StringGetAsync((RedisKey)"ar:recovery:corr-a", It.IsAny<CommandFlags>()))
             .ReturnsAsync(RedisValue.Null);
@@ -766,13 +772,14 @@ public class RedisRecoveryStateStoreTests
             () => _store.SaveAsync("corr-a", state, TimeSpan.FromMinutes(3)));
 
         // No unconditional write may overwrite registrations committed by competing waiters.
-        Assert.Equal(4, _transactions.Count);
+        Assert.Equal(RecoveryStateContention.MaxAttempts, _transactions.Count);
         Assert.DoesNotContain(_database.Invocations, invocation => invocation.Method.Name == nameof(IDatabase.StringSetAsync));
     }
 
     [Fact]
     public async Task TryDeleteAsync_ExhaustedOptimisticAttempts_LeavesRegistrationForExpiry()
     {
+        using var noPauses = RecoveryStateContention.SuppressPauses();
         var first = new RecoveryState { RegistrationId = Guid.NewGuid(), CorrelationId = "corr-a" };
         _database
             .Setup(d => d.StringGetAsync((RedisKey)"ar:recovery:corr-a", It.IsAny<CommandFlags>()))
@@ -783,7 +790,7 @@ public class RedisRecoveryStateStoreTests
 
         // No unconditional delete or write may run — a lost concurrent registration is worse than
         // one row waiting out its TTL.
-        Assert.Equal(4, _transactions.Count);
+        Assert.Equal(RecoveryStateContention.MaxAttempts, _transactions.Count);
         Assert.DoesNotContain(_database.Invocations, invocation => invocation.Method.Name == nameof(IDatabase.KeyDeleteAsync));
         Assert.DoesNotContain(_database.Invocations, invocation => invocation.Method.Name == nameof(IDatabase.StringSetAsync));
     }
@@ -848,8 +855,9 @@ public class RedisRecoveryStateStoreTests
         });
 
         // The corrupt blob is reported (round 45, F4), not skipped — and only once every readable
-        // registration has been yielded.
-        Assert.Equal(1, unreadable.UnreadableCount);
+        // registration has been yielded. So is the JSON null (round 51): no build writes one, and
+        // read as an empty value it hid whatever the key was supposed to hold.
+        Assert.Equal(2, unreadable.UnreadableCount);
         Assert.Equal(2, states.Count);
         Assert.Contains(states, state => state.CorrelationId == "corr-a");
         Assert.Contains(states, state => state.CorrelationId == "corr-b");

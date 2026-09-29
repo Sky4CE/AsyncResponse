@@ -25,6 +25,7 @@ internal sealed class RedisRecoveryStateStore : IRecoveryStateStore, IRecoverySt
     private readonly RedisKeySchema _keys;
     private readonly ILogger<RedisRecoveryStateStore> _logger;
     private readonly TimeProvider _timeProvider;
+    private readonly int _maxRegistrationsPerCorrelationId;
 
     /// <summary>Creates a Redis-backed recovery state store.</summary>
     public RedisRecoveryStateStore(
@@ -38,6 +39,7 @@ internal sealed class RedisRecoveryStateStore : IRecoveryStateStore, IRecoverySt
         _keys = new RedisKeySchema(options.Value.KeyPrefix);
         _logger = logger;
         _timeProvider = timeProvider ?? TimeProvider.System;
+        _maxRegistrationsPerCorrelationId = options.Value.MaxRecoveryRegistrationsPerCorrelationId;
     }
 
     /// <inheritdoc />
@@ -64,10 +66,14 @@ internal sealed class RedisRecoveryStateStore : IRecoveryStateStore, IRecoverySt
 
         // Optimistic read-modify-write: two waiters registering the same correlation id
         // concurrently must both survive, so each write commits only while the stored value is
-        // still the one we read (transaction condition), retrying on a conflict.
-        for (var attempt = 0; attempt < MaxCasAttempts; attempt++)
+        // still the one we read (transaction condition), retrying on a conflict — after a pause
+        // (see RecoveryStateContention): retried at once, the losers of a burst collided again
+        // and all but a handful gave up.
+        for (var attempt = 0; attempt < RecoveryStateContention.MaxAttempts; attempt++)
         {
             cancellationToken.ThrowIfCancellationRequested();
+            if (attempt > 0)
+                await RecoveryStateContention.PauseAsync(attempt, cancellationToken).ConfigureAwait(false);
 
             var nowUtc = _timeProvider.GetUtcNow();
             var previous = await _database.StringGetAsync(recoveryKey).ConfigureAwait(false);
@@ -85,6 +91,14 @@ internal sealed class RedisRecoveryStateStore : IRecoveryStateStore, IRecoverySt
             }
 
             entries.RemoveAll(existing => existing.State?.RegistrationId == state.RegistrationId);
+
+            // Every registration under the id lives in this one value, which each save reads,
+            // parses and rewrites whole: N waiters cost 1 + 2 + … + N serialized registrations.
+            // Expired entries were pruned by the read and a re-save of the same registration was
+            // removed above, so neither counts against the bound.
+            if (entries.Count >= _maxRegistrationsPerCorrelationId)
+                throw RecoveryRegistrationLimit.Exceeded(correlationId, entries.Count, nameof(RedisAsyncResponseOptions));
+
             entries.Add(new StoredRegistration { State = state, ExpiresAtUtc = nowUtc + ttl });
 
             var transaction = _database.CreateTransaction();
@@ -107,7 +121,7 @@ internal sealed class RedisRecoveryStateStore : IRecoveryStateStore, IRecoverySt
         }
 
         throw new InvalidOperationException(
-            $"Recovery-state save for correlationId '{correlationId}' could not commit after {MaxCasAttempts} optimistic attempts.");
+            $"Recovery-state save for correlationId '{correlationId}' could not commit after {RecoveryStateContention.MaxAttempts} optimistic attempts.");
     }
 
     /// <inheritdoc />
@@ -136,7 +150,7 @@ internal sealed class RedisRecoveryStateStore : IRecoveryStateStore, IRecoverySt
         // with an unconditional rewrite; the caller treats false as "nothing deleted".
         _logger.LogWarning(
             "Recovery-state delete for correlationId {CorrelationId} registration {RegistrationId} exhausted {Attempts} optimistic attempts; leaving the registration for expiry.",
-            correlationId, registrationId, MaxCasAttempts);
+            correlationId, registrationId, RecoveryStateContention.MaxAttempts);
         return false;
     }
 
@@ -160,7 +174,7 @@ internal sealed class RedisRecoveryStateStore : IRecoveryStateStore, IRecoverySt
 
         _logger.LogWarning(
             "Recovery-state delete for correlationId {CorrelationId} of {RegistrationCount} registration(s) exhausted {Attempts} optimistic attempts; leaving the registrations for expiry.",
-            correlationId, targets.Count, MaxCasAttempts);
+            correlationId, targets.Count, RecoveryStateContention.MaxAttempts);
         return 0;
     }
 
@@ -174,10 +188,13 @@ internal sealed class RedisRecoveryStateStore : IRecoveryStateStore, IRecoverySt
         var recoveryKey = _keys.RecoveryKey(correlationId);
 
         // Optimistic removal: deleting registrations must not clobber a registration that a
-        // concurrent writer appended between our read and our write.
-        for (var attempt = 0; attempt < MaxCasAttempts; attempt++)
+        // concurrent writer appended between our read and our write. Paced like SaveAsync: the
+        // waiters of a fan-out that complete together delete from the same value at once.
+        for (var attempt = 0; attempt < RecoveryStateContention.MaxAttempts; attempt++)
         {
             cancellationToken.ThrowIfCancellationRequested();
+            if (attempt > 0)
+                await RecoveryStateContention.PauseAsync(attempt, cancellationToken).ConfigureAwait(false);
 
             var nowUtc = _timeProvider.GetUtcNow();
             var previous = await _database.StringGetAsync(recoveryKey).ConfigureAwait(false);
@@ -438,8 +455,6 @@ internal sealed class RedisRecoveryStateStore : IRecoveryStateStore, IRecoverySt
     private static RedisConnectionException ScanUnavailable(string message)
         => new(ConnectionFailureType.UnableToConnect, CommandFlags.None, message, innerException: null, CommandStatus.Unknown);
 
-    private const int MaxCasAttempts = 4;
-
     private async Task<List<RecoveryState>> LoadStatesAsync(string recoveryKey, string correlationId)
     {
         var value = await _database.StringGetAsync(recoveryKey).ConfigureAwait(false);
@@ -502,11 +517,13 @@ internal sealed class RedisRecoveryStateStore : IRecoveryStateStore, IRecoverySt
     /// </summary>
     private static TimeSpan MaxRemaining(List<StoredRegistration> entries, DateTimeOffset nowUtc)
     {
+        // Every entry a rewrite carries has its stamp: a value with an entry whose expiry cannot be
+        // established is never rewritten (see DeserializeEntriesCore).
         var maxExpiresAtUtc = DateTimeOffset.MinValue;
         foreach (var entry in entries)
         {
-            if (entry.ExpiresAtUtc > maxExpiresAtUtc)
-                maxExpiresAtUtc = entry.ExpiresAtUtc;
+            if (entry.ExpiresAtUtc is { } expiresAtUtc && expiresAtUtc > maxExpiresAtUtc)
+                maxExpiresAtUtc = expiresAtUtc;
         }
 
         var remaining = maxExpiresAtUtc - nowUtc;
@@ -573,14 +590,63 @@ internal sealed class RedisRecoveryStateStore : IRecoveryStateStore, IRecoverySt
             }
 
             var stored = JsonSafety.SafeDeserialize(json, _envelopeTypeInfo);
-            var entries = stored?.Registrations ?? [];
+            if (stored?.Registrations is not { } entries)
+            {
+                // A JSON null, or an object without the registration list: no build writes either,
+                // so it is not an empty value but an unreadable one. Read as "no registrations" it
+                // acknowledged the response every registration the key once held was waiting for.
+                _logger.Log(
+                    logAsError ? LogLevel.Error : LogLevel.Warning,
+                    "Recovery state at {RecoveryKey} holds no registration list; refusing it as unreadable.",
+                    recoveryKey);
+                if (throwOnUnreadableEnvelope)
+                    throw new RecoveryStateUnreadableException(correlationId, 1);
+
+                unreadable = 1;
+                return ([], false);
+            }
+
+            // Structure before expiry. Every build that wrote this shape stamped each entry, and a
+            // missing stamp deserialized to DateTimeOffset.MinValue — long expired — so the prune
+            // below removed the entry as lapsed: a lookup reported it absent and the response was
+            // acknowledged, and a save rewrote the key without it. An entry whose expiry cannot be
+            // established (or a null entry) is unreadable instead. A read drops it and counts it;
+            // a write refuses to rewrite the value at all, since carrying it through would have to
+            // invent an expiry for it (see SaveAsync's refusal of an unparseable value).
+            var incomplete = 0;
+            foreach (var entry in entries)
+            {
+                if (entry?.ExpiresAtUtc is null)
+                    incomplete++;
+            }
+
+            if (incomplete > 0)
+            {
+                _logger.Log(
+                    logAsError ? LogLevel.Error : LogLevel.Warning,
+                    "Recovery state at {RecoveryKey} has {Incomplete} registration(s) without an expiry; refusing them as unreadable rather than treating them as expired.",
+                    recoveryKey,
+                    incomplete);
+                if (preserveUnreadable)
+                {
+                    if (throwOnUnreadableEnvelope)
+                        throw new RecoveryStateUnreadableException(correlationId, incomplete);
+
+                    unreadable = incomplete;
+                    return ([], false);
+                }
+
+                entries.RemoveAll(static entry => entry?.ExpiresAtUtc is null);
+                unreadable = incomplete;
+            }
+
             // An entry past its per-entry expiry is logically gone even while a longer-lived
             // sibling keeps the key alive; surfacing it would fire recovery callbacks for a
             // registration that lapsed long ago. Dropped BEFORE the readability check, so a lapsed
             // entry is gone rather than counted (or logged) as unreadable.
-            entries.RemoveAll(entry => entry is null || entry.ExpiresAtUtc <= nowUtc);
+            entries.RemoveAll(entry => entry.ExpiresAtUtc is { } expiresAtUtc && expiresAtUtc <= nowUtc);
             if (!preserveUnreadable)
-                unreadable = entries.RemoveAll(entry => !IsStateReadable(entry.State, recoveryKey, correlationId));
+                unreadable += entries.RemoveAll(entry => !IsStateReadable(entry.State, recoveryKey, correlationId));
             return (entries, false);
         }
         catch (Exception ex) when (ex is JsonException or InvalidDataException)
@@ -658,7 +724,14 @@ internal sealed class RedisRecoveryStateStore : IRecoveryStateStore, IRecoverySt
     internal sealed class StoredRegistration
     {
         public RecoveryState? State { get; set; }
-        public DateTimeOffset ExpiresAtUtc { get; set; }
+
+        /// <summary>
+        /// Nullable so that a missing stamp is seen as missing rather than read as
+        /// <see cref="DateTimeOffset.MinValue"/> (long expired). Every enveloped entry carries one;
+        /// only a legacy bare-array entry, which lives until the key's TTL, has none in memory.
+        /// The wire form is unchanged.
+        /// </summary>
+        public DateTimeOffset? ExpiresAtUtc { get; set; }
     }
 }
 

@@ -28,6 +28,7 @@ internal readonly record struct MongoDbChannelMessage(
 internal sealed class MongoDbChannelStore : IDisposable
 {
     private readonly IMongoCollection<MongoRecoveryStateDocument> _recovery;
+    private readonly IMongoCollection<MongoRecoveryStateDocument> _recoveryAuthoritative;
     private readonly IMongoCollection<MongoChannelMessageDocument> _messages;
     private readonly IMongoCollection<MongoChannelSubscriberDocument> _subscribers;
     private readonly IMongoCollection<BsonDocument> _counters;
@@ -87,6 +88,9 @@ internal sealed class MongoDbChannelStore : IDisposable
         _recovery = database.GetCollection<MongoRecoveryStateDocument>(_options.RecoveryStateCollection)
             .WithReadPreference(ReadPreference.Primary)
             .WithWriteConcern(writeConcern);
+        // The lost-subscriber lookup's handle: majority reads, ordered after a majority barrier
+        // write by a causally consistent session (see LoadRecoveryStatesAsync).
+        _recoveryAuthoritative = _recovery.WithReadConcern(ReadConcern.Majority);
         _messages = database.GetCollection<MongoChannelMessageDocument>(_options.MessageCollection)
             .WithReadPreference(ReadPreference.Primary)
             .WithWriteConcern(writeConcern);
@@ -371,17 +375,104 @@ internal sealed class MongoDbChannelStore : IDisposable
             })
         });
 
+    /// <summary>
+    /// Every live registration of <paramref name="correlationId"/>, read authoritatively: the
+    /// answer decides whether a response is acknowledged, so it must include every registration
+    /// whose majority-acknowledged save completed before this lookup began.
+    /// <para>
+    /// A primary read alone does not guarantee that. A primary deposed by a partition keeps
+    /// serving reads until it notices (up to about <c>electionTimeoutMillis</c>), and a publisher
+    /// that can reach only it saw none — or only some — of the registrations the new primary had
+    /// taken: the dispatcher invoked nothing (or too little), the transport acknowledged the
+    /// response, and the missing registrations stayed armed with no payload left to deliver. A
+    /// <c>majority</c> read alone is no better there (a deposed primary's majority snapshot is just
+    /// as stale), and <c>linearizable</c> — what the flow store uses — guarantees only a read whose
+    /// filter selects a single document, while this one selects the id's whole registration set.
+    /// </para>
+    /// <para>
+    /// So the lookup first raises a barrier: a majority write (see
+    /// <see cref="RaiseRecoveryReadBarrierAsync"/>), bounded by the handle's <c>wtimeout</c>, which
+    /// only a primary still in contact with a majority can acknowledge. The registrations are then
+    /// read at <c>majority</c> read concern in the same causally consistent session, so the server
+    /// answers from a majority-committed snapshot that includes the barrier — and therefore every
+    /// save acknowledged before it. A lookup that cannot complete that way (a lapsed <c>wtimeout</c>,
+    /// a step-down before or after the barrier, a network error) fails with
+    /// <see cref="RecoveryStateUnconfirmedException"/> rather than answering from an unconfirmed
+    /// view: the publish fails, the broker ingress passes it through without escalating, and the
+    /// response is redelivered instead of acknowledged. The read carries the same bound
+    /// (<c>maxTimeMS</c>) as the flow store's authoritative reads. Only the
+    /// lost-subscriber lookup pays this — one small write — and the watchdog scan, which settles
+    /// nothing, reads plainly.
+    /// </para>
+    /// </summary>
     public async Task<IReadOnlyList<string>> LoadRecoveryStatesAsync(string correlationId, CancellationToken cancellationToken)
     {
-        await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
-        var filter = Builders<MongoRecoveryStateDocument>.Filter.Eq(item => item.CorrelationId, correlationId)
-                     & NotExpiredOnServerClock<MongoRecoveryStateDocument>();
-        var documents = await _recovery.Find(filter)
-            .SortBy(item => item.RegisteredAtUtc)
-            .Project(item => item.StateJson)
-            .ToListAsync(cancellationToken).ConfigureAwait(false);
-        return documents;
+        try
+        {
+            await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
+            var filter = Builders<MongoRecoveryStateDocument>.Filter.Eq(item => item.CorrelationId, correlationId)
+                         & NotExpiredOnServerClock<MongoRecoveryStateDocument>();
+
+            using var session = await _database.Client.StartSessionAsync(AuthoritativeReadSession, cancellationToken).ConfigureAwait(false);
+            await RaiseRecoveryReadBarrierAsync(session, correlationId, cancellationToken).ConfigureAwait(false);
+            return await _recoveryAuthoritative
+                .Find(session, filter, new FindOptions { MaxTime = MongoWriteConcerns.DefaultMajorityTimeout })
+                .SortBy(item => item.RegisteredAtUtc)
+                .Project(item => item.StateJson)
+                .ToListAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            // Every step — first-use setup, the session, the barrier, the majority read — is
+            // wrapped, not rethrown as is: a raw driver error is an ordinary transient fault to the
+            // broker ingress, which escalates it through SetException once its ladder is spent, and
+            // that escalation's own lookup, on a set that had just recovered, ran the FAILURE
+            // callback for a response the worker produced successfully. A barrier acknowledged just
+            // before a step-down leaves the read to fail the same way. The ingress passes this type
+            // through untouched, so the transport redelivers the response.
+            SafeLog.Try(
+                (Logger: _logger, Error: ex, CorrelationId: correlationId),
+                static state => state.Logger.LogWarning(
+                    state.Error,
+                    "MongoDB channel could not confirm that it reads the current recovery registrations for correlationId {CorrelationId}: " +
+                    "the authoritative lookup (first-use setup, session, majority barrier write or majority read) failed. The lookup is refused " +
+                    "rather than answered from a view a deposed primary may serve, so nothing is dispatched and the response is not acknowledged.",
+                    state.CorrelationId));
+            throw new RecoveryStateUnconfirmedException(correlationId, ex);
+        }
     }
+
+    /// <summary>Explicit causal consistency: the majority read must be ordered after the barrier write.</summary>
+    private static readonly ClientSessionOptions AuthoritativeReadSession = new() { CausalConsistency = true };
+
+    /// <summary>
+    /// How many barrier documents the lookups spread over, so the lost-subscriber lookups of
+    /// unrelated correlation ids do not all queue on one hot document. Any one of them is as good
+    /// a barrier as another: what orders the read is the write's position in the oplog, not which
+    /// document it touched.
+    /// </summary>
+    internal const int RecoveryReadBarrierStripes = 16;
+
+    /// <summary>The counters-collection document a lookup for <paramref name="correlationId"/> writes its barrier to.</summary>
+    internal static string RecoveryReadBarrierId(string correlationId)
+        => $"recovery_read_barrier_{(uint)StringComparer.Ordinal.GetHashCode(correlationId) % RecoveryReadBarrierStripes}";
+
+    /// <summary>
+    /// The majority write in front of an authoritative recovery lookup (see
+    /// <see cref="LoadRecoveryStatesAsync"/>), in the counters collection the channel already owns.
+    /// An <c>$inc</c>, never a no-op: an update that changes nothing writes no oplog entry, and its
+    /// majority wait is then satisfied by whatever the node already believes committed — which a
+    /// deposed primary believes of its own stale history. Deliberately not absorbed on a lapsed
+    /// <c>wtimeout</c>, unlike the channel's other writes: the barrier's only purpose is the
+    /// majority acknowledgement.
+    /// </summary>
+    private Task RaiseRecoveryReadBarrierAsync(IClientSessionHandle session, string correlationId, CancellationToken cancellationToken)
+        => _counters.UpdateOneAsync(
+            session,
+            new BsonDocument("_id", RecoveryReadBarrierId(correlationId)),
+            new BsonDocument("$inc", new BsonDocument("seq", 1L)),
+            new UpdateOptions { IsUpsert = true },
+            cancellationToken);
 
     public async Task<bool> DeleteRecoveryStateAsync(string correlationId, Guid registrationId, CancellationToken cancellationToken)
     {

@@ -397,3 +397,6 @@ AsyncResponse.FlowLeaseObservation.LeaseId.get -> string?
 AsyncResponse.IFlowStateStore.ObserveLeaseAsync(string! flowId, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task<AsyncResponse.FlowLeaseObservation?>!
 AsyncResponse.IFlowStateStore.LoadCurrentAsync(string! flowId, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task<AsyncResponse.FlowState?>!
 static AsyncResponse.FlowLeaseObservation.Unheld.get -> AsyncResponse.FlowLeaseObservation!
+AsyncResponse.RecoveryStateUnconfirmedException
+AsyncResponse.RecoveryStateUnconfirmedException.CorrelationId.get -> string?
+AsyncResponse.RecoveryStateUnconfirmedException.RecoveryStateUnconfirmedException(string? correlationId, System.Exception! innerException) -> void

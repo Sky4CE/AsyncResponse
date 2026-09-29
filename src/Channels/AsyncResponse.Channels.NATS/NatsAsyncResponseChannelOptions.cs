@@ -82,6 +82,18 @@ public sealed class NatsAsyncResponseChannelOptions : DurableAsyncResponseChanne
     /// </summary>
     public TimeSpan PresenceProbeTimeout { get; set; } = TimeSpan.FromSeconds(2);
 
+    /// <summary>
+    /// The most recovery registrations one correlation id may hold at a time — how many recoverable
+    /// waiters can share it. Every registration of an id lives in one Key-Value entry that each new
+    /// waiter reads and rewrites whole, so registering N waiters writes 1 + 2 + … + N registrations,
+    /// and the entry must stay under the server's maximum payload (1 MB by default). A waiter that
+    /// would exceed the limit fails at creation, before its trigger runs, with an
+    /// <see cref="InvalidOperationException"/>; re-saving a registration and expired registrations
+    /// do not count. For wider fan-out use a database channel (PostgreSQL, SQL Server, MongoDB),
+    /// which stores one row per registration. Default: 64.
+    /// </summary>
+    public int MaxRecoveryRegistrationsPerCorrelationId { get; set; } = RecoveryRegistrationLimit.Default;
+
     // IncludeRemoteStackTrace and MaxRemoteStackTraceLength are inherited from
     // DurableAsyncResponseChannelOptions.
 
@@ -116,6 +128,8 @@ public sealed class NatsAsyncResponseChannelOptions : DurableAsyncResponseChanne
 
         if (MaxRemoteStackTraceLength < 0)
             throw new InvalidOperationException($"{nameof(NatsAsyncResponseChannelOptions)}.{nameof(MaxRemoteStackTraceLength)} must not be negative.");
+
+        RecoveryRegistrationLimit.Validate(MaxRecoveryRegistrationsPerCorrelationId, nameof(NatsAsyncResponseChannelOptions));
 
         // A NATS bucket name must be a single token of [A-Za-z0-9_-]. A dotted/whitespace value would
         // silently produce an unusable backing stream, so reject it explicitly.

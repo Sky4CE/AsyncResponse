@@ -148,10 +148,11 @@ public sealed class Round49NewApiTests
         var a = Registration("corr");
         redis.Value = RedisEnvelope((a, time.Now + TimeSpan.FromMinutes(5)));
         redis.ConflictEveryExecute = true;
+        using var noPauses = RecoveryStateContention.SuppressPauses();
 
         Assert.Equal(0, await store.TryDeleteManyAsync("corr", [a.RegistrationId]));
 
-        Assert.Equal(4, redis.Conflicts);
+        Assert.Equal(RecoveryStateContention.MaxAttempts, redis.Conflicts);
         Assert.Equal(a.RegistrationId, Assert.Single(RedisEntries(redis)).RegistrationId);
     }
 
@@ -223,7 +224,8 @@ public sealed class Round49NewApiTests
         await store.SaveAsync("corr", a, TimeSpan.FromMinutes(5));
         await store.SaveAsync("corr", b, TimeSpan.FromMinutes(5));
 
-        kv.ForcedUpdateConflicts = 4;
+        kv.ForcedUpdateConflicts = RecoveryStateContention.MaxAttempts;
+        using var noPauses = RecoveryStateContention.SuppressPauses();
         Assert.Equal(0, await store.TryDeleteManyAsync("corr", [a.RegistrationId]));
         Assert.Equal(2, NatsEnvelope(kv, "corr").States!.Count);
 

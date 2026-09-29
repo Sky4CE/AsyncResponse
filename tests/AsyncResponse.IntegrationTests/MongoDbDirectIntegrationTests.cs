@@ -26,6 +26,39 @@ public sealed class MongoDbDirectIntegrationTests(DataBatchFixture fixture) : In
     private readonly MongoClient _client = new(fixture.MongoDbConnectionString);
     private readonly List<string> _databases = [];
 
+    /// <summary>
+    /// Round 51 (F1), against the real replica set: the lost-subscriber lookup raises a majority
+    /// barrier (an <c>$inc</c> upsert in the counters collection) and reads the registrations at
+    /// majority read concern in the same causally consistent session — the server accepts the
+    /// session, the barrier and the causally ordered read, and the read sees every registration
+    /// saved before it. (A partitioned three-node set, where a deposed primary cannot acknowledge
+    /// the barrier, was verified separately; the unit suite pins that path.)
+    /// </summary>
+    [Fact]
+    public async Task RecoveryLookup_RaisesItsMajorityBarrier_ThenReadsEveryRegistration()
+    {
+        var (database, options) = NewChannelDatabase("recovery-barrier");
+        using var store = new MongoDbChannelStore(database, Options.Create(options));
+        var recovery = new MongoDbRecoveryStateStore(store, NullLogger<MongoDbRecoveryStateStore>.Instance);
+        var correlationId = NewId("barrier");
+        var first = new RecoveryState { CorrelationId = correlationId, PayloadTypeFullName = typeof(OperationResult).FullName };
+        var second = new RecoveryState { CorrelationId = correlationId, PayloadTypeFullName = typeof(OperationResult).FullName };
+        await recovery.SaveAsync(correlationId, first, TimeSpan.FromSeconds(30));
+        await recovery.SaveAsync(correlationId, second, TimeSpan.FromSeconds(30));
+
+        var found = await recovery.GetAllAsync(correlationId);
+        Assert.Equal(
+            new[] { first.RegistrationId, second.RegistrationId }.Order(),
+            found.Select(state => state.RegistrationId).Order());
+        Assert.Empty(await recovery.GetAllAsync(NewId("barrier-absent")));
+
+        var barrier = await database
+            .GetCollection<BsonDocument>(MongoDbChannelStore.CountersCollectionName(options.MessageCollection))
+            .Find(new BsonDocument("_id", MongoDbChannelStore.RecoveryReadBarrierId(correlationId)))
+            .SingleAsync();
+        Assert.True(barrier["seq"].ToInt64() >= 1);
+    }
+
     [Fact]
     public async Task ChannelStore_RoundTripsRecoveryStateSubscribersMessagesAndClaims()
     {

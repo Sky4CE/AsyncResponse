@@ -23,6 +23,7 @@ internal sealed class NatsRecoveryStateStore : IRecoveryStateStore, IRecoverySta
     private readonly INatsKvStore _store;
     private readonly ILogger<NatsRecoveryStateStore> _logger;
     private readonly TimeProvider _timeProvider;
+    private readonly int _maxRegistrationsPerCorrelationId;
 
     /// <summary>Creates a NATS JetStream Key-Value recovery state store.</summary>
     public NatsRecoveryStateStore(
@@ -35,6 +36,7 @@ internal sealed class NatsRecoveryStateStore : IRecoveryStateStore, IRecoverySta
         _store = store;
         _logger = logger;
         _timeProvider = timeProvider ?? TimeProvider.System;
+        _maxRegistrationsPerCorrelationId = options.Value.MaxRecoveryRegistrationsPerCorrelationId;
     }
 
     /// <inheritdoc />
@@ -60,10 +62,14 @@ internal sealed class NatsRecoveryStateStore : IRecoveryStateStore, IRecoverySta
         var key = NatsSubjectSchema.RecoveryKey(correlationId);
 
         // Revision-conditioned read-modify-write: two waiters registering the same correlation id
-        // concurrently must both survive.
-        for (var attempt = 0; attempt < MaxCasAttempts; attempt++)
+        // concurrently must both survive. A loser pauses before it tries again (see
+        // RecoveryStateContention): retried at once, the losers of a burst collided again and all
+        // but a handful gave up.
+        for (var attempt = 0; attempt < RecoveryStateContention.MaxAttempts; attempt++)
         {
             cancellationToken.ThrowIfCancellationRequested();
+            if (attempt > 0)
+                await RecoveryStateContention.PauseAsync(attempt, cancellationToken).ConfigureAwait(false);
 
             var entry = await _store.GetAsync(key, cancellationToken).ConfigureAwait(false);
             var stored = entry is { } existing ? TryDeserialize(existing.Value, key) : null;
@@ -94,6 +100,14 @@ internal sealed class NatsRecoveryStateStore : IRecoveryStateStore, IRecoverySta
             // per-row expires_at drops it.
             entries.RemoveAll(existingEntry => existingEntry.ExpiresAtUtc <= now);
             entries.RemoveAll(existingEntry => existingEntry.State is { } existingState && existingState.RegistrationId == state.RegistrationId);
+
+            // Every registration under the id lives in this one value, which each save reads,
+            // parses and rewrites whole: N waiters cost 1 + 2 + … + N serialized registrations,
+            // and every rewrite nears the server's value-size limit. A re-save of the same
+            // registration was removed above, so it never counts against the bound.
+            if (entries.Count >= _maxRegistrationsPerCorrelationId)
+                throw RecoveryRegistrationLimit.Exceeded(correlationId, entries.Count, nameof(NatsAsyncResponseChannelOptions));
+
             entries.Add((state, now + ttl));
             var json = SerializeStates(entries);
 
@@ -105,7 +119,7 @@ internal sealed class NatsRecoveryStateStore : IRecoveryStateStore, IRecoverySta
         }
 
         throw new InvalidOperationException(
-            $"Recovery-state save for correlationId '{correlationId}' could not commit after {MaxCasAttempts} optimistic attempts.");
+            $"Recovery-state save for correlationId '{correlationId}' could not commit after {RecoveryStateContention.MaxAttempts} optimistic attempts.");
     }
 
     /// <inheritdoc />
@@ -186,7 +200,7 @@ internal sealed class NatsRecoveryStateStore : IRecoveryStateStore, IRecoverySta
 
         _logger.LogWarning(
             "Recovery-state delete for correlationId {CorrelationId} registration {RegistrationId} exhausted {Attempts} optimistic attempts; leaving the registration for expiry.",
-            correlationId, registrationId, MaxCasAttempts);
+            correlationId, registrationId, RecoveryStateContention.MaxAttempts);
         return false;
     }
 
@@ -211,7 +225,7 @@ internal sealed class NatsRecoveryStateStore : IRecoveryStateStore, IRecoverySta
 
         _logger.LogWarning(
             "Recovery-state delete for correlationId {CorrelationId} of {RegistrationCount} registration(s) exhausted {Attempts} optimistic attempts; leaving the registrations for expiry.",
-            correlationId, targets.Count, MaxCasAttempts);
+            correlationId, targets.Count, RecoveryStateContention.MaxAttempts);
         return 0;
     }
 
@@ -225,10 +239,13 @@ internal sealed class NatsRecoveryStateStore : IRecoveryStateStore, IRecoverySta
         var key = NatsSubjectSchema.RecoveryKey(correlationId);
 
         // Revision-conditioned removal: deleting registrations must not clobber a registration
-        // that another writer appended between our read and our write.
-        for (var attempt = 0; attempt < MaxCasAttempts; attempt++)
+        // that another writer appended between our read and our write. Paced like SaveAsync: the
+        // waiters of a fan-out that complete together delete from the same value at once.
+        for (var attempt = 0; attempt < RecoveryStateContention.MaxAttempts; attempt++)
         {
             cancellationToken.ThrowIfCancellationRequested();
+            if (attempt > 0)
+                await RecoveryStateContention.PauseAsync(attempt, cancellationToken).ConfigureAwait(false);
 
             var entry = await _store.GetAsync(key, cancellationToken).ConfigureAwait(false);
             if (entry is not { } existing)
@@ -412,8 +429,6 @@ internal sealed class NatsRecoveryStateStore : IRecoveryStateStore, IRecoverySta
         }, CancellationToken.None);
     }
 
-    private const int MaxCasAttempts = 4;
-
     /// <summary>
     /// Tri-state load: the key is absent, or it holds an envelope this build can read, or it holds
     /// an envelope it cannot. The third case is NOT absence — see the note in <see cref="GetAllAsync"/>.
@@ -471,23 +486,64 @@ internal sealed class NatsRecoveryStateStore : IRecoveryStateStore, IRecoverySta
     /// <summary>
     /// Pairs each stored registration with its own expiry. Envelopes written before
     /// <see cref="StoredRecoveryState.StateExpiries"/> existed carry only the shared stamp, which
-    /// those registrations inherit — the old behavior, applied to old data only.
+    /// those registrations inherit — the old behavior, applied to old data only. Only envelopes
+    /// that passed <see cref="ExpiryDefect"/> get here, so both stamps are present and consistent.
     /// </summary>
     private static List<(RecoveryState? State, DateTimeOffset ExpiresAtUtc)> EntriesFrom(StoredRecoveryState stored)
     {
         var states = stored.States;
-        if (states is not { Count: > 0 })
+        if (states is not { Count: > 0 } || stored.ExpiresAtUtc is not { } sharedExpiry)
             return [];
 
-        var expiries = stored.StateExpiries is { } perState && perState.Count == states.Count ? stored.StateExpiries : null;
+        var expiries = stored.StateExpiries;
         var entries = new List<(RecoveryState? State, DateTimeOffset ExpiresAtUtc)>(states.Count);
         for (var i = 0; i < states.Count; i++)
-            entries.Add((states[i], expiries is not null ? expiries[i] : stored.ExpiresAtUtc));
+            entries.Add((states[i], expiries is not null ? expiries[i] : sharedExpiry));
 
         return entries;
     }
 
-    private bool IsExpired(StoredRecoveryState stored) => stored.ExpiresAtUtc <= _timeProvider.GetUtcNow();
+    /// <summary>
+    /// Whether the whole envelope is past its stamp. An envelope without one is never "expired":
+    /// <see cref="TryDeserialize"/> already refused it, and a record whose expiry cannot be
+    /// established must not be deleted as if it had lapsed.
+    /// </summary>
+    private bool IsExpired(StoredRecoveryState stored)
+        => stored.ExpiresAtUtc is { } expiresAtUtc && expiresAtUtc <= _timeProvider.GetUtcNow();
+
+    /// <summary>
+    /// Why an envelope's expiry metadata cannot be trusted, or <c>null</c> when it is complete and
+    /// consistent. Every build that wrote this envelope stamped the shared expiry, and the current
+    /// one stamps it as the latest of the per-registration expiries, which it writes one per
+    /// registration. A missing field deserializes to nothing rather than failing the parse, and
+    /// was read as <see cref="DateTimeOffset.MinValue"/>: already expired, so a lookup reported
+    /// the registrations absent and deleted the key — the watchdog scan too — while their own
+    /// expiries were still in the future. Only the direction that can hide a live registration is
+    /// refused for the shared stamp: one later than every registration's own merely keeps the
+    /// whole-key fast path from firing early.
+    /// </summary>
+    internal static string? ExpiryDefect(StoredRecoveryState stored)
+    {
+        if (stored.States is null)
+            return "has no registration list";
+
+        if (stored.ExpiresAtUtc is not { } sharedExpiry)
+            return "has no expiry";
+
+        if (stored.StateExpiries is not { } expiries)
+            return null;
+
+        if (expiries.Count != stored.States.Count)
+            return $"has {expiries.Count} registration expiries for {stored.States.Count} registrations";
+
+        foreach (var expiresAtUtc in expiries)
+        {
+            if (expiresAtUtc > sharedExpiry)
+                return "has an expiry earlier than one of its registrations' own";
+        }
+
+        return null;
+    }
 
     /// <summary>
     /// Readability check that also counts rows this build could not INTERPRET. A row carrying
@@ -524,19 +580,39 @@ internal sealed class NatsRecoveryStateStore : IRecoveryStateStore, IRecoverySta
 
     private StoredRecoveryState? TryDeserialize(string json, string key)
     {
+        StoredRecoveryState? stored;
         try
         {
             // Through JsonSafety, not the raw reader: the exception logged below is the body-free
             // rebuild (size and position). The reader's own appends `Path: $.States[0].Context['<key>']`
             // built from the stored registration's context keys — tenant and auth baggage — which
             // this warning then carried into the application log.
-            return JsonSafety.SafeDeserialize(json, _envelopeTypeInfo);
+            stored = JsonSafety.SafeDeserialize(json, _envelopeTypeInfo);
         }
         catch (Exception ex) when (ex is JsonException or InvalidDataException)
         {
             _logger.LogWarning(ex, "Unreadable recovery state at key {RecoveryKey}; skipping.", key);
             return null;
         }
+
+        if (stored is null)
+        {
+            _logger.LogWarning("Recovery state at key {RecoveryKey} holds no envelope; refusing it as unreadable.", key);
+            return null;
+        }
+
+        // Parsed is not readable: an envelope whose expiry cannot be established is refused like
+        // one that does not parse — every caller treats that as "unreadable", never as absent or
+        // expired, so nothing deletes or rewrites it (see ExpiryDefect).
+        if (ExpiryDefect(stored) is { } defect)
+        {
+            _logger.LogWarning(
+                "Recovery state at key {RecoveryKey} {Defect}; refusing it as unreadable rather than treating it as expired.",
+                key, defect);
+            return null;
+        }
+
+        return stored;
     }
 
     private async Task TryDeleteSilentlyAsync(string key, ulong revision, CancellationToken cancellationToken)
@@ -570,9 +646,11 @@ internal sealed class NatsRecoveryStateStore : IRecoveryStateStore, IRecoverySta
         /// <summary>
         /// The envelope-level expiry — the maximum of <see cref="StateExpiries"/>. Kept for the
         /// whole-key fast path (every registration expired ⇒ the key is deletable) and for
-        /// downgrade compatibility with builds that read only this stamp.
+        /// downgrade compatibility with builds that read only this stamp. Nullable so that a
+        /// missing stamp is seen as missing: every build writes it, and an envelope without it
+        /// is refused as unreadable (see <see cref="ExpiryDefect"/>). The wire form is unchanged.
         /// </summary>
-        public DateTimeOffset ExpiresAtUtc { get; set; }
+        public DateTimeOffset? ExpiresAtUtc { get; set; }
     }
 }
 

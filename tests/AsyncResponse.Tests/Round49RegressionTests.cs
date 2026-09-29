@@ -609,9 +609,10 @@ public sealed class Round49RegressionTests
     /// delete) and N + 1 reads, rewriting ~N²/2 registrations in total. Now the fan-out costs two
     /// reads and ONE rewrite — of the survivor alone, with its own expiry — whatever N is.
     /// </summary>
+    // 63 consumed + the survivor = 64, the default MaxRecoveryRegistrationsPerCorrelationId (round 51).
     [Theory]
     [InlineData(16)]
-    [InlineData(64)]
+    [InlineData(63)]
     public async Task RedisFanOut_ConsumedRegistrations_AreRemovedInOneRewrite_WhateverTheirNumber(int consumedCount)
     {
         var spy = new R49Spy();
@@ -647,8 +648,8 @@ public sealed class Round49RegressionTests
     /// <summary>The NATS KV envelope, for the lost-RESPONSE and the lost-EXCEPTION fan-out alike.</summary>
     [Theory]
     [InlineData(16, false)]
-    [InlineData(64, false)]
-    [InlineData(64, true)]
+    [InlineData(63, false)]
+    [InlineData(63, true)]
     public async Task NatsFanOut_ConsumedRegistrations_AreRemovedInOneRewrite_WhateverTheirNumber(int consumedCount, bool exceptionRoute)
     {
         var spy = new R49Spy();
@@ -845,8 +846,12 @@ internal sealed class StatefulRedis
             .Returns(CreateTransaction);
     }
 
-    public RedisRecoveryStateStore CreateStore(TimeProvider time)
-        => new(_multiplexer.Object, Options.Create(new RedisAsyncResponseOptions { KeyPrefix = "ar" }), NullLogger<RedisRecoveryStateStore>.Instance, time);
+    public RedisRecoveryStateStore CreateStore(TimeProvider time, Action<RedisAsyncResponseOptions>? configure = null)
+    {
+        var options = new RedisAsyncResponseOptions { KeyPrefix = "ar" };
+        configure?.Invoke(options);
+        return new(_multiplexer.Object, Options.Create(options), NullLogger<RedisRecoveryStateStore>.Instance, time);
+    }
 
     public void ResetCounters()
     {

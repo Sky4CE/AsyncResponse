@@ -161,6 +161,7 @@ Options are set through the channel registration callback (`.WithInMemoryChannel
 | `RecoveryBucket` | NATS | `asyncresponse-recovery` | JetStream KV bucket for recovery state. **Give every application or environment sharing one NATS system its own bucket as well as its own `SubjectPrefix`:** registrations are keyed by correlation id only, so deployments sharing a bucket see (and can consume) each other's registrations; a non-default `SubjectPrefix` with the default bucket logs a startup warning. An existing bucket is used as it is, never recreated; a warning reports a max age shorter than `RecoveryStateExpiry` or a replica count different from `RecoveryBucketReplicas`. The watchdog scan purges delete markers left by completed waiters once they are 30 minutes old; with the watchdog disabled they stay until the bucket's max age. |
 | `RecoveryBucketReplicas` | NATS | `1` | Replica count the recovery bucket is created with (1–5, validated at startup); use 3 on a clustered JetStream so recovery state survives a node loss. Only applied when the bucket is created. Registrations are always read from the bucket stream's leader, never through Direct Get, which a follower that has not applied the latest write may answer. |
 | `PresenceProbeTimeout` | NATS | 2 seconds | How long a presence ping waits for a waiter to answer — for the watchdog's liveness probe and for the re-check a publish makes before routing a response to recovery. Only NATS no-responders reads as "no live waiter"; a subscriber that does not answer in time (busy in a slow `Until` predicate) is reported as unprobeable and never has its registration consumed. |
+| `MaxRecoveryRegistrationsPerCorrelationId` | Redis, NATS | 64 | How many live recovery registrations — recoverable waiters — one correlation id may hold. Both channels keep an id's registrations in one stored value that every new waiter reads and rewrites whole, so registering N waiters writes 1 + 2 + … + N registrations (with ~750-byte registrations: 64 write about 1.5 MB in total and leave a 47 KB value; 256 write about 24 MB). A waiter that would exceed the bound fails at creation, before its trigger runs, with an `InvalidOperationException`; expired registrations and re-saving a registration do not count. Must be at least 1. For wider fan-out use a database channel, which stores one row per registration — see [shared-correlation recovery](recovery.md#shared-correlation-recovery). |
 | `SchemaName` | PostgreSQL, SQL Server | `public` / `dbo` | Schema that contains the channel tables. |
 | `ConnectionString` | SQL Server, MongoDB | — | SQL Server: required; must point at an existing database (the package creates schema/tables, never the database). MongoDB: optional — the package prefers a host-registered `IMongoDatabase` (or `IMongoClient` + `DatabaseName`); against a single-node replica set include `directConnection=true`. PostgreSQL uses the registered `NpgsqlDataSource`. |
 | `DatabaseName` | MongoDB | — | Database used when no `IMongoDatabase` is registered. |
@@ -219,7 +220,9 @@ waiter runs to its timeout; without `STREAM.PURGE` the watchdog warns on every s
 markers stay until the bucket's max age. A message larger than the server's `max_payload` (1 MiB
 by default) cannot travel over the channel: it is reported as unprocessable at once (the ingress
 fails the waiter or runs its failure callback instead of retrying), so size responses — or
-`max_payload` — accordingly.
+`max_payload` — accordingly. The same ceiling applies to a correlation id's recovery registrations,
+which share one KV value: `MaxRecoveryRegistrationsPerCorrelationId` (64 by default) keeps that
+value well under it for registrations of up to about 16 KB each.
 
 ## Transport options
 

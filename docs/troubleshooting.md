@@ -27,6 +27,38 @@ owns the full story — this page is the map, not the territory.
   the connection string when connecting to a single-node replica set. See the MongoDB rows in
   [channel options](configuration.md#channel-options).
 
+### MongoDB: lost responses fail with `RecoveryStateUnconfirmedException`
+
+- **Symptom:** publishing a response nobody is waiting for fails with
+  `RecoveryStateUnconfirmedException` — inside it a write-concern error (`WriteConcernFailed`,
+  `waiting for replication timed out`) or a not-primary error — after the Warning
+  `MongoDB channel could not confirm that it reads the current recovery registrations`; the
+  transport redelivers the response.
+- **Cause:** the lost-subscriber lookup confirms that it reads the current registrations with a
+  majority write in front of the read (see [recovery-state durability](recovery.md#recovery-state-durability)).
+  A primary that cannot reach a majority — deposed by a partition, or a primary-secondary-arbiter
+  set with its secondary down — cannot acknowledge it, and answering from its view could
+  acknowledge a response whose registration it never saw.
+- **Fix:** restore the replica set's majority (the secondaries, or remove the arbiter). The
+  redelivered response settles once a primary with a majority answers; nothing is dispatched or
+  lost in the meantime (the broker ingress never escalates this exception through `SetException`,
+  and a direct `SetResponse` caller should retry it). Each attempt waits out the write's `wtimeout`
+  (10 s by default), so give the response transport a redelivery budget that outlasts the outage.
+  Do not lower the channel's write concern.
+
+### Redis or NATS: creating a waiter fails with `already has N live recovery registration(s)`
+
+- **Symptom:** a recoverable waiter fails at creation with an `InvalidOperationException` naming
+  `MaxRecoveryRegistrationsPerCorrelationId`; its trigger never ran.
+- **Cause:** that many recoverable waiters already share the correlation id. Redis and NATS keep
+  them in one value that each new waiter rewrites whole, so the channel bounds the fan-out (64 by
+  default).
+- **Fix:** raise `MaxRecoveryRegistrationsPerCorrelationId` if the fan-out is intended and its
+  cost acceptable (see [shared-correlation recovery](recovery.md#shared-correlation-recovery)), or
+  use a database channel, which has no such bound. A burst of waiters that was failing with
+  `could not commit after 4 optimistic attempts` needs no change: concurrent registrations now retry
+  with backoff (30 attempts).
+
 ### PostgreSQL: cross-process responses arrive late and `PostgreSQL LISTEN loop failed` repeats
 
 - **Symptom:** the channel logs `PostgreSQL LISTEN loop failed; retrying in …` every reconnect

@@ -13,6 +13,71 @@ work that has landed on `main` but not yet shipped. Security reporters credited 
 
 ### Changed
 
+- **Round-51 review (2026-09-29, external review of `93c3ba4`): a MongoDB recovery lookup can no
+  longer settle on a deposed primary's view, fan-out on Redis and NATS is bounded and survives a
+  concurrent burst, and a Redis or NATS registration whose expiry cannot be established is refused
+  instead of read as expired.**
+  - *Recovery — MongoDB channel.* The lost-subscriber lookup read the recovery collection on the
+    primary at its default read concern. A primary that a partition has deposed keeps answering
+    until it notices, and a publisher that could reach only it saw none — or only some — of the
+    registrations the new primary had taken: the dispatcher ran no callback for the missing ones,
+    the publish returned, and the transport acknowledged the response while those registrations
+    stayed armed. The lookup now first makes a small majority write (an `$inc` upsert on a
+    `recovery_read_barrier_*` document in `{MessageCollection}_counters`, bounded by the channel's
+    `wtimeout`) and then reads the registrations at `majority` read concern in the same causally
+    consistent session, bounded by `maxTimeMS` 10 s. A deposed primary cannot acknowledge the write,
+    so the lookup fails with the new public `RecoveryStateUnconfirmedException` (the driver's error
+    inside) and nothing is dispatched; every other step of the lookup (the session, the majority read
+    behind an acknowledged barrier, first-use setup) fails the same way. Reproduced and verified on a partitioned three-node replica
+    set: the old lookup on the deposed primary returned 0 registrations while the new primary held
+    one; the new lookup fails there after the 10 s `wtimeout`, and both read it on the real primary.
+    The broker ingress retries the exception on its ladder and then propagates it **without**
+    `SetException` escalation — like `RecoveryStateUnreadableException` — because the escalation's
+    own lookup, on a set that had just recovered, would run the failure callback for a response the
+    worker produced successfully (the pre-commit critic's catch); the transport redelivers the
+    original response. **Cost:** one majority write per lost-subscriber lookup (about 2.3 ms instead
+    of 0.4 ms on a local three-node set); while the set has no majority (a deposed primary, or a
+    primary-secondary-arbiter set with its secondary down) lookups fail after the `wtimeout` and are
+    redelivered rather than answered, holding a delivery for up to about 40 s per ladder. Watchdog
+    scans read as before.
+  - *Recovery — Redis and NATS fan-out — behaviour change.* Both channels keep every registration
+    of a correlation id in one stored value that each new waiter reads and rewrites whole, so
+    registering N waiters writes 1 + 2 + … + N registrations (with ~750-byte registrations, 64
+    waiters write 1.5 MB in total and allocate 8 MB; 256 write 24 MB and allocate 124 MB, with
+    eleven gen-2 collections per fan-out).
+    New `MaxRecoveryRegistrationsPerCorrelationId` on `RedisAsyncResponseOptions` and
+    `NatsAsyncResponseChannelOptions` (default **64**, at least 1) bounds how many live
+    registrations an id may hold: a waiter that would exceed it fails at creation — before its
+    trigger runs — with an `InvalidOperationException` naming the option. Expired registrations and
+    a re-save of the same registration do not count. A new `RecoveryRegistrationGrowthBenchmarks`
+    measures the registration cost (the deletion benchmarks did not show it). And a writer that
+    loses the optimistic race now pauses for a randomized, growing interval (full jitter, 2 ms
+    doubling to 250 ms, up to 30 attempts — at most about 6 s of pauses — on the real clock) instead
+    of retrying at once: with four immediate attempts only about four writers of a burst ever
+    committed — 25 to 28 of 32 concurrent registrations on one id failed against Redis 7 and NATS
+    2.15 — and concurrent completions of a fan-out left their registrations armed until expiry.
+    Bursts of 64 and 128 now all commit against local servers, and an event simulation at 5–20 ms
+    per read-to-commit (TLS, replicated NATS) loses no writer of a 64-way burst (the first cut, 16
+    attempts under a 100 ms ceiling, lost writers from 5 ms on).
+    **Upgrading:** a design with more than 64 recoverable waiters on one correlation id must raise
+    the option (its cost is quadratic) or move to a database channel, which stores one row per
+    registration.
+  - *Recovery — Redis and NATS expiry metadata.* The stored expiries were non-nullable, so a missing
+    field deserialized to `DateTimeOffset.MinValue` and was treated as long expired: a Redis entry
+    without its stamp was dropped from the lookup (the response was acknowledged) and from the next
+    save's rewrite, and a NATS envelope without its shared stamp read as expired — the lookup, and
+    the watchdog scan, deleted the key while every registration's own expiry was still in the
+    future. Structure is now checked before expiry: a Redis entry (or null entry) without a stamp, a
+    Redis value with no registration list or a JSON `null`, a NATS envelope without its stamp or its
+    registration list, a NATS per-registration expiry list whose length does not match, and a NATS
+    shared stamp earlier than one of its registrations' own are refused as unreadable (so is a
+    Redis value holding one bare registration object, the shape the first pre-release builds wrote,
+    which used to read as empty)
+    (`RecoveryStateUnreadableException` on lookup, counted by the scan so health goes `Degraded`);
+    no save, delete or scan rewrites or deletes them. Legacy shapes (a Redis bare array, a NATS
+    envelope without per-registration expiries) read as before, and well-formed records whose
+    stamps have lapsed are still absence.
+
 - **Round-50 review (2026-09-28, external review of `8e7420f`): NATS recovery reads come from
   the bucket's leader, a DynamoDB ledger is warned about before its cap refuses it, and a
   telemetry listener's stopped callback can no longer fail work that already happened.**

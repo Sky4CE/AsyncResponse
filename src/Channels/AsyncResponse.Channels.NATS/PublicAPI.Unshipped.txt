@@ -15,3 +15,5 @@ AsyncResponse.Channels.NATS.NatsAsyncResponseChannelOptions.Validate() -> void
 const AsyncResponse.Channels.NATS.NatsAsyncResponseChannelOptions.ChannelName = "NATS" -> string!
 Microsoft.Extensions.DependencyInjection.NatsAsyncResponseChannelServiceCollectionExtensions
 static Microsoft.Extensions.DependencyInjection.NatsAsyncResponseChannelServiceCollectionExtensions.WithNatsChannel(this Microsoft.Extensions.DependencyInjection.AsyncResponseRegistrationBuilder! builder, System.Action<AsyncResponse.Channels.NATS.NatsAsyncResponseChannelOptions!>? configure = null) -> Microsoft.Extensions.DependencyInjection.AsyncResponseRegistrationBuilder!
+AsyncResponse.Channels.NATS.NatsAsyncResponseChannelOptions.MaxRecoveryRegistrationsPerCorrelationId.get -> int
+AsyncResponse.Channels.NATS.NatsAsyncResponseChannelOptions.MaxRecoveryRegistrationsPerCorrelationId.set -> void
