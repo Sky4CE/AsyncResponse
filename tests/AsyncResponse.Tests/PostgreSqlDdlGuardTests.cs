@@ -159,6 +159,86 @@ public sealed class PostgreSqlDdlGuardTests
     }
 
     /// <summary>
+    /// Fixpoint r5 (H4): the predicate test above stays green without the catch arm that uses it, so
+    /// this drives the real step: the fake server never answers the statement, the guard's lowered
+    /// command timeout fires, and Npgsql surfaces its own timeout (no cancel wait: the fake never
+    /// answers cancel requests). The window must latch. Red on the old code: nothing latched.
+    /// </summary>
+    [Theory]
+    [InlineData(Package.Channel)]
+    [InlineData(Package.Transport)]
+    [InlineData(Package.DurableFlow)]
+    public async Task LongRunningDdl_ADriverCommandTimeoutMidStatement_LatchesTheRetryAfter(Package package)
+    {
+        var stalled = new TaskCompletionSource<FakePostgresWireServer.Reply>(TaskCreationOptions.RunContinuationsAsynchronously);
+        await using var server = new FakePostgresWireServer
+        {
+            Respond = (_, sql) => sql.StartsWith("ALTER TABLE", StringComparison.Ordinal)
+                ? stalled.Task
+                : Task.FromResult(FakePostgresWireServer.Reply.Complete(sql))
+        };
+        await using var dataSource = NpgsqlDataSource.Create(server.ConnectionString("Cancellation Timeout=-1;"));
+        await using var connection = await dataSource.OpenConnectionAsync();
+        var guard = new Guard(package) { LongRunningCommandTimeoutSeconds = 1 };
+
+        var failure = await Assert.ThrowsAnyAsync<NpgsqlException>(
+            () => guard.ExecuteLongRunningAsync("ALTER TABLE \"s\".\"t\" ALTER COLUMN c TYPE text USING c::text;", connection));
+        Assert.IsType<TimeoutException>(failure.InnerException);
+
+        var refused = Assert.Throws<InvalidOperationException>(guard.ThrowIfBackingOff);
+        Assert.Same(failure, refused.InnerException);
+    }
+
+    /// <summary>
+    /// Fixpoint r5 (H4): a caller cancelling the step mid-statement is not a DDL failure — whatever
+    /// Npgsql surfaces for it must not latch the window (the same harness as the timeout above).
+    /// </summary>
+    [Theory]
+    [InlineData(Package.Channel)]
+    [InlineData(Package.Transport)]
+    [InlineData(Package.DurableFlow)]
+    public async Task LongRunningDdl_ACallerCancellationMidStatement_LatchesNothing(Package package)
+    {
+        var received = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var stalled = new TaskCompletionSource<FakePostgresWireServer.Reply>(TaskCreationOptions.RunContinuationsAsynchronously);
+        await using var server = new FakePostgresWireServer
+        {
+            Respond = (_, sql) =>
+            {
+                if (!sql.StartsWith("ALTER TABLE", StringComparison.Ordinal))
+                    return Task.FromResult(FakePostgresWireServer.Reply.Complete(sql));
+
+                received.TrySetResult();
+                return stalled.Task;
+            }
+        };
+        await using var dataSource = NpgsqlDataSource.Create(server.ConnectionString("Cancellation Timeout=-1;"));
+        await using var connection = await dataSource.OpenConnectionAsync();
+        var guard = new Guard(package);
+        using var cts = new CancellationTokenSource();
+
+        var step = guard.ExecuteLongRunningAsync("ALTER TABLE \"s\".\"t\" ALTER COLUMN c TYPE text USING c::text;", connection, cts.Token);
+        await received.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        await cts.CancelAsync();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => step.WaitAsync(TimeSpan.FromSeconds(10)));
+        guard.ThrowIfBackingOff();
+    }
+
+    /// <summary>
+    /// Fixpoint r5 (R5-01): Npgsql's own command timeout surfaces as NpgsqlException(TimeoutException), not
+    /// a PostgresException, so a step that outran LongRunningDdlCommandTimeoutSeconds was never latched.
+    /// </summary>
+    [Fact]
+    public void LongRunningDdl_TheDriversCommandTimeout_IsRecognisedAsALatchingFailure()
+    {
+        var guard = new Guard(Package.Channel);
+        Assert.True(guard.IsCommandTimeout(new NpgsqlException("timeout", new TimeoutException())));
+        Assert.False(guard.IsCommandTimeout(new NpgsqlException("broken", new IOException())));
+        Assert.False(guard.IsCommandTimeout(new NpgsqlException("plain")));
+    }
+
+    /// <summary>
     /// Fixpoint r2 precommit (D residual): the long-running step latched every server error but a
     /// collision — a deadlock (40P01), a serialization failure (40001), an administrator shutdown
     /// (57P01) included, each ending the statement as soon as the server detected it — so a deadlock
@@ -329,14 +409,25 @@ public sealed class PostgreSqlDdlGuardTests
 
         public void ThrowIfBackingOff() => Invoke("ThrowIfBackingOff");
 
-        public Task ExecuteLongRunningAsync(string sql, NpgsqlConnection connection)
-            => (Task)Invoke("ExecuteLongRunningAsync", sql, connection, null, CancellationToken.None)!;
+        public Task ExecuteLongRunningAsync(string sql, NpgsqlConnection connection, CancellationToken cancellationToken = default)
+            => (Task)Invoke("ExecuteLongRunningAsync", sql, connection, null, cancellationToken)!;
+
+        public int LongRunningCommandTimeoutSeconds
+        {
+            init => Property("LongRunningCommandTimeoutSeconds").SetValue(_instance, value);
+        }
 
         /// <summary>Whether a long-running step failing with <paramref name="failure"/> latches the window.</summary>
         public bool LatchesOnLongRunningFailure(PostgresException failure)
         {
             // The step's catch filter (the fake server answers every error with one SQLSTATE).
             var filter = _type.GetMethod("LatchesOnFailure", BindingFlags.Static | BindingFlags.NonPublic)!;
+            return (bool)filter.Invoke(null, [failure])!;
+        }
+
+        public bool IsCommandTimeout(NpgsqlException failure)
+        {
+            var filter = _type.GetMethod("IsCommandTimeout", BindingFlags.Static | BindingFlags.NonPublic)!;
             return (bool)filter.Invoke(null, [failure])!;
         }
 

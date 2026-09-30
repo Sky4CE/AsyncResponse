@@ -1049,6 +1049,68 @@ public class RedisAsyncResponseChannelWaiterTests
     }
 
     /// <summary>
+    /// Round 5 (R5-08): the registration-failure catch evaluated <c>ex.Message</c> as an argument
+    /// BEFORE the cleanup, so an exception whose Message getter throws skipped the cleanup.
+    /// Pre-fix: the getter's exception escapes and nothing is unsubscribed.
+    /// </summary>
+    [Fact]
+    public async Task CreateResponseWaiter_RegistrationFailure_WithAThrowingMessageGetter_StillCleansUp()
+    {
+        var failure = new ThrowingMessageFailure();
+        _store
+            .Setup(s => s.SaveAsync(It.IsAny<string>(), It.IsAny<RecoveryState>(), It.IsAny<TimeSpan>(), It.IsAny<CancellationToken>()))
+            .ThrowsAsync(failure);
+        var channel = CreateChannel(new RedisAsyncResponseOptions(), new RecordingThrowingLogger<RedisAsyncResponseChannel>());
+
+        // Caught by hand: the xunit throw helpers read Exception.Message themselves.
+        Exception? thrown = null;
+        try
+        {
+            await channel.CreateResponseWaiter<OperationResult>("corr-msg-getter");
+        }
+        catch (Exception ex)
+        {
+            thrown = ex;
+        }
+
+        Assert.Same(failure, thrown);
+        Assert.Equal(1, _channelSubscriber.UnsubscribeCount);
+        Assert.False(HasExecutorRegistration(GetExecutorRegistry(channel), _channelSubscriber.SubscribedChannel.ToString()!));
+    }
+
+    /// <summary>
+    /// Round 5 (R5-10): the per-node NUMSUB read documents "never faults" but logged through an
+    /// unguarded logger, so a throwing provider turned the -1 "unknown" answer into an exception.
+    /// </summary>
+    [Fact]
+    public async Task CountActiveSubscribersAsync_WhenTheNodeFailsAndTheLoggerThrows_StillReturnsUnknown()
+    {
+        var multiplexer = new Mock<IConnectionMultiplexer>();
+        multiplexer.Setup(m => m.GetSubscriber(It.IsAny<object?>())).Returns(new Mock<ISubscriber>().Object);
+        var endPoint = new Mock<EndPoint>().Object;
+        multiplexer.Setup(m => m.GetEndPoints(It.IsAny<bool>())).Returns([endPoint]);
+        var server = new Mock<IServer>();
+        server.SetupGet(s => s.IsConnected).Returns(true);
+        server.Setup(s => s.SubscriptionSubscriberCountAsync(It.IsAny<RedisChannel>(), It.IsAny<CommandFlags>()))
+            .ThrowsAsync(new InvalidOperationException("Redis command failed"));
+        multiplexer.Setup(m => m.GetServer(endPoint, It.IsAny<object?>())).Returns(server.Object);
+        var channel = new RedisAsyncResponseChannel(
+            _services.GetRequiredService<IServiceScopeFactory>(),
+            multiplexer.Object,
+            _store.Object,
+            Options.Create(new RedisAsyncResponseOptions()),
+            new AsyncResponseContextPropagation([]),
+            new RecordingThrowingLogger<RedisAsyncResponseChannel> { ThrowOnMessageContaining = "Failed to read subscriber count" });
+
+        Assert.Equal(-1, await channel.CountActiveSubscribersAsync("corr"));
+    }
+
+    private sealed class ThrowingMessageFailure : Exception
+    {
+        public override string Message => throw new InvalidOperationException("message getter");
+    }
+
+    /// <summary>
     /// Fixpoint round 2 (S2#13): the settled-waiter warning was unguarded — a throwing logging
     /// provider turned a delivered response into a create failure after all. Pre-fix: the create
     /// throws the logger's exception.

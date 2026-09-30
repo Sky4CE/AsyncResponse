@@ -149,7 +149,7 @@ public sealed class NatsTransportCoverageGapTests
             await parked.WaitAsync(HangGuard);
 
             Assert.Equal(0, p3.Acks);
-            Assert.Equal([subscriber.RedeliveryDelay], p3.Naks);
+            Assert.Equal([TimeSpan.Zero], p3.Naks);
         }
         finally
         {

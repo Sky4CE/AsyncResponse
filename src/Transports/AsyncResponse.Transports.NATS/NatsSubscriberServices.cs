@@ -145,9 +145,9 @@ internal abstract class NatsSubscriberService : BackgroundService
         // lapse between renewals and redeliver messages under live handlers.
         var renewalInterval = RenewalIntervalFor(liveAckWait < Options.AckWait ? liveAckWait : Options.AckWait);
 
-        Logger.LogInformation(
+        SafeLog.Try(() => Logger.LogInformation(
             "NATS subscriber started. Subject: {Subject}. Stream: {Stream}. Consumer: {Consumer}. Role: {Role}. AckMode: {AckMode}.",
-            Subject, Stream, Consumer, Role, SubscriberOptions.AckMode);
+            Subject, Stream, Consumer, Role, SubscriberOptions.AckMode));
 
         // JetStream counts a delivery when it hands the message over, not when a handler starts.
         // ACK-after-handler runs its batch serially, so every message prefetched behind a handler
@@ -251,13 +251,13 @@ internal abstract class NatsSubscriberService : BackgroundService
         }
 
         var delay = AsyncResponseRetry.Backoff(fastEmptyPolls, Options.SubscriberRetryBaseDelay, Options.SubscriberRetryMaxDelay);
-        Logger.LogDebug(
+        SafeLog.Try(() => Logger.LogDebug(
             "NATS long poll for {Role} returned empty after {PollDuration} instead of being held; backing off {Delay} before polling again ({FastEmptyPolls}/{MaxFastEmptyPolls}).",
             Role,
             pollDuration,
             delay,
             fastEmptyPolls,
-            MaxConsecutiveFastEmptyPolls);
+            MaxConsecutiveFastEmptyPolls));
         await Task.Delay(delay, _timeProvider, stoppingToken).ConfigureAwait(false);
         return fastEmptyPolls;
     }

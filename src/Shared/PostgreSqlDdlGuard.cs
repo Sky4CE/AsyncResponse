@@ -91,6 +91,9 @@ internal sealed class PostgreSqlDdlGuard
     /// <summary>The clock of the retry-after window (test seam).</summary>
     internal TimeProvider Clock { get; set; } = TimeProvider.System;
 
+    /// <summary>The command timeout <see cref="ExecuteLongRunningAsync"/> runs under, in seconds (test seam).</summary>
+    internal int LongRunningCommandTimeoutSeconds { get; set; } = LongRunningDdlCommandTimeoutSeconds;
+
     /// <summary>
     /// Opens a DDL transaction holding the advisory key <paramref name="lockKey"/>, with every lock
     /// wait in it bounded by <see cref="DdlLockTimeout"/>. The bound is set FIRST: <c>lock_timeout</c>
@@ -177,6 +180,7 @@ internal sealed class PostgreSqlDdlGuard
     public async Task ExecuteLongRunningAsync(string sql, NpgsqlConnection connection, NpgsqlTransaction? transaction, CancellationToken cancellationToken)
     {
         await using var command = LongRunningDdlCommand(sql, connection, transaction);
+        command.CommandTimeout = LongRunningCommandTimeoutSeconds;
         try
         {
             await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
@@ -186,7 +190,19 @@ internal sealed class PostgreSqlDdlGuard
             BackOff(ex);
             throw;
         }
+        catch (NpgsqlException ex) when (IsCommandTimeout(ex))
+        {
+            // The client-side CommandTimeout: Npgsql cancels the statement and surfaces its own
+            // NpgsqlException(TimeoutException), not a PostgresException; the rollback still held the
+            // lock for the whole timeout, so it latches like any other step that ran long.
+            BackOff(ex);
+            throw;
+        }
     }
+
+    /// <summary>Whether <paramref name="failure"/> is Npgsql's own command timeout (a <see cref="TimeoutException"/> inside).</summary>
+    internal static bool IsCommandTimeout(NpgsqlException failure)
+        => failure is not PostgresException && failure.InnerException is TimeoutException;
 
     /// <summary>
     /// Whether a long-running step that failed with <paramref name="failure"/> latches the

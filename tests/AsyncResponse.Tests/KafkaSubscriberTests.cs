@@ -554,8 +554,13 @@ public class KafkaSubscriberTests
             releaseSlow.SetResult();
             await KafkaTestData.WaitUntilAsync(() => consumer.StoredOffsets.Count == 2);
             Assert.Equal([5L, 6L], consumer.StoredOffsets.Select(stored => stored.Offset));
-            Assert.Equal(3, Assert.Single(consumer.PartitionPauses));
-            Assert.Equal(3, Assert.Single(consumer.PartitionResumes));
+            // The detach threshold is a real 20 ms, so on a loaded runner "next-job" can detach too
+            // and pause the partition a second time; every pause is still on partition 3 and is
+            // matched by a resume once its handler settles.
+            await KafkaTestData.WaitUntilAsync(() => consumer.PartitionResumes.Count == consumer.PartitionPauses.Count);
+            Assert.NotEmpty(consumer.PartitionPauses);
+            Assert.All(consumer.PartitionPauses, partition => Assert.Equal(3, partition));
+            Assert.All(consumer.PartitionResumes, partition => Assert.Equal(3, partition));
             lock (handled)
             {
                 Assert.Equal(["slow-job", "next-job"], handled);

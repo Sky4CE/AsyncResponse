@@ -354,6 +354,40 @@ public class NatsAsyncResponseChannelTests
         _store.Verify(s => s.TryDeleteAsync("corr-throwing-logger", It.IsAny<Guid>(), It.IsAny<CancellationToken>()), Times.Once);
     }
 
+    /// <summary>
+    /// Round 5 (H2, R5-08 sibling): the registration-failure catch evaluated <c>ex.Message</c> for the
+    /// span BEFORE the cleanup, so an exception whose Message getter throws skipped the cleanup and
+    /// replaced the failure. Pre-fix: the getter's exception escapes and nothing is disposed.
+    /// </summary>
+    [Fact]
+    public async Task CreateResponseWaiter_RegistrationFailureWithAThrowingMessageGetter_StillCleansUp()
+    {
+        var failure = new ThrowingMessageFailure();
+        _store.Setup(s => s.SaveAsync(It.IsAny<string>(), It.IsAny<RecoveryState>(), It.IsAny<TimeSpan>(), It.IsAny<CancellationToken>()))
+            .ThrowsAsync(failure);
+        var channel = CreateChannel(logger: new RecordingThrowingLogger<NatsAsyncResponseChannel>());
+
+        // Caught by hand: the xunit throw helpers read Exception.Message themselves.
+        Exception? thrown = null;
+        try
+        {
+            await channel.CreateResponseWaiter<OperationResult>("corr-msg-getter", timeout: TimeSpan.FromSeconds(5));
+        }
+        catch (Exception ex)
+        {
+            thrown = ex;
+        }
+
+        Assert.Same(failure, thrown);
+        Assert.Equal(1, _client.SubscriptionDisposeCount);
+        _store.Verify(s => s.TryDeleteAsync("corr-msg-getter", It.IsAny<Guid>(), It.IsAny<CancellationToken>()), Times.Once);
+    }
+
+    private sealed class ThrowingMessageFailure : Exception
+    {
+        public override string Message => throw new InvalidOperationException("message getter");
+    }
+
     [Fact]
     public async Task CreateResponseWaiter_RegistrationBudgetLapseBehindAThrowingLogger_StillCancelsTheAbandonedSubscribe()
     {

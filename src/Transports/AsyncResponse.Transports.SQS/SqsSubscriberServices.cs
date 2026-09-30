@@ -96,11 +96,11 @@ internal abstract class SqsSubscriberService : BackgroundService
             ? queue
             : await _client.GetQueueUrlAsync(queue, stoppingToken).ConfigureAwait(false);
 
-        Logger.LogInformation(
+        SafeLog.Try(() => Logger.LogInformation(
             "SQS subscriber started. Queue: {Queue}. Role: {Role}. AckMode: {AckMode}.",
             queue,
             SubscriberRole,
-            SubscriberOptions.AckMode);
+            SubscriberOptions.AckMode));
 
         // SQS counts every message a receive hands over (ApproximateReceiveCount) and starts its
         // in-flight clock at the receive, not when a handler starts. ACK-after-handler works a
@@ -610,11 +610,13 @@ internal sealed class SqsWorkerSubscriber : SqsSubscriberService
     public override Task StartAsync(CancellationToken cancellationToken)
     {
         var start = base.StartAsync(cancellationToken);
+        // Guarded: the loop is already running, so a throwing logging provider must not fail
+        // StartAsync (and the host's start) for a subscriber that is consuming.
         foreach (var collision in SqsOptionsValidator.PossibleQueueCollisions(Options))
         {
-            Logger.LogWarning(
+            SafeLog.Try(() => Logger.LogWarning(
                 "SQS {Collision} may be one queue: a queue name resolves in the client's own account and region, so the two collide unless the URL names another account's or region's queue. Configure both as URLs to make the comparison exact.",
-                collision);
+                collision));
         }
 
         WarnAboutDurableFlowLimits();
@@ -627,11 +629,11 @@ internal sealed class SqsWorkerSubscriber : SqsSubscriberService
         {
             // Flow start, resume and wake-up jobs carry no correlation id unless the flow was
             // started inside a request scope, and FIFO keeps every flow timer in process.
-            Logger.LogWarning(
+            SafeLog.Try(() => Logger.LogWarning(
                 "The SQS worker queue {Queue} is a FIFO queue, and durable-flow jobs ride this queue: every job without a correlation id — durable-flow start, resume and wake-up jobs among them — shares the single MessageGroupId '{FallbackGroup}' ({FallbackOption}), which SQS delivers strictly one at a time across all consumers. FIFO also keeps flow timers in process, so one flow parked on a timer or an awaited step holds that group — and with it every other flow — for as long as it waits. Prefer a standard worker queue for durable flows.",
                 Options.WorkerQueue,
                 Options.FifoMessageGroupIdFallback,
-                $"{nameof(SqsAsyncResponseOptions)}.{nameof(SqsAsyncResponseOptions.FifoMessageGroupIdFallback)}");
+                $"{nameof(SqsAsyncResponseOptions)}.{nameof(SqsAsyncResponseOptions.FifoMessageGroupIdFallback)}"));
         }
 
         if (SubscriberOptions is { AckMode: SqsAckMode.AckAfterHandlerCompletes, VisibilityRenewalInterval: null, VisibilityTimeout: null })
@@ -640,11 +642,11 @@ internal sealed class SqsWorkerSubscriber : SqsSubscriberService
             // 12-hour SQS maximum as the in-flight ceiling the engine plans in-process waits
             // against — while SQS redelivers after the queue's visibility timeout (30 s unless
             // configured otherwise).
-            Logger.LogWarning(
+            SafeLog.Try(() => Logger.LogWarning(
                 "The SQS worker subscriber for {Queue} sets neither {VisibilityTimeout} nor {RenewalInterval}, so the queue's own visibility timeout (30 seconds unless configured otherwise) decides when SQS redelivers an in-flight job — a value the transport cannot read, so it advertises the 12-hour SQS maximum to the durable-flow engine instead. An in-process timer park or awaited step longer than the real visibility timeout then runs a second copy of the job on a peer, without a warning. Set the visibility timeout option to the queue's value, or enable renewal.",
                 Options.WorkerQueue,
                 $"{nameof(SqsAsyncResponseOptions.WorkerSubscriber)}.{nameof(SqsSubscriberOptions.VisibilityTimeout)}",
-                $"{nameof(SqsAsyncResponseOptions.WorkerSubscriber)}.{nameof(SqsSubscriberOptions.VisibilityRenewalInterval)}");
+                $"{nameof(SqsAsyncResponseOptions.WorkerSubscriber)}.{nameof(SqsSubscriberOptions.VisibilityRenewalInterval)}"));
         }
     }
 

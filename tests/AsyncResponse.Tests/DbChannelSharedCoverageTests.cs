@@ -2793,6 +2793,42 @@ public sealed partial class DbChannelSharedCoverageTests
     }
 
     /// <summary>
+    /// Round 5 (H2, R5-08 sibling): the registration-failure catch evaluated <c>ex.Message</c> for the
+    /// span BEFORE the cleanup, so an exception whose Message getter throws skipped the cleanup (the
+    /// subscriber row stayed for publishers to count) and replaced the failure.
+    /// </summary>
+    [Fact]
+    public async Task CreateWaiter_AFailedRegistrationWithAThrowingMessageGetter_IsStillCleanedUpAndRethrown()
+    {
+        await using var harness = Harness.Create(Provider.MongoDb, failing: false, pollInterval: TimeSpan.FromSeconds(30));
+        var failure = new ThrowingMessageFailure();
+        harness.RecoveryState
+            .Setup(store => store.SaveAsync(It.IsAny<string>(), It.IsAny<RecoveryState>(), It.IsAny<TimeSpan>(), It.IsAny<CancellationToken>()))
+            .ThrowsAsync(failure);
+
+        // Caught by hand: the xunit throw helpers read Exception.Message themselves.
+        Exception? thrown = null;
+        try
+        {
+            await ((IAsyncResponseSubscriber)harness.Channel).CreateResponseWaiter<OperationResult>("corr");
+        }
+        catch (Exception ex)
+        {
+            thrown = ex;
+        }
+
+        Assert.Same(failure, thrown);
+        harness.MongoSubscribers!.Verify(
+            collection => collection.DeleteOneAsync(It.IsAny<FilterDefinition<MongoChannelSubscriberDocument>>(), It.IsAny<CancellationToken>()),
+            Times.Once);
+    }
+
+    private sealed class ThrowingMessageFailure : Exception
+    {
+        public override string Message => throw new InvalidOperationException("message getter");
+    }
+
+    /// <summary>
     /// Fixpoint r2 S5#6: a LISTEN that succeeded was taken as proof NOTIFY works, but behind a
     /// transaction-mode pooler (PgBouncer pool_mode=transaction) the LISTEN runs on a server
     /// connection that goes straight back to the pool, and nothing reaches the channel's — while

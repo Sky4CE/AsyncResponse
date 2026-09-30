@@ -292,12 +292,13 @@ internal sealed class NatsMessageDispatcher : IAsyncDisposable
             catch (Exception ex) when (ex is OperationCanceledException or ChannelClosedException)
             {
                 // Subscriber stopping or dispatcher disposing while parked: the delivery was never
-                // enqueued, so NAK so JetStream redelivers elsewhere; if the NAK itself fails the
+                // enqueued or started, so NAK at once (like the intake-closed hand-back) so a live
+                // peer takes it without waiting out RedeliveryDelay; if the NAK itself fails the
                 // AckWait lapses to the same effect.
                 SafeLog.Try(() => _logger.LogDebug("Background queue unavailable for {Role} during shutdown; NAKing message for redelivery.", _role));
                 try
                 {
-                    await delivery.NakAsync(_subscriberOptions.RedeliveryDelay).ConfigureAwait(false);
+                    await delivery.NakAsync(TimeSpan.Zero).ConfigureAwait(false);
                 }
                 catch (Exception nakException)
                 {

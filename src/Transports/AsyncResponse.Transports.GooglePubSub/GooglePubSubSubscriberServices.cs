@@ -195,12 +195,12 @@ internal abstract class GooglePubSubSubscriberService : BackgroundService
         // in about a second and dead-letters every message that arrives during the blip. The
         // package never creates subscriptions and reading one needs an admin client plus
         // pubsub.subscriptions.get, which a consumer identity commonly lacks — so say it here too.
-        Logger.LogWarning(
+        SafeLog.Try(() => Logger.LogWarning(
             "Pub/Sub redelivery is unbounded for subscription {Subscription} ({Role}): the transport enforces no delivery-attempt cap and has no library dead-letter queue. "
             + "Configure a DeadLetterPolicy on the subscription to cap redeliveries of failing messages, and a RetryPolicy (exponential backoff) with it: "
             + "without one Pub/Sub redelivers a NACKed message immediately, so a transient failure exhausts the DeadLetterPolicy's delivery attempts within seconds.",
             subscriptionName.ToString(),
-            SubscriberRole);
+            SubscriberRole));
 
         // The dispatcher outlives every supervised attempt; only host stop drains it. A streaming-pull
         // fault (network blip, UNAVAILABLE) ends an attempt, not the host — yet scoped to the attempt,
@@ -243,11 +243,11 @@ internal abstract class GooglePubSubSubscriberService : BackgroundService
         var subscriber = await _subscriberFactory(subscriptionName, SubscriberOptions, stoppingToken).ConfigureAwait(false);
         try
         {
-            Logger.LogInformation(
+            SafeLog.Try(() => Logger.LogInformation(
                 "Pub/Sub subscriber started. Subscription: {Subscription}. Role: {Role}. AckMode: {AckMode}.",
                 subscriptionName.ToString(),
                 SubscriberRole,
-                SubscriberOptions.AckMode);
+                SubscriberOptions.AckMode));
 
             var runTask = subscriber.StartAsync(dispatcher.HandleAsync);
 

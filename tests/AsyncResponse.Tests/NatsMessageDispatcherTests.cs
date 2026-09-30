@@ -858,7 +858,7 @@ public class NatsMessageDispatcherTests
     }
 
     [Fact]
-    public async Task EarlyAck_WhenQueueFullAndSubscriberStops_NaksWaitingMessageForRedelivery()
+    public async Task EarlyAck_WhenQueueFullAndSubscriberStops_NaksWaitingMessageForImmediateRedelivery()
     {
         var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var gate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -883,9 +883,10 @@ public class NatsMessageDispatcherTests
         stopping.Cancel();
         await thirdHandle.WaitAsync(TimeSpan.FromSeconds(5));
 
-        // A message caught waiting when the subscriber stops is NAKed so JetStream redelivers it.
+        // A message caught waiting when the subscriber stops never started, so it is handed back at
+        // once (like every other never-started hand-back) instead of after RedeliveryDelay.
         Assert.Equal(0, third.Acks);
-        Assert.Equal([TimeSpan.FromSeconds(3)], third.Naks);
+        Assert.Equal([TimeSpan.Zero], third.Naks);
 
         gate.TrySetResult();
     }

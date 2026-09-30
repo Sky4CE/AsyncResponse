@@ -576,8 +576,25 @@ var workerAckModePrefix = useAzureServiceBus ? "AzureServiceBus"
     : useSqs ? "SQS"
     : useMongoDbTransport ? "MongoDB"
     : null;
-var workerEarlyAckOptedIn = workerAckModePrefix is not null && string.Equals(
-    builder.Configuration[$"{workerAckModePrefix}:Worker:AckMode"], "AckAfterEnqueue", StringComparison.OrdinalIgnoreCase);
+// Parsed the way every Configure*Subscriber parses the same key (Enum.TryParse: trims whitespace,
+// accepts the numeric value) so the two readers cannot disagree about the opt-in.
+var workerAckModeRaw = workerAckModePrefix is null ? null : builder.Configuration[$"{workerAckModePrefix}:Worker:AckMode"];
+var workerEarlyAckOptedIn = workerAckModeRaw is not null && workerAckModePrefix switch
+{
+    "AzureServiceBus" => IsAckAfterEnqueue(workerAckModeRaw, AzureServiceBusAckMode.AckAfterEnqueue),
+    "PubSub" => IsAckAfterEnqueue(workerAckModeRaw, GooglePubSubAckMode.AckAfterEnqueue),
+    "Kafka" => IsAckAfterEnqueue(workerAckModeRaw, KafkaAckMode.AckAfterEnqueue),
+    "RabbitMQ" => IsAckAfterEnqueue(workerAckModeRaw, RabbitMqAckMode.AckAfterEnqueue),
+    "Redis" => IsAckAfterEnqueue(workerAckModeRaw, RedisAckMode.AckAfterEnqueue),
+    "Nats" => IsAckAfterEnqueue(workerAckModeRaw, NatsAckMode.AckAfterEnqueue),
+    "PostgreSQL" => IsAckAfterEnqueue(workerAckModeRaw, PostgreSqlAckMode.AckAfterEnqueue),
+    "SqlServer" => IsAckAfterEnqueue(workerAckModeRaw, SqlServerAckMode.AckAfterEnqueue),
+    "SQS" => IsAckAfterEnqueue(workerAckModeRaw, SqsAckMode.AckAfterEnqueue),
+    "MongoDB" => IsAckAfterEnqueue(workerAckModeRaw, MongoDbAckMode.AckAfterEnqueue),
+    _ => false,
+};
+static bool IsAckAfterEnqueue<TMode>(string raw, TMode ackAfterEnqueue) where TMode : struct, Enum
+    => Enum.TryParse<TMode>(raw, ignoreCase: true, out var mode) && EqualityComparer<TMode>.Default.Equals(mode, ackAfterEnqueue);
 var durableFlowStore = builder.Configuration["AsyncResponse:DurableFlowStore"]
     ?? Environment.GetEnvironmentVariable("ASYNCRESPONSE_SAMPLE_DURABLE_STORE");
 if (string.Equals(durableFlowStore, "sqlite", StringComparison.OrdinalIgnoreCase))

@@ -13,6 +13,25 @@ work that has landed on `main` but not yet shipped. Security reporters credited 
 
 ### Changed
 
+- **Round-56 review (2026-09-30, whole-repository review of `0cfbe20`): a PostgreSQL DDL step that
+  outruns its client timeout backs off like any other failed step, and more subscriber lifecycle
+  logs and failure paths are guarded.**
+  - *Schema — PostgreSQL (every package sharing the DDL guard).* A long-running DDL step that
+    outran `LongRunningDdlCommandTimeoutSeconds` surfaced as Npgsql's command-timeout exception,
+    which the guard did not recognise, so it never latched the retry-after window and every start
+    retried the step at once. It now latches.
+  - *Schema — SQL Server verifier.* A NOT NULL `rowversion` or temporal period column is no longer
+    reported as an extra column that breaks inserts.
+  - *NATS, SQS and Google Pub/Sub transports.* The "subscriber started" logs (and the Pub/Sub and
+    SQS startup warnings and the NATS fast-empty back-off log) are guarded, so a throwing logging
+    provider can no longer rebuild the subscriber in a loop. A NATS delivery still parked on a full
+    early-ACK queue when the subscriber stops was never started, so it is NAKed for immediate
+    redelivery instead of after `RedeliveryDelay`.
+  - *Redis, NATS and DB channels.* A registration failure whose exception message getter throws no
+    longer skips the waiter's cleanup, and the Redis subscriber-count probe's logs no longer fault
+    it.
+  - *Sample app.* The early-ACK opt-in for durable flows is parsed like the subscriber's own ack
+    mode (trimmed, numeric values accepted).
 - **Round-55 review (2026-09-30, whole-repository review of `a715b18`): NATS dead-letters a failure
   whatever its exception message does, the Oracle and EF Core MySQL flow stores refuse flow-id
   columns that do not compare ordinally, and the sample app wires its crash route and shutdown

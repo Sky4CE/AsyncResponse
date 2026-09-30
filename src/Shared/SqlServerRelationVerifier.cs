@@ -359,7 +359,9 @@ internal static class SqlServerRelationVerifier
         command.CommandText =
             $"""
             SELECT o.name, c.name, t.name, c.max_length, c.scale, c.is_nullable, ISNULL(c.collation_name, N''),
-                   CASE WHEN c.default_object_id <> 0 OR c.is_identity = 1 OR c.is_computed = 1 THEN 1 ELSE 0 END,
+                   CASE WHEN c.default_object_id <> 0 OR c.is_identity = 1 OR c.is_computed = 1
+                             OR t.name = N'timestamp' OR ISNULL(COLUMNPROPERTY(c.object_id, c.name, 'GeneratedAlwaysType'), 0) <> 0
+                        THEN 1 ELSE 0 END,
                    ISNULL(dc.definition, N'')
             FROM sys.columns c
             JOIN sys.objects o ON o.object_id = c.object_id

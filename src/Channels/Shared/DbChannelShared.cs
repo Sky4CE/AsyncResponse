@@ -312,7 +312,7 @@ internal abstract class DbAsyncResponseChannelBase :
             // Logging rethrows a provider's failure) used to skip the cleanup below — leaving a
             // subscriber row publishers counted as a live waiter nobody holds, and the wait's
             // activity never ended — and replaced the failure the caller receives.
-            AsyncResponseDiagnostics.SetError(activity, "subscribe_failure", ex.Message);
+            SafeLog.Try(() => AsyncResponseDiagnostics.SetError(activity, "subscribe_failure", ex.Message));
             await subscription.DrainThenCleanupAsync(deleteRecoveryState: true).ConfigureAwait(false);
             SafeLog.Try(
                 (Logger: _logger, Error: ex, Provider: _providerName, CorrelationId: correlationId),

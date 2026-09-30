@@ -371,7 +371,7 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
             // throw, and logging first left a zombie behind a throwing logger — the SUBSCRIBE and
             // the executor registration survived with no timer, so publish and NUMSUB kept counting
             // a live waiter and the next response for the id was read as delivered.
-            AsyncResponseDiagnostics.SetError(activity, "subscribe_failure", ex.Message);
+            SafeLog.Try(() => AsyncResponseDiagnostics.SetError(activity, "subscribe_failure", ex.Message));
             await subscription.DrainThenCleanupAsync().ConfigureAwait(false);
 
             // The drain waits for a delivery that was still inside the executor — mid Until
@@ -1521,11 +1521,11 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
         // until it has stayed down for the grace.
         if (withinGrace is not null)
         {
-            _logger.LogDebug(
+            SafeLog.Try(() => _logger.LogDebug(
                 "Redis subscriber liveness probe for channel {Channel}: {EndPoint} has been disconnected for less than {Grace}; a waiter may still be moving its subscription, so the zero stays unknown.",
                 channel.ToString()!,
                 withinGrace,
-                DisconnectedEndPointGrace);
+                DisconnectedEndPointGrace));
             return -1L;
         }
 
@@ -1575,7 +1575,7 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
         }
         catch (Exception ex)
         {
-            _logger.LogDebug(ex, "Failed to read subscriber count for channel {Channel} from {EndPoint}.", channel.ToString()!, server.EndPoint);
+            SafeLog.Try(() => _logger.LogDebug(ex, "Failed to read subscriber count for channel {Channel} from {EndPoint}.", channel.ToString()!, server.EndPoint));
             return null;
         }
     }

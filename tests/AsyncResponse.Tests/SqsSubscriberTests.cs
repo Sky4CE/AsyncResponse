@@ -47,6 +47,63 @@ public sealed class SqsSubscriberTests
     }
 
     [Fact]
+    public async Task WorkerSubscriber_AThrowingLoggerAtTheStartedLog_StillConsumesTheQueue()
+    {
+        var client = new FakeSqsClient();
+        var ingress = new Mock<IAsyncResponseIngress>();
+        ingress.Setup(i => i.HandleWorkerMessageAsync("worker-json")).Returns(Task.CompletedTask);
+        var calls = new SettlementCalls();
+        var subscriber = new SqsWorkerSubscriber(
+            Options.Create(new SqsAsyncResponseOptions
+            {
+                WorkerQueue = "workers",
+                ResponseQueue = "responses",
+                ReceiveWaitTime = TimeSpan.FromMilliseconds(10)
+            }),
+            client,
+            ingress.Object,
+            new RecordingThrowingLogger<SqsWorkerSubscriber> { ThrowOnMessageContaining = "SQS subscriber started" });
+
+        await subscriber.StartAsync(CancellationToken.None);
+        client.Enqueue(Delivery(calls, body: "worker-json"));
+
+        await calls.Deleted.Task.WaitAsync(HangGuard);
+        await subscriber.StopAsync(CancellationToken.None);
+
+        Assert.Equal(1, calls.Delete);
+    }
+
+    /// <summary>
+    /// Round 5 (H3, R5-06 sibling): the worker's startup warnings (queue collision, FIFO and
+    /// visibility-timeout durable-flow limits) logged unguarded after <c>base.StartAsync</c> had
+    /// already started the loop, so a throwing logging provider failed StartAsync for a running
+    /// subscriber. Pre-fix: StartAsync throws the logger's exception.
+    /// </summary>
+    [Theory]
+    [InlineData("workers", "https://sqs.us-east-1.amazonaws.com/123456789012/workers", "may be one queue")]
+    [InlineData("workers.fifo", "responses", "is a FIFO queue")]
+    [InlineData("workers", "responses", "sets neither")]
+    public async Task WorkerSubscriber_AThrowingLoggerAtAStartupWarning_StillStarts(string workerQueue, string responseQueue, string fragment)
+    {
+        var client = new FakeSqsClient();
+        var ingress = new Mock<IAsyncResponseIngress>();
+        var logger = new RecordingThrowingLogger<SqsWorkerSubscriber> { ThrowOnMessageContaining = fragment };
+        var subscriber = new SqsWorkerSubscriber(
+            Options.Create(new SqsAsyncResponseOptions
+            {
+                WorkerQueue = workerQueue,
+                ResponseQueue = responseQueue,
+                ReceiveWaitTime = TimeSpan.FromMilliseconds(10)
+            }),
+            client,
+            ingress.Object,
+            logger);
+
+        await subscriber.StartAsync(CancellationToken.None);
+        await subscriber.StopAsync(CancellationToken.None);
+    }
+
+    [Fact]
     public async Task ResponseSubscriber_ExtractsCorrelationAndForwardsBody()
     {
         var client = new FakeSqsClient();

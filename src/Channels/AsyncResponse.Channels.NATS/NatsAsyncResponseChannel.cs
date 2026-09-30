@@ -920,7 +920,7 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
             // Clean up first, report second: logging first left the subscription and registration
             // behind a throwing logging provider (MEL rethrows provider failures) — no timer armed,
             // read as a live waiter by the probe, silently consuming the next response for the id.
-            AsyncResponseDiagnostics.SetError(activity, "subscribe_failure", ex.Message);
+            SafeLog.Try(() => AsyncResponseDiagnostics.SetError(activity, "subscribe_failure", ex.Message));
             await DrainThenCleanupAsync(waiterHandedOut: false).ConfigureAwait(false);
 
             // The drain JOINS the consume loop, so a delivery that was still inside the Until

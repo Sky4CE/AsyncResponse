@@ -733,6 +733,32 @@ public class NatsSubscriberServicesTests
         }
     }
 
+    [Fact]
+    public async Task WorkerSubscriber_AThrowingLoggerAtTheStartedLog_DoesNotStopTheSubscriberFetching()
+    {
+        // Fixpoint round 5: the "subscriber started" log ran unguarded right after provisioning, so a
+        // logging provider that throws rebuilt the subscriber on every attempt and nothing was fetched.
+        var ingress = new GatedIngress();
+        var first = new RecordingDelivery();
+        _jetStream.EnqueueDelivery(first.Create("p1", numDelivered: 1));
+        var logger = new RecordingThrowingLogger<NatsWorkerSubscriber> { ThrowOnMessageContaining = "NATS subscriber started" };
+        var subscriber = new NatsWorkerSubscriber(Options(_ => { }), _jetStream, ingress, logger);
+
+        await subscriber.StartAsync(CancellationToken.None);
+        try
+        {
+            await ingress.Started.Task.WaitAsync(HangGuard);
+            ingress.Release.TrySetResult();
+            await Eventually(() => first.Acks == 1);
+        }
+        finally
+        {
+            ingress.Release.TrySetResult();
+            await subscriber.StopAsync(CancellationToken.None);
+            subscriber.Dispose();
+        }
+    }
+
     private static async Task Eventually(Func<bool> condition)
     {
         using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(5));

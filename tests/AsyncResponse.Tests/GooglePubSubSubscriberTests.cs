@@ -60,6 +60,30 @@ public class GooglePubSubSubscriberTests
     }
 
     [Fact]
+    public async Task WorkerSubscriberService_AThrowingLoggerAtTheLifecycleLogs_StillPullsTheSubscription()
+    {
+        var client = new FakeSubscriberClient();
+        var factoryCalls = 0;
+        var subscriber = new GooglePubSubWorkerSubscriber(
+            Options.Create(new GooglePubSubAsyncResponseOptions { ProjectId = "project-a", WorkerSubscriptionId = "workers" }),
+            new Mock<IAsyncResponseIngress>().Object,
+            new RecordingThrowingLogger<GooglePubSubWorkerSubscriber> { ThrowOnMessageContaining = "Pub/Sub" },
+            (_, _, _) =>
+            {
+                Interlocked.Increment(ref factoryCalls);
+                return Task.FromResult<IGooglePubSubSubscriberClient>(client);
+            });
+
+        await subscriber.StartAsync(CancellationToken.None);
+        var handler = await WaitForHandlerAsync(client);
+        Assert.NotNull(handler);
+        await subscriber.StopAsync(CancellationToken.None);
+
+        // Built once and pulled: a throwing "started" log used to fault the attempt and rebuild forever.
+        Assert.Equal(1, Volatile.Read(ref factoryCalls));
+    }
+
+    [Fact]
     public async Task WorkerSubscriberService_AcksHandledMessagesAndStopsSubscriber()
     {
         var client = new FakeSubscriberClient();
