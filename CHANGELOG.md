@@ -19,6 +19,11 @@ work that has landed on `main` but not yet shipped. Security reporters credited 
   job as still running user code, so each step of an `AdvanceAsync` over it spent the settle's
   whole 500 ms real-time grace. The engine now reports that park to the harness through an
   internal hook; the regression test that covers it went from ~46 s to ~2 s.
+- **Round-62 review (2026-10-01): the in-process park is reported for every timer that waits in
+  process.** The hook fired only when the remainder after the first-pass checkpoint was still above
+  `TimerInProcessThreshold`, while the harness predicted suspend-or-park from the remainder before
+  that save; a timer whose save took it under the threshold parked with neither signal, and settle
+  again spent its real-time grace on it. The engine now reports every in-process wait.
 - **Round-61 review (2026-09-30, re-review of every file changed since `1fc2b20`): a Cosmos DB ledger
   no longer disappears up to a second before it expires, and three documentation gaps are closed.**
   - *Durable flows — Cosmos DB.* Cosmos counts a document's TTL from `_ts`, which it truncates to

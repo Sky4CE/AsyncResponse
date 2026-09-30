@@ -1319,6 +1319,59 @@ public class DurableFlowInProcessParkTests
         }
     }
 
+    [Fact]
+    public async Task ATimerWhoseRemainderCrossesTheThresholdDuringItsFirstSave_ReportsItsInProcessPark()
+    {
+        // Fixpoint r1 (R1-02): the park hook fired only when the post-save remainder was still above
+        // the threshold, but a harness predicts from the PRE-save remainder (suspend) — a timer
+        // whose save pushed it under the threshold waited in process with neither signal.
+        var clock = new VirtualTimeProvider();
+        var transport = new RecordingDelayedTransport();
+        await using var provider = BuildProvider(transport, clock);
+        var store = new SlowUpdateStore(provider.GetRequiredService<IFlowStateStore>(), clock, TimeSpan.FromSeconds(30));
+        var options = Options(o => o.TimerInProcessThreshold = TimeSpan.FromMinutes(1));
+        var state = State("park-crosses-threshold-during-save");
+        Assert.True(await store.TryCreateAsync(state.FlowId!, state, options.StateExpiry));
+        var observer = new ParkObserver();
+
+        await using var lease = await AcquireAsync(store, state.FlowId!, options, clock);
+        var context = new DurableFlowContext(
+            state, store,
+            provider.GetRequiredService<IAsyncResponseBuilder>(),
+            provider.GetRequiredService<AsyncResponseContextPropagation>(),
+            options,
+            provider.GetRequiredService<IAsyncResponseSubscriber>(),
+            recoverableSubscriber: null,
+            NullLogger.Instance,
+            lease,
+            clock,
+            observers: [observer],
+            workerTransport: transport);
+        var sleeping = context.DelayAsync("nap", TimeSpan.FromSeconds(75));
+        await WaitForArmedTimerAsync(clock, TimeSpan.FromMinutes(1));
+
+        Assert.False(context.IsSuspended);
+        Assert.Equal(["nap"], observer.Parked);
+
+        clock.Advance(TimeSpan.FromMinutes(2));
+        await sleeping.WaitAsync(TimeSpan.FromSeconds(30));
+    }
+
+    private sealed class ParkObserver : IDurableFlowExecutionObserver, IInProcessTimerParkObserver
+    {
+        private readonly List<string> _parked = [];
+
+        public IReadOnlyList<string> Parked
+        {
+            get { lock (_parked) return [.. _parked]; }
+        }
+
+        public void OnTimerParkedInProcess(string flowId, string stepName, DateTime waitEndsAtUtc)
+        {
+            lock (_parked) _parked.Add(stepName);
+        }
+    }
+
     /// <summary>Every checkpoint takes <c>latency</c> of virtual time.</summary>
     private sealed class SlowUpdateStore(IFlowStateStore inner, VirtualTimeProvider clock, TimeSpan latency) : DelegatingFlowStateStore(inner)
     {

@@ -372,10 +372,11 @@ internal sealed class DurableFlowContext : IDurableFlowContext
                     "re-suspending would loop instead of sleeping. Fix the clock skew between the application and the broker/database.");
             }
 
-            // Above the threshold only a skew-forced wake-up (or a transport without delayed
-            // delivery) waits in process: observers told Waiting could not know it parks.
-            if (remaining > _options.TimerInProcessThreshold)
-                NotifyTimerParkedInProcess(name, UtcNow + wait);
+            // Told unconditionally: a skew-forced wake-up (or a transport without delayed delivery)
+            // waits in process above the threshold, and a first-pass/replay save that took the
+            // remainder under it does too, while observers told Waiting predicted from the
+            // pre-save remainder (suspend) and could not know it parks.
+            NotifyTimerParkedInProcess(name, UtcNow + wait);
 
             await WaitInProcessAsync(name, wakeAtUtc, wait, cancellationToken).ConfigureAwait(false);
             _lease.ThrowIfLost();
