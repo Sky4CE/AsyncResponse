@@ -366,7 +366,7 @@ var assemblies = [
   {
     "name": "AsyncResponse.Channels.PostgreSQL",
     "classes": [
-      { "name": "AsyncResponse.Channels.DbAsyncResponseChannelBase", "rp": "AsyncResponse.Channels.PostgreSQL_DbAsyncResponseChannelBase.html", "cl": 1129, "ucl": 22, "cal": 1151, "tl": 3043, "cb": 515, "tb": 568, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
+      { "name": "AsyncResponse.Channels.DbAsyncResponseChannelBase", "rp": "AsyncResponse.Channels.PostgreSQL_DbAsyncResponseChannelBase.html", "cl": 1134, "ucl": 17, "cal": 1151, "tl": 3043, "cb": 517, "tb": 568, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
       { "name": "AsyncResponse.Channels.DbRecoveryStateStoreBase", "rp": "AsyncResponse.Channels.PostgreSQL_DbRecoveryStateStoreBase.html", "cl": 80, "ucl": 0, "cal": 80, "tl": 179, "cb": 36, "tb": 40, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
       { "name": "AsyncResponse.Channels.PostgreSQL.PostgreSqlAsyncResponseChannel", "rp": "AsyncResponse.Channels.PostgreSQL_PostgreSqlAsyncResponseChannel.html", "cl": 53, "ucl": 0, "cal": 53, "tl": 134, "cb": 9, "tb": 10, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
       { "name": "AsyncResponse.Channels.PostgreSQL.PostgreSqlAsyncResponseChannelOptions", "rp": "AsyncResponse.Channels.PostgreSQL_PostgreSqlAsyncResponseChannelOptions.html", "cl": 59, "ucl": 0, "cal": 59, "tl": 187, "cb": 16, "tb": 16, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
@@ -386,7 +386,7 @@ var assemblies = [
     "name": "AsyncResponse.Channels.Redis",
     "classes": [
       { "name": "AsyncResponse.Channels.Redis.IRedisChannelSubscriber", "rp": "AsyncResponse.Channels.Redis_IRedisChannelSubscriber.html", "cl": 1, "ucl": 0, "cal": 1, "tl": 67, "cb": 0, "tb": 0, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
-      { "name": "AsyncResponse.Channels.Redis.RedisAsyncResponseChannel", "rp": "AsyncResponse.Channels.Redis_RedisAsyncResponseChannel.html", "cl": 706, "ucl": 3, "cal": 709, "tl": 1613, "cb": 268, "tb": 284, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
+      { "name": "AsyncResponse.Channels.Redis.RedisAsyncResponseChannel", "rp": "AsyncResponse.Channels.Redis_RedisAsyncResponseChannel.html", "cl": 715, "ucl": 3, "cal": 718, "tl": 1623, "cb": 268, "tb": 284, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
       { "name": "AsyncResponse.Channels.Redis.RedisAsyncResponseOptions", "rp": "AsyncResponse.Channels.Redis_RedisAsyncResponseOptions.html", "cl": 7, "ucl": 0, "cal": 7, "tl": 57, "cb": 2, "tb": 2, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
       { "name": "AsyncResponse.Channels.Redis.RedisAsyncResponseWaiter\u003CT\u003E", "rp": "AsyncResponse.Channels.Redis_RedisAsyncResponseWaiter_1.html", "cl": 5, "ucl": 0, "cal": 5, "tl": 14, "cb": 0, "tb": 0, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
       { "name": "AsyncResponse.Channels.Redis.RedisChannelMessageQueueSubscriber", "rp": "AsyncResponse.Channels.Redis_RedisChannelMessageQueueSubscriber.html", "cl": 8, "ucl": 0, "cal": 8, "tl": 67, "cb": 0, "tb": 0, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
@@ -421,7 +421,7 @@ var assemblies = [
       { "name": "AsyncResponse.AsyncResponseChannelMarker", "rp": "AsyncResponse.Core_AsyncResponseChannelMarker.html", "cl": 3, "ucl": 0, "cal": 3, "tl": 616, "cb": 0, "tb": 0, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
       { "name": "AsyncResponse.AsyncResponseChannelOptions", "rp": "AsyncResponse.Core_AsyncResponseChannelOptions.html", "cl": 64, "ucl": 0, "cal": 64, "tl": 241, "cb": 46, "tb": 46, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
       { "name": "AsyncResponse.AsyncResponseContextPropagation", "rp": "AsyncResponse.Core_AsyncResponseContextPropagation.html", "cl": 111, "ucl": 0, "cal": 111, "tl": 321, "cb": 67, "tb": 72, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
-      { "name": "AsyncResponse.AsyncResponseDiagnostics", "rp": "AsyncResponse.Core_AsyncResponseDiagnostics.html", "cl": 207, "ucl": 0, "cal": 207, "tl": 587, "cb": 92, "tb": 100, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
+      { "name": "AsyncResponse.AsyncResponseDiagnostics", "rp": "AsyncResponse.Core_AsyncResponseDiagnostics.html", "cl": 214, "ucl": 0, "cal": 214, "tl": 608, "cb": 91, "tb": 100, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
       { "name": "AsyncResponse.AsyncResponseDurableFlowStoreMarker", "rp": "AsyncResponse.Core_AsyncResponseDurableFlowStoreMarker.html", "cl": 21, "ucl": 0, "cal": 21, "tl": 616, "cb": 10, "tb": 14, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
       { "name": "AsyncResponse.AsyncResponseEnvelope\u003CT\u003E", "rp": "AsyncResponse.Core_AsyncResponseEnvelope_1.html", "cl": 5, "ucl": 0, "cal": 5, "tl": 298, "cb": 0, "tb": 0, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
       { "name": "AsyncResponse.AsyncResponseEnvelopeConverter\u003CT\u003E", "rp": "AsyncResponse.Core_AsyncResponseEnvelopeConverter_1.html", "cl": 93, "ucl": 0, "cal": 93, "tl": 298, "cb": 93, "tb": 94, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
@@ -435,19 +435,19 @@ var assemblies = [
       { "name": "AsyncResponse.AsyncResponsePackageVersionGate", "rp": "AsyncResponse.Core_AsyncResponsePackageVersionGate.html", "cl": 3, "ucl": 0, "cal": 3, "tl": 616, "cb": 0, "tb": 0, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
       { "name": "AsyncResponse.AsyncResponsePackageVersions", "rp": "AsyncResponse.Core_AsyncResponsePackageVersions.html", "cl": 58, "ucl": 0, "cal": 58, "tl": 616, "cb": 59, "tb": 64, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
       { "name": "AsyncResponse.AsyncResponseRecoveryHealthCheck", "rp": "AsyncResponse.Core_AsyncResponseRecoveryHealthCheck.html", "cl": 87, "ucl": 0, "cal": 87, "tl": 220, "cb": 37, "tb": 38, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
-      { "name": "AsyncResponse.AsyncResponseRecoveryStats", "rp": "AsyncResponse.Core_AsyncResponseRecoveryStats.html", "cl": 4, "ucl": 3, "cal": 7, "tl": 220, "cb": 0, "tb": 0, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
+      { "name": "AsyncResponse.AsyncResponseRecoveryStats", "rp": "AsyncResponse.Core_AsyncResponseRecoveryStats.html", "cl": 7, "ucl": 0, "cal": 7, "tl": 220, "cb": 0, "tb": 0, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
       { "name": "AsyncResponse.AsyncResponseRetry", "rp": "AsyncResponse.Core_AsyncResponseRetry.html", "cl": 28, "ucl": 0, "cal": 28, "tl": 100, "cb": 6, "tb": 6, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
-      { "name": "AsyncResponse.AsyncResponseStaleRecoveryEntry", "rp": "AsyncResponse.Core_AsyncResponseStaleRecoveryEntry.html", "cl": 2, "ucl": 2, "cal": 4, "tl": 220, "cb": 0, "tb": 0, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
+      { "name": "AsyncResponse.AsyncResponseStaleRecoveryEntry", "rp": "AsyncResponse.Core_AsyncResponseStaleRecoveryEntry.html", "cl": 4, "ucl": 0, "cal": 4, "tl": 220, "cb": 0, "tb": 0, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
       { "name": "AsyncResponse.AsyncResponseStartupValidator", "rp": "AsyncResponse.Core_AsyncResponseStartupValidator.html", "cl": 128, "ucl": 0, "cal": 128, "tl": 616, "cb": 68, "tb": 70, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
       { "name": "AsyncResponse.AsyncResponseTransportMarker", "rp": "AsyncResponse.Core_AsyncResponseTransportMarker.html", "cl": 6, "ucl": 0, "cal": 6, "tl": 616, "cb": 0, "tb": 0, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
       { "name": "AsyncResponse.AsyncResponseTypeResolution", "rp": "AsyncResponse.Core_AsyncResponseTypeResolution.html", "cl": 97, "ucl": 1, "cal": 98, "tl": 363, "cb": 45, "tb": 48, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
-      { "name": "AsyncResponse.AsyncResponseWatchdog", "rp": "AsyncResponse.Core_AsyncResponseWatchdog.html", "cl": 147, "ucl": 0, "cal": 147, "tl": 704, "cb": 71, "tb": 74, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
+      { "name": "AsyncResponse.AsyncResponseWatchdog", "rp": "AsyncResponse.Core_AsyncResponseWatchdog.html", "cl": 147, "ucl": 0, "cal": 147, "tl": 704, "cb": 72, "tb": 74, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
       { "name": "AsyncResponse.AsyncResponseWatchdogOptions", "rp": "AsyncResponse.Core_AsyncResponseWatchdogOptions.html", "cl": 32, "ucl": 0, "cal": 32, "tl": 704, "cb": 10, "tb": 10, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
       { "name": "AsyncResponse.AsyncResponseWatchdogReport", "rp": "AsyncResponse.Core_AsyncResponseWatchdogReport.html", "cl": 50, "ucl": 0, "cal": 50, "tl": 704, "cb": 36, "tb": 36, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
       { "name": "AsyncResponse.AsyncResponseWatchdogSnapshot", "rp": "AsyncResponse.Core_AsyncResponseWatchdogSnapshot.html", "cl": 5, "ucl": 0, "cal": 5, "tl": 704, "cb": 0, "tb": 0, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
       { "name": "AsyncResponse.AsyncResponseWatchdogState", "rp": "AsyncResponse.Core_AsyncResponseWatchdogState.html", "cl": 14, "ucl": 0, "cal": 14, "tl": 704, "cb": 4, "tb": 6, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
       { "name": "AsyncResponse.CallbackExpressionConverter", "rp": "AsyncResponse.Core_CallbackExpressionConverter.html", "cl": 59, "ucl": 0, "cal": 59, "tl": 161, "cb": 47, "tb": 52, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
-      { "name": "AsyncResponse.CallbackTargetUnresolvableException", "rp": "AsyncResponse.Core_CallbackTargetUnresolvableException.html", "cl": 4, "ucl": 0, "cal": 4, "tl": 785, "cb": 0, "tb": 0, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
+      { "name": "AsyncResponse.CallbackTargetUnresolvableException", "rp": "AsyncResponse.Core_CallbackTargetUnresolvableException.html", "cl": 4, "ucl": 0, "cal": 4, "tl": 794, "cb": 0, "tb": 0, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
       { "name": "AsyncResponse.ChannelSerialExecutor", "rp": "AsyncResponse.Core_ChannelSerialExecutor.html", "cl": 71, "ucl": 0, "cal": 71, "tl": 200, "cb": 16, "tb": 16, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
       { "name": "AsyncResponse.CorrelationIdGuard", "rp": "AsyncResponse.Core_CorrelationIdGuard.html", "cl": 27, "ucl": 0, "cal": 27, "tl": 123, "cb": 20, "tb": 20, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
       { "name": "AsyncResponse.CronSchedule", "rp": "AsyncResponse.Core_CronSchedule.html", "cl": 155, "ucl": 2, "cal": 157, "tl": 382, "cb": 94, "tb": 96, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
@@ -489,7 +489,7 @@ var assemblies = [
       { "name": "AsyncResponse.RecoveryStateContention", "rp": "AsyncResponse.Core_RecoveryStateContention.html", "cl": 11, "ucl": 0, "cal": 11, "tl": 69, "cb": 2, "tb": 2, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
       { "name": "AsyncResponse.RecoveryStateObservation", "rp": "AsyncResponse.Core_RecoveryStateObservation.html", "cl": 5, "ucl": 0, "cal": 5, "tl": 704, "cb": 0, "tb": 0, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
       { "name": "AsyncResponse.ReflectionCallDtoGuard", "rp": "AsyncResponse.Core_ReflectionCallDtoGuard.html", "cl": 16, "ucl": 0, "cal": 16, "tl": 59, "cb": 14, "tb": 14, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
-      { "name": "AsyncResponse.ReflectionExtensions", "rp": "AsyncResponse.Core_ReflectionExtensions.html", "cl": 240, "ucl": 0, "cal": 240, "tl": 785, "cb": 135, "tb": 142, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
+      { "name": "AsyncResponse.ReflectionExtensions", "rp": "AsyncResponse.Core_ReflectionExtensions.html", "cl": 247, "ucl": 0, "cal": 247, "tl": 794, "cb": 141, "tb": 148, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
       { "name": "AsyncResponse.RemoteStackTrace", "rp": "AsyncResponse.Core_RemoteStackTrace.html", "cl": 4, "ucl": 0, "cal": 4, "tl": 35, "cb": 8, "tb": 8, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
       { "name": "AsyncResponse.SafeLog", "rp": "AsyncResponse.Core_SafeLog.html", "cl": 10, "ucl": 0, "cal": 10, "tl": 44, "cb": 0, "tb": 0, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
       { "name": "AsyncResponse.ScheduledFlowOptions", "rp": "AsyncResponse.Core_ScheduledFlowOptions.html", "cl": 4, "ucl": 0, "cal": 4, "tl": 575, "cb": 0, "tb": 0, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
@@ -530,13 +530,13 @@ var assemblies = [
   {
     "name": "AsyncResponse.DurableFlows.EFCore",
     "classes": [
-      { "name": "AsyncResponse.DurableFlows.EFCore.DurableFlowStateRecord", "rp": "AsyncResponse.DurableFlows.EFCore_DurableFlowStateRecord.html", "cl": 7, "ucl": 0, "cal": 7, "tl": 682, "cb": 0, "tb": 0, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
-      { "name": "AsyncResponse.DurableFlows.EFCore.EFCoreDurableFlowModelBuilderExtensions", "rp": "AsyncResponse.DurableFlows.EFCore_EFCoreDurableFlowModelBuilderExtensions.html", "cl": 30, "ucl": 0, "cal": 30, "tl": 682, "cb": 2, "tb": 2, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
-      { "name": "AsyncResponse.DurableFlows.EFCore.EFCoreDurableFlowOptions", "rp": "AsyncResponse.DurableFlows.EFCore_EFCoreDurableFlowOptions.html", "cl": 3, "ucl": 0, "cal": 3, "tl": 682, "cb": 0, "tb": 0, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
-      { "name": "AsyncResponse.DurableFlows.EFCore.EFCoreFlowStateStore\u003CT\u003E", "rp": "AsyncResponse.DurableFlows.EFCore_EFCoreFlowStateStore_1.html", "cl": 210, "ucl": 1, "cal": 211, "tl": 682, "cb": 40, "tb": 40, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
-      { "name": "AsyncResponse.DurableFlows.EFCore.FlowIdCollationRules", "rp": "AsyncResponse.DurableFlows.EFCore_FlowIdCollationRules.html", "cl": 23, "ucl": 0, "cal": 23, "tl": 682, "cb": 8, "tb": 8, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
+      { "name": "AsyncResponse.DurableFlows.EFCore.DurableFlowStateRecord", "rp": "AsyncResponse.DurableFlows.EFCore_DurableFlowStateRecord.html", "cl": 7, "ucl": 0, "cal": 7, "tl": 685, "cb": 0, "tb": 0, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
+      { "name": "AsyncResponse.DurableFlows.EFCore.EFCoreDurableFlowModelBuilderExtensions", "rp": "AsyncResponse.DurableFlows.EFCore_EFCoreDurableFlowModelBuilderExtensions.html", "cl": 30, "ucl": 0, "cal": 30, "tl": 685, "cb": 2, "tb": 2, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
+      { "name": "AsyncResponse.DurableFlows.EFCore.EFCoreDurableFlowOptions", "rp": "AsyncResponse.DurableFlows.EFCore_EFCoreDurableFlowOptions.html", "cl": 3, "ucl": 0, "cal": 3, "tl": 685, "cb": 0, "tb": 0, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
+      { "name": "AsyncResponse.DurableFlows.EFCore.EFCoreFlowStateStore\u003CT\u003E", "rp": "AsyncResponse.DurableFlows.EFCore_EFCoreFlowStateStore_1.html", "cl": 210, "ucl": 1, "cal": 211, "tl": 685, "cb": 40, "tb": 40, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
+      { "name": "AsyncResponse.DurableFlows.EFCore.FlowIdCollationRules", "rp": "AsyncResponse.DurableFlows.EFCore_FlowIdCollationRules.html", "cl": 26, "ucl": 0, "cal": 26, "tl": 685, "cb": 10, "tb": 10, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
       { "name": "AsyncResponse.DurableFlows.Internal.DurableFlowStoreShared", "rp": "AsyncResponse.DurableFlows.EFCore_DurableFlowStoreShared.html", "cl": 142, "ucl": 0, "cal": 142, "tl": 481, "cb": 93, "tb": 96, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
-      { "name": "Microsoft.Extensions.DependencyInjection.EFCoreDurableFlowServiceCollectionExtensions", "rp": "AsyncResponse.DurableFlows.EFCore_EFCoreDurableFlowServiceCollectionExtensions.html", "cl": 2, "ucl": 0, "cal": 2, "tl": 682, "cb": 0, "tb": 0, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
+      { "name": "Microsoft.Extensions.DependencyInjection.EFCoreDurableFlowServiceCollectionExtensions", "rp": "AsyncResponse.DurableFlows.EFCore_EFCoreDurableFlowServiceCollectionExtensions.html", "cl": 2, "ucl": 0, "cal": 2, "tl": 685, "cb": 0, "tb": 0, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
     ]},
   {
     "name": "AsyncResponse.DurableFlows.MongoDB",
@@ -564,9 +564,9 @@ var assemblies = [
     "name": "AsyncResponse.DurableFlows.Oracle",
     "classes": [
       { "name": "AsyncResponse.DurableFlows.Internal.DurableFlowStoreShared", "rp": "AsyncResponse.DurableFlows.Oracle_DurableFlowStoreShared.html", "cl": 142, "ucl": 0, "cal": 142, "tl": 481, "cb": 93, "tb": 96, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
-      { "name": "AsyncResponse.DurableFlows.Oracle.OracleDurableFlowOptions", "rp": "AsyncResponse.DurableFlows.Oracle_OracleDurableFlowOptions.html", "cl": 15, "ucl": 0, "cal": 15, "tl": 860, "cb": 2, "tb": 2, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
-      { "name": "AsyncResponse.DurableFlows.Oracle.OracleFlowStateStore", "rp": "AsyncResponse.DurableFlows.Oracle_OracleFlowStateStore.html", "cl": 373, "ucl": 15, "cal": 388, "tl": 860, "cb": 104, "tb": 120, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
-      { "name": "Microsoft.Extensions.DependencyInjection.OracleDurableFlowServiceCollectionExtensions", "rp": "AsyncResponse.DurableFlows.Oracle_OracleDurableFlowServiceCollectionExtensions.html", "cl": 2, "ucl": 0, "cal": 2, "tl": 860, "cb": 0, "tb": 0, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
+      { "name": "AsyncResponse.DurableFlows.Oracle.OracleDurableFlowOptions", "rp": "AsyncResponse.DurableFlows.Oracle_OracleDurableFlowOptions.html", "cl": 15, "ucl": 0, "cal": 15, "tl": 936, "cb": 2, "tb": 2, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
+      { "name": "AsyncResponse.DurableFlows.Oracle.OracleFlowStateStore", "rp": "AsyncResponse.DurableFlows.Oracle_OracleFlowStateStore.html", "cl": 403, "ucl": 22, "cal": 425, "tl": 936, "cb": 122, "tb": 140, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
+      { "name": "Microsoft.Extensions.DependencyInjection.OracleDurableFlowServiceCollectionExtensions", "rp": "AsyncResponse.DurableFlows.Oracle_OracleDurableFlowServiceCollectionExtensions.html", "cl": 2, "ucl": 0, "cal": 2, "tl": 936, "cb": 0, "tb": 0, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
     ]},
   {
     "name": "AsyncResponse.DurableFlows.PostgreSQL",
@@ -605,7 +605,7 @@ var assemblies = [
       { "name": "AsyncResponse.Testing.FlowRunHandle", "rp": "AsyncResponse.Testing_FlowRunHandle.html", "cl": 52, "ucl": 0, "cal": 52, "tl": 748, "cb": 10, "tb": 12, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
       { "name": "AsyncResponse.Testing.FlowTestHarness", "rp": "AsyncResponse.Testing_FlowTestHarness.html", "cl": 23, "ucl": 0, "cal": 23, "tl": 748, "cb": 1, "tb": 2, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
       { "name": "AsyncResponse.Testing.SimulatedCrashException", "rp": "AsyncResponse.Testing_SimulatedCrashException.html", "cl": 3, "ucl": 0, "cal": 3, "tl": 18, "cb": 2, "tb": 2, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
-      { "name": "AsyncResponse.Testing.VirtualTimeProvider", "rp": "AsyncResponse.Testing_VirtualTimeProvider.html", "cl": 123, "ucl": 0, "cal": 123, "tl": 349, "cb": 44, "tb": 44, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
+      { "name": "AsyncResponse.Testing.VirtualTimeProvider", "rp": "AsyncResponse.Testing_VirtualTimeProvider.html", "cl": 122, "ucl": 1, "cal": 123, "tl": 349, "cb": 43, "tb": 44, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
     ]},
   {
     "name": "AsyncResponse.Transports.AzureServiceBus",
@@ -663,7 +663,7 @@ var assemblies = [
     "name": "AsyncResponse.Transports.Kafka",
     "classes": [
       { "name": "AsyncResponse.Transports.CorrelationIdJsonPaths", "rp": "AsyncResponse.Transports.Kafka_CorrelationIdJsonPaths.html", "cl": 114, "ucl": 1, "cal": 115, "tl": 271, "cb": 58, "tb": 62, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
-      { "name": "AsyncResponse.Transports.Kafka.AwaitingKafkaMessageDispatcher", "rp": "AsyncResponse.Transports.Kafka_AwaitingKafkaMessageDispatcher.html", "cl": 328, "ucl": 0, "cal": 328, "tl": 2131, "cb": 93, "tb": 98, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
+      { "name": "AsyncResponse.Transports.Kafka.AwaitingKafkaMessageDispatcher", "rp": "AsyncResponse.Transports.Kafka_AwaitingKafkaMessageDispatcher.html", "cl": 327, "ucl": 1, "cal": 328, "tl": 2131, "cb": 92, "tb": 98, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
       { "name": "AsyncResponse.Transports.Kafka.KafkaAssignmentGenerations", "rp": "AsyncResponse.Transports.Kafka_KafkaAssignmentGenerations.html", "cl": 9, "ucl": 0, "cal": 9, "tl": 715, "cb": 6, "tb": 6, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
       { "name": "AsyncResponse.Transports.Kafka.KafkaAsyncResponseTransportOptions", "rp": "AsyncResponse.Transports.Kafka_KafkaAsyncResponseTransportOptions.html", "cl": 42, "ucl": 0, "cal": 42, "tl": 223, "cb": 0, "tb": 0, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
       { "name": "AsyncResponse.Transports.Kafka.KafkaBackgroundFailureContext", "rp": "AsyncResponse.Transports.Kafka_KafkaBackgroundFailureContext.html", "cl": 23, "ucl": 0, "cal": 23, "tl": 219, "cb": 0, "tb": 0, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
@@ -741,16 +741,16 @@ var assemblies = [
       { "name": "AsyncResponse.Transports.NATS.NatsCorrelationIdExtractor", "rp": "AsyncResponse.Transports.NATS_NatsCorrelationIdExtractor.html", "cl": 11, "ucl": 0, "cal": 11, "tl": 45, "cb": 16, "tb": 16, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
       { "name": "AsyncResponse.Transports.NATS.NatsJetStreamTransportAdapter", "rp": "AsyncResponse.Transports.NATS_NatsJetStreamTransportAdapter.html", "cl": 200, "ucl": 0, "cal": 200, "tl": 570, "cb": 99, "tb": 104, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
       { "name": "AsyncResponse.Transports.NATS.NatsJobDelivery", "rp": "AsyncResponse.Transports.NATS_NatsJobDelivery.html", "cl": 9, "ucl": 0, "cal": 9, "tl": 570, "cb": 0, "tb": 0, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
-      { "name": "AsyncResponse.Transports.NATS.NatsMessageDispatcher", "rp": "AsyncResponse.Transports.NATS_NatsMessageDispatcher.html", "cl": 349, "ucl": 5, "cal": 354, "tl": 766, "cb": 96, "tb": 96, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
+      { "name": "AsyncResponse.Transports.NATS.NatsMessageDispatcher", "rp": "AsyncResponse.Transports.NATS_NatsMessageDispatcher.html", "cl": 354, "ucl": 5, "cal": 359, "tl": 781, "cb": 98, "tb": 98, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
       { "name": "AsyncResponse.Transports.NATS.NatsReplyTargetOptions", "rp": "AsyncResponse.Transports.NATS_NatsReplyTargetOptions.html", "cl": 3, "ucl": 0, "cal": 3, "tl": 186, "cb": 0, "tb": 0, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
       { "name": "AsyncResponse.Transports.NATS.NatsReplyTargetProvider", "rp": "AsyncResponse.Transports.NATS_NatsReplyTargetProvider.html", "cl": 44, "ucl": 0, "cal": 44, "tl": 75, "cb": 12, "tb": 12, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
-      { "name": "AsyncResponse.Transports.NATS.NatsResponseIngressSubscriber", "rp": "AsyncResponse.Transports.NATS_NatsResponseIngressSubscriber.html", "cl": 13, "ucl": 0, "cal": 13, "tl": 518, "cb": 1, "tb": 2, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
+      { "name": "AsyncResponse.Transports.NATS.NatsResponseIngressSubscriber", "rp": "AsyncResponse.Transports.NATS_NatsResponseIngressSubscriber.html", "cl": 13, "ucl": 0, "cal": 13, "tl": 520, "cb": 1, "tb": 2, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
       { "name": "AsyncResponse.Transports.NATS.NatsSubscriberOptions", "rp": "AsyncResponse.Transports.NATS_NatsSubscriberOptions.html", "cl": 18, "ucl": 0, "cal": 18, "tl": 132, "cb": 6, "tb": 6, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
-      { "name": "AsyncResponse.Transports.NATS.NatsSubscriberService", "rp": "AsyncResponse.Transports.NATS_NatsSubscriberService.html", "cl": 155, "ucl": 1, "cal": 156, "tl": 518, "cb": 50, "tb": 52, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
+      { "name": "AsyncResponse.Transports.NATS.NatsSubscriberService", "rp": "AsyncResponse.Transports.NATS_NatsSubscriberService.html", "cl": 154, "ucl": 2, "cal": 156, "tl": 520, "cb": 50, "tb": 52, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
       { "name": "AsyncResponse.Transports.NATS.NatsTransportOptionsValidator", "rp": "AsyncResponse.Transports.NATS_NatsTransportOptionsValidator.html", "cl": 134, "ucl": 0, "cal": 134, "tl": 278, "cb": 87, "tb": 90, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
       { "name": "AsyncResponse.Transports.NATS.NatsTransportRetry", "rp": "AsyncResponse.Transports.NATS_NatsTransportRetry.html", "cl": 6, "ucl": 0, "cal": 6, "tl": 570, "cb": 10, "tb": 10, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
       { "name": "AsyncResponse.Transports.NATS.NatsTransportSubjectSchema", "rp": "AsyncResponse.Transports.NATS_NatsTransportSubjectSchema.html", "cl": 20, "ucl": 0, "cal": 20, "tl": 46, "cb": 16, "tb": 16, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
-      { "name": "AsyncResponse.Transports.NATS.NatsWorkerSubscriber", "rp": "AsyncResponse.Transports.NATS_NatsWorkerSubscriber.html", "cl": 15, "ucl": 0, "cal": 15, "tl": 518, "cb": 0, "tb": 0, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
+      { "name": "AsyncResponse.Transports.NATS.NatsWorkerSubscriber", "rp": "AsyncResponse.Transports.NATS_NatsWorkerSubscriber.html", "cl": 15, "ucl": 0, "cal": 15, "tl": 520, "cb": 0, "tb": 0, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
       { "name": "AsyncResponse.Transports.NATS.NatsWorkerTransport", "rp": "AsyncResponse.Transports.NATS_NatsWorkerTransport.html", "cl": 65, "ucl": 0, "cal": 65, "tl": 131, "cb": 14, "tb": 18, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
       { "name": "AsyncResponse.Transports.SubscriberSupervisor", "rp": "AsyncResponse.Transports.NATS_SubscriberSupervisor.html", "cl": 15, "ucl": 0, "cal": 15, "tl": 88, "cb": 8, "tb": 8, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
       { "name": "AsyncResponse.Transports.WorkerIntakeGate", "rp": "AsyncResponse.Transports.NATS_WorkerIntakeGate.html", "cl": 4, "ucl": 0, "cal": 4, "tl": 41, "cb": 2, "tb": 2, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
@@ -767,7 +767,7 @@ var assemblies = [
       { "name": "AsyncResponse.Internal.RelationalNamePlan", "rp": "AsyncResponse.Transports.PostgreSQL_RelationalNamePlan.html", "cl": 15, "ucl": 0, "cal": 15, "tl": 71, "cb": 12, "tb": 12, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
       { "name": "AsyncResponse.Transports.CorrelationIdJsonPaths", "rp": "AsyncResponse.Transports.PostgreSQL_CorrelationIdJsonPaths.html", "cl": 114, "ucl": 1, "cal": 115, "tl": 271, "cb": 58, "tb": 62, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
       { "name": "AsyncResponse.Transports.DbCorrelationIdExtractor", "rp": "AsyncResponse.Transports.PostgreSQL_DbCorrelationIdExtractor.html", "cl": 4, "ucl": 0, "cal": 4, "tl": 1224, "cb": 6, "tb": 6, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
-      { "name": "AsyncResponse.Transports.DbDeadLetterPrune", "rp": "AsyncResponse.Transports.PostgreSQL_DbDeadLetterPrune.html", "cl": 8, "ucl": 0, "cal": 8, "tl": 1224, "cb": 3, "tb": 4, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
+      { "name": "AsyncResponse.Transports.DbDeadLetterPrune", "rp": "AsyncResponse.Transports.PostgreSQL_DbDeadLetterPrune.html", "cl": 8, "ucl": 0, "cal": 8, "tl": 1224, "cb": 4, "tb": 4, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
       { "name": "AsyncResponse.Transports.DbMessageDispatcherBase", "rp": "AsyncResponse.Transports.PostgreSQL_DbMessageDispatcherBase.html", "cl": 557, "ucl": 0, "cal": 557, "tl": 1224, "cb": 108, "tb": 110, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
       { "name": "AsyncResponse.Transports.DbTransportHeaders", "rp": "AsyncResponse.Transports.PostgreSQL_DbTransportHeaders.html", "cl": 24, "ucl": 0, "cal": 24, "tl": 1224, "cb": 12, "tb": 12, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
       { "name": "AsyncResponse.Transports.PostgreSQL.PostgreSqlAsyncResponseTransportOptions", "rp": "AsyncResponse.Transports.PostgreSQL_PostgreSqlAsyncResponseTransportOptions.html", "cl": 35, "ucl": 0, "cal": 35, "tl": 233, "cb": 0, "tb": 0, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
@@ -778,13 +778,13 @@ var assemblies = [
       { "name": "AsyncResponse.Transports.PostgreSQL.PostgreSqlReplyTargetProvider", "rp": "AsyncResponse.Transports.PostgreSQL_PostgreSqlReplyTargetProvider.html", "cl": 40, "ucl": 0, "cal": 40, "tl": 70, "cb": 10, "tb": 10, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
       { "name": "AsyncResponse.Transports.PostgreSQL.PostgreSqlResponseIngressSubscriber", "rp": "AsyncResponse.Transports.PostgreSQL_PostgreSqlResponseIngressSubscriber.html", "cl": 9, "ucl": 0, "cal": 9, "tl": 283, "cb": 1, "tb": 2, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
       { "name": "AsyncResponse.Transports.PostgreSQL.PostgreSqlSubscriberOptions", "rp": "AsyncResponse.Transports.PostgreSQL_PostgreSqlSubscriberOptions.html", "cl": 19, "ucl": 0, "cal": 19, "tl": 233, "cb": 6, "tb": 6, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
-      { "name": "AsyncResponse.Transports.PostgreSQL.PostgreSqlSubscriberService", "rp": "AsyncResponse.Transports.PostgreSQL_PostgreSqlSubscriberService.html", "cl": 94, "ucl": 2, "cal": 96, "tl": 283, "cb": 28, "tb": 30, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
+      { "name": "AsyncResponse.Transports.PostgreSQL.PostgreSqlSubscriberService", "rp": "AsyncResponse.Transports.PostgreSQL_PostgreSqlSubscriberService.html", "cl": 92, "ucl": 4, "cal": 96, "tl": 283, "cb": 28, "tb": 30, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
       { "name": "AsyncResponse.Transports.PostgreSQL.PostgreSqlTransportDelivery", "rp": "AsyncResponse.Transports.PostgreSQL_PostgreSqlTransportDelivery.html", "cl": 10, "ucl": 0, "cal": 10, "tl": 918, "cb": 0, "tb": 0, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
       { "name": "AsyncResponse.Transports.PostgreSQL.PostgreSqlTransportOptionsValidator", "rp": "AsyncResponse.Transports.PostgreSQL_PostgreSqlTransportOptionsValidator.html", "cl": 92, "ucl": 0, "cal": 92, "tl": 163, "cb": 50, "tb": 52, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
       { "name": "AsyncResponse.Transports.PostgreSQL.PostgreSqlTransportRetry", "rp": "AsyncResponse.Transports.PostgreSQL_PostgreSqlTransportRetry.html", "cl": 2, "ucl": 0, "cal": 2, "tl": 107, "cb": 0, "tb": 0, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
       { "name": "AsyncResponse.Transports.PostgreSQL.PostgreSqlTransportStore", "rp": "AsyncResponse.Transports.PostgreSQL_PostgreSqlTransportStore.html", "cl": 417, "ucl": 15, "cal": 432, "tl": 918, "cb": 93, "tb": 96, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
       { "name": "AsyncResponse.Transports.PostgreSQL.PostgreSqlWorkerSubscriber", "rp": "AsyncResponse.Transports.PostgreSQL_PostgreSqlWorkerSubscriber.html", "cl": 6, "ucl": 0, "cal": 6, "tl": 283, "cb": 0, "tb": 0, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
-      { "name": "AsyncResponse.Transports.PostgreSQL.PostgreSqlWorkerTransport", "rp": "AsyncResponse.Transports.PostgreSQL_PostgreSqlWorkerTransport.html", "cl": 49, "ucl": 0, "cal": 49, "tl": 107, "cb": 9, "tb": 14, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
+      { "name": "AsyncResponse.Transports.PostgreSQL.PostgreSqlWorkerTransport", "rp": "AsyncResponse.Transports.PostgreSQL_PostgreSqlWorkerTransport.html", "cl": 49, "ucl": 0, "cal": 49, "tl": 107, "cb": 12, "tb": 14, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
       { "name": "AsyncResponse.Transports.SubscriberSupervisor", "rp": "AsyncResponse.Transports.PostgreSQL_SubscriberSupervisor.html", "cl": 15, "ucl": 0, "cal": 15, "tl": 88, "cb": 7, "tb": 8, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
       { "name": "AsyncResponse.Transports.WorkerIntakeGate", "rp": "AsyncResponse.Transports.PostgreSQL_WorkerIntakeGate.html", "cl": 4, "ucl": 0, "cal": 4, "tl": 41, "cb": 2, "tb": 2, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
       { "name": "Microsoft.Extensions.DependencyInjection.PostgreSqlAsyncResponseTransportServiceCollectionExtensions", "rp": "AsyncResponse.Transports.PostgreSQL_PostgreSqlAsyncResponseTransportServiceCollectionExtensions.html", "cl": 26, "ucl": 0, "cal": 26, "tl": 57, "cb": 0, "tb": 0, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
@@ -812,7 +812,7 @@ var assemblies = [
       { "name": "AsyncResponse.Transports.RabbitMQ.RabbitMqSubscriberService", "rp": "AsyncResponse.Transports.RabbitMQ_RabbitMqSubscriberService.html", "cl": 95, "ucl": 0, "cal": 95, "tl": 375, "cb": 16, "tb": 16, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
       { "name": "AsyncResponse.Transports.RabbitMQ.RabbitMqTopology", "rp": "AsyncResponse.Transports.RabbitMQ_RabbitMqTopology.html", "cl": 55, "ucl": 0, "cal": 55, "tl": 142, "cb": 20, "tb": 20, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
       { "name": "AsyncResponse.Transports.RabbitMQ.RabbitMqWorkerSubscriber", "rp": "AsyncResponse.Transports.RabbitMQ_RabbitMqWorkerSubscriber.html", "cl": 37, "ucl": 0, "cal": 37, "tl": 375, "cb": 9, "tb": 12, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
-      { "name": "AsyncResponse.Transports.RabbitMQ.RabbitMqWorkerTransport", "rp": "AsyncResponse.Transports.RabbitMQ_RabbitMqWorkerTransport.html", "cl": 111, "ucl": 0, "cal": 111, "tl": 272, "cb": 52, "tb": 52, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
+      { "name": "AsyncResponse.Transports.RabbitMQ.RabbitMqWorkerTransport", "rp": "AsyncResponse.Transports.RabbitMQ_RabbitMqWorkerTransport.html", "cl": 111, "ucl": 0, "cal": 111, "tl": 272, "cb": 51, "tb": 52, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
       { "name": "AsyncResponse.Transports.SubscriberSupervisor", "rp": "AsyncResponse.Transports.RabbitMQ_SubscriberSupervisor.html", "cl": 15, "ucl": 0, "cal": 15, "tl": 88, "cb": 7, "tb": 8, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
       { "name": "AsyncResponse.Transports.WorkerIntakeGate", "rp": "AsyncResponse.Transports.RabbitMQ_WorkerIntakeGate.html", "cl": 4, "ucl": 0, "cal": 4, "tl": 41, "cb": 2, "tb": 2, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
       { "name": "Microsoft.Extensions.DependencyInjection.RabbitMqAsyncResponseServiceCollectionExtensions", "rp": "AsyncResponse.Transports.RabbitMQ_RabbitMqAsyncResponseServiceCollectionExtensions.html", "cl": 24, "ucl": 0, "cal": 24, "tl": 56, "cb": 0, "tb": 0, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
@@ -879,15 +879,15 @@ var assemblies = [
     "name": "AsyncResponse.Transports.SQS",
     "classes": [
       { "name": "AsyncResponse.Transports.CorrelationIdJsonPaths", "rp": "AsyncResponse.Transports.SQS_CorrelationIdJsonPaths.html", "cl": 114, "ucl": 1, "cal": 115, "tl": 271, "cb": 58, "tb": 62, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
-      { "name": "AsyncResponse.Transports.SQS.AwaitingSqsMessageDispatcher", "rp": "AsyncResponse.Transports.SQS_AwaitingSqsMessageDispatcher.html", "cl": 32, "ucl": 0, "cal": 32, "tl": 660, "cb": 10, "tb": 10, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
-      { "name": "AsyncResponse.Transports.SQS.QueuedSqsMessageDispatcher", "rp": "AsyncResponse.Transports.SQS_QueuedSqsMessageDispatcher.html", "cl": 178, "ucl": 0, "cal": 178, "tl": 660, "cb": 22, "tb": 22, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
+      { "name": "AsyncResponse.Transports.SQS.AwaitingSqsMessageDispatcher", "rp": "AsyncResponse.Transports.SQS_AwaitingSqsMessageDispatcher.html", "cl": 32, "ucl": 0, "cal": 32, "tl": 662, "cb": 10, "tb": 10, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
+      { "name": "AsyncResponse.Transports.SQS.QueuedSqsMessageDispatcher", "rp": "AsyncResponse.Transports.SQS_QueuedSqsMessageDispatcher.html", "cl": 178, "ucl": 0, "cal": 178, "tl": 662, "cb": 22, "tb": 22, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
       { "name": "AsyncResponse.Transports.SQS.SqsAsyncResponseOptions", "rp": "AsyncResponse.Transports.SQS_SqsAsyncResponseOptions.html", "cl": 37, "ucl": 0, "cal": 37, "tl": 204, "cb": 0, "tb": 0, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
       { "name": "AsyncResponse.Transports.SQS.SqsBackgroundFailureContext", "rp": "AsyncResponse.Transports.SQS_SqsBackgroundFailureContext.html", "cl": 20, "ucl": 0, "cal": 20, "tl": 138, "cb": 0, "tb": 0, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
       { "name": "AsyncResponse.Transports.SQS.SqsClientAdapter", "rp": "AsyncResponse.Transports.SQS_SqsClientAdapter.html", "cl": 95, "ucl": 0, "cal": 95, "tl": 250, "cb": 39, "tb": 40, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
       { "name": "AsyncResponse.Transports.SQS.SqsClientFactory", "rp": "AsyncResponse.Transports.SQS_SqsClientFactory.html", "cl": 10, "ucl": 0, "cal": 10, "tl": 250, "cb": 7, "tb": 10, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
       { "name": "AsyncResponse.Transports.SQS.SqsClientResolver", "rp": "AsyncResponse.Transports.SQS_SqsClientResolver.html", "cl": 4, "ucl": 0, "cal": 4, "tl": 250, "cb": 2, "tb": 2, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
       { "name": "AsyncResponse.Transports.SQS.SqsCorrelationIdExtractor", "rp": "AsyncResponse.Transports.SQS_SqsCorrelationIdExtractor.html", "cl": 5, "ucl": 0, "cal": 5, "tl": 25, "cb": 6, "tb": 6, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
-      { "name": "AsyncResponse.Transports.SQS.SqsMessageDispatcher", "rp": "AsyncResponse.Transports.SQS_SqsMessageDispatcher.html", "cl": 106, "ucl": 0, "cal": 106, "tl": 660, "cb": 29, "tb": 38, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
+      { "name": "AsyncResponse.Transports.SQS.SqsMessageDispatcher", "rp": "AsyncResponse.Transports.SQS_SqsMessageDispatcher.html", "cl": 106, "ucl": 0, "cal": 106, "tl": 662, "cb": 29, "tb": 38, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
       { "name": "AsyncResponse.Transports.SQS.SqsOptionsValidator", "rp": "AsyncResponse.Transports.SQS_SqsOptionsValidator.html", "cl": 141, "ucl": 0, "cal": 141, "tl": 287, "cb": 93, "tb": 96, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
       { "name": "AsyncResponse.Transports.SQS.SqsOutboundMessage", "rp": "AsyncResponse.Transports.SQS_SqsOutboundMessage.html", "cl": 8, "ucl": 0, "cal": 8, "tl": 250, "cb": 0, "tb": 0, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
       { "name": "AsyncResponse.Transports.SQS.SqsQueueAddress", "rp": "AsyncResponse.Transports.SQS_SqsQueueAddress.html", "cl": 30, "ucl": 0, "cal": 30, "tl": 99, "cb": 28, "tb": 32, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
@@ -1026,7 +1026,7 @@ var riskHotspots = [
       { "value": 48, "exceeded": true },
     ]},
   {
-    "assembly": "AsyncResponse.Channels.Redis", "class": "AsyncResponse.Channels.Redis.RedisAsyncResponseChannel", "reportPath": "AsyncResponse.Channels.Redis_RedisAsyncResponseChannel.html", "methodName": "CountActiveSubscribersAsync()", "methodShortName": "CountActiveSubscribersAsync()", "fileIndex": 0, "line": 1412,
+    "assembly": "AsyncResponse.Channels.Redis", "class": "AsyncResponse.Channels.Redis.RedisAsyncResponseChannel", "reportPath": "AsyncResponse.Channels.Redis_RedisAsyncResponseChannel.html", "methodName": "CountActiveSubscribersAsync()", "methodShortName": "CountActiveSubscribersAsync()", "fileIndex": 0, "line": 1422,
     "metrics": [
       { "value": 46, "exceeded": true },
       { "value": 46, "exceeded": true },
@@ -1416,12 +1416,6 @@ var riskHotspots = [
       { "value": 26, "exceeded": true },
     ]},
   {
-    "assembly": "AsyncResponse.Channels.Redis", "class": "AsyncResponse.Channels.Redis.RedisAsyncResponseChannel", "reportPath": "AsyncResponse.Channels.Redis_RedisAsyncResponseChannel.html", "methodName": "SetException()", "methodShortName": "SetException()", "fileIndex": 0, "line": 1216,
-    "metrics": [
-      { "value": 26, "exceeded": false },
-      { "value": 26, "exceeded": true },
-    ]},
-  {
     "assembly": "AsyncResponse.Channels.Redis", "class": "AsyncResponse.Channels.Redis.RedisRecoveryStateStore", "reportPath": "AsyncResponse.Channels.Redis_RedisRecoveryStateStore.html", "methodName": "ResolveScanTargetsAsync()", "methodShortName": "ResolveScanTargetsAsync()", "fileIndex": 0, "line": 355,
     "metrics": [
       { "value": 26, "exceeded": false },
@@ -1452,7 +1446,7 @@ var riskHotspots = [
       { "value": 26, "exceeded": true },
     ]},
   {
-    "assembly": "AsyncResponse.DurableFlows.Oracle", "class": "AsyncResponse.DurableFlows.Oracle.OracleFlowStateStore", "reportPath": "AsyncResponse.DurableFlows.Oracle_OracleFlowStateStore.html", "methodName": "Mismatch(AsyncResponse.DurableFlows.Oracle.OracleFlowStateStore/ActualColumn)", "methodShortName": "Mismatch(...)", "fileIndex": 0, "line": 712,
+    "assembly": "AsyncResponse.DurableFlows.Oracle", "class": "AsyncResponse.DurableFlows.Oracle.OracleFlowStateStore", "reportPath": "AsyncResponse.DurableFlows.Oracle_OracleFlowStateStore.html", "methodName": "Mismatch(AsyncResponse.DurableFlows.Oracle.OracleFlowStateStore/ActualColumn)", "methodShortName": "Mismatch(...)", "fileIndex": 0, "line": 788,
     "metrics": [
       { "value": 26, "exceeded": false },
       { "value": 26, "exceeded": true },
@@ -1513,6 +1507,12 @@ var riskHotspots = [
     ]},
   {
     "assembly": "AsyncResponse.Channels.MongoDB", "class": "AsyncResponse.Channels.MongoDB.MongoDbAsyncResponseChannelOptions", "reportPath": "AsyncResponse.Channels.MongoDB_MongoDbAsyncResponseChannelOptions.html", "methodName": "Validate()", "methodShortName": "Validate()", "fileIndex": 0, "line": 153,
+    "metrics": [
+      { "value": 24, "exceeded": false },
+      { "value": 24, "exceeded": true },
+    ]},
+  {
+    "assembly": "AsyncResponse.Channels.Redis", "class": "AsyncResponse.Channels.Redis.RedisAsyncResponseChannel", "reportPath": "AsyncResponse.Channels.Redis_RedisAsyncResponseChannel.html", "methodName": "SetException()", "methodShortName": "SetException()", "fileIndex": 0, "line": 1222,
     "metrics": [
       { "value": 24, "exceeded": false },
       { "value": 24, "exceeded": true },
@@ -1608,18 +1608,6 @@ var riskHotspots = [
       { "value": 22, "exceeded": true },
     ]},
   {
-    "assembly": "AsyncResponse.Channels.Redis", "class": "AsyncResponse.Channels.Redis.RedisAsyncResponseChannel", "reportPath": "AsyncResponse.Channels.Redis_RedisAsyncResponseChannel.html", "methodName": "SetRawResponseJsonCore()", "methodShortName": "SetRawResponseJsonCore()", "fileIndex": 0, "line": 1119,
-    "metrics": [
-      { "value": 22, "exceeded": false },
-      { "value": 22, "exceeded": true },
-    ]},
-  {
-    "assembly": "AsyncResponse.Channels.Redis", "class": "AsyncResponse.Channels.Redis.RedisAsyncResponseChannel", "reportPath": "AsyncResponse.Channels.Redis_RedisAsyncResponseChannel.html", "methodName": "SetResponseCore()", "methodShortName": "SetResponseCore()", "fileIndex": 0, "line": 1012,
-    "metrics": [
-      { "value": 22, "exceeded": false },
-      { "value": 22, "exceeded": true },
-    ]},
-  {
     "assembly": "AsyncResponse.Channels.SqlServer", "class": "AsyncResponse.Channels.DbAsyncResponseChannelBase", "reportPath": "AsyncResponse.Channels.SqlServer_DbAsyncResponseChannelBase.html", "methodName": "DispatchMessageToSubscribersAsync()", "methodShortName": "DispatchMessageToSubscribersAsync()", "fileIndex": 0, "line": 1928,
     "metrics": [
       { "value": 25, "exceeded": false },
@@ -1645,6 +1633,12 @@ var riskHotspots = [
     ]},
   {
     "assembly": "AsyncResponse.Core", "class": "AsyncResponse.InMemoryFlowStateStore", "reportPath": "AsyncResponse.Core_InMemoryFlowStateStore.html", "methodName": "TryChangeLeaseAsync(System.String,System.String,System.TimeSpan,System.Boolean,System.Threading.CancellationToken)", "methodShortName": "TryChangeLeaseAsync(...)", "fileIndex": 0, "line": 244,
+    "metrics": [
+      { "value": 22, "exceeded": false },
+      { "value": 22, "exceeded": true },
+    ]},
+  {
+    "assembly": "AsyncResponse.Core", "class": "AsyncResponse.ReflectionExtensions", "reportPath": "AsyncResponse.Core_ReflectionExtensions.html", "methodName": "CreateInvocationPlan(AsyncResponse.ReflectionExtensions/InvocationPlanKey)", "methodShortName": "CreateInvocationPlan(...)", "fileIndex": 0, "line": 372,
     "metrics": [
       { "value": 22, "exceeded": false },
       { "value": 22, "exceeded": true },
@@ -1717,6 +1711,18 @@ var riskHotspots = [
     ]},
   {
     "assembly": "AsyncResponse.Channels.PostgreSQL", "class": "AsyncResponse.Channels.DbAsyncResponseChannelBase", "reportPath": "AsyncResponse.Channels.PostgreSQL_DbAsyncResponseChannelBase.html", "methodName": "ProcessAsync()", "methodShortName": "ProcessAsync()", "fileIndex": 0, "line": 2703,
+    "metrics": [
+      { "value": 20, "exceeded": false },
+      { "value": 20, "exceeded": true },
+    ]},
+  {
+    "assembly": "AsyncResponse.Channels.Redis", "class": "AsyncResponse.Channels.Redis.RedisAsyncResponseChannel", "reportPath": "AsyncResponse.Channels.Redis_RedisAsyncResponseChannel.html", "methodName": "SetRawResponseJsonCore()", "methodShortName": "SetRawResponseJsonCore()", "fileIndex": 0, "line": 1122,
+    "metrics": [
+      { "value": 20, "exceeded": false },
+      { "value": 20, "exceeded": true },
+    ]},
+  {
+    "assembly": "AsyncResponse.Channels.Redis", "class": "AsyncResponse.Channels.Redis.RedisAsyncResponseChannel", "reportPath": "AsyncResponse.Channels.Redis_RedisAsyncResponseChannel.html", "methodName": "SetResponseCore()", "methodShortName": "SetResponseCore()", "fileIndex": 0, "line": 1012,
     "metrics": [
       { "value": 20, "exceeded": false },
       { "value": 20, "exceeded": true },
@@ -2244,13 +2250,7 @@ var riskHotspots = [
       { "value": 16, "exceeded": true },
     ]},
   {
-    "assembly": "AsyncResponse.Core", "class": "AsyncResponse.ReflectionExtensions", "reportPath": "AsyncResponse.Core_ReflectionExtensions.html", "methodName": "CreateInvocationPlan(AsyncResponse.ReflectionExtensions/InvocationPlanKey)", "methodShortName": "CreateInvocationPlan(...)", "fileIndex": 0, "line": 370,
-    "metrics": [
-      { "value": 16, "exceeded": false },
-      { "value": 16, "exceeded": true },
-    ]},
-  {
-    "assembly": "AsyncResponse.Core", "class": "AsyncResponse.ReflectionExtensions", "reportPath": "AsyncResponse.Core_ReflectionExtensions.html", "methodName": "Convert(System.Object)", "methodShortName": "Convert(...)", "fileIndex": 0, "line": 746,
+    "assembly": "AsyncResponse.Core", "class": "AsyncResponse.ReflectionExtensions", "reportPath": "AsyncResponse.Core_ReflectionExtensions.html", "methodName": "Convert(System.Object)", "methodShortName": "Convert(...)", "fileIndex": 0, "line": 755,
     "metrics": [
       { "value": 16, "exceeded": false },
       { "value": 16, "exceeded": true },
@@ -2340,7 +2340,13 @@ var riskHotspots = [
       { "value": 16, "exceeded": true },
     ]},
   {
-    "assembly": "AsyncResponse.DurableFlows.Oracle", "class": "AsyncResponse.DurableFlows.Oracle.OracleFlowStateStore", "reportPath": "AsyncResponse.DurableFlows.Oracle_OracleFlowStateStore.html", "methodName": "ResolveBaseTableAsync()", "methodShortName": "ResolveBaseTableAsync()", "fileIndex": 0, "line": 516,
+    "assembly": "AsyncResponse.DurableFlows.Oracle", "class": "AsyncResponse.DurableFlows.Oracle.OracleFlowStateStore", "reportPath": "AsyncResponse.DurableFlows.Oracle_OracleFlowStateStore.html", "methodName": "DiagnoseFlowIdCollation(System.String,System.String,System.String)", "methodShortName": "DiagnoseFlowIdCollation(...)", "fileIndex": 0, "line": 556,
+    "metrics": [
+      { "value": 16, "exceeded": false },
+      { "value": 16, "exceeded": true },
+    ]},
+  {
+    "assembly": "AsyncResponse.DurableFlows.Oracle", "class": "AsyncResponse.DurableFlows.Oracle.OracleFlowStateStore", "reportPath": "AsyncResponse.DurableFlows.Oracle_OracleFlowStateStore.html", "methodName": "ResolveBaseTableAsync()", "methodShortName": "ResolveBaseTableAsync()", "fileIndex": 0, "line": 592,
     "metrics": [
       { "value": 17, "exceeded": false },
       { "value": 16, "exceeded": true },
