@@ -13,6 +13,10 @@ work that has landed on `main` but not yet shipped. Security reporters credited 
 
 ### Changed
 
+- **Round-61 review (2026-09-30, re-review of every file changed since `1fc2b20`): converged — one
+  documentation gap.**
+  - *Docs.* `IDurableFlows.GetStateAsync` documents `FlowStateUnreadableException` for a ledger that
+    exists but cannot be read, like its `ResumeAsync` sibling.
 - **Round-60 review (2026-09-30, whole-repository review of `21da56a`, completing the first full pass
   over every source file): a blank-id exception publish can no longer throw from its own guard, and
   the package-dependency check reads every dependency.**

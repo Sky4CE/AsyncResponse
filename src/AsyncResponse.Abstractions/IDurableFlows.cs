@@ -97,5 +97,9 @@ public interface IDurableFlows
     Task ResumeAsync(string flowId, CancellationToken cancellationToken = default);
 
     /// <summary>Loads a snapshot of the flow run's state, or <c>null</c> when unknown or expired.</summary>
+    /// <exception cref="FlowStateUnreadableException">
+    /// A ledger exists for <paramref name="flowId"/> but cannot be read by this build (for example a
+    /// corrupt or newer-schema document): the run is still there, so do not treat it as gone.
+    /// </exception>
     Task<FlowState?> GetStateAsync(string flowId, CancellationToken cancellationToken = default);
 }
