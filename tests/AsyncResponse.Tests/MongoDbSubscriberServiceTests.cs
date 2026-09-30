@@ -193,6 +193,25 @@ public sealed class MongoDbSubscriberServiceTests
         await subscriber.StopAsync(CancellationToken.None);
     }
 
+    [Fact]
+    public async Task WorkerSubscriber_ALoggerThatThrowsOnTheStartedLine_StillClaims()
+    {
+        // Round 6 (R6-07): the per-attempt "subscriber started" line was unguarded before the first claim.
+        var fixture = new Fixture();
+        fixture.Logger.ThrowOnMessageContaining = "MongoDB subscriber started";
+
+        var subscriber = fixture.WorkerSubscriber();
+        await subscriber.StartAsync(CancellationToken.None);
+        try
+        {
+            await fixture.ClaimAttempted.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        }
+        finally
+        {
+            await subscriber.StopAsync(CancellationToken.None);
+        }
+    }
+
     /// <summary>
     /// Fixpoint r2 precommit J7: the wake loop's retry warning ran unguarded, so a logging provider
     /// that throws ended the loop at its first fault — the subscriber stayed poll-only for the rest

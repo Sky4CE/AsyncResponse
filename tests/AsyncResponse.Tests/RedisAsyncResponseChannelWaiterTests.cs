@@ -1307,6 +1307,70 @@ public class RedisAsyncResponseChannelWaiterTests
         Assert.Same(failure, ex);
     }
 
+    /// <summary>
+    /// Round 6 (R6-08): the publish-failure catches logged unguarded before <c>throw;</c>, so a
+    /// throwing Error provider replaced the real publish exception with its own.
+    /// </summary>
+    [Fact]
+    public async Task SetRawResponseJson_WhenPublishFailsAndTheLoggerThrows_StillThrowsTheRealFailure()
+    {
+        var failure = new InvalidOperationException("publish failed");
+        _subscriber
+            .Setup(s => s.PublishAsync(It.IsAny<RedisChannel>(), It.IsAny<RedisValue>(), It.IsAny<CommandFlags>()))
+            .ThrowsAsync(failure);
+        var channel = CreateChannel(new RedisAsyncResponseOptions(), new RecordingThrowingLogger<RedisAsyncResponseChannel> { ThrowOnMessageContaining = "Failed to publish" });
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            ((IRawAsyncResponsePublisher)channel).SetRawResponseJson("""{"Status":2}""", "corr-a"));
+
+        Assert.Same(failure, ex);
+    }
+
+    [Fact]
+    public async Task SetException_WhenPublishFailsAndTheLoggerThrows_StillThrowsTheRealFailure()
+    {
+        var failure = new InvalidOperationException("publish failed");
+        _subscriber
+            .Setup(s => s.PublishAsync(It.IsAny<RedisChannel>(), It.IsAny<RedisValue>(), It.IsAny<CommandFlags>()))
+            .ThrowsAsync(failure);
+        var channel = CreateChannel(new RedisAsyncResponseOptions(), new RecordingThrowingLogger<RedisAsyncResponseChannel> { ThrowOnMessageContaining = "Failed to publish" });
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            channel.SetException(new InvalidOperationException("remote failure"), "corr-a"));
+
+        Assert.Same(failure, ex);
+    }
+
+    [Fact]
+    public async Task SetResponse_WhenPublishFailsAndTheLoggerThrows_StillThrowsTheRealFailure()
+    {
+        var failure = new InvalidOperationException("publish failed");
+        _subscriber
+            .Setup(s => s.PublishAsync(It.IsAny<RedisChannel>(), It.IsAny<RedisValue>(), It.IsAny<CommandFlags>()))
+            .ThrowsAsync(failure);
+        var channel = CreateChannel(new RedisAsyncResponseOptions(), new RecordingThrowingLogger<RedisAsyncResponseChannel> { ThrowOnMessageContaining = "Failed to publish" });
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            channel.SetResponse(new OperationResult(), "corr-a"));
+
+        Assert.Same(failure, ex);
+    }
+
+    /// <summary>
+    /// Round 6 (R6-09): the "Waiting for response" Debug line was unguarded, so a throwing
+    /// provider made every CreateResponseWaiter throw the logger's exception.
+    /// </summary>
+    [Fact]
+    public async Task CreateResponseWaiter_WithAThrowingLoggerOnTheWaitingLine_StillCreatesTheWaiter()
+    {
+        var channel = CreateChannel(new RedisAsyncResponseOptions(), new RecordingThrowingLogger<RedisAsyncResponseChannel> { ThrowOnMessageContaining = "Waiting for response" });
+
+        var waiter = await channel.CreateResponseWaiter<OperationResult>("corr-waiting-log");
+
+        Assert.NotNull(waiter);
+        await waiter.DisposeAsync();
+    }
+
     [Fact]
     public async Task SetException_WhenPublishFails_Propagates()
     {

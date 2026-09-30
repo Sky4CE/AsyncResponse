@@ -32,16 +32,20 @@ public sealed class TransportSubscriberTeardownTests
             ConnectionString = "Server=tcp:127.0.0.1,1;Database=none;User ID=sa;Password=unused;Encrypt=False;Connect Timeout=1"
         });
         var store = new SqlServerTransportStore(options);
-        Prelatch(store);
-        // A throwing logger provider on the "subscriber started" line: the deterministic escape
-        // between the += and the claim loop. (The dispatcher is built by the hosted service now,
-        // outside the attempt, so its option validation no longer lands in here.)
+        // Deterministic claim failure through the store seam: the latched DDL retry-after window
+        // makes EnsureCreatedAsync (and so the claim) throw at once, with no network I/O.
+        store.BackOffDdlAfterLockTimeout(new InvalidOperationException("ddl lock wait"));
+        // A throwing logger provider on the "subscriber started" line, which the attempt must
+        // survive (it is guarded); the escape is then the refused claim,
+        // after the +=. (The dispatcher is built by the hosted service, outside the attempt.)
         var logger = new CollectingLogger { ThrowOnMessageContaining = "subscriber started" };
         var subscriber = new SqlServerWorkerSubscriber(
             options, store, Mock.Of<IAsyncResponseIngress>(), logger.For<SqlServerWorkerSubscriber>());
 
-        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => RunSubscriberAsync(subscriber));
-        Assert.Equal("logger exploded", ex.Message);
+        // Red-on-old: the throwing "subscriber started" line no longer ends the attempt (it is
+        // guarded); the attempt goes on to its claim, and THAT failure is what escapes.
+        var ex = await Assert.ThrowsAnyAsync<Exception>(() => RunSubscriberAsync(subscriber));
+        Assert.NotEqual("logger exploded", ex.Message);
 
         // The finally must have unsubscribed: the store is a singleton, so a leaked closure would
         // survive this run and every retry, invoked by every later publish.
@@ -63,16 +67,20 @@ public sealed class TransportSubscriberTeardownTests
             ShutdownTimeout = TimeSpan.FromSeconds(5)
         });
         var store = new PostgreSqlTransportStore(dataSource, options);
-        Prelatch(store);
-        // A throwing logger provider on the "subscriber started" line: the escape lands after the
-        // listen task was started and before the claim loop. (The dispatcher is built by the
-        // hosted service now, outside the attempt, so its option validation cannot serve here.)
+        // Deterministic claim failure through the store seam: the latched DDL retry-after window
+        // makes EnsureCreatedAsync (and so the claim) throw at once, with no network I/O.
+        store.BackOffDdlAfterLockTimeout(new InvalidOperationException("ddl lock wait"));
+        // A throwing logger provider on the "subscriber started" line, which the attempt must
+        // survive (it is guarded); the escape is then the refused claim,
+        // after the listen task was started. (The dispatcher is built outside the attempt.)
         var logger = new CollectingLogger { ThrowOnMessageContaining = "subscriber started" };
         var subscriber = new PostgreSqlWorkerSubscriber(
             options, store, Mock.Of<IAsyncResponseIngress>(), logger.For<PostgreSqlWorkerSubscriber>());
 
-        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => RunSubscriberAsync(subscriber));
-        Assert.Equal("logger exploded", ex.Message);
+        // Red-on-old: the throwing "subscriber started" line no longer ends the attempt (it is
+        // guarded); the attempt goes on to its claim, and THAT failure is what escapes.
+        var ex = await Assert.ThrowsAnyAsync<Exception>(() => RunSubscriberAsync(subscriber));
+        Assert.NotEqual("logger exploded", ex.Message);
 
         // The finally cancelled AND joined the listen task before the fault surfaced, so its
         // failure-retry loop (unreachable server, 25 ms backoff) must be silent from here on. A
@@ -80,6 +88,45 @@ public sealed class TransportSubscriberTeardownTests
         var settled = ListenFailureCount(logger);
         await Task.Delay(500);
         Assert.Equal(settled, ListenFailureCount(logger));
+    }
+
+    /// <summary>
+    /// Red-on-old (R6-05): the LISTEN helper's retry warning ran unguarded, so a throwing logging
+    /// provider ended the loop on its first transient failure — push wake gone for the attempt —
+    /// and its fault then escaped the attempt's teardown join.
+    /// </summary>
+    [Fact]
+    public async Task PostgreSqlListenLoop_UnderAThrowingLogger_KeepsRetrying()
+    {
+        await using var dataSource = NpgsqlDataSource.Create(
+            "Host=127.0.0.1;Port=1;Username=unused;Password=unused;Database=none;Timeout=1;Pooling=false");
+        var options = Options.Create(new PostgreSqlAsyncResponseTransportOptions
+        {
+            SubscriberRetryBaseDelay = TimeSpan.FromMilliseconds(1),
+            SubscriberRetryMaxDelay = TimeSpan.FromMilliseconds(1)
+        });
+        var store = new PostgreSqlTransportStore(dataSource, options);
+        Prelatch(store);
+        var logger = new CollectingLogger { ThrowOnMessageContaining = "LISTEN helper" };
+        var subscriber = new PostgreSqlWorkerSubscriber(
+            options, store, Mock.Of<IAsyncResponseIngress>(), logger.For<PostgreSqlWorkerSubscriber>());
+        var method = subscriber.GetType().BaseType!
+            .GetMethod("ListenLoopAsync", BindingFlags.Instance | BindingFlags.NonPublic)!;
+
+        using var cts = new CancellationTokenSource();
+        var loop = (Task)method.Invoke(subscriber, [cts.Token])!;
+        try
+        {
+            // A second failure logged proves the loop survived the first throwing log call.
+            await logger.WaitForAsync("PostgreSQL LISTEN helper", occurrences: 2);
+        }
+        finally
+        {
+            await cts.CancelAsync();
+        }
+
+        await loop.WaitAsync(TimeSpan.FromSeconds(10));
+        Assert.True(loop.IsCompletedSuccessfully);
     }
 
     [Fact]
@@ -100,6 +147,14 @@ public sealed class TransportSubscriberTeardownTests
         database
             .Setup(d => d.GetCollection<MongoTransportMessageDocument>(It.IsAny<string>(), It.IsAny<MongoCollectionSettings>()))
             .Returns(collection.Object);
+        // The claim fails: once the "subscriber started" line is guarded, this is the escape.
+        database.WithRawTransportMessages()
+            .Setup(c => c.FindOneAndUpdateAsync(
+                It.IsAny<FilterDefinition<BsonDocument>>(),
+                It.IsAny<UpdateDefinition<BsonDocument>>(),
+                It.IsAny<FindOneAndUpdateOptions<BsonDocument, BsonDocument>>(),
+                It.IsAny<CancellationToken>()))
+            .ThrowsAsync(new MongoClientException("claim refused"));
 
         var options = Options.Create(new MongoDbAsyncResponseTransportOptions
         {
@@ -108,14 +163,16 @@ public sealed class TransportSubscriberTeardownTests
             ShutdownTimeout = TimeSpan.FromSeconds(5)
         });
         using var store = new MongoDbTransportStore(database.Object, options);
-        // The escape here is a throwing logger provider — it blocks until the wake loop is
-        // genuinely parked on the change stream, then throws from the "subscriber started" log
-        // call, i.e. after the wake task started and before the claim loop's try.
+        // A throwing logger provider on the "subscriber started" line — it blocks until the wake
+        // loop is genuinely parked on the change stream, then throws; the attempt must survive it
+        // (it is guarded), so the escape is the failing claim, after the wake task started.
         var subscriber = new MongoDbWorkerSubscriber(
             options, store, Mock.Of<IAsyncResponseIngress>(), new ExplodingStartupLogger<MongoDbWorkerSubscriber>(watchStarted.Task));
 
-        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => RunSubscriberAsync(subscriber));
-        Assert.Equal("logger exploded", ex.Message);
+        // Red-on-old: the throwing "subscriber started" line no longer ends the attempt (it is
+        // guarded); the attempt goes on to its claim, and THAT failure is what escapes.
+        var ex = await Assert.ThrowsAnyAsync<Exception>(() => RunSubscriberAsync(subscriber));
+        Assert.NotEqual("logger exploded", ex.Message);
 
         // The finally must cancel the wake task's token; disposing the linked CTS alone does not,
         // leaving the loop parked on the cursor forever (one leaked cursor per retry).

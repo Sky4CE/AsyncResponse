@@ -237,8 +237,13 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
         AsyncResponseDiagnostics.SetPayloadType(activity, typeof(T));
         activity?.SetTag("asyncresponse.timeout_seconds", timeout.Value.TotalSeconds);
 
-        if (_logger.IsEnabled(LogLevel.Debug))
-            _logger.LogDebug("Waiting for response on correlationId {CorrelationId} with timeout {Timeout}.", correlationId, timeout.Value);
+        SafeLog.Try(
+            (_logger, correlationId, timeout: timeout.Value),
+            static s =>
+            {
+                if (s._logger.IsEnabled(LogLevel.Debug))
+                    s._logger.LogDebug("Waiting for response on correlationId {CorrelationId} with timeout {Timeout}.", s.correlationId, s.timeout);
+            });
 
         var subscription = new RedisSubscription<T>(
             this,
@@ -1093,11 +1098,13 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
             }
             else
             {
-                SafeLog.Try(() =>
-                {
-                    if (_logger.IsEnabled(LogLevel.Debug))
-                        _logger.LogDebug("Published response for correlationId {CorrelationId} on channel {Channel}. PayloadType: {PayloadType}. Subscribers: {SubscriberCount}.", correlationId, channel.ToString()!, typeof(T), numSubscribers);
-                });
+                SafeLog.Try(
+                    (_logger, correlationId, channel, numSubscribers),
+                    static s =>
+                    {
+                        if (s._logger.IsEnabled(LogLevel.Debug))
+                            s._logger.LogDebug("Published response for correlationId {CorrelationId} on channel {Channel}. PayloadType: {PayloadType}. Subscribers: {SubscriberCount}.", s.correlationId, s.channel.ToString()!, typeof(T), s.numSubscribers);
+                    });
             }
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
@@ -1109,7 +1116,9 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Failed to publish response for correlationId {CorrelationId} on channel {Channel}.", correlationId, channel.ToString()!);
+            SafeLog.Try(
+                (_logger, ex, correlationId, channel),
+                static s => s._logger.LogError(s.ex, "Failed to publish response for correlationId {CorrelationId} on channel {Channel}.", s.correlationId, s.channel.ToString()!));
             AsyncResponseDiagnostics.SetError(activity, ex);
             throw;
         }
@@ -1196,11 +1205,13 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
             }
             else
             {
-                SafeLog.Try(() =>
-                {
-                    if (_logger.IsEnabled(LogLevel.Debug))
-                        _logger.LogDebug("Published raw response for correlationId {CorrelationId} on channel {Channel}. Subscribers: {SubscriberCount}.", correlationId, channel.ToString()!, numSubscribers);
-                });
+                SafeLog.Try(
+                    (_logger, correlationId, channel, numSubscribers),
+                    static s =>
+                    {
+                        if (s._logger.IsEnabled(LogLevel.Debug))
+                            s._logger.LogDebug("Published raw response for correlationId {CorrelationId} on channel {Channel}. Subscribers: {SubscriberCount}.", s.correlationId, s.channel.ToString()!, s.numSubscribers);
+                    });
             }
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
@@ -1210,7 +1221,9 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Failed to publish raw response for correlationId {CorrelationId} on channel {Channel}.", correlationId, channel.ToString()!);
+            SafeLog.Try(
+                (_logger, ex, correlationId, channel),
+                static s => s._logger.LogError(s.ex, "Failed to publish raw response for correlationId {CorrelationId} on channel {Channel}.", s.correlationId, s.channel.ToString()!));
             AsyncResponseDiagnostics.SetError(activity, ex);
             throw;
         }
@@ -1304,11 +1317,13 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
             }
             else
             {
-                SafeLog.Try(() =>
-                {
-                    if (_logger.IsEnabled(LogLevel.Debug))
-                        _logger.LogDebug("Published exception response for correlationId {CorrelationId} on channel {Channel}. Subscribers: {SubscriberCount}.", correlationId, channel.ToString()!, numSubscribers);
-                });
+                SafeLog.Try(
+                    (_logger, correlationId, channel, numSubscribers),
+                    static s =>
+                    {
+                        if (s._logger.IsEnabled(LogLevel.Debug))
+                            s._logger.LogDebug("Published exception response for correlationId {CorrelationId} on channel {Channel}. Subscribers: {SubscriberCount}.", s.correlationId, s.channel.ToString()!, s.numSubscribers);
+                    });
             }
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
@@ -1318,7 +1333,9 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Failed to publish exception response for correlationId {CorrelationId} on channel {Channel}.", correlationId, channel.ToString()!);
+            SafeLog.Try(
+                (_logger, ex, correlationId, channel),
+                static s => s._logger.LogError(s.ex, "Failed to publish exception response for correlationId {CorrelationId} on channel {Channel}.", s.correlationId, s.channel.ToString()!));
             AsyncResponseDiagnostics.SetError(activity, ex);
             throw;
         }

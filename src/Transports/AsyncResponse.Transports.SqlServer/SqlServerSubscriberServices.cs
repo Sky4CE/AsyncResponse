@@ -109,11 +109,13 @@ internal abstract class SqlServerSubscriberService : BackgroundService
         {
             _store.MessagePublished += onPublished;
 
-            Logger.LogInformation(
+            // SafeLog: a throwing logging provider here failed every supervised attempt before its
+            // first claim, so the queue was never consumed.
+            SafeLog.Try(() => Logger.LogInformation(
                 "SQL Server subscriber started. Queue: {Queue}. Role: {Role}. AckMode: {AckMode}.",
                 Queue,
                 Role,
-                SubscriberOptions.AckMode);
+                SubscriberOptions.AckMode));
 
             while (!stoppingToken.IsCancellationRequested)
             {

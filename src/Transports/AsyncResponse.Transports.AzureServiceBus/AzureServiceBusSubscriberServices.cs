@@ -58,11 +58,12 @@ internal abstract class AzureServiceBusSubscriberService : BackgroundService
             // the renewal heartbeat covers only what a receive has returned — so behind a slow
             // handler the buffered locks lapse, those messages run a second time on a peer, fail
             // their late Complete here, and burn DeliveryCount toward MaxDeliveryAttempts.
-            Logger.LogWarning(
+            // SafeLog: a throwing logging provider must not fail host startup over an advisory.
+            SafeLog.Try(() => Logger.LogWarning(
                 "Azure Service Bus {Role} subscriber for {Queue} prefetches {PrefetchCount} message(s) in AckAfterHandlerCompletes mode: buffered messages are locked but never renewed while they wait behind the running handler, so a slow handler lets their locks expire and they run twice. Keep PrefetchCount × handler latency well under the queue's LockDuration, or set PrefetchCount = 0.",
                 SubscriberRole,
                 QueueName,
-                SubscriberOptions.PrefetchCount);
+                SubscriberOptions.PrefetchCount));
         }
         else if (SubscriberOptions is { AckMode: AzureServiceBusAckMode.AckAfterEnqueue, PrefetchCount: > 0 })
         {
@@ -71,11 +72,11 @@ internal abstract class AzureServiceBusSubscriberService : BackgroundService
             // PrefetchCount messages locked, never renewed, all that time. Saturated for longer
             // than the queue's LockDuration, the buffered locks lapse: those messages run on a
             // peer, then again here once handed out, and burn DeliveryCount.
-            Logger.LogWarning(
+            SafeLog.Try(() => Logger.LogWarning(
                 "Azure Service Bus {Role} subscriber for {Queue} prefetches {PrefetchCount} message(s) in AckAfterEnqueue mode: buffered messages are locked but never renewed while the receive loop waits for background capacity, so a background queue saturated for longer than the queue's LockDuration lets their locks expire and they run twice. Set PrefetchCount = 0, or keep it well under what the background workers drain within one LockDuration.",
                 SubscriberRole,
                 QueueName,
-                SubscriberOptions.PrefetchCount);
+                SubscriberOptions.PrefetchCount));
         }
 
         return base.StartAsync(cancellationToken);
@@ -118,11 +119,13 @@ internal abstract class AzureServiceBusSubscriberService : BackgroundService
     {
         await using var receiver = _client.CreateReceiver(queue, SubscriberOptions);
 
-        Logger.LogInformation(
+        // SafeLog: a throwing logging provider here failed every supervised attempt before its
+        // first receive, so the subscriber retried forever and consumed nothing.
+        SafeLog.Try(() => Logger.LogInformation(
             "Azure Service Bus subscriber started. Queue: {Queue}. Role: {Role}. AckMode: {AckMode}.",
             queue,
             SubscriberRole,
-            SubscriberOptions.AckMode);
+            SubscriberOptions.AckMode));
 
         // Service Bus locks — and, once a lock lapses, counts — every message a receive hands over,
         // not the one a handler starts. ACK-after-handler works a batch serially, so every worker
@@ -614,10 +617,11 @@ internal sealed class AzureServiceBusWorkerSubscriber : AzureServiceBusSubscribe
             // The transport cannot read the entity's LockDuration, so it advertises the 5-minute
             // Service Bus maximum as the in-flight ceiling the engine plans in-process waits
             // against — while Service Bus redelivers once the real lock lapses (60 s by default).
-            Logger.LogWarning(
+            // SafeLog: the loop is already started; a throwing provider must not fail host startup.
+            SafeLog.Try(() => Logger.LogWarning(
                 "Durable-flow jobs ride the Azure Service Bus worker queue {Queue}, and its subscriber disables lock renewal ({RenewalInterval} = null): the queue's own LockDuration (60 seconds unless configured otherwise) decides when Service Bus redelivers an in-flight job — a value the transport cannot read, so it advertises the 5-minute Service Bus maximum to the durable-flow engine instead. An awaited step or long step that outlives the real LockDuration then runs a second copy of the job on a peer, without a warning. Keep lock renewal on (the default), or keep every flow step well under the queue's LockDuration.",
                 QueueName,
-                $"{nameof(AzureServiceBusAsyncResponseOptions.WorkerSubscriber)}.{nameof(AzureServiceBusSubscriberOptions.LockRenewalInterval)}");
+                $"{nameof(AzureServiceBusAsyncResponseOptions.WorkerSubscriber)}.{nameof(AzureServiceBusSubscriberOptions.LockRenewalInterval)}"));
         }
 
         return start;

@@ -13,6 +13,22 @@ work that has landed on `main` but not yet shipped. Security reporters credited 
 
 ### Changed
 
+- **Round-57 review (2026-09-30, whole-repository review of `392f225`): a throwing logging provider
+  can no longer stop a subscriber, fail a delivered publish or replace a real publish failure,
+  closed as a class across every transport.**
+  - *Transports — Redis, PostgreSQL, MongoDB, SQL Server, Azure Service Bus.* The "subscriber
+    started" lines ran before the first claim, so a throwing provider failed every supervised
+    attempt and the queue was never consumed. The Azure Service Bus startup advisories failed host
+    startup; the PostgreSQL LISTEN-helper retry warning faulted its loop; the Redis claim-renewal
+    heartbeat, tombstone acknowledgement and consumer retirement faulted their attempt or the stop.
+    Every subscriber lifecycle log is now guarded (Kafka, RabbitMQ, NATS, SQS and Pub/Sub already
+    were, and the supervisor's retry logs run guarded).
+  - *Channels — Redis, NATS.* A Debug "published" line that throws no longer turns a delivered
+    publish into a failure; a throwing logger in a publish failure path no longer replaces the real
+    exception, nor fails `CreateResponseWaiter` on its "waiting" line. The Redis publish-path guards
+    no longer allocate a closure per publish.
+  - *Sample app.* `/lost-subscriber-flow` fails fast when its waiter faults and refuses a channel
+    that cannot drop a local subscription (NATS) before arming a waiter.
 - **Round-56 review (2026-09-30, whole-repository review of `0cfbe20`): a PostgreSQL DDL step that
   outruns its client timeout backs off like any other failed step, and more subscriber lifecycle
   logs and failure paths are guarded.**

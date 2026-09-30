@@ -169,22 +169,24 @@ internal abstract class RedisSubscriberService : BackgroundService
         {
             using var budget = new CancellationTokenSource(ConsumerRetirementBudget);
             var deleted = await _database.TryDeleteIdleConsumerAsync(Stream, ConsumerGroup, consumerName, budget.Token).ConfigureAwait(false);
-            Logger.LogDebug(
+            // SafeLog: this method never throws — a throwing logging provider faulted the
+            // hosted service's ExecuteTask at stop.
+            SafeLog.Try(() => Logger.LogDebug(
                 deleted
                     ? "Deleted Redis consumer {ConsumerName} from group {ConsumerGroup} on {Stream} at subscriber stop."
                     : "Kept Redis consumer {ConsumerName} in group {ConsumerGroup} on {Stream} at subscriber stop: it still owns pending entries, which a peer reclaims.",
                 consumerName.ToString(),
                 ConsumerGroup.ToString(),
-                Stream.ToString());
+                Stream.ToString()));
         }
         catch (Exception ex)
         {
-            Logger.LogDebug(
+            SafeLog.Try(() => Logger.LogDebug(
                 ex,
                 "Could not delete Redis consumer {ConsumerName} from group {ConsumerGroup} on {Stream} at subscriber stop; it stays in the group.",
                 consumerName.ToString(),
                 ConsumerGroup.ToString(),
-                Stream.ToString());
+                Stream.ToString()));
         }
     }
 
@@ -195,13 +197,15 @@ internal abstract class RedisSubscriberService : BackgroundService
 
         var consumerName = ResolveConsumerName(Options, SubscriberRole);
 
-        Logger.LogInformation(
+        // SafeLog (NATS/SQS parity): a throwing logging provider here failed every supervised
+        // attempt before its first read, so the subscriber retried forever and consumed nothing.
+        SafeLog.Try(() => Logger.LogInformation(
             "Redis subscriber started. Stream: {Stream}. Group: {ConsumerGroup}. Consumer: {ConsumerName}. Role: {Role}. AckMode: {AckMode}.",
             Stream.ToString(),
             ConsumerGroup.ToString(),
             consumerName.ToString(),
             SubscriberRole,
-            SubscriberOptions.AckMode);
+            SubscriberOptions.AckMode));
 
         long? lastPendingClaim = null;
         while (!stoppingToken.IsCancellationRequested)
@@ -450,18 +454,21 @@ internal abstract class RedisSubscriberService : BackgroundService
                     try
                     {
                         await _database.StreamAcknowledgeAsync(Stream, ConsumerGroup, tombstoneId, CancellationToken.None).ConfigureAwait(false);
-                        Logger.LogWarning(
+                        // SafeLog: a throwing logging provider escaped the claim (the catch below
+                        // logs too), so the live entries of this claim were never dispatched and
+                        // the attempt failed.
+                        SafeLog.Try((Logger, TombstoneId: tombstoneId, Stream), static s => s.Logger.LogWarning(
                             "Redis pending entry {MessageId} on {Stream} was trimmed while still pending; ACKed the tombstone so it drains.",
-                            tombstoneId.ToString(),
-                            Stream.ToString());
+                            s.TombstoneId.ToString(),
+                            s.Stream.ToString()));
                     }
                     catch (Exception ex)
                     {
-                        Logger.LogWarning(
-                            ex,
+                        SafeLog.Try((Logger, Error: ex, TombstoneId: tombstoneId, Stream), static s => s.Logger.LogWarning(
+                            s.Error,
                             "Failed to ACK trimmed pending entry {MessageId} on {Stream}; it is retried on the next pending-claim cycle.",
-                            tombstoneId.ToString(),
-                            Stream.ToString());
+                            s.TombstoneId.ToString(),
+                            s.Stream.ToString()));
                     }
                 }
             }
@@ -600,11 +607,13 @@ internal abstract class RedisSubscriberService : BackgroundService
                 }
                 catch (Exception ex) when (ex is not OperationCanceledException)
                 {
-                    Logger.LogWarning(
-                        ex,
+                    // SafeLog: a throwing logging provider ended this heartbeat mid-batch (a peer
+                    // then reclaimed the queued entries) and failed the attempt at its join.
+                    SafeLog.Try((Logger, Error: ex, Count: remaining.Length, Stream), static s => s.Logger.LogWarning(
+                        s.Error,
                         "Failed to refresh the pending idle time of {EntryCount} Redis entries on {Stream}; a sibling may reclaim them while they are still queued here (at-least-once preserved).",
-                        remaining.Length,
-                        Stream.ToString());
+                        s.Count,
+                        s.Stream.ToString()));
                 }
             }
         }

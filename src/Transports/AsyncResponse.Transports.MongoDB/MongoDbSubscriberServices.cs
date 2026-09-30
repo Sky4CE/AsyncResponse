@@ -103,11 +103,13 @@ internal abstract class MongoDbSubscriberService : BackgroundService
                 ? Task.Run(() => ListenLoopAsync(signalCts.Token), signalCts.Token)
                 : Task.CompletedTask;
 
-            Logger.LogInformation(
-                "MongoDB subscriber started. Queue: {Queue}. Role: {Role}. AckMode: {AckMode}.",
-                Queue,
-                Role,
-                SubscriberOptions.AckMode);
+            SafeLog.Try(
+                (Logger, Queue, Role, SubscriberOptions.AckMode),
+                static s => s.Logger.LogInformation(
+                    "MongoDB subscriber started. Queue: {Queue}. Role: {Role}. AckMode: {AckMode}.",
+                    s.Queue,
+                    s.Role,
+                    s.AckMode));
 
             while (!stoppingToken.IsCancellationRequested)
             {

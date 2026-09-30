@@ -101,11 +101,13 @@ internal abstract class PostgreSqlSubscriberService : BackgroundService
         {
             listenTask = Task.Run(() => ListenLoopAsync(signalCts.Token), signalCts.Token);
 
-            Logger.LogInformation(
+            // SafeLog: a throwing logging provider here failed every supervised attempt before its
+            // first claim, so the queue was never consumed.
+            SafeLog.Try(() => Logger.LogInformation(
                 "PostgreSQL subscriber started. Queue: {Queue}. Role: {Role}. AckMode: {AckMode}.",
                 Queue,
                 Role,
-                SubscriberOptions.AckMode);
+                SubscriberOptions.AckMode));
 
             while (!stoppingToken.IsCancellationRequested)
             {
@@ -184,7 +186,9 @@ internal abstract class PostgreSqlSubscriberService : BackgroundService
             {
                 failures++;
                 var delay = AsyncResponseRetry.Backoff(failures, Options.SubscriberRetryBaseDelay, Options.SubscriberRetryMaxDelay);
-                Logger.LogWarning(ex, "PostgreSQL LISTEN helper for queue {Queue} failed; retrying in {RetryDelay} (polling continues meanwhile).", Queue, delay);
+                // SafeLog (MongoDB parity): a throwing logging provider ended this loop for good —
+                // push wake gone for the attempt — and its fault then escaped the attempt's teardown.
+                SafeLog.Try(() => Logger.LogWarning(ex, "PostgreSQL LISTEN helper for queue {Queue} failed; retrying in {RetryDelay} (polling continues meanwhile).", Queue, delay));
                 try
                 {
                     await Task.Delay(delay, cancellationToken).ConfigureAwait(false);

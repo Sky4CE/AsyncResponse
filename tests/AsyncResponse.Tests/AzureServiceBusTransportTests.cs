@@ -1538,6 +1538,51 @@ public sealed class AzureServiceBusTransportTests
         Assert.Contains(logger.Messages, message => message.Contains("prefetches 50 message(s)", StringComparison.Ordinal));
     }
 
+    /// <summary>
+    /// Red-on-old: the startup advisories and the per-attempt "subscriber started" line ran
+    /// unguarded, so a throwing logging provider failed host startup (the advisories) or every
+    /// supervised attempt before its first receive (the started line), and nothing was consumed.
+    /// </summary>
+    [Theory]
+    [InlineData("prefetches")]
+    [InlineData("advertises the 5-minute Service Bus maximum")]
+    [InlineData("Azure Service Bus subscriber started")]
+    public async Task WorkerSubscriber_UnderAThrowingLogger_StillStartsAndConsumes(string throwingLine)
+    {
+        var logger = new CollectingLogger { ThrowOnMessageContaining = throwingLine };
+        var options = new AzureServiceBusAsyncResponseOptions
+        {
+            WorkerQueue = "workers",
+            ResponseQueue = "responses",
+            ReceiveWaitTime = TimeSpan.FromMilliseconds(10)
+        };
+        options.WorkerSubscriber.PrefetchCount = 5;
+        options.WorkerSubscriber.LockRenewalInterval = null;
+        var receiver = new FakeReceiver();
+        var ingress = new Mock<IAsyncResponseIngress>();
+        ingress.Setup(i => i.HandleWorkerMessageAsync("worker-json")).Returns(Task.CompletedTask);
+        var calls = new SettlementCalls();
+        var subscriber = new AzureServiceBusWorkerSubscriber(
+            Options.Create(options),
+            new FakeServiceBusClient { Receiver = receiver },
+            ingress.Object,
+            logger.For<AzureServiceBusWorkerSubscriber>());
+
+        await subscriber.StartAsync(CancellationToken.None);
+        try
+        {
+            receiver.Enqueue(Delivery(calls, queue: "workers", body: "worker-json"));
+            await calls.Completed.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        }
+        finally
+        {
+            await subscriber.StopAsync(CancellationToken.None);
+        }
+
+        Assert.Equal(1, calls.Complete);
+        Assert.Contains(logger.Messages, message => message.Contains(throwingLine, StringComparison.Ordinal));
+    }
+
     [Theory]
     [InlineData(true)]
     [InlineData(false)]

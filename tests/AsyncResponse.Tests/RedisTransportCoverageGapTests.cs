@@ -405,6 +405,133 @@ public sealed class RedisTransportCoverageGapTests
         Assert.Contains("p1", ingress.Handled);
     }
 
+    // ------------------------------------------- subscriber under a throwing logging provider
+
+    /// <summary>
+    /// Red-on-old (R6-04): the "subscriber started" line ran unguarded before the first read, so a
+    /// throwing logging provider failed every supervised attempt and nothing was ever consumed.
+    /// </summary>
+    [Fact]
+    public async Task Subscriber_WithAThrowingStartedLog_StillConsumes()
+    {
+        var database = new RedisTransportTests.FakeRedisStreamDatabase();
+        database.ReadBatches.Enqueue([RedisTransportTests.Entry("1-0", ("payload", "p1"), ("correlationId", "c1"))]);
+        var ingress = new BlockingIngress();
+        var logger = new CollectingLogger { ThrowOnMessageContaining = "Redis subscriber started" };
+        var subscriber = WorkerSubscriber(database, ingress, _ => { }, logger.For<RedisWorkerSubscriber>());
+
+        await subscriber.StartAsync(CancellationToken.None);
+        try
+        {
+            await WaitUntilAsync(() => database.Acks.Any(ack => ack.MessageId == "1-0"));
+        }
+        finally
+        {
+            await subscriber.StopAsync(CancellationToken.None).WaitAsync(HangGuard);
+        }
+
+        Assert.Contains("p1", ingress.Handled);
+        Assert.DoesNotContain(logger.Messages, message => message.Contains("Redis subscriber failed", StringComparison.Ordinal));
+    }
+
+    /// <summary>
+    /// Red-on-old (R6-11): the heartbeat's failure warning ran unguarded, so a throwing provider
+    /// ended the heartbeat and its join failed the attempt after the batch had been handled.
+    /// The second read's entry is handled only after the first batch's teardown, so by then any
+    /// attempt failure has been logged.
+    /// </summary>
+    [Fact]
+    public async Task Subscriber_HeartbeatClaimFailure_UnderAThrowingLogger_DoesNotFailTheAttempt()
+    {
+        var database = new RedisTransportTests.FakeRedisStreamDatabase
+        {
+            ClaimIdsOnlyException = new InvalidOperationException("XCLAIM JUSTID refused")
+        };
+        database.ReadBatches.Enqueue([RedisTransportTests.Entry("1-0", ("payload", "p1"), ("correlationId", "c1"))]);
+        database.ReadBatches.Enqueue([RedisTransportTests.Entry("2-0", ("payload", "p2"), ("correlationId", "c2"))]);
+        var ingress = new BlockingIngress("p1");
+        var logger = new CollectingLogger { ThrowOnMessageContaining = "Failed to refresh the pending idle time" };
+        var subscriber = WorkerSubscriber(
+            database,
+            ingress,
+            options =>
+            {
+                // Heartbeat cadence = PendingMessageMinIdleTime / 3 = 10 ms.
+                options.PendingMessageMinIdleTime = TimeSpan.FromMilliseconds(30);
+                options.PendingClaimInterval = TimeSpan.FromSeconds(30);
+            },
+            logger.For<RedisWorkerSubscriber>());
+
+        await subscriber.StartAsync(CancellationToken.None);
+        try
+        {
+            await ingress.Started("p1").WaitAsync(HangGuard);
+            await logger.WaitForAsync("Failed to refresh the pending idle time");
+            ingress.Release("p1");
+            await WaitUntilAsync(() => database.Acks.Any(ack => ack.MessageId == "2-0"));
+        }
+        finally
+        {
+            ingress.Release("p1");
+            await subscriber.StopAsync(CancellationToken.None).WaitAsync(HangGuard);
+        }
+
+        Assert.Contains(database.Acks, ack => ack.MessageId == "1-0");
+        Assert.DoesNotContain(logger.Messages, message => message.Contains("Redis subscriber failed", StringComparison.Ordinal));
+    }
+
+    /// <summary>
+    /// Red-on-old: the tombstone warnings ran unguarded (the success line's throw landed in the
+    /// catch, whose own line threw again), so the claim escaped before its live entry was
+    /// dispatched and the attempt failed.
+    /// </summary>
+    [Fact]
+    public async Task Subscriber_TombstoneAck_UnderAThrowingLogger_StillDispatchesTheLiveEntry()
+    {
+        var database = new ScriptedStreamDatabase();
+        database.AddPending("1-0", StreamEntry.Null);
+        database.AddPending("2-0", RedisTransportTests.Entry("2-0", ("payload", "p2"), ("correlationId", "c2")));
+        var ingress = new BlockingIngress();
+        var logger = new CollectingLogger { ThrowOnMessageContaining = "trimmed" };
+        var subscriber = WorkerSubscriber(database, ingress, options => options.UseAckAfterEnqueue(1, 8, TimeSpan.FromSeconds(5)), logger.For<RedisWorkerSubscriber>());
+
+        await subscriber.StartAsync(CancellationToken.None);
+        try
+        {
+            await WaitUntilAsync(() => ingress.Handled.Contains("p2"));
+        }
+        finally
+        {
+            await subscriber.StopAsync(CancellationToken.None).WaitAsync(HangGuard);
+        }
+
+        Assert.Contains("1-0", database.Acks);
+        Assert.Contains("2-0", database.Acks);
+        Assert.DoesNotContain(logger.Messages, message => message.Contains("Redis subscriber failed", StringComparison.Ordinal));
+    }
+
+    /// <summary>
+    /// Red-on-old: consumer retirement "never throws", yet its debug lines ran unguarded, so a
+    /// throwing provider faulted the hosted service's execute task at stop.
+    /// </summary>
+    [Fact]
+    public async Task Subscriber_RetiringItsConsumer_UnderAThrowingLogger_StopsCleanly()
+    {
+        var database = new ScriptedStreamDatabase
+        {
+            DeleteConsumerException = new InvalidOperationException("DELCONSUMER refused")
+        };
+        var logger = new CollectingLogger { ThrowOnMessageContaining = "Redis consumer" };
+        var subscriber = WorkerSubscriber(database, new BlockingIngress(), _ => { }, logger.For<RedisWorkerSubscriber>());
+
+        await subscriber.StartAsync(CancellationToken.None);
+        await WaitUntilAsync(() => database.ReadCount >= 1);
+        await subscriber.StopAsync(CancellationToken.None).WaitAsync(HangGuard);
+
+        Assert.Equal(1, database.DeleteConsumerCalls);
+        Assert.True(subscriber.ExecuteTask!.IsCompletedSuccessfully);
+    }
+
     /// <summary>
     /// A response-ingress subscriber that does not override the inbound budget check treats every
     /// payload as within budget, so the correlation id is still extracted for it.

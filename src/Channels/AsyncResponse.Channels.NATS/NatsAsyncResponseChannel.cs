@@ -155,8 +155,11 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
         AsyncResponseDiagnostics.SetPayloadType(activity, typeof(T));
         activity?.SetTag("asyncresponse.timeout_seconds", timeout.Value.TotalSeconds);
 
-        if (_logger.IsEnabled(LogLevel.Debug))
-            _logger.LogDebug("Waiting for response on correlationId {CorrelationId} with timeout {Timeout}.", correlationId, timeout.Value);
+        SafeLog.Try((_logger, correlationId, Timeout: timeout.Value), static s =>
+        {
+            if (s._logger.IsEnabled(LogLevel.Debug))
+                s._logger.LogDebug("Waiting for response on correlationId {CorrelationId} with timeout {Timeout}.", s.correlationId, s.Timeout);
+        });
 
         var tcs = new TaskCompletionSource<T>(TaskCreationOptions.RunContinuationsAsynchronously);
         var registrationId = Guid.NewGuid();
@@ -1103,9 +1106,14 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
                 AsyncResponseDiagnostics.RecordLostSubscriber("response", dispatchResult.Action, dispatchResult.CallbackInvoked, dispatchResult.RouteMixed);
                 activity?.SetTag("asyncresponse.recovery.callback_invoked", dispatchResult.CallbackInvoked);
             }
-            else if (_logger.IsEnabled(LogLevel.Debug))
+            else
             {
-                _logger.LogDebug("Published response for correlationId {CorrelationId} on subject {Subject}. PayloadType: {PayloadType}. Outcome: {Outcome}.", correlationId, subject, typeof(T), outcome);
+                // Best-effort: a throwing logging provider must not fail a publish that already delivered.
+                SafeLog.Try((_logger, correlationId, subject, PayloadType: typeof(T), outcome), static s =>
+                {
+                    if (s._logger.IsEnabled(LogLevel.Debug))
+                        s._logger.LogDebug("Published response for correlationId {CorrelationId} on subject {Subject}. PayloadType: {PayloadType}. Outcome: {Outcome}.", s.correlationId, s.subject, s.PayloadType, s.outcome);
+                });
             }
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
@@ -1115,7 +1123,7 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Failed to publish response for correlationId {CorrelationId} on subject {Subject}.", correlationId, subject);
+            SafeLog.Try((_logger, ex, correlationId, subject), static s => s._logger.LogError(s.ex, "Failed to publish response for correlationId {CorrelationId} on subject {Subject}.", s.correlationId, s.subject));
             AsyncResponseDiagnostics.SetError(activity, ex);
             throw;
         }
@@ -1199,9 +1207,13 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
                 AsyncResponseDiagnostics.RecordLostSubscriber("response", dispatchResult.Action, dispatchResult.CallbackInvoked, dispatchResult.RouteMixed);
                 activity?.SetTag("asyncresponse.recovery.callback_invoked", dispatchResult.CallbackInvoked);
             }
-            else if (_logger.IsEnabled(LogLevel.Debug))
+            else
             {
-                _logger.LogDebug("Published raw response for correlationId {CorrelationId} on subject {Subject}. Outcome: {Outcome}.", correlationId, subject, outcome);
+                SafeLog.Try((_logger, correlationId, subject, outcome), static s =>
+                {
+                    if (s._logger.IsEnabled(LogLevel.Debug))
+                        s._logger.LogDebug("Published raw response for correlationId {CorrelationId} on subject {Subject}. Outcome: {Outcome}.", s.correlationId, s.subject, s.outcome);
+                });
             }
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
@@ -1211,7 +1223,7 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Failed to publish raw response for correlationId {CorrelationId} on subject {Subject}.", correlationId, subject);
+            SafeLog.Try((_logger, ex, correlationId, subject), static s => s._logger.LogError(s.ex, "Failed to publish raw response for correlationId {CorrelationId} on subject {Subject}.", s.correlationId, s.subject));
             AsyncResponseDiagnostics.SetError(activity, ex);
             throw;
         }
@@ -1304,9 +1316,13 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
                 activity?.SetTag("asyncresponse.recovery.callback_invoked", dispatchResult.CallbackInvoked);
                 AsyncResponseDiagnostics.RecordLostSubscriber("exception", action: RecoveryAction.Fail, dispatchResult.CallbackInvoked);
             }
-            else if (_logger.IsEnabled(LogLevel.Debug))
+            else
             {
-                _logger.LogDebug("Published exception response for correlationId {CorrelationId} on subject {Subject}. Outcome: {Outcome}.", correlationId, subject, outcome);
+                SafeLog.Try((_logger, correlationId, subject, outcome), static s =>
+                {
+                    if (s._logger.IsEnabled(LogLevel.Debug))
+                        s._logger.LogDebug("Published exception response for correlationId {CorrelationId} on subject {Subject}. Outcome: {Outcome}.", s.correlationId, s.subject, s.outcome);
+                });
             }
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
@@ -1316,7 +1332,7 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Failed to publish exception response for correlationId {CorrelationId} on subject {Subject}.", correlationId, subject);
+            SafeLog.Try((_logger, ex, correlationId, subject), static s => s._logger.LogError(s.ex, "Failed to publish exception response for correlationId {CorrelationId} on subject {Subject}.", s.correlationId, s.subject));
             AsyncResponseDiagnostics.SetError(activity, ex);
             throw;
         }

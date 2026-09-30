@@ -1198,6 +1198,80 @@ public class NatsAsyncResponseChannelTests
     }
 
     [Fact]
+    public async Task Publish_DebugLogBehindAThrowingLogger_StillCompletesAfterTheDelivery()
+    {
+        // The success-path Debug line ran unguarded inside the publish try: a throwing provider turned
+        // a delivered response into a failed publish (Error log + rethrow), so the worker job that had
+        // already delivered was recorded failed and redelivered.
+        var logger = new RecordingThrowingLogger<NatsAsyncResponseChannel> { ThrowOnMessageContaining = "Published " };
+        var channel = CreateChannel(logger: logger);
+
+        await channel.SetResponse(new OperationResult { Status = OperationStatus.Completed }, "corr-log-typed");
+        await ((IRawAsyncResponsePublisher)channel).SetRawResponseJson("{}", "corr-log-raw");
+        await channel.SetException(new InvalidOperationException("boom"), "corr-log-exception");
+
+        Assert.False(logger.HasEntry(LogLevel.Error, "Failed to publish"));
+    }
+
+    /// <summary>
+    /// Round 6 (K1, R6-08 sibling): the publish-failure catches logged unguarded before <c>throw;</c>, so a
+    /// throwing Error provider replaced the real publish exception with its own.
+    /// </summary>
+    [Fact]
+    public async Task SetResponse_WhenPublishFailsAndTheLoggerThrows_StillThrowsTheRealFailure()
+    {
+        var failure = new InvalidOperationException("request failed");
+        _client.RequestException = failure;
+        var channel = CreateChannel(logger: new RecordingThrowingLogger<NatsAsyncResponseChannel> { ThrowOnMessageContaining = "Failed to publish" });
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            channel.SetResponse(new OperationResult { Status = OperationStatus.Completed }, "corr-a"));
+
+        Assert.Same(failure, ex);
+    }
+
+    [Fact]
+    public async Task SetRawResponseJson_WhenPublishFailsAndTheLoggerThrows_StillThrowsTheRealFailure()
+    {
+        var failure = new InvalidOperationException("request failed");
+        _client.RequestException = failure;
+        var channel = CreateChannel(logger: new RecordingThrowingLogger<NatsAsyncResponseChannel> { ThrowOnMessageContaining = "Failed to publish" });
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            ((IRawAsyncResponsePublisher)channel).SetRawResponseJson("""{"Status":2}""", "corr-a"));
+
+        Assert.Same(failure, ex);
+    }
+
+    [Fact]
+    public async Task SetException_WhenPublishFailsAndTheLoggerThrows_StillThrowsTheRealFailure()
+    {
+        var failure = new InvalidOperationException("request failed");
+        _client.RequestException = failure;
+        var channel = CreateChannel(logger: new RecordingThrowingLogger<NatsAsyncResponseChannel> { ThrowOnMessageContaining = "Failed to publish" });
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            channel.SetException(new InvalidOperationException("boom"), "corr-a"));
+
+        Assert.Same(failure, ex);
+    }
+
+    /// <summary>
+    /// Round 6 (K2, R6-09 sibling): the "Waiting for response" Debug line was unguarded, so a throwing
+    /// provider failed every CreateResponseWaiter (and leaked the started activity).
+    /// </summary>
+    [Fact]
+    public async Task CreateResponseWaiter_WhenTheWaitingDebugLogThrows_StillReturnsTheWaiter()
+    {
+        var logger = new RecordingThrowingLogger<NatsAsyncResponseChannel> { ThrowOnMessageContaining = "Waiting for response" };
+        var channel = CreateChannel(logger: logger);
+
+        await using var waiter = await channel.CreateResponseWaiter<OperationResult>("corr-wait-log", timeout: TimeSpan.FromSeconds(5));
+
+        Assert.NotNull(waiter);
+    }
+
+    [Fact]
     public async Task SetException_NoResponders_ConsultsRecoveryStore()
     {
         _client.NextOutcome = NatsDeliveryOutcome.NoResponders;

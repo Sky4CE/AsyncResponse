@@ -1977,7 +1977,12 @@ app.MapPost("/lost-subscriber-flow", async (
 {
     var asyncResponse = services.GetService<IRecoverableAsyncResponseBuilder>();
     if (asyncResponse is null)
-        return Results.Conflict("Composed lost-subscriber recovery requires a durable channel such as Redis, NATS, or PostgreSQL.");
+        return Results.Conflict("Composed lost-subscriber recovery requires a durable channel such as Redis, PostgreSQL, SQL Server, or MongoDB.");
+
+    // Refuse before arming: an unsupported channel (e.g. NATS) would otherwise be left with a live
+    // waiter and a persisted recovery registration while this route answers 409.
+    if (!SupportsDropLocalSubscription(services))
+        return Results.Conflict("Composed lost-subscriber recovery currently supports Redis, PostgreSQL, SQL Server or MongoDB channels.");
 
     SampleTraceContext.Set(trace ?? $"trace-{Guid.NewGuid().ToString("N")[..8]}");
     SampleTenantContext.Set("tenant-acme");
@@ -1997,12 +2002,18 @@ app.MapPost("/lost-subscriber-flow", async (
             return Task.CompletedTask;
         });
 
+    // Fail fast: a waiter that faults before its trigger would otherwise hide its real exception
+    // behind a 10 s TimeoutException.
+    _ = waitTask.ContinueWith(
+        t => armed.TrySetException(t.Exception?.GetBaseException() ?? new InvalidOperationException("waiter faulted")),
+        default, TaskContinuationOptions.OnlyOnFaulted, TaskScheduler.Default);
+
     var correlationId = await armed.Task.WaitAsync(TimeSpan.FromSeconds(10));
     _ = waitTask.ContinueWith(t => recorder.RecordWaiterResult(correlationId, t), TaskScheduler.Default);
 
     var crashed = await DropLocalSubscriptionAsync(services, correlationId, cancellationToken).ConfigureAwait(false);
     if (!crashed)
-        return Results.Conflict("Composed lost-subscriber recovery currently supports Redis or PostgreSQL channels.");
+        return Results.Conflict("Composed lost-subscriber recovery currently supports Redis, PostgreSQL, SQL Server or MongoDB channels.");
 
     var normalized = (outcome ?? "Completed").Trim().ToLowerInvariant();
     if (normalized is "exception" or "failtechnical" or "technical")
@@ -2037,6 +2048,12 @@ app.MapPost("/lost-subscriber-flow", async (
 })
 .WithTags("Recovery");
 }
+
+static bool SupportsDropLocalSubscription(IServiceProvider services)
+    => services.GetService<RedisChannelSelected>() is not null
+        || services.GetService<PostgreSqlAsyncResponseChannel>() is not null
+        || services.GetService<SqlServerAsyncResponseChannel>() is not null
+        || services.GetService<MongoDbAsyncResponseChannel>() is not null;
 
 static async Task<bool> DropLocalSubscriptionAsync(
     IServiceProvider services,
