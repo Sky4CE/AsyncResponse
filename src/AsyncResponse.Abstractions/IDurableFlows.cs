@@ -90,7 +90,9 @@ public interface IDurableFlows
     /// that are suspended (set a suspended run back to running first).
     /// </summary>
     /// <exception cref="InvalidOperationException">
-    /// No ledger exists for <paramref name="flowId"/> (unknown, expired, or unreadable id).
+    /// No ledger exists for <paramref name="flowId"/> (unknown or expired id). A ledger that exists but
+    /// cannot be read throws <see cref="FlowStateUnreadableException"/> (also an
+    /// <see cref="InvalidOperationException"/>): the run is still there, so do not treat it as gone.
     /// </exception>
     Task ResumeAsync(string flowId, CancellationToken cancellationToken = default);
 

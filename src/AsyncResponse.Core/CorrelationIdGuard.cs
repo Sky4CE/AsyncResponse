@@ -93,23 +93,30 @@ internal static class CorrelationIdGuard
         if (reason.ContractViolation && !dropContractViolations)
             throw new ArgumentException(reason.Description, nameof(correlationId));
 
-        if (reason.ContractViolation)
+        // A throwing Message getter or logging provider must not turn the documented
+        // "log and skip" into an exception on the settlement path.
+        SafeLog.Try((logger, what, reason, dropped), static state =>
         {
-            // Error, not warning: unlike a missing id this one looks routable, so left alone it
-            // would fail much later — at the storage write, or worse, at somebody else's waiter.
-            if (dropped is null)
-                logger.LogError("Cannot publish {What}; the correlation id is outside the portable contract. {Rejection}", what, reason.Description);
+            var (log, target, why, error) = state;
+            var message = error is null ? null : AsyncResponseDiagnostics.SafeDescription(error, error.GetType().Name);
+            if (why.ContractViolation)
+            {
+                // Error, not warning: unlike a missing id this one looks routable, so left alone it
+                // would fail much later — at the storage write, or worse, at somebody else's waiter.
+                if (error is null)
+                    log.LogError("Cannot publish {What}; the correlation id is outside the portable contract. {Rejection}", target, why.Description);
+                else
+                    log.LogError("Cannot publish {What}; the correlation id is outside the portable contract. {Rejection} Exception: {ExceptionMessage}", target, why.Description, message);
+            }
+            else if (error is null)
+            {
+                log.LogWarning("CorrelationId is null; cannot publish {What}.", target);
+            }
             else
-                logger.LogError("Cannot publish {What}; the correlation id is outside the portable contract. {Rejection} Exception: {ExceptionMessage}", what, reason.Description, dropped.Message);
-        }
-        else if (dropped is null)
-        {
-            logger.LogWarning("CorrelationId is null; cannot publish {What}.", what);
-        }
-        else
-        {
-            logger.LogWarning("CorrelationId is null; cannot publish {What}. Exception: {ExceptionMessage}", what, dropped.Message);
-        }
+            {
+                log.LogWarning("CorrelationId is null; cannot publish {What}. Exception: {ExceptionMessage}", target, message);
+            }
+        });
 
         AsyncResponseDiagnostics.SetError(activity, reason.ErrorType, $"Cannot publish {what}: {reason.Description}.");
         return true;

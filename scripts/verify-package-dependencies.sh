@@ -61,7 +61,7 @@ for package in "${packages[@]}"; do
             *) echo "FAIL $name: depends on $id with version $version (expected an exact range like [$version])" >&2
                failures=$((failures + 1)) ;;
         esac
-    done < <(printf '%s' "$nuspec" | tr '>' '>\n' | grep '<dependency ' || true)
+    done < <(printf '%s' "$nuspec" | sed 's/>/>\'$'\n''/g' | grep '<dependency ' || true)
 done
 
 if [ "$failures" -gt 0 ]; then

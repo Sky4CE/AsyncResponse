@@ -157,6 +157,32 @@ public sealed class CoreTailCoverageGapTests
             });
     }
 
+    [Fact]
+    public void IsUnpublishable_ThrowingExceptionMessage_StillLogsAndDrops()
+    {
+        var logger = new CollectingLogger();
+
+        Assert.True(CorrelationIdGuard.IsUnpublishable(null, logger, activity: null, "an exception", dropped: new ThrowingMessageException()));
+        Assert.True(CorrelationIdGuard.IsUnpublishable(" padded", logger, activity: null, "an exception", dropped: new ThrowingMessageException(), dropContractViolations: true));
+        Assert.Equal(2, logger.Messages.Count);
+    }
+
+    [Fact]
+    public void IsUnpublishable_ThrowingLogger_StillDrops()
+    {
+        var logger = new Mock<ILogger>();
+        logger.Setup(l => l.IsEnabled(It.IsAny<LogLevel>())).Returns(true);
+        logger.Setup(l => l.Log(It.IsAny<LogLevel>(), It.IsAny<EventId>(), It.IsAny<It.IsAnyType>(), It.IsAny<Exception?>(), It.IsAny<Func<It.IsAnyType, Exception?, string>>()))
+            .Throws(new InvalidOperationException("sink ended"));
+
+        Assert.True(CorrelationIdGuard.IsUnpublishable("  ", logger.Object, activity: null, "a response"));
+    }
+
+    private sealed class ThrowingMessageException : Exception
+    {
+        public override string Message => throw new InvalidOperationException("getter");
+    }
+
     public interface IPlaceholderTarget
     {
         Task Handle(Exception error);

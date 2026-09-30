@@ -13,6 +13,17 @@ work that has landed on `main` but not yet shipped. Security reporters credited 
 
 ### Changed
 
+- **Round-60 review (2026-09-30, whole-repository review of `21da56a`, completing the first full pass
+  over every source file): a blank-id exception publish can no longer throw from its own guard, and
+  the package-dependency check reads every dependency.**
+  - *Core.* The guard that drops an exception publish with a blank correlation id no longer throws
+    when the exception's message getter or the logger throws.
+  - *Docs.* `IDurableFlows.ResumeAsync` names `FlowStateUnreadableException` for an unreadable
+    ledger instead of folding it into "no ledger".
+  - *Build scripts.* `verify-package-dependencies.sh` split its dependency list on a `tr` that
+    never inserted the newline, so only the first dependency of a line was checked.
+  - *Benchmarks.* The recovery health-check benchmark evaluates its snapshots at the instant they
+    were stamped instead of the wall clock, which sent later iterations down the early-return path.
 - **Round-59 review (2026-09-30, whole-repository review of `7449425`): startup refuses two
   configurations that silently misbehaved, the Azure Service Bus renewal heartbeat runs on the
   injected clock, and a pull request's CI can no longer cancel main's coverage publish.**

@@ -426,7 +426,7 @@ public static class AsyncResponseDiagnostics
     /// throws: every provider calls <see cref="SetError(Activity?, Exception)"/> from a
     /// catch-and-rethrow, where a throwing getter would replace the exception being reported.
     /// </summary>
-    private static string SafeDescription(Exception exception, string typeName)
+    internal static string SafeDescription(Exception exception, string typeName)
     {
         try
         {

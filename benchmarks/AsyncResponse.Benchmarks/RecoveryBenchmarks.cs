@@ -13,6 +13,10 @@ public class RecoveryBenchmarks
     private AsyncResponseWatchdogSnapshot _healthySnapshot = null!;
     private AsyncResponseWatchdogSnapshot _degradedSnapshot = null!;
     private long _nextId;
+    // The evaluation instant is pinned to the snapshot stamp: evaluating against a live DateTime.UtcNow
+    // would let the snapshot age past 2 x ScanInterval mid-run and switch the health check to its
+    // cheap "watchdog stopped reporting" path.
+    private DateTime _snapshotTime;
 
     [Params(128, 1024, 8192)]
     public int Entries;
@@ -22,6 +26,7 @@ public class RecoveryBenchmarks
     {
         _store = new InMemoryRecoveryStateStore();
         var now = DateTime.UtcNow;
+        _snapshotTime = now;
         _observations = Enumerable.Range(0, Entries)
             .Select(i => new RecoveryStateObservation(
                 $"bench-{i}",
@@ -87,15 +92,15 @@ public class RecoveryBenchmarks
 
     [Benchmark]
     public AsyncResponseWatchdogReport Watchdog_Evaluate_MixedSnapshot()
-        => AsyncResponseWatchdogReport.Evaluate(_observations, DateTime.UtcNow, TimeSpan.FromMinutes(10));
+        => AsyncResponseWatchdogReport.Evaluate(_observations, _snapshotTime,TimeSpan.FromMinutes(10));
 
     [Benchmark]
     public string HealthCheck_Evaluate_Healthy()
-        => AsyncResponseRecoveryHealthCheck.Evaluate(_healthySnapshot, activation: null, DateTime.UtcNow).Status.ToString();
+        => AsyncResponseRecoveryHealthCheck.Evaluate(_healthySnapshot, activation: null, _snapshotTime).Status.ToString();
 
     [Benchmark]
     public string HealthCheck_Evaluate_Degraded()
-        => AsyncResponseRecoveryHealthCheck.Evaluate(_degradedSnapshot, activation: null, DateTime.UtcNow).Status.ToString();
+        => AsyncResponseRecoveryHealthCheck.Evaluate(_degradedSnapshot, activation: null, _snapshotTime).Status.ToString();
 
     private static RecoveryState NewRecoveryState(string correlationId)
         => new()
