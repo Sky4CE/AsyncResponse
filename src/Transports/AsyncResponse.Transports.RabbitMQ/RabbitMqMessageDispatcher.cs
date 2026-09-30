@@ -540,8 +540,15 @@ internal abstract class RabbitMqMessageDispatcher : IAsyncDisposable
                 delivery.DeliveryTag,
                 queue));
         }
-        catch (Exception callbackException)
+        catch (Exception waitException)
         {
+            // The bound can lapse in the gap before the filter above runs while the callback
+            // finishes: then the callback's own outcome (not the wait's cancellation) is what counts.
+            if (invocation.IsCompletedSuccessfully)
+                return;
+            var callbackException = waitException is OperationCanceledException && invocation.IsFaulted
+                ? invocation.Exception!.InnerException ?? waitException
+                : waitException;
             SafeLog.Try(() => Logger.LogError(
                 callbackException,
                 "RabbitMQ background failure callback failed for already-ACKed delivery {DeliveryTag} on {Queue}.",

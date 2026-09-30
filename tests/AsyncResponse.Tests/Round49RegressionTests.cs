@@ -280,6 +280,82 @@ public sealed class Round49RegressionTests
         Assert.Null((await inner.LoadAsync(previousParentId))!.RetainUntilUtc);
     }
 
+    /// <summary>
+    /// After a lost compare-and-swap the retry must read the CURRENT copy: a lagging read that is
+    /// stale but Running and uncovered looked "fine" on every attempt, so the same stale revision
+    /// was re-written until the park was abandoned as retriable.
+    /// </summary>
+    [Fact]
+    public async Task AncestorExtension_ALaggingRunningCopyBehindALostRace_IsReReadCurrently_AndExtendsTheAncestor()
+    {
+        var clock = new VirtualTimeProvider();
+        var transport = new CapturingDelayedTransport();
+        await using var provider = BuildContextProvider(transport, clock);
+        var inner = provider.GetRequiredService<IFlowStateStore>();
+        const string rootId = "r49-lag-root";
+        const string childId = "r49-lag-root:child";
+        var root = State(rootId);
+        root.Steps = new Dictionary<string, FlowStepState>(StringComparer.Ordinal) { ["child"] = new() { ChildFlowId = childId } };
+        Assert.True(await inner.TryCreateAsync(rootId, root, TimeSpan.FromMinutes(1)));
+        Assert.True(await inner.TryCreateAsync(childId, State(childId, rootId), TimeSpan.FromMinutes(1)));
+
+        // Another writer advances the root; plain loads keep serving the revision before it.
+        var stale = (await inner.LoadAsync(rootId))!;
+        var current = (await inner.LoadAsync(rootId))!;
+        current.Revision = stale.Revision + 1;
+        Assert.True(await inner.TryUpdateAsync(rootId, current, stale.Revision, TimeSpan.FromMinutes(1)));
+        var store = new LaggingFlowStateStore(inner);
+        store.ServeStaleCopy(rootId, stale);
+
+        await using (var lease = (await FlowStateConcurrency.TryAcquireExecutionLeaseAsync(store, childId, ShortLedgerOptions, NullLogger.Instance, clock))!)
+        {
+            var context = CreateContext(provider, (await inner.LoadAsync(childId))!, store, lease, ShortLedgerOptions, clock, transport);
+            await Assert.ThrowsAsync<DurableFlowSuspendedException>(() => context.DelayAsync("long-wait", TimeSpan.FromHours(1)));
+        }
+
+        clock.Advance(TimeSpan.FromMinutes(2));
+        Assert.NotNull(await inner.LoadAsync(rootId));
+    }
+
+    /// <summary>
+    /// A retry's read is already current; a covered result must not trigger a second identical
+    /// current read. Pre-fix the covered copy on attempt 2 was read currently twice.
+    /// </summary>
+    [Fact]
+    public async Task AncestorExtension_ARetryThatReadCurrentlyAndFoundItCovered_DoesNotReadCurrentlyAgain()
+    {
+        var clock = new VirtualTimeProvider();
+        var transport = new CapturingDelayedTransport();
+        await using var provider = BuildContextProvider(transport, clock);
+        var inner = provider.GetRequiredService<IFlowStateStore>();
+        const string rootId = "r49-once-root";
+        const string childId = "r49-once-root:child";
+        var root = State(rootId);
+        root.Steps = new Dictionary<string, FlowStepState>(StringComparer.Ordinal) { ["child"] = new() { ChildFlowId = childId } };
+        Assert.True(await inner.TryCreateAsync(rootId, root, TimeSpan.FromMinutes(1)));
+        Assert.True(await inner.TryCreateAsync(childId, State(childId, rootId), TimeSpan.FromMinutes(1)));
+
+        var stale = (await inner.LoadAsync(rootId))!;
+        var current = (await inner.LoadAsync(rootId))!;
+        current.Revision = stale.Revision + 1;
+        current.RetainUntilUtc = clock.GetUtcNow().UtcDateTime.AddDays(30);
+        Assert.True(await inner.TryUpdateAsync(rootId, current, stale.Revision, TimeSpan.FromMinutes(1)));
+        var store = new LaggingFlowStateStore(inner);
+        store.ServeStaleCopy(rootId, stale);
+
+        await using (var lease = (await FlowStateConcurrency.TryAcquireExecutionLeaseAsync(store, childId, ShortLedgerOptions, NullLogger.Instance, clock))!)
+        {
+            var context = CreateContext(provider, (await inner.LoadAsync(childId))!, store, lease, ShortLedgerOptions, clock, transport);
+            await Assert.ThrowsAsync<DurableFlowSuspendedException>(() => context.DelayAsync("long-wait", TimeSpan.FromHours(1)));
+        }
+
+        // Each walk of the ancestor reads plainly once, loses the swap to the covered current
+        // copy, then reads currently ONCE (it is covered, so nothing is re-read to confirm it).
+        var walks = store.PlainLoads.GetValueOrDefault(rootId);
+        Assert.True(walks >= 1);
+        Assert.Equal(walks, store.CurrentLoads.GetValueOrDefault(rootId));
+    }
+
     private sealed class CapturingDelayedTransport : IDelayedWorkerTransport
     {
         private readonly List<WorkerJobEnvelope> _jobs = [];
@@ -319,13 +395,26 @@ public sealed class Round49RegressionTests
         public void ServeStaleCopy(string flowId, FlowState copy, bool onlyAfterCreateAttempt = false)
             => _stale[flowId] = (copy, onlyAfterCreateAttempt);
 
+        public ConcurrentDictionary<string, int> PlainLoads { get; } = new(StringComparer.Ordinal);
+
         public Task<FlowState?> LoadAsync(string flowId, CancellationToken cancellationToken = default)
-            => _stale.TryGetValue(flowId, out var stale) && (!stale.AfterCreate || _createAttempted)
+            => CountPlain(flowId) && _stale.TryGetValue(flowId, out var stale) && (!stale.AfterCreate || _createAttempted)
                 ? Task.FromResult<FlowState?>(Copy(stale.Copy))
                 : inner.LoadAsync(flowId, cancellationToken);
 
+        private bool CountPlain(string flowId)
+        {
+            PlainLoads.AddOrUpdate(flowId, 1, static (_, n) => n + 1);
+            return true;
+        }
+
+        public ConcurrentDictionary<string, int> CurrentLoads { get; } = new(StringComparer.Ordinal);
+
         public Task<FlowState?> LoadCurrentAsync(string flowId, CancellationToken cancellationToken = default)
-            => inner.LoadCurrentAsync(flowId, cancellationToken);
+        {
+            CurrentLoads.AddOrUpdate(flowId, 1, static (_, n) => n + 1);
+            return inner.LoadCurrentAsync(flowId, cancellationToken);
+        }
 
         public async Task<bool> TryCreateAsync(string flowId, FlowState state, TimeSpan ttl, CancellationToken cancellationToken = default)
         {

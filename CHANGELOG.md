@@ -13,6 +13,23 @@ work that has landed on `main` but not yet shipped. Security reporters credited 
 
 ### Changed
 
+- **Round-52 review (2026-09-30, whole-repository review of `1fc2b20`): a DB-channel waiter
+  timeout that lost to a delivery is no longer reported as a timeout, and three narrow settlement
+  windows are closed.**
+  - *Observability — PostgreSQL, SQL Server and MongoDB channels.* A waiter timeout that lost the
+    race to an in-flight delivery still logged the timeout warning, marked the wait span as a
+    `timeout` error and counted a waiter timeout. Those now happen only when the timeout actually
+    settles the wait.
+  - *Recovery — Redis channel.* A response delivered while `SubscribeAsync` was still arming the
+    wait settled and cleaned up the waiter, and the create path then wrote a callback-armed recovery
+    registration for a wait that no longer existed. It is now skipped; the post-save compensation
+    for the save race stays.
+  - *Durable flows — child flows.* After a lost compare-and-swap, the ancestor-ledger extension
+    retried with the possibly lagging `LoadAsync` view and rewrote the same stale revision on every
+    attempt, exhausting its retries. The retry now re-reads the ancestor with `LoadCurrentAsync`
+    (once per attempt).
+  - *Shutdown — RabbitMQ transport.* A background-failure callback that faulted just as the
+    shutdown reserve lapsed was logged as a cancellation; it now logs its own fault.
 - **Round-51 review (2026-09-29, external review of `93c3ba4`): a MongoDB recovery lookup can no
   longer settle on a deposed primary's view, fan-out on Redis and NATS is bounded and survives a
   concurrent burst, and a Redis or NATS registration whose expiry cannot be established is refused

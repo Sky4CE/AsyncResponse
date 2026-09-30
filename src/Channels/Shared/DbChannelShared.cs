@@ -2361,16 +2361,22 @@ internal abstract class DbAsyncResponseChannelBase :
         Activity? activity,
         string correlationId) where T : IAsyncResponsePayload
     {
-        // SafeLog: a throwing provider here skipped the cleanup below, so the waiter never
-        // completed and its subscription, subscriber row and executor stayed registered for good.
-        SafeLog.Try(
-            (Logger: _logger, Provider: _providerName, CorrelationId: correlationId),
-            static state => state.Logger.LogWarning("Timed out waiting for {Provider} response for correlationId {CorrelationId}.", state.Provider, state.CorrelationId));
-        AsyncResponseDiagnostics.SetError(activity, "timeout", $"Timed out waiting for response for correlationId {correlationId}.");
-        AsyncResponseDiagnostics.RecordWaiterTimeout(_activityTag);
-        await subscription.DrainThenCleanupAsync(
+        // Reported only once the drain confirms the timeout actually won: an in-flight delivery
+        // ahead of the drain marker can still hand the waiter its response, and a "timeout" log,
+        // span error and counter for a wait that carries a result would be false diagnostics.
+        // SafeLog: a throwing provider here skipped the cleanup, so the waiter never completed
+        // and its subscription, subscriber row and executor stayed registered for good.
+        await subscription.DrainThenCleanupCoreAsync(
             deleteRecoveryState: true,
-            new TimeoutException($"Timed out waiting for response for correlationId {correlationId}.")).ConfigureAwait(false);
+            new TimeoutException($"Timed out waiting for response for correlationId {correlationId}."),
+            onTerminalSettled: () =>
+            {
+                SafeLog.Try(
+                    (Logger: _logger, Provider: _providerName, CorrelationId: correlationId),
+                    static state => state.Logger.LogWarning("Timed out waiting for {Provider} response for correlationId {CorrelationId}.", state.Provider, state.CorrelationId));
+                SafeLog.Try(() => AsyncResponseDiagnostics.SetError(activity, "timeout", $"Timed out waiting for response for correlationId {correlationId}."));
+                SafeLog.Try(() => AsyncResponseDiagnostics.RecordWaiterTimeout(_activityTag));
+            }).ConfigureAwait(false);
     }
 
     private interface IWaiterTimeoutState
@@ -2745,7 +2751,15 @@ internal abstract class DbAsyncResponseChannelBase :
         /// below is truthful.
         /// </para>
         /// </summary>
-        public async ValueTask DrainThenCleanupAsync(bool deleteRecoveryState, Exception? terminalIfUndelivered = null)
+        public ValueTask DrainThenCleanupAsync(bool deleteRecoveryState, Exception? terminalIfUndelivered = null)
+            => DrainThenCleanupCoreAsync(deleteRecoveryState, terminalIfUndelivered, onTerminalSettled: null);
+
+        /// <summary>
+        /// <see cref="DrainThenCleanupAsync"/> plus <paramref name="onTerminalSettled"/>, invoked
+        /// (before the cleanup stops the wait's span) only when <paramref name="terminalIfUndelivered"/>
+        /// is what settled the waiter, i.e. it won against any in-flight delivery.
+        /// </summary>
+        public async ValueTask DrainThenCleanupCoreAsync(bool deleteRecoveryState, Exception? terminalIfUndelivered, Action? onTerminalSettled)
         {
             if (Volatile.Read(ref _cleanupStarted) == 0)
             {
@@ -2795,8 +2809,8 @@ internal abstract class DbAsyncResponseChannelBase :
             // timeout; TrySet loses here if the delivery won, which is the whole point. (A lapsed
             // drain budget has already faulted the task as indeterminate above, and TrySet is a
             // no-op behind it.)
-            if (terminalIfUndelivered is not null)
-                _tcs.TrySetException(terminalIfUndelivered);
+            if (terminalIfUndelivered is not null && _tcs.TrySetException(terminalIfUndelivered))
+                onTerminalSettled?.Invoke();
 
             await CleanupOnceAsync(deleteRecoveryState).ConfigureAwait(false);
         }

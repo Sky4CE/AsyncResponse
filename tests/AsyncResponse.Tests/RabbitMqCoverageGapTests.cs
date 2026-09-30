@@ -710,6 +710,50 @@ public class RabbitMqCoverageGapTests
         Assert.Equal(bool.TrueString, correlationId);
     }
 
+    [Fact]
+    public async Task BackgroundFailureCallback_FaultingAsTheReserveLapses_LogsItsOwnFaultNotTheCancellation()
+    {
+        var logger = new GapLogger();
+        var subscriber = EnqueueSubscriber();
+        var callbackFault = new TaskCompletionSource();
+        var callbackFailure = new InvalidOperationException("callback fault");
+        subscriber.OnBackgroundFailure = _ => new ValueTask(callbackFault.Task);
+        var dispatcher = new NotifyProbeDispatcher(subscriber, logger);
+
+        // Guard test, not a reproduction of the gap between the wait's cancellation and the
+        // exception filter (that instant cannot be reached without timing). Registrations on a
+        // token run last-in first-out, so this one runs BEFORE the linked bound is cancelled: the
+        // callback is already faulted when the bound lapses, and whichever way the wait observes
+        // it, the logged exception must be the callback's own fault, never the cancellation.
+        using var parent = new CancellationTokenSource();
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(parent.Token);
+        using var settle = parent.Token.Register(() => callbackFault.TrySetException(callbackFailure));
+
+        var notify = dispatcher.NotifyAsync(Delivery("m", deliveryTag: 7), new InvalidOperationException("original"), linked.Token);
+        parent.Cancel();
+        await notify.AsTask().WaitAsync(Wait);
+
+        var error = Assert.Single(logger.Entries, e => e.Level == LogLevel.Error);
+        Assert.Same(callbackFailure, error.Exception);
+    }
+
+    private sealed class NotifyProbeDispatcher(RabbitMqSubscriberOptions subscriber, ILogger logger)
+        : RabbitMqMessageDispatcher(
+            (_, _) => Task.CompletedTask,
+            new RabbitMqAsyncResponseOptions(),
+            subscriber,
+            logger,
+            "worker.q",
+            RabbitMqSubscriberRole.Worker,
+            null)
+    {
+        public ValueTask NotifyAsync(RabbitMqDelivery delivery, Exception exception, CancellationToken bound)
+            => NotifyBackgroundFailureAsync(delivery, exception, "worker.q", RabbitMqSubscriberRole.Worker, bound);
+
+        public override Task HandleAsync(RabbitMqDelivery delivery, IRabbitMqChannel channel, CancellationToken subscriberCancellationToken)
+            => Task.CompletedTask;
+    }
+
     // ---------- helpers ----------
 
     private static RabbitMqSubscriberOptions EnqueueSubscriber(int workers = 1, int capacity = 8, TimeSpan? drain = null)

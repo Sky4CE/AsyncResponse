@@ -587,6 +587,109 @@ public sealed partial class DbChannelSharedCoverageTests
     }
 
     /// <summary>
+    /// A timer that fires while the in-flight delivery is delivering the response must not be
+    /// reported as a timeout: the drain decides who won, and only a winning timeout is logged.
+    /// </summary>
+    [Theory]
+    [InlineData(Provider.SqlServer)]
+    [InlineData(Provider.PostgreSql)]
+    [InlineData(Provider.MongoDb)]
+    public async Task WaiterTimeout_LosingToADelivery_IsNotLoggedAsATimeout(Provider provider)
+    {
+        await using var harness = Harness.Create(provider, failing: true, pollInterval: TimeSpan.FromSeconds(30));
+        var (subscription, completion) = harness.Subscription("corr", cleanupStarted: false);
+        harness.AddSubscription("corr", subscription);
+        using var timeouts = WaiterTimeoutCounter();
+        completion.TrySetResult(new OperationResult { Status = OperationStatus.Completed });
+
+        var handler = harness.Channel.GetType().BaseType!
+            .GetMethod("HandleWaiterTimeoutAsync", BindingFlags.Instance | BindingFlags.NonPublic)!
+            .MakeGenericMethod(typeof(OperationResult));
+        await ((Task)handler.Invoke(harness.Channel, [subscription, null, "corr"])!).WaitAsync(TimeSpan.FromSeconds(10));
+
+        Assert.Equal(OperationStatus.Completed, (await completion.Task).Status);
+        Assert.DoesNotContain(harness.Logger.Messages, m => m.Contains("Timed out waiting", StringComparison.Ordinal));
+        Assert.Equal(0, timeouts.Count);
+    }
+
+    /// <summary>
+    /// Winning path (round 1): with nothing in flight the timeout is reported — Warning, counter and
+    /// span error "timeout" — once the timeout has settled the waiter.
+    /// </summary>
+    [Theory]
+    [InlineData(Provider.SqlServer)]
+    [InlineData(Provider.PostgreSql)]
+    [InlineData(Provider.MongoDb)]
+    public async Task WaiterTimeout_Winning_ReportsWarningCounterAndSpanError(Provider provider)
+    {
+        await using var harness = Harness.Create(provider, failing: true, pollInterval: TimeSpan.FromSeconds(30));
+        var (subscription, completion) = harness.Subscription("corr", cleanupStarted: false);
+        harness.AddSubscription("corr", subscription);
+        using var timeouts = WaiterTimeoutCounter();
+        using var source = new System.Diagnostics.ActivitySource("AsyncResponse.Tests.WaiterTimeout");
+        using var activityListener = new System.Diagnostics.ActivityListener
+        {
+            ShouldListenTo = s => s.Name == source.Name,
+            Sample = (ref System.Diagnostics.ActivityCreationOptions<System.Diagnostics.ActivityContext> _) => System.Diagnostics.ActivitySamplingResult.AllData
+        };
+        System.Diagnostics.ActivitySource.AddActivityListener(activityListener);
+        using var activity = source.StartActivity("wait");
+        Assert.NotNull(activity);
+
+        var handler = harness.Channel.GetType().BaseType!
+            .GetMethod("HandleWaiterTimeoutAsync", BindingFlags.Instance | BindingFlags.NonPublic)!
+            .MakeGenericMethod(typeof(OperationResult));
+        var handling = (Task)handler.Invoke(harness.Channel, [subscription, activity, "corr"])!;
+
+        await Assert.ThrowsAsync<TimeoutException>(() => completion.Task);
+        await handling.WaitAsync(TimeSpan.FromSeconds(10));
+
+        Assert.Equal(1, timeouts.Count);
+        Assert.Contains(harness.Logger.Messages, m => m.Contains("Timed out waiting", StringComparison.Ordinal));
+        Assert.Equal(System.Diagnostics.ActivityStatusCode.Error, activity.Status);
+        Assert.Equal("timeout", activity.GetTagItem("error.type"));
+    }
+
+    private static readonly AsyncLocal<WaiterTimeoutCounterScope?> CountingWaiterTimeouts = new();
+
+    private sealed class WaiterTimeoutCounterScope(System.Diagnostics.Metrics.MeterListener listener) : IDisposable
+    {
+        public int Count;
+        public void Dispose()
+        {
+            listener.Dispose();
+            CountingWaiterTimeouts.Value = null;
+        }
+    }
+
+    /// <summary>
+    /// Counts waiter-timeout measurements emitted on THIS test's async flow only (the meter is
+    /// process-wide and tests run in parallel; the flow carries this scope, compared by reference).
+    /// </summary>
+    private static WaiterTimeoutCounterScope WaiterTimeoutCounter()
+    {
+        WaiterTimeoutCounterScope? scope = null;
+        var listener = new System.Diagnostics.Metrics.MeterListener
+        {
+            InstrumentPublished = (instrument, l) =>
+            {
+                if (instrument.Meter.Name == AsyncResponseDiagnostics.MeterName && instrument.Name == "asyncresponse.waiter.timeouts")
+                    l.EnableMeasurementEvents(instrument);
+            }
+        };
+        listener.SetMeasurementEventCallback<long>((_, _, _, _) =>
+        {
+            if (scope is null || !ReferenceEquals(CountingWaiterTimeouts.Value, scope))
+                return;
+            Interlocked.Increment(ref scope.Count);
+        });
+        scope = new WaiterTimeoutCounterScope(listener);
+        CountingWaiterTimeouts.Value = scope;
+        listener.Start();
+        return scope;
+    }
+
+    /// <summary>
     /// Regression (round 31): round 30's shared publish-with-recovery helper erased the
     /// publisher's declared <c>T</c> to <c>object</c>, so the three DB channels serialized the
     /// recovery payload by its RUNTIME type while the durable envelope (and Redis/NATS/in-memory

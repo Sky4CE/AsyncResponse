@@ -791,7 +791,12 @@ internal sealed class DurableFlowContext : IDurableFlowContext
             // (never under the plain idle margin).
             var now = UtcNow;
             var ttl = retainUntil - now > _options.StateExpiry ? retainUntil - now : _options.StateExpiry;
-            var ancestor = await _store.LoadAsync(ancestorId, cancellationToken).ConfigureAwait(false);
+            // After a lost compare-and-swap the plain read is what just lied (or raced): a lagging
+            // copy that is stale but Running and uncovered would be re-written at the same stale
+            // revision on every attempt. Read currently from the second attempt on.
+            var ancestor = attempt > 1
+                ? await _store.LoadCurrentAsync(ancestorId, cancellationToken).ConfigureAwait(false)
+                : await _store.LoadAsync(ancestorId, cancellationToken).ConfigureAwait(false);
 
             // Stopping here writes nothing, so no revision fence corrects a stale read behind it
             // (see IFlowStateStore.LoadCurrentAsync): under a reused ancestor id a lagging copy
@@ -801,7 +806,8 @@ internal sealed class DurableFlowContext : IDurableFlowContext
             // look is the authoritative answer and ends the walk here: falling back to the lagging
             // copy would follow a covered previous run's ParentFlowId up a chain that is not this
             // one's and raise the floors of ledgers this park has nothing to do with.
-            if (ancestor is not null
+            if (attempt == 1
+                && ancestor is not null
                 && (ancestor.Status != FlowRunStatus.Running || FlowStateRetention.Covers(ancestor, retainUntil)))
             {
                 ancestor = await _store.LoadCurrentAsync(ancestorId, cancellationToken).ConfigureAwait(false);

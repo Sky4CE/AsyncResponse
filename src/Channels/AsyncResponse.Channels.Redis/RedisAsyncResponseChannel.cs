@@ -308,7 +308,11 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
                 RegisteredAtUtc = _timeProvider.GetUtcNow().UtcDateTime,
                 Context = _propagation.Capture()
             };
-            await _recoveryStateStore.SaveAsync(correlationId, recoveryState, _options.RecoveryStateExpiry).ConfigureAwait(false);
+            // A wait a pumped-in delivery already settled and cleaned up needs no registration:
+            // writing one would only leave it to a best-effort compensating delete (and, if that
+            // delete fails, to a spurious recovery callback for the id until the expiry).
+            if (!subscription.CleanupStarted)
+                await _recoveryStateStore.SaveAsync(correlationId, recoveryState, _options.RecoveryStateExpiry).ConfigureAwait(false);
             if (subscription.CleanupStarted)
             {
                 // A terminal delivery started cleanup while this registration was still being

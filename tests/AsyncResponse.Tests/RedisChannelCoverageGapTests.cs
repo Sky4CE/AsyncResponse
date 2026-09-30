@@ -94,6 +94,24 @@ public sealed class RedisChannelCoverageGapTests
     }
 
     /// <summary>
+    /// A terminal delivery pumped inside SubscribeAsync settles the wait and cleans up before the
+    /// registration is written; the creator must not write a callback-armed registration for a
+    /// wait that is already settled.
+    /// </summary>
+    [Fact]
+    public async Task TerminalDeliveryInsideSubscribe_DoesNotSaveARecoveryRegistration()
+    {
+        _subscriber.InvokeOnSubscribe = TerminalEnvelope;
+        _subscriber.AfterInvokeOnSubscribe = WaitForCleanupStartedAsync;
+        var channel = CreateChannel();
+
+        await using var waiter = await channel.CreateResponseWaiter<OperationResult>("corr-no-save-after-settle").WaitAsync(HangGuard);
+
+        Assert.Equal("inline", (await waiter.ResponseTask).Message);
+        _store.Verify(s => s.SaveAsync(It.IsAny<string>(), It.IsAny<RecoveryState>(), It.IsAny<TimeSpan>(), It.IsAny<CancellationToken>()), Times.Never);
+    }
+
+    /// <summary>
     /// A terminal delivery landing while the recovery registration is being saved orphans it; the
     /// creator's compensating delete is best-effort, so its failure is logged (the registration
     /// then expires by TTL) and the completed waiter is returned.
