@@ -1,22 +1,22 @@
 Summary - AsyncResponse (Release / net8.0+net10.0 / unit+integration)
-  Generated on: 09/30/2026 - 16:31:34
-  Coverage date: 09/30/2026 - 16:15:08 - 09/30/2026 - 16:30:34
+  Generated on: 09/30/2026 - 17:23:14
+  Coverage date: 09/30/2026 - 17:05:09 - 09/30/2026 - 17:21:40
   Parser: MultiReport (16x Cobertura)
   Assemblies: 27
   Classes: 510
   Files: 253
   Line coverage: 98.9%
-  Covered lines: 37578
-  Uncovered lines: 386
-  Coverable lines: 37964
-  Total lines: 76803
-  Branch coverage: 94.2% (14701 of 15605)
-  Covered branches: 14701
-  Total branches: 15605
+  Covered lines: 37610
+  Uncovered lines: 385
+  Coverable lines: 37995
+  Total lines: 76857
+  Branch coverage: 94.2% (14711 of 15615)
+  Covered branches: 14711
+  Total branches: 15615
   Method coverage: 99.9% (5034 of 5039)
-  Full method coverage: 97.3% (4903 of 5039)
+  Full method coverage: 97.2% (4902 of 5039)
   Covered methods: 5034
-  Fully covered methods: 4903
+  Fully covered methods: 4902
   Total methods: 5039
 
 AsyncResponse.Abstractions                                                                                100%
@@ -117,8 +117,8 @@ AsyncResponse.Channels.Redis                                                    
   AsyncResponse.Channels.Redis.RedisRecoveryStateStore                                                    100%
   Microsoft.Extensions.DependencyInjection.RedisAsyncResponseServiceCollectionExtensions                  100%
 
-AsyncResponse.Channels.SqlServer                                                                         99.4%
-  AsyncResponse.Channels.DbAsyncResponseChannelBase                                                      98.9%
+AsyncResponse.Channels.SqlServer                                                                         99.3%
+  AsyncResponse.Channels.DbAsyncResponseChannelBase                                                      98.8%
   AsyncResponse.Channels.DbRecoveryStateStoreBase                                                         100%
   AsyncResponse.Channels.SqlServer.SqlServerAsyncResponseChannel                                          100%
   AsyncResponse.Channels.SqlServer.SqlServerAsyncResponseChannelOptions                                   100%
@@ -444,7 +444,7 @@ AsyncResponse.Transports.NATS                                                   
   AsyncResponse.Transports.WorkerIntakeGate                                                               100%
   Microsoft.Extensions.DependencyInjection.NatsAsyncResponseTransportServiceCollectionExtensions          100%
 
-AsyncResponse.Transports.PostgreSQL                                                                      98.7%
+AsyncResponse.Transports.PostgreSQL                                                                      98.8%
   AsyncResponse.Internal.OpportunisticPrune                                                               100%
   AsyncResponse.Internal.PostgreSqlDdlGuard                                                              99.1%
   AsyncResponse.Internal.PostgreSqlListenConnection                                                      94.8%
@@ -464,7 +464,7 @@ AsyncResponse.Transports.PostgreSQL                                             
   AsyncResponse.Transports.PostgreSQL.PostgreSqlReplyTargetProvider                                       100%
   AsyncResponse.Transports.PostgreSQL.PostgreSqlResponseIngressSubscriber                                 100%
   AsyncResponse.Transports.PostgreSQL.PostgreSqlSubscriberOptions                                         100%
-  AsyncResponse.Transports.PostgreSQL.PostgreSqlSubscriberService                                        95.8%
+  AsyncResponse.Transports.PostgreSQL.PostgreSqlSubscriberService                                        97.9%
   AsyncResponse.Transports.PostgreSQL.PostgreSqlTransportDelivery                                         100%
   AsyncResponse.Transports.PostgreSQL.PostgreSqlTransportOptionsValidator                                 100%
   AsyncResponse.Transports.PostgreSQL.PostgreSqlTransportRetry                                            100%
