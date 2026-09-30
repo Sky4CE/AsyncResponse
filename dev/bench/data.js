@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1790805195369,
+  "lastUpdate": 1790805199340,
   "repoUrl": "https://github.com/Sky4CE/AsyncResponse",
   "entries": {
     "AsyncResponse Microbenchmarks": [
@@ -327914,6 +327914,630 @@ window.BENCHMARK_DATA = {
           {
             "name": "mongodb_worker_ack_after_enqueue_observed p99 latency",
             "value": 396.29,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "tyunisov@gmail.com",
+            "name": "Sky4CE",
+            "username": "Sky4CE"
+          },
+          "committer": {
+            "email": "tyunisov@gmail.com",
+            "name": "Sky4CE",
+            "username": "Sky4CE"
+          },
+          "distinct": true,
+          "id": "03002cc0f23251a2afe9bd4202fe0220e1eb3511",
+          "message": "fix: a skew-forced in-process timer wait counts as parked in the test harness — the engine reports it through an internal observer hook, so AdvanceAsync no longer spends its 500 ms settle grace on every step and the SkewProvenTimer test drops from ~46 s to ~2 s",
+          "timestamp": "2026-09-30T23:47:24+02:00",
+          "tree_id": "cdd20b3a1634810473d581c0bdc9760fee2d62e6",
+          "url": "https://github.com/Sky4CE/AsyncResponse/commit/03002cc0f23251a2afe9bd4202fe0220e1eb3511"
+        },
+        "date": 1790805198619,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "request_response_success_redis p95 latency",
+            "value": 13148.16,
+            "unit": "ms"
+          },
+          {
+            "name": "request_response_success_redis p99 latency",
+            "value": 13688.83,
+            "unit": "ms"
+          },
+          {
+            "name": "request_response_domain_failure_redis p95 latency",
+            "value": 12419.07,
+            "unit": "ms"
+          },
+          {
+            "name": "request_response_domain_failure_redis p99 latency",
+            "value": 13254.66,
+            "unit": "ms"
+          },
+          {
+            "name": "attach_redis p95 latency",
+            "value": 9838.59,
+            "unit": "ms"
+          },
+          {
+            "name": "attach_redis p99 latency",
+            "value": 10633.22,
+            "unit": "ms"
+          },
+          {
+            "name": "worker_pubsub_observed p95 latency",
+            "value": 286.46,
+            "unit": "ms"
+          },
+          {
+            "name": "worker_pubsub_observed p99 latency",
+            "value": 385.79,
+            "unit": "ms"
+          },
+          {
+            "name": "multi_step_success_redis p95 latency",
+            "value": 19300.35,
+            "unit": "ms"
+          },
+          {
+            "name": "multi_step_success_redis p99 latency",
+            "value": 20054.02,
+            "unit": "ms"
+          },
+          {
+            "name": "multi_step_domain_failure_redis p95 latency",
+            "value": 19365.89,
+            "unit": "ms"
+          },
+          {
+            "name": "multi_step_domain_failure_redis p99 latency",
+            "value": 19529.73,
+            "unit": "ms"
+          },
+          {
+            "name": "ambient_exception_redis p95 latency",
+            "value": 10665.98,
+            "unit": "ms"
+          },
+          {
+            "name": "ambient_exception_redis p99 latency",
+            "value": 10960.9,
+            "unit": "ms"
+          },
+          {
+            "name": "shared_exception_fanout_redis p95 latency",
+            "value": 14524.42,
+            "unit": "ms"
+          },
+          {
+            "name": "shared_exception_fanout_redis p99 latency",
+            "value": 14811.14,
+            "unit": "ms"
+          },
+          {
+            "name": "reply_target_pubsub p95 latency",
+            "value": 11280.38,
+            "unit": "ms"
+          },
+          {
+            "name": "reply_target_pubsub p99 latency",
+            "value": 11436.03,
+            "unit": "ms"
+          },
+          {
+            "name": "rabbitmq_worker_default_ack_observed p95 latency",
+            "value": 172.67,
+            "unit": "ms"
+          },
+          {
+            "name": "rabbitmq_worker_default_ack_observed p99 latency",
+            "value": 293.89,
+            "unit": "ms"
+          },
+          {
+            "name": "rabbitmq_response_ingress_header p95 latency",
+            "value": 1048.06,
+            "unit": "ms"
+          },
+          {
+            "name": "rabbitmq_response_ingress_header p99 latency",
+            "value": 1131.52,
+            "unit": "ms"
+          },
+          {
+            "name": "rabbitmq_response_ingress_body p95 latency",
+            "value": 1011.71,
+            "unit": "ms"
+          },
+          {
+            "name": "rabbitmq_response_ingress_body p99 latency",
+            "value": 1093.63,
+            "unit": "ms"
+          },
+          {
+            "name": "rabbitmq_reply_target p95 latency",
+            "value": 636.93,
+            "unit": "ms"
+          },
+          {
+            "name": "rabbitmq_reply_target p99 latency",
+            "value": 689.66,
+            "unit": "ms"
+          },
+          {
+            "name": "rabbitmq_worker_ack_after_enqueue_observed p95 latency",
+            "value": 218.62,
+            "unit": "ms"
+          },
+          {
+            "name": "rabbitmq_worker_ack_after_enqueue_observed p99 latency",
+            "value": 300.8,
+            "unit": "ms"
+          },
+          {
+            "name": "azure_servicebus_request_response_success p95 latency",
+            "value": 1784.83,
+            "unit": "ms"
+          },
+          {
+            "name": "azure_servicebus_request_response_success p99 latency",
+            "value": 1831.94,
+            "unit": "ms"
+          },
+          {
+            "name": "azure_servicebus_worker_default_ack_observed p95 latency",
+            "value": 220.54,
+            "unit": "ms"
+          },
+          {
+            "name": "azure_servicebus_worker_default_ack_observed p99 latency",
+            "value": 252.16,
+            "unit": "ms"
+          },
+          {
+            "name": "azure_servicebus_response_ingress_property p95 latency",
+            "value": 1276.93,
+            "unit": "ms"
+          },
+          {
+            "name": "azure_servicebus_response_ingress_property p99 latency",
+            "value": 1451.01,
+            "unit": "ms"
+          },
+          {
+            "name": "azure_servicebus_response_ingress_body p95 latency",
+            "value": 1356.8,
+            "unit": "ms"
+          },
+          {
+            "name": "azure_servicebus_response_ingress_body p99 latency",
+            "value": 1457.15,
+            "unit": "ms"
+          },
+          {
+            "name": "azure_servicebus_reply_target p95 latency",
+            "value": 760.83,
+            "unit": "ms"
+          },
+          {
+            "name": "azure_servicebus_reply_target p99 latency",
+            "value": 865.28,
+            "unit": "ms"
+          },
+          {
+            "name": "azure_servicebus_worker_ack_after_receive_observed p95 latency",
+            "value": 268.29,
+            "unit": "ms"
+          },
+          {
+            "name": "azure_servicebus_worker_ack_after_receive_observed p99 latency",
+            "value": 306.94,
+            "unit": "ms"
+          },
+          {
+            "name": "sqs_request_response_success p95 latency",
+            "value": 2024.45,
+            "unit": "ms"
+          },
+          {
+            "name": "sqs_request_response_success p99 latency",
+            "value": 2053.12,
+            "unit": "ms"
+          },
+          {
+            "name": "sqs_worker_default_ack_observed p95 latency",
+            "value": 214.14,
+            "unit": "ms"
+          },
+          {
+            "name": "sqs_worker_default_ack_observed p99 latency",
+            "value": 293.63,
+            "unit": "ms"
+          },
+          {
+            "name": "sqs_response_ingress_attribute p95 latency",
+            "value": 1377.28,
+            "unit": "ms"
+          },
+          {
+            "name": "sqs_response_ingress_attribute p99 latency",
+            "value": 1409.02,
+            "unit": "ms"
+          },
+          {
+            "name": "sqs_response_ingress_body p95 latency",
+            "value": 1195.01,
+            "unit": "ms"
+          },
+          {
+            "name": "sqs_response_ingress_body p99 latency",
+            "value": 1438.72,
+            "unit": "ms"
+          },
+          {
+            "name": "sqs_reply_target p95 latency",
+            "value": 915.97,
+            "unit": "ms"
+          },
+          {
+            "name": "sqs_reply_target p99 latency",
+            "value": 1089.54,
+            "unit": "ms"
+          },
+          {
+            "name": "sqs_worker_ack_after_enqueue_observed p95 latency",
+            "value": 167.94,
+            "unit": "ms"
+          },
+          {
+            "name": "sqs_worker_ack_after_enqueue_observed p99 latency",
+            "value": 234.62,
+            "unit": "ms"
+          },
+          {
+            "name": "redis_worker_default_ack_observed p95 latency",
+            "value": 360.96,
+            "unit": "ms"
+          },
+          {
+            "name": "redis_worker_default_ack_observed p99 latency",
+            "value": 449.02,
+            "unit": "ms"
+          },
+          {
+            "name": "redis_response_ingress_field p95 latency",
+            "value": 1185.79,
+            "unit": "ms"
+          },
+          {
+            "name": "redis_response_ingress_field p99 latency",
+            "value": 1534.98,
+            "unit": "ms"
+          },
+          {
+            "name": "redis_response_ingress_body p95 latency",
+            "value": 1339.39,
+            "unit": "ms"
+          },
+          {
+            "name": "redis_response_ingress_body p99 latency",
+            "value": 1499.14,
+            "unit": "ms"
+          },
+          {
+            "name": "redis_reply_target p95 latency",
+            "value": 694.78,
+            "unit": "ms"
+          },
+          {
+            "name": "redis_reply_target p99 latency",
+            "value": 757.25,
+            "unit": "ms"
+          },
+          {
+            "name": "redis_worker_ack_after_enqueue_observed p95 latency",
+            "value": 187.39,
+            "unit": "ms"
+          },
+          {
+            "name": "redis_worker_ack_after_enqueue_observed p99 latency",
+            "value": 269.06,
+            "unit": "ms"
+          },
+          {
+            "name": "nats_request_response_success p95 latency",
+            "value": 1348.61,
+            "unit": "ms"
+          },
+          {
+            "name": "nats_request_response_success p99 latency",
+            "value": 1415.17,
+            "unit": "ms"
+          },
+          {
+            "name": "nats_worker_default_ack_observed p95 latency",
+            "value": 138.24,
+            "unit": "ms"
+          },
+          {
+            "name": "nats_worker_default_ack_observed p99 latency",
+            "value": 158.98,
+            "unit": "ms"
+          },
+          {
+            "name": "nats_response_ingress_header p95 latency",
+            "value": 400.64,
+            "unit": "ms"
+          },
+          {
+            "name": "nats_response_ingress_header p99 latency",
+            "value": 446.21,
+            "unit": "ms"
+          },
+          {
+            "name": "nats_response_ingress_body p95 latency",
+            "value": 474.11,
+            "unit": "ms"
+          },
+          {
+            "name": "nats_response_ingress_body p99 latency",
+            "value": 642.05,
+            "unit": "ms"
+          },
+          {
+            "name": "nats_reply_target p95 latency",
+            "value": 253.95,
+            "unit": "ms"
+          },
+          {
+            "name": "nats_reply_target p99 latency",
+            "value": 380.16,
+            "unit": "ms"
+          },
+          {
+            "name": "nats_worker_ack_after_receive_observed p95 latency",
+            "value": 167.55,
+            "unit": "ms"
+          },
+          {
+            "name": "nats_worker_ack_after_receive_observed p99 latency",
+            "value": 313.6,
+            "unit": "ms"
+          },
+          {
+            "name": "postgresql_request_response_success p95 latency",
+            "value": 1442.82,
+            "unit": "ms"
+          },
+          {
+            "name": "postgresql_request_response_success p99 latency",
+            "value": 1490.94,
+            "unit": "ms"
+          },
+          {
+            "name": "postgresql_worker_default_ack_observed p95 latency",
+            "value": 217.6,
+            "unit": "ms"
+          },
+          {
+            "name": "postgresql_worker_default_ack_observed p99 latency",
+            "value": 330.75,
+            "unit": "ms"
+          },
+          {
+            "name": "postgresql_response_ingress_header p95 latency",
+            "value": 581.12,
+            "unit": "ms"
+          },
+          {
+            "name": "postgresql_response_ingress_header p99 latency",
+            "value": 688.13,
+            "unit": "ms"
+          },
+          {
+            "name": "postgresql_response_ingress_body p95 latency",
+            "value": 565.76,
+            "unit": "ms"
+          },
+          {
+            "name": "postgresql_response_ingress_body p99 latency",
+            "value": 632.32,
+            "unit": "ms"
+          },
+          {
+            "name": "postgresql_reply_target p95 latency",
+            "value": 348.67,
+            "unit": "ms"
+          },
+          {
+            "name": "postgresql_reply_target p99 latency",
+            "value": 381.7,
+            "unit": "ms"
+          },
+          {
+            "name": "postgresql_worker_ack_after_receive_observed p95 latency",
+            "value": 175.74,
+            "unit": "ms"
+          },
+          {
+            "name": "postgresql_worker_ack_after_receive_observed p99 latency",
+            "value": 406.78,
+            "unit": "ms"
+          },
+          {
+            "name": "kafka_worker_default_ack_observed p95 latency",
+            "value": 193.41,
+            "unit": "ms"
+          },
+          {
+            "name": "kafka_worker_default_ack_observed p99 latency",
+            "value": 213.63,
+            "unit": "ms"
+          },
+          {
+            "name": "kafka_response_ingress_header p95 latency",
+            "value": 945.66,
+            "unit": "ms"
+          },
+          {
+            "name": "kafka_response_ingress_header p99 latency",
+            "value": 1130.49,
+            "unit": "ms"
+          },
+          {
+            "name": "kafka_response_ingress_body p95 latency",
+            "value": 955.9,
+            "unit": "ms"
+          },
+          {
+            "name": "kafka_response_ingress_body p99 latency",
+            "value": 1085.44,
+            "unit": "ms"
+          },
+          {
+            "name": "kafka_reply_target p95 latency",
+            "value": 614.91,
+            "unit": "ms"
+          },
+          {
+            "name": "kafka_reply_target p99 latency",
+            "value": 636.93,
+            "unit": "ms"
+          },
+          {
+            "name": "kafka_worker_ack_after_enqueue_observed p95 latency",
+            "value": 187.65,
+            "unit": "ms"
+          },
+          {
+            "name": "kafka_worker_ack_after_enqueue_observed p99 latency",
+            "value": 327.17,
+            "unit": "ms"
+          },
+          {
+            "name": "sqlserver_request_response_success p95 latency",
+            "value": 1544.19,
+            "unit": "ms"
+          },
+          {
+            "name": "sqlserver_request_response_success p99 latency",
+            "value": 1559.55,
+            "unit": "ms"
+          },
+          {
+            "name": "sqlserver_worker_default_ack_observed p95 latency",
+            "value": 206.59,
+            "unit": "ms"
+          },
+          {
+            "name": "sqlserver_worker_default_ack_observed p99 latency",
+            "value": 339.2,
+            "unit": "ms"
+          },
+          {
+            "name": "sqlserver_response_ingress_header p95 latency",
+            "value": 816.13,
+            "unit": "ms"
+          },
+          {
+            "name": "sqlserver_response_ingress_header p99 latency",
+            "value": 962.56,
+            "unit": "ms"
+          },
+          {
+            "name": "sqlserver_response_ingress_body p95 latency",
+            "value": 824.32,
+            "unit": "ms"
+          },
+          {
+            "name": "sqlserver_response_ingress_body p99 latency",
+            "value": 959.49,
+            "unit": "ms"
+          },
+          {
+            "name": "sqlserver_reply_target p95 latency",
+            "value": 466.18,
+            "unit": "ms"
+          },
+          {
+            "name": "sqlserver_reply_target p99 latency",
+            "value": 473.86,
+            "unit": "ms"
+          },
+          {
+            "name": "sqlserver_worker_ack_after_enqueue_observed p95 latency",
+            "value": 298.75,
+            "unit": "ms"
+          },
+          {
+            "name": "sqlserver_worker_ack_after_enqueue_observed p99 latency",
+            "value": 320.77,
+            "unit": "ms"
+          },
+          {
+            "name": "mongodb_request_response_success p95 latency",
+            "value": 1620.99,
+            "unit": "ms"
+          },
+          {
+            "name": "mongodb_request_response_success p99 latency",
+            "value": 1715.2,
+            "unit": "ms"
+          },
+          {
+            "name": "mongodb_worker_default_ack_observed p95 latency",
+            "value": 231.68,
+            "unit": "ms"
+          },
+          {
+            "name": "mongodb_worker_default_ack_observed p99 latency",
+            "value": 389.63,
+            "unit": "ms"
+          },
+          {
+            "name": "mongodb_response_ingress_header p95 latency",
+            "value": 918.53,
+            "unit": "ms"
+          },
+          {
+            "name": "mongodb_response_ingress_header p99 latency",
+            "value": 1018.37,
+            "unit": "ms"
+          },
+          {
+            "name": "mongodb_response_ingress_body p95 latency",
+            "value": 1159.17,
+            "unit": "ms"
+          },
+          {
+            "name": "mongodb_response_ingress_body p99 latency",
+            "value": 1205.25,
+            "unit": "ms"
+          },
+          {
+            "name": "mongodb_reply_target p95 latency",
+            "value": 545.28,
+            "unit": "ms"
+          },
+          {
+            "name": "mongodb_reply_target p99 latency",
+            "value": 573.44,
+            "unit": "ms"
+          },
+          {
+            "name": "mongodb_worker_ack_after_enqueue_observed p95 latency",
+            "value": 163.2,
+            "unit": "ms"
+          },
+          {
+            "name": "mongodb_worker_ack_after_enqueue_observed p99 latency",
+            "value": 296.7,
             "unit": "ms"
           }
         ]
