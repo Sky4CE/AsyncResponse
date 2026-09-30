@@ -13,6 +13,12 @@ work that has landed on `main` but not yet shipped. Security reporters credited 
 
 ### Changed
 
+- **Testing package: a skew-forced in-process timer wait counts as parked.** A wake-up released
+  early by clock skew waits out a remainder above `TimerInProcessThreshold` in process (so it keeps
+  its skew proof), but the harness predicted every such remainder would suspend and counted the
+  job as still running user code, so each step of an `AdvanceAsync` over it spent the settle's
+  whole 500 ms real-time grace. The engine now reports that park to the harness through an
+  internal hook; the regression test that covers it went from ~46 s to ~2 s.
 - **Round-61 review (2026-09-30, re-review of every file changed since `1fc2b20`): a Cosmos DB ledger
   no longer disappears up to a second before it expires, and three documentation gaps are closed.**
   - *Durable flows — Cosmos DB.* Cosmos counts a document's TTL from `_ts`, which it truncates to

@@ -137,6 +137,16 @@ internal sealed class DurableFlowContext : IDurableFlowContext
             await invoke(observer, stepEvent).ConfigureAwait(false);
     }
 
+    /// <summary>Tells <see cref="IInProcessTimerParkObserver"/> observers a timer step is waiting in process.</summary>
+    private void NotifyTimerParkedInProcess(string stepName, DateTime waitEndsAtUtc)
+    {
+        foreach (var observer in _observers)
+        {
+            if (observer is IInProcessTimerParkObserver parkObserver)
+                parkObserver.OnTimerParkedInProcess(FlowId, stepName, waitEndsAtUtc);
+        }
+    }
+
     internal bool IsSuspended => _suspended;
 
     /// <summary>
@@ -361,6 +371,11 @@ internal sealed class DurableFlowContext : IDurableFlowContext
                     "this wake-up was released early because the transport's delay gate and the publishing clock disagree, so " +
                     "re-suspending would loop instead of sleeping. Fix the clock skew between the application and the broker/database.");
             }
+
+            // Above the threshold only a skew-forced wake-up (or a transport without delayed
+            // delivery) waits in process: observers told Waiting could not know it parks.
+            if (remaining > _options.TimerInProcessThreshold)
+                NotifyTimerParkedInProcess(name, UtcNow + wait);
 
             await WaitInProcessAsync(name, wakeAtUtc, wait, cancellationToken).ConfigureAwait(false);
             _lease.ThrowIfLost();

@@ -945,6 +945,21 @@ public sealed class AsyncResponseTestHarness : IAsyncDisposable
             }
         }
 
+        /// <summary>
+        /// The engine's own word that a timer waits in process: OnStepWaiting predicts suspension
+        /// for a remainder above the threshold, which a skew-forced wake-up does not do (it waits
+        /// the remainder out rather than re-suspend and lose its skew proof). Left uncounted, that
+        /// job read as running user code and every settle spent its whole real-time grace on it.
+        /// </summary>
+        private void OnTimerParkedInProcess(string flowId, string stepName, DateTime waitEndsAtUtc, int generation)
+        {
+            lock (_gate)
+            {
+                if (generation == _generation)
+                    _parked[(flowId, stepName)] = waitEndsAtUtc;
+            }
+        }
+
         private void OnStepCompleted(DurableFlowStepEvent step, int generation)
         {
             lock (_gate)
@@ -978,8 +993,11 @@ public sealed class AsyncResponseTestHarness : IAsyncDisposable
         }
 
         /// <summary>One incarnation's view of the probe (see <see cref="ForCurrentGeneration"/>).</summary>
-        private sealed class GenerationView(QuiesceProbe probe, int generation) : IDurableFlowExecutionObserver
+        private sealed class GenerationView(QuiesceProbe probe, int generation) : IDurableFlowExecutionObserver, IInProcessTimerParkObserver
         {
+            public void OnTimerParkedInProcess(string flowId, string stepName, DateTime waitEndsAtUtc)
+                => probe.OnTimerParkedInProcess(flowId, stepName, waitEndsAtUtc, generation);
+
             public ValueTask OnStepStartingAsync(DurableFlowStepEvent step)
             {
                 probe.OnStepStarting(step, generation);

@@ -231,6 +231,12 @@ public class DelayedWorkerTransportTests
         // and minted a fresh wake-up with the stall counters reset, adding a THIRD entry here and
         // one more for every skewed lap in production, which is the loop that never converged.
         Assert.Equal(2, run.StepExecutions("nap"));
+
+        // The harness knew the skew-forced wait was a park: the engine reports an in-process wait
+        // above the threshold, which the Waiting event alone predicts as a suspension. Counted as
+        // a job still running user code instead, every step of the 30-minute advance spent the
+        // settle's whole real-time grace (this test took ~45 s).
+        Assert.Equal(0, harness.Engine.SettleBudgetLapses);
     }
 
     /// <summary>Records every delayed hop; optionally fails each one (delayed capacity exhausted, host draining).</summary>
