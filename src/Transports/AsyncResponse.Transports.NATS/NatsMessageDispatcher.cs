@@ -107,12 +107,12 @@ internal sealed class NatsMessageDispatcher : IAsyncDisposable
         var cap = _subscriberOptions.MaxDeliveryAttempts;
         if (cap > 0 && delivery.NumDelivered > cap)
         {
-            _logger.LogError(
+            SafeLog.Try(() => _logger.LogError(
                 "Message on subject {Subject} ({Role}) arrived on delivery {NumDelivered} with a cap of {MaxDeliveryAttempts}; dead-lettering without executing it.",
                 delivery.Subject,
                 _role,
                 delivery.NumDelivered,
-                cap);
+                cap));
 
             var shouldTerminate = await DeadLetterAsync(
                 delivery,
@@ -129,11 +129,11 @@ internal sealed class NatsMessageDispatcher : IAsyncDisposable
                 }
                 catch (Exception ex)
                 {
-                    _logger.LogWarning(
+                    SafeLog.Try(() => _logger.LogWarning(
                         ex,
                         "Failed to TERM NATS message on subject {Subject} ({Role}) after dead-lettering; it may redeliver and be dead-lettered again.",
                         delivery.Subject,
-                        _role);
+                        _role));
                 }
             }
             else
@@ -152,7 +152,7 @@ internal sealed class NatsMessageDispatcher : IAsyncDisposable
 
         try
         {
-            await ExecuteHandlerAsync(delivery, cancellationToken).ConfigureAwait(false);
+            await ExecuteHandlerAsync(delivery, cancellationToken, inline: true).ConfigureAwait(false);
         }
         catch (OperationCanceledException ex) when (cancellationToken.IsCancellationRequested || ex is DurableFlowInterruptedException)
         {
@@ -203,16 +203,16 @@ internal sealed class NatsMessageDispatcher : IAsyncDisposable
         }
         catch (Exception ex)
         {
-            _logger.LogWarning(
+            SafeLog.Try(() => _logger.LogWarning(
                 ex,
                 "Failed to ACK NATS message on subject {Subject} ({Role}) after a successful handler; it may be redelivered.",
                 delivery.Subject,
-                _role);
+                _role));
         }
     }
 
     // Single choke point for handler execution so both ACK modes emit the consumer receive span.
-    private async Task ExecuteHandlerAsync(NatsJobDelivery delivery, CancellationToken cancellationToken)
+    private async Task ExecuteHandlerAsync(NatsJobDelivery delivery, CancellationToken cancellationToken, bool inline)
     {
         var activity = AsyncResponseDiagnostics.StartActivity(
             "asyncresponse.nats.receive",
@@ -232,10 +232,14 @@ internal sealed class NatsMessageDispatcher : IAsyncDisposable
         {
             await _handler(delivery, cancellationToken).ConfigureAwait(false);
         }
-        catch (Exception ex) when (ex is not DurableFlowInterruptedException)
+        catch (Exception ex) when (ex is not DurableFlowInterruptedException
+            && !(inline && ex is OperationCanceledException && cancellationToken.IsCancellationRequested))
         {
-            // The flow engine's host-stop hand-back is a shutdown, not a failed receive (parity
-            // with the other transports): no error span on every rolling deploy.
+            // The flow engine's host-stop hand-back and, on the inline path, a cancellation caused
+            // by this subscriber's own stopping token are shutdowns, not failed receives (parity
+            // with the other transports): no error span on every rolling deploy. On the early-ACK
+            // background path the token is the drain budget: its cancel strands an already-ACKed
+            // message, which is a failure (GooglePubSubMessageDispatcher parity).
             AsyncResponseDiagnostics.SetError(activity, ex);
             throw;
         }
@@ -250,7 +254,7 @@ internal sealed class NatsMessageDispatcher : IAsyncDisposable
         {
             try
             {
-                _logger.LogDebug("Background queue full for {Role}; pausing the consume loop until capacity frees.", _role);
+                SafeLog.Try(() => _logger.LogDebug("Background queue full for {Role}; pausing the consume loop until capacity frees.", _role));
 
                 // Wait for the slot, then re-check intake before taking it: a delivery parked here
                 // when a worker set HandBackSignalled was still enqueued and ACKed once a slot
@@ -290,18 +294,18 @@ internal sealed class NatsMessageDispatcher : IAsyncDisposable
                 // Subscriber stopping or dispatcher disposing while parked: the delivery was never
                 // enqueued, so NAK so JetStream redelivers elsewhere; if the NAK itself fails the
                 // AckWait lapses to the same effect.
-                _logger.LogDebug("Background queue unavailable for {Role} during shutdown; NAKing message for redelivery.", _role);
+                SafeLog.Try(() => _logger.LogDebug("Background queue unavailable for {Role} during shutdown; NAKing message for redelivery.", _role));
                 try
                 {
                     await delivery.NakAsync(_subscriberOptions.RedeliveryDelay).ConfigureAwait(false);
                 }
                 catch (Exception nakException)
                 {
-                    _logger.LogWarning(
+                    SafeLog.Try(() => _logger.LogWarning(
                         nakException,
                         "Failed to NAK NATS message on subject {Subject} ({Role}) while stopping; AckWait will lapse and it will be redelivered.",
                         delivery.Subject,
-                        _role);
+                        _role));
                 }
 
                 return;
@@ -319,11 +323,11 @@ internal sealed class NatsMessageDispatcher : IAsyncDisposable
         }
         catch (Exception ex)
         {
-            _logger.LogWarning(
+            SafeLog.Try(() => _logger.LogWarning(
                 ex,
                 "Failed to ACK NATS message on subject {Subject} ({Role}) after enqueueing it for background execution; it may be redelivered.",
                 delivery.Subject,
-                _role);
+                _role));
         }
     }
 
@@ -348,7 +352,7 @@ internal sealed class NatsMessageDispatcher : IAsyncDisposable
 
             try
             {
-                await ExecuteHandlerAsync(delivery, cancellationToken).ConfigureAwait(false);
+                await ExecuteHandlerAsync(delivery, cancellationToken, inline: false).ConfigureAwait(false);
             }
             catch (DurableFlowInterruptedException ex)
             {
@@ -463,12 +467,12 @@ internal sealed class NatsMessageDispatcher : IAsyncDisposable
         var maxAttempts = _subscriberOptions.MaxDeliveryAttempts;
         if (maxAttempts > 0 && delivery.NumDelivered >= maxAttempts)
         {
-            _logger.LogError(
+            SafeLog.Try(() => _logger.LogError(
                 exception,
                 "Message on subject {Subject} ({Role}) failed after {Attempts} attempts; dead-lettering.",
                 delivery.Subject,
                 _role,
-                delivery.NumDelivered);
+                delivery.NumDelivered));
 
             // CancellationToken.None like every other settlement in this package (the
             // pre-execution cap and the early-ACK failure path already pin it): burying a poison
@@ -489,31 +493,31 @@ internal sealed class NatsMessageDispatcher : IAsyncDisposable
                 }
                 catch (Exception ex)
                 {
-                    _logger.LogWarning(
+                    SafeLog.Try(() => _logger.LogWarning(
                         ex,
                         "Failed to TERM NATS message on subject {Subject} ({Role}) after dead-lettering; it may redeliver and be dead-lettered again.",
                         delivery.Subject,
-                        _role);
+                        _role));
                 }
             }
             else
             {
-                _logger.LogWarning(
+                SafeLog.Try(() => _logger.LogWarning(
                     exception,
                     "Dead-letter publish failed for subject {Subject} ({Role}); NAKing so the message can be retried.",
                     delivery.Subject,
-                    _role);
+                    _role));
                 await NakQuietlyAsync(delivery).ConfigureAwait(false);
             }
         }
         else
         {
-            _logger.LogWarning(
+            SafeLog.Try(() => _logger.LogWarning(
                 exception,
                 "Message on subject {Subject} ({Role}) failed on attempt {Attempt}; NAKing for redelivery.",
                 delivery.Subject,
                 _role,
-                delivery.NumDelivered);
+                delivery.NumDelivered));
             await NakQuietlyAsync(delivery).ConfigureAwait(false);
         }
     }
@@ -532,11 +536,11 @@ internal sealed class NatsMessageDispatcher : IAsyncDisposable
         }
         catch (Exception ex)
         {
-            _logger.LogWarning(
+            SafeLog.Try(() => _logger.LogWarning(
                 ex,
                 "Failed to NAK NATS message on subject {Subject} ({Role}); redelivery falls back to AckWait.",
                 delivery.Subject,
-                _role);
+                _role));
         }
     }
 
@@ -608,7 +612,7 @@ internal sealed class NatsMessageDispatcher : IAsyncDisposable
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "OnBackgroundFailure callback threw for {Role}.", _role);
+            SafeLog.Try(() => _logger.LogError(ex, "OnBackgroundFailure callback threw for {Role}.", _role));
         }
     }
 
@@ -650,7 +654,7 @@ internal sealed class NatsMessageDispatcher : IAsyncDisposable
         catch (Exception ex)
         {
             // WhenAll only completes once every worker has finished, so the source is safe to dispose here.
-            _logger.LogDebug(ex, "Background worker drain for {Role} ended with an error.", _role);
+            SafeLog.Try(() => _logger.LogDebug(ex, "Background worker drain for {Role} ended with an error.", _role));
             _backgroundCts!.Dispose();
             return;
         }
@@ -694,7 +698,7 @@ internal sealed class NatsMessageDispatcher : IAsyncDisposable
         catch (Exception ex)
         {
             ReportLostUndrained(unburied, routingReserve);
-            _logger.LogDebug(ex, "Background worker drain for {Role} ended with an error.", _role);
+            SafeLog.Try(() => _logger.LogDebug(ex, "Background worker drain for {Role} ended with an error.", _role));
             _backgroundCts.Dispose();
             return;
         }

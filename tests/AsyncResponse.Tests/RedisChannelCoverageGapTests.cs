@@ -419,6 +419,61 @@ public sealed class RedisChannelCoverageGapTests
         Assert.False(waiter.ResponseTask.IsCompleted);
     }
 
+    [Fact]
+    public async Task Cleanup_AnExecutorRetirementThatThrows_WithAThrowingLogger_DoesNotFaultDisposal()
+    {
+        // r3/R3-11: the tracked retirement's catch logged unguarded, so a throwing logger faulted
+        // the task DisposeAsync joins ("the bodies swallow, so this cannot throw").
+        var gate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var logger = new GatedThrowingLogger(entered, gate.Task);
+        var channel = new RedisAsyncResponseChannel(
+            new ServiceCollection().BuildServiceProvider().GetRequiredService<IServiceScopeFactory>(),
+            _multiplexer.Object,
+            _store.Object,
+            Options.Create(new RedisAsyncResponseOptions { DefaultTimeout = TimeSpan.FromSeconds(5), RecoveryStateExpiry = TimeSpan.FromMinutes(5) }),
+            new AsyncResponseContextPropagation([]),
+            logger,
+            _subscriber);
+        // A registry whose dispose budget cannot be armed: retiring a live executor throws.
+        var registry = new SerialExecutorRegistry(NullLogger.Instance, disposeDrainLimit: TimeSpan.FromMilliseconds(-5));
+        typeof(RedisAsyncResponseChannel)
+            .GetField("_executors", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!
+            .SetValue(channel, registry);
+        var waiter = await channel.CreateResponseWaiter<OperationResult>("corr-retire-throws");
+        Assert.True(await registry.EnqueueAsync("asyncresponse:response:corr-retire-throws", () => Task.CompletedTask));
+
+        try
+        {
+            await waiter.DisposeAsync();
+            await entered.Task.WaitAsync(TimeSpan.FromSeconds(10)); // the tracked retirement is parked in its catch's log call
+            var disposal = channel.DisposeAsync().AsTask();
+            gate.TrySetResult();
+            await disposal.WaitAsync(TimeSpan.FromSeconds(10));
+        }
+        finally
+        {
+            gate.TrySetResult();
+        }
+    }
+
+    private sealed class GatedThrowingLogger(TaskCompletionSource entered, Task gate) : ILogger<RedisAsyncResponseChannel>
+    {
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+        public bool IsEnabled(LogLevel logLevel) => true;
+
+        public void Log<TState>(LogLevel logLevel, EventId eventId, TState state, Exception? exception, Func<TState, Exception?, string> formatter)
+        {
+            var message = formatter(state, exception);
+            if (!message.Contains("Failed to retire the executor", StringComparison.Ordinal))
+                return;
+
+            entered.TrySetResult();
+            gate.Wait(TimeSpan.FromSeconds(10));
+            throw new InvalidOperationException("Logger provider failed while logging: " + message);
+        }
+    }
+
     // ---------------------------------------------------------------- helpers
 
     private const int ExecutorCapacity = 1024;

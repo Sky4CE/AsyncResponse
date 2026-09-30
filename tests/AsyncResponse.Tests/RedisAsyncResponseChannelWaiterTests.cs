@@ -265,6 +265,35 @@ public class RedisAsyncResponseChannelWaiterTests
     }
 
     [Fact]
+    public async Task CreateResponseWaiter_TerminalDeliveryInsideSubscribe_SkipsTheSaveAndItsCompensatingDelete()
+    {
+        // r3/R3-03: cleanup already started before the save, so the save is skipped; the
+        // compensating delete existed only for a save that ran, and issuing it anyway cost a
+        // round trip and, when it failed, logged a false "registration remains until TTL".
+        _channelSubscriber.InvokeOnSubscribe =
+            """{"SchemaVersion":1,"Success":true,"Payload":{"Status":2,"Message":"inline"},"ExceptionMessage":null,"ExceptionStackTrace":null}""";
+        var cleanupDelete = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        _store.Setup(s => s.TryDeleteAsync(It.IsAny<string>(), It.IsAny<Guid>(), It.IsAny<CancellationToken>()))
+            .Callback(() => cleanupDelete.TrySetResult())
+            .ThrowsAsync(new InvalidOperationException("delete failed"));
+        var logger = new RecordingThrowingLogger<RedisAsyncResponseChannel>();
+        var channel = CreateChannel(new RedisAsyncResponseOptions
+        {
+            DefaultTimeout = TimeSpan.FromSeconds(5),
+            RecoveryStateExpiry = TimeSpan.FromMinutes(5)
+        }, logger);
+        // The cleanup's recovery delete runs right after CleanupStarted is latched: awaiting it
+        // pins "cleanup started before SubscribeAsync returned" on the actual signal.
+        _channelSubscriber.AfterInvokeOnSubscribe = _ => cleanupDelete.Task.WaitAsync(TimeSpan.FromSeconds(30));
+
+        await using var waiter = await channel.CreateResponseWaiter<OperationResult>("corr-inline-skip-save");
+
+        Assert.Equal(OperationStatus.Completed, (await waiter.ResponseTask).Status);
+        _store.Verify(s => s.SaveAsync(It.IsAny<string>(), It.IsAny<RecoveryState>(), It.IsAny<TimeSpan>(), It.IsAny<CancellationToken>()), Times.Never);
+        Assert.False(logger.HasEntry(LogLevel.Error, "Post-save recovery-state compensation delete failed"));
+    }
+
+    [Fact]
     public async Task CreateResponseWaiter_CompletesFromSubscribedRedisMessage()
     {
         var channel = CreateChannel();
@@ -708,6 +737,29 @@ public class RedisAsyncResponseChannelWaiterTests
 
         var ex = await Assert.ThrowsAsync<TimeoutException>(() => waiter.ResponseTask.WaitAsync(TimeSpan.FromSeconds(5)));
         Assert.Contains("corr-timeout-throws-settle", ex.Message);
+    }
+
+    [Fact]
+    public async Task WaiterTimeout_WhoseCleanupFails_WithAThrowingLogger_DoesNotFaultTheTimeoutTask()
+    {
+        // Regression (fixpoint r3 R3-11/E4): the timeout body runs fire-and-forget, and its catch
+        // logged unguarded — a failing cleanup plus a throwing provider left a faulted task nobody
+        // observes. The body is awaited directly here (OnTimeout discards it).
+        var logger = new RecordingThrowingLogger<RedisAsyncResponseChannel> { ThrowOnMessageContaining = "Error handling waiter timeout" };
+        var options = new RedisAsyncResponseOptions { DefaultTimeout = TimeSpan.FromSeconds(5), RecoveryStateExpiry = TimeSpan.FromMinutes(5) };
+        var channel = CreateChannel(options, logger);
+        // Not disposed: its latched cleanup is the one this test makes fail.
+        var waiter = await channel.CreateResponseWaiter<OperationResult>("corr-timeout-cleanup-fails", timeout: TimeSpan.FromMinutes(10));
+        var subscription = _channelSubscriber.Handler!.Target!;
+
+        // An unusable drain budget: the drain cannot be armed and the unsubscribe wait throws, so
+        // the cleanup faults into the timeout body's catch.
+        options.DisposalDrainTimeout = TimeSpan.FromMilliseconds(-5);
+        var body = subscription.GetType().GetMethod("HandleTimeoutAsync", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!;
+
+        await ((Task)body.Invoke(subscription, null)!).WaitAsync(TimeSpan.FromSeconds(30));
+
+        await Assert.ThrowsAsync<AsyncResponseIndeterminateDeliveryException>(() => waiter.ResponseTask);
     }
 
     [Fact]

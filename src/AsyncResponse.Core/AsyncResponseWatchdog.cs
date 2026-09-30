@@ -696,7 +696,8 @@ internal sealed class AsyncResponseWatchdog : BackgroundService
         }
         catch (Exception ex)
         {
-            _logger.LogDebug(ex, "Recovery watchdog failed to probe subscribers for correlationId {CorrelationId}.", correlationId);
+            _logger.LogDebug(ex, "Recovery watchdog failed to probe subscribers for correlationId {CorrelationId}.",
+                DiagnosticText.EscapedExcerpt(correlationId, AsyncResponseChannelOptions.MaxCorrelationIdLength));
             return -1;
         }
     }

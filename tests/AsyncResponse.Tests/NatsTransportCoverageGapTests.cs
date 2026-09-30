@@ -242,34 +242,25 @@ public sealed class NatsTransportCoverageGapTests
     }
 
     /// <summary>
-    /// A worker that faults outside its handler guard (a logging provider throwing from the
-    /// OnBackgroundFailure failure log) while the stop-time reserve waits for it: DisposeAsync
-    /// logs the fault and returns instead of rethrowing it into the subscriber's stop.
+    /// A logging provider that throws from the OnBackgroundFailure failure log while the stop-time
+    /// reserve waits for the worker: the log is guarded, so the worker does not fault, the
+    /// handler failure is still dead-lettered and DisposeAsync returns without a drain error.
+    /// (Before the guard this throw faulted the worker outside its handler guard.)
     /// </summary>
     [Fact]
-    public async Task EarlyAck_AWorkerFaultingDuringTheReserve_DoesNotEscapeDisposeAsync()
+    public async Task EarlyAck_AThrowingLoggerDuringTheReserve_DoesNotFaultTheWorkerOrEscapeDisposeAsync()
     {
         var jetStream = new FakeNatsJetStreamTransport();
         var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        var faultLogged = new ManualResetEventSlim();
         var logger = new HookLogger
         {
             OnLog = message =>
             {
                 if (message.Contains("did not drain within", StringComparison.Ordinal))
-                {
-                    // The drain budget has lapsed: let the wedged handler fail now, and hold the
-                    // dispose thread until the worker is on its way to faulting, so the fault
-                    // lands inside the reserve that is about to start.
                     release.TrySetResult();
-                    faultLogged.Wait(HangGuard);
-                }
                 else if (message.Contains("OnBackgroundFailure callback threw", StringComparison.Ordinal))
-                {
-                    faultLogged.Set();
                     throw new InvalidOperationException("logging provider failed");
-                }
             }
         };
         var subscriber = new NatsSubscriberOptions().UseAckAfterEnqueue(backgroundWorkerCount: 1, backgroundQueueCapacity: 8, TimeSpan.FromSeconds(1));
@@ -287,11 +278,16 @@ public sealed class NatsTransportCoverageGapTests
 
         await dispatcher.HandleAsync(new RecordingDelivery().Create("p1", numDelivered: 1), CancellationToken.None);
         await started.Task.WaitAsync(HangGuard);
-
         await dispatcher.DisposeAsync().AsTask().WaitAsync(HangGuard);
 
-        Assert.True(logger.Has(LogLevel.Debug, "Background worker drain for Worker ended with an error."));
-        // The handler failure was still dead-lettered before the worker faulted.
+        // The worker finishes on its own even when the reserve lapsed first; wait for it, not for time.
+        var workers = (Task[])dispatcher.GetType()
+            .GetField("_backgroundWorkers", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!
+            .GetValue(dispatcher)!;
+        await Task.WhenAll(workers).WaitAsync(HangGuard);
+
+        Assert.True(logger.Has(LogLevel.Error, "OnBackgroundFailure callback threw"));
+        Assert.False(logger.Has(LogLevel.Debug, "Background worker drain for Worker ended with an error."));
         Assert.Equal(DeadLetterSubject, Assert.Single(jetStream.Published).Subject);
     }
 

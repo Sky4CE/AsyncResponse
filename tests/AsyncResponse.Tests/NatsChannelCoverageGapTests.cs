@@ -250,6 +250,88 @@ public sealed class NatsChannelCoverageGapTests
         Assert.True(_logger.HasEntry(LogLevel.Error, "Post-save recovery-state compensation delete failed for correlationId corr-nats-compensate"));
     }
 
+    [Fact]
+    public async Task OverloadDuringSave_AThrowingLoggerOnTheFailedCompensation_DoesNotReplaceTheWaiterWithTheLoggersFault()
+    {
+        // r3/R3-07: the compensation's LogError was unguarded (Redis wraps it in SafeLog). An
+        // overload fault is not a "delivery" (SettledByDelivery is false), so a throwing provider
+        // escaped the outer filter and CreateResponseWaiter threw the logger's exception.
+        _logger.ThrowOnMessageContaining = "compensation delete failed";
+        var saveStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var cleanupDeleteIssued = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var deletes = 0;
+        _store.Setup(s => s.SaveAsync(It.IsAny<string>(), It.IsAny<RecoveryState>(), It.IsAny<TimeSpan>(), It.IsAny<CancellationToken>()))
+            .Returns(async () =>
+            {
+                saveStarted.TrySetResult();
+                await cleanupDeleteIssued.Task;
+            });
+        _store.Setup(s => s.TryDeleteAsync(It.IsAny<string>(), It.IsAny<Guid>(), It.IsAny<CancellationToken>()))
+            .Returns(() =>
+            {
+                if (Interlocked.Increment(ref deletes) == 1)
+                {
+                    cleanupDeleteIssued.TrySetResult();
+                    return Task.FromResult(true);
+                }
+
+                return Task.FromException<bool>(new InvalidOperationException("delete failed"));
+            });
+        var channel = CreateChannel();
+
+        var waiterTask = channel.CreateResponseWaiter<OperationResult>("corr-nats-compensate-log");
+        await saveStarted.Task.WaitAsync(HangGuard);
+        _client.DropMessage(buffered: 16_384);
+
+        await using var waiter = await waiterTask.WaitAsync(HangGuard);
+        await Assert.ThrowsAsync<AsyncResponseIndeterminateDeliveryException>(() => waiter.ResponseTask);
+    }
+
+    [Fact]
+    public async Task TerminalDeliveryBeforeSave_SkipsTheSaveAndItsCompensatingDelete()
+    {
+        // r3/R3-06: cleanup started before the save, so the save is skipped; the compensating
+        // delete (unbounded, tokenless) for a row never written was a wasted KV round trip.
+        var cleanupDeleteIssued = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var deletes = 0;
+        _client.FlushBehavior = async _ =>
+        {
+            _client.Push(Envelope("early"));
+            await cleanupDeleteIssued.Task.WaitAsync(HangGuard);
+        };
+        _store.Setup(s => s.TryDeleteAsync(It.IsAny<string>(), It.IsAny<Guid>(), It.IsAny<CancellationToken>()))
+            .Returns(() =>
+            {
+                if (Interlocked.Increment(ref deletes) == 1)
+                {
+                    cleanupDeleteIssued.TrySetResult();
+                    return Task.FromResult(true);
+                }
+
+                return Task.FromException<bool>(new InvalidOperationException("delete failed"));
+            });
+        var channel = CreateChannel();
+
+        await using var waiter = await channel.CreateResponseWaiter<OperationResult>("corr-nats-early").WaitAsync(HangGuard);
+
+        Assert.Equal("early", (await waiter.ResponseTask).Message);
+        _store.Verify(s => s.SaveAsync(It.IsAny<string>(), It.IsAny<RecoveryState>(), It.IsAny<TimeSpan>(), It.IsAny<CancellationToken>()), Times.Never);
+        Assert.False(_logger.HasEntry(LogLevel.Error, "Post-save recovery-state compensation delete failed"));
+    }
+
+    [Fact]
+    public async Task AbandonedSubscribe_ThatFailsWhileTheLoggerThrows_DoesNotFaultTheFireAndForgetTask()
+    {
+        // r3/R3-08: DisposeLateSubscriptionAsync is discarded (`_ =`), so its catch must not log
+        // unguarded: a throwing provider left the task faulted and unobserved.
+        _logger.ThrowOnMessageContaining = "Abandoned subscribe";
+        var channel = CreateChannel();
+        var method = typeof(NatsAsyncResponseChannel).GetMethod("DisposeLateSubscriptionAsync", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!;
+        var pending = Task.FromException<INatsChannelSubscription>(new InvalidOperationException("the subscribe failed late"));
+
+        await ((Task)method.Invoke(channel, [pending, "subj"])!).WaitAsync(HangGuard);
+    }
+
     // ---------------------------------------------------------------- client adapters
 
     [Fact]

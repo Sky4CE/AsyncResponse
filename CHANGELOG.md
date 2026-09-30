@@ -13,6 +13,23 @@ work that has landed on `main` but not yet shipped. Security reporters credited 
 
 ### Changed
 
+- **Round-54 review (2026-09-30, whole-repository review of `ce3a5a6`): the NATS dispatcher settles
+  poison messages even when logging throws, and the round-52/53 recovery-registration fixes stop
+  issuing a compensating delete for a save they skipped.**
+  - *Durable flows — docs.* `IDurableFlows.ResumeAsync` documents its `InvalidOperationException`
+    for an unknown or expired id and the no-op for a suspended run.
+  - *NATS transport.* An inline handler cancelled by the subscriber's own stopping token no longer
+    marks the receive span as an error (an early-ACK job the drain lapse cancels still does). The
+    attempt-cap, TERM/NAK/ACK, failure-callback, early-ACK shutdown and disposal-drain log calls are
+    guarded, so a throwing logging provider can no longer leave a poison message unburied, skip
+    the NAK or escape disposal.
+  - *Recovery — Redis and NATS channels.* When the recovery save was skipped because the wait had
+    already settled, the post-save compensating delete (and its error log) still ran; it now runs
+    only when the save did.
+  - *Resilience — Redis and NATS channels, watchdog.* The NATS compensation and abandoned-subscribe
+    logs and the Redis executor-retirement and waiter-timeout logs no longer let a throwing logger
+    fault the wait or disposal. The watchdog's probe-failure log escapes and bounds the correlation
+    id like its other logs.
 - **Round-53 review (2026-09-30, whole-repository review of `b50e93f`): the NATS channel gets the
   round-52 settlement fixes, and two durable-flow start/failure paths no longer act on a stale view.**
   - *Durable flows — start.* `StartAsync` with an explicit flow id decided that the id was bound to

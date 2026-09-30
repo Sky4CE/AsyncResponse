@@ -86,8 +86,12 @@ public interface IDurableFlows
 
     /// <summary>
     /// Re-enqueues execution of an existing run — completed steps are skipped and the in-flight
-    /// awaited step re-attaches. No-op for runs that already succeeded or failed.
+    /// awaited step re-attaches. No-op for runs that already succeeded or failed, and for runs
+    /// that are suspended (set a suspended run back to running first).
     /// </summary>
+    /// <exception cref="InvalidOperationException">
+    /// No ledger exists for <paramref name="flowId"/> (unknown, expired, or unreadable id).
+    /// </exception>
     Task ResumeAsync(string flowId, CancellationToken cancellationToken = default);
 
     /// <summary>Loads a snapshot of the flow run's state, or <c>null</c> when unknown or expired.</summary>

@@ -838,9 +838,15 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
                 Context = _propagation.Capture()
             };
             // A wait a delivery already settled and cleaned up needs no registration.
+            var saveIssued = false;
             if (Volatile.Read(ref cleanupStarted) == 0)
+            {
+                saveIssued = true;
                 await _recoveryStateStore.SaveAsync(correlationId, recoveryState, _options.RecoveryStateExpiry, registrationCancellation.Token).ConfigureAwait(false);
-            if (Volatile.Read(ref cleanupStarted) != 0)
+            }
+
+            // Compensate only where a save was actually issued: a skipped save wrote nothing.
+            if (saveIssued && Volatile.Read(ref cleanupStarted) != 0)
             {
                 // A terminal delivery on the already-running consume loop started cleanup while
                 // this registration was still being written: cleanup's delete ran before the save
@@ -854,7 +860,7 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
                 }
                 catch (Exception ex)
                 {
-                    _logger.LogError(ex, "Post-save recovery-state compensation delete failed for correlationId {CorrelationId}; the registration remains until TTL.", correlationId);
+                    SafeLog.Try(() => _logger.LogError(ex, "Post-save recovery-state compensation delete failed for correlationId {CorrelationId}; the registration remains until TTL.", correlationId));
                 }
             }
 
@@ -1002,7 +1008,8 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
         }
         catch (Exception ex)
         {
-            _logger.LogDebug(ex, "Abandoned subscribe for subject {Subject} ended.", subject);
+            // Guarded: this task is fire-and-forget, so a throwing logger would fault it unobserved.
+            SafeLog.Try(() => _logger.LogDebug(ex, "Abandoned subscribe for subject {Subject} ended.", subject));
         }
     }
 

@@ -329,6 +329,26 @@ public class AsyncResponseWatchdogLoopTests
     }
 
     [Fact]
+    public async Task SubscriberProbeFailure_LogsTheCorrelationIdEscaped()
+    {
+        var logger = new CollectingLogger();
+        var state = new AsyncResponseWatchdogState();
+        var watchdog = new AsyncResponseWatchdog(
+            [new FakeScanner(StaleEntry("probe\r\n[Error] forged" + new string('c', 100_000)))],
+            [new ThrowingProbe()],
+            state,
+            Options(enabled: true),
+            logger.For<AsyncResponseWatchdog>());
+
+        await RunUntilPublishedAsync(watchdog, state);
+
+        var message = Assert.Single(logger.Messages, m => m.StartsWith("Recovery watchdog failed to probe", StringComparison.Ordinal));
+        Assert.DoesNotContain('\r', message);
+        Assert.DoesNotContain('\n', message);
+        Assert.True(message.Length < 5_000);
+    }
+
+    [Fact]
     public async Task ProbeConcurrencyOne_ProbesStrictlySequentially()
     {
         var state = new AsyncResponseWatchdogState();

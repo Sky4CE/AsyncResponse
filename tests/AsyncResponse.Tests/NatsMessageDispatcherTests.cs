@@ -184,6 +184,133 @@ public class NatsMessageDispatcherTests
     }
 
     [Fact]
+    public async Task HandlerCanceledByTheSubscribersStoppingToken_DoesNotMarkTheReceiveSpanError()
+    {
+        // Regression (fixpoint r3 R3-02): the receive span was marked an error for every exception
+        // but the flow hand-back, including the cancellation caused by the subscriber's own stop —
+        // which HandleAsync treats as a host stop (cancellation != failure).
+        using var collector = new AsyncResponseActivityCollector();
+        using var stopping = new CancellationTokenSource();
+        await using var dispatcher = CreateDispatcher(
+            (_, token) =>
+            {
+                stopping.Cancel();
+                token.ThrowIfCancellationRequested();
+                return Task.CompletedTask;
+            },
+            new NatsSubscriberOptions());
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            () => dispatcher.HandleAsync(new RecordingDelivery().Create("payload", numDelivered: 1), stopping.Token));
+
+        var activity = collector.Single("asyncresponse.nats.receive", "asyncresponse.transport", "nats");
+        Assert.NotEqual(ActivityStatusCode.Error, activity.Status);
+    }
+
+    [Fact]
+    public async Task EarlyAck_BackgroundHandlerCanceledByTheDrainLapse_StillMarksTheReceiveSpanError()
+    {
+        // Regression (fixpoint r3 E2): the stopping-token exemption sat in the shared handler path,
+        // so the drain-lapse cancel of an already-ACKed message (lost unless OnBackgroundFailure
+        // records it) got a non-error span. Only the inline path's host stop is exempt.
+        using var collector = new AsyncResponseActivityCollector();
+        var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var failure = new TaskCompletionSource<NatsBackgroundFailureContext>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var subscriber = new NatsSubscriberOptions
+        {
+            OnBackgroundFailure = ctx =>
+            {
+                failure.TrySetResult(ctx);
+                return ValueTask.CompletedTask;
+            }
+        }.UseAckAfterEnqueue(backgroundWorkerCount: 1, backgroundQueueCapacity: 4, backgroundDrainTimeout: TimeSpan.FromMilliseconds(50));
+        var dispatcher = CreateDispatcher(
+            async (_, cancellationToken) =>
+            {
+                started.TrySetResult();
+                await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
+            },
+            subscriber);
+
+        await dispatcher.HandleAsync(new RecordingDelivery().Create("payload", numDelivered: 1), CancellationToken.None);
+        await started.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await dispatcher.DisposeAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.IsAssignableFrom<OperationCanceledException>((await failure.Task.WaitAsync(TimeSpan.FromSeconds(5))).Exception);
+        var activity = collector.Single("asyncresponse.nats.receive", "asyncresponse.transport", "nats");
+        Assert.Equal(ActivityStatusCode.Error, activity.Status);
+    }
+
+    [Theory]
+    [InlineData("Background queue full", false)]
+    [InlineData("Background queue unavailable", false)]
+    [InlineData("Failed to NAK", true)]
+    public async Task EarlyAck_ParkedDeliveryWhileStopping_WithAThrowingLoggerProvider_IsStillNaked(string throwOn, bool nakFails)
+    {
+        // Regression (fixpoint r3 E3): the parked/shutdown path of the early-ACK intake logged
+        // unguarded, so a throwing provider escaped HandleAsync (before the NAK, for the first two).
+        var logger = new RecordingThrowingLogger<NatsMessageDispatcherTests> { ThrowOnMessageContaining = throwOn };
+        var handlerStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseHandler = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        await using var dispatcher = CreateDispatcher(
+            (_, _) =>
+            {
+                handlerStarted.TrySetResult();
+                return releaseHandler.Task;
+            },
+            new NatsSubscriberOptions().UseAckAfterEnqueue(backgroundWorkerCount: 1, backgroundQueueCapacity: 1, backgroundDrainTimeout: TimeSpan.FromSeconds(5)),
+            logger: logger);
+
+        var parked = new RecordingDelivery { NakException = nakFails ? new InvalidOperationException("nak failed") : null };
+        await dispatcher.HandleAsync(new RecordingDelivery().Create("payload", numDelivered: 1), CancellationToken.None);
+        await handlerStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await dispatcher.HandleAsync(new RecordingDelivery().Create("payload", numDelivered: 1), CancellationToken.None);
+
+        using var stopping = new CancellationTokenSource();
+        await stopping.CancelAsync();
+        await dispatcher.HandleAsync(parked.Create("payload", numDelivered: 1), stopping.Token).WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.Single(parked.Naks);
+        Assert.Equal(0, parked.Acks);
+        releaseHandler.TrySetResult();
+    }
+
+    [Fact]
+    public async Task OverCapDelivery_WithAThrowingLoggerProvider_StillDeadLettersAndTerms()
+    {
+        // Regression (fixpoint r3 R3-09): the cap paths logged unguarded before settling, so a
+        // throwing provider escaped HandleAsync before the dead-letter and the poison message was
+        // never buried.
+        var logger = new RecordingThrowingLogger<NatsMessageDispatcherTests> { ThrowOnMessageContaining = "dead-lettering without executing" };
+        var rec = new RecordingDelivery();
+        await using var dispatcher = CreateDispatcher(
+            (_, _) => Task.CompletedTask,
+            new NatsSubscriberOptions { MaxDeliveryAttempts = 3 },
+            logger: logger);
+
+        await dispatcher.HandleAsync(rec.Create("payload", numDelivered: 4), CancellationToken.None);
+
+        Assert.Single(_jetStream.Published);
+        Assert.Equal(1, rec.Terms);
+    }
+
+    [Fact]
+    public async Task FailureAtTheCap_WithAThrowingLoggerProvider_StillDeadLettersAndTerms()
+    {
+        var logger = new RecordingThrowingLogger<NatsMessageDispatcherTests> { ThrowOnMessageContaining = "dead-lettering." };
+        var rec = new RecordingDelivery();
+        await using var dispatcher = CreateDispatcher(
+            (_, _) => throw new InvalidOperationException("boom"),
+            new NatsSubscriberOptions { MaxDeliveryAttempts = 3 },
+            logger: logger);
+
+        await dispatcher.HandleAsync(rec.Create("payload", numDelivered: 3), CancellationToken.None);
+
+        Assert.Single(_jetStream.Published);
+        Assert.Equal(1, rec.Terms);
+    }
+
+    [Fact]
     public async Task ShutdownCancellation_AtMaxAttempts_LeavesDeliveryUnsettled()
     {
         // Regression (r23): a graceful drain cancelling the stoppingToken while user code was in

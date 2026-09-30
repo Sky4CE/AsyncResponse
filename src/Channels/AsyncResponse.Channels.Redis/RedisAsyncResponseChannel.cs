@@ -311,9 +311,17 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
             // A wait a pumped-in delivery already settled and cleaned up needs no registration:
             // writing one would only leave it to a best-effort compensating delete (and, if that
             // delete fails, to a spurious recovery callback for the id until the expiry).
+            var saveIssued = false;
             if (!subscription.CleanupStarted)
+            {
+                saveIssued = true;
                 await _recoveryStateStore.SaveAsync(correlationId, recoveryState, _options.RecoveryStateExpiry).ConfigureAwait(false);
-            if (subscription.CleanupStarted)
+            }
+
+            // Compensate only where a save was actually issued: a skipped save wrote nothing, and
+            // a delete of a row that never existed is a wasted round trip whose failure would log
+            // a false "registration remains until TTL".
+            if (saveIssued && subscription.CleanupStarted)
             {
                 // A terminal delivery started cleanup while this registration was still being
                 // written: cleanup's delete ran before the save committed, so the save just
@@ -506,36 +514,44 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
         }
 
         private void OnTimeout()
-            => _ = Task.Run(async () =>
+            => _ = Task.Run(HandleTimeoutAsync);
+
+        /// <summary>
+        /// The timeout body, run fire-and-forget by <see cref="OnTimeout"/>: nothing awaits it, so it
+        /// must never fault.
+        /// </summary>
+        private async Task HandleTimeoutAsync()
+        {
+            try
             {
-                try
-                {
-                    // Logged/tagged through SafeLog, and only once the drain confirms the timeout
-                    // actually won: an in-flight delivery mid Until-predicate on a terminal message
-                    // can still win the race inside the drain below, in which case TrySetException
-                    // is a no-op and reporting "timeout" here would be a false diagnostic for a wait
-                    // that in fact carries a delivered result (mirrors OnOverloadedAsync and the
-                    // drain-lapse branch of DrainThenCleanupAsync, which log only when their fault
-                    // wins). A throwing logger or metrics listener must still not skip
-                    // DrainThenCleanupAsync below — the in-memory channel settles first for the same
-                    // reason, and a throw here would otherwise leave ResponseTask pending with the
-                    // SUBSCRIBE, executor and recovery registration leaked until disposal.
-                    await DrainThenCleanupAsync(
-                        new TimeoutException($"Timed out waiting for response for correlationId {_correlationId}."),
-                        onTerminalSettled: () =>
-                        {
-                            SafeLog.Try(() => _owner._logger.LogWarning("Timed out waiting for response for correlationId {CorrelationId}.", _correlationId));
-                            SafeLog.Try(() => AsyncResponseDiagnostics.SetError(_activity, "timeout", $"Timed out waiting for response for correlationId {_correlationId}."));
-                            SafeLog.Try(() => AsyncResponseDiagnostics.RecordWaiterTimeout("redis"));
-                        })
-                        .ConfigureAwait(false);
-                }
-                catch (Exception ex)
-                {
-                    // Fire-and-forget: nothing awaits this task, so an escaped fault would vanish.
-                    _owner._logger.LogError(ex, "Error handling waiter timeout for correlationId {CorrelationId}.", _correlationId);
-                }
-            });
+                // Logged/tagged through SafeLog, and only once the drain confirms the timeout
+                // actually won: an in-flight delivery mid Until-predicate on a terminal message
+                // can still win the race inside the drain below, in which case TrySetException
+                // is a no-op and reporting "timeout" here would be a false diagnostic for a wait
+                // that in fact carries a delivered result (mirrors OnOverloadedAsync and the
+                // drain-lapse branch of DrainThenCleanupAsync, which log only when their fault
+                // wins). A throwing logger or metrics listener must still not skip
+                // DrainThenCleanupAsync below — the in-memory channel settles first for the same
+                // reason, and a throw here would otherwise leave ResponseTask pending with the
+                // SUBSCRIBE, executor and recovery registration leaked until disposal.
+                await DrainThenCleanupAsync(
+                    new TimeoutException($"Timed out waiting for response for correlationId {_correlationId}."),
+                    onTerminalSettled: () =>
+                    {
+                        SafeLog.Try(() => _owner._logger.LogWarning("Timed out waiting for response for correlationId {CorrelationId}.", _correlationId));
+                        SafeLog.Try(() => AsyncResponseDiagnostics.SetError(_activity, "timeout", $"Timed out waiting for response for correlationId {_correlationId}."));
+                        SafeLog.Try(() => AsyncResponseDiagnostics.RecordWaiterTimeout("redis"));
+                    })
+                    .ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                // Fire-and-forget: nothing awaits this task, so an escaped fault would vanish.
+                SafeLog.Try(
+                    (_owner._logger, ex, _correlationId),
+                    static s => s._logger.LogError(s.ex, "Error handling waiter timeout for correlationId {CorrelationId}.", s._correlationId));
+            }
+        }
 
         /// <summary>
         /// Receives pub/sub messages from the async subscription and admits them to the
@@ -896,7 +912,10 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
                     }
                     catch (Exception ex)
                     {
-                        _owner._logger.LogError(ex, "Failed to retire the executor for channel {Channel}.", ChannelName);
+                        // SafeLog: DisposeAsync joins this task and relies on it never faulting.
+                        SafeLog.Try(
+                            (Logger: _owner._logger, Error: ex, Channel: ChannelName),
+                            static state => state.Logger.LogError(state.Error, "Failed to retire the executor for channel {Channel}.", state.Channel));
                     }
                 }));
 
