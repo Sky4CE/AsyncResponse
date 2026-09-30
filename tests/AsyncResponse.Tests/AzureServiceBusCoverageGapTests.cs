@@ -1,3 +1,4 @@
+using AsyncResponse.Testing;
 using AsyncResponse.Transports.AzureServiceBus;
 using Azure.Messaging.ServiceBus;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -51,6 +52,49 @@ public sealed class AzureServiceBusCoverageGapTests
         finally
         {
             releaseRenew.TrySetResult();
+            await subscriber.StopAsync(CancellationToken.None);
+        }
+    }
+
+    [Fact]
+    public async Task RenewalJoin_IsBoundedByTheInjectedClock()
+    {
+        // The join waited on the system clock while the stop path's other bounds use Clock, so a
+        // virtual-clock stop could never reach it: a renew ignoring cancellation held the loop for
+        // the real ShutdownTimeout (here 60 seconds).
+        var clock = new VirtualTimeProvider();
+        var renewStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseRenew = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var hooks = new Hooks
+        {
+            Renew = async _ =>
+            {
+                renewStarted.TrySetResult();
+                await releaseRenew.Task;
+            }
+        };
+        var logger = new CollectingLogger();
+        var ingress = new Mock<IAsyncResponseIngress>();
+        ingress.Setup(i => i.HandleWorkerMessageAsync("first")).Returns(() => renewStarted.Task);
+        var options = WorkerOptions();
+        options.ShutdownTimeout = TimeSpan.FromSeconds(60);
+        options.HostShutdownTimeout = TimeSpan.FromMinutes(5);
+        options.WorkerSubscriber.LockRenewalInterval = TimeSpan.FromMilliseconds(20);
+        var subscriber = Worker(options, [Delivery("m1", "first", hooks)], ingress.Object, logger);
+        subscriber.Clock = clock;
+
+        try
+        {
+            await subscriber.StartAsync(CancellationToken.None);
+            await renewStarted.Task.WaitAsync(Wait);
+            await WaitUntilAsync(() => Volatile.Read(ref hooks.CompleteCalls) == 1 && clock.NextTimerDueAt is not null);
+            clock.Advance(TimeSpan.FromSeconds(60));
+            await logger.WaitForAsync("did not stop within the shutdown budget");
+        }
+        finally
+        {
+            releaseRenew.TrySetResult();
+            clock.Advance(TimeSpan.FromSeconds(120));
             await subscriber.StopAsync(CancellationToken.None);
         }
     }

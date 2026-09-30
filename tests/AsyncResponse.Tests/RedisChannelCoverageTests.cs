@@ -311,6 +311,26 @@ public sealed class RedisChannelCoverageTests
     [InlineData(PublishKind.Response)]
     [InlineData(PublishKind.RawJson)]
     [InlineData(PublishKind.Exception)]
+    public async Task Publish_LivenessContradictionLogThatThrows_StillSurfacesTheRetryableFailure(PublishKind kind)
+    {
+        _liveSubscribers = 1;
+        _subscriber
+            .Setup(instance => instance.PublishAsync(It.IsAny<RedisChannel>(), It.IsAny<RedisValue>(), It.IsAny<CommandFlags>()))
+            .ReturnsAsync(0L);
+        _store.Setup(store => store.GetAllAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync([NewRecoveryState("corr-contradiction-log")]);
+        var logger = new RecordingThrowingLogger<RedisAsyncResponseChannel> { ThrowOnMessageContaining = "found no subscribers twice" };
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => PublishAsync(CreateChannel(logger: logger), kind, "corr-contradiction-log"));
+
+        Assert.Contains("Retry the publish", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData(PublishKind.Response)]
+    [InlineData(PublishKind.RawJson)]
+    [InlineData(PublishKind.Exception)]
     public async Task Publish_ASuccessLogThatThrows_DoesNotFailAnAlreadyDeliveredPublish(PublishKind kind)
     {
         // r4/R4-10: the post-delivery Debug log was unguarded, so a throwing provider turned a

@@ -1079,9 +1079,11 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
                         // machinery re-attempts once the subscription is visible (bounded by the
                         // heartbeat's liveness expiry, after which normal recovery takes over).
                         // Returning here instead would silently drop the payload.
-                        _logger.LogWarning(
-                            "Delivery for correlationId {CorrelationId} found no subscribers twice while the liveness probe kept reporting one; recovery registrations are left intact.",
-                            correlationId);
+                        SafeLog.Try(
+                            (_logger, correlationId),
+                            static s => s._logger.LogWarning(
+                                "Delivery for correlationId {CorrelationId} found no subscribers twice while the liveness probe kept reporting one; recovery registrations are left intact.",
+                                s.correlationId));
                         activity?.SetTag("asyncresponse.recovery.liveness_contradiction", true);
                         throw new InvalidOperationException(
                             $"Redis delivery for correlationId '{correlationId}' found no subscribers twice while the liveness probe kept " +
@@ -1186,9 +1188,11 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
                         // machinery re-attempts once the subscription is visible (bounded by the
                         // heartbeat's liveness expiry, after which normal recovery takes over).
                         // Returning here instead would silently drop the payload.
-                        _logger.LogWarning(
-                            "Delivery for correlationId {CorrelationId} found no subscribers twice while the liveness probe kept reporting one; recovery registrations are left intact.",
-                            correlationId);
+                        SafeLog.Try(
+                            (_logger, correlationId),
+                            static s => s._logger.LogWarning(
+                                "Delivery for correlationId {CorrelationId} found no subscribers twice while the liveness probe kept reporting one; recovery registrations are left intact.",
+                                s.correlationId));
                         activity?.SetTag("asyncresponse.recovery.liveness_contradiction", true);
                         throw new InvalidOperationException(
                             $"Redis delivery for correlationId '{correlationId}' found no subscribers twice while the liveness probe kept " +
@@ -1299,9 +1303,11 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
                         // machinery re-attempts once the subscription is visible (bounded by the
                         // heartbeat's liveness expiry, after which normal recovery takes over).
                         // Returning here instead would silently drop the payload.
-                        _logger.LogWarning(
-                            "Delivery for correlationId {CorrelationId} found no subscribers twice while the liveness probe kept reporting one; recovery registrations are left intact.",
-                            correlationId);
+                        SafeLog.Try(
+                            (_logger, correlationId),
+                            static s => s._logger.LogWarning(
+                                "Delivery for correlationId {CorrelationId} found no subscribers twice while the liveness probe kept reporting one; recovery registrations are left intact.",
+                                s.correlationId));
                         activity?.SetTag("asyncresponse.recovery.liveness_contradiction", true);
                         throw new InvalidOperationException(
                             $"Redis delivery for correlationId '{correlationId}' found no subscribers twice while the liveness probe kept " +

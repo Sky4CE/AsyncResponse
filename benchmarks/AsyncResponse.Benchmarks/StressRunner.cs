@@ -1608,11 +1608,24 @@ internal static class StressRunner
             sw.Stop();
             var alloc = GC.GetTotalAllocatedBytes() - allocBefore;
 
-            // Finalize-step execution is necessary but not sufficient — sweep the terminal states.
+            // Finalize-step execution is necessary but not sufficient: the drain signal fires when the
+            // last finalize step body runs, before that step's checkpoint and the flow's terminal
+            // Succeeded save. Wait (bounded) for every flow to leave Running before counting, so the
+            // tail's terminal saves are not reported as failures. The measurement above stays at the
+            // drain point, so the published throughput/allocation series keep their baseline.
             var notSucceeded = 0;
+            var settleDeadline = Stopwatch.GetTimestamp() + (long)(Stopwatch.Frequency * 60.0);
             for (var i = 0; i < count; i++)
             {
-                var state = flowIds[i] is null ? null : await flows.GetStateAsync(flowIds[i]);
+                FlowState? state;
+                while (true)
+                {
+                    state = flowIds[i] is null ? null : await flows.GetStateAsync(flowIds[i]);
+                    if (state is null || state.Status != FlowRunStatus.Running || Stopwatch.GetTimestamp() > settleDeadline)
+                        break;
+                    await Task.Delay(10);
+                }
+
                 if (state?.Status != FlowRunStatus.Succeeded)
                     notSucceeded++;
             }

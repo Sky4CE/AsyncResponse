@@ -379,7 +379,7 @@ internal abstract class AzureServiceBusSubscriberService : BackgroundService
                 // call, so this normally completes immediately. The bound is the hard backstop: an
                 // unbounded await here would let a degraded namespace hold the receive loop (and, at
                 // shutdown, the whole host budget) hostage for the SDK retry budget per message.
-                await renewalTask.WaitAsync(Options.ShutdownTimeout).ConfigureAwait(false);
+                await renewalTask.WaitAsync(Options.ShutdownTimeout, Clock).ConfigureAwait(false);
             }
             catch (TimeoutException)
             {

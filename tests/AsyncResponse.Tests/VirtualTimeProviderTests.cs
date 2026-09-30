@@ -499,4 +499,18 @@ public class VirtualTimeProviderTests
             return $"{ex.GetType().Name}({ex.ParamName})";
         }
     }
+
+    [Fact]
+    public void SubMillisecondDueTimeAndPeriod_AreTruncatedToWholeMilliseconds_LikeTheSystemTimer()
+    {
+        var clock = new VirtualTimeProvider();
+        var fired = 0;
+        using var timer = clock.CreateTimer(_ => fired++, null, TimeSpan.FromMilliseconds(0.5), TimeSpan.FromMilliseconds(1.5));
+
+        clock.Advance(TimeSpan.Zero);
+        Assert.Equal(1, fired); // 0.5 ms truncates to 0: due now
+
+        clock.Advance(TimeSpan.FromMilliseconds(1));
+        Assert.Equal(2, fired); // 1.5 ms period truncates to 1 ms
+    }
 }

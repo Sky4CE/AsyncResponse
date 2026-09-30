@@ -281,11 +281,11 @@ public sealed class VirtualTimeProvider : TimeProvider
                 // Judged on the same truncated values as the check: a period of 0 or -1 whole
                 // milliseconds is one-shot, a due time of -1 is "never", and a negative
                 // sub-millisecond due time is 0 (due now) — never an instant before "now".
-                _period = periodMilliseconds > 0 ? period : Timeout.InfiniteTimeSpan;
+                _period = periodMilliseconds > 0 ? TimeSpan.FromMilliseconds(periodMilliseconds) : Timeout.InfiniteTimeSpan;
                 if (dueMilliseconds == -1)
                     return true;
 
-                DueAt = _owner._utcNow + (dueTime > TimeSpan.Zero ? dueTime : TimeSpan.Zero);
+                DueAt = _owner._utcNow + TimeSpan.FromMilliseconds(dueMilliseconds > 0 ? dueMilliseconds : 0);
                 Sequence = _owner._sequence++;
                 _owner._armed.Add(this);
                 _armed = true;

@@ -13,6 +13,18 @@ work that has landed on `main` but not yet shipped. Security reporters credited 
 
 ### Changed
 
+- **Round-58 review (2026-09-30, whole-repository review of `14962a2`): the Azure Service Bus stop
+  path is bounded on the injected clock, and the Testing package's virtual timers match the system
+  timer's millisecond truncation.**
+  - *Azure Service Bus transport.* The lock-renewal join on the stop path waited on the wall clock
+    while its sibling bounds use the injected `TimeProvider`; it now uses the provider too.
+  - *Redis channel.* The "found no subscribers twice" warning before the retryable publish failure
+    is guarded, so a throwing logger no longer replaces that exception.
+  - *Testing package.* `VirtualTimeProvider` timers truncate sub-millisecond due times and periods
+    to whole milliseconds, like `TimeProvider.System`, instead of validating one value and arming
+    another.
+  - *Benchmarks.* The durable-flow stress run no longer reports flows as unfinished when its drain
+    signal fires before their final checkpoint lands.
 - **Round-57 review (2026-09-30, whole-repository review of `392f225`): a throwing logging provider
   can no longer stop a subscriber, fail a delivered publish or replace a real publish failure,
   closed as a class across every transport.**
