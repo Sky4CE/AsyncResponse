@@ -3,8 +3,8 @@
 
 |||
 |:---|:---|
-| Generated on: | 09/30/2026 - 19:54:38 |
-| Coverage date: | 09/30/2026 - 19:39:27 - 09/30/2026 - 19:54:10 |
+| Generated on: | 09/30/2026 - 21:35:54 |
+| Coverage date: | 09/30/2026 - 21:19:02 - 09/30/2026 - 21:34:25 |
 | Parser: | MultiReport (16x Cobertura) |
 | Assemblies: | 27 |
 | Classes: | 510 |
@@ -13,9 +13,9 @@
 | Covered lines: | 37663 |
 | Uncovered lines: | 386 |
 | Coverable lines: | 38049 |
-| Total lines: | 76922 |
-| **Branch coverage:** | 94.2% (14745 of 15651) |
-| Covered branches: | 14745 |
+| Total lines: | 76940 |
+| **Branch coverage:** | 94.1% (14743 of 15651) |
+| Covered branches: | 14743 |
 | Total branches: | 15651 |
 | **Method coverage:** | [Feature is only available for sponsors](https://reportgenerator.io/pro) |
 
@@ -69,7 +69,7 @@
 |**Name**|**Line**|**Branch**|
 |:---|---:|---:|
 |**AsyncResponse.Channels.MongoDB**|**99.2%**|**92.9%**|
-|AsyncResponse.Channels.DbAsyncResponseChannelBase|98.7%|94.3%|
+|AsyncResponse.Channels.DbAsyncResponseChannelBase|98.6%|94.3%|
 |AsyncResponse.Channels.DbRecoveryStateStoreBase|100%|92.5%|
 |AsyncResponse.Channels.MongoDB.MongoChannelMessageDocument|100%||
 |AsyncResponse.Channels.MongoDB.MongoChannelSubscriberDocument|100%||
@@ -107,12 +107,12 @@
 |Microsoft.Extensions.DependencyInjection.NatsAsyncResponseChannelServiceCol<br/>lectionExtensions|100%|75%|
 
 </details>
-<details><summary>AsyncResponse.Channels.PostgreSQL - 98.8%</summary>
+<details><summary>AsyncResponse.Channels.PostgreSQL - 99%</summary>
 
 |**Name**|**Line**|**Branch**|
 |:---|---:|---:|
-|**AsyncResponse.Channels.PostgreSQL**|**98.8%**|**91.9%**|
-|AsyncResponse.Channels.DbAsyncResponseChannelBase|98%|90.8%|
+|**AsyncResponse.Channels.PostgreSQL**|**99%**|**92%**|
+|AsyncResponse.Channels.DbAsyncResponseChannelBase|98.3%|91%|
 |AsyncResponse.Channels.DbRecoveryStateStoreBase|100%|90%|
 |AsyncResponse.Channels.PostgreSQL.PostgreSqlAsyncResponseChannel|100%|90%|
 |AsyncResponse.Channels.PostgreSQL.PostgreSqlAsyncResponseChannelOptions|100%|100%|
@@ -378,11 +378,11 @@
 |Microsoft.Extensions.DependencyInjection.SqlServerDurableFlowServiceCollect<br/>ionExtensions|100%||
 
 </details>
-<details><summary>AsyncResponse.Testing - 99.8%</summary>
+<details><summary>AsyncResponse.Testing - 99.7%</summary>
 
 |**Name**|**Line**|**Branch**|
 |:---|---:|---:|
-|**AsyncResponse.Testing**|**99.8%**|**93.9%**|
+|**AsyncResponse.Testing**|**99.7%**|**93.6%**|
 |AsyncResponse.Testing.AsyncResponseTestHarness|99.6%|93.5%|
 |AsyncResponse.Testing.AsyncResponseTestHarnessOptions|100%||
 |AsyncResponse.Testing.FlowProbe|100%|93.8%|
@@ -390,7 +390,7 @@
 |AsyncResponse.Testing.FlowRunHandle|100%|83.3%|
 |AsyncResponse.Testing.FlowTestHarness|100%|50%|
 |AsyncResponse.Testing.SimulatedCrashException|100%|100%|
-|AsyncResponse.Testing.VirtualTimeProvider|100%|100%|
+|AsyncResponse.Testing.VirtualTimeProvider|99.1%|97.7%|
 
 </details>
 <details><summary>AsyncResponse.Transports.AzureServiceBus - 99.6%</summary>
@@ -455,9 +455,9 @@
 
 |**Name**|**Line**|**Branch**|
 |:---|---:|---:|
-|**AsyncResponse.Transports.Kafka**|**99.6%**|**96.5%**|
+|**AsyncResponse.Transports.Kafka**|**99.6%**|**96.3%**|
 |AsyncResponse.Transports.CorrelationIdJsonPaths|99.1%|93.5%|
-|AsyncResponse.Transports.Kafka.AwaitingKafkaMessageDispatcher|100%|94.8%|
+|AsyncResponse.Transports.Kafka.AwaitingKafkaMessageDispatcher|99.6%|93.8%|
 |AsyncResponse.Transports.Kafka.KafkaAssignmentGenerations|100%|100%|
 |AsyncResponse.Transports.Kafka.KafkaAsyncResponseTransportOptions|100%||
 |AsyncResponse.Transports.Kafka.KafkaBackgroundFailureContext|100%||
@@ -692,7 +692,7 @@
 
 |**Name**|**Line**|**Branch**|
 |:---|---:|---:|
-|**AsyncResponse.Transports.SQS**|**99.4%**|**91.8%**|
+|**AsyncResponse.Transports.SQS**|**99.4%**|**91.6%**|
 |AsyncResponse.Transports.CorrelationIdJsonPaths|99.1%|93.5%|
 |AsyncResponse.Transports.SQS.AwaitingSqsMessageDispatcher|100%|100%|
 |AsyncResponse.Transports.SQS.QueuedSqsMessageDispatcher|100%|100%|
@@ -716,7 +716,7 @@
 |AsyncResponse.Transports.SQS.SqsTransportDelivery|100%||
 |AsyncResponse.Transports.SQS.SqsWorkerSubscriber|100%|91.6%|
 |AsyncResponse.Transports.SQS.SqsWorkerTransport|100%|87.7%|
-|AsyncResponse.Transports.SubscriberSupervisor|100%|100%|
+|AsyncResponse.Transports.SubscriberSupervisor|100%|87.5%|
 |AsyncResponse.Transports.WorkerIntakeGate|100%|100%|
 |Microsoft.Extensions.DependencyInjection.SqsAsyncResponseServiceCollectionE<br/>xtensions|100%||
 
