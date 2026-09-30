@@ -400,42 +400,108 @@ public sealed class NatsTransportCoverageGapTests
     }
 
     /// <summary>
-    /// A heartbeat abandoned past its join bound that later faults (its failure log throws) is
-    /// still observed: the continuation left behind logs the fault.
+    /// A throwing logger provider must not fault the in-progress heartbeat: one failed renewal
+    /// whose warning throws used to end the loop, so the rest of the batch stopped renewing and
+    /// its AckWait lapsed under the live handler. Deterministic: the heartbeat runs on the
+    /// injected clock, and each tick is advanced only once its timer is armed.
     /// </summary>
     [Fact]
-    public async Task WorkerSubscriber_AnAbandonedHeartbeatThatFaultsLater_IsLogged()
+    public async Task WorkerSubscriber_AThrowingLoggerOnAFailedRenewal_DoesNotStopTheHeartbeat()
     {
+        var clock = new AsyncResponse.Testing.VirtualTimeProvider();
+        var interval = TimeSpan.FromSeconds(1); // AckWait 3 s / 3
+        var jetStream = new FakeNatsJetStreamTransport();
+        var ingress = new FirstGatedIngress();
+        var first = new RecordingDelivery { ProgressException = new InvalidOperationException("in-progress refused") };
+        jetStream.EnqueueDelivery(first.Create("p1", numDelivered: 1));
+        var logger = new RecordingThrowingLogger<NatsWorkerSubscriber> { ThrowOnMessageContaining = "Failed to signal in-progress" };
+        var subscriber = new NatsWorkerSubscriber(
+            SubscriberOptions(o => o.AckWait = TimeSpan.FromSeconds(3)),
+            jetStream,
+            ingress,
+            logger,
+            clock);
+
+        await subscriber.StartAsync(CancellationToken.None);
+        try
+        {
+            await ingress.Started.Task.WaitAsync(HangGuard); // p1 is wedged in the handler
+
+            await WaitUntilAsync(() => clock.NextTimerDueAt == clock.GetUtcNow() + interval);
+            clock.Advance(interval);
+            await WaitUntilAsync(() => first.Progresses == 1); // refused, and its warning threw
+
+            // The loop survived the unloggable failure: it re-arms and renews on the next tick.
+            await WaitUntilAsync(() => clock.NextTimerDueAt == clock.GetUtcNow() + interval);
+            clock.Advance(interval);
+            await WaitUntilAsync(() => first.Progresses == 2);
+            Assert.Equal(0, first.Acks);
+        }
+        finally
+        {
+            ingress.Release.TrySetResult();
+            await subscriber.StopAsync(CancellationToken.None).WaitAsync(HangGuard);
+            subscriber.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// A heartbeat wedged past its join bound (the client ignores cancellation) is abandoned with a
+    /// warning and the subscriber moves on to the next batch; when the wedged renewal later fails
+    /// — and its warning throws — the abandoned loop absorbs it instead of faulting, so the
+    /// "Abandoned NATS in-progress heartbeat faulted." backstop has nothing to report.
+    /// Deterministic: the heartbeat and the join bound run on the injected clock.
+    /// </summary>
+    [Fact]
+    public async Task WorkerSubscriber_AnAbandonedHeartbeatThatFailsLater_IsAbsorbed_AndTheSubscriberMovesOn()
+    {
+        var clock = new AsyncResponse.Testing.VirtualTimeProvider();
+        var interval = TimeSpan.FromSeconds(1); // AckWait 3 s / 3
         var jetStream = new FakeNatsJetStreamTransport();
         var ingress = new FirstGatedIngress();
         var wedge = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var lateFailureThrown = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var first = new RecordingDelivery
         {
             // Ignores its token, then fails.
             ProgressBehavior = async _ =>
             {
                 await wedge.Task.ConfigureAwait(false);
+                lateFailureThrown.TrySetResult();
                 throw new InvalidOperationException("in-progress refused");
             }
         };
+        var second = new RecordingDelivery();
         jetStream.EnqueueDelivery(first.Create("p1", numDelivered: 1));
-        var logger = new RecordingThrowingLogger<NatsWorkerSubscriber> { ThrowOnMessageContaining = "Failed to signal in-progress" };
+        var logger = new RecordingThrowingLogger<NatsWorkerSubscriber>();
         var subscriber = new NatsWorkerSubscriber(
-            SubscriberOptions(o => o.AckWait = TimeSpan.FromMilliseconds(150)),
+            SubscriberOptions(o => o.AckWait = TimeSpan.FromSeconds(3)),
             jetStream,
             ingress,
-            logger);
+            logger,
+            clock);
 
         await subscriber.StartAsync(CancellationToken.None);
         try
         {
             await ingress.Started.Task.WaitAsync(HangGuard);
-            await WaitUntilAsync(() => first.Progresses >= 1);
+            await WaitUntilAsync(() => clock.NextTimerDueAt == clock.GetUtcNow() + interval);
+            clock.Advance(interval);
+            await WaitUntilAsync(() => first.Progresses == 1); // the heartbeat is now wedged
+
             ingress.Release.TrySetResult();
+            await WaitUntilAsync(() => first.Acks == 1);
+            // The batch's join waits one interval for the wedged heartbeat, then abandons it.
+            await WaitUntilAsync(() => clock.NextTimerDueAt == clock.GetUtcNow() + interval);
+            clock.Advance(interval);
             await WaitUntilAsync(() => logger.HasEntry(LogLevel.Warning, "did not stop within"));
 
+            jetStream.EnqueueDelivery(second.Create("p2", numDelivered: 1));
+            await WaitUntilAsync(() => second.Acks == 1); // the subscriber moved on
+
+            logger.ThrowOnMessageContaining = "Failed to signal in-progress";
             wedge.TrySetResult();
-            await WaitUntilAsync(() => logger.HasEntry(LogLevel.Warning, "Abandoned NATS in-progress heartbeat faulted."));
+            await lateFailureThrown.Task.WaitAsync(HangGuard);
         }
         finally
         {
@@ -445,6 +511,7 @@ public sealed class NatsTransportCoverageGapTests
             subscriber.Dispose();
         }
 
+        Assert.False(logger.HasEntry(LogLevel.Warning, "Abandoned NATS in-progress heartbeat faulted."));
         Assert.Equal(1, first.Acks);
     }
 

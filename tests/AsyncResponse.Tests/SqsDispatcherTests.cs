@@ -430,6 +430,31 @@ public sealed class SqsDispatcherTests
     }
 
     [Fact]
+    public async Task AckAfterEnqueue_ThrowingLoggerOnTheCreatedLine_StillConstructsAWorkingDispatcher()
+    {
+        // The constructor starts the workers and then logs; a throwing provider used to abort
+        // construction with the workers parked on a channel nobody would ever complete (and the
+        // subscriber outside its retry supervisor).
+        var handled = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var logger = new CollectingLogger { ThrowOnMessageContaining = "Created SQS ACK-after-enqueue dispatcher" };
+
+        await using var dispatcher = SqsMessageDispatcher.Create(
+            (_, _) =>
+            {
+                handled.TrySetResult();
+                return Task.CompletedTask;
+            },
+            new SqsAsyncResponseOptions(),
+            new SqsSubscriberOptions().UseAckAfterEnqueue(1, 8, TimeSpan.FromSeconds(5)),
+            logger,
+            "workers",
+            SqsSubscriberRole.Worker);
+
+        await dispatcher.HandleAsync(Delivery(new SettlementCalls(), body: "healthy", messageId: "m1"), CancellationToken.None);
+        await handled.Task.WaitAsync(TimeSpan.FromSeconds(5));
+    }
+
+    [Fact]
     public async Task AckAfterEnqueue_BackgroundFailure_InvokesCallback()
     {
         var calls = new SettlementCalls();

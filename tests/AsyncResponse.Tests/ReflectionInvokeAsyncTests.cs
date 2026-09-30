@@ -23,6 +23,29 @@ public interface IInvokeTarget
     Task TwinAsync(int value);
 }
 
+public interface IHidingBase
+{
+    Task HiddenAsync(string value);
+}
+
+public interface IHidingDerived : IHidingBase
+{
+    new Task HiddenAsync(string value);
+}
+
+public sealed class HidingTarget : IHidingDerived
+{
+    public List<string> Recorded { get; } = [];
+
+    Task IHidingBase.HiddenAsync(string value) => throw new InvalidOperationException("base member must not be bound");
+
+    public Task HiddenAsync(string value)
+    {
+        Recorded.Add(value);
+        return Task.CompletedTask;
+    }
+}
+
 public sealed class InvokeTarget : IInvokeTarget
 {
     public List<string> Recorded { get; } = [];
@@ -235,6 +258,22 @@ public class ReflectionInvokeAsyncTests
         }));
 
         Assert.Contains("No method", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task NewRedeclaredInterfaceMember_BindsTheDerivedDeclaration()
+    {
+        var target = new HidingTarget();
+        var provider = new ServiceCollection().AddSingleton<IHidingDerived>(target).BuildServiceProvider();
+
+        await provider.InvokeAsync(new ReflectionInvocationDto
+        {
+            ServiceInterfaceFullName = typeof(IHidingDerived).FullName!,
+            MethodName = nameof(IHidingDerived.HiddenAsync),
+            Params = ["v"]
+        });
+
+        Assert.Equal("v", Assert.Single(target.Recorded));
     }
 
     [Fact]

@@ -137,8 +137,11 @@ internal static class FlowIdCollationRules
             "MySQL",
             nameof(AsyncResponseFlowIdCollations.MySql),
             AsyncResponseFlowIdCollations.MySql,
-            "_bin collation",
-            static c => c.EndsWith("_bin", StringComparison.OrdinalIgnoreCase)),
+            "utf8mb4 _bin collation",
+            // utf8mb4 only: COLLATE without CHARACTER SET makes the column that collation's
+            // character set, and latin1_bin / utf8mb3_bin cannot hold every flow id.
+            static c => c.StartsWith("utf8mb4_", StringComparison.OrdinalIgnoreCase)
+                && c.EndsWith("_bin", StringComparison.OrdinalIgnoreCase)),
         _ => null
     };
 

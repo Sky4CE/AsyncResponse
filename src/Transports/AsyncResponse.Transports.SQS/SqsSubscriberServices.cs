@@ -475,7 +475,7 @@ internal abstract class SqsSubscriberService : BackgroundService
         {
             while (true)
             {
-                await Task.Delay(renewalInterval, cancellationToken).ConfigureAwait(false);
+                await Task.Delay(renewalInterval, Clock, cancellationToken).ConfigureAwait(false);
 
                 // Renew from the first unsettled message onward: that covers the message currently in
                 // the handler plus everything still waiting its turn. Two settle paths race this

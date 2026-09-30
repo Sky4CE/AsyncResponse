@@ -311,6 +311,77 @@ public sealed class RedisChannelCoverageTests
     [InlineData(PublishKind.Response)]
     [InlineData(PublishKind.RawJson)]
     [InlineData(PublishKind.Exception)]
+    public async Task Publish_ASuccessLogThatThrows_DoesNotFailAnAlreadyDeliveredPublish(PublishKind kind)
+    {
+        // r4/R4-10: the post-delivery Debug log was unguarded, so a throwing provider turned a
+        // delivered publish into a thrown "Failed to publish" (and an ingress redelivery).
+        _subscriber
+            .Setup(instance => instance.PublishAsync(It.IsAny<RedisChannel>(), It.IsAny<RedisValue>(), It.IsAny<CommandFlags>()))
+            .ReturnsAsync(1L);
+        var logger = new RecordingThrowingLogger<RedisAsyncResponseChannel> { ThrowOnMessageContaining = "Published" };
+
+        await PublishAsync(CreateChannel(logger: logger), kind, "corr-log-throws");
+    }
+
+    [Theory]
+    [InlineData(PublishKind.Response)]
+    [InlineData(PublishKind.RawJson)]
+    [InlineData(PublishKind.Exception)]
+    public async Task Publish_AnIsEnabledCheckThatThrows_DoesNotFailAnAlreadyDeliveredPublish(PublishKind kind)
+    {
+        // r4 critic F5: SetException evaluated the Debug IsEnabled check outside SafeLog (its
+        // Response/Raw twins moved it inside), so a provider throwing from IsEnabled turned a
+        // delivered exception publish into a thrown "Failed to publish".
+        _subscriber
+            .Setup(instance => instance.PublishAsync(It.IsAny<RedisChannel>(), It.IsAny<RedisValue>(), It.IsAny<CommandFlags>()))
+            .ReturnsAsync(1L);
+
+        await PublishAsync(CreateChannel(logger: new DebugIsEnabledThrowsLogger()), kind, "corr-isenabled-throws");
+    }
+
+    [Theory]
+    [InlineData(PublishKind.Response)]
+    [InlineData(PublishKind.RawJson)]
+    [InlineData(PublishKind.Exception)]
+    public async Task RecoveryPublish_ARetirementTimeoutWarningThatThrows_DoesNotFailThePublish(PublishKind kind)
+    {
+        // r4/R4-10: the retirement-timeout warning was unguarded, so a throwing provider turned a
+        // recovery publish that had already routed the response into a thrown "Failed to publish".
+        _liveSubscribers = 0;
+        _subscriber
+            .Setup(instance => instance.PublishAsync(It.IsAny<RedisChannel>(), It.IsAny<RedisValue>(), It.IsAny<CommandFlags>()))
+            .ReturnsAsync(0L);
+        var logger = new RecordingThrowingLogger<RedisAsyncResponseChannel> { ThrowOnMessageContaining = "Retiring the serial executor" };
+        var channel = CreateChannel(disposalDrainTimeout: TimeSpan.FromMilliseconds(50), logger: logger);
+
+        // Wedge the correlation id's executor so its retirement outlives the drain timeout.
+        var executors = (SerialExecutorRegistry)typeof(RedisAsyncResponseChannel)
+            .GetField("_executors", BindingFlags.Instance | BindingFlags.NonPublic)!
+            .GetValue(channel)!;
+        var channelName = new RedisKeySchema(new RedisAsyncResponseOptions().KeyPrefix).Channel("corr-retire-log").ToString()!;
+        Assert.True(await executors.EnqueueAsync(channelName, () => new TaskCompletionSource().Task));
+
+        await PublishAsync(channel, kind, "corr-retire-log").WaitAsync(TimeSpan.FromSeconds(10));
+        Assert.False(logger.HasEntry(LogLevel.Error, "Failed to publish"));
+    }
+
+    /// <summary>A provider whose Debug <see cref="ILogger.IsEnabled"/> check throws; everything else is a no-op.</summary>
+    private sealed class DebugIsEnabledThrowsLogger : ILogger<RedisAsyncResponseChannel>
+    {
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+
+        public bool IsEnabled(LogLevel logLevel)
+            => logLevel == LogLevel.Debug ? throw new InvalidOperationException("IsEnabled failed") : true;
+
+        public void Log<TState>(LogLevel logLevel, EventId eventId, TState state, Exception? exception, Func<TState, Exception?, string> formatter)
+        {
+        }
+    }
+
+    [Theory]
+    [InlineData(PublishKind.Response)]
+    [InlineData(PublishKind.RawJson)]
+    [InlineData(PublishKind.Exception)]
     public async Task RecoveryPublish_BoundsTheExecutorRetirementByDisposalDrainTimeout(PublishKind kind)
     {
         // Regression: after routing a response with no live subscriber through recovery, the

@@ -386,12 +386,14 @@ internal sealed class QueuedSqsMessageDispatcher : SqsMessageDispatcher
             .Select(workerIndex => Task.Run(() => RunWorkerAsync(workerIndex)))
             .ToArray();
 
-        Logger.LogInformation(
+        // Guarded: the workers are already running, so a throwing provider must not abort
+        // construction and leak them (nothing would ever complete their channel).
+        SafeLog.Try(() => Logger.LogInformation(
             "Created SQS ACK-after-enqueue dispatcher for {Queue} with {WorkerCount} worker(s), queue capacity {QueueCapacity}, drain timeout {DrainTimeout}.",
             _queueName,
             subscriberOptions.BackgroundWorkerCount,
             subscriberOptions.BackgroundQueueCapacity,
-            _drainTimeout);
+            _drainTimeout));
     }
 
     internal int PendingCount => Volatile.Read(ref _pendingCount);

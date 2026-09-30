@@ -154,6 +154,32 @@ public class AsyncResponseDiagnosticsTests
     }
 
     [Fact]
+    public void SetError_AnExceptionWhoseMessageGetterThrows_FallsBackToTheTypeName()
+    {
+        // r4 critic F4: SetError read exception.Message whenever a span existed, so a throwing
+        // Message getter replaced the handler's exception at every provider's catch-and-rethrow.
+        var activity = new Activity("diagnostics");
+        activity.Start();
+        try
+        {
+            AsyncResponseDiagnostics.SetError(activity, new MessageGetterThrowsException());
+
+            Assert.Equal(ActivityStatusCode.Error, activity.Status);
+            Assert.Equal(typeof(MessageGetterThrowsException).FullName, activity.StatusDescription);
+            Assert.Equal(typeof(MessageGetterThrowsException).FullName, Tag(activity, "error.type"));
+        }
+        finally
+        {
+            activity.Stop();
+        }
+    }
+
+    private sealed class MessageGetterThrowsException : Exception
+    {
+        public override string Message => throw new InvalidOperationException("message getter");
+    }
+
+    [Fact]
     public void DiagnosticHelpers_TolerateNullsAndSetRouteVariants()
     {
         AsyncResponseDiagnostics.SetPayloadType(null, typeof(OperationResult));

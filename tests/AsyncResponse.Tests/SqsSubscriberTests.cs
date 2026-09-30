@@ -874,29 +874,43 @@ public sealed class SqsSubscriberTests
             ResponseQueue = "responses",
             ReceiveWaitTime = TimeSpan.FromMilliseconds(10)
         };
-        options.WorkerSubscriber.VisibilityTimeout = TimeSpan.FromSeconds(45);
-        options.WorkerSubscriber.VisibilityRenewalInterval = TimeSpan.FromMilliseconds(50);
+        // Hours-long virtual beats: the heartbeat waits on the injected Clock (as the ceiling it
+        // clamps against is measured on it), so no real time can fire a renewal in this test.
+        options.WorkerSubscriber.VisibilityTimeout = TimeSpan.FromHours(8);
+        options.WorkerSubscriber.VisibilityRenewalInterval = TimeSpan.FromHours(1);
         var calls = new SettlementCalls();
         var subscriber = new SqsWorkerSubscriber(Options.Create(options), client, ingress.Object, logger) { Clock = clock };
 
         client.Enqueue(Delivery(calls, messageId: "m1"));
         await subscriber.StartAsync(CancellationToken.None);
-        await WaitUntilAsync(() => calls.VisibilityChanges.Count >= 1);
-        Assert.All(calls.VisibilityChanges, change => Assert.Equal(TimeSpan.FromSeconds(45), change));
 
-        // 30 s before the ceiling: the next beat may only ask for what is left, then stops.
-        clock.Advance(TimeSpan.FromHours(12) - TimeSpan.FromSeconds(30));
-        await WaitUntilAsync(() => calls.VisibilityChanges.Contains(TimeSpan.FromSeconds(30)));
-        var afterCeiling = calls.VisibilityChanges.Count;
-        clock.Advance(TimeSpan.FromMinutes(1));
+        // Beats at 1h..4h: the whole visibility timeout still fits before the ceiling.
+        for (var beat = 1; beat <= 4; beat++)
+        {
+            await WaitUntilAsync(() => clock.NextTimerDueAt is not null);
+            clock.Advance(TimeSpan.FromHours(1));
+            await WaitUntilAsync(() => calls.VisibilityChanges.Count >= beat);
+        }
+
+        Assert.All(calls.VisibilityChanges, change => Assert.Equal(TimeSpan.FromHours(8), change));
+
+        // The 5 h beat: only 7 h are left before the ceiling, so the extension is shortened.
+        await WaitUntilAsync(() => clock.NextTimerDueAt is not null);
+        clock.Advance(TimeSpan.FromHours(1));
+        await WaitUntilAsync(() => calls.VisibilityChanges.Contains(TimeSpan.FromHours(7)));
         await WaitUntilAsync(() => logger.Snapshot().Any(entry => entry.Message.Contains("12-hour SQS in-flight ceiling", StringComparison.Ordinal)));
+        var afterCeiling = calls.VisibilityChanges.Count;
+
+        // Further beats no longer ask.
+        await WaitUntilAsync(() => clock.NextTimerDueAt is not null);
+        clock.Advance(TimeSpan.FromHours(1));
 
         release.TrySetResult();
         await calls.Deleted.Task.WaitAsync(HangGuard);
         await subscriber.StopAsync(CancellationToken.None);
 
         Assert.Equal(afterCeiling, calls.VisibilityChanges.Count);
-        Assert.Equal(TimeSpan.FromSeconds(30), calls.VisibilityChanges[^1]);
+        Assert.Equal(TimeSpan.FromHours(7), calls.VisibilityChanges[^1]);
         Assert.Single(logger.Snapshot(), entry => entry.Message.Contains("12-hour SQS in-flight ceiling", StringComparison.Ordinal));
     }
 

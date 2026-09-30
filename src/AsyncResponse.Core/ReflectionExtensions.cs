@@ -366,11 +366,20 @@ internal static class ReflectionExtensions
         // the service type alone therefore failed every callback and worker job whose method is
         // declared on a BASE interface — code that compiles cleanly, registers cleanly, and then
         // threw "no method" on every dispatch attempt forever. The base interfaces are searched too,
-        // deduped by declaring type so a re-declaration does not read as an ambiguous overload.
-        var candidates = CandidateMethods(key.ServiceType)
+        // deduped so a `new` re-declaration in a derived interface (which hides the base member)
+        // does not read as an ambiguous overload: a method is dropped when a same-signature method
+        // is declared on an interface that derives from its declaring interface.
+        var matching = CandidateMethods(key.ServiceType)
             .Where(m => m.Name == key.MethodName
                      && m.GetParameters().Length == key.ParameterCount)
             .DistinctBy(m => (m.DeclaringType, m.Name, string.Join(',', m.GetParameters().Select(p => p.ParameterType.FullName))))
+            .ToArray();
+        var candidates = matching
+            .Where(m => !matching.Any(o => o != m
+                && o.DeclaringType != m.DeclaringType
+                && m.DeclaringType!.IsAssignableFrom(o.DeclaringType)
+                && string.Join(',', o.GetParameters().Select(p => p.ParameterType.FullName))
+                    == string.Join(',', m.GetParameters().Select(p => p.ParameterType.FullName))))
             .ToArray();
 
         if (candidates.Length == 0)

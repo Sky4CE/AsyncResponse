@@ -13,6 +13,36 @@ work that has landed on `main` but not yet shipped. Security reporters credited 
 
 ### Changed
 
+- **Round-55 review (2026-09-30, whole-repository review of `a715b18`): NATS dead-letters a failure
+  whatever its exception message does, the Oracle and EF Core MySQL flow stores refuse flow-id
+  columns that do not compare ordinally, and the sample app wires its crash route and shutdown
+  budgets for every provider.**
+  - *NATS transport.* Dead-lettering read the failed handler's `Exception.Message` unguarded, so a
+    message getter that threw (or returned null) skipped the burial and faulted the early-ACK
+    worker. The subscriber's heartbeat, hand-back and abandon logs are guarded against a throwing
+    logger, which stopped the heartbeat or aborted the release loop.
+  - *SQS transport.* The visibility-renewal heartbeat waited on the wall clock while the 12-hour
+    ceiling it clamps against is measured on the injected `TimeProvider`; both now use the
+    provider. The queued dispatcher's creation log can no longer abort construction with its
+    workers already running.
+  - *Durable flows — Oracle.* The startup verifier checked only the session's `NLS_COMP`/`NLS_SORT`;
+    a `flow_id` column with its own case-folding collation (12.2+, e.g. `BINARY_CI`) passed. It is
+    now refused; `USING_NLS_SORT` is accepted only while the session's `NLS_SORT` is `BINARY`, and
+    the message says to recreate the column with `COLLATE BINARY`.
+  - *Durable flows — EF Core on MySQL.* The collation guard accepted any `_bin` collation;
+    `latin1_bin` and `utf8mb3_bin` are refused like the MySQL store does (utf8mb4 `_bin` only).
+  - *Resilience — Redis channel, core.* Post-delivery publish logs (and the exception publish's
+    Debug-level check) no longer fail a publish that was delivered when the logger throws. Span
+    error status no longer reads `Exception.Message` unguarded: an exception whose message getter
+    throws is recorded under its type name and its handler failure is still settled (every
+    provider). A `new` re-declaration of an interface member no longer reads
+    as two ambiguous callback overloads.
+  - *Sample app.* `/crash` and the lost-subscriber drop picked the Redis path whenever a Redis
+    connection was registered (also for the Redis transport); the PostgreSQL, SQL Server, MongoDB
+    and NATS transports now honour `<Transport>:HostShutdownTimeoutSeconds`; the Npgsql tuning
+    (`No Reset On Close`, `Max Auto Prepare`) is applied again unless the caller's connection string
+    sets those keys — `NpgsqlConnectionStringBuilder.ContainsKey` is true for every known keyword,
+    so it had never been applied.
 - **Round-54 review (2026-09-30, whole-repository review of `ce3a5a6`): the NATS dispatcher settles
   poison messages even when logging throws, and the round-52/53 recovery-registration fixes stop
   issuing a compensating delete for a save they skipped.**

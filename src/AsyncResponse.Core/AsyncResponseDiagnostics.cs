@@ -413,8 +413,29 @@ public static class AsyncResponseDiagnostics
 
     internal static void SetError(Activity? activity, Exception exception)
     {
-        activity?.SetTag("error.type", exception.GetType().FullName ?? exception.GetType().Name);
-        activity?.SetStatus(ActivityStatusCode.Error, exception.Message);
+        if (activity is null)
+            return;
+
+        var typeName = exception.GetType().FullName ?? exception.GetType().Name;
+        activity.SetTag("error.type", typeName);
+        activity.SetStatus(ActivityStatusCode.Error, SafeDescription(exception, typeName));
+    }
+
+    /// <summary>
+    /// The exception's message, or its type name when the <see cref="Exception.Message"/> override
+    /// throws: every provider calls <see cref="SetError(Activity?, Exception)"/> from a
+    /// catch-and-rethrow, where a throwing getter would replace the exception being reported.
+    /// </summary>
+    private static string SafeDescription(Exception exception, string typeName)
+    {
+        try
+        {
+            return exception.Message ?? typeName;
+        }
+        catch (Exception)
+        {
+            return typeName;
+        }
     }
 
     internal static void SetError(Activity? activity, string errorType, string? description = null)

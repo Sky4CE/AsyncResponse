@@ -70,6 +70,8 @@ if (useRedis || useRedisTransport)
 {
     var redisConnectionString = builder.Configuration.GetConnectionString("Redis") ?? "localhost:6379";
     builder.Services.AddSingleton<IConnectionMultiplexer>(_ => ConnectionMultiplexer.Connect(redisConnectionString));
+    if (useRedis)
+        builder.Services.AddSingleton<RedisChannelSelected>();
 }
 
 if (useNats || useNatsTransport)
@@ -89,9 +91,17 @@ if (usePostgreSql || usePostgreSqlTransport)
     // server-side statements and parse/plan CPU under load. Applied unless the caller set them
     // explicitly, so a provided connection string still wins.
     var postgresBuilder = new NpgsqlConnectionStringBuilder(postgresConnectionString);
-    if (!postgresConnectionString.Contains("Reset On Close", StringComparison.OrdinalIgnoreCase))
+    // NpgsqlConnectionStringBuilder.ContainsKey is true for every keyword Npgsql knows, so "set by the
+    // caller" is read from the keys actually present in the original string. Comparing with spaces
+    // removed, case-insensitively, covers the synonyms ("No Reset On Close" / "NoResetOnClose",
+    // "Max Auto Prepare" / "MaxAutoPrepare"); an explicit 0 or false counts as caller-set.
+    var callerKeys = new System.Data.Common.DbConnectionStringBuilder { ConnectionString = postgresConnectionString }
+        .Keys.Cast<string>()
+        .Select(key => key.Replace(" ", string.Empty, StringComparison.Ordinal))
+        .ToHashSet(StringComparer.OrdinalIgnoreCase);
+    if (!callerKeys.Contains("NoResetOnClose"))
         postgresBuilder.NoResetOnClose = true;
-    if (postgresBuilder.MaxAutoPrepare == 0)
+    if (!callerKeys.Contains("MaxAutoPrepare"))
         postgresBuilder.MaxAutoPrepare = 20;
     builder.Services.AddSingleton(_ => NpgsqlDataSource.Create(postgresBuilder.ConnectionString));
 }
@@ -166,6 +176,10 @@ else if (usePostgreSqlTransport)
 else if (useSqlServerTransport)
 {
     ConfigureHostShutdownBudget(builder.Configuration, builder.Services, "SqlServer");
+}
+else if (useNatsTransport)
+{
+    ConfigureHostShutdownBudget(builder.Configuration, builder.Services, "Nats");
 }
 else if (useSqs)
 {
@@ -405,6 +419,7 @@ else if (useNatsTransport)
     asyncResponse.WithNatsTransport(options =>
     {
         options.SubjectPrefix = builder.Configuration["Nats:SubjectPrefix"] ?? options.SubjectPrefix;
+        ApplyOptionalTimeout(builder.Configuration, "Nats:HostShutdownTimeoutSeconds", value => options.HostShutdownTimeout = value);
         options.WorkerConsumer = builder.Configuration["Nats:WorkerConsumer"] ?? options.WorkerConsumer;
         options.ResponseConsumer = builder.Configuration["Nats:ResponseConsumer"] ?? options.ResponseConsumer;
         ConfigureNatsSubscriber(builder.Configuration, "Nats:Worker", options.WorkerSubscriber);
@@ -417,6 +432,7 @@ else if (usePostgreSqlTransport)
     {
         options.SchemaName = builder.Configuration["PostgreSQL:SchemaName"] ?? options.SchemaName;
         options.MessageTable = builder.Configuration["PostgreSQL:TransportMessageTable"] ?? options.MessageTable;
+        ApplyOptionalTimeout(builder.Configuration, "PostgreSQL:HostShutdownTimeoutSeconds", value => options.HostShutdownTimeout = value);
         options.NotificationChannel = builder.Configuration["PostgreSQL:TransportNotificationChannel"] ?? options.NotificationChannel;
         options.WorkerQueue = builder.Configuration["PostgreSQL:WorkerQueue"] ?? options.WorkerQueue;
         options.ResponseQueue = builder.Configuration["PostgreSQL:ResponseQueue"] ?? options.ResponseQueue;
@@ -446,6 +462,7 @@ else if (useSqlServerTransport)
             ?? builder.Configuration["SqlServer:ConnectionString"];
         options.SchemaName = builder.Configuration["SqlServer:SchemaName"] ?? options.SchemaName;
         options.MessageTable = builder.Configuration["SqlServer:TransportMessageTable"] ?? options.MessageTable;
+        ApplyOptionalTimeout(builder.Configuration, "SqlServer:HostShutdownTimeoutSeconds", value => options.HostShutdownTimeout = value);
         options.WorkerQueue = builder.Configuration["SqlServer:WorkerQueue"] ?? options.WorkerQueue;
         options.ResponseQueue = builder.Configuration["SqlServer:ResponseQueue"] ?? options.ResponseQueue;
         options.DeadLetterQueue = builder.Configuration["SqlServer:DeadLetterQueue"] ?? options.DeadLetterQueue;
@@ -503,6 +520,7 @@ else if (useMongoDbTransport)
     asyncResponse.WithMongoDbTransport(options =>
     {
         options.MessageCollection = builder.Configuration["MongoDB:TransportMessageCollection"] ?? options.MessageCollection;
+        ApplyOptionalTimeout(builder.Configuration, "MongoDB:HostShutdownTimeoutSeconds", value => options.HostShutdownTimeout = value);
         options.WorkerQueue = builder.Configuration["MongoDB:WorkerQueue"] ?? options.WorkerQueue;
         options.ResponseQueue = builder.Configuration["MongoDB:ResponseQueue"] ?? options.ResponseQueue;
         options.DeadLetterQueue = builder.Configuration["MongoDB:DeadLetterQueue"] ?? options.DeadLetterQueue;
@@ -1873,7 +1891,7 @@ if (enableTestEndpoints)
 {
 app.MapPost("/crash", async (IServiceProvider services, CancellationToken cancellationToken) =>
 {
-    var multiplexer = services.GetService<IConnectionMultiplexer>();
+    var multiplexer = services.GetService<RedisChannelSelected>() is null ? null : services.GetService<IConnectionMultiplexer>();
     if (multiplexer is null)
     {
         var postgres = services.GetService<PostgreSqlAsyncResponseChannel>();
@@ -2008,7 +2026,8 @@ static async Task<bool> DropLocalSubscriptionAsync(
     string correlationId,
     CancellationToken cancellationToken)
 {
-    var multiplexer = services.GetService<IConnectionMultiplexer>();
+    // The multiplexer is also registered for the Redis TRANSPORT; only a Redis CHANNEL has channel subscriptions to drop.
+    var multiplexer = services.GetService<RedisChannelSelected>() is null ? null : services.GetService<IConnectionMultiplexer>();
     if (multiplexer is not null)
     {
         var redisOptions = services.GetRequiredService<IOptions<RedisAsyncResponseOptions>>();
@@ -2600,3 +2619,6 @@ app.Run();
 
 /// <summary>Exposed so in-process integration tests can boot the app with WebApplicationFactory.</summary>
 public partial class Program;
+
+/// <summary>Marker registered only when the Redis CHANNEL (not just the Redis transport) is selected.</summary>
+internal sealed class RedisChannelSelected;

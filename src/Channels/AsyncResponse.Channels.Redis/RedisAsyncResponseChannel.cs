@@ -1000,10 +1000,10 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
         }
         catch (TimeoutException)
         {
-            _logger.LogWarning(
+            SafeLog.Try(() => _logger.LogWarning(
                 "Retiring the serial executor for channel {Channel} did not complete within DisposalDrainTimeout ({DisposalDrainTimeout}); leaving it to finish in the background.",
                 channel,
-                _options.DisposalDrainTimeout);
+                _options.DisposalDrainTimeout));
         }
     }
 
@@ -1093,8 +1093,11 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
             }
             else
             {
-                if (_logger.IsEnabled(LogLevel.Debug))
-                    _logger.LogDebug("Published response for correlationId {CorrelationId} on channel {Channel}. PayloadType: {PayloadType}. Subscribers: {SubscriberCount}.", correlationId, channel.ToString()!, typeof(T), numSubscribers);
+                SafeLog.Try(() =>
+                {
+                    if (_logger.IsEnabled(LogLevel.Debug))
+                        _logger.LogDebug("Published response for correlationId {CorrelationId} on channel {Channel}. PayloadType: {PayloadType}. Subscribers: {SubscriberCount}.", correlationId, channel.ToString()!, typeof(T), numSubscribers);
+                });
             }
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
@@ -1193,8 +1196,11 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
             }
             else
             {
-                if (_logger.IsEnabled(LogLevel.Debug))
-                    _logger.LogDebug("Published raw response for correlationId {CorrelationId} on channel {Channel}. Subscribers: {SubscriberCount}.", correlationId, channel.ToString()!, numSubscribers);
+                SafeLog.Try(() =>
+                {
+                    if (_logger.IsEnabled(LogLevel.Debug))
+                        _logger.LogDebug("Published raw response for correlationId {CorrelationId} on channel {Channel}. Subscribers: {SubscriberCount}.", correlationId, channel.ToString()!, numSubscribers);
+                });
             }
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
@@ -1296,9 +1302,13 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
 
                 await RetireExecutorBoundedAsync(channel.ToString()!).ConfigureAwait(false);
             }
-            else if (_logger.IsEnabled(LogLevel.Debug))
+            else
             {
-                _logger.LogDebug("Published exception response for correlationId {CorrelationId} on channel {Channel}. Subscribers: {SubscriberCount}.", correlationId, channel.ToString()!, numSubscribers);
+                SafeLog.Try(() =>
+                {
+                    if (_logger.IsEnabled(LogLevel.Debug))
+                        _logger.LogDebug("Published exception response for correlationId {CorrelationId} on channel {Channel}. Subscribers: {SubscriberCount}.", correlationId, channel.ToString()!, numSubscribers);
+                });
             }
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)

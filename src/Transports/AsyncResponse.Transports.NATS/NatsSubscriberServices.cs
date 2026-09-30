@@ -322,12 +322,13 @@ internal abstract class NatsSubscriberService : BackgroundService
             }
             catch (TimeoutException)
             {
-                Logger.LogWarning(
+                // Logged through SafeLog: a throwing provider must not abort the batch's finally.
+                SafeLog.Try(() => Logger.LogWarning(
                     "NATS in-progress heartbeat for {Role} did not stop within {RenewalInterval} after its batch settled; abandoning it — unsettled deliveries fall back to the server-side AckWait.",
                     Role,
-                    renewalInterval);
+                    renewalInterval));
                 _ = renewalTask.ContinueWith(
-                    static (task, state) => ((ILogger)state!).LogWarning(task.Exception, "Abandoned NATS in-progress heartbeat faulted."),
+                    static (task, state) => SafeLog.Try(() => ((ILogger)state!).LogWarning(task.Exception, "Abandoned NATS in-progress heartbeat faulted.")),
                     Logger,
                     CancellationToken.None,
                     TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously,
@@ -352,11 +353,12 @@ internal abstract class NatsSubscriberService : BackgroundService
         }
         catch (Exception ex)
         {
-            Logger.LogDebug(
+            // SafeLog: a throwing provider must not skip the rest of the release loop or the heartbeat cancel.
+            SafeLog.Try(() => Logger.LogDebug(
                 ex,
                 "Failed to hand back an unstarted NATS message on subject {Subject} ({Role}); it redelivers when its AckWait lapses.",
                 delivery.Subject,
-                Role);
+                Role));
         }
     }
 
@@ -406,11 +408,11 @@ internal abstract class NatsSubscriberService : BackgroundService
                         // is cancelled by the connection's CommandTimeout — and treating any of
                         // them as the batch ending stopped every renewal for the rest of the
                         // batch, so AckWait lapsed under a live handler and redelivered to a peer.
-                        Logger.LogWarning(
+                        SafeLog.Try(() => Logger.LogWarning(
                             ex,
                             "Failed to signal in-progress for NATS message on subject {Subject} ({Role}); its AckWait may lapse and it may redeliver while still queued (at-least-once preserved).",
                             delivery.Subject,
-                            Role);
+                            Role));
                     }
                 }
             }

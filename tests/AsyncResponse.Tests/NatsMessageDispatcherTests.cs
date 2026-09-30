@@ -618,6 +618,63 @@ public class NatsMessageDispatcherTests
     }
 
     [Fact]
+    public async Task HandlerFailureAtMaxAttempts_WithAThrowingMessageGetter_StillDeadLettersAndTerminates()
+    {
+        var rec = new RecordingDelivery();
+        var subscriber = new NatsSubscriberOptions { MaxDeliveryAttempts = 5 };
+        await using var dispatcher = CreateDispatcher((_, _) => throw new ThrowingMessageException(), subscriber);
+
+        await dispatcher.HandleAsync(rec.Create("payload", numDelivered: 5), CancellationToken.None);
+
+        Assert.Equal(1, rec.Terms);
+        var deadLettered = Assert.Single(_jetStream.Published);
+        Assert.False(string.IsNullOrEmpty(deadLettered.Headers!["AR-DeadLetter-Reason"]));
+    }
+
+    [Fact]
+    public async Task HandlerFailureAtMaxAttempts_WithAThrowingMessageGetterAndARecordedSpan_StillDeadLettersAndTerminates()
+    {
+        // r4 critic F4: with a span recorded, SetError read the exception's Message before the
+        // rethrow; a throwing getter replaced the handler's exception, so the failure path never
+        // saw it and the message was neither dead-lettered nor terminated.
+        using var collector = new AsyncResponseActivityCollector();
+        var rec = new RecordingDelivery();
+        var subscriber = new NatsSubscriberOptions { MaxDeliveryAttempts = 5 };
+        await using var dispatcher = CreateDispatcher((_, _) => throw new ThrowingMessageException(), subscriber);
+
+        await dispatcher.HandleAsync(rec.Create("payload", numDelivered: 5), CancellationToken.None);
+
+        Assert.Equal(1, rec.Terms);
+        Assert.Equal(DeadLetterSubject, Assert.Single(_jetStream.Published).Subject);
+        var activity = collector.Single("asyncresponse.nats.receive", "asyncresponse.transport", "nats");
+        Assert.Equal(ActivityStatusCode.Error, activity.Status);
+        Assert.Equal(typeof(ThrowingMessageException).FullName, AsyncResponseActivityCollector.Tag(activity, "error.type"));
+    }
+
+    [Fact]
+    public async Task HandlerFailureAtMaxAttempts_WithANullMessage_StillDeadLettersAndTerminates()
+    {
+        var rec = new RecordingDelivery();
+        var subscriber = new NatsSubscriberOptions { MaxDeliveryAttempts = 5 };
+        await using var dispatcher = CreateDispatcher((_, _) => throw new NullMessageException(), subscriber);
+
+        await dispatcher.HandleAsync(rec.Create("payload", numDelivered: 5), CancellationToken.None);
+
+        Assert.Equal(1, rec.Terms);
+        Assert.Single(_jetStream.Published);
+    }
+
+    private sealed class ThrowingMessageException : Exception
+    {
+        public override string Message => throw new InvalidOperationException("getter");
+    }
+
+    private sealed class NullMessageException : Exception
+    {
+        public override string Message => null!;
+    }
+
+    [Fact]
     public async Task DeadLetterPublish_DropsTheInboundNatsMsgId()
     {
         // Regression (round 29): the inbound Nats-Msg-Id belongs to the LIVE publish, not to this

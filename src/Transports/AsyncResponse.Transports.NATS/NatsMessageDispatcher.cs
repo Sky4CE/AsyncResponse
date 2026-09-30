@@ -579,7 +579,10 @@ internal sealed class NatsMessageDispatcher : IAsyncDisposable
 
         // Capped (RabbitMQ/Kafka parity) so an arbitrarily long exception message cannot push the
         // burial past the server's max_payload; surrogate-aware (see PortableText.TruncateWellFormed).
-        var reason = reasonCode is null ? exception.Message : $"{reasonCode}: {exception.Message}";
+        // The Message getter is user code (a custom exception can throw or return null); a burial
+        // must not depend on it, or the worker faults / the consume loop unwinds with no settlement.
+        var message = SafeMessage(exception);
+        var reason = reasonCode is null ? message : $"{reasonCode}: {message}";
         headers["AR-DeadLetter-Reason"] = SanitizeHeaderValue(PortableText.TruncateWellFormed(reason, MaxDeadLetterReasonLength));
         headers["AR-DeadLetter-Source-Subject"] = delivery.Subject;
         headers["AR-DeadLetter-Role"] = _role.ToString();
@@ -618,6 +621,18 @@ internal sealed class NatsMessageDispatcher : IAsyncDisposable
 
     /// <summary>Longest <c>AR-DeadLetter-Reason</c> header value, in UTF-16 code units.</summary>
     internal const int MaxDeadLetterReasonLength = 512;
+
+    private static string SafeMessage(Exception exception)
+    {
+        try
+        {
+            return exception.Message ?? exception.GetType().Name;
+        }
+        catch (Exception)
+        {
+            return exception.GetType().Name;
+        }
+    }
 
     private static string SanitizeHeaderValue(string value)
         => value.Replace('\r', ' ').Replace('\n', ' ');

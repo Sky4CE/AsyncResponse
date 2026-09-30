@@ -433,6 +433,53 @@ public class NatsSubscriberServicesTests
     }
 
     [Fact]
+    public async Task Subscriber_AHandBackWhoseFailedNakLogThrows_StillHandsBackTheRestOfTheBatch()
+    {
+        // A failed NAK on the release loop is only logged; a throwing provider used to escape the
+        // catch, abort the loop (the rest of the batch stayed unsettled until AckWait) and fault
+        // the batch before its heartbeat was cancelled.
+        var ingress = new HandBackIngress();
+        var deliveries = new[]
+        {
+            new RecordingDelivery(),
+            new RecordingDelivery(),
+            new RecordingDelivery(),
+            new RecordingDelivery { NakException = new InvalidOperationException("NAK refused") },
+            new RecordingDelivery()
+        };
+        for (var i = 0; i < deliveries.Length; i++)
+            _jetStream.EnqueueDelivery(deliveries[i].Create($"p{i + 1}", numDelivered: 1));
+        var logger = new RecordingThrowingLogger<NatsWorkerSubscriber> { ThrowOnMessageContaining = "Failed to hand back" };
+        var subscriber = new NatsWorkerSubscriber(
+            Options(o =>
+            {
+                o.WorkerSubscriber.UseAckAfterEnqueue(backgroundWorkerCount: 1, backgroundQueueCapacity: 1, TimeSpan.FromSeconds(5));
+                o.WorkerSubscriber.BatchSize = 5;
+            }),
+            _jetStream,
+            ingress,
+            logger);
+
+        await subscriber.StartAsync(CancellationToken.None);
+        try
+        {
+            await ingress.Started.Task.WaitAsync(HangGuard);
+            await Eventually(() => deliveries[1].Acks == 1);
+
+            ingress.Release.TrySetResult();
+            await Eventually(() => deliveries[3].Naks.Count == 1 && deliveries[4].Naks.Count == 1);
+
+            Assert.Equal(0, logger.CountEntries(Microsoft.Extensions.Logging.LogLevel.Warning, "NATS subscriber failed"));
+        }
+        finally
+        {
+            ingress.Release.TrySetResult();
+            await subscriber.StopAsync(CancellationToken.None);
+            subscriber.Dispose();
+        }
+    }
+
+    [Fact]
     public async Task WorkerSubscriber_HostStopping_EndsTheIdleLongPollAtOnce_AndFetchesNothingMore()
     {
         // Fixpoint round 2 (worker intake stops at host stop): from ApplicationStopping on, the

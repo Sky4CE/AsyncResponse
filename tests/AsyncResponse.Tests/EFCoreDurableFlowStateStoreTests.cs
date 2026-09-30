@@ -138,6 +138,8 @@ public sealed class EFCoreDurableFlowStateStoreTests
     // MySQL, through both the official provider id and Pomelo's.
     [InlineData("Pomelo.EntityFrameworkCore.MySql", "utf8mb4_bin", true)]
     [InlineData("MySql.EntityFrameworkCore", "utf8mb4_bin", true)]
+    [InlineData("Pomelo.EntityFrameworkCore.MySql", "latin1_bin", false)]
+    [InlineData("Pomelo.EntityFrameworkCore.MySql", "utf8mb3_bin", false)]
     [InlineData("Pomelo.EntityFrameworkCore.MySql", "utf8mb4_0900_as_cs", false)]
     [InlineData("Pomelo.EntityFrameworkCore.MySql", "utf8mb4_0900_ai_ci", false)]
     public void FlowIdCollationRules_NameWhatIsOrdinalPerProvider(string providerName, string collation, bool ordinal)

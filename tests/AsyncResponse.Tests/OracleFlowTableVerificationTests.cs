@@ -45,6 +45,39 @@ public sealed class OracleFlowTableVerificationTests
         Assert.Contains("ALTER SESSION SET NLS_COMP = BINARY", diagnosis, StringComparison.Ordinal);
     }
 
+    [Theory]
+    [InlineData(null, "GERMAN", false)]
+    [InlineData("USING_NLS_COMP", "GERMAN", false)] // follows the session, verified separately
+    [InlineData("BINARY", "GERMAN", false)]
+    [InlineData("BINARY_CI", "BINARY", true)]
+    [InlineData("BINARY_AI", "BINARY", true)]
+    [InlineData("GERMAN", "BINARY", true)]
+    // USING_NLS_SORT follows NLS_SORT alone: ordinal exactly when the session sort is BINARY.
+    [InlineData("USING_NLS_SORT", "BINARY", false)]
+    [InlineData("using_nls_sort", "binary", false)]
+    [InlineData("USING_NLS_SORT", "GERMAN", true)]
+    [InlineData("USING_NLS_SORT", "BINARY_CI", true)]
+    [InlineData("USING_NLS_SORT", null, true)]
+    // The _CI/_AI variants fold whatever the session sort is.
+    [InlineData("USING_NLS_SORT_CI", "BINARY", true)]
+    [InlineData("USING_NLS_SORT_AI", "BINARY", true)]
+    public void DiagnoseFlowIdCollation_RejectsAColumnCollationThatFolds(string? collation, string? nlsSort, bool rejected)
+    {
+        var diagnosis = OracleFlowStateStore.DiagnoseFlowIdCollation(collation, nlsSort, "flows");
+        if (!rejected)
+        {
+            Assert.Null(diagnosis);
+            return;
+        }
+
+        Assert.NotNull(diagnosis);
+        Assert.Contains($"'{collation}'", diagnosis, StringComparison.Ordinal);
+        Assert.Contains("COLLATE BINARY", diagnosis, StringComparison.Ordinal);
+        // flow_id is the primary key: an in-place MODIFY ... COLLATE is not the remediation.
+        Assert.DoesNotContain("MODIFY (flow_id COLLATE BINARY)", diagnosis, StringComparison.Ordinal);
+        Assert.Contains("Recreate", diagnosis, StringComparison.OrdinalIgnoreCase);
+    }
+
     [Fact]
     public void Mismatch_AcceptsTheShapeTheStoresOwnDdlCreates()
     {

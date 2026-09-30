@@ -496,8 +496,84 @@ public sealed class OracleFlowStateStore : IFlowStateStore
                 "it a default, make it nullable, virtual, or identity, or move it to a table of your own.");
         }
 
+        await VerifyFlowIdCollationAsync(connection, table.Owner, table.Name, cancellationToken).ConfigureAwait(false);
         await VerifyFlowIdIsUniqueAsync(connection, table.Owner, table.Name, cancellationToken).ConfigureAwait(false);
         return true;
+    }
+
+    /// <summary>
+    /// Reads flow_id's own collation (Oracle 12.2+). It is queried on its own because ALL_TAB_COLS
+    /// has no COLLATION column before 12.2: ORA-00904 there means column-level collation does not
+    /// exist, so the session check alone is the whole story.
+    /// </summary>
+    private async Task VerifyFlowIdCollationAsync(OracleConnection connection, string owner, string tableName, CancellationToken cancellationToken)
+    {
+        string? collation;
+        try
+        {
+            await using var command = connection.CreateCommand();
+            command.BindByName = true;
+            command.CommandText =
+                "SELECT COLLATION FROM ALL_TAB_COLS WHERE OWNER = :owner AND TABLE_NAME = :table_name AND COLUMN_NAME = 'FLOW_ID'";
+            command.Parameters.Add(new OracleParameter("owner", owner));
+            command.Parameters.Add(new OracleParameter("table_name", tableName));
+            collation = await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false) as string;
+        }
+        catch (OracleException ex) when (ex.Number == 904)
+        {
+            return;
+        }
+
+        // USING_NLS_SORT defers to the session's NLS_SORT, read only when it matters.
+        string? nlsSort = null;
+        if (string.Equals(collation, UsingNlsSort, StringComparison.OrdinalIgnoreCase))
+        {
+            await using var command = connection.CreateCommand();
+            command.CommandText = "SELECT VALUE FROM NLS_SESSION_PARAMETERS WHERE PARAMETER = 'NLS_SORT'";
+            nlsSort = await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false) as string;
+        }
+
+        if (DiagnoseFlowIdCollation(collation, nlsSort, _options.TableName) is { } message)
+            throw new InvalidOperationException(message);
+    }
+
+    private const string UsingNlsSort = "USING_NLS_SORT";
+
+    /// <summary>
+    /// The column-collation decision on its catalog input: the rejection message for a flow_id
+    /// whose data-bound collation folds case or accents, or null when it is ordinal or absent.
+    /// A column collation overrides NLS_COMP/NLS_SORT for the primary key and every
+    /// <c>flow_id = :flow_id</c>, so BINARY_CI or a linguistic collation makes "Abc" and "abc"
+    /// one row however the session is set. The pseudo-collations defer to the session:
+    /// <c>USING_NLS_COMP</c> (the default) follows NLS_COMP/NLS_SORT, which is verified
+    /// separately; <c>USING_NLS_SORT</c> follows NLS_SORT alone (NLS_COMP does not apply), so it
+    /// is ordinal only when <paramref name="nlsSort"/> is BINARY; the <c>_CI</c>/<c>_AI</c>
+    /// variants fold by definition and the <c>_CS</c> one is not accepted either. No value means
+    /// the catalog predates column collations.
+    /// </summary>
+    internal static string? DiagnoseFlowIdCollation(string? collation, string? nlsSort, string tableName)
+    {
+        if (string.IsNullOrEmpty(collation)
+            || string.Equals(collation, "USING_NLS_COMP", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(collation, "BINARY", StringComparison.OrdinalIgnoreCase))
+        {
+            return null;
+        }
+
+        var deferredToSession = string.Equals(collation, UsingNlsSort, StringComparison.OrdinalIgnoreCase);
+        if (deferredToSession && string.Equals(nlsSort, "BINARY", StringComparison.OrdinalIgnoreCase))
+            return null;
+
+        var resolved = deferredToSession ? $" (this session's NLS_SORT is '{nlsSort ?? "(unknown)"}')" : string.Empty;
+        return
+            $"The Oracle durable-flow table '{tableName}' declares flow_id with the collation '{collation}'{resolved}, which does not " +
+            "compare ordinally. Flow ids differing only in case (or accent) would share one primary-key value and match each other's " +
+            "rows: the second flow fails to start and a load or lease can reach the other flow's state. " +
+            (deferredToSession
+                ? "Set NLS_SORT = BINARY for the store's sessions, or recreate "
+                : "Recreate ") +
+            $"the table (or its flow_id column) with flow_id declared COLLATE BINARY — flow_id is the primary key, so its collation " +
+            $"cannot simply be changed in place with ALTER TABLE {tableName} MODIFY.";
     }
 
     /// <summary>
