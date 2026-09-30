@@ -104,6 +104,27 @@ public class NatsTransportOptionsAndSchemaTests
     }
 
     /// <summary>
+    /// The correlation id shares the publish header dictionary with the JetStream dedup id, so a
+    /// reserved Nats-* publish directive as its name would replace the per-publish GUID (two jobs of
+    /// one correlation id then dedupe into one) or fail every publish.
+    /// </summary>
+    [Theory]
+    [InlineData("Nats-Msg-Id")]
+    [InlineData("nats-msg-id")]
+    [InlineData("Nats-Expected-Stream")]
+    [InlineData("Nats-Rollup")]
+    [InlineData("Nats-TTL")]
+    [InlineData("nats-incr")]
+    [InlineData("Nats-Schedule-Target")]
+    [InlineData("Nats-Batch-Id")]
+    public void ValidateCommon_Throws_ForReservedNatsPublishHeaderAsCorrelationHeader(string header)
+    {
+        var options = new NatsAsyncResponseTransportOptions { CorrelationIdHeader = header };
+        var ex = Assert.Throws<InvalidOperationException>(() => NatsTransportOptionsValidator.ValidateCommon(options));
+        Assert.Contains(nameof(NatsAsyncResponseTransportOptions.CorrelationIdHeader), ex.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>
     /// A blank stream name is NOT configured — the schema derives the stream from the subject
     /// (IsNullOrWhiteSpace) — so the JetStream-name check must skip it the same way. It skipped
     /// only null/empty, and a whitespace-only stream option that used to resolve to the derived

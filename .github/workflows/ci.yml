@@ -478,9 +478,12 @@ jobs:
     permissions:
       contents: write
     # Shared with the benchmark and load-test workflows: all three commit to gh-pages, and
-    # concurrent pushes to the same branch fail on a non-fast-forward.
+    # concurrent pushes to the same branch fail on a non-fast-forward. Only a main push publishes,
+    # so only it joins the shared group: the group keeps ONE pending entry and cancels the older
+    # one, so a pull request's coverage job queued behind a benchmark run used to cancel main's
+    # pending coverage job (a "cancelled" CI run and a skipped publish).
     concurrency:
-      group: benchmark-publish
+      group: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'benchmark-publish' || format('coverage-{0}', github.run_id) }}
       cancel-in-progress: false
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

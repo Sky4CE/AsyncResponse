@@ -89,6 +89,28 @@ internal static class NatsTransportOptionsValidator
         }
     }
 
+    /// <summary>
+    /// The correlation id is written into the same header set as the JetStream publish directives.
+    /// Named Nats-Msg-Id it replaces the per-publish dedup GUID (a second job of one correlation id
+    /// inside the duplicate window is then acknowledged as a duplicate and silently dropped); named
+    /// Nats-Expected-*, Nats-Rollup, Nats-TTL, Nats-Incr, Nats-Schedule* or Nats-Batch-* it turns
+    /// every publish into a broker directive the stream may reject. Other Nats-* names are left alone:
+    /// the server ignores headers it does not recognise, so such a setting works today.
+    /// </summary>
+    private static void EnsureNotReservedPublishHeader(string value, string name)
+    {
+        if (value.Equals("Nats-Msg-Id", StringComparison.OrdinalIgnoreCase)
+            || value.Equals("Nats-Rollup", StringComparison.OrdinalIgnoreCase)
+            || value.Equals("Nats-TTL", StringComparison.OrdinalIgnoreCase)
+            || value.Equals("Nats-Incr", StringComparison.OrdinalIgnoreCase)
+            || value.StartsWith("Nats-Expected-", StringComparison.OrdinalIgnoreCase)
+            || value.StartsWith("Nats-Schedule", StringComparison.OrdinalIgnoreCase)
+            || value.StartsWith("Nats-Batch-", StringComparison.OrdinalIgnoreCase))
+            throw new InvalidOperationException(
+                $"{nameof(NatsAsyncResponseTransportOptions)}.{name} '{value}' is a reserved JetStream publish header; " +
+                "choose another header name for the correlation id.");
+    }
+
     private static void EnsureDistinct(string left, string right, string kind, string leftName, string rightName)
     {
         if (StringComparer.Ordinal.Equals(left, right))
@@ -108,6 +130,7 @@ internal static class NatsTransportOptionsValidator
         _ = Required(options.DefaultReplyTargetName, nameof(options.DefaultReplyTargetName));
 
         EnsureHeaderName(options.CorrelationIdHeader, nameof(options.CorrelationIdHeader));
+        EnsureNotReservedPublishHeader(options.CorrelationIdHeader, nameof(options.CorrelationIdHeader));
         EnsureJetStreamName(options.WorkerStream, nameof(options.WorkerStream));
         EnsureJetStreamName(options.ResponseStream, nameof(options.ResponseStream));
         EnsureJetStreamName(options.DeadLetterStream, nameof(options.DeadLetterStream));

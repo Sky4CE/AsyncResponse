@@ -13,6 +13,25 @@ work that has landed on `main` but not yet shipped. Security reporters credited 
 
 ### Changed
 
+- **Round-59 review (2026-09-30, whole-repository review of `7449425`): startup refuses two
+  configurations that silently misbehaved, the Azure Service Bus renewal heartbeat runs on the
+  injected clock, and a pull request's CI can no longer cancel main's coverage publish.**
+  - *NATS transport.* A `CorrelationIdHeader` naming a reserved JetStream publish header
+    (`Nats-Msg-Id`, `Nats-Expected-*`, `Nats-Rollup`, `Nats-TTL`, `Nats-Incr`, `Nats-Schedule*`,
+    `Nats-Batch-*`, case-insensitive) is refused at startup: `Nats-Msg-Id` silently replaced the
+    dedup id, so a second job for one correlation id inside the duplicate window was dropped as a
+    duplicate. No wire change for valid settings.
+  - *RabbitMQ transport.* Options validation at construction rejects a blank host name, virtual
+    host or user name and a port outside 1–65535 (the default sentinel stays allowed) when no
+    connection string is set; such settings already failed every connect, and subscribers retried
+    them forever.
+  - *Azure Service Bus transport.* The lock-renewal heartbeat waits on the injected `TimeProvider`
+    like the join that bounds it.
+  - *Durable flows.* Comparing a ledger or input whose JSON repeats a property name reads as "not
+    equivalent" instead of throwing `ArgumentException`.
+  - *Redis channel.* The receive and subscribe Debug logs no longer allocate per message.
+  - *CI.* Only a main push joins the shared gh-pages publish concurrency group; a pull request's
+    coverage job queued there cancelled main's pending one.
 - **Round-58 review (2026-09-30, whole-repository review of `14962a2`): the Azure Service Bus stop
   path is bounded on the injected clock, and the Testing package's virtual timers match the system
   timer's millisecond truncation.**

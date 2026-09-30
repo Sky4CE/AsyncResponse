@@ -346,7 +346,13 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
                 }
             }
 
-            SafeLog.Try(() => _logger.LogDebug("Subscribed to channel {Channel} for correlationId {CorrelationId}.", channelName, correlationId));
+            SafeLog.Try(
+                (_logger, channelName, correlationId),
+                static s =>
+                {
+                    if (s._logger.IsEnabled(LogLevel.Debug))
+                        s._logger.LogDebug("Subscribed to channel {Channel} for correlationId {CorrelationId}.", s.channelName, s.correlationId);
+                });
         }
         catch (Exception ex) when (subscription.ResponseTask.IsCompletedSuccessfully || subscription.ResponseTask.IsFaulted)
         {
@@ -656,7 +662,13 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
                 return;
             }
 
-            SafeLog.Try(() => _owner._logger.LogDebug("Received message on channel {Channel}.", ChannelName));
+            SafeLog.Try(
+                this,
+                static s =>
+                {
+                    if (s._owner._logger.IsEnabled(LogLevel.Debug))
+                        s._owner._logger.LogDebug("Received message on channel {Channel}.", s.ChannelName);
+                });
 
             bool finished = false;
             try
@@ -718,11 +730,13 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
                 }
                 else
                 {
-                    SafeLog.Try(() =>
-                    {
-                        if (_owner._logger.IsEnabled(LogLevel.Debug))
-                            _owner._logger.LogDebug("Received response for correlationId {CorrelationId}.", _correlationId);
-                    });
+                    SafeLog.Try(
+                        this,
+                        static s =>
+                        {
+                            if (s._owner._logger.IsEnabled(LogLevel.Debug))
+                                s._owner._logger.LogDebug("Received response for correlationId {CorrelationId}.", s._correlationId);
+                        });
 
                     finished = await _completionPredicate(envelope.Payload!).ConfigureAwait(false);
 

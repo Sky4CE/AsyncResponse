@@ -29,7 +29,20 @@ internal static class RabbitMqOptionsValidator
         AsyncResponseChannelOptions.EnsureTimerBacked(options.NetworkRecoveryInterval, nameof(RabbitMqAsyncResponseOptions), nameof(options.NetworkRecoveryInterval));
 
         if (!string.IsNullOrWhiteSpace(options.ConnectionString))
+        {
             ValidateConnectionString(options.ConnectionString);
+            return;
+        }
+
+        // Discrete endpoint knobs apply only without a connection string (the factory ignores them
+        // otherwise). CreateFactory checks the same three at the first connect; -1 is the client's
+        // "default port" sentinel.
+        _ = Required(options.HostName, nameof(options.HostName));
+        _ = Required(options.VirtualHost, nameof(options.VirtualHost));
+        _ = Required(options.UserName, nameof(options.UserName));
+        if (options.Port is 0 or < -1 or > ushort.MaxValue)
+            throw new InvalidOperationException(
+                $"{nameof(RabbitMqAsyncResponseOptions)}.{nameof(options.Port)} must be between 1 and {ushort.MaxValue} (or -1 for the protocol default).");
     }
 
     /// <summary>

@@ -102,8 +102,10 @@ internal static class FlowStateJson
         {
             return JsonNode.DeepEquals(JsonNode.Parse(left), JsonNode.Parse(right));
         }
-        catch (JsonException)
+        catch (Exception ex) when (ex is JsonException or ArgumentException)
         {
+            // JsonNode builds object dictionaries lazily: a repeated property name surfaces as an
+            // ArgumentException during the comparison, and reads as "not equivalent".
             return false;
         }
     }

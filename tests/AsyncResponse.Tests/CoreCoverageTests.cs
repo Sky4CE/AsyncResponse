@@ -393,6 +393,8 @@ public sealed class CoreCoverageTests
         Assert.False(FlowStateJson.JsonEquivalent(null, "{}"));
         Assert.True(FlowStateJson.JsonEquivalent("{\"a\":1,\"b\":2}", "{\"b\":2,\"a\":1}"));
         Assert.False(FlowStateJson.JsonEquivalent("{not-json", "{}"));
+        Assert.False(FlowStateJson.JsonEquivalent("{\"a\":1,\"a\":2}", "{}"));
+        Assert.False(FlowStateJson.JsonEquivalent("{}", "{\"a\":1,\"a\":2}"));
     }
 
     private static FlowExecutionLease LongLease(IFlowStateStore store, string flowId)

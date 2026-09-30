@@ -86,6 +86,8 @@ public sealed class AzureServiceBusCoverageGapTests
         try
         {
             await subscriber.StartAsync(CancellationToken.None);
+            await WaitUntilAsync(() => clock.NextTimerDueAt is not null);
+            clock.Advance(TimeSpan.FromMilliseconds(20));
             await renewStarted.Task.WaitAsync(Wait);
             await WaitUntilAsync(() => Volatile.Read(ref hooks.CompleteCalls) == 1 && clock.NextTimerDueAt is not null);
             clock.Advance(TimeSpan.FromSeconds(60));
@@ -95,6 +97,37 @@ public sealed class AzureServiceBusCoverageGapTests
         {
             releaseRenew.TrySetResult();
             clock.Advance(TimeSpan.FromSeconds(120));
+            await subscriber.StopAsync(CancellationToken.None);
+        }
+    }
+
+    [Fact]
+    public async Task RenewalBeat_IsArmedOnTheInjectedClock()
+    {
+        // The renewal heartbeat slept on the system clock: a virtual-clock test never saw a renew
+        // until the real LockRenewalInterval (here 2 minutes) elapsed.
+        var clock = new VirtualTimeProvider();
+        var renewed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseHandler = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var hooks = new Hooks { Renew = _ => { renewed.TrySetResult(); return ValueTask.CompletedTask; } };
+        var ingress = new Mock<IAsyncResponseIngress>();
+        ingress.Setup(i => i.HandleWorkerMessageAsync("first")).Returns(() => releaseHandler.Task);
+        var options = WorkerOptions();
+        options.WorkerSubscriber.LockRenewalInterval = TimeSpan.FromMinutes(2);
+        var subscriber = Worker(options, [Delivery("m1", "first", hooks)], ingress.Object, new CollectingLogger());
+        subscriber.Clock = clock;
+
+        try
+        {
+            await subscriber.StartAsync(CancellationToken.None);
+            await WaitUntilAsync(() => clock.NextTimerDueAt is not null);
+            clock.Advance(TimeSpan.FromMinutes(2));
+            await renewed.Task.WaitAsync(Wait);
+        }
+        finally
+        {
+            releaseHandler.TrySetResult();
+            clock.Advance(TimeSpan.FromMinutes(5));
             await subscriber.StopAsync(CancellationToken.None);
         }
     }

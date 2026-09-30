@@ -121,6 +121,24 @@ public sealed class OptionCeilingSweepTests
             new RabbitMqAsyncResponseOptions { NetworkRecoveryInterval = TimeSpan.FromSeconds(-1) }));
     }
 
+    [Theory]
+    [InlineData("HostName", "", 5672, "v", "u")]
+    [InlineData("VirtualHost", "h", 5672, "", "u")]
+    [InlineData("UserName", "h", 5672, "v", " ")]
+    [InlineData("Port", "h", 70000, "v", "u")]
+    [InlineData("Port", "h", 0, "v", "u")]
+    public void RabbitMq_DiscreteEndpointKnobs_AreValidatedAtConstruction(string knob, string host, int port, string vhost, string user)
+    {
+        var options = new RabbitMqAsyncResponseOptions { HostName = host, Port = port, VirtualHost = vhost, UserName = user };
+        var ex = Assert.Throws<InvalidOperationException>(() => RabbitMqOptionsValidator.ValidateConnection(options));
+        Assert.Contains(knob, ex.Message, StringComparison.Ordinal);
+
+        // Defaults and the client's "use default port" sentinel stay valid; a connection string makes the discrete knobs irrelevant.
+        RabbitMqOptionsValidator.ValidateConnection(new RabbitMqAsyncResponseOptions());
+        RabbitMqOptionsValidator.ValidateConnection(new RabbitMqAsyncResponseOptions { Port = -1 });
+        RabbitMqOptionsValidator.ValidateConnection(new RabbitMqAsyncResponseOptions { ConnectionString = "amqp://u:p@h:5672/v", HostName = "", Port = 0 });
+    }
+
     [Fact]
     public void GooglePubSub_TimeoutsArePinnedAtLast()
     {

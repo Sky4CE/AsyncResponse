@@ -466,7 +466,7 @@ internal abstract class AzureServiceBusSubscriberService : BackgroundService
         {
             while (true)
             {
-                await Task.Delay(renewalInterval, cancellationToken).ConfigureAwait(false);
+                await Task.Delay(renewalInterval, Clock, cancellationToken).ConfigureAwait(false);
 
                 // Renew from the first unsettled message onward: that covers the message currently in
                 // the handler plus everything still waiting its turn. A message whose handler has
