@@ -382,14 +382,63 @@ public sealed class CosmosDurableFlowStateStoreTests
         Assert.Null(PatchValue(PatchFor(patched!, "/leaseExpiresAtUtc")));
         Assert.InRange((int)PatchValue(PatchFor(patched!, "/ttl"))!, 540, 601);
 
-        // An already-due ledger collapses to the 1-second floor (Cosmos rejects 0) instead of the
-        // release granting it a fresh retention window.
+        // An already-due ledger collapses to the 1-second floor (Cosmos rejects 0) plus the second
+        // _ts truncation costs, instead of the release granting it a fresh retention window: with a
+        // bare 1 it could be hidden a few ms after the patch, before it was ever visible-and-expired.
         document.LeaseId = "owner";
         document.ExpiresAtUtc = DateTime.UtcNow.AddMinutes(-5);
         document.Ttl = (int)TimeSpan.FromHours(2).TotalSeconds;
         patched = null;
         await harness.Store.ReleaseLeaseAsync("flow", "owner");
-        Assert.Equal(1, PatchValue(PatchFor(patched!, "/ttl")));
+        Assert.Equal(2, PatchValue(PatchFor(patched!, "/ttl")));
+    }
+
+    [Fact]
+    public async Task Store_ServerTtlOutlastsTheLogicalExpiry_DespiteTheWholeSecondTimestampAnchor()
+    {
+        // The server counts an item's ttl from _ts, which is WHOLE Unix seconds (truncated): an item
+        // written at hh:mm:ss.985 with ttl 1 is hidden from reads 15 ms later (measured on the
+        // pinned vnext emulator). A ttl of only ceil(logical window) therefore hid a ledger up to a
+        // second BEFORE its ExpiresAtUtc — a live run read as absent under Session, as unreadable
+        // under Eventual, and its id could not be re-created until the purge (the CI flake of
+        // FlowStoreContract's "expired-flow"). Every write covers the truncated second too.
+        using var harness = new CosmosHarness();
+        var state = CreateState("flow");
+        CosmosFlowStateDocument? created = null;
+        harness.Container
+            .Setup(container => container.CreateItemAsync(
+                It.IsAny<CosmosFlowStateDocument>(),
+                It.IsAny<PartitionKey?>(),
+                It.IsAny<ItemRequestOptions>(),
+                It.IsAny<CancellationToken>()))
+            .Callback<CosmosFlowStateDocument, PartitionKey?, ItemRequestOptions, CancellationToken>((document, _, _, _) => created = document)
+            .ReturnsAsync(Mock.Of<ItemResponse<CosmosFlowStateDocument>>());
+        Assert.True(await harness.Store.TryCreateAsync("flow", state, TimeSpan.FromMilliseconds(1)));
+        Assert.Equal(2, created!.Ttl);
+        Assert.True(await harness.Store.TryCreateAsync("flow", state, TimeSpan.FromMinutes(10)));
+        Assert.Equal(601, created!.Ttl);
+
+        CosmosFlowStateDocument? replaced = null;
+        harness.Reads(Document(state, DateTime.UtcNow.AddMinutes(1)));
+        harness.ReplacesSuccessfully(document => replaced = document);
+        state.Revision = 1;
+        Assert.True(await harness.Store.TryUpdateAsync("flow", state, 0, TimeSpan.FromMinutes(10)));
+        Assert.Equal(601, replaced!.Ttl);
+
+        var leaseExpiry = DateTime.UtcNow.AddMinutes(10).AddMilliseconds(500);
+        var leased = Document(state, leaseExpiry);
+        harness.QueriesLease(leased);
+        IReadOnlyList<PatchOperation>? patched = null;
+        harness.PatchesSuccessfully((operations, _) => patched = operations);
+        var before = DateTime.UtcNow;
+        Assert.True(await harness.Store.TryAcquireLeaseAsync("flow", "owner", TimeSpan.FromMinutes(1)));
+        var after = DateTime.UtcNow;
+        // ceil(remaining) + the truncated second, where "remaining" is read by the store somewhere in
+        // [before, after]: bounded by the clock reads around the call, not by how fast the runner is.
+        Assert.InRange(
+            (int)PatchValue(PatchFor(patched!, "/ttl"))!,
+            (int)Math.Ceiling((leaseExpiry - after).TotalSeconds) + 1,
+            (int)Math.Ceiling((leaseExpiry - before).TotalSeconds) + 1);
     }
 
     [Fact]

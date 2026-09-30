@@ -299,7 +299,7 @@ internal sealed class DurableFlowService : IDurableFlows
             state = await store.LoadCurrentAsync(flowId, cancellationToken).ConfigureAwait(false) ?? state;
 
         if (state is null)
-            throw new InvalidOperationException($"No flow state found for '{flowId}' (unknown, expired, or unreadable).");
+            throw new InvalidOperationException($"No flow state found for '{flowId}' (unknown or expired).");
 
         if (state.Status != FlowRunStatus.Running)
         {

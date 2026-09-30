@@ -507,7 +507,7 @@ public sealed class OracleCosmosStoreContractTests(OracleCosmosBatchFixture fixt
     public async Task CosmosPackageStore_AfterItsServerTtlLapses_NeverReadsAsLive_AndTheIdIsReusable()
     {
         // FlowStoreContract only reaches "visible but logically expired" (a 1 ms logical expiry
-        // under a 1 s server TTL, read 30 ms later). Past the SERVER ttl, reads answer 404 while the
+        // under a 2 s server TTL — 1 s rounded up plus the second _ts truncation costs — read 30 ms later). Past the SERVER ttl, reads answer 404 while the
         // write path (the store's never-matching conditional patch) still sees the physical item
         // and answers 412 — the emulator keeps doing so after it already accepts a new create of
         // the id. Under Session or Strong consistency each 412 makes the re-read current, so the
@@ -540,7 +540,7 @@ public sealed class OracleCosmosStoreContractTests(OracleCosmosBatchFixture fixt
                 },
                 done => done,
                 TimeSpan.FromSeconds(60));
-            Assert.True(hidden, "the emulator never hid the item after its 1 s ttl");
+            Assert.True(hidden, "the emulator never hid the item after its server ttl");
 
             var account = await client.ReadAccountAsync();
             var sessionConsistent = account.Consistency.DefaultConsistencyLevel is ConsistencyLevel.Session or ConsistencyLevel.Strong;

@@ -221,7 +221,7 @@ public sealed class CosmosFlowStateStore : IFlowStateStore, IFlowStateStoreStart
                 // once, not every time. Under Session or Strong consistency each 412 made the
                 // re-read current, so the item is physically present but hidden by its SERVER ttl
                 // and not yet purged (the physical ttl is counted from the last write and never
-                // ends before the logical expiry): absent. Otherwise this client's reads are not
+                // ends before the logical expiry, see TimestampTruncationSeconds): absent. Otherwise this client's reads are not
                 // session-consistent with its writes (an Eventual or Consistent Prefix account or
                 // client), so nothing it reads can prove the run is gone.
                 if (attempt == MaxAbsenceConfirmations - 1)
@@ -1157,23 +1157,41 @@ public sealed class CosmosFlowStateStore : IFlowStateStore, IFlowStateStoreStart
             ExpiresAtUtc = DurableFlowStoreShared.AddSaturating(now, ttl),
             UpdatedAtUtc = now,
             Revision = revision,
-            // Cosmos reaps the item itself once container TTL is enabled. Ceiling keeps the
-            // server-side TTL from being shorter than the requested duration.
+            // Cosmos reaps the item itself once container TTL is enabled. See CosmosTtlSeconds:
+            // the server-side TTL never ends before the requested duration.
             Ttl = CosmosTtlSeconds(ttl)
         };
 
-    /// <summary>Per-item TTL in whole seconds, rounded up and saturated at int.MaxValue (~68 years) for absurd expiries.</summary>
+    /// <summary>
+    /// Per-item TTL in whole seconds, rounded up, plus <see cref="TimestampTruncationSeconds"/>, and
+    /// saturated at int.MaxValue (~68 years) for absurd expiries.
+    /// </summary>
     private static int CosmosTtlSeconds(TimeSpan ttl)
-        => (int)Math.Min(Math.Ceiling(ttl.TotalSeconds), int.MaxValue);
+        => (int)Math.Min(Math.Ceiling(ttl.TotalSeconds) + TimestampTruncationSeconds, int.MaxValue);
 
     /// <summary>
-    /// Remaining per-item TTL in whole seconds until <paramref name="expiresAtUtc"/>, rounded up
-    /// and floored at 1 (Cosmos rejects 0). Used by replaces that keep the logical expiry in place:
-    /// an already-due document collapses to the shortest legal TTL so the next sweep purges it
-    /// instead of the replace granting it a fresh retention window.
+    /// The server counts an item's ttl from <c>_ts</c>, the write instant TRUNCATED to whole Unix
+    /// seconds, and hides the item from reads at <c>_ts + ttl</c>. Without this extra second a write
+    /// at hh:mm:ss.985 with ttl 1 was hidden 15 ms later (measured on the vnext emulator), so a
+    /// ledger vanished from reads up to a second BEFORE its logical <c>ExpiresAtUtc</c>: a live run
+    /// read as absent (Session) or unreadable (below Session), and a create over its id kept
+    /// answering 409 until the purge. With it, <c>_ts + ttl</c> is always past the logical expiry,
+    /// so an expiring ledger is first visible-and-expired (read as absent, reclaimed by
+    /// <see cref="TryCreateAsync"/>'s conditional replace) and only then hidden. The margin covers the
+    /// truncation only: it assumes this client's clock (which stamps <c>ExpiresAtUtc</c>) and the
+    /// service's (which stamps <c>_ts</c>) agree to within a second.
+    /// </summary>
+    private const int TimestampTruncationSeconds = 1;
+
+    /// <summary>
+    /// Remaining per-item TTL in whole seconds until <paramref name="expiresAtUtc"/>, rounded up,
+    /// floored at 1 (Cosmos rejects 0), plus <see cref="TimestampTruncationSeconds"/>. Used by replaces
+    /// that keep the logical expiry in place: an already-due document collapses to the shortest TTL
+    /// that still outlasts <c>_ts</c> truncation, so it is visible-and-expired (reclaimable by a create)
+    /// before the next sweep purges it, instead of the replace granting it a fresh retention window.
     /// </summary>
     private static int CosmosTtlSeconds(DateTime expiresAtUtc, DateTime now)
-        => (int)Math.Min(Math.Max(Math.Ceiling((expiresAtUtc - now).TotalSeconds), 1), int.MaxValue);
+        => (int)Math.Min(Math.Max(Math.Ceiling((expiresAtUtc - now).TotalSeconds), 1) + TimestampTruncationSeconds, int.MaxValue);
 
     /// <summary>Disposes the Cosmos client when the store created (and therefore owns) it.</summary>
     public void Dispose()

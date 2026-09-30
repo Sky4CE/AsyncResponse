@@ -13,10 +13,18 @@ work that has landed on `main` but not yet shipped. Security reporters credited 
 
 ### Changed
 
-- **Round-61 review (2026-09-30, re-review of every file changed since `1fc2b20`): converged — one
-  documentation gap.**
+- **Round-61 review (2026-09-30, re-review of every file changed since `1fc2b20`): a Cosmos DB ledger
+  no longer disappears up to a second before it expires, and three documentation gaps are closed.**
+  - *Durable flows — Cosmos DB.* Cosmos counts a document's TTL from `_ts`, which it truncates to
+    whole seconds, and the store set the TTL to the rounded-up window alone, so a ledger could vanish
+    from reads up to a second before its logical expiry: under Session consistency it read as absent
+    while still live, below Session as unreadable, and its id could not be re-created until the
+    purge. The server TTL now includes that second. This was the intermittent failure of the
+    `oracle-cosmos` store-contract test.
   - *Docs.* `IDurableFlows.GetStateAsync` documents `FlowStateUnreadableException` for a ledger that
     exists but cannot be read, like its `ResumeAsync` sibling.
+    `StartAsync` names the flow-id portability rules its `ArgumentException` enforces, and
+    `ResumeAsync`'s "no flow state" message no longer suggests the run may be unreadable.
 - **Round-60 review (2026-09-30, whole-repository review of `21da56a`, completing the first full pass
   over every source file): a blank-id exception publish can no longer throw from its own guard, and
   the package-dependency check reads every dependency.**

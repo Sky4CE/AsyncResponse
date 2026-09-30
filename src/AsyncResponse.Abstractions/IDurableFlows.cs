@@ -40,7 +40,12 @@ public interface IDurableFlows
     /// </summary>
     /// <typeparam name="TFlow">The flow class; must be registered in DI and resolvable by its persisted type name.</typeparam>
     /// <typeparam name="TInput">The flow input, persisted as JSON with the flow state.</typeparam>
-    /// <exception cref="ArgumentException"><paramref name="flowId"/> is empty or whitespace.</exception>
+    /// <exception cref="ArgumentException">
+    /// <paramref name="flowId"/> is empty or whitespace, or not portable across the stores: longer
+    /// than 400 UTF-16 code units or the portable UTF-8 byte budget, ill-formed UTF-16, containing
+    /// <c>/</c>, <c>\</c>, <c>?</c>, <c>#</c> or control characters, or beginning or ending with a space.
+    /// Rejected before anything is published.
+    /// </exception>
     /// <exception cref="InvalidOperationException"><paramref name="flowId"/> already belongs to different work.</exception>
     /// <exception cref="DurableFlowNotDispatchedException">
     /// The start job could not be published to the worker transport, even after retries. Nothing
