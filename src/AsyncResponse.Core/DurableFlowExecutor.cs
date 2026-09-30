@@ -230,7 +230,21 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
             // Terminal by declaration: mark failed and swallow so the transport acks the job.
             state.Status = FlowRunStatus.Failed;
             state.LastMessage = ex.Message;
-            await lease.SaveAsync(state, _options.StateExpiry, cause: ex).ConfigureAwait(false);
+            try
+            {
+                await lease.SaveAsync(state, _options.StateExpiry, cause: ex).ConfigureAwait(false);
+            }
+            catch (Exception saveError)
+            {
+                // The terminal save was rejected (lease lost, store fault): the attempt ended
+                // without a terminal outcome like every other failed attempt — observers hear it
+                // and the span carries the error before the save's exception propagates. The
+                // ledger still reads Running, and so does the event.
+                state.Status = FlowRunStatus.Running;
+                AsyncResponseDiagnostics.SetError(activity, saveError);
+                await NotifyRunAttemptFailedAsync(state).ConfigureAwait(false);
+                throw;
+            }
 
             AsyncResponseDiagnostics.SetError(activity, ex);
             _logger.LogWarning(ex, "Durable flow {FlowId} failed terminally: {Message}", flowId, ex.Message);

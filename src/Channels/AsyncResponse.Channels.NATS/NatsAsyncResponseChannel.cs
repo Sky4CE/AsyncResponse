@@ -266,7 +266,7 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
         // the fault would surface only as an UnobservedTaskException, and its Warning and span
         // status would report a delivery question about a wait that never started — and the
         // cleanup core settles it Canceled instead.
-        async ValueTask DrainThenCleanupAsync(Exception? terminalIfUndelivered = null, bool waiterHandedOut = true)
+        async ValueTask DrainThenCleanupAsync(Exception? terminalIfUndelivered = null, bool waiterHandedOut = true, Action? onTerminalSettled = null)
         {
             if (Volatile.Read(ref cleanupStarted) == 0)
             {
@@ -333,11 +333,15 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
                         // is dropped; the loop's own cleanup call is a no-op behind the latch. The
                         // non-cancellation exception case is unforeseen infrastructure failure —
                         // settlement is equally unproven there, so it must not fall back to cancel.
-                        tcs.TrySetException(new AsyncResponseIndeterminateDeliveryException(correlationId, drainTimeout));
-                        AsyncResponseDiagnostics.SetError(activity, "indeterminate_delivery", "Disposal drain did not prove settlement.");
-                        SafeLog.Try(() => _logger.LogWarning(
-                            "Disposal drain for correlationId {CorrelationId} did not prove settlement within {DrainTimeout}; faulting the waiter as indeterminate.",
-                            correlationId, drainTimeout));
+                        // Reported only when the fault wins (Redis parity): a delivery that landed
+                        // its result first makes this a no-op, and a Warning/error span would lie.
+                        if (tcs.TrySetException(new AsyncResponseIndeterminateDeliveryException(correlationId, drainTimeout)))
+                        {
+                            AsyncResponseDiagnostics.SetError(activity, "indeterminate_delivery", "Disposal drain did not prove settlement.");
+                            SafeLog.Try(() => _logger.LogWarning(
+                                "Disposal drain for correlationId {CorrelationId} did not prove settlement within {DrainTimeout}; faulting the waiter as indeterminate.",
+                                correlationId, drainTimeout));
+                        }
                     }
                     else
                     {
@@ -366,8 +370,8 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
             // response as a timeout; TrySet loses here if the delivery won, which is the whole
             // point. (A lapsed drain budget has already faulted the task as indeterminate above,
             // and TrySet is a no-op behind it.)
-            if (terminalIfUndelivered is not null)
-                tcs.TrySetException(terminalIfUndelivered);
+            if (terminalIfUndelivered is not null && tcs.TrySetException(terminalIfUndelivered))
+                onTerminalSettled?.Invoke();
 
             await CleanupOnceAsync().ConfigureAwait(false);
         }
@@ -752,11 +756,16 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
                 {
                     // Guarded (Redis parity): a throwing logging provider here skipped the drain
                     // below, and a waiter whose timeout never settles it waits forever.
-                    SafeLog.Try(() => _logger.LogWarning("Timed out waiting for response for correlationId {CorrelationId}.", correlationId));
-                    AsyncResponseDiagnostics.SetError(activity, "timeout", $"Timed out waiting for response for correlationId {correlationId}.");
-                    AsyncResponseDiagnostics.RecordWaiterTimeout("nats");
+                    // Reported only once the timeout actually wins the settle (Redis parity): a
+                    // delivery mid-predicate can still win inside the drain.
                     await DrainThenCleanupAsync(
-                        new TimeoutException($"Timed out waiting for response for correlationId {correlationId}."))
+                        new TimeoutException($"Timed out waiting for response for correlationId {correlationId}."),
+                        onTerminalSettled: () =>
+                        {
+                            SafeLog.Try(() => _logger.LogWarning("Timed out waiting for response for correlationId {CorrelationId}.", correlationId));
+                            SafeLog.Try(() => AsyncResponseDiagnostics.SetError(activity, "timeout", $"Timed out waiting for response for correlationId {correlationId}."));
+                            SafeLog.Try(() => AsyncResponseDiagnostics.RecordWaiterTimeout("nats"));
+                        })
                         .ConfigureAwait(false);
                 }
                 catch (Exception ex)
@@ -828,7 +837,9 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
                 RegisteredAtUtc = _timeProvider.GetUtcNow().UtcDateTime,
                 Context = _propagation.Capture()
             };
-            await _recoveryStateStore.SaveAsync(correlationId, recoveryState, _options.RecoveryStateExpiry, registrationCancellation.Token).ConfigureAwait(false);
+            // A wait a delivery already settled and cleaned up needs no registration.
+            if (Volatile.Read(ref cleanupStarted) == 0)
+                await _recoveryStateStore.SaveAsync(correlationId, recoveryState, _options.RecoveryStateExpiry, registrationCancellation.Token).ConfigureAwait(false);
             if (Volatile.Read(ref cleanupStarted) != 0)
             {
                 // A terminal delivery on the already-running consume loop started cleanup while
@@ -847,7 +858,7 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
                 }
             }
 
-            _logger.LogDebug("Subscribed to subject {Subject} for correlationId {CorrelationId}.", subject, correlationId);
+            SafeLog.Try(() => _logger.LogDebug("Subscribed to subject {Subject} for correlationId {CorrelationId}.", subject, correlationId));
         }
         catch (Exception ex) when (SettledByDelivery())
         {
@@ -1090,6 +1101,11 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
                 _logger.LogDebug("Published response for correlationId {CorrelationId} on subject {Subject}. PayloadType: {PayloadType}. Outcome: {Outcome}.", correlationId, subject, typeof(T), outcome);
             }
         }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            // Cancellation is not a failure: the caller's own token fired mid-publish.
+            throw;
+        }
         catch (Exception ex)
         {
             _logger.LogError(ex, "Failed to publish response for correlationId {CorrelationId} on subject {Subject}.", correlationId, subject);
@@ -1180,6 +1196,11 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
             {
                 _logger.LogDebug("Published raw response for correlationId {CorrelationId} on subject {Subject}. Outcome: {Outcome}.", correlationId, subject, outcome);
             }
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            // Cancellation is not a failure: the caller's own token fired mid-publish.
+            throw;
         }
         catch (Exception ex)
         {
@@ -1280,6 +1301,11 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
             {
                 _logger.LogDebug("Published exception response for correlationId {CorrelationId} on subject {Subject}. Outcome: {Outcome}.", correlationId, subject, outcome);
             }
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            // Cancellation is not a failure: the caller's own token fired mid-publish.
+            throw;
         }
         catch (Exception ex)
         {

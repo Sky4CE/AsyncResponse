@@ -472,6 +472,65 @@ public sealed class DurableFlowStaleStartJobTests
     }
 
     [Fact]
+    public async Task StartAsync_WhoseLaggingReadShowsAnOlderRunUnderTheId_ReadsItCurrently_AndIsNotRefused()
+    {
+        // R2-01: the conflict verdict came from a plain load. On a store whose loads lag another
+        // process's writes (Cosmos session reads) that load still showed the previous run under a
+        // reused id, so the caller was told the id was refused while the current ledger was the
+        // same start.
+        var inner = new InMemoryFlowStateStore();
+        await inner.TryCreateAsync("lagging-starter", OldShapeLedger("lagging-starter"), TimeSpan.FromDays(1));
+        var older = OldShapeLedger("lagging-starter");
+        older.InputJson = "{\"TenantId\":99}";
+        var store = new SessionLaggingStore(inner, lagging: true, older);
+        var (starter, published, _) = CreateStarter(store);
+
+        Assert.Equal("lagging-starter", await starter.StartAsync<ShapeFlow, ShapeInput>(new ShapeInput(7), "lagging-starter"));
+
+        Assert.Equal(1, published());
+    }
+
+    [Fact]
+    public async Task StartAsync_WhoseLaggingReadShowsAnOlderRun_ButNoCurrentLedger_IsNotRefused_BeforeThePublish()
+    {
+        // R2-01 follow-up: the current re-read found no ledger at all (the older run expired) and
+        // the starter fell back to the lagging copy, refusing a start nothing is bound to.
+        var older = OldShapeLedger("gone-before-publish");
+        older.InputJson = "{\"TenantId\":99}";
+        var inner = new InMemoryFlowStateStore();
+        var store = new SessionLaggingStore(inner, lagging: true, older);
+        var (starter, published, _) = CreateStarter(store);
+
+        Assert.Equal("gone-before-publish", await starter.StartAsync<ShapeFlow, ShapeInput>(new ShapeInput(7), "gone-before-publish"));
+
+        Assert.Equal(1, published());
+        Assert.NotNull(await inner.LoadAsync("gone-before-publish"));
+    }
+
+    [Fact]
+    public async Task StartAsync_WhoseLaggingReadShowsAnOlderRun_ButNoCurrentLedger_ReturnsTheId_AfterThePublish()
+    {
+        // ...and past the publish the same fallback told the caller "refused" while its published
+        // job — which reads currently, finds nothing, and creates the run — executed anyway.
+        var older = OldShapeLedger("gone-after-publish");
+        older.InputJson = "{\"TenantId\":99}";
+        var loads = 0;
+        var store = new Mock<IFlowStateStore>();
+        store.Setup(s => s.LoadAsync("gone-after-publish", It.IsAny<CancellationToken>()))
+            .ReturnsAsync(() => Interlocked.Increment(ref loads) == 1 ? null : FlowStateJson.Deserialize(FlowStateJson.Serialize(older), "gone-after-publish"));
+        store.Setup(s => s.TryCreateAsync("gone-after-publish", It.IsAny<FlowState>(), It.IsAny<TimeSpan>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(false);
+        store.Setup(s => s.LoadCurrentAsync("gone-after-publish", It.IsAny<CancellationToken>()))
+            .ReturnsAsync((FlowState?)null);
+        var (starter, published, _) = CreateStarter(store.Object);
+
+        Assert.Equal("gone-after-publish", await starter.StartAsync<ShapeFlow, ShapeInput>(new ShapeInput(7), "gone-after-publish"));
+
+        Assert.Equal(1, published());
+        store.Verify(s => s.LoadCurrentAsync("gone-after-publish", It.IsAny<CancellationToken>()), Times.Once);
+    }
+
+    [Fact]
     public async Task StartAsync_WhoseLedgerReadFailsAfterThePublish_StillReturnsTheId()
     {
         // Fixpoint r1 (GS1#4): the start job is published — the run WILL execute — but the read

@@ -647,6 +647,201 @@ public sealed partial class DbChannelSharedCoverageTests
         }
 
         /// <summary>
+        /// Disposal drains every waiter at once — across ids AND among siblings on one id — so K
+        /// waiters wedged in an in-flight delivery cost one drain budget, not K. Each drain here
+        /// parks until all of them have arrived: a serial teardown never lets the first one finish.
+        /// </summary>
+        [Theory]
+        [InlineData(Provider.MongoDb)]
+        [InlineData(Provider.PostgreSql)]
+        [InlineData(Provider.SqlServer)]
+        public async Task Dispose_DrainsEveryWaiterConcurrently(Provider provider)
+        {
+            await using var harness = Harness.Create(provider, failing: true, LongPoll);
+            var barrier = new DrainBarrier(expected: 4);
+            foreach (var correlationId in new[] { "corr-a", "corr-b", "corr-shared", "corr-shared" })
+            {
+                var proxy = (DrainBarrierSubscription)DispatchProxy.Create(SubscriptionInterface(harness), typeof(DrainBarrierSubscription));
+                proxy.Barrier = barrier;
+                harness.AddSubscription(correlationId, proxy);
+            }
+
+            try
+            {
+                await harness.Channel.DisposeAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(30));
+                Assert.Equal(4, barrier.Arrivals);
+            }
+            finally
+            {
+                barrier.Open();
+            }
+        }
+
+        /// <summary>
+        /// Disposal's subscriber deletes each take a pooled connection, so at most
+        /// <see cref="DisposalStoreConcurrency"/> run at once; and they share ONE deadline
+        /// (<c>DisposalDrainTimeout</c> on the channel's clock): deletes still queued behind the
+        /// gate when it lapses are skipped — the rows age out via the heartbeat timeout — and
+        /// counted in one warning, never logged as failures.
+        /// </summary>
+        [Theory]
+        [InlineData(Provider.MongoDb)]
+        [InlineData(Provider.PostgreSql)]
+        [InlineData(Provider.SqlServer)]
+        public async Task Dispose_BoundsConcurrentSubscriberDeletes_UnderOneDeadline(Provider provider)
+        {
+            var clock = new AsyncResponse.Testing.VirtualTimeProvider();
+            await using var fixture = GapFixture.Create(provider, LongPoll, timeProvider: clock);
+            var harness = fixture.Harness;
+            var hung = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            var entered = 0;
+            var gateFull = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            OnSubscriberDelete(fixture, () =>
+            {
+                if (Interlocked.Increment(ref entered) == DisposalStoreConcurrency)
+                    gateFull.TrySetResult();
+                return hung.Task;
+            });
+
+            const int waiters = 20;
+            var completions = new List<TaskCompletionSource<OperationResult>>();
+            for (var i = 0; i < waiters; i++)
+            {
+                var (waiter, completion) = harness.Subscription($"corr-{i % 15}", cleanupStarted: false);
+                harness.AddSubscription($"corr-{i % 15}", waiter);
+                completions.Add(completion);
+            }
+
+            try
+            {
+                var disposal = harness.Channel.DisposeAsync().AsTask();
+                await gateFull.Task.WaitAsync(TimeSpan.FromSeconds(30));
+
+                clock.Advance(TimeSpan.FromSeconds(30));
+                await disposal.WaitAsync(TimeSpan.FromSeconds(30));
+
+                // Exactly the gate's width ever reached the store: an unbounded fan-out would have
+                // sent all of them before disposal could complete.
+                Assert.Equal(DisposalStoreConcurrency, Volatile.Read(ref entered));
+                Assert.All(completions, completion => Assert.True(completion.Task.IsCanceled));
+                Assert.Empty(harness.Subscriptions);
+                Assert.Empty(harness.ExecutorRegistrations);
+                Assert.Contains(harness.Logger.Messages, message => message.Contains($"skipped {waiters} subscriber", StringComparison.Ordinal));
+                Assert.DoesNotContain(harness.Logger.Messages, message => message.Contains("Failed to delete", StringComparison.Ordinal));
+            }
+            finally
+            {
+                hung.TrySetResult();
+            }
+        }
+
+        /// <summary>
+        /// A subscriber delete that never returns (it ignores its token, as a Mongo command on an
+        /// infinite socket timeout can) no longer holds disposal hostage: at the deadline it is
+        /// abandoned, and every waiter is still settled, unlinked and its executor retired.
+        /// </summary>
+        [Theory]
+        [InlineData(Provider.MongoDb)]
+        [InlineData(Provider.PostgreSql)]
+        [InlineData(Provider.SqlServer)]
+        public async Task Dispose_ASubscriberDeleteThatNeverReturns_StillSettlesAndRetiresEveryWaiterAtTheDeadline(Provider provider)
+        {
+            var clock = new AsyncResponse.Testing.VirtualTimeProvider();
+            await using var fixture = GapFixture.Create(provider, LongPoll, timeProvider: clock);
+            var harness = fixture.Harness;
+            var hung = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            const int waiters = 3;
+            var entered = 0;
+            var allEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            OnSubscriberDelete(fixture, () =>
+            {
+                if (Interlocked.Increment(ref entered) == waiters)
+                    allEntered.TrySetResult();
+                return hung.Task;
+            });
+
+            var completions = new List<TaskCompletionSource<OperationResult>>();
+            foreach (var correlationId in new[] { "corr-a", "corr-b", "corr-b" })
+            {
+                var (waiter, completion) = harness.Subscription(correlationId, cleanupStarted: false);
+                harness.AddSubscription(correlationId, waiter);
+                completions.Add(completion);
+            }
+
+            try
+            {
+                var disposal = harness.Channel.DisposeAsync().AsTask();
+                await allEntered.Task.WaitAsync(TimeSpan.FromSeconds(30));
+
+                clock.Advance(TimeSpan.FromSeconds(30));
+                await disposal.WaitAsync(TimeSpan.FromSeconds(30));
+
+                Assert.All(completions, completion => Assert.True(completion.Task.IsCanceled));
+                Assert.Empty(harness.Subscriptions);
+                Assert.Empty(harness.ExecutorRegistrations);
+                Assert.Contains(harness.Logger.Messages, message => message.Contains($"skipped {waiters} subscriber", StringComparison.Ordinal));
+            }
+            finally
+            {
+                hung.TrySetResult();
+            }
+        }
+
+        /// <summary>
+        /// A registration that raced disposal (published after its snapshot) finds the channel
+        /// disposed and cleans itself up — possibly after the teardown deadline lapsed. That
+        /// cleanup is not disposal's: its subscriber delete still runs, instead of being skipped
+        /// at once and counted after disposal already reported (an orphan nobody hears about).
+        /// </summary>
+        [Theory]
+        [InlineData(Provider.MongoDb)]
+        [InlineData(Provider.PostgreSql)]
+        [InlineData(Provider.SqlServer)]
+        public async Task Dispose_ARegistrationCleaningItselfUpAfterTheDeadline_StillDeletesItsSubscriber(Provider provider)
+        {
+            var clock = new AsyncResponse.Testing.VirtualTimeProvider();
+            await using var fixture = GapFixture.Create(provider, LongPoll, timeProvider: clock);
+            var harness = fixture.Harness;
+            var deletes = 0;
+            OnSubscriberDelete(fixture, () =>
+            {
+                Interlocked.Increment(ref deletes);
+                return Task.CompletedTask;
+            });
+
+            await harness.Channel.DisposeAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(30));
+            clock.Advance(TimeSpan.FromSeconds(30)); // the teardown deadline lapses
+
+            var (late, _) = harness.Subscription("corr-late", cleanupStarted: false);
+            harness.AddSubscription("corr-late", late);
+            await ((ValueTask)late.GetType().GetMethod("DrainThenCleanupAsync")!.Invoke(late, [true, null])!).AsTask().WaitAsync(TimeSpan.FromSeconds(30));
+
+            Assert.Equal(1, Volatile.Read(ref deletes));
+            Assert.DoesNotContain(harness.Logger.Messages, message => message.Contains("Failed to delete", StringComparison.Ordinal));
+        }
+
+        /// <summary>Mirrors the shared base's private disposal delete width.</summary>
+        private const int DisposalStoreConcurrency = 8;
+
+        /// <summary>Routes every subscriber delete (Mongo's DeleteOne, the relational DELETE) through <paramref name="onDelete"/>.</summary>
+        private static void OnSubscriberDelete(GapFixture fixture, Func<Task> onDelete)
+        {
+            if (fixture.Store is null)
+            {
+                fixture.Harness.MongoSubscribers!
+                    .Setup(collection => collection.DeleteOneAsync(It.IsAny<FilterDefinition<MongoChannelSubscriberDocument>>(), It.IsAny<CancellationToken>()))
+                    .Returns(async () =>
+                    {
+                        await onDelete();
+                        return (DeleteResult)new DeleteResult.Acknowledged(1);
+                    });
+                return;
+            }
+
+            fixture.Store.SubscriberWrite = operation => operation == "delete-subscriber" ? onDelete() : Task.CompletedTask;
+        }
+
+        /// <summary>
         /// A per-waiter executor retirement that throws is logged and swallowed: disposal awaits
         /// the tracked retirement and must not fault on it.
         /// </summary>
@@ -984,6 +1179,58 @@ public sealed partial class DbChannelSharedCoverageTests
         }
     }
 
+    /// <summary>Counts the waiters that reached a disposal drain and holds each until all have.</summary>
+    public sealed class DrainBarrier(int expected)
+    {
+        private readonly TaskCompletionSource _allArrived = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private int _arrivals;
+
+        public int Arrivals => Volatile.Read(ref _arrivals);
+
+        public Task ArriveAsync()
+        {
+            if (Interlocked.Increment(ref _arrivals) >= expected)
+                _allArrived.TrySetResult();
+            return _allArrived.Task;
+        }
+
+        public void Open() => _allArrived.TrySetResult();
+    }
+
+    /// <summary>
+    /// A subscription (proxying the provider assembly's private <c>IDbSubscription</c>) whose
+    /// disposal drain parks on a <see cref="DrainBarrier"/>, as if a delivery were wedged in its
+    /// <c>Until</c> predicate. Every other member succeeds at once.
+    /// </summary>
+    public class DrainBarrierSubscription : DispatchProxy
+    {
+        private readonly Guid _id = Guid.NewGuid();
+
+        public DrainBarrier Barrier { get; set; } = null!;
+
+        protected override object? Invoke(MethodInfo? targetMethod, object?[]? args)
+        {
+            switch (targetMethod!.Name)
+            {
+                case "get_Id":
+                    return _id;
+                case "get_StartedAtUtc":
+                    return DateTimeOffset.UtcNow;
+                // The serial teardown drained and cleaned up in one call; the split one drains first.
+                case "DrainThenCleanupAsync":
+                case "DrainForDisposalAsync":
+                    return new ValueTask(Barrier.ArriveAsync());
+                default:
+                    var returnType = targetMethod.ReturnType;
+                    if (returnType == typeof(ValueTask))
+                        return ValueTask.CompletedTask;
+                    if (returnType == typeof(Task))
+                        return Task.CompletedTask;
+                    return returnType.IsValueType && returnType != typeof(void) ? Activator.CreateInstance(returnType) : null;
+            }
+        }
+    }
+
     /// <summary>A harness plus, for the relational providers, the scripted store it runs on.</summary>
     private sealed class GapFixture : IAsyncDisposable
     {
@@ -997,13 +1244,13 @@ public sealed partial class DbChannelSharedCoverageTests
 
         public ScriptedRelationalStore? Store { get; }
 
-        public static GapFixture Create(Provider provider, TimeSpan pollInterval, TimeSpan? fullSweepInterval = null, int? pendingMessageBatchSize = null)
+        public static GapFixture Create(Provider provider, TimeSpan pollInterval, TimeSpan? fullSweepInterval = null, int? pendingMessageBatchSize = null, TimeProvider? timeProvider = null)
         {
             if (provider == Provider.MongoDb)
-                return new GapFixture(Harness.Create(provider, failing: false, pollInterval, fullSweepInterval, pendingMessageBatchSize: pendingMessageBatchSize), null);
+                return new GapFixture(Harness.Create(provider, failing: false, pollInterval, fullSweepInterval, pendingMessageBatchSize: pendingMessageBatchSize, timeProvider: timeProvider), null);
 
             var store = new ScriptedRelationalStore(provider);
-            return new GapFixture(store.CreateHarness(pollInterval, fullSweepInterval, pendingMessageBatchSize), store);
+            return new GapFixture(store.CreateHarness(pollInterval, fullSweepInterval, pendingMessageBatchSize, timeProvider), store);
         }
 
         public async ValueTask DisposeAsync()

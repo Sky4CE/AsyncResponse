@@ -1445,6 +1445,169 @@ public class NatsAsyncResponseChannelTests
         releasePredicate.Release();
     }
 
+    private static string TerminalJson(string message) => JsonSerializer.Serialize(new AsyncResponseEnvelope<OperationResult>
+    {
+        Success = true,
+        Payload = new OperationResult { Status = OperationStatus.Completed, Message = message }
+    }, AsyncResponseEnvelopeOptions<OperationResult>.Instance);
+
+    [Fact]
+    public async Task WaiterTimeout_LosingToAnInFlightDelivery_IsNotLoggedOrCountedAsATimeout()
+    {
+        // The timeout callback logged, stamped the span and counted the metric BEFORE the drain
+        // decided whether the timeout wins; a delivery mid-predicate then won and the wait returned
+        // its result while diagnostics said "timed out". Reported only when the fault wins now.
+        var clock = new VirtualTimeProvider();
+        var logger = new RecordingThrowingLogger<NatsAsyncResponseChannel>();
+        var insidePredicate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releasePredicate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var drainDeleting = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        _store.Setup(s => s.TryDeleteAsync(It.IsAny<string>(), It.IsAny<Guid>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(true)
+            .Callback(() => drainDeleting.TrySetResult());
+        var channel = CreateChannel(timeProvider: clock, logger: logger);
+        await using var waiter = await channel.CreateResponseWaiter<OperationResult>(
+            "corr-timeout-loses",
+            completionPredicate: async _ =>
+            {
+                insidePredicate.TrySetResult();
+                await releasePredicate.Task;
+                return true;
+            },
+            timeout: TimeSpan.FromMinutes(10));
+
+        _client.Push(TerminalJson("delivered"));
+        await insidePredicate.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        clock.Advance(TimeSpan.FromMinutes(11));
+        await drainDeleting.Task.WaitAsync(TimeSpan.FromSeconds(5)); // the timeout's drain is running
+        releasePredicate.TrySetResult();
+
+        Assert.Equal("delivered", (await waiter.ResponseTask.WaitAsync(TimeSpan.FromSeconds(10))).Message);
+        Assert.False(logger.HasEntry(LogLevel.Warning, "Timed out waiting"));
+    }
+
+    [Fact]
+    public async Task WaiterDrainLapse_LosingToADelivery_IsNotLoggedAsIndeterminate()
+    {
+        // Ordering by gates, not time: the timeout's drain issues the registration delete and is
+        // held INSIDE that call (a synchronous gate in the fake) until the in-flight delivery has
+        // settled the waiter. Only then does the drain reach its budgeted wait, so its lapse is
+        // observed strictly after the delivery won, whatever the runner's speed; the delete never
+        // returns, and the consume loop is still inside cleanup (joined on that same delete).
+        var clock = new VirtualTimeProvider();
+        var logger = new SignallingLogger("tearing the subscription down regardless");
+        var insidePredicate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releasePredicate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var reconnected = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        Task<OperationResult>? response = null;
+        _store.Setup(s => s.TryDeleteAsync(It.IsAny<string>(), It.IsAny<Guid>(), It.IsAny<CancellationToken>()))
+            .Returns(() =>
+            {
+                releasePredicate.TrySetResult();
+                Assert.True(Volatile.Read(ref response)!.Wait(TimeSpan.FromSeconds(10)), "the delivery never settled the waiter");
+                return reconnected.Task;
+            });
+        var channel = CreateChannel(drainTimeout: TimeSpan.FromMilliseconds(200), timeProvider: clock, logger: logger);
+        await using var waiter = await channel.CreateResponseWaiter<OperationResult>(
+            "corr-lapse-loses",
+            completionPredicate: async _ =>
+            {
+                insidePredicate.TrySetResult();
+                await releasePredicate.Task;
+                return true;
+            },
+            timeout: TimeSpan.FromMinutes(10));
+        Volatile.Write(ref response, waiter.ResponseTask);
+
+        try
+        {
+            _client.Push(TerminalJson("delivered"));
+            await insidePredicate.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            clock.Advance(TimeSpan.FromMinutes(11));
+
+            Assert.Equal("delivered", (await waiter.ResponseTask.WaitAsync(TimeSpan.FromSeconds(10))).Message);
+
+            // The cleanup core gives up on the never-returning delete and tears the stream down.
+            await logger.Signalled.WaitAsync(TimeSpan.FromSeconds(10));
+            Assert.False(logger.Inner.HasEntry(LogLevel.Warning, "faulting the waiter as indeterminate"));
+        }
+        finally
+        {
+            reconnected.TrySetResult(true);
+        }
+    }
+
+    /// <summary>Records like <see cref="RecordingThrowingLogger{T}"/> and signals once a message containing <paramref name="fragment"/> is logged.</summary>
+    private sealed class SignallingLogger(string fragment) : ILogger<NatsAsyncResponseChannel>
+    {
+        private readonly TaskCompletionSource _signalled = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public RecordingThrowingLogger<NatsAsyncResponseChannel> Inner { get; } = new();
+
+        public Task Signalled => _signalled.Task;
+
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+
+        public bool IsEnabled(LogLevel logLevel) => true;
+
+        public void Log<TState>(LogLevel logLevel, EventId eventId, TState state, Exception? exception, Func<TState, Exception?, string> formatter)
+        {
+            Inner.Log(logLevel, eventId, state, exception, formatter);
+            if (formatter(state, exception).Contains(fragment, StringComparison.Ordinal))
+                _signalled.TrySetResult();
+        }
+    }
+
+    [Fact]
+    public async Task CreateResponseWaiter_DeliverySettlesTheWaitBeforeTheSave_DoesNotWriteARegistration()
+    {
+        var cleanupDeleteIssued = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        _store.Setup(s => s.TryDeleteAsync(It.IsAny<string>(), It.IsAny<Guid>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(true)
+            .Callback(() => cleanupDeleteIssued.TrySetResult());
+        _client.FlushBehavior = async _ =>
+        {
+            _client.Push(TerminalJson("fast"));
+            await cleanupDeleteIssued.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        };
+        var channel = CreateChannel();
+
+        await using var waiter = await channel.CreateResponseWaiter<OperationResult>("corr-settled-before-save");
+
+        Assert.Equal("fast", (await waiter.ResponseTask).Message);
+        _store.Verify(s => s.SaveAsync("corr-settled-before-save", It.IsAny<RecoveryState>(), It.IsAny<TimeSpan>(), It.IsAny<CancellationToken>()), Times.Never);
+    }
+
+    [Fact]
+    public async Task CreateResponseWaiter_AThrowingDebugLogger_DoesNotFailARegisteredWaiter()
+    {
+        var logger = new RecordingThrowingLogger<NatsAsyncResponseChannel> { ThrowOnMessageContaining = "Subscribed to subject" };
+        var channel = CreateChannel(logger: logger);
+
+        await using var waiter = await channel.CreateResponseWaiter<OperationResult>("corr-debug-throws");
+
+        Assert.False(waiter.ResponseTask.IsCompleted);
+    }
+
+    [Fact]
+    public async Task Publish_CancelledByTheCallersToken_IsNotLoggedAsAFailure()
+    {
+        using var cts = new CancellationTokenSource();
+        cts.Cancel();
+        _client.RequestException = new OperationCanceledException(cts.Token);
+        var logger = new RecordingThrowingLogger<NatsAsyncResponseChannel>();
+        var channel = CreateChannel(logger: logger);
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
+            channel.SetResponse(new OperationResult { Status = OperationStatus.Completed }, "corr-c1", cts.Token));
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
+            ((IRawAsyncResponsePublisher)channel).SetRawResponseJson("{}", "corr-c2", cts.Token));
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
+            channel.SetException(new InvalidOperationException("x"), "corr-c3", cts.Token));
+
+        Assert.False(logger.HasEntry(LogLevel.Error, "Failed to publish"));
+    }
+
     private NatsAsyncResponseChannel CreateChannel(bool useRecoveryExpiry = false, TimeSpan? drainTimeout = null, TimeProvider? timeProvider = null, ILogger<NatsAsyncResponseChannel>? logger = null) => new(
         _services.GetRequiredService<IServiceScopeFactory>(),
         _client,

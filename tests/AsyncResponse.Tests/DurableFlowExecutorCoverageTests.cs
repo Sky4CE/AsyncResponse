@@ -694,6 +694,68 @@ public sealed class DurableFlowExecutorCoverageTests
         Assert.Single(observer.AttemptFailures);
     }
 
+    [Fact]
+    public async Task ExecuteAsync_TerminalFailure_WhoseTerminalSaveIsRejected_StillRaisesRunAttemptFailed()
+    {
+        // R2-05: a DurableFlowFailedException whose terminal save throws (lease lost, store fault)
+        // skipped the attempt-ended notification every other failed attempt gets.
+        var inner = new InMemoryFlowStateStore();
+        var state = State("terminal-save-rejected");
+        state.FlowTypeName = typeof(TerminalFailureFlow).FullName;
+        state.InputTypeName = typeof(TestFlowInput).FullName;
+        await CreateAsync(inner, state);
+        var observer = new AttemptFailureObserver();
+        await using var harness = CreateHarness(
+            new RejectingFailedSaveStore(inner),
+            services => services.AddSingleton<TerminalFailureFlow>(),
+            observers: [observer]);
+
+        await Assert.ThrowsAsync<IOException>(() => harness.Executor.ExecuteAsync("terminal-save-rejected"));
+
+        // The ledger is still Running (the terminal save never landed), so the event must say so.
+        Assert.Equal(FlowRunStatus.Running, Assert.Single(observer.AttemptFailures).Status);
+        Assert.Empty(observer.Finished);
+        Assert.Equal(FlowRunStatus.Running, (await inner.LoadAsync("terminal-save-rejected"))!.Status);
+    }
+
+    public sealed class TerminalFailureFlow : IDurableFlow<TestFlowInput>
+    {
+        public Task ExecuteAsync(IDurableFlowContext context, TestFlowInput input)
+            => throw new DurableFlowFailedException("declared failure");
+    }
+
+    private sealed class RejectingFailedSaveStore(InMemoryFlowStateStore current) : IFlowStateStore
+    {
+        public Task<FlowState?> LoadAsync(string flowId, CancellationToken cancellationToken = default)
+            => current.LoadAsync(flowId, cancellationToken);
+
+        public Task<FlowLeaseObservation?> ObserveLeaseAsync(string flowId, CancellationToken cancellationToken = default)
+            => current.ObserveLeaseAsync(flowId, cancellationToken);
+
+        public Task<FlowState?> LoadCurrentAsync(string flowId, CancellationToken cancellationToken = default)
+            => current.LoadAsync(flowId, cancellationToken);
+
+        public Task<bool> TryCreateAsync(string flowId, FlowState state, TimeSpan ttl, CancellationToken cancellationToken = default)
+            => current.TryCreateAsync(flowId, state, ttl, cancellationToken);
+
+        public Task<bool> TryUpdateAsync(string flowId, FlowState state, long expectedRevision, TimeSpan ttl, string? leaseId = null, CancellationToken cancellationToken = default)
+            => state.Status == FlowRunStatus.Failed
+                ? throw new IOException("store rejected the terminal save")
+                : current.TryUpdateAsync(flowId, state, expectedRevision, ttl, leaseId, cancellationToken);
+
+        public Task<bool> TryAcquireLeaseAsync(string flowId, string leaseId, TimeSpan leaseDuration, CancellationToken cancellationToken = default)
+            => current.TryAcquireLeaseAsync(flowId, leaseId, leaseDuration, cancellationToken);
+
+        public Task<bool> TryRenewLeaseAsync(string flowId, string leaseId, TimeSpan leaseDuration, CancellationToken cancellationToken = default)
+            => current.TryRenewLeaseAsync(flowId, leaseId, leaseDuration, cancellationToken);
+
+        public Task ReleaseLeaseAsync(string flowId, string leaseId, CancellationToken cancellationToken = default)
+            => current.ReleaseLeaseAsync(flowId, leaseId, cancellationToken);
+
+        public Task<bool> TryDeleteAsync(string flowId, CancellationToken cancellationToken = default)
+            => current.TryDeleteAsync(flowId, cancellationToken);
+    }
+
     public sealed class ThrowingBodyFlow : IDurableFlow<TestFlowInput>
     {
         public Task ExecuteAsync(IDurableFlowContext context, TestFlowInput input)

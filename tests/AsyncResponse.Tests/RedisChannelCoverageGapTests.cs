@@ -408,6 +408,17 @@ public sealed class RedisChannelCoverageGapTests
         Assert.True(logger.HasEntry(LogLevel.Error, "Failed to deserialize recovery state at ar:recovery:corr-blank"));
     }
 
+    [Fact]
+    public async Task CreateResponseWaiter_AThrowingDebugLogger_DoesNotFailARegisteredWaiter()
+    {
+        _logger.ThrowOnMessageContaining = "Subscribed to channel";
+        var channel = CreateChannel();
+
+        await using var waiter = await channel.CreateResponseWaiter<OperationResult>("corr-debug-throws");
+
+        Assert.False(waiter.ResponseTask.IsCompleted);
+    }
+
     // ---------------------------------------------------------------- helpers
 
     private const int ExecutorCapacity = 1024;

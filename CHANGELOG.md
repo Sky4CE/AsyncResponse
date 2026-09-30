@@ -13,6 +13,32 @@ work that has landed on `main` but not yet shipped. Security reporters credited 
 
 ### Changed
 
+- **Round-53 review (2026-09-30, whole-repository review of `b50e93f`): the NATS channel gets the
+  round-52 settlement fixes, and two durable-flow start/failure paths no longer act on a stale view.**
+  - *Durable flows — start.* `StartAsync` with an explicit flow id decided that the id was bound to
+    different work from a plain `LoadAsync`, so a lagging store read showing an older run under the
+    id refused a valid start. It now re-reads the ledger with `LoadCurrentAsync` before refusing; a
+    current read that finds no ledger is treated as gone (before the publish the start proceeds,
+    after it the caller gets the id the executor runs).
+  - *Durable flows — terminal failure.* A `DurableFlowFailedException` whose terminal save was
+    rejected skipped the run-attempt-failed notification and the span error; both now run, and the
+    event reports `Running` (the ledger's actual status), not `Failed`.
+  - *Observability — NATS channel.* A waiter timeout or drain lapse that lost the race to an
+    in-flight delivery still logged, traced and counted a timeout (or an indeterminate delivery);
+    they are now reported only when they settle the wait. A publish cancelled by the caller's token
+    is no longer logged as a failure.
+  - *Recovery — NATS channel.* A delivery that settled the wait before the recovery registration was
+    saved no longer leaves that registration behind.
+  - *Resilience — NATS and Redis channels.* A throwing Debug logger after the waiter registered no
+    longer fails the wait.
+  - *Shutdown — PostgreSQL, SQL Server and MongoDB channels* (deferred in round 52). Disposal drained
+    waiters one after another, so each waiter wedged in its `Until` predicate added a full
+    `DisposalDrainTimeout` to host stop. All waiters now drain at once, bounded by one
+    `DisposalDrainTimeout`; the subscriber-row deletes then run at most eight at a time under one
+    further `DisposalDrainTimeout` deadline, so a host with more waiters than its connection pool
+    holds neither exhausts the pool nor waits per waiter on a dead database. A delete not finished by
+    the deadline is skipped and counted in one warning; its row expires after
+    `SubscriberHeartbeatTimeout`. Every waiter is still settled, unlinked and its executor retired.
 - **Round-52 review (2026-09-30, whole-repository review of `1fc2b20`): a DB-channel waiter
   timeout that lost to a delivery is no longer reported as a timeout, and three narrow settlement
   windows are closed.**

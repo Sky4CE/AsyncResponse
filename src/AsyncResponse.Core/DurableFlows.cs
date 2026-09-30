@@ -91,7 +91,12 @@ internal sealed class DurableFlowService : IDurableFlows
         // retrying under another id then ran the work twice). Best-effort: a read that fails
         // publishes anyway, and the post-publish check still covers the create race.
         if (explicitId && await TryLoadBeforePublishAsync(store, flowId, cancellationToken).ConfigureAwait(false) is { } bound)
-            EnsureIdempotentStart<TFlow, TInput>(bound, inputJson, flowId);
+        {
+            // A current read that finds no ledger (the older run expired) binds nothing: the start
+            // proceeds like a fresh one.
+            if (await ConfirmDifferentStartAsync<TFlow, TInput>(store, bound, inputJson, flowId, cancellationToken).ConfigureAwait(false) is { } current)
+                EnsureIdempotentStart<TFlow, TInput>(current, inputJson, flowId);
+        }
 
         await PublishStartAsync(
             executor => executor.CreateAndExecuteAsync(id, initialStateJson),
@@ -161,7 +166,19 @@ internal sealed class DurableFlowService : IDurableFlows
         }
 
         // Throws DurableFlowIdConflictException for different work; the executor drops the
-        // already-published job on the same test.
+        // already-published job on the same test — after a current read, and so does this: a
+        // lagging plain load showing an older run must not refuse a start the executor executes.
+        existing = await ConfirmDifferentStartAsync<TFlow, TInput>(store, existing, inputJson, flowId, CancellationToken.None).ConfigureAwait(false);
+        if (existing is null)
+        {
+            // The lagging copy showed an older run, but the current ledger is gone: the executor
+            // reads currently too, finds nothing, and creates and runs this start — refusing it here
+            // would tell the caller "refused" for a run that executes.
+            SafeLog.Try((Logger: _logger, FlowId: flowId), static s => s.Logger.LogWarning(
+                "Durable flow {FlowId} start job is published; the existing ledger is expired and the executor re-creates it.", s.FlowId));
+            return flowId;
+        }
+
         EnsureIdempotentStart<TFlow, TInput>(existing, inputJson, flowId);
 
         // A semantically identical retry: the published job re-enqueues the existing run
@@ -319,6 +336,34 @@ internal sealed class DurableFlowService : IDurableFlows
             SafeLog.Try((Logger: _logger, Error: ex, FlowId: flowId), static s => s.Logger.LogDebug(
                 s.Error, "Durable flow {FlowId} could not be read before its start was published; publishing anyway.", s.FlowId));
             return null;
+        }
+    }
+
+    /// <summary>
+    /// A plain load that shows the id bound to different work may be a lagging copy
+    /// (<see cref="IFlowStateStore.LoadCurrentAsync"/>): re-reads it currently before it is used to
+    /// refuse the start. A failed current read keeps the plain answer; an empty one returns
+    /// <c>null</c> — nothing is bound to the id any more (the executor's start path reads it the same way).
+    /// </summary>
+    private async Task<FlowState?> ConfirmDifferentStartAsync<TFlow, TInput>(
+        IFlowStateStore store,
+        FlowState existing,
+        string requestedInputJson,
+        string flowId,
+        CancellationToken cancellationToken)
+    {
+        if (FlowStateConcurrency.IsSameStart(existing, typeof(TFlow).FullName, typeof(TInput).FullName, requestedInputJson, FlowStateJson.InputEquivalent<TInput>))
+            return existing;
+
+        try
+        {
+            return await store.LoadCurrentAsync(flowId, cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException || !cancellationToken.IsCancellationRequested)
+        {
+            SafeLog.Try((Logger: _logger, Error: ex, FlowId: flowId), static s => s.Logger.LogDebug(
+                s.Error, "Durable flow {FlowId} could not be re-read currently before its start was judged against the existing ledger.", s.FlowId));
+            return existing;
         }
     }
 

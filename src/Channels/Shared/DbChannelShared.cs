@@ -129,6 +129,7 @@ internal abstract class DbAsyncResponseChannelBase :
         _timeProvider = timeProvider ?? TimeProvider.System;
         _lostSubscriberDispatcher = new LostSubscriberCallbackDispatcher(scopeFactory, propagation, logger, _timeProvider);
         _executors = new SerialExecutorRegistry(logger, timeProvider: _timeProvider);
+        _teardownDeadline = new CancellationTokenSource(Timeout.InfiniteTimeSpan, _timeProvider);
     }
 
     /// <summary>
@@ -724,6 +725,19 @@ internal abstract class DbAsyncResponseChannelBase :
         foreach (var entry in group)
             merged[entry.Key] = entry.Value;
     }
+
+    /// <summary>Most subscriber deletes disposal runs at once: each takes a pooled connection.</summary>
+    private const int DisposalStoreConcurrency = 8;
+
+    // The ONE deadline disposal's subscriber deletes share, armed (DisposalDrainTimeout) once
+    // every waiter has drained. Only the cleanups disposal runs itself honour it; it stops
+    // waiting for a store call that ignores it. Never disposed: a registration racing disposal
+    // may still read its token afterwards, and until armed it holds no timer. Deliberately on _timeProvider while each waiter's drain
+    // budget stays on the real clock (round 41): the deadline's tests advance a virtual clock.
+    private readonly CancellationTokenSource _teardownDeadline;
+
+    // Subscriber deletes the teardown deadline cut short; reported once by DisposeAsync.
+    private int _skippedTeardownDeletes;
 
     // Executor retirements started off the cleanup path (see CleanupCoreAsync). Keyed by the task
     // itself and self-evicting, so a long-lived channel never accumulates completed entries.
@@ -2513,12 +2527,47 @@ internal abstract class DbAsyncResponseChannelBase :
             cts.Dispose();
         }
 
-        foreach (var (correlationId, group) in _subscriptions.ToArray())
+        // Three phases, so teardown is bounded by budgets rather than by the number of waiters.
+        // 1) Drain every waiter at once — across ids and among siblings on one id. A drain only
+        //    waits for the in-flight delivery on the waiter's executor (no connection), so K
+        //    waiters wedged in an Until predicate cost one DisposalDrainTimeout, not K.
+        // 2) Clean every waiter up, the subscriber deletes (a pooled connection each) at most
+        //    DisposalStoreConcurrency at once, all under ONE deadline armed now. A delete still
+        //    queued or running when it lapses is skipped: the row stops counting as a live
+        //    subscriber once SubscriberHeartbeatTimeout passes without a heartbeat, which this
+        //    disposal has already stopped — the same fate as a delete that fails, or a process
+        //    that is killed. Settlement, unlinking, executor retirement and the span's stop run
+        //    for every waiter either way.
+        // 3) Retire every correlation id's executor at once (each bounded by the registry's own
+        //    drain budgets).
+        var snapshot = _subscriptions.ToArray();
+        var waiters = snapshot.SelectMany(static entry => entry.Value.Values).ToArray();
+        await Task.WhenAll(waiters.Select(static subscription => subscription.DrainForDisposalAsync().AsTask())).ConfigureAwait(false);
+
+        try
         {
-            foreach (var subscription in group.Values.ToArray())
-                await subscription.DrainThenCleanupAsync(deleteRecoveryState: false).ConfigureAwait(false);
-            await _executors.RemoveAsync(ChannelName(correlationId)).ConfigureAwait(false);
+            _teardownDeadline.CancelAfter(_options.DisposalDrainTimeout);
         }
+        catch (ArgumentOutOfRangeException)
+        {
+            // Unreachable past options validation; an unarmable budget must not skip the waiters'
+            // cleanup below, so the deletes then run without a deadline (still gated).
+        }
+
+        using (var storeGate = new SemaphoreSlim(DisposalStoreConcurrency, DisposalStoreConcurrency))
+            await Task.WhenAll(waiters.Select(subscription => subscription.CleanupForDisposalAsync(storeGate).AsTask())).ConfigureAwait(false);
+
+        var skipped = Interlocked.Exchange(ref _skippedTeardownDeletes, 0);
+        if (skipped > 0)
+        {
+            SafeLog.Try(
+                (Logger: _logger, Count: skipped, Provider: _providerName, Record: _subscriberRecordNoun, Budget: _options.DisposalDrainTimeout),
+                static state => state.Logger.LogWarning(
+                    "Disposal skipped {Count} subscriber {SubscriberRecord} deletes that did not finish within {Budget}; the {Provider} records expire after the subscriber heartbeat timeout.",
+                    state.Count, state.Record, state.Budget, state.Provider));
+        }
+
+        await Task.WhenAll(snapshot.Select(entry => _executors.RemoveAsync(ChannelName(entry.Key)).AsTask())).ConfigureAwait(false);
 
         // Retirements for subscriptions that cleaned themselves up (a response landing during
         // shutdown) unlink their correlation id before scheduling, so the loop above never sees
@@ -2554,6 +2603,8 @@ internal abstract class DbAsyncResponseChannelBase :
         Task ProcessAsync(DbChannelMessage message);
         ValueTask CleanupOnceAsync(bool deleteRecoveryState);
         ValueTask DrainThenCleanupAsync(bool deleteRecoveryState, Exception? terminalIfUndelivered = null);
+        ValueTask DrainForDisposalAsync();
+        ValueTask CleanupForDisposalAsync(SemaphoreSlim storeGate);
         ValueTask DropLocalAsync(CancellationToken cancellationToken);
     }
 
@@ -2720,12 +2771,20 @@ internal abstract class DbAsyncResponseChannelBase :
         /// a fire-once flag alone would let a disposing waiter racing the timeout return before
         /// the response task was settled.
         /// </summary>
-        public ValueTask CleanupOnceAsync(bool deleteRecoveryState)
+        public ValueTask CleanupOnceAsync(bool deleteRecoveryState) => CleanupLatchedAsync(deleteRecoveryState, storeGate: null);
+
+        /// <summary>
+        /// Channel disposal's cleanup, once <see cref="DrainForDisposalAsync"/> ran: keeps the
+        /// recovery state, and admits the subscriber delete through <paramref name="storeGate"/>.
+        /// </summary>
+        public ValueTask CleanupForDisposalAsync(SemaphoreSlim storeGate) => CleanupLatchedAsync(deleteRecoveryState: false, storeGate);
+
+        private ValueTask CleanupLatchedAsync(bool deleteRecoveryState, SemaphoreSlim? storeGate)
         {
             Task task;
             lock (_cleanupGate)
             {
-                task = _cleanupTask ??= CleanupCoreAsync(deleteRecoveryState);
+                task = _cleanupTask ??= CleanupCoreAsync(deleteRecoveryState, storeGate);
             }
 
             return task.IsCompletedSuccessfully ? ValueTask.CompletedTask : new ValueTask(task);
@@ -2760,6 +2819,29 @@ internal abstract class DbAsyncResponseChannelBase :
         /// is what settled the waiter, i.e. it won against any in-flight delivery.
         /// </summary>
         public async ValueTask DrainThenCleanupCoreAsync(bool deleteRecoveryState, Exception? terminalIfUndelivered, Action? onTerminalSettled)
+        {
+            await DrainForDisposalAsync().ConfigureAwait(false);
+
+            // Settle AFTER the drain, never before it. A delivery already inside the per-correlation
+            // executor may hold a message the claim acked — the publisher was told "delivered" and
+            // the watermark excludes it from every later sweep, so it exists nowhere else. Faulting
+            // first let a timeout beat that in-flight delivery and report a consumed response as a
+            // timeout; TrySet loses here if the delivery won, which is the whole point. (A lapsed
+            // drain budget has already faulted the task as indeterminate, and TrySet is a no-op
+            // behind it.)
+            if (terminalIfUndelivered is not null && _tcs.TrySetException(terminalIfUndelivered))
+                onTerminalSettled?.Invoke();
+
+            await CleanupOnceAsync(deleteRecoveryState).ConfigureAwait(false);
+        }
+
+        /// <summary>
+        /// The drain half of <see cref="DrainThenCleanupAsync"/>: waits (at most one
+        /// <c>DisposalDrainTimeout</c>) for any delivery in flight on the waiter's executor, and
+        /// faults the waiter as indeterminate when that cannot be proven. Holds no connection, so
+        /// channel disposal runs it for every waiter at once. Never throws.
+        /// </summary>
+        public async ValueTask DrainForDisposalAsync()
         {
             if (Volatile.Read(ref _cleanupStarted) == 0)
             {
@@ -2801,21 +2883,9 @@ internal abstract class DbAsyncResponseChannelBase :
                         });
                 }
             }
-
-            // Settle AFTER the drain, never before it. A delivery already inside the per-correlation
-            // executor may hold a message the claim acked — the publisher was told "delivered" and
-            // the watermark excludes it from every later sweep, so it exists nowhere else. Faulting
-            // first let a timeout beat that in-flight delivery and report a consumed response as a
-            // timeout; TrySet loses here if the delivery won, which is the whole point. (A lapsed
-            // drain budget has already faulted the task as indeterminate above, and TrySet is a
-            // no-op behind it.)
-            if (terminalIfUndelivered is not null && _tcs.TrySetException(terminalIfUndelivered))
-                onTerminalSettled?.Invoke();
-
-            await CleanupOnceAsync(deleteRecoveryState).ConfigureAwait(false);
         }
 
-        private async Task CleanupCoreAsync(bool deleteRecoveryState)
+        private async Task CleanupCoreAsync(bool deleteRecoveryState, SemaphoreSlim? storeGate)
         {
             // The flag is kept alongside the task latch: dispatch cores and white-box tests gate
             // on it, and a pre-set flag (test isolation) must keep skipping the network cleanup.
@@ -2858,7 +2928,13 @@ internal abstract class DbAsyncResponseChannelBase :
 
                 try
                 {
-                    await _owner._store.DeleteSubscriberAsync(_correlationId, Id, CancellationToken.None).ConfigureAwait(false);
+                    await DeleteSubscriberBeforeTeardownDeadlineAsync(storeGate).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException) when (storeGate is not null && _owner._teardownDeadline.IsCancellationRequested)
+                {
+                    // Cut short by channel disposal's deadline: not a failure. DisposeAsync reports
+                    // the count once; the record expires via the heartbeat timeout.
+                    Interlocked.Increment(ref _owner._skippedTeardownDeletes);
                 }
                 catch (Exception ex)
                 {
@@ -2905,6 +2981,56 @@ internal abstract class DbAsyncResponseChannelBase :
                     await TimeoutRegistration().ConfigureAwait(false);
                 TimeoutCancellation?.Dispose();
                 AsyncResponseDiagnostics.StopActivity(_activity);
+            }
+        }
+
+        /// <summary>
+        /// The subscriber delete, bounded by the channel's teardown deadline (never armed outside
+        /// disposal): through <paramref name="storeGate"/> when disposal runs it, and abandoned —
+        /// not awaited — once the deadline lapses, since a store may not honour the token.
+        /// </summary>
+        private async Task DeleteSubscriberBeforeTeardownDeadlineAsync(SemaphoreSlim? storeGate)
+        {
+            // Only the cleanups disposal runs itself take the deadline. A waiter's own cleanup
+            // keeps its unbounded delete: one latched after disposal read the skipped count (a
+            // registration that raced disposal and cleans itself up) would otherwise skip its
+            // delete at once and leave an orphan nobody reports.
+            if (storeGate is null)
+            {
+                await _owner._store.DeleteSubscriberAsync(_correlationId, Id, CancellationToken.None).ConfigureAwait(false);
+                return;
+            }
+
+            var deadline = _owner._teardownDeadline.Token;
+            await storeGate.WaitAsync(deadline).ConfigureAwait(false);
+            try
+            {
+                deadline.ThrowIfCancellationRequested();
+                var delete = _owner._store.DeleteSubscriberAsync(_correlationId, Id, deadline);
+                try
+                {
+                    await delete.WaitAsync(deadline).ConfigureAwait(false);
+                }
+                catch (Exception ex) when (deadline.IsCancellationRequested)
+                {
+                    // Abandoned, or failed by its own reaction to the deadline (SqlClient reports
+                    // a cancelled command as a SqlException): either way the deadline cut it
+                    // short. Observe its eventual fault so it never surfaces as unobserved.
+                    if (!delete.IsCompleted)
+                    {
+                        _ = delete.ContinueWith(
+                            static completed => _ = completed.Exception,
+                            CancellationToken.None,
+                            TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously,
+                            TaskScheduler.Default);
+                    }
+
+                    throw new OperationCanceledException("The subscriber delete missed the disposal deadline.", ex, deadline);
+                }
+            }
+            finally
+            {
+                storeGate.Release();
             }
         }
 

@@ -333,7 +333,7 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
                 }
             }
 
-            _logger.LogDebug("Subscribed to channel {Channel} for correlationId {CorrelationId}.", channelName, correlationId);
+            SafeLog.Try(() => _logger.LogDebug("Subscribed to channel {Channel} for correlationId {CorrelationId}.", channelName, correlationId));
         }
         catch (Exception ex) when (subscription.ResponseTask.IsCompletedSuccessfully || subscription.ResponseTask.IsFaulted)
         {
