@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1790799505490,
+  "lastUpdate": 1790803732859,
   "repoUrl": "https://github.com/Sky4CE/AsyncResponse",
   "entries": {
     "AsyncResponse Microbenchmarks": [
@@ -105878,6 +105878,630 @@ window.BENCHMARK_DATA = {
             "value": 18127.333333333332,
             "unit": "ns",
             "range": "± 10763.67248355938"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "tyunisov@gmail.com",
+            "name": "Sky4CE",
+            "username": "Sky4CE"
+          },
+          "committer": {
+            "email": "tyunisov@gmail.com",
+            "name": "Sky4CE",
+            "username": "Sky4CE"
+          },
+          "distinct": true,
+          "id": "733c5f2a91f8b8c4785059fc9c54594cb657516b",
+          "message": "fix: apply round-61 review — a Cosmos DB ledger no longer disappears up to a second before it expires (server TTL counted from the truncated _ts), GetStateAsync and StartAsync document the exceptions they throw, ResumeAsync's no-state message no longer suggests the run is unreadable",
+          "timestamp": "2026-09-30T23:14:11+02:00",
+          "tree_id": "d17ee09227bdbc5b22c9325e37a39dc7591656aa",
+          "url": "https://github.com/Sky4CE/AsyncResponse/commit/733c5f2a91f8b8c4785059fc9c54594cb657516b"
+        },
+        "date": 1790803715798,
+        "tool": "benchmarkdotnet",
+        "benches": [
+          {
+            "name": "AsyncResponse.Benchmarks.SerializationBenchmarks.Envelope_Serialize",
+            "value": 241.40023120244345,
+            "unit": "ns",
+            "range": "± 1.2302209951016128"
+          },
+          {
+            "name": "AsyncResponse.Benchmarks.SerializationBenchmarks.Envelope_Deserialize",
+            "value": 435.7647322018941,
+            "unit": "ns",
+            "range": "± 0.5738256280947911"
+          },
+          {
+            "name": "AsyncResponse.Benchmarks.SerializationBenchmarks.Classify_TypedPayload",
+            "value": 2.945042605201403,
+            "unit": "ns",
+            "range": "± 0.000942145795160775"
+          },
+          {
+            "name": "AsyncResponse.Benchmarks.SerializationBenchmarks.Classify_RawJson",
+            "value": 241.05533377329508,
+            "unit": "ns",
+            "range": "± 0.5267546166184075"
+          },
+          {
+            "name": "AsyncResponse.Benchmarks.PostgreSqlAckDispatchBenchmarks.AckAfterHandlerCompletes_Callback(BackgroundWorkers: 1)",
+            "value": 1745.4777743021648,
+            "unit": "ns",
+            "range": "± 13.062354854759588"
+          },
+          {
+            "name": "AsyncResponse.Benchmarks.PostgreSqlAckDispatchBenchmarks.AckAfterEnqueue_Callback(BackgroundWorkers: 1)",
+            "value": 1241.2666212717693,
+            "unit": "ns",
+            "range": "± 8.86360543880921"
+          },
+          {
+            "name": "AsyncResponse.Benchmarks.PostgreSqlAckDispatchBenchmarks.AckAfterHandlerCompletes_Callback(BackgroundWorkers: 8)",
+            "value": 1781.4155921936035,
+            "unit": "ns",
+            "range": "± 5.032162121868338"
+          },
+          {
+            "name": "AsyncResponse.Benchmarks.PostgreSqlAckDispatchBenchmarks.AckAfterEnqueue_Callback(BackgroundWorkers: 8)",
+            "value": 1646.0549780527751,
+            "unit": "ns",
+            "range": "± 1.8581427445658931"
+          },
+          {
+            "name": "AsyncResponse.Benchmarks.LedgerGrowthBenchmarks.RunOfNSteps(Steps: 50, ResultBytes: 1024, StepsPerLedger: 0)",
+            "value": 2280277.25,
+            "unit": "ns",
+            "range": "± 50590.646541150265"
+          },
+          {
+            "name": "AsyncResponse.Benchmarks.LedgerGrowthBenchmarks.RunOfNSteps(Steps: 50, ResultBytes: 1024, StepsPerLedger: 8)",
+            "value": 402301.7047526042,
+            "unit": "ns",
+            "range": "± 2420.465279656588"
+          },
+          {
+            "name": "AsyncResponse.Benchmarks.LedgerGrowthBenchmarks.RunOfNSteps(Steps: 200, ResultBytes: 1024, StepsPerLedger: 0)",
+            "value": 37532191.166666664,
+            "unit": "ns",
+            "range": "± 413499.62123579485"
+          },
+          {
+            "name": "AsyncResponse.Benchmarks.LedgerGrowthBenchmarks.RunOfNSteps(Steps: 200, ResultBytes: 1024, StepsPerLedger: 8)",
+            "value": 1653289.7916666667,
+            "unit": "ns",
+            "range": "± 7746.045760196685"
+          },
+          {
+            "name": "AsyncResponse.Benchmarks.LedgerGrowthBenchmarks.RunOfNSteps(Steps: 400, ResultBytes: 1024, StepsPerLedger: 0)",
+            "value": 150223123.66666666,
+            "unit": "ns",
+            "range": "± 489844.3603486043"
+          },
+          {
+            "name": "AsyncResponse.Benchmarks.LedgerGrowthBenchmarks.RunOfNSteps(Steps: 400, ResultBytes: 1024, StepsPerLedger: 8)",
+            "value": 3301280.4765625,
+            "unit": "ns",
+            "range": "± 30704.02399578121"
+          },
+          {
+            "name": "AsyncResponse.Benchmarks.SqsAckDispatchBenchmarks.AckAfterHandlerCompletes_Callback(BackgroundWorkers: 1)",
+            "value": 782.3217210769653,
+            "unit": "ns",
+            "range": "± 7.138149181331619"
+          },
+          {
+            "name": "AsyncResponse.Benchmarks.SqsAckDispatchBenchmarks.AckAfterEnqueue_Callback(BackgroundWorkers: 1)",
+            "value": 1258.0992533365886,
+            "unit": "ns",
+            "range": "± 6.758986592518617"
+          },
+          {
+            "name": "AsyncResponse.Benchmarks.SqsAckDispatchBenchmarks.AckAfterHandlerCompletes_Callback(BackgroundWorkers: 8)",
+            "value": 751.6542743047079,
+            "unit": "ns",
+            "range": "± 1.0124995706263795"
+          },
+          {
+            "name": "AsyncResponse.Benchmarks.SqsAckDispatchBenchmarks.AckAfterEnqueue_Callback(BackgroundWorkers: 8)",
+            "value": 1546.7412694295247,
+            "unit": "ns",
+            "range": "± 12.152777830811795"
+          },
+          {
+            "name": "AsyncResponse.Benchmarks.CallbackBenchmarks.ExpressionToReflectionCall",
+            "value": 92.26206421852112,
+            "unit": "ns",
+            "range": "± 1.0073667238547201"
+          },
+          {
+            "name": "AsyncResponse.Benchmarks.CallbackBenchmarks.ReflectionInvoke",
+            "value": 83.32939799626668,
+            "unit": "ns",
+            "range": "± 0.14712044365916713"
+          },
+          {
+            "name": "AsyncResponse.Benchmarks.RedisAckDispatchBenchmarks.AckAfterHandlerCompletes_Callback(BackgroundWorkers: 1)",
+            "value": 53.23774719238281,
+            "unit": "ns",
+            "range": "± 0.06791518822297009"
+          },
+          {
+            "name": "AsyncResponse.Benchmarks.RedisAckDispatchBenchmarks.AckAfterEnqueue_Callback(BackgroundWorkers: 1)",
+            "value": 174.47713812192282,
+            "unit": "ns",
+            "range": "± 1.1808142009177276"
+          },
+          {
+            "name": "AsyncResponse.Benchmarks.RedisAckDispatchBenchmarks.AckAfterHandlerCompletes_Callback(BackgroundWorkers: 8)",
+            "value": 53.83955578009287,
+            "unit": "ns",
+            "range": "± 0.05117079474799107"
+          },
+          {
+            "name": "AsyncResponse.Benchmarks.RedisAckDispatchBenchmarks.AckAfterEnqueue_Callback(BackgroundWorkers: 8)",
+            "value": 393.26072057088214,
+            "unit": "ns",
+            "range": "± 14.014128160641524"
+          },
+          {
+            "name": "AsyncResponse.Benchmarks.RecoveryBenchmarks.InMemoryStore_SaveGetDelete(Entries: 128)",
+            "value": 973.5430202484131,
+            "unit": "ns",
+            "range": "± 6.000473942297675"
+          },
+          {
+            "name": "AsyncResponse.Benchmarks.RecoveryBenchmarks.InMemoryStore_Scan(Entries: 128)",
+            "value": 125183.45166015625,
+            "unit": "ns",
+            "range": "± 363.0897812140923"
+          },
+          {
+            "name": "AsyncResponse.Benchmarks.RecoveryBenchmarks.Watchdog_Evaluate_MixedSnapshot(Entries: 128)",
+            "value": 2539.844482421875,
+            "unit": "ns",
+            "range": "± 23.725350408487856"
+          },
+          {
+            "name": "AsyncResponse.Benchmarks.RecoveryBenchmarks.HealthCheck_Evaluate_Healthy(Entries: 128)",
+            "value": 133.06275097529092,
+            "unit": "ns",
+            "range": "± 1.6364201356139685"
+          },
+          {
+            "name": "AsyncResponse.Benchmarks.RecoveryBenchmarks.HealthCheck_Evaluate_Degraded(Entries: 128)",
+            "value": 360.64776070912677,
+            "unit": "ns",
+            "range": "± 6.011705625423395"
+          },
+          {
+            "name": "AsyncResponse.Benchmarks.RecoveryBenchmarks.InMemoryStore_SaveGetDelete(Entries: 1024)",
+            "value": 977.6681874593099,
+            "unit": "ns",
+            "range": "± 5.140998639304227"
+          },
+          {
+            "name": "AsyncResponse.Benchmarks.RecoveryBenchmarks.InMemoryStore_Scan(Entries: 1024)",
+            "value": 1026627.0989583334,
+            "unit": "ns",
+            "range": "± 2588.56458939209"
+          },
+          {
+            "name": "AsyncResponse.Benchmarks.RecoveryBenchmarks.Watchdog_Evaluate_MixedSnapshot(Entries: 1024)",
+            "value": 22440.815526326496,
+            "unit": "ns",
+            "range": "± 64.57492685850862"
+          },
+          {
+            "name": "AsyncResponse.Benchmarks.RecoveryBenchmarks.HealthCheck_Evaluate_Healthy(Entries: 1024)",
+            "value": 131.82025031248727,
+            "unit": "ns",
+            "range": "± 0.09750654613584853"
+          },
+          {
+            "name": "AsyncResponse.Benchmarks.RecoveryBenchmarks.HealthCheck_Evaluate_Degraded(Entries: 1024)",
+            "value": 364.63041830062866,
+            "unit": "ns",
+            "range": "± 1.293102994996842"
+          },
+          {
+            "name": "AsyncResponse.Benchmarks.RecoveryBenchmarks.InMemoryStore_SaveGetDelete(Entries: 8192)",
+            "value": 974.0718371073405,
+            "unit": "ns",
+            "range": "± 2.629331887642523"
+          },
+          {
+            "name": "AsyncResponse.Benchmarks.RecoveryBenchmarks.InMemoryStore_Scan(Entries: 8192)",
+            "value": 8710840.59375,
+            "unit": "ns",
+            "range": "± 16145.650016591217"
+          },
+          {
+            "name": "AsyncResponse.Benchmarks.RecoveryBenchmarks.Watchdog_Evaluate_MixedSnapshot(Entries: 8192)",
+            "value": 325671.84326171875,
+            "unit": "ns",
+            "range": "± 1325.2589821470622"
+          },
+          {
+            "name": "AsyncResponse.Benchmarks.RecoveryBenchmarks.HealthCheck_Evaluate_Healthy(Entries: 8192)",
+            "value": 132.0668018658956,
+            "unit": "ns",
+            "range": "± 0.22529663025467356"
+          },
+          {
+            "name": "AsyncResponse.Benchmarks.RecoveryBenchmarks.HealthCheck_Evaluate_Degraded(Entries: 8192)",
+            "value": 368.6458508173625,
+            "unit": "ns",
+            "range": "± 5.758289643725673"
+          },
+          {
+            "name": "AsyncResponse.Benchmarks.SqlServerAckDispatchBenchmarks.AckAfterHandlerCompletes_Callback(BackgroundWorkers: 1)",
+            "value": 1750.8882605234783,
+            "unit": "ns",
+            "range": "± 5.090507796322925"
+          },
+          {
+            "name": "AsyncResponse.Benchmarks.SqlServerAckDispatchBenchmarks.AckAfterEnqueue_Callback(BackgroundWorkers: 1)",
+            "value": 1194.5384934743245,
+            "unit": "ns",
+            "range": "± 32.23705519102011"
+          },
+          {
+            "name": "AsyncResponse.Benchmarks.SqlServerAckDispatchBenchmarks.AckAfterHandlerCompletes_Callback(BackgroundWorkers: 8)",
+            "value": 1740.7996088663738,
+            "unit": "ns",
+            "range": "± 31.575534617882504"
+          },
+          {
+            "name": "AsyncResponse.Benchmarks.SqlServerAckDispatchBenchmarks.AckAfterEnqueue_Callback(BackgroundWorkers: 8)",
+            "value": 1556.579741160075,
+            "unit": "ns",
+            "range": "± 8.321533519319532"
+          },
+          {
+            "name": "AsyncResponse.Benchmarks.NatsAckDispatchBenchmarks.AckAfterHandlerCompletes_Callback(BackgroundWorkers: 1)",
+            "value": 76.71175762017567,
+            "unit": "ns",
+            "range": "± 0.30832748408568583"
+          },
+          {
+            "name": "AsyncResponse.Benchmarks.NatsAckDispatchBenchmarks.AckAfterEnqueue_Callback(BackgroundWorkers: 1)",
+            "value": 213.46466183662415,
+            "unit": "ns",
+            "range": "± 1.0839201031162513"
+          },
+          {
+            "name": "AsyncResponse.Benchmarks.NatsAckDispatchBenchmarks.AckAfterHandlerCompletes_Callback(BackgroundWorkers: 8)",
+            "value": 66.80771579345067,
+            "unit": "ns",
+            "range": "± 0.3721056866866123"
+          },
+          {
+            "name": "AsyncResponse.Benchmarks.NatsAckDispatchBenchmarks.AckAfterEnqueue_Callback(BackgroundWorkers: 8)",
+            "value": 421.16618394851685,
+            "unit": "ns",
+            "range": "± 4.566781631170843"
+          },
+          {
+            "name": "AsyncResponse.Benchmarks.ContextPropagationBenchmarks.Capture_NoPropagators",
+            "value": 0.24915546799699465,
+            "unit": "ns",
+            "range": "± 0.009681009444772976"
+          },
+          {
+            "name": "AsyncResponse.Benchmarks.ContextPropagationBenchmarks.Capture_TwoPropagators",
+            "value": 55.28198619683584,
+            "unit": "ns",
+            "range": "± 0.21280515486445284"
+          },
+          {
+            "name": "AsyncResponse.Benchmarks.ContextPropagationBenchmarks.Restore_TwoPropagators",
+            "value": 79.63000657161076,
+            "unit": "ns",
+            "range": "± 0.8085978740534834"
+          },
+          {
+            "name": "AsyncResponse.Benchmarks.MongoDbAckDispatchBenchmarks.AckAfterHandlerCompletes_Callback(BackgroundWorkers: 1)",
+            "value": 1757.1485850016277,
+            "unit": "ns",
+            "range": "± 7.911918640146221"
+          },
+          {
+            "name": "AsyncResponse.Benchmarks.MongoDbAckDispatchBenchmarks.AckAfterEnqueue_Callback(BackgroundWorkers: 1)",
+            "value": 1184.4350725809734,
+            "unit": "ns",
+            "range": "± 15.045794820145824"
+          },
+          {
+            "name": "AsyncResponse.Benchmarks.MongoDbAckDispatchBenchmarks.AckAfterHandlerCompletes_Callback(BackgroundWorkers: 8)",
+            "value": 1755.2447319030762,
+            "unit": "ns",
+            "range": "± 8.187331577202823"
+          },
+          {
+            "name": "AsyncResponse.Benchmarks.MongoDbAckDispatchBenchmarks.AckAfterEnqueue_Callback(BackgroundWorkers: 8)",
+            "value": 1661.4230155944824,
+            "unit": "ns",
+            "range": "± 5.329471043097485"
+          },
+          {
+            "name": "AsyncResponse.Benchmarks.GooglePubSubAckDispatchBenchmarks.AckAfterHandlerCompletes_Callback(BackgroundWorkers: 1)",
+            "value": 33.8210817972819,
+            "unit": "ns",
+            "range": "± 0.09087862607288852"
+          },
+          {
+            "name": "AsyncResponse.Benchmarks.GooglePubSubAckDispatchBenchmarks.AckAfterEnqueue_Callback(BackgroundWorkers: 1)",
+            "value": 196.02864011128744,
+            "unit": "ns",
+            "range": "± 6.815459855236949"
+          },
+          {
+            "name": "AsyncResponse.Benchmarks.GooglePubSubAckDispatchBenchmarks.AckAfterHandlerCompletes_Callback(BackgroundWorkers: 8)",
+            "value": 33.60153716802597,
+            "unit": "ns",
+            "range": "± 0.08495497134156053"
+          },
+          {
+            "name": "AsyncResponse.Benchmarks.GooglePubSubAckDispatchBenchmarks.AckAfterEnqueue_Callback(BackgroundWorkers: 8)",
+            "value": 372.729966322581,
+            "unit": "ns",
+            "range": "± 11.252697279100262"
+          },
+          {
+            "name": "AsyncResponse.Benchmarks.RabbitMqAckDispatchBenchmarks.AckAfterHandlerCompletes_Callback(BackgroundWorkers: 1)",
+            "value": 43.53087565302849,
+            "unit": "ns",
+            "range": "± 0.02432409617464232"
+          },
+          {
+            "name": "AsyncResponse.Benchmarks.RabbitMqAckDispatchBenchmarks.AckAfterEnqueue_Callback(BackgroundWorkers: 1)",
+            "value": 141.4754192829132,
+            "unit": "ns",
+            "range": "± 2.9733231620206073"
+          },
+          {
+            "name": "AsyncResponse.Benchmarks.RabbitMqAckDispatchBenchmarks.AckAfterHandlerCompletes_Callback(BackgroundWorkers: 8)",
+            "value": 41.64244099458059,
+            "unit": "ns",
+            "range": "± 0.11115513029213664"
+          },
+          {
+            "name": "AsyncResponse.Benchmarks.RabbitMqAckDispatchBenchmarks.AckAfterEnqueue_Callback(BackgroundWorkers: 8)",
+            "value": 453.4177289009094,
+            "unit": "ns",
+            "range": "± 22.255625659061987"
+          },
+          {
+            "name": "AsyncResponse.Benchmarks.IngressBenchmarks.TypedPublisher_RoundTrip(Fanout: 1)",
+            "value": 2991.2794075012207,
+            "unit": "ns",
+            "range": "± 5.591596992087766"
+          },
+          {
+            "name": "AsyncResponse.Benchmarks.IngressBenchmarks.RawIngress_RoundTrip(Fanout: 1)",
+            "value": 2876.7282524108887,
+            "unit": "ns",
+            "range": "± 24.251063179030293"
+          },
+          {
+            "name": "AsyncResponse.Benchmarks.IngressBenchmarks.TypedPublisher_Fanout(Fanout: 1)",
+            "value": 3165.063060760498,
+            "unit": "ns",
+            "range": "± 5.463271960209954"
+          },
+          {
+            "name": "AsyncResponse.Benchmarks.IngressBenchmarks.Exception_Fanout(Fanout: 1)",
+            "value": 8044.204762776692,
+            "unit": "ns",
+            "range": "± 248.62516673521478"
+          },
+          {
+            "name": "AsyncResponse.Benchmarks.IngressBenchmarks.TypedPublisher_RoundTrip(Fanout: 4)",
+            "value": 2984.829268137614,
+            "unit": "ns",
+            "range": "± 3.034846194824505"
+          },
+          {
+            "name": "AsyncResponse.Benchmarks.IngressBenchmarks.RawIngress_RoundTrip(Fanout: 4)",
+            "value": 2858.528251647949,
+            "unit": "ns",
+            "range": "± 14.021023373028356"
+          },
+          {
+            "name": "AsyncResponse.Benchmarks.IngressBenchmarks.TypedPublisher_Fanout(Fanout: 4)",
+            "value": 8000.641672770183,
+            "unit": "ns",
+            "range": "± 7.22435250448808"
+          },
+          {
+            "name": "AsyncResponse.Benchmarks.IngressBenchmarks.Exception_Fanout(Fanout: 4)",
+            "value": 18678.097279866535,
+            "unit": "ns",
+            "range": "± 194.50224225360697"
+          },
+          {
+            "name": "AsyncResponse.Benchmarks.IngressBenchmarks.TypedPublisher_RoundTrip(Fanout: 16)",
+            "value": 2976.631244659424,
+            "unit": "ns",
+            "range": "± 6.2871750152040144"
+          },
+          {
+            "name": "AsyncResponse.Benchmarks.IngressBenchmarks.RawIngress_RoundTrip(Fanout: 16)",
+            "value": 2924.610121409098,
+            "unit": "ns",
+            "range": "± 6.85872856757766"
+          },
+          {
+            "name": "AsyncResponse.Benchmarks.IngressBenchmarks.TypedPublisher_Fanout(Fanout: 16)",
+            "value": 28441.03874206543,
+            "unit": "ns",
+            "range": "± 36.960793103415476"
+          },
+          {
+            "name": "AsyncResponse.Benchmarks.IngressBenchmarks.Exception_Fanout(Fanout: 16)",
+            "value": 58886.99790445963,
+            "unit": "ns",
+            "range": "± 70.321446432938"
+          },
+          {
+            "name": "AsyncResponse.Benchmarks.RedisRecoveryScanBenchmarks.Scan(Registrations: 1024, RoundTripMilliseconds: 1)",
+            "value": 17475620.802083332,
+            "unit": "ns",
+            "range": "± 195324.17901535335"
+          },
+          {
+            "name": "AsyncResponse.Benchmarks.RedisRecoveryScanBenchmarks.OneRoundTripPerKey(Registrations: 1024, RoundTripMilliseconds: 1)",
+            "value": 1151536793,
+            "unit": "ns",
+            "range": "± 9962632.70258916"
+          },
+          {
+            "name": "AsyncResponse.Benchmarks.RedisRecoveryScanBenchmarks.Scan(Registrations: 8192, RoundTripMilliseconds: 1)",
+            "value": 134195027.55555554,
+            "unit": "ns",
+            "range": "± 123703.23310260131"
+          },
+          {
+            "name": "AsyncResponse.Benchmarks.RedisRecoveryScanBenchmarks.OneRoundTripPerKey(Registrations: 8192, RoundTripMilliseconds: 1)",
+            "value": 9099507425.666666,
+            "unit": "ns",
+            "range": "± 42911772.902376816"
+          },
+          {
+            "name": "AsyncResponse.Benchmarks.KafkaAckDispatchBenchmarks.AckAfterHandlerCompletes_Callback(BackgroundWorkers: 1)",
+            "value": 47.02263208230337,
+            "unit": "ns",
+            "range": "± 0.10367608590618911"
+          },
+          {
+            "name": "AsyncResponse.Benchmarks.KafkaAckDispatchBenchmarks.AckAfterEnqueue_Callback(BackgroundWorkers: 1)",
+            "value": 195.2704029083252,
+            "unit": "ns",
+            "range": "± 2.0597149457538464"
+          },
+          {
+            "name": "AsyncResponse.Benchmarks.KafkaAckDispatchBenchmarks.AckAfterHandlerCompletes_Callback(BackgroundWorkers: 8)",
+            "value": 48.640677551428475,
+            "unit": "ns",
+            "range": "± 0.182627087589512"
+          },
+          {
+            "name": "AsyncResponse.Benchmarks.KafkaAckDispatchBenchmarks.AckAfterEnqueue_Callback(BackgroundWorkers: 8)",
+            "value": 346.368948618571,
+            "unit": "ns",
+            "range": "± 33.2857868016051"
+          },
+          {
+            "name": "AsyncResponse.Benchmarks.ChannelBenchmarks.RoundTrip_ViaBuilder",
+            "value": 3117.4414672851562,
+            "unit": "ns",
+            "range": "± 13.785140617807434"
+          },
+          {
+            "name": "AsyncResponse.Benchmarks.ChannelBenchmarks.RoundTrip_ViaSubscriber",
+            "value": 2952.674977620443,
+            "unit": "ns",
+            "range": "± 2.5038907229138037"
+          },
+          {
+            "name": "AsyncResponse.Benchmarks.RecoveryRegistrationGrowthBenchmarks.Nats(Registrations: 16)",
+            "value": 478348.984375,
+            "unit": "ns",
+            "range": "± 5648.982013863515"
+          },
+          {
+            "name": "AsyncResponse.Benchmarks.RecoveryRegistrationGrowthBenchmarks.Redis(Registrations: 16)",
+            "value": 518974.2174479167,
+            "unit": "ns",
+            "range": "± 5407.141022689411"
+          },
+          {
+            "name": "AsyncResponse.Benchmarks.RecoveryRegistrationGrowthBenchmarks.Nats(Registrations: 64)",
+            "value": 7514077.450520833,
+            "unit": "ns",
+            "range": "± 48147.39910280097"
+          },
+          {
+            "name": "AsyncResponse.Benchmarks.RecoveryRegistrationGrowthBenchmarks.Redis(Registrations: 64)",
+            "value": 8404964.635416666,
+            "unit": "ns",
+            "range": "± 71799.69357251815"
+          },
+          {
+            "name": "AsyncResponse.Benchmarks.RecoveryRegistrationGrowthBenchmarks.Nats(Registrations: 256)",
+            "value": 158868209.66666666,
+            "unit": "ns",
+            "range": "± 30997326.10597605"
+          },
+          {
+            "name": "AsyncResponse.Benchmarks.RecoveryRegistrationGrowthBenchmarks.Redis(Registrations: 256)",
+            "value": 174280295.66666666,
+            "unit": "ns",
+            "range": "± 12211885.15765401"
+          },
+          {
+            "name": "AsyncResponse.Benchmarks.AzureServiceBusAckDispatchBenchmarks.AckAfterHandlerCompletes_Callback(BackgroundWorkers: 1)",
+            "value": 761.3486073811849,
+            "unit": "ns",
+            "range": "± 1.1726205921477357"
+          },
+          {
+            "name": "AsyncResponse.Benchmarks.AzureServiceBusAckDispatchBenchmarks.AckAfterEnqueue_Callback(BackgroundWorkers: 1)",
+            "value": 1250.3605556488037,
+            "unit": "ns",
+            "range": "± 4.266063367769999"
+          },
+          {
+            "name": "AsyncResponse.Benchmarks.AzureServiceBusAckDispatchBenchmarks.AckAfterHandlerCompletes_Callback(BackgroundWorkers: 8)",
+            "value": 755.0384457906088,
+            "unit": "ns",
+            "range": "± 5.245952407234518"
+          },
+          {
+            "name": "AsyncResponse.Benchmarks.AzureServiceBusAckDispatchBenchmarks.AckAfterEnqueue_Callback(BackgroundWorkers: 8)",
+            "value": 1621.9243653615315,
+            "unit": "ns",
+            "range": "± 18.37430730480473"
+          },
+          {
+            "name": "AsyncResponse.Benchmarks.DurableFlowStateStoreBenchmarks.LoadAsync",
+            "value": 10202.697397867838,
+            "unit": "ns",
+            "range": "± 234.2616544038145"
+          },
+          {
+            "name": "AsyncResponse.Benchmarks.DurableFlowStateStoreBenchmarks.SaveLoadDeleteAsync",
+            "value": 625535.8092447916,
+            "unit": "ns",
+            "range": "± 122410.62803130611"
+          },
+          {
+            "name": "AsyncResponse.Benchmarks.DurableFlowStateStoreBenchmarks.InMemoryLoadAsync",
+            "value": 1494.9168968200684,
+            "unit": "ns",
+            "range": "± 23.101315934109433"
+          },
+          {
+            "name": "AsyncResponse.Benchmarks.DurableFlowStateStoreBenchmarks.InMemoryCreateLoadDeleteAsync",
+            "value": 3032.980962117513,
+            "unit": "ns",
+            "range": "± 22.729952559071886"
+          },
+          {
+            "name": "AsyncResponse.Benchmarks.DurableFlowStateStoreBenchmarks.CreateAsync",
+            "value": 416456,
+            "unit": "ns",
+            "range": "± 14922.633916303113"
+          },
+          {
+            "name": "AsyncResponse.Benchmarks.DurableFlowStateStoreBenchmarks.InMemoryCreateAsync",
+            "value": 29541.666666666668,
+            "unit": "ns",
+            "range": "± 1252.8516805006623"
           }
         ]
       }
