@@ -429,6 +429,71 @@ public class DurableChildFlowRegressionTests
         Assert.Contains("semantically identical child input", error.Message);
     }
 
+    [Theory]
+    [InlineData(FlowRunStatus.Succeeded, false, 2)] // input edited
+    [InlineData(FlowRunStatus.Succeeded, true, 1)] // class renamed
+    [InlineData(FlowRunStatus.Failed, true, 2)] // renamed AND edited, child failed
+    public async Task AwaitChildFlow_BreadcrumbbedChildThatFinishedUnderEditedInputOrRenamedClass_ReturnsTheSettledOutcome(
+        FlowRunStatus childStatus,
+        bool renamedClass,
+        int requestedInput)
+    {
+        // The parent's wake-up after its child finished has a breadcrumb but no completed memo yet.
+        // Ownership is already proven by the breadcrumb plus ParentFlowId/ParentStepName, and the
+        // child is terminal, so an input edit since creation must not fail the parent.
+        var store = new InMemoryFlowStateStore();
+        var child = new FlowState
+        {
+            FlowId = "woken-root:child",
+            FlowTypeName = renamedClass ? "Old.Renamed.ChildFlow" : typeof(GatedChildFlow).FullName,
+            InputTypeName = typeof(TestFlowInput).FullName,
+            InputJson = JsonSerializer.Serialize(new TestFlowInput(1)),
+            Status = childStatus,
+            LastMessage = "child boom",
+            ParentFlowId = "woken-root",
+            ParentStepName = "child",
+            CreatedAtUtc = DateTime.UtcNow,
+            UpdatedAtUtc = DateTime.UtcNow
+        };
+        var parent = new FlowState
+        {
+            FlowId = "woken-root",
+            FlowTypeName = typeof(GatedParentFlow).FullName,
+            Status = FlowRunStatus.Running,
+            Steps = new Dictionary<string, FlowStepState>(StringComparer.Ordinal)
+            {
+                ["child"] = new() { ChildFlowId = child.FlowId }
+            },
+            CreatedAtUtc = DateTime.UtcNow,
+            UpdatedAtUtc = DateTime.UtcNow
+        };
+
+        Assert.True(await store.TryCreateAsync(child.FlowId!, child, TimeSpan.FromMinutes(5)));
+        Assert.True(await store.TryCreateAsync(parent.FlowId!, parent, TimeSpan.FromMinutes(5)));
+        await using var lease = await FlowStateConcurrency.TryAcquireExecutionLeaseAsync(
+            store,
+            parent.FlowId!,
+            new DurableFlowOptions(),
+            NullLogger.Instance);
+        Assert.NotNull(lease);
+
+        var context = CreateContext(parent, store, lease!);
+        var requested = new TestFlowInput(requestedInput);
+        if (childStatus == FlowRunStatus.Failed)
+        {
+            // The child's own failure surfaces, not a rename/input-edit mismatch.
+            var failure = await Assert.ThrowsAsync<DurableFlowFailedException>(() =>
+                context.AwaitChildFlowAsync<GatedChildFlow, TestFlowInput>("child", requested));
+            Assert.Contains("child boom", failure.Message);
+            return;
+        }
+
+        var result = await context.AwaitChildFlowAsync<GatedChildFlow, TestFlowInput>("child", requested);
+
+        Assert.Equal(child.FlowId, result.FlowId);
+        Assert.Equal(childStatus, result.Status);
+    }
+
     [Fact]
     public async Task AwaitChildFlow_CompletedCheckpoint_WhoseOldInputTodaysTypeRejects_ReturnsTheMemoizedChild()
     {

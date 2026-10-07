@@ -1122,9 +1122,9 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
                         // Returning here instead would silently drop the payload: the caller
                         // reports success, the broker message is acked, and the response then
                         // exists nowhere.
-                        _logger.LogWarning(
+                        SafeLog.Try(() => _logger.LogWarning(
                             "Delivery for correlationId {CorrelationId} found no subscribers twice while the liveness probe kept reporting one; recovery registrations are left intact.",
-                            correlationId);
+                            correlationId));
                         activity?.SetTag("asyncresponse.recovery.liveness_contradiction", true);
                         throw new InvalidOperationException(
                             $"NATS delivery for correlationId '{correlationId}' found no responders twice while the liveness probe kept " +
@@ -1223,9 +1223,9 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
                         // Returning here instead would silently drop the payload: the caller
                         // reports success, the broker message is acked, and the response then
                         // exists nowhere.
-                        _logger.LogWarning(
+                        SafeLog.Try(() => _logger.LogWarning(
                             "Delivery for correlationId {CorrelationId} found no subscribers twice while the liveness probe kept reporting one; recovery registrations are left intact.",
-                            correlationId);
+                            correlationId));
                         activity?.SetTag("asyncresponse.recovery.liveness_contradiction", true);
                         throw new InvalidOperationException(
                             $"NATS delivery for correlationId '{correlationId}' found no responders twice while the liveness probe kept " +
@@ -1333,9 +1333,9 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
                         // Returning here instead would silently drop the payload: the caller
                         // reports success, the broker message is acked, and the response then
                         // exists nowhere.
-                        _logger.LogWarning(
+                        SafeLog.Try(() => _logger.LogWarning(
                             "Delivery for correlationId {CorrelationId} found no subscribers twice while the liveness probe kept reporting one; recovery registrations are left intact.",
-                            correlationId);
+                            correlationId));
                         activity?.SetTag("asyncresponse.recovery.liveness_contradiction", true);
                         throw new InvalidOperationException(
                             $"NATS delivery for correlationId '{correlationId}' found no responders twice while the liveness probe kept " +
@@ -1433,7 +1433,8 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
         }
         catch (Exception ex)
         {
-            _logger.LogDebug(ex, "Failed to probe active subscribers for subject {Subject}.", subject);
+            // Guarded: a throwing logging provider must not replace the -1 (unknown liveness).
+            SafeLog.Try((_logger, ex, subject), static s => s._logger.LogDebug(s.ex, "Failed to probe active subscribers for subject {Subject}.", s.subject));
             // Negative = "could not be probed" (the watchdog's unknown-liveness contract): 0 would
             // assert there is definitively no live waiter and flag every over-threshold
             // registration stale during a transient probe outage.

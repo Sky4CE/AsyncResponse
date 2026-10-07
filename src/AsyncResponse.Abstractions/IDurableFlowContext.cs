@@ -88,8 +88,8 @@ public interface IDurableFlowContext
     /// The default child id is <c>{FlowId}:{name}</c>. Pass a nonblank <paramref name="flowId"/> when
     /// the child needs a domain-owned idempotency key. A child id is permanently bound to one parent
     /// step, flow type, input type, and semantically identical input value; conflicting reuse fails
-    /// fast while the child runs. Once the step has completed, only the parent step binding is
-    /// enforced: like any completed step it answers from its memo, so a child class renamed or an
+    /// fast while the child runs. Once the step has completed or its breadcrumbed child has finished
+    /// (Succeeded/Failed), only the parent step binding is enforced: like any completed step it answers from its memo, so a child class renamed or an
     /// input edited since logs a warning instead of failing the parent.
     /// On success the child <see cref="FlowState"/> snapshot is memoized as this step's result.
     /// On failure the step is also memoized, then

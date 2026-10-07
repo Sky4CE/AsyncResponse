@@ -1678,7 +1678,11 @@ internal abstract class DbAsyncResponseChannelBase :
 
         var scan = _dispatchScans.GetOrCreateValue(group);
         var registrations = subscriptions.Select(subscription => subscription.Id).ToHashSet();
-        if (!scan.Registrations.SetEquals(registrations) || Interlocked.Exchange(ref scan.RewindRequested, 0) != 0)
+        // Both operands are always evaluated: a short-circuit would leave a pending rewind set when
+        // the registrations changed, and the next pass would reset a second time for it.
+        var registrationsChanged = !scan.Registrations.SetEquals(registrations);
+        var rewindRequested = Interlocked.Exchange(ref scan.RewindRequested, 0) != 0;
+        if (registrationsChanged || rewindRequested)
         {
             scan.Registrations = registrations;
             scan.Forward = new MessageCursor();

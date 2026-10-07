@@ -1066,7 +1066,15 @@ internal sealed class DurableFlowContext : IDurableFlowContext
         }
         else
         {
-            ThrowIfChildMismatched<TFlow, TInput>(child, childFlowId, name, inputJson);
+            // A terminal child behind this step's own breadcrumb is a settled outcome whose
+            // ownership the breadcrumb plus ParentFlowId/ParentStepName already prove: the parent's
+            // normal wake-up must not fail over a rename or input edit made since the child ran.
+            ThrowIfChildMismatched<TFlow, TInput>(
+                child,
+                childFlowId,
+                name,
+                inputJson,
+                completed: breadcrumb is not null && child.Status is FlowRunStatus.Succeeded or FlowRunStatus.Failed);
         }
 
         if (breadcrumb is null)

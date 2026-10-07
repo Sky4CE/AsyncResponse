@@ -121,6 +121,21 @@ work that has landed on `main` but not yet shipped. Security reporters credited 
     concluded `success`. CI runs the package-dependency pin check. The retry classifier treats
     SQLite "database is locked" as a flake only in the EF Core storm tests. Integration-test,
     sample AppHost and docker-compose images are pinned by multi-arch digest.
+- **Round-66 review (2026-10-08, fixpoint re-review of the round-65 changes): a renamed child flow
+  no longer fails its parent, and three more fixes.**
+  - *Durable flows.* A parent woken after its child finished no longer fails terminally when the
+    child class was renamed or its input edited since the child was created; the settled child
+    outcome is returned (the breadcrumb already proves the child is this step's).
+  - *RabbitMQ.* An ack-after-handler subscriber's stop-time in-flight wait now reserves the other,
+    early-ACK subscriber's whole stop path (cancel, `BackgroundDrainTimeout`, close) out of
+    `HostShutdownTimeout`, so a mixed worker/response pair no longer cuts the early-ACK
+    subscriber's drain short.
+  - *Database channels.* A dispatch pass that resets for a registration change also consumes a
+    pending local-dispatch-failure rewind, so the next pass no longer resets a second time and
+    re-admits rows that are still queued.
+  - *NATS channel.* A throwing logging provider no longer replaces the retryable "found no
+    responders twice" liveness-contradiction exception or skips its span tag, nor the "could not be
+    probed" outcome of a subscriber probe that faulted.
 - **Round-61 review (2026-09-30, re-review of every file changed since `1fc2b20`): a Cosmos DB ledger
   no longer disappears up to a second before it expires, and three documentation gaps are closed.**
   - *Durable flows — Cosmos DB.* Cosmos counts a document's TTL from `_ts`, which it truncates to

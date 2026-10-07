@@ -1414,6 +1414,44 @@ public sealed partial class DbChannelSharedCoverageTests
     }
 
     /// <summary>
+    /// Round-66 fix: the rewind flag was consumed behind a short-circuit, so a pass that already
+    /// reset for a registration change left a pending local-dispatch-failure rewind set and the
+    /// next pass reset a second time (queued rows admitted twice). Both are consumed by one reset.
+    /// </summary>
+    [Fact]
+    public async Task DispatchSweep_ARegistrationChange_AlsoConsumesAPendingRewind()
+    {
+        var clock = new AsyncResponse.Testing.VirtualTimeProvider();
+        await using var harness = Harness.Create(Provider.MongoDb, false, TimeSpan.FromSeconds(30), timeProvider: clock);
+        harness.ConfigureDeliveryConfirmation(timeout: TimeSpan.FromSeconds(5), pollInterval: TimeSpan.FromMilliseconds(50));
+        harness.SetOption("HistoryReconciliationInterval", TimeSpan.FromHours(1));
+        var started = clock.GetUtcNow();
+        var rows = Enumerable.Range(1, 3).Select(i => HistoryRow(started, i)).ToList();
+        var first = harness.Subscription("corr", started).Instance;
+        harness.SetProcessHook(first, () => Task.CompletedTask);
+        harness.AddSubscription("corr", first);
+        var reads = new List<int>();
+        ServeHistory(harness, rows, reads);
+        await SweepAndDrainAsync(harness);
+
+        // A failed local dispatch asked for a rewind, and a waiter joined before the next pass.
+        harness.RequestRewind("corr");
+        var second = harness.Subscription("corr", started).Instance;
+        harness.SetProcessHook(second, () => Task.CompletedTask);
+        harness.AddSubscription("corr", second);
+        await SweepAndDrainAsync(harness);
+
+        // That pass reset once, for both reasons (the scan took a fresh registration set). Counted
+        // by that set's identity, which only a reset replaces, rather than by reading the flag:
+        // the next pass must not reset again for a rewind the first one already served.
+        var afterFirstReset = harness.ScanRegistrations("corr");
+        await SweepAndDrainAsync(harness);
+        var afterNextPass = harness.ScanRegistrations("corr");
+
+        Assert.Same(afterFirstReset, afterNextPass);
+    }
+
+    /// <summary>
     /// Pre-commit fix (fixpoint r1 pass 2): the restored cursor does not advance, so while
     /// refusals lasted the lookback window aged out behind it — an executor full for longer than
     /// twice the lookback (a slow Until predicate with 1,024 queued) — and the refused late row,
@@ -3451,6 +3489,20 @@ public sealed partial class DbChannelSharedCoverageTests
                 (DateTimeOffset?)cursor.GetType().GetField("CreatedAtUtc")!.GetValue(cursor),
                 (Guid?)cursor.GetType().GetField("Id")!.GetValue(cursor),
                 (bool)scan.GetType().GetField("ForwardCaughtUp")!.GetValue(scan)!);
+        }
+
+        /// <summary>Marks the correlation id's scan as owing a rewind (what a failed local dispatch does).</summary>
+        public void RequestRewind(string correlationId)
+        {
+            var scan = Scan(correlationId);
+            scan.GetType().GetField("RewindRequested")!.SetValue(scan, 1);
+        }
+
+        /// <summary>The registration set the scan last reset to; replaced only by a reset.</summary>
+        public object ScanRegistrations(string correlationId)
+        {
+            var scan = Scan(correlationId);
+            return scan.GetType().GetField("Registrations")!.GetValue(scan)!;
         }
 
         /// <summary>Work items waiting in the correlation id's executor (the one running excluded).</summary>

@@ -119,6 +119,46 @@ public sealed class NatsChannelCoverageTests
         _store.Verify(store => store.TryDeleteAsync(It.IsAny<string>(), It.IsAny<Guid>(), It.IsAny<CancellationToken>()), Times.Never);
     }
 
+    [Theory]
+    [InlineData(PublishKind.Response)]
+    [InlineData(PublishKind.RawJson)]
+    [InlineData(PublishKind.Exception)]
+    public async Task Publish_LivenessContradiction_WithAThrowingLogger_StillSurfacesTheRetryableNonDelivery(PublishKind kind)
+    {
+        // The contradiction warning was the one unguarded log in the publish paths: a throwing
+        // provider replaced the "retry the publish" InvalidOperationException with its own fault.
+        using var activities = new AsyncResponseActivityCollector();
+        var logger = new RecordingThrowingLogger<NatsAsyncResponseChannel> { ThrowOnMessageContaining = "found no subscribers twice" };
+        var channel = CreateChannel(_client, logger);
+        _client.NextOutcome = NatsDeliveryOutcome.NoResponders;
+        _client.OutcomeForProbe = _ => NatsDeliveryOutcome.Replied;
+        _store.Setup(store => store.GetAllAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync([NewRecoveryState("corr-contradiction-log")]);
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => PublishAsync(channel, kind, "corr-contradiction-log"));
+
+        Assert.Contains("found no responders twice", exception.Message);
+        // The tag is set before the (guarded) warning and the throw, so it survives a bad provider.
+        Assert.Equal(true, AsyncResponseActivityCollector.Tag(
+            activities.All().Single(a => AsyncResponseActivityCollector.Tag(a, "asyncresponse.recovery.liveness_contradiction") is not null),
+            "asyncresponse.recovery.liveness_contradiction"));
+    }
+
+    [Fact]
+    public async Task CountActiveSubscribers_AFaultingProbe_WithAThrowingLogger_StillReportsUnknownLiveness()
+    {
+        // The probe-failure debug line is on the publish path (hasLiveSubscriber) and the watchdog's
+        // unknown-liveness contract: a throwing provider must not replace the -1.
+        var logger = new RecordingThrowingLogger<NatsAsyncResponseChannel> { ThrowOnMessageContaining = "Failed to probe" };
+        var channel = CreateChannel(_client, logger);
+        _client.OutcomeForProbe = _ => throw new InvalidOperationException("probe boom");
+
+        var count = await channel.CountActiveSubscribersAsync("corr-probe-log");
+
+        Assert.Equal(-1L, count);
+    }
+
     private static RecoveryState NewRecoveryState(string correlationId) => new()
     {
         RegistrationId = Guid.NewGuid(),

@@ -123,7 +123,8 @@ public sealed class RabbitMqSubscriberOptions
     /// whatever is still queued once the rest lapses). In <see cref="RabbitMqAckMode.AckAfterHandlerCompletes"/>
     /// mode it bounds the wait for the handler still running when the subscriber stops, so its ACK lands
     /// before the channel closes — shortened to what <see cref="RabbitMqAsyncResponseOptions.HostShutdownTimeout"/>
-    /// leaves after the two <see cref="RabbitMqAsyncResponseOptions.ShutdownTimeout"/> spends. Default: <c>20s</c>.
+    /// leaves after the two <see cref="RabbitMqAsyncResponseOptions.ShutdownTimeout"/> spends and, when the other
+    /// subscriber ACKs early, the stop path reserved for it. Default: <c>20s</c>.
     /// </summary>
     public TimeSpan BackgroundDrainTimeout { get; set; } = TimeSpan.FromSeconds(20);
 

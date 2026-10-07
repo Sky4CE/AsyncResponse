@@ -613,7 +613,8 @@ internal sealed class AwaitingRabbitMqMessageDispatcher : RabbitMqMessageDispatc
     /// stops: <see cref="RabbitMqSubscriberOptions.BackgroundDrainTimeout"/>, shortened to what
     /// <see cref="RabbitMqAsyncResponseOptions.HostShutdownTimeout"/> leaves after the stop path's
     /// two <see cref="RabbitMqAsyncResponseOptions.ShutdownTimeout"/> spends (the consumer cancel
-    /// before the wait, the channel/connection close after it). Clamped rather than validated: a
+    /// before the wait, the channel/connection close after it) and, when the other subscriber
+    /// ACKs early, the stop path reserved for it (its two spends plus its drain). Clamped rather than validated: a
     /// wait that does not fit only costs a redelivery (the delivery is still un-ACKed), so it must
     /// never fail a configuration that started before.
     /// </summary>
@@ -630,14 +631,14 @@ internal sealed class AwaitingRabbitMqMessageDispatcher : RabbitMqMessageDispatc
         IHostApplicationLifetime? hostLifetime = null)
         : base(handler, transportOptions, subscriberOptions, logger, queue, role, hostLifetime)
     {
-        _inFlightDrainTimeout = ResolveInFlightDrainTimeout(transportOptions, subscriberOptions);
+        _inFlightDrainTimeout = ResolveInFlightDrainTimeout(transportOptions, subscriberOptions, role);
 
         // Said once, when the subscriber starts, rather than as a "still running 00:00:00 after the
         // subscriber began stopping" warning on every stop that had a handler in flight.
         if (_inFlightDrainTimeout == TimeSpan.Zero && subscriberOptions.BackgroundDrainTimeout > TimeSpan.Zero)
         {
             SafeLog.Try(() => Logger.LogInformation(
-                "The RabbitMQ subscriber for {Queue} will not wait for a running handler when it stops: HostShutdownTimeout ({HostShutdownTimeout}) leaves nothing after the consumer cancel and the channel/connection close ({ShutdownTimeout} each), so the close cuts off a handler still running at stop and the broker redelivers its un-ACKed delivery. Raise HostShutdownTimeout (mirroring HostOptions.ShutdownTimeout) to let a stop wait up to BackgroundDrainTimeout ({BackgroundDrainTimeout}) for it.",
+                "The RabbitMQ subscriber for {Queue} will not wait for a running handler when it stops: HostShutdownTimeout ({HostShutdownTimeout}) leaves nothing after the consumer cancel and the channel/connection close ({ShutdownTimeout} each) and, when the other subscriber ACKs early, the stop path reserved for it, so the close cuts off a handler still running at stop and the broker redelivers its un-ACKed delivery. Raise HostShutdownTimeout (mirroring HostOptions.ShutdownTimeout) to let a stop wait up to BackgroundDrainTimeout ({BackgroundDrainTimeout}) for it.",
                 queue,
                 transportOptions.HostShutdownTimeout,
                 transportOptions.ShutdownTimeout,
@@ -656,7 +657,8 @@ internal sealed class AwaitingRabbitMqMessageDispatcher : RabbitMqMessageDispatc
 
     private static TimeSpan ResolveInFlightDrainTimeout(
         RabbitMqAsyncResponseOptions transportOptions,
-        RabbitMqSubscriberOptions subscriberOptions)
+        RabbitMqSubscriberOptions subscriberOptions,
+        RabbitMqSubscriberRole role)
     {
         var wait = subscriberOptions.BackgroundDrainTimeout;
         if (transportOptions.HostShutdownTimeout is { } hostBudget)
@@ -664,6 +666,21 @@ internal sealed class AwaitingRabbitMqMessageDispatcher : RabbitMqMessageDispatc
             // Compared before subtracting: an unvalidated budget near TimeSpan.MinValue must clamp
             // to zero, not overflow (ShutdownTimeout itself is validated timer-backed).
             var closes = transportOptions.ShutdownTimeout + transportOptions.ShutdownTimeout;
+
+            // The other subscriber is stopped in the same host budget, before or after this one. When
+            // it ACKs early, its validated stop path (cancel + drain + close) must still fit, so it
+            // is reserved first: otherwise this wait could spend it all and the early-ACK
+            // subscriber's already-ACKed queued deliveries would be lost to the process exit.
+            var other = role is RabbitMqSubscriberRole.Worker
+                ? transportOptions.ResponseSubscriber
+                : transportOptions.WorkerSubscriber;
+            if (other is { AckMode: RabbitMqAckMode.AckAfterEnqueue } && !ReferenceEquals(other, subscriberOptions)
+                && other.BackgroundDrainTimeout >= TimeSpan.Zero
+                && other.BackgroundDrainTimeout <= AsyncResponseChannelOptions.MaxTimerBackedTimeout)
+            {
+                closes += closes + other.BackgroundDrainTimeout;
+            }
+
             var left = hostBudget <= closes ? TimeSpan.Zero : hostBudget - closes;
             if (left < wait)
                 wait = left;

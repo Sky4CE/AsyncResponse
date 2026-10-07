@@ -1667,6 +1667,46 @@ public class RabbitMqDispatcherTests
     }
 
     [Fact]
+    public async Task Awaiting_Dispose_LeavesTheOtherEarlyAckSubscribersStopPathOutOfItsInFlightWait()
+    {
+        // The worker (ack after handler) and response (early ACK) subscribers stop one after the
+        // other inside one host budget. HostShutdownTimeout 20 s minus this subscriber's two 5 s
+        // spends left a 10 s wait, which would have eaten the budget the response subscriber's
+        // validated stop path (5 + 5 drain + 5) needs: that path is reserved first, leaving nothing.
+        var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var options = new RabbitMqAsyncResponseOptions { HostShutdownTimeout = TimeSpan.FromSeconds(20) };
+        options.ResponseSubscriber.AckMode = RabbitMqAckMode.AckAfterEnqueue;
+        options.ResponseSubscriber.BackgroundWorkerCount = 1;
+        options.ResponseSubscriber.BackgroundQueueCapacity = 1;
+        options.ResponseSubscriber.BackgroundDrainTimeout = TimeSpan.FromSeconds(5);
+        var dispatcher = RabbitMqMessageDispatcher.Create(
+            async (_, _) =>
+            {
+                started.TrySetResult();
+                await release.Task.ConfigureAwait(false);
+            },
+            options,
+            options.WorkerSubscriber,
+            NullLogger.Instance,
+            "worker.q",
+            RabbitMqSubscriberRole.Worker);
+
+        var handling = dispatcher.HandleAsync(Delivery("payload", deliveryTag: 16), new FakeDispatcherChannel(), CancellationToken.None);
+        await started.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        try
+        {
+            Assert.True(dispatcher.DisposeAsync().IsCompleted);
+        }
+        finally
+        {
+            release.TrySetResult();
+            await handling.WaitAsync(TimeSpan.FromSeconds(10));
+        }
+    }
+
+    [Fact]
     public void ValidateOptions_RejectsANegativeMaxDeliveryAttempts()
     {
         // Regression (r1 GS5#10): every cap check is `> 0` / `<= 0`, so -1 silently meant
