@@ -24,6 +24,13 @@ work that has landed on `main` but not yet shipped. Security reporters credited 
   `TimerInProcessThreshold`, while the harness predicted suspend-or-park from the remainder before
   that save; a timer whose save took it under the threshold parked with neither signal, and settle
   again spent its real-time grace on it. The engine now reports every in-process wait.
+- **Round-63 review (2026-10-07): a throwing logging provider no longer skips the lease-less
+  checkpoint of a claimed response.** When the fenced save of an already-claimed step response
+  failed, the rescue logged through the unguarded logger before falling back to the lease-less
+  checkpoint; a provider that threw there dropped the claimed response with the breadcrumb still
+  pointing at a consumed id, and the checkpoint's own warning and error logs could replace the
+  lost-lease signal that hands the flow to its takeover. These log calls are now guarded like the
+  engine's other failure paths.
 - **Round-61 review (2026-09-30, re-review of every file changed since `1fc2b20`): a Cosmos DB ledger
   no longer disappears up to a second before it expires, and three documentation gaps are closed.**
   - *Durable flows — Cosmos DB.* Cosmos counts a document's TTL from `_ts`, which it truncates to

@@ -1411,7 +1411,10 @@ internal sealed class DurableFlowContext : IDurableFlowContext
             // The lease lapsed (or the store refused the fenced write) between the check above and
             // this save — every failed fenced save marks it lost. Same rescue as above, or the
             // claimed response is dropped with the breadcrumb still pointing at a consumed id.
-            _logger.LogDebug(saveFailure, "Flow {FlowId} step '{Step}' could not checkpoint its claimed response under the lease; falling back to the lease-less checkpoint.", FlowId, name);
+            // Guarded: a throwing logging provider must not skip the checkpoint below.
+            SafeLog.Try(
+                (Logger: _logger, Error: saveFailure, FlowId, Step: name),
+                static s => s.Logger.LogDebug(s.Error, "Flow {FlowId} step '{Step}' could not checkpoint its claimed response under the lease; falling back to the lease-less checkpoint.", s.FlowId, s.Step));
             await CheckpointReceivedWithoutLeaseAsync(name, checkpoint, received, correlationId).ConfigureAwait(false);
             _lease.ThrowIfLost(cause);
             throw;
@@ -1906,34 +1909,39 @@ internal sealed class DurableFlowContext : IDurableFlowContext
                 },
                 CancellationToken.None).ConfigureAwait(false);
 
+            // Guarded: a throwing logging provider must neither hide the takeover signal the caller
+            // raises next nor skip marking the checkpointed step completed below.
             if (applied)
             {
-                WarnIfWriteCrossedLedgerWarning(_logger, _options, written!, sizeBefore);
-                _logger.LogWarning(
-                    "Flow {FlowId} lost its execution lease while step '{Step}' held a claimed response for correlationId {CorrelationId}; the response was checkpointed without the lease so the takeover resumes from it.",
-                    FlowId,
-                    name,
-                    correlationId);
+                SafeLog.Try(() =>
+                {
+                    WarnIfWriteCrossedLedgerWarning(_logger, _options, written!, sizeBefore);
+                    _logger.LogWarning(
+                        "Flow {FlowId} lost its execution lease while step '{Step}' held a claimed response for correlationId {CorrelationId}; the response was checkpointed without the lease so the takeover resumes from it.",
+                        FlowId,
+                        name,
+                        correlationId);
+                });
             }
             else
             {
-                _logger.LogWarning(
+                SafeLog.Try(() => _logger.LogWarning(
                     "Flow {FlowId} lost its execution lease while step '{Step}' held a claimed response for correlationId {CorrelationId}; the response was discarded because {Reason}.",
                     FlowId,
                     name,
                     correlationId,
-                    found ? skipReason : "the ledger no longer exists");
+                    found ? skipReason : "the ledger no longer exists"));
             }
         }
         catch (Exception ex)
         {
             // The takeover signal is raised by the caller regardless; losing this write only means
             // the step restarts as it did before.
-            _logger.LogError(
+            SafeLog.Try(() => _logger.LogError(
                 ex,
                 "Flow {FlowId} could not checkpoint the claimed response for step '{Step}' after losing its execution lease; the step will restart.",
                 FlowId,
-                name);
+                name));
         }
 
         if (!applied)

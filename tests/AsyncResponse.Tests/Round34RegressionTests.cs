@@ -143,6 +143,89 @@ public sealed class Round34RegressionTests
     }
 
     /// <summary>
+    /// Fixpoint r1 (R1-01): the rescue's debug log was unguarded and ran BEFORE the lease-less
+    /// checkpoint, so a throwing logging provider skipped the checkpoint for a claimed response.
+    /// </summary>
+    [Fact]
+    public async Task AwaitStep_WonResponse_WhoseSettleSaveIsRefused_IsStillCheckpointed_WhenTheLoggerThrows()
+    {
+        var store = new TakeoverStore("remote", takeover: _ => { });
+        var state = new FlowState { FlowId = "fixpoint-settle-save-refused-logger" };
+        Assert.True(await store.TryCreateAsync(state.FlowId!, state, TimeSpan.FromMinutes(5)));
+        var observer = new Mock<IDurableFlowExecutionObserver>();
+        observer.Setup(instance => instance.OnStepStartingAsync(It.IsAny<DurableFlowStepEvent>())).Returns(ValueTask.CompletedTask);
+        observer.Setup(instance => instance.OnStepWaitingAsync(It.IsAny<DurableFlowStepEvent>()))
+            .Returns(ValueTask.FromException(new InvalidOperationException("observer crashed")));
+        var logger = new RecordingThrowingLogger<DurableFlowContext> { ThrowOnMessageContaining = "falling back to the lease-less checkpoint" };
+
+        var won = new OperationResult { Status = OperationStatus.Completed, Message = "the-won-response" };
+        await using (var lease = await AcquireLeaseAsync(store, state.FlowId!))
+        {
+            var context = new DurableFlowContext(
+                state,
+                store,
+                Mock.Of<IAsyncResponseBuilder>(),
+                new AsyncResponseContextPropagation([]),
+                new DurableFlowOptions(),
+                SubscriberReturning(Task.FromResult(won)),
+                null,
+                logger,
+                lease,
+                observers: [observer.Object]);
+
+            var surfaced = await Assert.ThrowsAsync<InvalidOperationException>(() => context.AwaitStepAsync<OperationResult>("remote", _ => Task.CompletedTask));
+            Assert.Contains("lost its execution lease", surfaced.Message, StringComparison.Ordinal);
+        }
+
+        var step = (await store.LoadAsync(state.FlowId!))!.Steps!["remote"];
+        Assert.True(step.Completed);
+        Assert.Null(step.PendingCorrelationId);
+        Assert.Contains("the-won-response", step.ResultJson, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Fixpoint r1 critic (R1-01 residual): the lease-less checkpoint's own warning and its catch's
+    /// error log were unguarded too, so a provider throwing on both replaced the takeover signal the
+    /// caller raises with the logger's exception.
+    /// </summary>
+    [Fact]
+    public async Task AwaitStep_WonResponse_LeaselessCheckpointLogsThrow_StillSurfacesTheLostLease()
+    {
+        var store = new TakeoverStore("remote", takeover: _ => { });
+        var state = new FlowState { FlowId = "fixpoint-settle-save-refused-checkpoint-logger" };
+        Assert.True(await store.TryCreateAsync(state.FlowId!, state, TimeSpan.FromMinutes(5)));
+        var observer = new Mock<IDurableFlowExecutionObserver>();
+        observer.Setup(instance => instance.OnStepStartingAsync(It.IsAny<DurableFlowStepEvent>())).Returns(ValueTask.CompletedTask);
+        observer.Setup(instance => instance.OnStepWaitingAsync(It.IsAny<DurableFlowStepEvent>()))
+            .Returns(ValueTask.FromException(new InvalidOperationException("observer crashed")));
+        var logger = new RecordingThrowingLogger<DurableFlowContext> { ThrowOnMessageContaining = "execution lease" };
+
+        var won = new OperationResult { Status = OperationStatus.Completed, Message = "the-won-response" };
+        await using (var lease = await AcquireLeaseAsync(store, state.FlowId!))
+        {
+            var context = new DurableFlowContext(
+                state,
+                store,
+                Mock.Of<IAsyncResponseBuilder>(),
+                new AsyncResponseContextPropagation([]),
+                new DurableFlowOptions(),
+                SubscriberReturning(Task.FromResult(won)),
+                null,
+                logger,
+                lease,
+                observers: [observer.Object]);
+
+            var surfaced = await Assert.ThrowsAsync<InvalidOperationException>(() => context.AwaitStepAsync<OperationResult>("remote", _ => Task.CompletedTask));
+            Assert.DoesNotContain("Logger provider failed", surfaced.Message, StringComparison.Ordinal);
+            Assert.Contains("lost its execution lease", surfaced.Message, StringComparison.Ordinal);
+        }
+
+        var step = (await store.LoadAsync(state.FlowId!))!.Steps!["remote"];
+        Assert.True(step.Completed);
+        Assert.Contains("the-won-response", step.ResultJson, StringComparison.Ordinal);
+    }
+
+    /// <summary>
     /// Pass-2 precommit review (A3 residual): the same lease-less checkpoint can be the write that
     /// takes the ledger past <see cref="DurableFlowOptions.LedgerSizeWarningBytes"/>, and no context
     /// save follows it — the takeover's execution seeds its first warning at the next doubling above
