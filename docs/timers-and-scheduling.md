@@ -200,7 +200,9 @@ job was published and then lost in transit (an early-ACK worker subscriber, a br
 it). A run merely queued behind a busy worker looks the same and is re-driven harmlessly: the lease
 keeps the two wake-ups from running the flow at once and completed steps replay from their
 checkpoints (a run that has parked by then gains a second wake-up chain, as above). Every re-drive
-is logged.
+is logged. The scheduler's logging is best-effort: each outcome — queue for re-drive, start, skip —
+is decided before its log line, so a logging provider that throws neither loses an occurrence nor
+stops the schedule (or the host).
 
 ## Cron syntax
 

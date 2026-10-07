@@ -168,7 +168,7 @@ internal static class FlowStateConcurrency
         // if it were still owned, so a worker could believe it held a 60s lease 20s past the point
         // another replica was free to take it. Anchoring first is conservative in the safe
         // direction: the client's deadline can only be EARLIER than the server's.
-        var deadline = FlowExecutionLease.DeadlineFrom(clock, options.ExecutionLeaseDuration);
+        var acquiredAt = clock.GetTimestamp();
 
         if (!await store.TryAcquireLeaseAsync(
                 flowId,
@@ -178,10 +178,10 @@ internal static class FlowStateConcurrency
             return null;
 
         // The constructor is throw-free after the option bounds above: it only assigns fields,
-        // records the pre-call deadline, and starts the renewal loop (whose first Task.Delay faults
+        // records the pre-call anchor, and starts the renewal loop (whose first Task.Delay faults
         // the loop task, never the constructor). Were that ever to change, lease expiry is the
         // backstop for the persisted row.
-        return new FlowExecutionLease(store, flowId, leaseId, options, logger, clock, deadline);
+        return new FlowExecutionLease(store, flowId, leaseId, options, logger, clock, acquiredAt);
     }
 
     public static async Task<bool> MutateAsync(
@@ -282,9 +282,16 @@ internal sealed class FlowExecutionLease : IAsyncDisposable
     // publish failed), so its loop and stop signal are replaceable; _stop still ends both loops.
     private CancellationTokenSource _renewalStop;
     private Task _renewal;
-    // DateTime ticks so the renewal loop's writes and the execution path's reads tear-free on
-    // 32-bit runtimes and order via Volatile.
-    private long _validUntilUtcTicks;
+    // The MONOTONIC timestamp (TimeProvider.GetTimestamp) the current lease term was anchored at —
+    // the acquire, then each successful renewal — read and written via Volatile so the renewal
+    // loop's writes and the execution path's reads stay tear-free on 32-bit runtimes. The lease is
+    // valid until ExecutionLeaseDuration has ELAPSED since then. It used to be a wall-clock
+    // deadline ("now + duration" in UTC ticks), and a backward wall-clock step (an NTP step, a VM
+    // snapshot restore) during a renewal outage kept this side's guard open by the size of the
+    // step while the store's lease expired on schedule and another replica took the run over:
+    // step bodies kept starting beside the new holder's. Elapsed time cannot be stepped back, and
+    // a virtual clock still drives it (VirtualTimeProvider's timestamps follow its virtual time).
+    private long _termStartTimestamp;
     private int _disposed;
     // 1 once the lease has been released — by a committed park, or by disposal. See EndForParkAsync.
     private int _ended;
@@ -335,10 +342,10 @@ internal sealed class FlowExecutionLease : IAsyncDisposable
     /// <param name="options">Validated durable-flow options.</param>
     /// <param name="logger">Sink for renewal and deadline watcher events.</param>
     /// <param name="timeProvider">Clock used for deadline computation; <see cref="TimeProvider.System"/> when omitted.</param>
-    /// <param name="acquiredDeadlineUtcTicks">
-    /// The conservative deadline for the lease this instance was handed, captured BEFORE the
-    /// acquire call went out. Omitted only by callers that construct a lease without an acquire
-    /// round trip (tests), where "now + duration" is exact.
+    /// <param name="acquiredAtTimestamp">
+    /// The <see cref="TimeProvider.GetTimestamp"/> captured BEFORE the acquire call went out — the
+    /// conservative start of the lease this instance was handed. Omitted only by callers that
+    /// construct a lease without an acquire round trip (tests), where "now" is exact.
     /// </param>
     public FlowExecutionLease(
         IFlowStateStore store,
@@ -347,7 +354,7 @@ internal sealed class FlowExecutionLease : IAsyncDisposable
         DurableFlowOptions options,
         ILogger logger,
         TimeProvider? timeProvider = null,
-        long? acquiredDeadlineUtcTicks = null)
+        long? acquiredAtTimestamp = null)
     {
         _store = store;
         _flowId = flowId;
@@ -355,21 +362,20 @@ internal sealed class FlowExecutionLease : IAsyncDisposable
         _options = options;
         _logger = logger;
         _timeProvider = timeProvider ?? TimeProvider.System;
-        Volatile.Write(
-            ref _validUntilUtcTicks,
-            acquiredDeadlineUtcTicks ?? DeadlineFrom(_timeProvider, options.ExecutionLeaseDuration));
+        Volatile.Write(ref _termStartTimestamp, acquiredAtTimestamp ?? _timeProvider.GetTimestamp());
         _renewalStop = CancellationTokenSource.CreateLinkedTokenSource(_stop.Token);
         _renewal = RenewLoopAsync(_renewalStop.Token, options.ExecutionLeaseRenewInterval);
         _deadline = DeadlineLoopAsync();
     }
 
     /// <summary>
-    /// "Now + duration" in UTC ticks, saturating instead of overflowing: <c>ExecutionLeaseDuration</c>
-    /// is bounded as a persistence TTL, not a timer, so a 60-day lease near <see cref="DateTime.MaxValue"/>
-    /// is a legal configuration that must not throw here.
+    /// What is left of the current lease term on the monotonic clock: zero or less once
+    /// <c>ExecutionLeaseDuration</c> has elapsed since the term was anchored (see
+    /// <see cref="_termStartTimestamp"/>). No overflow to guard: the elapsed time is real time
+    /// spent, and the duration is a valid <see cref="TimeSpan"/>.
     /// </summary>
-    internal static long DeadlineFrom(TimeProvider timeProvider, TimeSpan duration)
-        => FlowStateRetention.AddSaturating(timeProvider.GetUtcNow().UtcDateTime, duration).Ticks;
+    private TimeSpan Remaining()
+        => _options.ExecutionLeaseDuration - _timeProvider.GetElapsedTime(Volatile.Read(ref _termStartTimestamp));
 
     public CancellationToken LostToken => _lost.Token;
 
@@ -379,7 +385,7 @@ internal sealed class FlowExecutionLease : IAsyncDisposable
     /// </summary>
     public bool IsLost => _lost.IsCancellationRequested
         || Volatile.Read(ref _ended) != 0
-        || _timeProvider.GetUtcNow().UtcDateTime.Ticks >= Volatile.Read(ref _validUntilUtcTicks);
+        || Remaining() <= TimeSpan.Zero;
 
     /// <summary>
     /// Throws when the lease is lost. <paramref name="cause"/> (e.g. the exception that made the
@@ -398,14 +404,13 @@ internal sealed class FlowExecutionLease : IAsyncDisposable
         // Released on purpose (see EndForParkAsync), not lost: nothing is fenced by it any more,
         // and the run's successor may already hold a lease of its own.
         if (Volatile.Read(ref _ended) != 0)
-            throw new InvalidOperationException($"Durable flow '{_flowId}' has released its execution lease (the run parked, or the execution ended); this execution checkpoints nothing more.", cause);
+            throw new DurableFlowLeaseLostException(_flowId, $"Durable flow '{_flowId}' has released its execution lease (the run parked, or the execution ended); this execution checkpoints nothing more.", cause);
 
-        if (!_lost.IsCancellationRequested
-            && _timeProvider.GetUtcNow().UtcDateTime.Ticks < Volatile.Read(ref _validUntilUtcTicks))
+        if (!_lost.IsCancellationRequested && Remaining() > TimeSpan.Zero)
             return;
 
         MarkLost();
-        throw new InvalidOperationException($"Durable flow '{_flowId}' lost its execution lease; the worker will retry from the last checkpoint.", cause);
+        throw new DurableFlowLeaseLostException(_flowId, $"Durable flow '{_flowId}' lost its execution lease; the worker will retry from the last checkpoint.", cause);
     }
 
     public async Task SaveAsync(FlowState state, TimeSpan ttl, CancellationToken cancellationToken = default, Exception? cause = null)
@@ -546,7 +551,7 @@ internal sealed class FlowExecutionLease : IAsyncDisposable
         }
 
         MarkLost();
-        throw new InvalidOperationException(
+        throw new DurableFlowLeaseLostException(_flowId,
             $"Durable flow '{_flowId}' could not confirm the checkpoint its caller cancelled mid-write (revision {uncertain.ExpectedRevision} -> {uncertain.ExpectedRevision + 1}): " +
             (current is null
                 ? "its ledger entry is gone (expired or deleted)"
@@ -588,7 +593,7 @@ internal sealed class FlowExecutionLease : IAsyncDisposable
             // Best-effort diagnosis only — the rejection itself is what matters.
         }
 
-        return new InvalidOperationException(
+        return new DurableFlowLeaseLostException(_flowId,
             $"Durable flow '{_flowId}' could not checkpoint because {reason}; the worker abandons this execution and the delivery retries from the last checkpoint.",
             cause);
     }
@@ -615,13 +620,13 @@ internal sealed class FlowExecutionLease : IAsyncDisposable
         {
             try
             {
-                await Task.Delay(wait, _timeProvider, stop).ConfigureAwait(false);
+                await EngineGuardTimers.Delay(wait, _timeProvider, stop).ConfigureAwait(false);
 
                 // Same anchoring rule as acquisition: the renewed lease starts when the store runs
-                // the command, so the deadline is measured from before the call, not from whenever
+                // the command, so the term is measured from before the call, not from whenever
                 // the answer gets back here. Published only on success, so a failed renewal never
                 // extends anything.
-                var renewedDeadline = DeadlineFrom(_timeProvider, _options.ExecutionLeaseDuration);
+                var renewedAt = _timeProvider.GetTimestamp();
 
                 if (!await _store.TryRenewLeaseAsync(
                         _flowId,
@@ -633,7 +638,7 @@ internal sealed class FlowExecutionLease : IAsyncDisposable
                     return;
                 }
 
-                Volatile.Write(ref _validUntilUtcTicks, renewedDeadline);
+                Volatile.Write(ref _termStartTimestamp, renewedAt);
                 wait = interval;
                 failures = 0;
             }
@@ -647,7 +652,7 @@ internal sealed class FlowExecutionLease : IAsyncDisposable
             catch (Exception ex)
             {
                 failures++;
-                var left = new DateTime(Volatile.Read(ref _validUntilUtcTicks), DateTimeKind.Utc) - _timeProvider.GetUtcNow().UtcDateTime;
+                var left = Remaining();
                 if (left > TimeSpan.Zero)
                     wait = RenewalRetryDelay(failures, retryInterval, interval, left);
                 else
@@ -709,8 +714,7 @@ internal sealed class FlowExecutionLease : IAsyncDisposable
         {
             while (!_stop.IsCancellationRequested && !_lost.IsCancellationRequested)
             {
-                var remaining = new DateTime(Volatile.Read(ref _validUntilUtcTicks), DateTimeKind.Utc)
-                    - _timeProvider.GetUtcNow().UtcDateTime;
+                var remaining = Remaining();
 
                 if (remaining <= TimeSpan.Zero)
                 {
@@ -723,7 +727,7 @@ internal sealed class FlowExecutionLease : IAsyncDisposable
                     return;
                 }
 
-                await Task.Delay(
+                await EngineGuardTimers.Delay(
                     remaining < MaxDeadlineChunk ? remaining : MaxDeadlineChunk,
                     _timeProvider,
                     _stop.Token).ConfigureAwait(false);
@@ -766,7 +770,7 @@ internal sealed class FlowExecutionLease : IAsyncDisposable
         _renewalStop.Cancel();
         try
         {
-            await _renewal.WaitAsync(DisposeJoinLimit, _timeProvider).ConfigureAwait(false);
+            await EngineGuardTimers.WaitAsync(_renewal, DisposeJoinLimit, _timeProvider).ConfigureAwait(false);
         }
         catch (TimeoutException)
         {
@@ -844,7 +848,7 @@ internal sealed class FlowExecutionLease : IAsyncDisposable
         {
             // Bounded join (see DisposeJoinLimit): both loops swallow their own exceptions, so an
             // abandoned task cannot fault unobserved.
-            await loops.WaitAsync(DisposeJoinLimit, _timeProvider).ConfigureAwait(false);
+            await EngineGuardTimers.WaitAsync(loops, DisposeJoinLimit, _timeProvider).ConfigureAwait(false);
         }
         catch (TimeoutException) when (!loops.IsCompleted)
         {
@@ -874,7 +878,7 @@ internal sealed class FlowExecutionLease : IAsyncDisposable
         try
         {
             release = _store.ReleaseLeaseAsync(_flowId, _leaseId, releaseCancellation.Token);
-            await release.WaitAsync(ReleaseLimit, _timeProvider).ConfigureAwait(false);
+            await EngineGuardTimers.WaitAsync(release, ReleaseLimit, _timeProvider).ConfigureAwait(false);
             releaseCancellation.Dispose();
         }
         catch (TimeoutException) when (release is { IsCompleted: false })
@@ -933,4 +937,64 @@ internal sealed class FlowExecutionLease : IAsyncDisposable
             CancellationToken.None,
             TaskContinuationOptions.ExecuteSynchronously,
             TaskScheduler.Default);
+}
+
+/// <summary>
+/// Arms the engine's HANG-GUARD timers: the execution lease's renew and deadline loops, and the
+/// bounded joins and release of its disposal (<see cref="FlowExecutionLease.DisposeJoinLimit"/>).
+/// They bound real I/O — a store call that never answers — and are no wait of the execution's
+/// own, so in production they behave exactly like <c>Task.Delay</c> / <c>WaitAsync</c> on the
+/// injected clock. Under the test kit's virtual clock they are attributed to <see cref="Owner"/>
+/// (<see cref="InMemoryWorkerTransport.TimerAttribution"/>), and the harness's settle does not read
+/// arming one as "the busy job began a virtual-time wait": it did, the job that took a worker
+/// armed its 20-second renew delay, on an otherwise idle harness that arm was the new earliest
+/// timer, and the settle moved the clock 20 s under a job still running its first step — every
+/// timer it then reached was anchored late — and a park's 30-second renewal join, read the same
+/// way, was fired by the advance before the renewal could stop, refusing the park as if the store
+/// had hung. The timers still fire in order as the clock moves; only the settle ignores them.
+/// </summary>
+internal static class EngineGuardTimers
+{
+    /// <summary>The attribution every hang-guard timer carries under a virtual clock.</summary>
+    internal static readonly object Owner = new();
+
+    /// <summary><c>Task.Delay(delay, timeProvider, cancellationToken)</c>, attributed as a hang guard.</summary>
+    public static Task Delay(TimeSpan delay, TimeProvider timeProvider, CancellationToken cancellationToken)
+    {
+        // The system clock has no settle to inform: skip the ambient-state writes (each AsyncLocal
+        // write allocates an execution context) on the production path.
+        if (ReferenceEquals(timeProvider, TimeProvider.System))
+            return Task.Delay(delay, timeProvider, cancellationToken);
+
+        // The timer is created synchronously inside Task.Delay, so the attribution only has to
+        // hold for the call; restored at once, it never leaks into the caller's flow.
+        var previous = InMemoryWorkerTransport.TimerAttribution.Current;
+        InMemoryWorkerTransport.TimerAttribution.Current = Owner;
+        try
+        {
+            return Task.Delay(delay, timeProvider, cancellationToken);
+        }
+        finally
+        {
+            InMemoryWorkerTransport.TimerAttribution.Current = previous;
+        }
+    }
+
+    /// <summary><c>task.WaitAsync(timeout, timeProvider)</c>, attributed as a hang guard.</summary>
+    public static Task WaitAsync(Task task, TimeSpan timeout, TimeProvider timeProvider)
+    {
+        if (ReferenceEquals(timeProvider, TimeProvider.System))
+            return task.WaitAsync(timeout, timeProvider);
+
+        var previous = InMemoryWorkerTransport.TimerAttribution.Current;
+        InMemoryWorkerTransport.TimerAttribution.Current = Owner;
+        try
+        {
+            return task.WaitAsync(timeout, timeProvider);
+        }
+        finally
+        {
+            InMemoryWorkerTransport.TimerAttribution.Current = previous;
+        }
+    }
 }

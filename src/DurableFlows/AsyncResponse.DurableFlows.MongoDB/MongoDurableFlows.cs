@@ -8,7 +8,6 @@ using Microsoft.Extensions.Options;
 using MongoDB.Bson;
 using MongoDB.Bson.Serialization;
 using MongoDB.Bson.Serialization.Attributes;
-using MongoDB.Bson.Serialization.Serializers;
 using MongoDB.Driver;
 
 namespace Microsoft.Extensions.DependencyInjection
@@ -552,9 +551,20 @@ public sealed class MongoDbFlowStateStore : IFlowStateStore, IDisposable
             // createIndex({ expires_at_utc: 1 }, { expireAfterSeconds: 0 }), is named
             // "expires_at_utc_1", and MongoDB refuses the same key and options under a second name
             // (85 IndexOptionsConflict; 86 IndexKeySpecsConflict for a same-named different key).
+            //
+            // Through a w=1 view of the collection (the transport's and channel's EnsureCreated do
+            // the same): createIndexes carries the handle's write concern, and under the bounded
+            // majority even a no-op one — the index already exists — waits for the set's last optime
+            // to reach a majority. On a set that cannot acknowledge majority (a
+            // primary-secondary-arbiter set with its secondary down) every attempt held the gate for
+            // the whole wtimeout and then threw, so a host that started during the degradation could
+            // not even read a ledger (status queries, loads) — every operation runs this first, and
+            // _created never latched. Index DDL is idempotent, and a build a failover rolled back
+            // reruns at the next start.
             try
             {
-                await _collection.Indexes.CreateOneAsync(model, cancellationToken: cancellationToken).ConfigureAwait(false);
+                await _collection.WithWriteConcern(MongoWriteConcerns.PrimaryAcknowledged(_database)).Indexes
+                    .CreateOneAsync(model, cancellationToken: cancellationToken).ConfigureAwait(false);
             }
             catch (MongoCommandException ex) when (ex.Code is 85 or 86)
             {
@@ -881,37 +891,5 @@ internal sealed class MongoFlowStateDocument
     [BsonIgnoreIfNull]
     [BsonSerializer(typeof(NullableUtcBsonDateSerializer))]
     public DateTime? LeaseExpiresAtUtc { get; set; }
-}
-
-/// <summary>
-/// A ledger instant as a UTC BSON date, set on the member itself so the global serializer registry
-/// is never consulted. <c>[BsonDateTimeOptions]</c> would not do: it RECONFIGURES whatever
-/// serializer the registry returns for <see cref="DateTime"/>, and for a host that registered its
-/// own <c>IBsonSerializer&lt;DateTime&gt;</c> (anything but the driver's
-/// <see cref="DateTimeSerializer"/>) freezing this class map throws
-/// <see cref="NotSupportedException"/>, failing every flow-store operation. The driver's
-/// serializers are sealed, so this delegates to a privately held one instead of deriving from it.
-/// </summary>
-internal sealed class UtcBsonDateSerializer : SerializerBase<DateTime>
-{
-    internal static readonly DateTimeSerializer Pinned = new(DateTimeKind.Utc, BsonType.DateTime);
-
-    public override DateTime Deserialize(BsonDeserializationContext context, BsonDeserializationArgs args)
-        => Pinned.Deserialize(context, args);
-
-    public override void Serialize(BsonSerializationContext context, BsonSerializationArgs args, DateTime value)
-        => Pinned.Serialize(context, args, value);
-}
-
-/// <summary>The nullable twin of <see cref="UtcBsonDateSerializer"/>, for the lease expiry.</summary>
-internal sealed class NullableUtcBsonDateSerializer : SerializerBase<DateTime?>
-{
-    private static readonly NullableSerializer<DateTime> Pinned = new(UtcBsonDateSerializer.Pinned);
-
-    public override DateTime? Deserialize(BsonDeserializationContext context, BsonDeserializationArgs args)
-        => Pinned.Deserialize(context, args);
-
-    public override void Serialize(BsonSerializationContext context, BsonSerializationArgs args, DateTime? value)
-        => Pinned.Serialize(context, args, value);
 }
 }

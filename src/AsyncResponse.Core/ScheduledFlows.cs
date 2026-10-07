@@ -114,9 +114,11 @@ internal sealed class ScheduledFlowService(
         var duplicate = registrations.GroupBy(r => r.Name, StringComparer.Ordinal).FirstOrDefault(g => g.Count() > 1);
         if (duplicate is not null)
         {
-            _logger.LogError(
-                "Two scheduled flows share the name '{Schedule}'. Schedule names key the deterministic occurrence ids; not scheduling ANY occurrences until the duplicate registration is removed.",
-                duplicate.Key);
+            SafeLog.Try(
+                (Logger: _logger, Name: duplicate.Key),
+                static s => s.Logger.LogError(
+                    "Two scheduled flows share the name '{Schedule}'. Schedule names key the deterministic occurrence ids; not scheduling ANY occurrences until the duplicate registration is removed.",
+                    s.Name));
             return;
         }
 
@@ -126,7 +128,9 @@ internal sealed class ScheduledFlowService(
                 if (registration.Options.Enabled)
                     return true;
 
-                _logger.LogInformation("Scheduled flow '{Schedule}' is disabled; not scheduling occurrences.", registration.Name);
+                SafeLog.Try(
+                    (Logger: _logger, registration.Name),
+                    static s => s.Logger.LogInformation("Scheduled flow '{Schedule}' is disabled; not scheduling occurrences.", s.Name));
                 return false;
             })
             .Select(registration => RunScheduleAsync(registration, stoppingToken))
@@ -149,9 +153,9 @@ internal sealed class ScheduledFlowService(
                 foreach (var sibling in pending)
                 {
                     _ = sibling.ContinueWith(
-                        static (task, state) => ((ILogger)state!).LogError(
-                            task.Exception?.GetBaseException(),
-                            "A scheduled-flow loop faulted while the scheduler was already failing."),
+                        static (task, state) => SafeLog.Try(
+                            (Logger: (ILogger)state!, Error: task.Exception?.GetBaseException()),
+                            static s => s.Logger.LogError(s.Error, "A scheduled-flow loop faulted while the scheduler was already failing.")),
                         _logger,
                         CancellationToken.None,
                         TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously,
@@ -216,9 +220,18 @@ internal sealed class ScheduledFlowService(
         }
 
         var next = schedule.GetNextOccurrence(timeProvider.GetUtcNow());
-        _logger.LogInformation(
-            "Scheduled flow '{Schedule}' ({Cron}, {TimeZone}): first occurrence at {NextOccurrence}.",
-            registration.Name, registration.CronExpression, registration.Options.TimeZone.Id, next);
+
+        // Every log line of this service is guarded (SafeLog): a logging provider that throws —
+        // Microsoft.Extensions.Logging rethrows a provider's failure — escaped the loop, faulted
+        // the BackgroundService and stopped the host, and the throw at a failed publish's error
+        // line skipped queueing the occurrence for re-drive, so it was lost for good (the publish
+        // is the start's commit point: nothing was persisted for it). Outcomes are decided first,
+        // and the log line is the optional part.
+        SafeLog.Try(
+            (Logger: _logger, Registration: registration, Next: next),
+            static s => s.Logger.LogInformation(
+                "Scheduled flow '{Schedule}' ({Cron}, {TimeZone}): first occurrence at {NextOccurrence}.",
+                s.Registration.Name, s.Registration.CronExpression, s.Registration.Options.TimeZone.Id, s.Next));
 
         var undispatched = new List<UndispatchedOccurrence>();
         try
@@ -251,9 +264,11 @@ internal sealed class ScheduledFlowService(
 
                 if (next is null && undispatched.Count == 0)
                 {
-                    _logger.LogWarning(
-                        "Scheduled flow '{Schedule}' ({Cron}) has no future occurrence (unsatisfiable expression); stopping its loop.",
-                        registration.Name, registration.CronExpression);
+                    SafeLog.Try(
+                        (Logger: _logger, Registration: registration),
+                        static s => s.Logger.LogWarning(
+                            "Scheduled flow '{Schedule}' ({Cron}) has no future occurrence (unsatisfiable expression); stopping its loop.",
+                            s.Registration.Name, s.Registration.CronExpression));
                     return;
                 }
 
@@ -293,7 +308,6 @@ internal sealed class ScheduledFlowService(
         try
         {
             await registration.StartOccurrenceAsync(_flows, flowId, occurrence, stoppingToken).ConfigureAwait(false);
-            _logger.LogInformation("Scheduled flow '{Schedule}' started occurrence {FlowId}.", registration.Name, flowId);
         }
         catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
         {
@@ -307,10 +321,13 @@ internal sealed class ScheduledFlowService(
             // ONLY the dedicated conflict type gets this benign reading: the delegate also runs
             // the user's input factory, and a plain InvalidOperationException from it (or from the
             // store) means nothing was started — that is the generic failure logged below.
-            _logger.LogWarning(
-                ex,
-                "Scheduled flow '{Schedule}' occurrence {FlowId} was already started with different input — the input factory is not deterministic across replicas. The occurrence still ran exactly once.",
-                registration.Name, flowId);
+            SafeLog.Try(
+                (Logger: _logger, Error: ex, registration.Name, FlowId: flowId),
+                static s => s.Logger.LogWarning(
+                    s.Error,
+                    "Scheduled flow '{Schedule}' occurrence {FlowId} was already started with different input — the input factory is not deterministic across replicas. The occurrence still ran exactly once.",
+                    s.Name, s.FlowId));
+            return true;
         }
         catch (DurableFlowNotDispatchedException ex)
         {
@@ -319,19 +336,29 @@ internal sealed class ScheduledFlowService(
             // this one is worth re-driving on its own: the id is deterministic and the start
             // idempotent, so repeating it publishes the job once the broker is back — and if the
             // publish had landed ambiguously, the same id dedupes against the run it created.
-            _logger.LogError(
-                ex,
-                "Scheduled flow '{Schedule}' could not publish the start job for occurrence {FlowId}; the occurrence is not started and will be re-driven every {RedriveInterval} until it is published.",
-                registration.Name, flowId, registration.Options.RedriveInterval);
+            SafeLog.Try(
+                (Logger: _logger, Error: ex, Registration: registration, FlowId: flowId),
+                static s => s.Logger.LogError(
+                    s.Error,
+                    "Scheduled flow '{Schedule}' could not publish the start job for occurrence {FlowId}; the occurrence is not started and will be re-driven every {RedriveInterval} until it is published.",
+                    s.Registration.Name, s.FlowId, s.Registration.Options.RedriveInterval));
             return false;
         }
         catch (Exception ex)
         {
             // A failed start (store or transport outage) is this occurrence's loss only; the loop
             // lives on for the next one. Another replica may still have started it.
-            _logger.LogError(ex, "Scheduled flow '{Schedule}' failed to start occurrence {FlowId}.", registration.Name, flowId);
+            SafeLog.Try(
+                (Logger: _logger, Error: ex, registration.Name, FlowId: flowId),
+                static s => s.Logger.LogError(s.Error, "Scheduled flow '{Schedule}' failed to start occurrence {FlowId}.", s.Name, s.FlowId));
+            return true;
         }
 
+        // Logged after the start, outside its try: a throw from this line was caught below as a
+        // failed start, and an occurrence that had started was reported as lost.
+        SafeLog.Try(
+            (Logger: _logger, registration.Name, FlowId: flowId),
+            static s => s.Logger.LogInformation("Scheduled flow '{Schedule}' started occurrence {FlowId}.", s.Name, s.FlowId));
         return true;
     }
 
@@ -348,9 +375,11 @@ internal sealed class ScheduledFlowService(
         {
             var dropped = undispatched[0];
             undispatched.RemoveAt(0);
-            _logger.LogError(
-                "Scheduled flow '{Schedule}' has {Count} undispatched occurrences queued for re-drive; dropping the oldest, {FlowId}. Nothing was persisted for it (the publish is the start's commit point) — start the same occurrence id by hand once the worker transport is back.",
-                registration.Name, MaxUndispatchedOccurrences, dropped.FlowId);
+            SafeLog.Try(
+                (Logger: _logger, registration.Name, dropped.FlowId),
+                static s => s.Logger.LogError(
+                    "Scheduled flow '{Schedule}' has {Count} undispatched occurrences queued for re-drive; dropping the oldest, {FlowId}. Nothing was persisted for it (the publish is the start's commit point) — start the same occurrence id by hand once the worker transport is back.",
+                    s.Name, MaxUndispatchedOccurrences, s.FlowId));
         }
 
         undispatched.Add(new UndispatchedOccurrence
@@ -417,7 +446,9 @@ internal sealed class ScheduledFlowService(
         }
         catch (Exception ex)
         {
-            _logger.LogWarning(ex, "Scheduled flow '{Schedule}' could not load occurrence {FlowId} to re-drive it; retrying after {RedriveInterval}.", registration.Name, entry.FlowId, registration.Options.RedriveInterval);
+            SafeLog.Try(
+                (Logger: _logger, Error: ex, Registration: registration, entry.FlowId),
+                static s => s.Logger.LogWarning(s.Error, "Scheduled flow '{Schedule}' could not load occurrence {FlowId} to re-drive it; retrying after {RedriveInterval}.", s.Registration.Name, s.FlowId, s.Registration.Options.RedriveInterval));
             return RedriveOutcome.Retry;
         }
 
@@ -425,7 +456,9 @@ internal sealed class ScheduledFlowService(
         {
             if (!entry.AwaitingFirstPublish)
             {
-                _logger.LogWarning("Scheduled flow '{Schedule}' occurrence {FlowId} no longer has a ledger (expired or deleted); giving up its re-drive.", registration.Name, entry.FlowId);
+                SafeLog.Try(
+                    (Logger: _logger, registration.Name, entry.FlowId),
+                    static s => s.Logger.LogWarning("Scheduled flow '{Schedule}' occurrence {FlowId} no longer has a ledger (expired or deleted); giving up its re-drive.", s.Name, s.FlowId));
                 return RedriveOutcome.Settled;
             }
 
@@ -435,21 +468,23 @@ internal sealed class ScheduledFlowService(
             // old create-then-publish order) permanently lost every occurrence that fell due during
             // a broker outage: the queue held the id, the ledger it looked for had never existed,
             // and the startup probe cannot find a run that was never persisted either.
-            _logger.LogInformation("Scheduled flow '{Schedule}' occurrence {FlowId} has no ledger because its start job was never published; re-driving the start.", registration.Name, entry.FlowId);
+            SafeLog.Try(
+                (Logger: _logger, registration.Name, entry.FlowId),
+                static s => s.Logger.LogInformation("Scheduled flow '{Schedule}' occurrence {FlowId} has no ledger because its start job was never published; re-driving the start.", s.Name, s.FlowId));
         }
         else if (state.Status != FlowRunStatus.Running || state.Attempts > 0)
         {
             // Another replica re-drove it (or its own wake-up arrived after all) and the run
             // executed: nothing left to publish.
-            _logger.LogInformation("Scheduled flow '{Schedule}' occurrence {FlowId} has been picked up ({Status}, {Attempts} attempt(s)); no re-drive needed.", registration.Name, entry.FlowId, state.Status, state.Attempts);
+            SafeLog.Try(
+                (Logger: _logger, registration.Name, entry.FlowId, state.Status, state.Attempts),
+                static s => s.Logger.LogInformation("Scheduled flow '{Schedule}' occurrence {FlowId} has been picked up ({Status}, {Attempts} attempt(s)); no re-drive needed.", s.Name, s.FlowId, s.Status, s.Attempts));
             return RedriveOutcome.Settled;
         }
 
         try
         {
             await registration.StartOccurrenceAsync(_flows, entry.FlowId, entry.Occurrence, stoppingToken).ConfigureAwait(false);
-            _logger.LogInformation("Scheduled flow '{Schedule}' re-drove occurrence {FlowId}: its worker job is published.", registration.Name, entry.FlowId);
-            return RedriveOutcome.Settled;
         }
         catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
         {
@@ -457,19 +492,32 @@ internal sealed class ScheduledFlowService(
         }
         catch (DurableFlowNotDispatchedException ex)
         {
-            _logger.LogWarning(ex, "Scheduled flow '{Schedule}' could not publish the worker job for occurrence {FlowId} on re-drive; retrying after {RedriveInterval}.", registration.Name, entry.FlowId, registration.Options.RedriveInterval);
+            SafeLog.Try(
+                (Logger: _logger, Error: ex, Registration: registration, entry.FlowId),
+                static s => s.Logger.LogWarning(s.Error, "Scheduled flow '{Schedule}' could not publish the worker job for occurrence {FlowId} on re-drive; retrying after {RedriveInterval}.", s.Registration.Name, s.FlowId, s.Registration.Options.RedriveInterval));
             return RedriveOutcome.Retry;
         }
         catch (DurableFlowIdConflictException ex)
         {
-            _logger.LogWarning(ex, "Scheduled flow '{Schedule}' occurrence {FlowId} cannot be re-driven: the input factory produced a different input than the persisted run (it is not deterministic). Giving up its re-drive; the run is still Running and needs a manual re-drive.", registration.Name, entry.FlowId);
+            SafeLog.Try(
+                (Logger: _logger, Error: ex, registration.Name, entry.FlowId),
+                static s => s.Logger.LogWarning(s.Error, "Scheduled flow '{Schedule}' occurrence {FlowId} cannot be re-driven: the input factory produced a different input than the persisted run (it is not deterministic). Giving up its re-drive; the run is still Running and needs a manual re-drive.", s.Name, s.FlowId));
             return RedriveOutcome.Settled;
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Scheduled flow '{Schedule}' failed to re-drive occurrence {FlowId}; retrying after {RedriveInterval}.", registration.Name, entry.FlowId, registration.Options.RedriveInterval);
+            SafeLog.Try(
+                (Logger: _logger, Error: ex, Registration: registration, entry.FlowId),
+                static s => s.Logger.LogError(s.Error, "Scheduled flow '{Schedule}' failed to re-drive occurrence {FlowId}; retrying after {RedriveInterval}.", s.Registration.Name, s.FlowId, s.Registration.Options.RedriveInterval));
             return RedriveOutcome.Retry;
         }
+
+        // After the start, outside its try (see StartOccurrenceAsync): a throw here was a re-drive
+        // that published reported as failed, and published again after RedriveInterval.
+        SafeLog.Try(
+            (Logger: _logger, registration.Name, entry.FlowId),
+            static s => s.Logger.LogInformation("Scheduled flow '{Schedule}' re-drove occurrence {FlowId}: its worker job is published.", s.Name, s.FlowId));
+        return RedriveOutcome.Settled;
     }
 
     /// <summary>
@@ -511,17 +559,21 @@ internal sealed class ScheduledFlowService(
             }
             catch (Exception ex)
             {
-                _logger.LogWarning(ex, "Scheduled flow '{Schedule}' could not probe occurrence {FlowId} for an undispatched run at startup; skipping the rest of the probe.", registration.Name, flowId);
+                SafeLog.Try(
+                    (Logger: _logger, Error: ex, registration.Name, FlowId: flowId),
+                    static s => s.Logger.LogWarning(s.Error, "Scheduled flow '{Schedule}' could not probe occurrence {FlowId} for an undispatched run at startup; skipping the rest of the probe.", s.Name, s.FlowId));
                 return;
             }
 
             if (state is not { Status: FlowRunStatus.Running, Attempts: 0 })
                 continue;
 
-            _logger.LogWarning(
-                "Scheduled flow '{Schedule}' found occurrence {FlowId} created but never executed (Running, 0 attempts) — its start job was published and then lost in transit (an early-ACK worker subscriber, a broker that dropped it). Re-driving it.",
-                registration.Name, flowId);
             undispatched.Add(new UndispatchedOccurrence { FlowId = flowId, Occurrence = occurrence, DueUtc = now, AwaitingFirstPublish = false });
+            SafeLog.Try(
+                (Logger: _logger, registration.Name, FlowId: flowId),
+                static s => s.Logger.LogWarning(
+                    "Scheduled flow '{Schedule}' found occurrence {FlowId} created but never executed (Running, 0 attempts) — its start job was published and then lost in transit (an early-ACK worker subscriber, a broker that dropped it). Re-driving it.",
+                    s.Name, s.FlowId));
         }
     }
 

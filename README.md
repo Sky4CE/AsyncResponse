@@ -260,7 +260,8 @@ var flowId = await flows.StartAsync<TenantProvisioningFlow, ProvisioningInput>(n
   `AsyncResponse.DurableFlows.*` provider such as `.WithSqlServerDurableFlows(...)`, or
   `.WithDurableFlows<MyFlowStateStore>()` for an application-owned implementation.
 - **Tested like the rest of the library** — a crash-at-every-checkpoint unit matrix, end-to-end
-  integration runs against every durable channel, and a concurrent-flow stress scenario gating CI.
+  integration runs against every durable channel, and a concurrent-flow stress scenario in CI —
+  and no release is published unless CI passed for the tagged commit.
 - **And testable by *your* tests** — the `AsyncResponse.Testing` package runs the complete
   engine in-process on a virtual clock: script replies to awaited steps, skip a three-day timer
   in milliseconds, inject a crash at any checkpoint, and simulate a restart with real

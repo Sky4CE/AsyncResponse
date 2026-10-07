@@ -70,7 +70,7 @@ public class RedisTransportTests
         var add = Assert.Single(database.Adds);
         Assert.Equal("ar-workers", add.Stream);
         Assert.Equal(123, add.MaxLength);
-        Assert.True(add.Approximate);
+        Assert.Equal(options.WorkerConsumerGroup, Assert.Single(database.AddOnceSettlingGroups));
         Assert.Equal("corr-redis", Field(add.Values, "cid"));
         var job = JsonSerializer.Deserialize<WorkerJobEnvelope>(Field(add.Values, "body"));
         Assert.Equal("corr-redis", job!.CorrelationId);
@@ -643,17 +643,21 @@ public class RedisTransportTests
             return Task.FromResult<RedisValue>($"{AddAttempts}-0");
         }
 
+        /// <summary>Settling groups passed to StreamAddOnceAsync, in call order.</summary>
+        public List<string> AddOnceSettlingGroups { get; } = [];
+
         public async Task<RedisValue> StreamAddOnceAsync(
             RedisKey stream,
             RedisKey dedupKey,
             TimeSpan dedupTtl,
             NameValueEntry[] values,
             long? maxLength,
-            bool useApproximateMaxLength,
+            RedisValue settlingGroup,
             CancellationToken cancellationToken)
         {
             var key = dedupKey.ToString();
             AddOnceDedupKeys.Add(key);
+            AddOnceSettlingGroups.Add(settlingGroup.ToString());
             if (CommittedDedupKeys.Contains(key))
             {
                 AddAttempts++;
@@ -661,7 +665,7 @@ public class RedisTransportTests
                 return RedisValue.Null;
             }
 
-            var id = await StreamAddAsync(stream, values, maxLength, useApproximateMaxLength, cancellationToken);
+            var id = await StreamAddAsync(stream, values, maxLength, useApproximateMaxLength: false, cancellationToken);
             CommittedDedupKeys.Add(key);
 
             if (AmbiguousTimeoutsBeforeSuccess > 0)

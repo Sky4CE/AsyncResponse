@@ -31,8 +31,10 @@ expect pure-fixture-flake 0 "flake: Fixture' threw in InitializeAsync" \
   "  failed AsyncResponse.IntegrationTests.Foo\n  Xunit.Sdk.TestPipelineException: Class fixture type 'AsyncResponse.IntegrationTests.DataBatchFixture' threw in InitializeAsync\n"
 expect matrix-fixture-flake 0 "flake: Fixture' threw in InitializeAsync" \
   "Xunit.Sdk.TestPipelineException: Collection fixture type 'AsyncResponse.IntegrationTests.MatrixDatabaseLightFixture' threw in InitializeAsync\n"
-expect sqlite-locked 0 "flake: SQLite Error 5: 'database is locked'" \
-  "Microsoft.Data.Sqlite.SqliteException : SQLite Error 5: 'database is locked'.\n"
+# SQLITE_BUSY is a flake only in the EF Core storm tests it was written for (round 65): there the
+# busy timeout is the test's own, on a slow runner disk.
+expect sqlite-locked-in-an-ef-core-storm-test 0 "flake: SQLite Error 5: 'database is locked'" \
+  "  failed AsyncResponse.Tests.EFCoreDurableFlowStateStoreTests.EFCoreStore_ConcurrentSaveLoadDeleteStorm_WithScopedDbContext (41s 12ms)\n  Microsoft.Data.Sqlite.SqliteException : SQLite Error 5: 'database is locked'.\n"
 expect runner-lost 0 "flake: The runner has received a shutdown signal" \
   "The runner has received a shutdown signal. This can happen when the runner service is stopped.\n"
 # The finding: a boot flake in the same log as an executed test that failed on its merits.
@@ -133,6 +135,23 @@ expect summary-reports-more-failures-than-blocks 1 "real: the log reports" \
 # it, and a flake signature logged in there is not that test's exception.
 expect host-output-after-the-assembly-result-is-not-the-last-test 1 "real: System.NullReferenceException: boom in AsyncResponse.IntegrationTests.Foo.Bar" \
   "  failed AsyncResponse.IntegrationTests.Foo.Bar (3s)\n  System.NullReferenceException: boom\n${dll} failed with 1 error(s) (3m 24s)\nExit code: 2\n  Standard output: warn: Microsoft.EntityFrameworkCore.Database.Command[0]\n        SQLite Error 5: 'database is locked'.\nTest run summary: Failed!\n  total: 10\n  failed: 1\n"
+
+# ---- Round 65: the SQLite signature is scoped to the tests it excuses. ----
+#
+# The SQLite flow store serializes its in-process writers so they never see SQLITE_BUSY; a
+# regression of exactly that guarantee prints this string from the store's OWN tests, and an
+# unscoped signature retried it toward green on main.
+expect sqlite-locked-in-the-sqlite-store-tests-is-real 1 "real: Microsoft.Data.Sqlite.SqliteException : SQLite Error 5: 'database is locked'. in AsyncResponse.Tests.SqliteFlowStateStoreTests.ConcurrentCheckpoints_NeverLoseARevision" \
+  "  failed AsyncResponse.Tests.SqliteFlowStateStoreTests.ConcurrentCheckpoints_NeverLoseARevision (3s 40ms)\n  Microsoft.Data.Sqlite.SqliteException : SQLite Error 5: 'database is locked'.\n     at Microsoft.Data.Sqlite.SqliteException.ThrowExceptionForRC(Int32 rc, sqlite3 db)\nTest run summary: Failed!\n  total: 10\n  failed: 1\n"
+# Another EF Core test of the same class is not a storm test either.
+expect sqlite-locked-in-another-ef-core-test-is-real 1 "real: Microsoft.Data.Sqlite.SqliteException" \
+  "  failed AsyncResponse.Tests.EFCoreDurableFlowStateStoreTests.EFCoreStore_RoundTripsState (1s)\n  Microsoft.Data.Sqlite.SqliteException : SQLite Error 5: 'database is locked'.\n"
+# The jobs/logs API shape of the storm-test flake still earns its retry.
+expect api-log-sqlite-locked-in-an-ef-core-storm-test 0 "flake: SQLite Error 5: 'database is locked'" \
+  "\xEF\xBB\xBF${ts}\e[m\e[31mfailed\e[m AsyncResponse.Tests.EFCoreDurableFlowStateStoreTests.EFCoreStore_ConcurrentSaveLoadDeleteStorm_WithDbContextFactory \e[90m(40s)\e[m\n${ts}  from ${dll}\n${ts}\e[31m  Microsoft.Data.Sqlite.SqliteException : SQLite Error 5: 'database is locked'.\n$(api_summary 1)"
+# Outside any failed-test block there is no test name to scope by: never a flake on its own.
+expect sqlite-locked-outside-a-test-block-is-unmatched 2 "unmatched" \
+  "Microsoft.Data.Sqlite.SqliteException : SQLite Error 5: 'database is locked'.\n"
 
 code=0
 "$classifier" "$work/does-not-exist.log" > "$work/missing.out" || code=$?

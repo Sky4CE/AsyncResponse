@@ -38,6 +38,7 @@ public sealed class VirtualTimeProvider : TimeProvider
     private readonly SortedSet<VirtualTimer> _armed = new(VirtualTimerOrder.Instance);
     private DateTimeOffset _utcNow;
     private long _sequence;
+    private long _waitSequence;
 
     /// <summary>Creates a provider starting at <see cref="DefaultStartTime"/>.</summary>
     public VirtualTimeProvider()
@@ -174,6 +175,42 @@ public sealed class VirtualTimeProvider : TimeProvider
     }
 
     /// <summary>
+    /// <see cref="ArmSequence"/> without the engine's hang-guard timers
+    /// (<see cref="EngineGuardTimers"/>: the execution lease's renew and deadline loops, its bounded
+    /// disposal joins). Those are armed by a job that is still running code — taking a worker arms
+    /// a 20-second renew delay, a park arms a 30-second join — so reading them as "a virtual wait
+    /// began" let the settle move the clock under the job. What the settle reads, with
+    /// <see cref="NextWaitDueAt"/>.
+    /// </summary>
+    internal long WaitArmSequence
+    {
+        get
+        {
+            lock (_gate)
+                return _waitSequence;
+        }
+    }
+
+    /// <summary><see cref="NextTimerDueAt"/> without the engine's hang-guard timers (see <see cref="WaitArmSequence"/>).</summary>
+    internal DateTimeOffset? NextWaitDueAt
+    {
+        get
+        {
+            lock (_gate)
+            {
+                // Ordered by due time: the first match is the earliest.
+                foreach (var timer in _armed)
+                {
+                    if (!timer.IsEngineGuard)
+                        return timer.DueAt;
+                }
+
+                return null;
+            }
+        }
+    }
+
+    /// <summary>
     /// Advances to <paramref name="target"/>, or — when another driver already moved the clock past
     /// it — only fires what is due at the current instant: never backwards. Decided under the
     /// advance gate, so two drivers (a pending harness publish and the test's own advance) cannot
@@ -249,6 +286,9 @@ public sealed class VirtualTimeProvider : TimeProvider
 
         /// <summary>The attributed operation that created this timer (<see cref="StartAttributed"/>), if any.</summary>
         internal object? Owner { get; init; }
+
+        /// <summary>An engine hang guard (<see cref="EngineGuardTimers"/>), which the harness's settle does not count as a wait.</summary>
+        internal bool IsEngineGuard => ReferenceEquals(Owner, EngineGuardTimers.Owner);
         private TimeSpan _period = Timeout.InfiniteTimeSpan;
         private bool _armed;
         private bool _disposed;
@@ -287,6 +327,8 @@ public sealed class VirtualTimeProvider : TimeProvider
 
                 DueAt = _owner._utcNow + TimeSpan.FromMilliseconds(dueMilliseconds > 0 ? dueMilliseconds : 0);
                 Sequence = _owner._sequence++;
+                if (!IsEngineGuard)
+                    _owner._waitSequence++;
                 _owner._armed.Add(this);
                 _armed = true;
                 return true;
@@ -300,6 +342,8 @@ public sealed class VirtualTimeProvider : TimeProvider
             {
                 DueAt = now + _period;
                 Sequence = _owner._sequence++;
+                if (!IsEngineGuard)
+                    _owner._waitSequence++;
                 rearmed = true;
                 return;
             }

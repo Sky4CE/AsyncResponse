@@ -40,6 +40,14 @@ internal sealed class PostgreSqlAsyncResponseChannel : DbAsyncResponseChannelBas
             localDispatchRetryHint: "listener retry will pick it up",
             timeProvider)
     {
+        // Only ListenerPollInterval: FullSweepInterval throttles the sweep only while LISTEN
+        // carries delivery, and is floored at a quarter of the confirmation budget while it does
+        // not (WakeDownFullSweepInterval) — but that floor is judged on poll ticks, so the tick
+        // itself bounds the wake-down delivery latency.
+        WarnIfSweepCadenceOutrunsConfirmation(
+            nameof(PostgreSqlAsyncResponseChannelOptions.ListenerPollInterval),
+            _options.ListenerPollInterval,
+            "While LISTEN is down or reconnecting, the poll tick is the only cross-process wake.");
     }
 
     /// <inheritdoc />

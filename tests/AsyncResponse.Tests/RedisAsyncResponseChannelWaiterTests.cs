@@ -2193,6 +2193,10 @@ public class RedisAsyncResponseChannelWaiterTests
         // fresh failover window.
         SetConnected(oldOwner, true);
         RaiseConnectionRestored(_multiplexer, oldOwner);
+        // Round 65: back from a disconnection, the node's own zero stays unknown for the restored
+        // grace — the waiters the same outage dropped may still be re-subscribing.
+        Assert.Equal(-1, await channel.CountActiveSubscribersAsync("corr"));
+        clock.Advance(RedisAsyncResponseChannel.RestoredEndPointGrace);
         Assert.Equal(0, await channel.CountActiveSubscribersAsync("corr"));
         SetConnected(oldOwner, false);
         RaiseConnectionFailed(_multiplexer, oldOwner);
@@ -2253,7 +2257,7 @@ public class RedisAsyncResponseChannelWaiterTests
         RaiseConnectionRestored(_multiplexer, oldOwner);
         shardA.Setup(s => s.SubscriptionSubscriberCountAsync(It.IsAny<RedisChannel>(), It.IsAny<CommandFlags>()))
             .ReturnsAsync(0L);
-        Assert.Equal(0, await channel.CountActiveSubscribersAsync("corr")); // a later probe sees it back
+        Assert.Equal(-1, await channel.CountActiveSubscribersAsync("corr")); // a later probe sees it back (inside the round-65 restored grace)
         shardAAnswer.SetResult(0);
         Assert.Equal(-1, await olderProbe); // its own observation: inside the grace
 
@@ -2303,7 +2307,7 @@ public class RedisAsyncResponseChannelWaiterTests
         SetConnected(oldOwner, false);
         RaiseConnectionFailed(_multiplexer, oldOwner);
         SetConnected(oldOwner, true); // back, its ConnectionRestored not handled yet
-        Assert.Equal(0, await channel.CountActiveSubscribersAsync("corr"));
+        Assert.Equal(-1, await channel.CountActiveSubscribersAsync("corr")); // round 65: a restore, inside its grace
 
         clock.Advance(TimeSpan.FromDays(1));
         SetConnected(oldOwner, false);

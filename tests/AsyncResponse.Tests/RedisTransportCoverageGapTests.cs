@@ -58,21 +58,21 @@ public sealed class RedisTransportCoverageGapTests
         var claimed = await seam.StreamClaimIdsOnlyAsync("s", "g", "c", 0, ["1-0", "2-0"], CancellationToken.None);
         Assert.Empty(claimed);
 
-        // The default idempotent append is a plain pass-through: it ignores the dedup key and
-        // forwards the append (and its trimming arguments) to StreamAddAsync.
+        // The default idempotent append is a plain pass-through: it ignores the dedup key and the
+        // capacity (a capacity is a refusal, never a length trim) and forwards the append.
         var id = await seam.StreamAddOnceAsync(
             "stream",
             "dedup-key",
             TimeSpan.FromMinutes(1),
             [new NameValueEntry("payload", "p")],
             maxLength: 42,
-            useApproximateMaxLength: true,
+            settlingGroup: "workers",
             CancellationToken.None);
         Assert.Equal("1-0", id.ToString());
         var add = Assert.Single(database.Adds);
         Assert.Equal("stream", add.Stream);
-        Assert.Equal(42, add.MaxLength);
-        Assert.True(add.Approximate);
+        Assert.Null(add.MaxLength);
+        Assert.False(add.Approximate);
 
         Assert.False(await seam.TryDeleteIdleConsumerAsync("s", "g", "c", CancellationToken.None));
     }

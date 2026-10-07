@@ -656,9 +656,13 @@ public sealed class MongoDbFlowStateStoreTests
         // never reaped. The members carry their own serializer instead of asking the registry
         // (the process-wide case itself runs in an isolated load context, below).
         var classMap = BsonClassMap.LookupClassMap(typeof(MongoFlowStateDocument));
-        Assert.IsType<UtcBsonDateSerializer>(classMap.GetMemberMap(nameof(MongoFlowStateDocument.ExpiresAtUtc)).GetSerializer());
-        Assert.IsType<UtcBsonDateSerializer>(classMap.GetMemberMap(nameof(MongoFlowStateDocument.UpdatedAtUtc)).GetSerializer());
-        Assert.IsType<NullableUtcBsonDateSerializer>(classMap.GetMemberMap(nameof(MongoFlowStateDocument.LeaseExpiresAtUtc)).GetSerializer());
+        // The serializers are shared source (src/Shared/MongoBsonDates.cs), compiled into every
+        // Mongo package, so they are named through the flow store's own assembly.
+        var pinned = typeof(MongoFlowStateDocument).Assembly.GetType("AsyncResponse.Internal.UtcBsonDateSerializer", throwOnError: true)!;
+        var pinnedNullable = typeof(MongoFlowStateDocument).Assembly.GetType("AsyncResponse.Internal.NullableUtcBsonDateSerializer", throwOnError: true)!;
+        Assert.IsType(pinned, classMap.GetMemberMap(nameof(MongoFlowStateDocument.ExpiresAtUtc)).GetSerializer());
+        Assert.IsType(pinned, classMap.GetMemberMap(nameof(MongoFlowStateDocument.UpdatedAtUtc)).GetSerializer());
+        Assert.IsType(pinnedNullable, classMap.GetMemberMap(nameof(MongoFlowStateDocument.LeaseExpiresAtUtc)).GetSerializer());
 
         var now = new DateTime(2031, 3, 14, 9, 26, 53, 589, DateTimeKind.Utc);
         var document = new MongoFlowStateDocument { FlowId = "flow", ExpiresAtUtc = now, UpdatedAtUtc = now, LeaseExpiresAtUtc = now, Revision = 0 }

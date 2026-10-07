@@ -118,9 +118,7 @@ internal abstract class RedisMessageDispatcher : IAsyncDisposable
     {
         RedisTransportOptionsValidator.ValidateCommon(transportOptions);
 
-        var optionPath = role is RedisSubscriberRole.Worker
-            ? $"{nameof(RedisAsyncResponseTransportOptions)}.{nameof(RedisAsyncResponseTransportOptions.WorkerSubscriber)}"
-            : $"{nameof(RedisAsyncResponseTransportOptions)}.{nameof(RedisAsyncResponseTransportOptions.ResponseSubscriber)}";
+        var optionPath = OptionPath(role);
 
         if (subscriberOptions.BatchSize <= 0)
             throw new InvalidOperationException($"{optionPath}.{nameof(RedisSubscriberOptions.BatchSize)} must be positive.");
@@ -163,11 +161,33 @@ internal abstract class RedisMessageDispatcher : IAsyncDisposable
 
                 // Redis subscribers spend only the background drain at shutdown; the read loop
                 // stops with the host token and the multiplexer teardown is not separately bounded.
+                // The worker and response subscribers are two hosted services, and the host stops
+                // them ONE AFTER THE OTHER (HostOptions.ServicesStopConcurrently defaults to false)
+                // inside one shutdown budget — each drain validated alone let two 20 s drains pass
+                // against 30 s, and the second was cut off with its already-ACKed entries still
+                // queued: no dead-letter copy, no OnBackgroundFailure, no log. With both roles in
+                // early ACK their drains are summed (NATS/PostgreSQL/SQL Server/MongoDB parity).
+                var drain = ($"{optionPath}.{nameof(RedisSubscriberOptions.BackgroundDrainTimeout)}", subscriberOptions.BackgroundDrainTimeout);
+                var (other, otherRole) = role is RedisSubscriberRole.Worker
+                    ? (transportOptions.ResponseSubscriber, RedisSubscriberRole.ResponseIngress)
+                    : (transportOptions.WorkerSubscriber, RedisSubscriberRole.Worker);
+                (string, TimeSpan)[] components;
+                if (other is { AckMode: RedisAckMode.AckAfterEnqueue } && !ReferenceEquals(other, subscriberOptions))
+                {
+                    // Checked first, so the sum below only ever adds timer-backed values.
+                    AsyncResponseChannelOptions.EnsureTimerBacked(other.BackgroundDrainTimeout, OptionPath(otherRole), nameof(RedisSubscriberOptions.BackgroundDrainTimeout));
+                    components = [drain, ($"{OptionPath(otherRole)}.{nameof(RedisSubscriberOptions.BackgroundDrainTimeout)}", other.BackgroundDrainTimeout)];
+                }
+                else
+                {
+                    components = [drain];
+                }
+
                 ShutdownBudgetValidator.Validate(
                     "Redis",
                     $"{nameof(RedisAsyncResponseTransportOptions)}.{nameof(RedisAsyncResponseTransportOptions.HostShutdownTimeout)}",
                     transportOptions.HostShutdownTimeout,
-                    ($"{optionPath}.{nameof(RedisSubscriberOptions.BackgroundDrainTimeout)}", subscriberOptions.BackgroundDrainTimeout));
+                    components);
 
                 return;
 
@@ -176,6 +196,11 @@ internal abstract class RedisMessageDispatcher : IAsyncDisposable
                     $"{optionPath}.{nameof(RedisSubscriberOptions.AckMode)} has unsupported value '{subscriberOptions.AckMode}'.");
         }
     }
+
+    private static string OptionPath(RedisSubscriberRole role)
+        => role is RedisSubscriberRole.Worker
+            ? $"{nameof(RedisAsyncResponseTransportOptions)}.{nameof(RedisAsyncResponseTransportOptions.WorkerSubscriber)}"
+            : $"{nameof(RedisAsyncResponseTransportOptions)}.{nameof(RedisAsyncResponseTransportOptions.ResponseSubscriber)}";
 
     /// <summary>Handles the delivered message.</summary>
     public abstract Task<RedisDispatchOutcome> HandleAsync(
@@ -261,13 +286,27 @@ internal abstract class RedisMessageDispatcher : IAsyncDisposable
         }
     }
 
-    /// <summary>Acknowledges the delivered message.</summary>
+    /// <summary>
+    /// Settles the delivered message. With a capacity (StreamMaxLength) a worker entry is ACKed
+    /// and deleted in one step: the capacity counts entries, so a settled job must not keep
+    /// holding room — the publisher refuses a full stream rather than evict unprocessed work.
+    /// Without one nothing needs the room, and another consumer group on the worker stream (an
+    /// audit or fan-out reader) must keep the entries it has not read yet, so it is only ACKed,
+    /// as before. The response stream is written by remote producers and may be read by groups
+    /// of theirs, so its entries are only ACKed.
+    /// </summary>
     protected Task AckAsync(RedisStreamDelivery delivery, CancellationToken cancellationToken)
-        => _database.StreamAcknowledgeAsync(
-            delivery.Stream,
-            delivery.ConsumerGroup,
-            delivery.MessageId,
-            cancellationToken);
+        => _role is RedisSubscriberRole.Worker && TransportOptions.StreamMaxLength is not null
+            ? _database.StreamAcknowledgeAndDeleteAsync(
+                delivery.Stream,
+                delivery.ConsumerGroup,
+                delivery.MessageId,
+                cancellationToken)
+            : _database.StreamAcknowledgeAsync(
+                delivery.Stream,
+                delivery.ConsumerGroup,
+                delivery.MessageId,
+                cancellationToken);
 
     /// <summary>Runs the AlreadyExceededDeliveryAttempts operation.</summary>
     protected bool AlreadyExceededDeliveryAttempts(RedisStreamDelivery delivery)
@@ -300,7 +339,7 @@ internal abstract class RedisMessageDispatcher : IAsyncDisposable
             new NameValueEntry("attempt", delivery.Attempt),
             new NameValueEntry("reason", reason),
             new NameValueEntry("exceptionType", exception.GetType().FullName!),
-            new NameValueEntry("exceptionMessage", exception.Message),
+            new NameValueEntry("exceptionMessage", SafeMessage(exception)),
             new NameValueEntry("payload", delivery.Payload),
             new NameValueEntry("occurredAtUtc", DateTimeOffset.UtcNow.ToString("O"))
         };
@@ -312,6 +351,32 @@ internal abstract class RedisMessageDispatcher : IAsyncDisposable
             TransportOptions.UseApproximateStreamTrimming,
             cancellationToken).ConfigureAwait(false);
         return true;
+    }
+
+    /// <summary>Longest <c>exceptionMessage</c> a dead-letter entry records, in UTF-16 code units.</summary>
+    internal const int MaxDeadLetterExceptionMessageLength = 4096;
+
+    /// <summary>
+    /// The handler exception's message for the dead-letter entry. The Message getter is user code
+    /// (a custom exception can throw or return null), and a burial must not depend on it: a
+    /// throwing getter failed the dead-letter write, and on the early-ACK path — where the entry
+    /// was already ACKed and Redis never redelivers it — the copy was the job's only durable
+    /// record (NATS parity). Capped surrogate-aware (see PortableText.TruncateWellFormed), so a
+    /// message quoting a payload cannot double the entry.
+    /// </summary>
+    private static string SafeMessage(Exception exception)
+    {
+        string message;
+        try
+        {
+            message = exception.Message ?? exception.GetType().Name;
+        }
+        catch (Exception)
+        {
+            message = exception.GetType().Name;
+        }
+
+        return PortableText.TruncateWellFormed(message, MaxDeadLetterExceptionMessageLength);
     }
 
     /// <summary>

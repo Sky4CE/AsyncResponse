@@ -8,10 +8,14 @@
        it to Core and the database channels, and the providers compile against those internals
        (AsyncResponseIngress, the envelope JSON, FlowStateJson, JsonSafety, the startup markers, …)
        — a surface no public-API baseline tracks and that changes freely between releases. With an open range NuGet happily
-       resolves AsyncResponse.Core 0.2.0 next to AsyncResponse.Transports.Redis 0.1.0, and the
-       application dies with MissingMethodException at the first call across the seam instead of
-       failing at restore. With the exact range the same graph is NU1608 (a direct reference
-       outside a dependency's range) or NU1107 (two providers pinning different Cores).
+       resolves AsyncResponse.Core 0.2.0 next to AsyncResponse.Transports.Redis 0.1.0 without a
+       word, and the application dies with MissingMethodException at the first call across the
+       seam. The exact range makes NuGet say so, but not always loudly: two providers pinning
+       different Cores is NU1107, a restore ERROR; a direct reference to a newer Core next to a
+       provider pinned to the old one (one package bumped, the rest not) is NU1608, only a restore
+       WARNING, and the mixed graph still restores, builds and runs. The control that enforces the
+       rule is the runtime one, AsyncResponsePackageVersionGate (AsyncResponseStartupValidator.cs),
+       which fails the host start with both versions named; the pin is the early warning.
 
        Every ProjectReference under src/ is a sibling package, so every one is pinned — including
        Core -> Abstractions, which is NOT public-API-only for this purpose (see the IVT list in
@@ -21,7 +25,8 @@
        _ProjectReferencesWithVersions, whose ProjectVersion metadata the pack task parses as a
        version RANGE. There is no public knob for this (NuGet/Home#5556), so the hook is guarded
        from the outside instead: scripts/verify-package-dependencies.sh reads the packed .nuspec
-       files in CI and before every publish, and fails when a sibling dependency is not exact —
+       files in CI (ci.yml, after "Pack (validation only)", on every push and pull request) and
+       before every publish (publish.yml), and fails when a sibling dependency is not exact —
        which is what an SDK that renamed the target would produce. -->
   <Target Name="PinSiblingPackageVersions" AfterTargets="_GetProjectReferenceVersions">
     <ItemGroup>

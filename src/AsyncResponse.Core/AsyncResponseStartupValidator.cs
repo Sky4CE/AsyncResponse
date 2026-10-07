@@ -137,9 +137,12 @@ internal sealed class DurableFlowObserverLifetimeAudit(IServiceCollection servic
 /// The runtime half of "all AsyncResponse packages are one version". The channel, transport,
 /// durable-flow store, and Testing packages are not ordinary consumers of Core: Core (and
 /// Abstractions) grant them <c>InternalsVisibleTo</c>, and they call internal types that carry no
-/// compatibility promise between releases. NuGet sees only <c>Core &gt;= x</c>, so bumping one
-/// package — or a transitive dependency dragging Core forward — yields an install that restores,
-/// builds, and starts, and then throws <see cref="MissingMethodException"/> or
+/// compatibility promise between releases. The packages pin one another to an EXACT version
+/// (<c>[x]</c>, src/Directory.Build.targets), but NuGet enforces that only partly: two providers
+/// pinning different Cores is a restore error (NU1107), while a direct reference to a newer Core
+/// next to a provider pinned to the old one — one package bumped, the rest not — is only a
+/// warning (NU1608). That install restores, builds, and starts, and then throws
+/// <see cref="MissingMethodException"/> or
 /// <see cref="TypeLoadException"/> at the first call into a changed internal: usually inside a
 /// background consume loop, long after startup, where it reads as a broker fault. Evaluated by
 /// <see cref="AsyncResponsePackageVersionGate"/> when the host resolves its hosted services —

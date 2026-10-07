@@ -327,8 +327,16 @@ internal sealed class AsyncResponseBuilder(
         => new AsyncResponseBuilder<T>(_subscriber, ReplyTargetProvider, ValidateCorrelationId(correlationId));
 
     /// <inheritdoc />
+    /// <remarks>
+    /// Generated, NOT stored ambiently: <c>For&lt;T&gt;()</c> is a synchronous call, so an
+    /// ambient write here persisted in the caller's frame past the wait — a worker handler that
+    /// awaited a nested <c>For&lt;X&gt;().WaitAsync(...)</c> then enqueued its follow-up jobs (and
+    /// resolved its <c>Placeholder.CorrelationId()</c> arguments) under the nested wait's finished
+    /// id instead of its own request's. The trigger's scope makes the id ambient exactly where
+    /// the outgoing request is built.
+    /// </remarks>
     public IAsyncResponseTriggeredBuilder<T> For<T>() where T : IAsyncResponsePayload
-        => new AsyncResponseBuilder<T>(_subscriber, ReplyTargetProvider, AsyncResponseContext.CreateCorrelationId());
+        => new AsyncResponseBuilder<T>(_subscriber, ReplyTargetProvider, AsyncResponseContext.GenerateCorrelationId());
 }
 
 /// <inheritdoc cref="IRecoverableAsyncResponseBuilder"/>
@@ -347,8 +355,9 @@ internal sealed class RecoverableAsyncResponseBuilder(
         => new RecoverableAsyncResponseBuilder<T>(_subscriber, ReplyTargetProvider, ValidateCorrelationId(correlationId));
 
     /// <inheritdoc />
+    /// <remarks>Generated, not stored ambiently — see <see cref="AsyncResponseBuilder.For{T}()"/>.</remarks>
     public IRecoverableAsyncResponseTriggeredBuilder<T> For<T>() where T : IAsyncResponsePayload
-        => new RecoverableAsyncResponseBuilder<T>(_subscriber, ReplyTargetProvider, AsyncResponseContext.CreateCorrelationId());
+        => new RecoverableAsyncResponseBuilder<T>(_subscriber, ReplyTargetProvider, AsyncResponseContext.GenerateCorrelationId());
 
     IAsyncResponseAttachedBuilder<T> IAsyncResponseBuilder.For<T>(string correlationId)
         => For<T>(correlationId);

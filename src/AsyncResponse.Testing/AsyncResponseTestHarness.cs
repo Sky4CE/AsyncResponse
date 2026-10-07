@@ -62,6 +62,20 @@ public sealed class AsyncResponseTestHarnessOptions
     /// simulated restart). <see cref="FlowTestHarness"/> installs its probe here.
     /// </summary>
     public IList<IDurableFlowExecutionObserver> FlowObservers { get; } = [];
+
+    /// <summary>
+    /// Serialized-ledger budget, in UTF-8 bytes, for the harness's in-memory flow store — the
+    /// production store's <c>MaxStateBytes</c>, enforced the same way: a start whose initial state
+    /// is over it throws <see cref="FlowStateTooLargeException"/> before anything is published, and
+    /// a checkpoint over it fails the attempt with that exception (retried, then dead-lettered, as
+    /// in production). Set it to the budget of the store you deploy on — the DynamoDB store's
+    /// default is 350 000 bytes, Cosmos DB's 1 900 000, MongoDB's 15 000 000 — so a flow whose
+    /// ledger that store would refuse fails its test instead of passing it. Like the provider
+    /// stores, a <see cref="DurableFlowOptions.LedgerSizeWarningBytes"/> left at its default is
+    /// fitted under the budget, and one set at or above it fails <see cref="AsyncResponseTestHarness.StartAsync"/>.
+    /// Default: <c>null</c>, unlimited. Must be positive when set.
+    /// </summary>
+    public long? MaxStateBytes { get; set; }
 }
 
 /// <summary>
@@ -98,7 +112,9 @@ public sealed class AsyncResponseTestHarness : IAsyncDisposable
         _observers = [.. options.FlowObservers];
         Clock = new VirtualTimeProvider(options.StartTime ?? VirtualTimeProvider.DefaultStartTime);
         _recoveryStore = new InMemoryRecoveryStateStore(Clock);
-        _flowStore = new InMemoryFlowStateStore(Clock);
+        if (options.MaxStateBytes is <= 0)
+            throw new InvalidOperationException($"{nameof(AsyncResponseTestHarnessOptions)}.{nameof(AsyncResponseTestHarnessOptions.MaxStateBytes)} must be positive when configured (got {options.MaxStateBytes}).");
+        _flowStore = new InMemoryFlowStateStore(Clock) { MaxStateBytes = options.MaxStateBytes };
     }
 
     /// <summary>Builds the engine and starts its background services.</summary>
@@ -534,6 +550,12 @@ public sealed class AsyncResponseTestHarness : IAsyncDisposable
                 "or backoff would ever elapse. Use harness.Clock / AdvanceAsync instead of registering your own TimeProvider.");
         }
 
+        // After every user hook, as a post-configuration, so a DurableFlowOptions configured by any
+        // of them is judged: the same fit-or-refuse rule the provider stores apply between their
+        // MaxStateBytes and the ledger-growth warning.
+        if (_options.MaxStateBytes is { } maxStateBytes)
+            services.PostConfigure<DurableFlowOptions>(flows => FitLedgerWarningUnderCap(flows, maxStateBytes));
+
         // Fallback only, and only AFTER the user's registrations: AddLogging registers ILogger<>
         // with TryAdd semantics, so a non-Try registration made before them would silently pin
         // NullLogger and swallow the very diagnostics the harness's failure messages tell users
@@ -553,6 +575,30 @@ public sealed class AsyncResponseTestHarness : IAsyncDisposable
         // after a restart.
         foreach (var observer in _observers)
             (observer as FlowProbe)?.Arm(Clock, flowOptions.TimerInProcessThreshold);
+    }
+
+    /// <summary>
+    /// The provider stores' rule between <c>MaxStateBytes</c> and
+    /// <see cref="DurableFlowOptions.LedgerSizeWarningBytes"/>: a warning at or above the cap can
+    /// never fire before the cap refuses a checkpoint, so a default one is lowered to three
+    /// quarters of the cap and one the test set is refused.
+    /// </summary>
+    private static void FitLedgerWarningUnderCap(DurableFlowOptions flows, long cap)
+    {
+        if (flows.LedgerSizeWarningBytes is not { } warning || warning < cap)
+            return;
+
+        if (!flows.LedgerSizeWarningBytesConfigured)
+        {
+            flows.SetLedgerSizeWarningBytesDefault(cap - cap / 4);
+            return;
+        }
+
+        throw new InvalidOperationException(
+            $"{nameof(DurableFlowOptions)}.{nameof(DurableFlowOptions.LedgerSizeWarningBytes)} ({warning}) must be below " +
+            $"{nameof(AsyncResponseTestHarnessOptions)}.{nameof(AsyncResponseTestHarnessOptions.MaxStateBytes)} ({cap}): the ledger-growth " +
+            "warning could never fire before the cap refuses a checkpoint. Lower LedgerSizeWarningBytes, leave it unset (its default is " +
+            "fitted under the cap), or set it to null to disable the warning.");
     }
 
     private async Task StartHostedServicesAsync()
@@ -731,7 +777,9 @@ public sealed class AsyncResponseTestHarness : IAsyncDisposable
     /// how they progress — and settling costs nothing.</item>
     /// <item>A virtual timer was armed while settling — the busy job just began a virtual-time
     /// wait (a retry backoff, a lease-acquisition poll, a timer chunk), so advancing the clock is
-    /// exactly how it progresses.</item>
+    /// exactly how it progresses. The engine's hang guards (the execution lease's renew and
+    /// deadline loops, its bounded disposal joins) never count: they are armed by a job still
+    /// running code.</item>
     /// <item>A bounded real-time grace for what cannot be attributed (a job blocked on some other
     /// virtual timer it armed before this settle began looks identical to one stuck in user code).
     /// The budget is generous relative to scheduling noise; a fake that sleeps on the SYSTEM clock
@@ -766,12 +814,17 @@ public sealed class AsyncResponseTestHarness : IAsyncDisposable
             // A new earliest due time counts only when a timer was actually ARMED: disposing the
             // earliest timer (a finished wait, a cancelled delay) moves NextTimerDueAt too, and
             // ended the settle while the job that disposed it was still running code — the clock
-            // then advanced under it. (Any arm alone is not enough either: a job that just took a
-            // worker arms its lease-renew timer long before it reaches a wait of its own.)
-            var armed = Clock.ArmSequence;
-            var next = Clock.NextTimerDueAt;
+            // then advanced under it. (Any arm alone is not enough either: a job arms timers that
+            // are no wait of its own.) The engine's hang guards are left out of both readings
+            // (VirtualTimeProvider.WaitArmSequence): a job that just took a worker arms its
+            // 20-second lease-renew delay long before it reaches a wait of its own, and on an idle
+            // harness that arm WAS the new earliest timer — the clock jumped 20 s under the job's
+            // first step, and a park's 30-second renewal join, read the same way, was fired before
+            // the renewal could stop, refusing the park as a hung store.
+            var armed = Clock.WaitArmSequence;
+            var next = Clock.NextWaitDueAt;
             await Task.Delay(TimeSpan.FromMilliseconds(1)).ConfigureAwait(false);
-            if (armed != Clock.ArmSequence && next != Clock.NextTimerDueAt)
+            if (armed != Clock.WaitArmSequence && next != Clock.NextWaitDueAt)
                 return; // A virtual wait just began — the advance loop re-evaluates immediately.
         }
     }

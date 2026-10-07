@@ -77,6 +77,29 @@ internal abstract class RabbitMqMessageDispatcher : IAsyncDisposable
     protected CancellationToken IntakeClosing => _intakeGate?.HostStopping ?? CancellationToken.None;
 
     /// <summary>
+    /// True when the channel <paramref name="delivery"/> arrived on is already gone. RabbitMQ.Client
+    /// (7.x) keeps dispatching the deliveries it had buffered when a channel shuts down — its
+    /// consumer dispatcher only refuses NEW ones, and cancels each buffered delivery's
+    /// <see cref="RabbitMqDelivery.CancellationToken"/> — while the broker has already requeued every
+    /// un-ACKed delivery of that channel for the next attempt or a peer. A handler started on one of
+    /// them runs the job a second time beside that redelivery, and its settle can only fail; so it
+    /// is started and settled not at all. The token is the precise signal (it also covers an
+    /// automatically recovered channel object that reports open again); <c>IsOpen</c> covers a
+    /// caller that passes no token.
+    /// </summary>
+    protected static bool DeliveryChannelGone(RabbitMqDelivery delivery, IRabbitMqChannel channel)
+        => delivery.CancellationToken.IsCancellationRequested || !channel.IsOpen;
+
+    /// <summary>Debug trace for a delivery dropped by <see cref="DeliveryChannelGone"/> (guarded, allocation-free).</summary>
+    protected void ReportDeliveryChannelGone(RabbitMqDelivery delivery)
+        => SafeLog.Try(
+            (Logger, delivery.DeliveryTag, Queue: _queue),
+            static state => state.Logger.LogDebug(
+                "RabbitMQ delivery {DeliveryTag} on {Queue} was buffered by the client when its channel shut down; not starting it — the broker already requeued it.",
+                state.DeliveryTag,
+                state.Queue));
+
+    /// <summary>
     /// Where a message that must leave the dead-letter cycle for good is parked:
     /// <see cref="RabbitMqAsyncResponseOptions.ParkQueue"/>, else
     /// <see cref="RabbitMqAsyncResponseOptions.DeadLetterQueue"/>; <c>null</c> when neither is set.
@@ -398,13 +421,35 @@ internal abstract class RabbitMqMessageDispatcher : IAsyncDisposable
                 // closes — so the worst case is ShutdownTimeout + drain + ShutdownTimeout, and all
                 // three must fit inside the host budget. Summing only one close term let a
                 // configuration that overran the host by a full ShutdownTimeout start.
+                // The worker and response subscribers are two hosted services that the host stops
+                // ONE AFTER THE OTHER inside one budget, so with both roles in early ACK both stop
+                // paths are summed (NATS/Redis/PostgreSQL/SQL Server/MongoDB parity): each validated
+                // alone let the second subscriber's drain be cut off with its already-ACKed
+                // deliveries still queued.
+                var shutdownPath = $"{nameof(RabbitMqAsyncResponseOptions)}.{nameof(RabbitMqAsyncResponseOptions.ShutdownTimeout)}";
+                var (other, otherPath) = role is RabbitMqSubscriberRole.Worker
+                    ? (transportOptions.ResponseSubscriber, $"{nameof(RabbitMqAsyncResponseOptions)}.{nameof(RabbitMqAsyncResponseOptions.ResponseSubscriber)}")
+                    : (transportOptions.WorkerSubscriber, $"{nameof(RabbitMqAsyncResponseOptions)}.{nameof(RabbitMqAsyncResponseOptions.WorkerSubscriber)}");
+                List<(string, TimeSpan)> components =
+                [
+                    ($"{shutdownPath} (consumer cancel)", transportOptions.ShutdownTimeout),
+                    ($"{optionPath}.{nameof(RabbitMqSubscriberOptions.BackgroundDrainTimeout)}", subscriberOptions.BackgroundDrainTimeout),
+                    ($"{shutdownPath} (channel/connection close)", transportOptions.ShutdownTimeout),
+                ];
+                if (other is { AckMode: RabbitMqAckMode.AckAfterEnqueue } && !ReferenceEquals(other, subscriberOptions))
+                {
+                    // Checked first, so the sum below only ever adds timer-backed values.
+                    AsyncResponseChannelOptions.EnsureTimerBacked(other.BackgroundDrainTimeout, otherPath, nameof(RabbitMqSubscriberOptions.BackgroundDrainTimeout));
+                    components.Add(($"{shutdownPath} (other subscriber's consumer cancel)", transportOptions.ShutdownTimeout));
+                    components.Add(($"{otherPath}.{nameof(RabbitMqSubscriberOptions.BackgroundDrainTimeout)}", other.BackgroundDrainTimeout));
+                    components.Add(($"{shutdownPath} (other subscriber's channel/connection close)", transportOptions.ShutdownTimeout));
+                }
+
                 ShutdownBudgetValidator.Validate(
                     "RabbitMQ",
                     $"{nameof(RabbitMqAsyncResponseOptions)}.{nameof(RabbitMqAsyncResponseOptions.HostShutdownTimeout)}",
                     transportOptions.HostShutdownTimeout,
-                    ($"{nameof(RabbitMqAsyncResponseOptions)}.{nameof(RabbitMqAsyncResponseOptions.ShutdownTimeout)} (consumer cancel)", transportOptions.ShutdownTimeout),
-                    ($"{optionPath}.{nameof(RabbitMqSubscriberOptions.BackgroundDrainTimeout)}", subscriberOptions.BackgroundDrainTimeout),
-                    ($"{nameof(RabbitMqAsyncResponseOptions)}.{nameof(RabbitMqAsyncResponseOptions.ShutdownTimeout)} (channel/connection close)", transportOptions.ShutdownTimeout));
+                    [.. components]);
 
                 return;
 
@@ -655,6 +700,15 @@ internal sealed class AwaitingRabbitMqMessageDispatcher : RabbitMqMessageDispatc
             // stopping host that a live replica could have used. Started nothing, settled nothing.
             if (IntakeClosed)
                 return;
+
+            // The delivery's channel already died (a broker restart, a network blip,
+            // consumer_timeout, a 406): the client still hands over what it had buffered, but the
+            // broker requeued it at the close. Started nothing, settled nothing.
+            if (DeliveryChannelGone(delivery, channel))
+            {
+                ReportDeliveryChannelGone(delivery);
+                return;
+            }
 
             await HandleCoreAsync(delivery, channel, subscriberCancellationToken).ConfigureAwait(false);
         }
@@ -1061,6 +1115,14 @@ internal sealed class QueuedRabbitMqMessageDispatcher : RabbitMqMessageDispatche
         if (IntakeClosed)
             return;
 
+        // The delivery's channel already died: enqueued and ACKed (the ACK only fails), it ran
+        // beside the copy the broker requeued at the close. Started nothing, settled nothing.
+        if (DeliveryChannelGone(delivery, channel))
+        {
+            ReportDeliveryChannelGone(delivery);
+            return;
+        }
+
         // The client owns the delivery body's memory only until the consumer callback returns
         // ("Accessing the body at a later point is unsafe as its memory can be already
         // released" — RabbitMQ.Client v7). This dispatcher hands the delivery to background
@@ -1088,11 +1150,11 @@ internal sealed class QueuedRabbitMqMessageDispatcher : RabbitMqMessageDispatche
             // so a write parked under a channel that has since died would otherwise land later —
             // after the broker already requeued that un-ACKed delivery for the next attempt — and
             // the job would run twice. And with host stop (a worker subscriber only): a delivery
-            // received but not yet enqueued is handed back, never settled first.
+            // received but not yet enqueued is handed back, never settled first. The delivery's own
+            // token is the earliest "channel died" signal (the client cancels it at the shutdown,
+            // before the attempt notices and unwinds its attachment).
             using var parked = CancellationTokenSource.CreateLinkedTokenSource(
-                subscriberCancellationToken,
-                AttachmentEnded(channel),
-                IntakeClosing);
+                [subscriberCancellationToken, AttachmentEnded(channel), IntakeClosing, delivery.CancellationToken]);
             try
             {
                 await _queue.Writer.WriteAsync(delivery, parked.Token).ConfigureAwait(false);
@@ -1326,8 +1388,12 @@ internal sealed class QueuedRabbitMqMessageDispatcher : RabbitMqMessageDispatche
     }
 
     /// <summary>
-    /// Cancelled when the attempt that attached <paramref name="channel"/> ends; never, for a
-    /// channel no attempt attached (a caller driving <see cref="HandleAsync"/> directly).
+    /// Cancelled when the attempt that attached <paramref name="channel"/> ends — and already
+    /// cancelled for a channel that is not the attached one. Every attempt attaches its channel
+    /// before it consumes, so a delivery whose channel is not attached arrived on an attempt that has
+    /// already unwound: the client's buffered tail of a dead channel, which the broker requeued. A
+    /// never-cancelled token there let its park outlive the channel, land in the queue later and run
+    /// the job beside the redelivery.
     /// </summary>
     private CancellationToken AttachmentEnded(IRabbitMqChannel channel)
     {
@@ -1335,7 +1401,7 @@ internal sealed class QueuedRabbitMqMessageDispatcher : RabbitMqMessageDispatche
         {
             return _attachment is { } attachment && ReferenceEquals(attachment.Channel, channel)
                 ? attachment.Ended
-                : CancellationToken.None;
+                : new CancellationToken(canceled: true);
         }
     }
 
@@ -1400,8 +1466,9 @@ internal sealed class QueuedRabbitMqMessageDispatcher : RabbitMqMessageDispatche
 
     private async ValueTask TryRequeueAsync(RabbitMqDelivery delivery, IRabbitMqChannel channel)
     {
-        // A closed channel already returned every un-ACKed delivery to the queue; NACKing it would throw.
-        if (!channel.IsOpen)
+        // A closed channel already returned every un-ACKed delivery to the queue; NACKing it would
+        // throw (or, on a recovered channel object, name a stale delivery tag).
+        if (DeliveryChannelGone(delivery, channel))
             return;
 
         try

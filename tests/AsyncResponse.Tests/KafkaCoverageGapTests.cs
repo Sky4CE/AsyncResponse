@@ -245,9 +245,11 @@ public class KafkaCoverageGapTests
 
         Assert.Contains(logger.Entries, e => e.Level == LogLevel.Error
             && e.Message.StartsWith("1 already-committed Kafka messages on worker-topic were neither handled nor dead-lettered", StringComparison.Ordinal));
-        Assert.Contains(logger.Entries, e => e.Level == LogLevel.Error
+        // The hung produce was abandoned at the reserve, not failed: librdkafka may still deliver
+        // it, so the log says unconfirmed (Warning) rather than lost (round 65).
+        Assert.Contains(logger.Entries, e => e.Level == LogLevel.Warning
             && e.Message.Contains("worker-topic[0]@2 was not started", StringComparison.Ordinal)
-            && e.Message.Contains("its dead-letter copy could not be written", StringComparison.Ordinal));
+            && e.Message.Contains("its dead-letter copy is unconfirmed", StringComparison.Ordinal));
         Assert.Empty(producer.Publishes);
 
         releaseHandler.SetResult();

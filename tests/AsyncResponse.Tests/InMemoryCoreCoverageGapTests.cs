@@ -411,9 +411,13 @@ public sealed class InMemoryCoreCoverageGapTests
 
         clock.Advance(TimeSpan.FromSeconds(11));
 
-        await logger.WaitForAsync("Error handling waiter timeout for correlationId gap-timeout-logger");
+        await logger.WaitForAsync("Timed out waiting for response for correlationId gap-timeout-logger");
         await Assert.ThrowsAsync<TimeoutException>(() => waiter.ResponseTask.WaitAsync(TimeSpan.FromSeconds(30)));
-        Assert.Contains(logger.Messages, message => message.StartsWith("Timed out waiting for response", StringComparison.Ordinal));
+
+        // Round 65: the timeout warning is guarded (and logged after the metric and span), so
+        // its throw no longer escapes to the timer body's error report.
+        await waiter.DisposeAsync();
+        Assert.DoesNotContain(logger.Messages, message => message.StartsWith("Error handling waiter timeout", StringComparison.Ordinal));
     }
 
     private static async Task WaitUntilAsync(Func<bool> condition)

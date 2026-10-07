@@ -23,9 +23,13 @@ concurrency:
 jobs:
   publish:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # Up to 45 minutes waiting for the commit's CI run (see "Require a green CI run" below) plus
+    # the build, the two unit legs and the push.
+    timeout-minutes: 90
     permissions:
       contents: read
+      # Reads the commit's CI run (scripts/require-ci-success.sh); nothing here writes to Actions.
+      actions: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -34,8 +38,10 @@ jobs:
 
       # A tag can be pushed to ANY commit, including one that never went through a pull request.
       # Without this, tag-creation rights alone were enough to publish unreviewed code to nuget.org
-      # under the repository's push key — around branch protection, not through it. Publishing only
-      # what `main` already contains puts the review gate back in front of the package.
+      # under the repository's push key. Publishing only what `main` already contains keeps a
+      # side-branch commit off the feed — but `main` itself takes direct pushes and is not a
+      # gate: being on main proves only that a commit is there, not that anything tested it. The
+      # next step is what proves that.
       - name: Verify the tagged commit is on main
         run: |
           git fetch --no-tags origin main
@@ -44,6 +50,23 @@ jobs:
             exit 1
           fi
           echo "Tagged commit is an ancestor of origin/main."
+
+      # CI runs AFTER a commit lands on main, so without this a tag on a commit whose integration
+      # batches, matrix shards, Native AOT legs or cross-platform units failed — or had not
+      # finished yet — was published on the strength of the unit suite below alone. The gate
+      # requires the commit's latest ci.yml run from a push to main to have concluded `success`
+      # (so a run auto-retry.yml re-ran green counts, and one still re-running is waited for). A
+      # run still in progress is waited for up to 45 minutes (a CI run takes 20–25); a failed,
+      # cancelled — e.g. superseded in CI's concurrency queue — or missing run, or an API error,
+      # fails the job, and re-running it once CI is green is enough. Logic and fixtures:
+      # scripts/require-ci-success.sh, scripts/tests/require-ci-success.test.sh.
+      - name: Require a green CI run of the tagged commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          CI_WAIT_SECONDS: "2700"
+          CI_POLL_SECONDS: "60"
+        run: COMMIT_SHA="$(git rev-parse HEAD)" bash scripts/require-ci-success.sh
 
       - name: Setup .NET
         uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
@@ -74,7 +97,9 @@ jobs:
 
       # Unit suite only, one TFM at a time — same invocation shape as ci.yml (MTP otherwise runs
       # both TFMs concurrently, which starves real-time tests on the 2-core hosted runner).
-      # The Docker/Aspire integration suite is omitted here because it already gates every merge to main.
+      # The Docker/Aspire integration suite is not re-run here: the "Require a green CI run" step
+      # above already demands that ci.yml — integration batches, matrix shards and AOT legs
+      # included — passed for this exact commit. These legs re-test the Release build being packed.
       # No coverage collection: nothing consumed the output here, and an instrumented run gates on
       # rewritten IL rather than on what ships (see scripts/coverage-collect.sh); this job is a
       # release gate, not a coverage source.
@@ -100,7 +125,8 @@ jobs:
       - name: Verify sibling package dependencies are pinned
         # The packages share internals, so a mixed-version install fails at runtime rather than at
         # restore. src/Directory.Build.targets pins each sibling dependency to an exact version
-        # through a private NuGet pack target; this is the check from outside it.
+        # through a private NuGet pack target; this is the check from outside it (ci.yml runs it
+        # on every push too, so a broken pin is seen long before a release).
         run: bash scripts/verify-package-dependencies.sh ./artifacts
 
       - name: Push to nuget.org

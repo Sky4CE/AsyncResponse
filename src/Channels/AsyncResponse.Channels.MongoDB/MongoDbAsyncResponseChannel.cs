@@ -42,6 +42,13 @@ internal sealed class MongoDbAsyncResponseChannel : DbAsyncResponseChannelBase
             localDispatchRetryHint: "listener retry will pick it up",
             timeProvider)
     {
+        // The poll tick is the only cross-process wake with UseChangeStreams off, on a standalone
+        // (change streams unsupported), and while a stream is down or reconnecting — PostgreSQL's
+        // LISTEN-down case.
+        WarnIfSweepCadenceOutrunsConfirmation(
+            nameof(MongoDbAsyncResponseChannelOptions.ListenerPollInterval),
+            _options.ListenerPollInterval,
+            "Without an open change stream the poll tick is the only cross-process wake.");
     }
 
     /// <inheritdoc />

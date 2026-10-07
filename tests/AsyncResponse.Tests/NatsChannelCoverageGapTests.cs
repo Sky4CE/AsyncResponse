@@ -473,7 +473,9 @@ public sealed class NatsChannelCoverageGapTests
             Options.Create(new NatsAsyncResponseChannelOptions
             {
                 DefaultTimeout = TimeSpan.FromSeconds(5),
-                RecoveryStateExpiry = TimeSpan.FromMinutes(5),
+                // Above the 10-minute waits several tests use: since round 65 a NATS wait may not
+                // outlive its registration (the KV bucket's MaxAge = RecoveryStateExpiry).
+                RecoveryStateExpiry = TimeSpan.FromMinutes(15),
                 DisposalDrainTimeout = drainTimeout ?? TimeSpan.FromSeconds(5)
             }),
             new AsyncResponseContextPropagation([]),

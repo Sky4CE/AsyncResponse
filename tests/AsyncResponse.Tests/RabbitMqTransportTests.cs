@@ -1835,6 +1835,8 @@ public class RabbitMqTransportTests
             return Task.CompletedTask;
         }
 
+        public Task AbortAsync() => Task.CompletedTask;
+
         public ValueTask DisposeAsync()
         {
             DisposeCalls++;

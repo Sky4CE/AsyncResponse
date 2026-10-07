@@ -19,16 +19,25 @@ public interface IAsyncResponseIngress
     /// Handles an inbound response message (raw JSON) for the given correlation id.
     /// Transient handling failures are retried in-process, then escalated through
     /// <see cref="IAsyncResponsePublisher.SetException"/> so the registered failure callback
-    /// runs, keeping broker subscription loops alive; failures no retry can fix (an unparseable
-    /// body, a recovery callback that can never be wired up) escalate on the first attempt.
+    /// runs, keeping broker subscription loops alive; a failure no retry can fix (an unparseable
+    /// body) escalates on the first attempt. A recovery resume callback that can never be wired
+    /// up is settled on its own registration's failure callback by the lost-subscriber dispatch
+    /// and never reaches this escalation.
     /// <para>
-    /// A throw means "do not acknowledge — redeliver", and it happens in exactly three cases, none
+    /// A throw means "do not acknowledge — redeliver", and it happens in exactly five cases, none
     /// of which is escalated: the escalation itself failed (the response would otherwise be
     /// acknowledged while existing nowhere); a <c>RecoveryCallbackFailedException</c> — the
     /// lost-subscriber failure callback already exhausted its own in-process retries, and
-    /// escalating would only invoke it again; or an <see cref="OperationCanceledException"/>,
+    /// escalating would only invoke it again; an <see cref="OperationCanceledException"/>,
     /// which is not a handler failure (a durable flow lost its execution lease, or the host is
-    /// stopping). The transport's redelivery/dead-letter policy then retries the delivery.
+    /// stopping); a <see cref="RecoveryStateUnreadableException"/> — the recovery store holds
+    /// registrations this build cannot interpret, so a build that can (the newer one a rolling
+    /// upgrade is bringing up) must receive the response; or a
+    /// <see cref="RecoveryStateUnconfirmedException"/> — the store could not confirm its lookup
+    /// (for example a replica-set majority barrier failed), and escalating would run the failure
+    /// callback for a response that was produced successfully. The last two still pass through
+    /// the in-process retry ladder first, which paces the redelivery. The transport's
+    /// redelivery/dead-letter policy then retries the delivery.
     /// </para>
     /// </summary>
     /// <param name="messageJson">The raw message body.</param>

@@ -47,6 +47,9 @@ public interface IDurableFlowExecutor
     /// <summary>
     /// Lost-subscriber success target: checkpoints the terminal payload into the matching pending
     /// step before re-enqueueing execution, so recovery does not wait for a consumed correlation id.
+    /// A step that already faulted on <paramref name="correlationId"/> (it timed out, or its wait
+    /// failed) is not pending on it any more: the late payload is not checkpointed into it — flow
+    /// code may already have caught the fault and moved on — and the step restarts fresh instead.
     /// </summary>
     Task RecoverAsync(string flowId, object payload, string correlationId);
 
@@ -58,8 +61,9 @@ public interface IDurableFlowExecutor
     /// <see cref="FlowRunStatus.Failed"/> only while a step is still pending on
     /// <paramref name="correlationId"/>. A failure for a correlation id the flow has since settled
     /// or superseded (a dead worker's registration outliving the replacement's, a late error for a
-    /// step that already restarted fresh) is stale and is ignored — the same scoping
-    /// <see cref="RecoverAsync"/> applies to the success target.
+    /// step that already restarted fresh, or one that already faulted on that id — timed out and
+    /// caught by a best-effort flow, or about to restart from the transport's retry) is stale and
+    /// is ignored — the same scoping <see cref="RecoverAsync"/> applies to the success target.
     /// </summary>
     Task FailAsync(string flowId, Exception exception, string correlationId);
 }
@@ -147,7 +151,14 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
         var state = await store.LoadAsync(flowId).ConfigureAwait(false);
         if (state is null)
         {
-            _logger.LogWarning("Durable flow {FlowId} has no state (unknown, pruned, or expired); nothing to execute.", flowId);
+            // Every log line in this executor is guarded (SafeLog): each one sits between a
+            // decision already made — often a durable write or publish already committed — and the
+            // work or acknowledgement that must follow it. A throwing logging provider (MEL's
+            // aggregate logger rethrows a provider's failure) turned an ack into a retried
+            // delivery, a committed park into a failure, a Succeeded run into a "failed attempt".
+            SafeLog.Try(
+                (Logger: _logger, FlowId: flowId),
+                static s => s.Logger.LogWarning("Durable flow {FlowId} has no state (unknown, pruned, or expired); nothing to execute.", s.FlowId));
             return;
         }
 
@@ -156,7 +167,9 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
 
         if (state.Status != FlowRunStatus.Running)
         {
-            _logger.LogDebug("Durable flow {FlowId} is already {Status}; skipping execution.", flowId, state.Status);
+            SafeLog.Try(
+                (Logger: _logger, FlowId: flowId, state.Status),
+                static s => s.Logger.LogDebug("Durable flow {FlowId} is already {Status}; skipping execution.", s.FlowId, s.Status));
             // Re-notify terminal runs on duplicate deliveries: the ORIGINAL delivery's
             // run-finished notification (below, outside the try/catch) may itself have thrown and
             // caused this redelivery — skipping here would lose the terminal event forever.
@@ -188,8 +201,12 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
             {
                 // The context persisted the suspended state BEFORE enqueueing the child; saving here
                 // could overwrite newer checkpoints written by a parent re-execution the child has
-                // already triggered on another worker.
-                _logger.LogDebug("Durable flow {FlowId} suspended: {Message}", flowId, state.LastMessage);
+                // already triggered on another worker. The park is committed (its wake-up is
+                // published, its lease released): a throwing logger here used to reach the
+                // general catch below, fail the delivery, and save through the released lease.
+                SafeLog.Try(
+                    (Logger: _logger, FlowId: flowId, state.LastMessage),
+                    static s => s.Logger.LogDebug("Durable flow {FlowId} suspended: {Message}", s.FlowId, s.LastMessage));
                 return;
             }
 
@@ -197,13 +214,18 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
             state.LastMessage = "Flow completed.";
             await lease.SaveAsync(state, _options.StateExpiry).ConfigureAwait(false);
 
-            _logger.LogInformation("Durable flow {FlowId} completed successfully (attempt {Attempts}).", flowId, state.Attempts);
+            // Nothing after the terminal save stays inside this try: an exception from here on
+            // would enter the general catch below and rewrite a Succeeded ledger's message with
+            // its own, report the attempt failed, and fail the delivery. The success line is
+            // logged after the try/catch, once the outcome is settled.
         }
         catch (DurableFlowSuspendedException ex)
         {
             // Same as the IsSuspended return above: the suspended state is already persisted, and a
             // save here races the child-triggered parent re-execution.
-            _logger.LogDebug("Durable flow {FlowId} suspended: {Message}", flowId, ex.Message);
+            SafeLog.Try(
+                (Logger: _logger, FlowId: flowId, ex.Message),
+                static s => s.Logger.LogDebug("Durable flow {FlowId} suspended: {Message}", s.FlowId, s.Message));
             return;
         }
         catch (DurableFlowInterruptedException ex)
@@ -247,7 +269,12 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
             }
 
             AsyncResponseDiagnostics.SetError(activity, ex);
-            _logger.LogWarning(ex, "Durable flow {FlowId} failed terminally: {Message}", flowId, ex.Message);
+            // Guarded: the terminal Failed save above is committed; a throw here failed the
+            // delivery and deferred the run-finished and parent notifications below to a
+            // redelivery that, once the attempts ran out, never came.
+            SafeLog.Try(
+                (Logger: _logger, Error: ex, FlowId: flowId),
+                static s => s.Logger.LogWarning(s.Error, "Durable flow {FlowId} failed terminally: {Message}", s.FlowId, s.Error.Message));
         }
         catch (Exception ex) when (lease.LostToken.IsCancellationRequested)
         {
@@ -284,6 +311,13 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
         // with a telemetry error — "the run's outcome is never at stake". A throw from here
         // propagates for redelivery; the replay sees the terminal status, RE-NOTIFIES (so the
         // event that just failed is not lost), and acks.
+        if (state.Status == FlowRunStatus.Succeeded)
+        {
+            SafeLog.Try(
+                (Logger: _logger, FlowId: flowId, state.Attempts),
+                static s => s.Logger.LogInformation("Durable flow {FlowId} completed successfully (attempt {Attempts}).", s.FlowId, s.Attempts));
+        }
+
         await NotifyRunFinishedAsync(state).ConfigureAwait(false);
         await NotifyParentAsync(state).ConfigureAwait(false);
     }
@@ -406,7 +440,9 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
                 var state = await store.LoadAsync(flowId).ConfigureAwait(false);
                 if (state is null)
                 {
-                    _logger.LogWarning("Durable flow {FlowId} has no state (unknown, expired, or unreadable); nothing to execute.", flowId);
+                    SafeLog.Try(
+                        (Logger: _logger, FlowId: flowId),
+                        static s => s.Logger.LogWarning("Durable flow {FlowId} has no state (unknown, expired, or unreadable); nothing to execute.", s.FlowId));
                     return null;
                 }
 
@@ -415,7 +451,9 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
 
                 if (state.Status != FlowRunStatus.Running)
                 {
-                    _logger.LogDebug("Durable flow {FlowId} is already {Status}; skipping duplicate delivery.", flowId, state.Status);
+                    SafeLog.Try(
+                        (Logger: _logger, FlowId: flowId, state.Status),
+                        static s => s.Logger.LogDebug("Durable flow {FlowId} is already {Status}; skipping duplicate delivery.", s.FlowId, s.Status));
                     // Same at-least-once re-notify as ExecuteAsync's terminal early return: the prior
                     // delivery may have died in the run-finished notification itself.
                     if (state.Status is FlowRunStatus.Succeeded or FlowRunStatus.Failed)
@@ -490,10 +528,12 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
                             // lease written before WorkerJobEnvelope.JobId existed, mid rolling
                             // upgrade) the two cannot be told apart, and the evidence-based ack
                             // applies as it did before.
-                            _logger.LogDebug(
-                                "Durable flow {FlowId} is executing on another live worker (its lease was {Evidence} while this delivery waited); skipping duplicate delivery.",
-                                flowId,
-                                string.Equals(observed.LeaseId, baseline.LeaseId, StringComparison.Ordinal) ? "renewed" : "taken over");
+                            SafeLog.Try(
+                                (Logger: _logger, FlowId: flowId, Evidence: string.Equals(observed.LeaseId, baseline.LeaseId, StringComparison.Ordinal) ? "renewed" : "taken over"),
+                                static s => s.Logger.LogDebug(
+                                    "Durable flow {FlowId} is executing on another live worker (its lease was {Evidence} while this delivery waited); skipping duplicate delivery.",
+                                    s.FlowId,
+                                    s.Evidence));
                             return null;
 
                         case FlowLeaseContentionVerdict.HolderOwnJobRedelivered:
@@ -513,13 +553,15 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
                             {
                                 ownJobHolderLeaseId = observed.LeaseId;
                                 AsyncResponseDiagnostics.RecordFlowOwnJobRedelivery(redelay is not null ? "redelayed" : "waiting");
-                                _logger.LogWarning(
-                                    "Durable flow {FlowId} wake-up is a redelivery of the job its live lease holder is still executing: a broker in-flight ceiling lapsed under the running handler " +
-                                    "(Google Pub/Sub MaxTotalAckExtension, RabbitMQ consumer_timeout, the SQS 12-hour visibility cap, a Kafka rebalance). It is the only copy of the wake-up the broker still has and is not acknowledged as a duplicate; {Resolution}.",
-                                    flowId,
-                                    redelay is not null
+                                SafeLog.Try(
+                                    (Logger: _logger, FlowId: flowId, Resolution: redelay is not null
                                         ? "it is re-published as the same job, delayed past the holder's lease"
-                                        : "it waits for the lease and is otherwise handed back to the transport");
+                                        : "it waits for the lease and is otherwise handed back to the transport"),
+                                    static s => s.Logger.LogWarning(
+                                        "Durable flow {FlowId} wake-up is a redelivery of the job its live lease holder is still executing: a broker in-flight ceiling lapsed under the running handler " +
+                                        "(Google Pub/Sub MaxTotalAckExtension, RabbitMQ consumer_timeout, the SQS 12-hour visibility cap, a Kafka rebalance). It is the only copy of the wake-up the broker still has and is not acknowledged as a duplicate; {Resolution}.",
+                                        s.FlowId,
+                                        s.Resolution));
                             }
 
                             if (redelay is not null)
@@ -624,11 +666,16 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
         var hop = CopyForRedelay(job, FlowStateRetention.AddSaturating(nowUtc, delay));
         await transport.PublishAsync(hop, delay).ConfigureAwait(false);
 
-        _logger.LogInformation(
-            "Durable flow {FlowId} wake-up re-published as the same job, due {NotBeforeUtc:O} ({Delay} from now, past the live holder's lease); acknowledging this delivery.",
-            flowId,
-            hop.NotBeforeUtc,
-            delay);
+        // Guarded: the copy is published. A throw here failed (NAKed) this delivery while its copy
+        // already existed — both carry the holder's JobId, so neither is ever acknowledged as a
+        // duplicate, and under a persistently throwing provider every lease cadence doubled them.
+        SafeLog.Try(
+            (Logger: _logger, FlowId: flowId, hop.NotBeforeUtc, Delay: delay),
+            static s => s.Logger.LogInformation(
+                "Durable flow {FlowId} wake-up re-published as the same job, due {NotBeforeUtc:O} ({Delay} from now, past the live holder's lease); acknowledging this delivery.",
+                s.FlowId,
+                s.NotBeforeUtc,
+                s.Delay));
     }
 
     /// <summary>
@@ -696,9 +743,11 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
                 if (StartedBeyondStateExpiry(initial, out var age)
                     && await store.LoadAsync(flowId).ConfigureAwait(false) is null)
                 {
-                    _logger.LogError(
-                        "Durable flow {FlowId} ({FlowType}) start job dropped: the start is {Age} old — past {StateExpiryOption} ({StateExpiry}) — and no ledger exists, so the run it started has finished and expired (or never ran within its ledger's lifetime). Re-creating it would re-execute completed work; start the flow again if it is still wanted.",
-                        flowId, AsyncResponseTypeResolution.DescribeForDiagnostics(initial.FlowTypeName), age, $"{nameof(DurableFlowOptions)}.{nameof(DurableFlowOptions.StateExpiry)}", _options.StateExpiry);
+                    SafeLog.Try(
+                        (Logger: _logger, FlowId: flowId, initial.FlowTypeName, Age: age, StateExpiry: _options.StateExpiry),
+                        static s => s.Logger.LogError(
+                            "Durable flow {FlowId} ({FlowType}) start job dropped: the start is {Age} old — past {StateExpiryOption} ({StateExpiry}) — and no ledger exists, so the run it started has finished and expired (or never ran within its ledger's lifetime). Re-creating it would re-execute completed work; start the flow again if it is still wanted.",
+                            s.FlowId, AsyncResponseTypeResolution.DescribeForDiagnostics(s.FlowTypeName), s.Age, $"{nameof(DurableFlowOptions)}.{nameof(DurableFlowOptions.StateExpiry)}", s.StateExpiry));
                     return;
                 }
 
@@ -706,7 +755,12 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
                 {
                     // The starter died (or has not got there yet) between its publish and its own
                     // create: the job is the durable record of the start, so the ledger comes from it.
-                    _logger.LogInformation("Durable flow {FlowId} ({FlowType}) ledger created from its start job.", flowId, AsyncResponseTypeResolution.DescribeForDiagnostics(initial.FlowTypeName));
+                    // Guarded: the ledger is created. A throw here dead-lettered (under a persistent
+                    // throw) a start job whose Running, never-executed ledger nothing would wake —
+                    // the orphan publish-first exists to prevent.
+                    SafeLog.Try(
+                        (Logger: _logger, FlowId: flowId, initial.FlowTypeName),
+                        static s => s.Logger.LogInformation("Durable flow {FlowId} ({FlowType}) ledger created from its start job.", s.FlowId, AsyncResponseTypeResolution.DescribeForDiagnostics(s.FlowTypeName)));
                     break;
                 }
 
@@ -734,9 +788,11 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
                     // and dead-letter policy is the alarm for it.
                     if (createAttempt < MaxStartCreateAttempts)
                     {
-                        _logger.LogDebug(
-                            "Durable flow {FlowId} start job lost its create to a ledger that is already expired or gone; creating again (attempt {Attempt}).",
-                            flowId, createAttempt + 1);
+                        SafeLog.Try(
+                            (Logger: _logger, FlowId: flowId, Attempt: createAttempt + 1),
+                            static s => s.Logger.LogDebug(
+                                "Durable flow {FlowId} start job lost its create to a ledger that is already expired or gone; creating again (attempt {Attempt}).",
+                                s.FlowId, s.Attempt));
                         continue;
                     }
 
@@ -753,11 +809,13 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
                     // published at all); executing the EXISTING run here would wake a flow nobody
                     // asked to wake, and a second one cannot live under the same id. Drop the job,
                     // loudly.
-                    _logger.LogError(
-                        "Durable flow {FlowId} start job dropped: the id is already bound to flow type {ExistingFlowType} with different input, not {RequestedFlowType}. Idempotent retries must use the same flow type, input type, and semantically identical input.",
-                        flowId,
-                        AsyncResponseTypeResolution.DescribeForDiagnostics(existing.FlowTypeName),
-                        AsyncResponseTypeResolution.DescribeForDiagnostics(initial.FlowTypeName));
+                    SafeLog.Try(
+                        (Logger: _logger, FlowId: flowId, Existing: existing.FlowTypeName, Requested: initial.FlowTypeName),
+                        static s => s.Logger.LogError(
+                            "Durable flow {FlowId} start job dropped: the id is already bound to flow type {ExistingFlowType} with different input, not {RequestedFlowType}. Idempotent retries must use the same flow type, input type, and semantically identical input.",
+                            s.FlowId,
+                            AsyncResponseTypeResolution.DescribeForDiagnostics(s.Existing),
+                            AsyncResponseTypeResolution.DescribeForDiagnostics(s.Requested)));
                     return;
                 }
 
@@ -812,17 +870,23 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
 
         if (state is null)
         {
-            _logger.LogWarning("Durable flow {FlowId} cannot resume: no state (unknown, expired, or unreadable).", flowId);
+            SafeLog.Try(
+                (Logger: _logger, FlowId: flowId),
+                static s => s.Logger.LogWarning("Durable flow {FlowId} cannot resume: no state (unknown, expired, or unreadable).", s.FlowId));
             return;
         }
 
         if (state.Status != FlowRunStatus.Running)
         {
-            _logger.LogDebug("Durable flow {FlowId} is already {Status}; ignoring resume.", flowId, state.Status);
+            SafeLog.Try(
+                (Logger: _logger, FlowId: flowId, state.Status),
+                static s => s.Logger.LogDebug("Durable flow {FlowId} is already {Status}; ignoring resume.", s.FlowId, s.Status));
             return;
         }
 
-        _logger.LogDebug("Durable flow {FlowId} resuming via worker transport.", flowId);
+        SafeLog.Try(
+            (Logger: _logger, FlowId: flowId),
+            static s => s.Logger.LogDebug("Durable flow {FlowId} resuming via worker transport.", s.FlowId));
         await _builder.EnqueueWorkerAsync<IDurableFlowExecutor>(executor => executor.ExecuteAsync(flowId)).ConfigureAwait(false);
     }
 
@@ -858,8 +922,12 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
             if (!checkpointable || state.Steps is null)
                 return false;
 
-            var pending = state.Steps.FirstOrDefault(pair =>
-                string.Equals(pair.Value.PendingCorrelationId, correlationId, StringComparison.Ordinal));
+            // A step that FAULTED on this id is not pending on it (see
+            // DurableFlowContext.IsAwaitingResponse): the engine restarts it fresh, and flow code may
+            // already have caught the fault and moved on — completing it here rewrote that history,
+            // and the next replay took the other branch. Such a response falls through to the
+            // no-pending-step path below, like any other stale one.
+            var pending = state.Steps.FirstOrDefault(pair => DurableFlowContext.IsAwaitingResponse(pair.Value, correlationId));
             if (pending.Value is null)
                 return false;
 
@@ -902,7 +970,9 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
 
         if (!found)
         {
-            _logger.LogWarning("Durable flow {FlowId} cannot recover response {CorrelationId}: no state found.", flowId, correlationId);
+            SafeLog.Try(
+                (Logger: _logger, FlowId: flowId, CorrelationId: correlationId),
+                static s => s.Logger.LogWarning("Durable flow {FlowId} cannot recover response {CorrelationId}: no state found.", s.FlowId, s.CorrelationId));
             return;
         }
 
@@ -910,7 +980,9 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
         {
             if (!running)
             {
-                _logger.LogDebug("Durable flow {FlowId} is {Status}; ignoring recovered correlationId {CorrelationId}.", flowId, lastStatus, correlationId);
+                SafeLog.Try(
+                    (Logger: _logger, FlowId: flowId, Status: lastStatus, CorrelationId: correlationId),
+                    static s => s.Logger.LogDebug("Durable flow {FlowId} is {Status}; ignoring recovered correlationId {CorrelationId}.", s.FlowId, s.Status, s.CorrelationId));
                 return;
             }
 
@@ -918,13 +990,17 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
             // between checkpointing this response and enqueueing the run, making this redelivery
             // the only remaining wake-up. Re-enqueue instead of dropping — it is idempotent, and
             // worst case the job finds a live holder's lease and acks as a duplicate.
-            _logger.LogDebug("Durable flow {FlowId} has no pending step for recovered correlationId {CorrelationId}; re-enqueueing execution to cover a checkpoint/enqueue crash window.", flowId, correlationId);
+            SafeLog.Try(
+                (Logger: _logger, FlowId: flowId, CorrelationId: correlationId),
+                static s => s.Logger.LogDebug("Durable flow {FlowId} has no pending step for recovered correlationId {CorrelationId}; re-enqueueing execution to cover a checkpoint/enqueue crash window.", s.FlowId, s.CorrelationId));
             await _builder.EnqueueWorkerAsync<IDurableFlowExecutor>(executor => executor.ExecuteAsync(flowId)).ConfigureAwait(false);
             return;
         }
 
         // A recovered response can be the write that takes the ledger past a warning band, and no
         // context saw it: the next execution seeds its warning above the ledger's new size.
+        // Self-guarding: the checkpoint is committed, and the step-completed event and wake-up
+        // below must follow it.
         DurableFlowContext.WarnIfWriteCrossedLedgerWarning(_logger, _options, checkpointedState!, sizeBefore);
 
         // The completion recorded here is the ONLY chance observers get to see this step finish:
@@ -938,13 +1014,17 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
 
         if (!running)
         {
-            _logger.LogInformation(
-                "Durable flow {FlowId} checkpointed recovered correlationId {CorrelationId} while Suspended; not waking the run — ResumeAsync continues from the checkpoint.",
-                flowId, correlationId);
+            SafeLog.Try(
+                (Logger: _logger, FlowId: flowId, CorrelationId: correlationId),
+                static s => s.Logger.LogInformation(
+                    "Durable flow {FlowId} checkpointed recovered correlationId {CorrelationId} while Suspended; not waking the run — ResumeAsync continues from the checkpoint.",
+                    s.FlowId, s.CorrelationId));
             return;
         }
 
-        _logger.LogDebug("Durable flow {FlowId} checkpointed recovered correlationId {CorrelationId}; resuming.", flowId, correlationId);
+        SafeLog.Try(
+            (Logger: _logger, FlowId: flowId, CorrelationId: correlationId),
+            static s => s.Logger.LogDebug("Durable flow {FlowId} checkpointed recovered correlationId {CorrelationId}; resuming.", s.FlowId, s.CorrelationId));
         await _builder.EnqueueWorkerAsync<IDurableFlowExecutor>(executor => executor.ExecuteAsync(flowId)).ConfigureAwait(false);
     }
 
@@ -1010,10 +1090,15 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
             // A correlation-scoped failure only counts against the step still pending on
             // that id (RecoverAsync parity): a dead worker's registration outlives the
             // replacement's, so a late error for a superseded or already-settled correlation
-            // id must not fail a run that is live on another one.
+            // id must not fail a run that is live on another one. Nor one whose step FAULTED on
+            // that id (DurableFlowContext.IsAwaitingResponse): the breadcrumb outlives the fault,
+            // but the engine restarts the step fresh — and a flow that caught the fault (a
+            // best-effort step) has already moved on, so a late remote failure behind it failed a
+            // healthy run terminally; a flow that did not catch it is in the transport's retry
+            // backoff, about to restart the step.
             if (correlationId is not null
                 && (state.Steps is null
-                    || !state.Steps.Values.Any(step => string.Equals(step.PendingCorrelationId, correlationId, StringComparison.Ordinal))))
+                    || !state.Steps.Values.Any(step => DurableFlowContext.IsAwaitingResponse(step, correlationId))))
             {
                 stale = true;
                 return false;
@@ -1055,19 +1140,25 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
 
         if (!found || updated is null)
         {
-            _logger.LogWarning("Durable flow {FlowId} cannot be failed: no state (unknown, expired, or unreadable).", flowId);
+            SafeLog.Try(
+                (Logger: _logger, FlowId: flowId),
+                static s => s.Logger.LogWarning("Durable flow {FlowId} cannot be failed: no state (unknown, expired, or unreadable).", s.FlowId));
             return;
         }
 
         if (stale)
         {
-            _logger.LogDebug("Durable flow {FlowId} has no step pending on correlationId {CorrelationId}; ignoring stale failure signal.", flowId, correlationId);
+            SafeLog.Try(
+                (Logger: _logger, FlowId: flowId, CorrelationId: correlationId),
+                static s => s.Logger.LogDebug("Durable flow {FlowId} has no step pending on correlationId {CorrelationId}; ignoring stale failure signal.", s.FlowId, s.CorrelationId));
             return;
         }
 
         if (!failedNow)
         {
-            _logger.LogDebug("Durable flow {FlowId} is already {Status}; ignoring failure signal.", flowId, updated.Status);
+            SafeLog.Try(
+                (Logger: _logger, FlowId: flowId, updated.Status),
+                static s => s.Logger.LogDebug("Durable flow {FlowId} is already {Status}; ignoring failure signal.", s.FlowId, s.Status));
             // At-least-once re-notify, as in ExecuteAsync: the prior delivery of this failure
             // signal may have marked the run and then died in its own run-finished notification.
             if (updated.Status is FlowRunStatus.Succeeded or FlowRunStatus.Failed)
@@ -1083,7 +1174,11 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
         await NotifyRunFinishedAsync(updated).ConfigureAwait(false);
         await NotifyParentAsync(updated).ConfigureAwait(false);
 
-        _logger.LogWarning(exception, "Durable flow {FlowId} failed via lost-subscriber routing: {Message}", flowId, exception.Message);
+        // Guarded: everything the signal had to do is done; a throw here turned it into a
+        // RecoveryCallbackFailedException, a redelivered signal, and a second parent wake-up.
+        SafeLog.Try(
+            (Logger: _logger, Error: exception, FlowId: flowId),
+            static s => s.Logger.LogWarning(s.Error, "Durable flow {FlowId} failed via lost-subscriber routing: {Message}", s.FlowId, s.Error.Message));
     }
 
     private DurableFlowContext CreateContext(
@@ -1169,11 +1264,16 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
     /// </summary>
     private DurableFlowSuspendedException ParkOutranConversion(FlowState state, Exception converted)
     {
-        _logger.LogWarning(
-            converted,
-            "Durable flow {FlowId} parked (its wake-up is already published), but flow code converted the park's cancellation into {ExceptionType}; the run stays parked. Let DurableFlowInterruptedException — an OperationCanceledException — propagate from context calls.",
-            state.FlowId,
-            converted.GetType().FullName);
+        // Guarded: this builds the exception that REPLACES the conversion. A throwing logging
+        // provider's exception replaced it instead, and the committed park read as a failed
+        // delivery — retried, re-parked, publishing another wake-up each time.
+        SafeLog.Try(
+            (Logger: _logger, Error: converted, state.FlowId),
+            static s => s.Logger.LogWarning(
+                s.Error,
+                "Durable flow {FlowId} parked (its wake-up is already published), but flow code converted the park's cancellation into {ExceptionType}; the run stays parked. Let DurableFlowInterruptedException — an OperationCanceledException — propagate from context calls.",
+                s.FlowId,
+                s.Error.GetType().FullName));
         return new DurableFlowSuspendedException(state.LastMessage ?? $"Flow {state.FlowId} is suspended.");
     }
 
@@ -1186,11 +1286,15 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
     /// caller rethrows the interruption itself, which the transport recognises as a hand-back.
     /// </summary>
     private void InterruptionOutranConversion(FlowState state, Exception converted)
-        => _logger.LogWarning(
-            converted,
-            "Durable flow {FlowId} was interrupted by host stop (its delivery is handed back for redelivery), but flow code converted the interruption into {ExceptionType}; the delivery is still handed back. Let DurableFlowInterruptedException — an OperationCanceledException — propagate from context calls.",
-            state.FlowId,
-            converted.GetType().FullName);
+        // Guarded: the caller rethrows the interruption next — its TYPE is the hand-back signal,
+        // and a throwing logging provider's exception escaped in its place.
+        => SafeLog.Try(
+            (Logger: _logger, Error: converted, state.FlowId),
+            static s => s.Logger.LogWarning(
+                s.Error,
+                "Durable flow {FlowId} was interrupted by host stop (its delivery is handed back for redelivery), but flow code converted the interruption into {ExceptionType}; the delivery is still handed back. Let DurableFlowInterruptedException — an OperationCanceledException — propagate from context calls.",
+                s.FlowId,
+                s.Error.GetType().FullName));
 
     [UnconditionalSuppressMessage("Trimming", "IL2026",
         Justification = "Reflection fallback for flows not registered via WithDurableFlow<TFlow, TInput>(). In a trimmed app an " +
@@ -1406,12 +1510,15 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
             return Task.CompletedTask;
 
         var parentFlowId = state.ParentFlowId;
-        _logger.LogInformation(
-            "Durable child flow {FlowId} reached {Status}; resuming parent flow {ParentFlowId} step '{ParentStepName}'.",
-            state.FlowId,
-            state.Status,
-            parentFlowId,
-            state.ParentStepName);
+        // Guarded: logged before the parent's wake-up is enqueued, which a throw here skipped.
+        SafeLog.Try(
+            (Logger: _logger, state.FlowId, state.Status, ParentFlowId: parentFlowId, state.ParentStepName),
+            static s => s.Logger.LogInformation(
+                "Durable child flow {FlowId} reached {Status}; resuming parent flow {ParentFlowId} step '{ParentStepName}'.",
+                s.FlowId,
+                s.Status,
+                s.ParentFlowId,
+                s.ParentStepName));
 
         return _builder.EnqueueWorkerAsync<IDurableFlowExecutor>(executor => executor.ExecuteAsync(parentFlowId));
     }

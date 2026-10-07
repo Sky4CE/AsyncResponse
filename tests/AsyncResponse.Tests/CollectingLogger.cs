@@ -64,9 +64,17 @@ internal sealed class CollectingLogger : ILogger
     /// </summary>
     public string? ThrowOnMessageContaining { get; set; }
 
+    /// <summary>
+    /// Runs synchronously on the logging call's own thread and ExecutionContext as each message is
+    /// recorded — how a test observes the ambient state (Activity, transaction, AsyncLocals) a
+    /// background loop runs under.
+    /// </summary>
+    public Action<string>? OnMessage { get; set; }
+
     private void Add(string message, Exception? exception)
     {
         lock (_gate) _entries.Add((message, exception));
+        OnMessage?.Invoke(message);
 
         if (ThrowOnMessageContaining is { } fragment && message.Contains(fragment, StringComparison.OrdinalIgnoreCase))
             throw new InvalidOperationException("logger exploded");

@@ -123,6 +123,12 @@ internal abstract class DbRecoveryStateStoreBase(
     // derived store types, and reflection over a derived type sees inherited non-private members only.
     private protected RecoveryState? DeserializeState(string json, string? correlationId, ref int unreadable)
     {
+        // Every warning below goes through SafeLog: Microsoft.Extensions.Logging rethrows a
+        // provider's failure, and a throwing logger used to replace this method's documented
+        // outcomes — the ordinal re-check's "absent", the unreadable count that becomes
+        // RecoveryStateUnreadableException / RecoveryStateScanUnreadableException — with its own
+        // exception: a lost-subscriber publish for the id failed (and was redelivered) over a log
+        // line, and the watchdog's scan ended with an unrelated error.
         try
         {
             // Through JsonSafety, not the raw reader: the exception logged below is the body-free
@@ -138,22 +144,26 @@ internal abstract class DbRecoveryStateStoreBase(
 
             if (state.RegistrationId == Guid.Empty || string.IsNullOrWhiteSpace(state.CorrelationId))
             {
-                logger.LogWarning(
-                    "{Provider} recovery state for correlationId {CorrelationId} has an incomplete identity; rejecting it.",
-                    providerName,
-                    correlationId ?? state.CorrelationId);
+                SafeLog.Try(
+                    (Logger: logger, Provider: providerName, CorrelationId: correlationId ?? state.CorrelationId),
+                    static s => s.Logger.LogWarning(
+                        "{Provider} recovery state for correlationId {CorrelationId} has an incomplete identity; rejecting it.",
+                        s.Provider,
+                        s.CorrelationId));
                 unreadable++;
                 return null;
             }
 
             if (!RecoveryStateSchema.IsReadable(state.SchemaVersion))
             {
-                logger.LogWarning(
-                    "{Provider} recovery state for correlationId {CorrelationId} has unsupported schema version {SchemaVersion} (current: {Current}); rejecting it instead of risking a misinterpreted recovery.",
-                    providerName,
-                    correlationId ?? state.CorrelationId,
-                    state.SchemaVersion,
-                    RecoveryStateSchema.Current);
+                SafeLog.Try(
+                    (Logger: logger, Provider: providerName, CorrelationId: correlationId ?? state.CorrelationId, state.SchemaVersion),
+                    static s => s.Logger.LogWarning(
+                        "{Provider} recovery state for correlationId {CorrelationId} has unsupported schema version {SchemaVersion} (current: {Current}); rejecting it instead of risking a misinterpreted recovery.",
+                        s.Provider,
+                        s.CorrelationId,
+                        s.SchemaVersion,
+                        RecoveryStateSchema.Current));
                 unreadable++;
                 return null;
             }
@@ -161,9 +171,11 @@ internal abstract class DbRecoveryStateStoreBase(
             if (!string.IsNullOrWhiteSpace(correlationId)
                 && !string.Equals(state.CorrelationId, correlationId, StringComparison.Ordinal))
             {
-                logger.LogWarning(
-                    "{Provider} recovery state has correlationId {StoredCorrelationId}, expected {CorrelationId}; rejecting it.",
-                    providerName, state.CorrelationId, correlationId);
+                SafeLog.Try(
+                    (Logger: logger, Provider: providerName, Stored: state.CorrelationId, Expected: correlationId),
+                    static s => s.Logger.LogWarning(
+                        "{Provider} recovery state has correlationId {StoredCorrelationId}, expected {CorrelationId}; rejecting it.",
+                        s.Provider, s.Stored, s.Expected));
                 return null;
             }
 
@@ -171,7 +183,9 @@ internal abstract class DbRecoveryStateStoreBase(
         }
         catch (Exception ex) when (ex is JsonException or InvalidDataException)
         {
-            logger.LogWarning(ex, "Unreadable {Provider} recovery state for correlationId {CorrelationId}; skipping.", providerName, correlationId);
+            SafeLog.Try(
+                (Logger: logger, Error: ex, Provider: providerName, CorrelationId: correlationId),
+                static s => s.Logger.LogWarning(s.Error, "Unreadable {Provider} recovery state for correlationId {CorrelationId}; skipping.", s.Provider, s.CorrelationId));
             unreadable++;
             return null;
         }

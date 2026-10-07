@@ -159,7 +159,10 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
                 }
                 catch (Exception ex)
                 {
-                    _logger.LogError(ex, "Post-save recovery-state compensation delete failed for correlationId {CorrelationId}; the registration remains until TTL.", correlationId);
+                    SafeLog.Try((Logger: _logger, Error: ex, CorrelationId: correlationId), static state => state.Logger.LogError(
+                        state.Error,
+                        "Post-save recovery-state compensation delete failed for correlationId {CorrelationId}; the registration remains until TTL.",
+                        state.CorrelationId));
                 }
             }
             else
@@ -167,8 +170,13 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
                 subscription.ArmTimeout();
             }
 
-            if (_logger.IsEnabled(LogLevel.Debug))
-                _logger.LogDebug("Waiting for response on correlationId {CorrelationId} with timeout {Timeout}.", correlationId, timeout.Value);
+            // Guarded: the wait is fully registered (subscription, recovery state, timer) by now,
+            // and a throwing Debug provider here tore all of it down and failed the create.
+            SafeLog.Try((Logger: _logger, CorrelationId: correlationId, Timeout: timeout.Value), static state =>
+            {
+                if (state.Logger.IsEnabled(LogLevel.Debug))
+                    state.Logger.LogDebug("Waiting for response on correlationId {CorrelationId} with timeout {Timeout}.", state.CorrelationId, state.Timeout);
+            });
         }
         catch (Exception ex) when (subscription.ResponseTask.IsCompletedSuccessfully || subscription.ResponseTask.IsFaulted)
         {
@@ -320,9 +328,11 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
                     // non-delivery to the caller, whose retry machinery re-attempts (Redis/NATS
                     // parity). Returning here instead would silently drop the payload while the
                     // caller reports success.
-                    _logger.LogWarning(
+                    // Guarded: a throwing provider replaced the exception below — the one that tells
+                    // the caller the payload was not delivered and to retry — with its own.
+                    SafeLog.Try((Logger: _logger, CorrelationId: correlationId), static state => state.Logger.LogWarning(
                         "Response for correlationId {CorrelationId} kept racing subscriber churn; recovery registrations are left intact.",
-                        correlationId);
+                        state.CorrelationId));
                     activity?.SetTag("asyncresponse.recovery.liveness_contradiction", true);
                     throw new InvalidOperationException(
                         $"In-memory delivery for correlationId '{correlationId}' found no subscribers twice while a live subscriber kept " +
@@ -333,8 +343,14 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
 
             await DispatchResponsesAsync(subscribers, response, wireBytes, cancellationToken).ConfigureAwait(false);
 
-            if (_logger.IsEnabled(LogLevel.Debug))
-                _logger.LogDebug("Published response for correlationId {CorrelationId}. PayloadType: {PayloadType}. Subscribers: {SubscriberCount}.", correlationId, typeof(T), subscribers.Count);
+            // Guarded (Redis/NATS parity): the response is delivered by now, and a throwing Debug
+            // provider reported it to the publisher as a failed SetResponse — a worker handler
+            // publishing its reply was then retried, re-running its side effects.
+            SafeLog.Try((Logger: _logger, CorrelationId: correlationId, PayloadType: typeof(T), subscribers.Count), static state =>
+            {
+                if (state.Logger.IsEnabled(LogLevel.Debug))
+                    state.Logger.LogDebug("Published response for correlationId {CorrelationId}. PayloadType: {PayloadType}. Subscribers: {SubscriberCount}.", state.CorrelationId, state.PayloadType, state.Count);
+            });
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
@@ -401,9 +417,11 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
                     // non-delivery to the caller, whose retry machinery re-attempts (Redis/NATS
                     // parity). Returning here instead would silently drop the payload while the
                     // caller reports success.
-                    _logger.LogWarning(
+                    // Guarded: a throwing provider replaced the exception below — the one that tells
+                    // the caller the payload was not delivered and to retry — with its own.
+                    SafeLog.Try((Logger: _logger, CorrelationId: correlationId), static state => state.Logger.LogWarning(
                         "Response for correlationId {CorrelationId} kept racing subscriber churn; recovery registrations are left intact.",
-                        correlationId);
+                        state.CorrelationId));
                     activity?.SetTag("asyncresponse.recovery.liveness_contradiction", true);
                     throw new InvalidOperationException(
                         $"In-memory delivery for correlationId '{correlationId}' found no subscribers twice while a live subscriber kept " +
@@ -414,8 +432,12 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
 
             await DispatchRawJsonResponsesAsync(subscribers, response, cancellationToken).ConfigureAwait(false);
 
-            if (_logger.IsEnabled(LogLevel.Debug))
-                _logger.LogDebug("Published raw response for correlationId {CorrelationId}. Subscribers: {SubscriberCount}.", correlationId, subscribers.Count);
+            // Guarded: delivered by now (see SetResponseCore).
+            SafeLog.Try((Logger: _logger, CorrelationId: correlationId, subscribers.Count), static state =>
+            {
+                if (state.Logger.IsEnabled(LogLevel.Debug))
+                    state.Logger.LogDebug("Published raw response for correlationId {CorrelationId}. Subscribers: {SubscriberCount}.", state.CorrelationId, state.Count);
+            });
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
@@ -483,9 +505,11 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
                     // non-delivery to the caller, whose retry machinery re-attempts (Redis/NATS
                     // parity). Returning here instead would silently drop the payload while the
                     // caller reports success.
-                    _logger.LogWarning(
+                    // Guarded: a throwing provider replaced the exception below — the one that tells
+                    // the caller the payload was not delivered and to retry — with its own.
+                    SafeLog.Try((Logger: _logger, CorrelationId: correlationId), static state => state.Logger.LogWarning(
                         "Response for correlationId {CorrelationId} kept racing subscriber churn; recovery registrations are left intact.",
-                        correlationId);
+                        state.CorrelationId));
                     activity?.SetTag("asyncresponse.recovery.liveness_contradiction", true);
                     throw new InvalidOperationException(
                         $"In-memory delivery for correlationId '{correlationId}' found no subscribers twice while a live subscriber kept " +
@@ -496,8 +520,12 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
 
             await DispatchExceptionsAsync(subscribers, exception, cancellationToken).ConfigureAwait(false);
 
-            if (_logger.IsEnabled(LogLevel.Debug))
-                _logger.LogDebug("Published exception for correlationId {CorrelationId}. Subscribers: {SubscriberCount}.", correlationId, subscribers.Count);
+            // Guarded: delivered by now (see SetResponseCore).
+            SafeLog.Try((Logger: _logger, CorrelationId: correlationId, subscribers.Count), static state =>
+            {
+                if (state.Logger.IsEnabled(LogLevel.Debug))
+                    state.Logger.LogDebug("Published exception for correlationId {CorrelationId}. Subscribers: {SubscriberCount}.", state.CorrelationId, state.Count);
+            });
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
@@ -891,9 +919,6 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
             if (CleanupStarted)
                 return Task.CompletedTask;
 
-            if (!TryBeginTerminal())
-                return Task.CompletedTask;
-
             // Wire parity: every durable channel transmits only the message (plus, optionally, the
             // capped stack trace in Data["RemoteStackTrace"]) and faults the waiter with a plain
             // Exception — the concrete type never crosses the wire. Handing the publisher's live
@@ -901,18 +926,41 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
             // in production, the same divergence DeclaredWireSerializer exists to prevent for
             // payloads. The wait activity gets the wire channels' tag too: error.type is
             // "remote_failure", never the publisher's concrete exception type.
-            var remoteFailure = new Exception(exception.Message);
-            // The status gets only a capped, escaped excerpt (wire-channel parity): the waiter's
-            // exception carries the whole message, but a span status is a line-oriented sink.
-            AsyncResponseDiagnostics.SetError(_activity, "remote_failure", DiagnosticText.EscapedExcerpt(remoteFailure.Message, RemoteFailureStatusLength));
+            //
+            // Both getters are virtual and read BEFORE the terminal latch, and neither may throw:
+            // a throwing Message override escaped after TryBeginTerminal, so the waiter was latched
+            // terminal but never settled — its timeout then no-opped behind the latch and the wait
+            // hung forever. The type name stands in for a message that cannot be read, as it does
+            // in every span status.
+            var remoteFailure = new Exception(AsyncResponseDiagnostics.SafeDescription(exception, exception.GetType().Name));
             var remoteStackTrace = RemoteStackTrace.ForWire(
-                exception.StackTrace,
+                SafeStackTrace(exception),
                 _owner._options.IncludeRemoteStackTrace,
                 _owner._options.MaxRemoteStackTraceLength);
             if (!string.IsNullOrEmpty(remoteStackTrace))
                 remoteFailure.Data["RemoteStackTrace"] = remoteStackTrace;
+
+            if (!TryBeginTerminal())
+                return Task.CompletedTask;
+
+            // The status gets only a capped, escaped excerpt (wire-channel parity): the waiter's
+            // exception carries the whole message, but a span status is a line-oriented sink.
+            AsyncResponseDiagnostics.SetError(_activity, "remote_failure", DiagnosticText.EscapedExcerpt(remoteFailure.Message, RemoteFailureStatusLength));
             TrySetException(remoteFailure);
             return CleanupOnceAsTask();
+        }
+
+        private static string? SafeStackTrace(Exception exception)
+        {
+            try
+            {
+                return exception.StackTrace;
+            }
+            catch (Exception)
+            {
+                // A broken override: the stack trace is optional diagnostics, never the outcome.
+                return null;
+            }
         }
 
         /// <summary>
@@ -1067,17 +1115,14 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
                     if (TrySetException(new AsyncResponseIndeterminateDeliveryException(CorrelationId, drainTimeout)))
                     {
                         AsyncResponseDiagnostics.SetError(_activity, "indeterminate_delivery", "Disposal drain timed out with a delivery in flight.");
-                        try
-                        {
-                            _owner._logger.LogWarning(
-                                "Disposal drain for correlationId {CorrelationId} did not finish within {DrainTimeout}; faulting the waiter as indeterminate.",
-                                CorrelationId, drainTimeout);
-                        }
-                        finally
-                        {
-                            await CleanupOnceAsync().ConfigureAwait(false);
-                        }
 
+                        // Guarded: a throwing provider here escaped the caller's `await using`
+                        // disposal and replaced the indeterminate fault the wait had just settled with.
+                        SafeLog.Try((Logger: _owner._logger, CorrelationId, DrainTimeout: drainTimeout), static state => state.Logger.LogWarning(
+                            "Disposal drain for correlationId {CorrelationId} did not finish within {DrainTimeout}; faulting the waiter as indeterminate.",
+                            state.CorrelationId,
+                            state.DrainTimeout));
+                        await CleanupOnceAsync().ConfigureAwait(false);
                         return;
                     }
                 }
@@ -1262,9 +1307,13 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
             SetTimeoutException(exception);
             try
             {
-                _owner._logger.LogWarning("Timed out waiting for response for correlationId {CorrelationId}.", CorrelationId);
+                // Metric and span first, the log line last and guarded: a throwing provider ahead
+                // of them skipped the asyncresponse.waiter.timeouts count and the span's error.
                 AsyncResponseDiagnostics.RecordWaiterTimeout("inmemory");
                 AsyncResponseDiagnostics.SetError(_activity, "timeout", exception.Message);
+                SafeLog.Try((Logger: _owner._logger, CorrelationId), static state => state.Logger.LogWarning(
+                    "Timed out waiting for response for correlationId {CorrelationId}.",
+                    state.CorrelationId));
             }
             finally
             {

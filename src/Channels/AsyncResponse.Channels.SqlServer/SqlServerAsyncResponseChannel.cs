@@ -42,6 +42,10 @@ internal sealed class SqlServerAsyncResponseChannel : DbAsyncResponseChannelBase
             localDispatchRetryHint: "the sweep retry will pick it up",
             timeProvider)
     {
+        const string sweepIsDelivery = "SQL Server has no push wake: the poll sweep is how every response published from another process is delivered.";
+        WarnIfSweepCadenceOutrunsConfirmation(nameof(SqlServerAsyncResponseChannelOptions.ActivePollInterval), _options.ActivePollInterval, sweepIsDelivery);
+        if (_options.FullSweepInterval is { } fullSweepInterval)
+            WarnIfSweepCadenceOutrunsConfirmation(nameof(SqlServerAsyncResponseChannelOptions.FullSweepInterval), fullSweepInterval, sweepIsDelivery);
     }
 
     /// <inheritdoc />

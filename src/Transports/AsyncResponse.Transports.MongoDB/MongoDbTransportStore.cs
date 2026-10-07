@@ -795,14 +795,30 @@ internal sealed class MongoDbTransportStore : IDisposable
     /// <summary>One second, the resolution of an event's <c>clusterTime</c> (see <see cref="IsClaimableOnArrival"/>).</summary>
     private static readonly TimeSpan WakeSlack = TimeSpan.FromSeconds(1);
 
-    /// <summary>Change-stream pipeline for queue wakes: a <c>$match</c> on inserts into one logical queue.</summary>
+    /// <summary>
+    /// Change-stream pipeline for queue wakes: a <c>$match</c> on inserts into one logical queue,
+    /// then a <c>$project</c> down to what <see cref="IsClaimableOnArrival"/> reads — the event's
+    /// <c>clusterTime</c> and the document's <c>available_at</c> (plus its operation type and the
+    /// <c>_id</c> resume token, which an inclusion projection keeps implicitly). Every subscriber
+    /// process of the queue holds a watch, and without the projection each insert event carried
+    /// the whole job — payload and headers — to every one of them just to read one date: payload ×
+    /// processes of egress on every publish (the channel's own wake stream projects for the same
+    /// reason).
+    /// </summary>
     internal static PipelineDefinition<ChangeStreamDocument<MongoTransportMessageDocument>, ChangeStreamDocument<MongoTransportMessageDocument>> BuildQueueWatchPipeline(string queue)
         => new EmptyPipelineDefinition<ChangeStreamDocument<MongoTransportMessageDocument>>()
             .Match(new BsonDocument("$and", new BsonArray
             {
                 new BsonDocument("operationType", "insert"),
                 new BsonDocument("fullDocument.queue", queue)
-            }));
+            }))
+            .Project(new BsonDocumentProjectionDefinition<ChangeStreamDocument<MongoTransportMessageDocument>, ChangeStreamDocument<MongoTransportMessageDocument>>(
+                new BsonDocument
+                {
+                    ["operationType"] = 1,
+                    ["clusterTime"] = 1,
+                    ["fullDocument.available_at"] = 1
+                }));
 
     /// <summary>Returns <c>true</c> when the server rejected the change stream itself (not a transient cursor error).</summary>
     internal static bool IsChangeStreamUnsupported(Exception exception)
@@ -887,6 +903,12 @@ internal sealed class MongoDbTransportStore : IDisposable
 /// That throw lands after findOneAndUpdate has already stamped attempts+1/lock_id and before any
 /// delivery object exists, so the document could never reach HandleFailureAsync or the dead-letter
 /// queue: it tore the subscriber down on every re-claim, forever, with attempts climbing unbounded.
+/// <para>
+/// The instants are pinned to BSON dates (<see cref="UtcBsonDateSerializer"/>), whatever
+/// <see cref="DateTime"/> serializer the host registered globally: the server stamps them with
+/// <c>$$NOW</c>, and under a host's own string serializer every claimed document failed to map —
+/// so the claim buried every job as unreadable, unexecuted.
+/// </para>
 /// </remarks>
 [BsonIgnoreExtraElements]
 internal sealed class MongoTransportMessageDocument
@@ -910,12 +932,15 @@ internal sealed class MongoTransportMessageDocument
     public Dictionary<string, string>? Headers { get; set; }
 
     [BsonElement("created_at")]
+    [BsonSerializer(typeof(UtcBsonDateSerializer))]
     public DateTime CreatedAtUtc { get; set; }
 
     [BsonElement("available_at")]
+    [BsonSerializer(typeof(UtcBsonDateSerializer))]
     public DateTime AvailableAtUtc { get; set; }
 
     [BsonElement("locked_until")]
+    [BsonSerializer(typeof(NullableUtcBsonDateSerializer))]
     public DateTime? LockedUntilUtc { get; set; }
 
     [BsonElement("lock_id")]

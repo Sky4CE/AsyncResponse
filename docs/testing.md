@@ -119,6 +119,12 @@ crash-at-every-checkpoint matrix in the library's own
 `harness.AdvanceAsync(delta)` advances stepwise and lets the worker pipeline settle between
 steps, so chained work is honored inside one call: a durable timer wakes, the flow re-suspends
 for the next chunk, a retry backoff elapses and redelivers, a cron loop fires and re-arms.
+Before each step it waits for any job still running code to reach its next wait, so the clock
+never moves under a step body: calling `AdvanceAsync` straight after `StartFlowAsync`, or across a
+cron occurrence whose run sleeps, anchors every timer on the instant the flow actually reached it.
+The engine's own hang guards (the execution lease's renewal and deadline timers, its bounded
+disposal joins) are not waits of the job and never end that wait early; they still fire, in
+order, as the clock moves.
 
 ```csharp
 var run = await harness.StartFlowAsync<ReminderFlow, ReminderInput>(new("acme"));
@@ -306,6 +312,13 @@ exact `TargetPath` into its assembly metadata (`EmbedCrashWorkerPath` in its csp
   Windows. Widen the lease cadence (`ExecutionLeaseDuration` / `ExecutionLeaseRenewInterval`) in
   such tests so the walk is a few steps, not thousands. Suspend-path timers (the default for long
   sleeps) don't have this concern — a 3-day sleep is one timer.
+- The in-memory flow store has no ledger-size budget by default. Set `options.MaxStateBytes` to
+  your production store's `MaxStateBytes` (DynamoDB 350 000 bytes by default, Cosmos DB
+  1 900 000, MongoDB 15 000 000) so a ledger that store would refuse fails the test that grows it:
+  a start whose initial state is over it throws `FlowStateTooLargeException` before anything is
+  published, and a checkpoint over it fails the attempt with that exception (retried, then
+  dead-lettered, as in production). A `LedgerSizeWarningBytes` left at its default is fitted under
+  the budget; one set at or above it fails `StartAsync`.
 - The in-memory channel's default wait timeout is 30 minutes (its `RecoveryStateExpiry`, used
   while `DefaultTimeout` is unset); drive scripted conversations with advances smaller than that
   (or set `options.Channel = c => c.DefaultTimeout = …`) unless the timeout is what you're testing.

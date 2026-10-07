@@ -171,7 +171,10 @@ Two mechanisms retry hosted-runner flakes, and both consult the **same classifie
 `scripts/ci-retryable-failure.sh`: the integration legs retry their own suite once in-job, and
 `auto-retry.yml` re-runs the failed jobs of a failed CI or CodeQL run on a `main` push. A log
 qualifies only when it matches a known infrastructure signature (a batch or matrix fixture that
-failed to boot, SQLite's "database is locked" on a slow runner disk, the runner going away) **and**
+failed to boot, the runner going away, and SQLite's "database is locked" on a slow runner disk —
+that last one only inside a failed EF Core storm test, the one place its busy timeout is the test's
+rather than the product's; from any other test, such as the SQLite flow store's own, it is a real
+failure) **and**
 carries no evidence that a test failed on its merits or that the build broke (an xunit assertion
 message, `XunitException`, a `CS`/`MSB`/`NU` error code) — a fixture-boot flake next to an assertion
 failure is a real failure and is never retried. Each attempt's console log is kept in the results

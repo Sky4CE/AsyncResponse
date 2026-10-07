@@ -563,9 +563,29 @@ internal static class ReflectionExtensions
     /// allowlist also authorized every property SETTER (and <c>GetHashCode</c>/<c>ToString</c>),
     /// so a worker-transport writer could aim <c>set_ApiKey</c> at a DI singleton and change
     /// process-wide state. The plan accepts <c>void</c> returns, so nothing downstream caught it.
+    /// <para>
+    /// Disposal is excluded on the same grounds: the members of <see cref="IDisposable"/> and
+    /// <see cref="IAsyncDisposable"/>, and any parameterless <c>Dispose</c>/<c>DisposeAsync</c>
+    /// (the dispose pattern's names, which a class or a derived interface re-declares). A
+    /// type-level allowance of an interface deriving from <see cref="IDisposable"/> authorized
+    /// <c>Dispose</c> through the base-interface search, so a job or recovery row naming it
+    /// disposed the DI singleton behind it, failing every later caller until a restart. Kept to
+    /// the dispose contract rather than every framework-declared member: a user interface may
+    /// legitimately derive its callback from a framework one (<c>IProgress&lt;T&gt;.Report</c>,
+    /// <c>IObserver&lt;T&gt;.OnNext</c>), and a type allowance is still the type's whole public
+    /// surface otherwise — allow narrow interfaces.
+    /// </para>
     /// </summary>
     private static bool IsCallbackCandidate(MethodInfo method)
-        => !method.IsSpecialName && method.DeclaringType != typeof(object);
+        => !method.IsSpecialName
+           && method.DeclaringType != typeof(object)
+           && !IsDisposal(method);
+
+    private static bool IsDisposal(MethodInfo method)
+        => method.DeclaringType == typeof(IDisposable)
+           || method.DeclaringType == typeof(IAsyncDisposable)
+           || (method.Name is nameof(IDisposable.Dispose) or nameof(IAsyncDisposable.DisposeAsync)
+               && method.GetParameters().Length == 0);
 
     private static AsyncMethodInvoker CreateInvoker(MethodInfo method, ParameterInfo[] parameters)
     {

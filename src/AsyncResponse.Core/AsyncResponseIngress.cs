@@ -124,6 +124,10 @@ internal sealed class AsyncResponseIngress(
             // malformed, or no longer binds) is excluded from the retry only: every attempt
             // re-dispatched and failed identically, so it paid the ~1.75 s ladder on the consumer
             // for nothing before escalating anyway. It escalates at once, like a parse failure.
+            // The lost-subscriber dispatcher no longer surfaces one for a resume — it settles it on
+            // that registration's own failure callback, because this escalation is per correlation
+            // id and failed every sibling registration too, a KeepWaiting one included — so this
+            // remains for a fault from any other source (a hand-written raw publisher).
             //
             // RecoveryStateUnreadableException is excluded from the escalation only: the store
             // holds registrations this build cannot interpret, and the escalation's own dispatch

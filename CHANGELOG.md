@@ -39,6 +39,88 @@ work that has landed on `main` but not yet shipped. Security reporters credited 
   classifies; and an awaited step's re-attach debug line and its in-flight-ceiling warning, both
   logged after its wait was checkpointed (and, for the warning, after the request was sent),
   faulted the step. All of these are now guarded.
+- **Round-65 review (2026-10-07, whole-repository seven-perspective review of `6d7e1ae`): the Redis
+  worker stream no longer evicts unprocessed jobs, and 32 further findings are fixed.**
+  - *Redis transport — behaviour change.* `StreamMaxLength` is now a capacity enforced by refusal,
+    not an `XADD … MAXLEN` trim: past the cap Redis deleted the oldest entries whatever the worker
+    group had read, so jobs never read and jobs pending in a handler (durable-flow wake-ups
+    included) vanished with no dead-letter copy. A full worker stream now first drops only entries
+    the worker group has settled (`XTRIM … MINID` below its last-delivered and oldest pending ids),
+    then refuses the publish (`RedisServerException` `ASYNCRESPONSE_STREAM_FULL`, retried within
+    `PublishMaxAttempts`). With a capacity set, worker settlement is `XACK` + `XDEL` in one script, so
+    settled entries no longer occupy the stream (`StreamMaxLength = null` keeps `XACK` only). The ACL must also allow `XINFO`, `XLEN`, `XTRIM` and `XDEL`.
+    `UseApproximateStreamTrimming` now applies only to the dead-letter stream. A handler exception
+    whose `Message` getter throws no longer loses an early-ACKed job's dead-letter copy.
+  - *Durable flows.* A late failure or response for an awaited step that already faulted on its
+    correlation id is ignored: a crashed worker's surviving recovery registration no longer fails a
+    run that caught the timeout and moved on, nor a run backing off before restarting the step, and
+    a late response is not checkpointed into the faulted step. A lost execution lease now reaches
+    flow code as the new `DurableFlowLeaseLostException` (derives from `InvalidOperationException`);
+    compensation filters should exclude it next to `OperationCanceledException`. The lease's local
+    deadline is measured on the monotonic clock. Every executor and scheduler log line is guarded,
+    so a throwing logging provider no longer rewrites a Succeeded ledger, fails a committed park,
+    doubles a same-JobId copy, dead-letters a start that created its ledger, loses an undispatched
+    scheduled occurrence or stops the host.
+  - *Recovery.* A resume callback that can never be wired up (unauthorized, unresolvable, not
+    registered) fails only its own registration through that registration's failure callback; the
+    ingress no longer escalates it through `SetException` for the whole correlation id, which also
+    failed and deleted a sibling registration whose payload said `KeepWaiting`. Callback targets can
+    no longer name `Dispose`/`DisposeAsync`. Recovery payload type names are checked against their
+    generic definition before any closed type is constructed (arrays refused). The health check
+    bounds and escapes stale-entry ids and type names. The recovery watchdog's logging is guarded.
+  - *Core.* `For<T>()` with a generated correlation id no longer writes it into the caller's
+    ambient context, so a worker handler that awaits a nested request still stamps follow-up jobs
+    and `Placeholder.CorrelationId()` with its own job's id. In-memory channel: an exception whose
+    `Message` getter throws no longer hangs the waiter, and a throwing logging provider no longer
+    reports a delivered publish as failed or skips the timeout metric.
+  - *Redis and NATS channels.* For 90 s after this process's connection comes back from an outage,
+    a zero `PUBSUB NUMSUB` / NATS "no responders" is no longer proof that no waiter is live (waiters
+    dropped by the same outage may still be re-subscribing); the lost-subscriber publish throws and
+    the response survives through redelivery. A Redis waiter whose timeout exceeds
+    `RecoveryStateExpiry` keeps its registration for the whole wait. On NATS, whose bucket `MaxAge`
+    caps every entry, such a wait still runs without recovery for its tail and is now reported by
+    a warning.
+  - *PostgreSQL and SQL Server channels.* Channel statements never join an ambient
+    `TransactionScope` (a response published inside one was invisible to other processes until
+    commit, so its own publisher claimed it for recovery under a live waiter; SQL Server promoted
+    to a distributed transaction), and the background loops no longer run in the execution context
+    of the request that created the first waiter (trace parent, log scope). A delivery-carrying
+    sweep cadence above half of `DeliveryConfirmationTimeout` is warned at construction (MongoDB
+    too); a waiter whose timeout exceeds `RecoveryStateExpiry` keeps its registration for the whole
+    wait. The recovery-state reader's outcomes survive a throwing logging provider.
+  - *Database transports.* PostgreSQL, SQL Server and MongoDB retry a transient fault on the fenced
+    ACK/NAK (at most four attempts, within a third of `LockTimeout`), so one lost round trip no
+    longer re-runs a completed job.
+  - *MongoDB.* The channel and transport pin every stored instant to a BSON date whatever `DateTime`
+    serializer the host registered (a host-wide string representation sent every response to
+    recovery; a host string serializer made the transport dead-letter every job unexecuted). The
+    channel and flow store create indexes with `w: 1`, and the transport's change-stream wake
+    projects events down to `available_at`.
+  - *RabbitMQ.* Deliveries the client buffered when their channel died are neither started nor
+    settled (they ran a second time after the broker's requeue); an early-ACK delivery parked on a
+    full queue is handed back when its channel dies. Stop and the publishing transport's dispose
+    keep to `ShutdownTimeout` against an unresponsive broker (abandoned close, background abort).
+  - *Google Pub/Sub, Kafka, Azure Service Bus, SQS.* The Pub/Sub subscriber stop is bounded by
+    `ShutdownTimeout` (the SDK's stop waits for every running handler). A Kafka dead-letter produce
+    abandoned at its bound is reported as unconfirmed, not lost, and its real outcome is logged. The
+    Service Bus and Pub/Sub early-ACK dispatchers survive a throwing logging provider at
+    construction. **SQS** rejects a half-configured static credential pair at startup instead of
+    silently using the ambient credential chain.
+  - *Startup validation — behaviour change.* With early ACK on **both** subscribers, Redis, Kafka and
+    RabbitMQ now sum both stop paths against `HostShutdownTimeout`, as NATS and the database
+    transports already did. MySQL `UseAffectedRows=true` and an EF Core context that does not map
+    the ledger (or leaves `flow_id` case-folding) fail the host start. The MySQL store learns the
+    server's `max_allowed_packet` at host start and refuses a ledger whose escaped size exceeds it
+    with `FlowStateTooLargeException`, instead of failing every redelivery with error 1153.
+  - *Testing package.* `AdvanceAsync` no longer moves the virtual clock under a job still running
+    engine code (the lease's renew and deadline timers counted as "a wait began", so a just-started
+    flow's first pass ran 20 s late and parks could be refused). New
+    `AsyncResponseTestHarnessOptions.MaxStateBytes` gives the harness store a production store's
+    ledger budget.
+  - *Build and CI.* `publish.yml` publishes a tag only after the commit's `ci.yml` run on `main`
+    concluded `success`. CI runs the package-dependency pin check. The retry classifier treats
+    SQLite "database is locked" as a flake only in the EF Core storm tests. Integration-test,
+    sample AppHost and docker-compose images are pinned by multi-arch digest.
 - **Round-61 review (2026-09-30, re-review of every file changed since `1fc2b20`): a Cosmos DB ledger
   no longer disappears up to a second before it expires, and three documentation gaps are closed.**
   - *Durable flows — Cosmos DB.* Cosmos counts a document's TTL from `_ts`, which it truncates to

@@ -65,6 +65,14 @@ internal interface INatsResponseChannelClient
 
     /// <summary>Round-trips to the server so previously issued subscriptions are guaranteed processed before the caller proceeds.</summary>
     Task FlushAsync(CancellationToken cancellationToken);
+
+    /// <summary>
+    /// Invokes <paramref name="onReconnected"/> — from the client's event loop — each time the
+    /// connection is re-established after a disconnection (never for the first connection), until
+    /// the returned registration is disposed. Carries a never-fires default (<c>null</c>) so
+    /// out-of-package fakes keep compiling; the channel treats <c>null</c> as "no reconnects to report".
+    /// </summary>
+    IDisposable? WatchReconnects(Action onReconnected) => null;
 }
 
 /// <summary>Header marking a request as a liveness probe rather than a response payload.</summary>
@@ -99,6 +107,9 @@ internal interface INatsRawRequester
 
     /// <summary>Round-trips to the server (a ping) so prior subscriptions are guaranteed processed.</summary>
     Task FlushAsync(CancellationToken cancellationToken);
+
+    /// <summary>See <see cref="INatsResponseChannelClient.WatchReconnects"/>. Never-fires default.</summary>
+    IDisposable? WatchReconnects(Action onReconnected) => null;
 }
 
 /// <summary>
@@ -114,10 +125,17 @@ internal sealed class NatsRawRequester : INatsRawRequester, IDisposable
     // handler per waiter: a multicast event copies its whole invocation list on every add/remove.
     private readonly ConcurrentDictionary<object, Action<int>> _dropWatchers = new(ReferenceEqualityComparer.Instance);
 
+    // Reconnect watchers, and whether a disconnection was seen since the last open: NATS.Net
+    // raises ConnectionOpened for the first connection and for every reconnect alike.
+    private readonly ConcurrentDictionary<object, Action> _reconnectWatchers = new(ReferenceEqualityComparer.Instance);
+    private int _disconnectedSinceOpen;
+
     public NatsRawRequester(INatsConnection connection)
     {
         _connection = connection;
         _connection.MessageDropped += OnMessageDroppedAsync;
+        _connection.ConnectionDisconnected += OnConnectionDisconnectedAsync;
+        _connection.ConnectionOpened += OnConnectionOpenedAsync;
     }
 
     /// <summary>Runs the RequestAsync operation.</summary>
@@ -173,11 +191,55 @@ internal sealed class NatsRawRequester : INatsRawRequester, IDisposable
     }
 
     /// <inheritdoc />
-    public void Dispose() => _connection.MessageDropped -= OnMessageDroppedAsync;
+    public IDisposable? WatchReconnects(Action onReconnected)
+    {
+        var key = new object();
+        _reconnectWatchers[key] = onReconnected;
+        return new ReconnectWatch(_reconnectWatchers, key);
+    }
+
+    private ValueTask OnConnectionDisconnectedAsync(object? sender, NatsEventArgs args)
+    {
+        Volatile.Write(ref _disconnectedSinceOpen, 1);
+        return ValueTask.CompletedTask;
+    }
+
+    private ValueTask OnConnectionOpenedAsync(object? sender, NatsEventArgs args)
+    {
+        if (Interlocked.Exchange(ref _disconnectedSinceOpen, 0) == 0)
+            return ValueTask.CompletedTask; // the first connection: nobody else is reconnecting
+
+        foreach (var onReconnected in _reconnectWatchers.Values)
+        {
+            try
+            {
+                onReconnected();
+            }
+            catch
+            {
+                // Never let a watcher's reaction fail the connection's shared event loop.
+            }
+        }
+
+        return ValueTask.CompletedTask;
+    }
+
+    /// <inheritdoc />
+    public void Dispose()
+    {
+        _connection.MessageDropped -= OnMessageDroppedAsync;
+        _connection.ConnectionDisconnected -= OnConnectionDisconnectedAsync;
+        _connection.ConnectionOpened -= OnConnectionOpenedAsync;
+    }
 
     private sealed class DropWatch(ConcurrentDictionary<object, Action<int>> watchers, object subscription) : IDisposable
     {
         public void Dispose() => watchers.TryRemove(subscription, out _);
+    }
+
+    private sealed class ReconnectWatch(ConcurrentDictionary<object, Action> watchers, object key) : IDisposable
+    {
+        public void Dispose() => watchers.TryRemove(key, out _);
     }
 }
 
@@ -240,6 +302,9 @@ internal sealed class NatsResponseChannelClient(INatsRawRequester _raw) : INatsR
 
     /// <summary>Runs the FlushAsync operation.</summary>
     public Task FlushAsync(CancellationToken cancellationToken) => _raw.FlushAsync(cancellationToken);
+
+    /// <inheritdoc />
+    public IDisposable? WatchReconnects(Action onReconnected) => _raw.WatchReconnects(onReconnected);
 
     private sealed class NatsChannelSubscription(INatsSub<string> _subscription, INatsRawRequester _raw, IDisposable? _dropWatch) : INatsChannelSubscription
     {

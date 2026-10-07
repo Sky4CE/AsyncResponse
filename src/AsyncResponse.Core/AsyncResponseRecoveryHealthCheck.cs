@@ -21,7 +21,9 @@ public sealed record AsyncResponseRecoveryStats(
 /// <summary>
 /// One stale recovery registration listed under the <c>staleEntries</c> key of the recovery
 /// health check's <see cref="HealthCheckResult.Data"/> (JSON names pinned; see
-/// <see cref="AsyncResponseRecoveryStats"/> for the AOT registration note).
+/// <see cref="AsyncResponseRecoveryStats"/> for the AOT registration note). The correlation id
+/// and payload type name are store-written text, so the check reports them bounded and with
+/// control characters escaped (as the watchdog's log line does): an ordinary value is unchanged.
 /// </summary>
 public sealed record AsyncResponseStaleRecoveryEntry(
     [property: JsonPropertyName("correlationId")] string? CorrelationId,
@@ -203,11 +205,16 @@ public sealed class AsyncResponseRecoveryHealthCheck(AsyncResponseWatchdogState 
 
         if (report.StaleEntries.Count > 0)
         {
+            // The id and type name are store-written text (the store is a trust boundary), and
+            // health data reaches JSON writers, UIs and publishers that log the report: quoted
+            // bounded and escaped exactly as the watchdog's own log line quotes them, so a CR/LF
+            // inside one cannot forge output and megabytes of it cannot bloat every probe. An
+            // ordinary value reads exactly as before.
             data["staleEntries"] = report.StaleEntries
                 .Take(MaxReportedStaleEntries)
-                .Select(e => new AsyncResponseStaleRecoveryEntry(
-                    e.CorrelationId,
-                    e.PayloadTypeFullName,
+                .Select(static e => new AsyncResponseStaleRecoveryEntry(
+                    e.CorrelationId is null ? null : DiagnosticText.EscapedExcerpt(e.CorrelationId, AsyncResponseChannelOptions.MaxCorrelationIdLength),
+                    e.PayloadTypeFullName is null ? null : AsyncResponseTypeResolution.DescribeForDiagnostics(e.PayloadTypeFullName),
                     e.RegisteredAtUtc))
                 .ToList();
 

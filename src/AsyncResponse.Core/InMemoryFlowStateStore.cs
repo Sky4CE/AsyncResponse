@@ -29,6 +29,33 @@ internal sealed class InMemoryFlowStateStore : IFlowStateStore
     public InMemoryFlowStateStore(TimeProvider? timeProvider = null)
         => _timeProvider = timeProvider ?? TimeProvider.System;
 
+    /// <summary>
+    /// Serialized-ledger budget in UTF-8 bytes, enforced like the provider stores' <c>MaxStateBytes</c>
+    /// (<see cref="FlowStateTooLargeException"/> from <see cref="ValidateCreate"/> and every write);
+    /// <c>null</c> (the default) is unlimited. Set by the test harness
+    /// (<c>AsyncResponseTestHarnessOptions.MaxStateBytes</c>) so a ledger that DynamoDB, Cosmos DB
+    /// or MongoDB would refuse fails the test that grows it instead of passing it.
+    /// </summary>
+    internal long? MaxStateBytes { get; init; }
+
+    /// <summary>The provider name <see cref="FlowStateTooLargeException"/> and the checkpoint-size metric carry.</summary>
+    private const string ProviderName = "InMemory";
+
+    /// <summary>
+    /// Refuses an initial state over <see cref="MaxStateBytes"/> before the start publishes its job,
+    /// as the provider stores do; a no-op while the budget is unlimited.
+    /// </summary>
+    public void ValidateCreate(string flowId, FlowState state, TimeSpan ttl)
+    {
+        if (MaxStateBytes is not { } limit)
+            return;
+
+        ValidateWrite(flowId, state, ttl);
+        var size = System.Text.Encoding.UTF8.GetByteCount(FlowStateJson.Serialize(state));
+        if (size > limit)
+            throw new FlowStateTooLargeException(flowId, size, limit, ProviderName);
+    }
+
     public Task<bool> TryCreateAsync(
         string flowId,
         FlowState state,
@@ -42,7 +69,7 @@ internal sealed class InMemoryFlowStateStore : IFlowStateStore
 
         var now = _timeProvider.GetUtcNow().UtcDateTime;
         SweepExpired(now);
-        var created = CreateEntry(state, Expiry(now, ttl));
+        var created = CreateEntry(flowId, state, Expiry(now, ttl));
         while (true)
         {
             if (_entries.TryAdd(flowId, created))
@@ -120,6 +147,7 @@ internal sealed class InMemoryFlowStateStore : IFlowStateStore
                 return Task.FromResult(false);
 
             var updated = CreateEntry(
+                flowId,
                 state,
                 Expiry(now, ttl),
                 current.LeaseId,
@@ -269,7 +297,8 @@ internal sealed class InMemoryFlowStateStore : IFlowStateStore
         return Task.FromResult(false);
     }
 
-    private static Entry CreateEntry(
+    private Entry CreateEntry(
+        string flowId,
         FlowState state,
         DateTime expiresAtUtc,
         string? leaseId = null,
@@ -279,11 +308,15 @@ internal sealed class InMemoryFlowStateStore : IFlowStateStore
 
         // The same measurements the durable stores record (DurableFlowStoreShared.SerializeBounded),
         // so a workload's checkpoint sizes — and the ledger-growth warning — read the same off a
-        // test or a development host.
+        // test or a development host. The budget is judged first and refuses the write the same
+        // way, before anything is recorded or stored.
         long size = System.Text.Encoding.UTF8.GetByteCount(stateJson);
+        if (MaxStateBytes is { } limit && size > limit)
+            throw new FlowStateTooLargeException(flowId, size, limit, ProviderName);
+
         FlowStateSize.Record(state, size);
         if (AsyncResponseDiagnostics.FlowStateCheckpointsMeasured)
-            AsyncResponseDiagnostics.RecordFlowStateCheckpoint("InMemory", size);
+            AsyncResponseDiagnostics.RecordFlowStateCheckpoint(ProviderName, size);
 
         return new(stateJson, state.Revision, expiresAtUtc, leaseId, leaseExpiresAtUtc);
     }

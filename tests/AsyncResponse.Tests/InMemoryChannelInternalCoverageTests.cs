@@ -302,7 +302,9 @@ public sealed class InMemoryChannelInternalCoverageTests
         // A hang guard, not an assertion window: a stalled walk must fail here, not hang the run
         // (and ThrowsAnyAsync<Exception> would accept a WaitAsync timeout as the expected fault).
         Assert.True(await Task.WhenAny(dispose, Task.Delay(TimeSpan.FromSeconds(10))) == dispose, "the disposal never completed");
-        await Assert.ThrowsAnyAsync<Exception>(() => dispose);
+        // Round 65: the log line is guarded, so the logger's throw no longer escapes the disposal
+        // either — an `await using` would otherwise surface it in place of the indeterminate fault.
+        await dispose;
         await Assert.ThrowsAsync<AsyncResponseIndeterminateDeliveryException>(() => waiter.ResponseTask.WaitAsync(TimeSpan.FromSeconds(5)));
         Assert.Equal(0, await channel.CountActiveSubscribersAsync("wedged-dispose"));
 

@@ -271,7 +271,16 @@ internal abstract class GooglePubSubSubscriberService : BackgroundService
                     dispatcher.ReleaseHeldDeliveries();
                 }
 
-                await subscriber.StopAsync(
+                // Bounded here, not by the SDK: its ShutdownOptions.Timeout only decides when it
+                // cancels the handlers' token, and its stop completes only once every handler it
+                // started has returned — the ingress takes no token, so one handler outliving the
+                // drain (a job parked on an awaited durable-flow response) held this stop for the
+                // whole remaining host budget, and every hosted service stopped after it (the
+                // worker subscriber, behind the response one) got an already-cancelled token: its
+                // own drain and client stop raced process exit. One ShutdownTimeout, as the drain
+                // budget reserves for it; past it the stop is abandoned.
+                var stopStarted = Clock.GetTimestamp();
+                var stop = subscriber.StopAsync(
                     new SubscriberClient.ShutdownOptions
                     {
                         // Explicit: the SDK already nacks at once for any timeout under its
@@ -279,8 +288,22 @@ internal abstract class GooglePubSubSubscriberService : BackgroundService
                         Mode = SubscriberClient.ShutdownMode.NackImmediately,
                         Timeout = Options.ShutdownTimeout
                     },
-                    CancellationToken.None).ConfigureAwait(false);
-                await runTask.ConfigureAwait(false);
+                    CancellationToken.None);
+                var stopped = await CompletesWithinAsync(stop, Options.ShutdownTimeout).ConfigureAwait(false);
+                if (!stopped)
+                    ObserveAbandoned(runTask);
+                var runTaskBudget = Options.ShutdownTimeout - Clock.GetElapsedTime(stopStarted);
+                if (!stopped || !await CompletesWithinAsync(runTask, runTaskBudget > MinRunTaskBudget ? runTaskBudget : MinRunTaskBudget).ConfigureAwait(false))
+                {
+                    SafeLog.Try(
+                        (Logger, Subscription: subscriptionName, Role: SubscriberRole, Options.ShutdownTimeout, InFlight: dispatcher.InFlightCount),
+                        static state => state.Logger.LogWarning(
+                            "The Pub/Sub subscriber client for {Subscription} ({Role}) did not stop within ShutdownTimeout ({ShutdownTimeout}); {InFlight} handler(s) still running (the SDK's stop waits for every handler it started, and the handlers ignore cancellation). Their messages were already handed back (NackImmediately), so Pub/Sub may redeliver them while they keep running; no longer waiting for the client.",
+                            state.Subscription.ToString(),
+                            state.Role,
+                            state.ShutdownTimeout,
+                            state.InFlight));
+                }
             }
         }
         catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
@@ -306,12 +329,23 @@ internal abstract class GooglePubSubSubscriberService : BackgroundService
     {
         try
         {
-            await subscriber.StopAsync(
-                new SubscriberClient.ShutdownOptions
-                {
-                    Timeout = Options.ShutdownTimeout
-                },
-                CancellationToken.None).ConfigureAwait(false);
+            // Bounded like the graceful stop: the SDK's stop waits for every handler it started,
+            // and the retry loop must not wait on one that ignores its token before it rebuilds.
+            if (!await CompletesWithinAsync(
+                subscriber.StopAsync(
+                    new SubscriberClient.ShutdownOptions
+                    {
+                        Timeout = Options.ShutdownTimeout
+                    },
+                    CancellationToken.None),
+                Options.ShutdownTimeout).ConfigureAwait(false))
+            {
+                SafeLog.Try(
+                    (Logger, Options.ShutdownTimeout),
+                    static state => state.Logger.LogDebug(
+                        "Best-effort stop of a failed Pub/Sub subscriber client did not complete within ShutdownTimeout ({ShutdownTimeout}): a handler still running ignores cancellation; no longer waiting for it.",
+                        state.ShutdownTimeout));
+            }
         }
         catch (Exception ex)
         {
@@ -320,6 +354,49 @@ internal abstract class GooglePubSubSubscriberService : BackgroundService
                 static state => state.Logger.LogDebug(state.ex, "Best-effort stop of a failed Pub/Sub subscriber client did not complete cleanly."));
         }
     }
+
+    /// <summary>
+    /// Awaits <paramref name="task"/> for at most <paramref name="budget"/> on <see cref="Clock"/>;
+    /// <c>false</c> when the budget lapsed first, the abandoned task's eventual fault observed. A
+    /// task that fails within the budget throws, as before.
+    /// </summary>
+    private async Task<bool> CompletesWithinAsync(Task task, TimeSpan budget)
+    {
+        try
+        {
+            await task.WaitAsync(budget > TimeSpan.Zero ? budget : TimeSpan.Zero, Clock).ConfigureAwait(false);
+            return true;
+        }
+        catch (TimeoutException)
+        {
+            // Not a filter on IsCompleted: a task finishing between the timer firing and the
+            // filter running made the filter false, so the TimeoutException escaped the stop as a
+            // fault. Completed by now → it made it (its own fault, if any, is rethrown as before).
+            if (task.IsCompleted)
+            {
+                await task.ConfigureAwait(false);
+                return true;
+            }
+
+            ObserveAbandoned(task);
+            return false;
+        }
+    }
+
+    /// <summary>Observes an abandoned task's eventual fault, so it is never reported as unobserved.</summary>
+    private static void ObserveAbandoned(Task task)
+        => _ = task.ContinueWith(
+            static abandoned => _ = abandoned.Exception,
+            CancellationToken.None,
+            TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously,
+            TaskScheduler.Default);
+
+    /// <summary>
+    /// The least the run task gets once the stop itself completed: a stop that finished close to
+    /// <c>ShutdownTimeout</c> left the run task a zero budget, so it was reported as not stopping
+    /// before its continuation could run.
+    /// </summary>
+    private static readonly TimeSpan MinRunTaskBudget = TimeSpan.FromMilliseconds(100);
 
 }
 

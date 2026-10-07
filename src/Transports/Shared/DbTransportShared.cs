@@ -247,11 +247,13 @@ internal abstract class DbMessageDispatcherBase : IAsyncDisposable
 
         // The ack runs outside the handler's try/catch: a transient ack failure after a
         // successful handler must not be misread as a handler failure — NAK/dead-letter here
-        // would redeliver (or bury) work whose side effects already completed. Swallow and log
-        // instead; the claim's lease lapses on its own and at-least-once redelivery applies.
+        // would redeliver (or bury) work whose side effects already completed. A transient fault
+        // is retried (SettleAsync): the heartbeat has stopped, so a single lost ack used to let the
+        // lease lapse and a peer run the completed job again. What still fails is swallowed and
+        // logged; the claim's lease lapses on its own and at-least-once redelivery applies.
         try
         {
-            await delivery.AckAsync().ConfigureAwait(false);
+            await SettleAsync(delivery, nakDelay: null).ConfigureAwait(false);
         }
         catch (Exception ex)
         {
@@ -598,10 +600,13 @@ internal abstract class DbMessageDispatcherBase : IAsyncDisposable
         // Same rule as the post-handler ACK above: the delivery is already owned by a background
         // worker, so an ACK failure must not escape and tear down the subscriber — that would
         // drain the workers (running the handler) while the un-ACKed row is re-claimed and run
-        // again. Swallow and log; the lease lapses and at-least-once redelivery applies.
+        // again. A transient fault is retried first (SettleAsync) — the job is already running on
+        // a background worker and nothing renews this claim any more, so a lost ack let a peer run
+        // the same job CONCURRENTLY once the lease lapsed. Swallow and log what still fails; the
+        // lease lapses and at-least-once redelivery applies.
         try
         {
-            await delivery.AckAsync().ConfigureAwait(false);
+            await SettleAsync(delivery, nakDelay: null).ConfigureAwait(false);
         }
         catch (Exception ex)
         {
@@ -626,9 +631,80 @@ internal abstract class DbMessageDispatcherBase : IAsyncDisposable
             s.Delivery.Queue,
             s.Self._role));
 
+    /// <summary>
+    /// Whether a settlement (ACK/NAK) fault is worth another attempt: the provider's transient-fault
+    /// classifier. The base accepts only a client-side <see cref="TimeoutException"/>, which every
+    /// provider raises for a lost round trip.
+    /// </summary>
+    protected virtual bool IsTransientSettlementFault(Exception exception) => exception is TimeoutException;
+
+    private const int SettlementMaxAttempts = 4;
+    private static readonly TimeSpan SettlementRetryBaseDelay = TimeSpan.FromMilliseconds(50);
+    private static readonly TimeSpan SettlementRetryMaxDelay = TimeSpan.FromMilliseconds(500);
+
+    /// <summary>
+    /// ACKs (<paramref name="nakDelay"/> null) or NAKs the claim, retrying a transient fault.
+    /// <para>
+    /// The settlement was the one database write on the success path with no retry: the heartbeat
+    /// stops when the handler does, so ONE transient fault on the fenced <c>DELETE</c> — a deadlock
+    /// victim, a command timeout, the first command on a pooled connection a failover broke — left
+    /// a completed job's row leased until <c>locked_until</c>, and then a subscriber (this one or a
+    /// peer) claimed and ran it again. Retrying is safe because both statements are fenced on
+    /// <c>lock_id</c> and idempotent: a retry after a commit whose reply was lost, or after a peer
+    /// re-claimed the row, matches nothing. Each attempt opens a fresh connection (the stores rent
+    /// one per statement). Bounded twice: at most <see cref="SettlementMaxAttempts"/> attempts, and
+    /// no retry is started once the elapsed time plus its backoff would pass a third of
+    /// <c>LockTimeout</c> — a healthy heartbeat leaves at least two thirds of the lease when the
+    /// handler ends, so the retries run while this subscriber still owns the row.
+    /// </para>
+    /// <para>
+    /// Not used for <see cref="NakWhileStoppingAsync"/>: a release that fails while stopping only
+    /// delays redelivery by the rest of the lease (the job was never started), and retrying it
+    /// would spend the host's stop budget on that.
+    /// </para>
+    /// </summary>
+    private async Task SettleAsync(DbTransportDelivery delivery, TimeSpan? nakDelay)
+    {
+        var budget = TimeSpan.FromTicks(_options.LockTimeout.Ticks / 3);
+        var started = _timeProvider.GetTimestamp();
+        for (var attempt = 1; ; attempt++)
+        {
+            try
+            {
+                if (nakDelay is { } delay)
+                    await delivery.NakAsync(delay).ConfigureAwait(false);
+                else
+                    await delivery.AckAsync().ConfigureAwait(false);
+                return;
+            }
+            catch (Exception ex) when (attempt < SettlementMaxAttempts)
+            {
+                // Classified in the body, not the filter (AsyncResponseRetry's rule): a fault
+                // inside an exception filter is swallowed and reads as "not transient".
+                if (!IsTransientSettlementFault(ex))
+                    throw;
+
+                var wait = AsyncResponseRetry.Backoff(attempt, SettlementRetryBaseDelay, SettlementRetryMaxDelay);
+                if (_timeProvider.GetElapsedTime(started) + wait >= budget)
+                    throw;
+
+                SafeLog.Try((Self: this, Delivery: delivery, Error: ex, Attempt: attempt, Nak: nakDelay is not null), static s => s.Self._logger.LogDebug(
+                    s.Error,
+                    "{Settlement} of {Provider} message {MessageId} on queue {Queue} ({Role}) failed transiently on attempt {Attempt}; retrying.",
+                    s.Nak ? "NAK" : "ACK",
+                    s.Self._providerName,
+                    s.Delivery.Id,
+                    s.Delivery.Queue,
+                    s.Self._role,
+                    s.Attempt));
+                await Task.Delay(wait, _timeProvider).ConfigureAwait(false);
+            }
+        }
+    }
+
     // Releases a delivery this subscriber will not start because it is stopping (its own stop, the
     // dispatcher draining, or host stop at the worker intake gate). A NAK that fails is logged and
-    // swallowed: the lease lapses to the same effect.
+    // swallowed: the lease lapses to the same effect (and is not retried — see SettleAsync).
     private async Task NakWhileStoppingAsync(DbTransportDelivery delivery, TimeSpan delay)
     {
         try
@@ -897,7 +973,7 @@ internal abstract class DbMessageDispatcherBase : IAsyncDisposable
     {
         try
         {
-            await delivery.NakAsync(_subscriberOptions.RedeliveryDelay).ConfigureAwait(false);
+            await SettleAsync(delivery, _subscriberOptions.RedeliveryDelay).ConfigureAwait(false);
         }
         catch (Exception ex)
         {

@@ -58,6 +58,11 @@ response to a waiter that registered after the ack.
 registration id. Shared-correlation waits therefore survive redeploys: if several waiters registered
 callbacks for the same correlation id, a late response dispatches all stored registrations.
 
+A registration is written once, when the waiter is created, and is not refreshed while the waiter
+lives. It expires `RecoveryStateExpiry` later — or, for a waiter whose timeout (explicit, or
+`DefaultTimeout`) is longer than that, when the wait itself ends, so the tail of a long wait keeps
+its recovery.
+
 The Core watchdog scans the same table through `IRecoveryStateScanner` and checks live waiters through
 `IActiveSubscriberProbe`, so `AddAsyncResponseRecoveryCheck()` works with SQL Server exactly like
 Redis, NATS, PostgreSQL, or MongoDB.
@@ -75,7 +80,11 @@ The transport uses one queue table, `asyncresponse_transport_messages`, with a l
 Subscribers claim work with `UPDLOCK, ROWLOCK, READPAST` — SQL Server's equivalent of PostgreSQL's
 `FOR UPDATE SKIP LOCKED` — increment `attempts`, and set a row-local `lock_id`/`locked_until`.
 `AckAfterHandlerCompletes` deletes the row after the handler succeeds and releases it for redelivery
-on failure. `AckAfterEnqueue` deletes the row after it enters a bounded background queue; if the
+on failure. Both settlements are fenced on `lock_id`, so they are idempotent, and a transient fault
+on one (a deadlock victim, a timeout, a broken pooled connection) is retried (up to 4 attempts, none
+started past a third of `LockTimeout`) — a single lost round trip no longer leaves a completed job
+leased until a subscriber runs it again. A release while the subscriber is stopping is not retried;
+the lease lapses to the same effect. `AckAfterEnqueue` deletes the row after it enters a bounded background queue; if the
 handler later fails, the original row is already acknowledged, so the dispatcher writes a dead-letter
 row and invokes `OnBackgroundFailure`. Dead-lettering a poison row moves it in one transaction.
 Publishes are idempotent: the caller-supplied id is inserted with an insert-if-absent
@@ -334,7 +343,22 @@ Connection-string notes:
   live waiters.
 - **Confirmation budget.** Keep `DeliveryConfirmationTimeout` long enough for the slowest expected
   live delivery (including one cross-process `ActivePollInterval`), but short enough that a truly
-  lost subscriber routes to recovery promptly.
+  lost subscriber routes to recovery promptly. The poll sweep is how every cross-process response is
+  delivered, so an `ActivePollInterval` or `FullSweepInterval` above half of
+  `DeliveryConfirmationTimeout` logs a warning when the channel is constructed: a response can then
+  reach its publisher's deadline before a sweep visits it, and is claimed for recovery while its
+  waiter is live.
+- **Ambient transactions.** The channel's connections are opened with `Enlist=false`, whatever the
+  configured connection string says, so its statements never join an ambient `System.Transactions`
+  transaction (`TransactionScope`). Every channel statement is its own autocommit by design — a
+  delivery or recovery claim, a subscriber row and a published response must be visible to other
+  processes immediately, and the publish protocol (insert, then wait for another process to claim
+  the row) cannot complete inside a transaction that commits later. So a response published inside
+  a scope is stored and delivered at once and is **not** undone if the scope rolls back; publish it
+  after the commit when it must depend on the outcome. The channel's background loops never run in
+  the context of the request that created the first waiter (its `Activity`, log scope or
+  transaction). The transport is unaffected: its publish follows the configured `Enlist` setting as
+  before.
 - **Transient faults.** Deadlock 1205, lock timeout 1222, Azure SQL throttling codes, and broken
   connections are retried with bounded backoff on the response insert, the recovery claim at the end
   of the confirmation wait, and the transport enqueue; the confirmation poll reads them as "not yet

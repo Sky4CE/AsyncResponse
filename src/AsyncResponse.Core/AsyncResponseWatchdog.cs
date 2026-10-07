@@ -438,14 +438,16 @@ internal sealed class AsyncResponseWatchdog : BackgroundService
         if (!_options.Enabled)
         {
             _state.MarkIdle($"disabled via {nameof(AsyncResponseOptions)}.{nameof(AsyncResponseOptions.Watchdog)}.{nameof(AsyncResponseWatchdogOptions.Enabled)}");
-            _logger.LogInformation("Recovery watchdog disabled via options; not scanning.");
+            // Guarded, like every line of this report-only service: an exception escaping
+            // ExecuteAsync stops the whole host under the default BackgroundServiceExceptionBehavior.
+            SafeLog.Try(_logger, static logger => logger.LogInformation("Recovery watchdog disabled via options; not scanning."));
             return;
         }
 
         if (_scanner is null)
         {
             _state.MarkIdle($"no {nameof(IRecoveryStateScanner)} registered (the configured channel does not support scanning)");
-            _logger.LogInformation("Recovery watchdog idle: no IRecoveryStateScanner registered (the configured channel does not support scanning).");
+            SafeLog.Try(_logger, static logger => logger.LogInformation("Recovery watchdog idle: no IRecoveryStateScanner registered (the configured channel does not support scanning)."));
             return;
         }
 
@@ -455,7 +457,8 @@ internal sealed class AsyncResponseWatchdog : BackgroundService
         _state.MarkScanning(_timeProvider.GetUtcNow().UtcDateTime, _options.StartupDelay, _options.Interval, _options.ResolvedJitter);
         AsyncResponseDiagnostics.EnsureWatchdogGauges(_state);
 
-        _logger.LogInformation("Recovery watchdog started. Interval: {Interval}, stale threshold: {StaleAfter}.", _options.Interval, _options.StaleAfter);
+        SafeLog.Try((Logger: _logger, _options.Interval, _options.StaleAfter), static state => state.Logger.LogInformation(
+            "Recovery watchdog started. Interval: {Interval}, stale threshold: {StaleAfter}.", state.Interval, state.StaleAfter));
 
         try
         {
@@ -480,14 +483,8 @@ internal sealed class AsyncResponseWatchdog : BackgroundService
                     // only cancellation, and under the default StopHost behaviour a report-only
                     // watchdog took the whole host down; now the loop carries on to its next scan.
                     _state.Publish(new AsyncResponseWatchdogSnapshot(_timeProvider.GetUtcNow().UtcDateTime, _options.Interval, Report: null, Error: ex.Message));
-                    try
-                    {
-                        _logger.LogError(ex, "Recovery watchdog scan failed; next attempt in {Interval}.", _options.Interval);
-                    }
-                    catch
-                    {
-                        // The logger is what is failing; the snapshot above already carries the error.
-                    }
+                    SafeLog.Try((Logger: _logger, Error: ex, _options.Interval), static state => state.Logger.LogError(
+                        state.Error, "Recovery watchdog scan failed; next attempt in {Interval}.", state.Interval));
                 }
 
                 await Task.Delay(NextWait(_options.Interval), _timeProvider, stoppingToken).ConfigureAwait(false);
@@ -625,9 +622,14 @@ internal sealed class AsyncResponseWatchdog : BackgroundService
             if (unreadable > 0)
             {
                 report = report with { UnreadableEntries = unreadable };
-                _logger.LogWarning(
+
+                // The scan is complete by now: every line from here on is guarded, because a
+                // throwing logging provider failed the whole scan, and the snapshot then attested
+                // "scan failed" (health Degraded with the logger's message) instead of the report
+                // this scan had just computed — stale entries and counts included.
+                SafeLog.Try((Logger: _logger, Unreadable: unreadable), static state => state.Logger.LogWarning(
                     "Recovery watchdog scan found {Unreadable} stored recovery registration(s) this build cannot read (malformed, incomplete identity, or an unsupported schema version); their recovery callbacks cannot run until a build that can read them, or an operator, resolves them. The store logs a warning for each.",
-                    unreadable);
+                    state.Unreadable));
             }
 
             if (truncated)
@@ -637,9 +639,9 @@ internal sealed class AsyncResponseWatchdog : BackgroundService
                 // staleness verdict it never actually computed.
                 report = report with { Truncated = true };
                 activity?.SetTag("asyncresponse.watchdog.truncated", true);
-                _logger.LogWarning(
+                SafeLog.Try((Logger: _logger, _options.MaxScanEntries), static state => state.Logger.LogWarning(
                     "Recovery watchdog scan stopped at the {MaxScanEntries}-entry buffer cap; staleness is reported for that subset only. Raise AsyncResponseOptions.Watchdog.MaxScanEntries to cover more (scan memory scales with the cap).",
-                    _options.MaxScanEntries);
+                    state.MaxScanEntries));
             }
 
             activity?.SetTag("asyncresponse.watchdog.total_entries", report.TotalEntries);
@@ -649,7 +651,15 @@ internal sealed class AsyncResponseWatchdog : BackgroundService
             activity?.SetTag("asyncresponse.watchdog.unprobeable_entries", report.UnprobeableEntries);
             activity?.SetTag("asyncresponse.watchdog.unreadable_entries", report.UnreadableEntries);
 
-            _logger.LogInformation("Recovery watchdog scan complete. Outstanding registrations: {Total}, with live waiter: {Active}, stale (no waiter, older than {StaleAfter}): {Stale}, unknown age: {UnknownAge}, liveness unprobeable: {Unprobeable}, unreadable: {Unreadable}.", report.TotalEntries, report.EntriesWithActiveWaiter, _options.StaleAfter, report.StaleEntries.Count, report.UnknownAgeEntries, report.UnprobeableEntries, report.UnreadableEntries);
+            SafeLog.Try((Logger: _logger, Report: report, _options.StaleAfter), static state => state.Logger.LogInformation(
+                "Recovery watchdog scan complete. Outstanding registrations: {Total}, with live waiter: {Active}, stale (no waiter, older than {StaleAfter}): {Stale}, unknown age: {UnknownAge}, liveness unprobeable: {Unprobeable}, unreadable: {Unreadable}.",
+                state.Report.TotalEntries,
+                state.Report.EntriesWithActiveWaiter,
+                state.StaleAfter,
+                state.Report.StaleEntries.Count,
+                state.Report.UnknownAgeEntries,
+                state.Report.UnprobeableEntries,
+                state.Report.UnreadableEntries));
 
             // The id and type name are store-written text (the store is a trust boundary): quoted
             // bounded and escaped like every other persisted name, so a CR/LF inside one cannot
@@ -657,11 +667,11 @@ internal sealed class AsyncResponseWatchdog : BackgroundService
             // exactly as before.
             foreach (var stale in report.StaleEntries)
             {
-                _logger.LogWarning(
+                SafeLog.Try((Logger: _logger, Stale: stale), static state => state.Logger.LogWarning(
                     "Stale async-response recovery state — correlationId {CorrelationId}, payload type {PayloadType}, registered {RegisteredAtUtc}, no live subscriber. The owning flow is likely stuck; investigate and resume or fail it.",
-                    stale.CorrelationId is null ? null : DiagnosticText.EscapedExcerpt(stale.CorrelationId, AsyncResponseChannelOptions.MaxCorrelationIdLength),
-                    stale.PayloadTypeFullName is null ? null : AsyncResponseTypeResolution.DescribeForDiagnostics(stale.PayloadTypeFullName),
-                    stale.RegisteredAtUtc);
+                    state.Stale.CorrelationId is null ? null : DiagnosticText.EscapedExcerpt(state.Stale.CorrelationId, AsyncResponseChannelOptions.MaxCorrelationIdLength),
+                    state.Stale.PayloadTypeFullName is null ? null : AsyncResponseTypeResolution.DescribeForDiagnostics(state.Stale.PayloadTypeFullName),
+                    state.Stale.RegisteredAtUtc));
             }
 
             return report;
@@ -696,8 +706,12 @@ internal sealed class AsyncResponseWatchdog : BackgroundService
         }
         catch (Exception ex)
         {
-            _logger.LogDebug(ex, "Recovery watchdog failed to probe subscribers for correlationId {CorrelationId}.",
-                DiagnosticText.EscapedExcerpt(correlationId, AsyncResponseChannelOptions.MaxCorrelationIdLength));
+            // Guarded: unguarded, a throwing Debug provider here turned one unprobeable entry into
+            // a failed scan.
+            SafeLog.Try((Logger: _logger, Error: ex, CorrelationId: correlationId), static state => state.Logger.LogDebug(
+                state.Error,
+                "Recovery watchdog failed to probe subscribers for correlationId {CorrelationId}.",
+                DiagnosticText.EscapedExcerpt(state.CorrelationId, AsyncResponseChannelOptions.MaxCorrelationIdLength)));
             return -1;
         }
     }

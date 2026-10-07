@@ -82,7 +82,7 @@ public sealed class Round28RegressionTests
 
         // Past the server's deadline. The old code thought it had until T+50.
         clock.Advance(TimeSpan.FromSeconds(6));
-        var lost = Assert.Throws<InvalidOperationException>(() => lease.ThrowIfLost());
+        var lost = Assert.Throws<DurableFlowLeaseLostException>(() => lease.ThrowIfLost());
         Assert.Contains("lost its execution lease", lost.Message, StringComparison.Ordinal);
     }
 

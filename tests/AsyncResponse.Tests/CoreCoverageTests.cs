@@ -139,7 +139,7 @@ public sealed class CoreCoverageTests
         var lease = new FlowExecutionLease(store.Object, "flow", "lease", options, NullLogger.Instance);
 
         await WaitUntilAsync(() => lease.LostToken.IsCancellationRequested);
-        Assert.Throws<InvalidOperationException>(() => lease.ThrowIfLost());
+        Assert.Throws<DurableFlowLeaseLostException>(() => lease.ThrowIfLost());
         await lease.DisposeAsync();
         await lease.DisposeAsync();
         InvokePrivate(lease, "MarkLost");
@@ -245,7 +245,7 @@ public sealed class CoreCoverageTests
         var conflictLease = LongLease(conflictStore.Object, "conflict");
         var conflicted = new FlowState { FlowId = "conflict", Revision = 7 };
 
-        await Assert.ThrowsAsync<InvalidOperationException>(() => conflictLease.SaveAsync(conflicted, TimeSpan.FromMinutes(1)));
+        await Assert.ThrowsAsync<DurableFlowLeaseLostException>(() => conflictLease.SaveAsync(conflicted, TimeSpan.FromMinutes(1)));
         Assert.Equal(7, conflicted.Revision);
         await conflictLease.DisposeAsync();
 

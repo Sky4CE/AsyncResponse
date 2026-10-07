@@ -1,6 +1,7 @@
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
+using System.Diagnostics;
 using System.Text;
 
 namespace AsyncResponse.Transports.RabbitMQ;
@@ -220,9 +221,25 @@ internal abstract class RabbitMqSubscriberService : BackgroundService
         // ShutdownTimeout, so the token armed for BasicCancel was already cancelled by the time
         // it reached CloseAsync — which threw, skipped the connection close, and left both to
         // the unbounded await-using unwind on every early-ACK shutdown.
+        // The token alone does not bound them, though: the client ignores it while the channel or
+        // connection is still open (RabbitMqBoundedClose), so an unresponsive broker held this stop
+        // ~50 s. One ShutdownTimeout bounds both closes, as the startup budget counts it; past it
+        // they are abandoned, the connection is aborted in the background, and the await-using
+        // unwind finds both already closing.
         using var closeBudget = new CancellationTokenSource(Options.ShutdownTimeout);
-        await channel.CloseAsync(closeBudget.Token).ConfigureAwait(false);
-        await connection.CloseAsync(Options.ShutdownTimeout, closeBudget.Token).ConfigureAwait(false);
+        var closeStarted = Stopwatch.GetTimestamp();
+        if (!await RabbitMqBoundedClose.WithinAsync(channel.CloseAsync(closeBudget.Token), Options.ShutdownTimeout).ConfigureAwait(false)
+            || !await RabbitMqBoundedClose.WithinAsync(
+                connection.CloseAsync(Options.ShutdownTimeout, closeBudget.Token),
+                Options.ShutdownTimeout - Stopwatch.GetElapsedTime(closeStarted)).ConfigureAwait(false))
+        {
+            RabbitMqBoundedClose.AbortInBackground(connection);
+            SafeLog.Try(() => Logger.LogWarning(
+                "Closing the RabbitMQ channel and connection for queue {Queue} ({Role}) did not complete within ShutdownTimeout ({ShutdownTimeout}); aborting the connection. The broker requeues whatever this consumer left un-ACKed.",
+                queue,
+                SubscriberRole,
+                Options.ShutdownTimeout));
+        }
     }
 }
 

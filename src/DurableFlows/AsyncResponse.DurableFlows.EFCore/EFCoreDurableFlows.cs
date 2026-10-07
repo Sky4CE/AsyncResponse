@@ -253,7 +253,7 @@ public static class EFCoreDurableFlowModelBuilderExtensions
 /// application-owned <typeparamref name="TContext"/>. Requires a relational provider
 /// (deletes and updates use <c>ExecuteDeleteAsync</c>/<c>ExecuteUpdateAsync</c>).
 /// </summary>
-public sealed class EFCoreFlowStateStore<[DynamicallyAccessedMembers(DynamicallyAccessedMemberTypes.PublicConstructors | DynamicallyAccessedMemberTypes.NonPublicConstructors | DynamicallyAccessedMemberTypes.PublicProperties)] TContext> : IFlowStateStore
+public sealed class EFCoreFlowStateStore<[DynamicallyAccessedMembers(DynamicallyAccessedMemberTypes.PublicConstructors | DynamicallyAccessedMemberTypes.NonPublicConstructors | DynamicallyAccessedMemberTypes.PublicProperties)] TContext> : IFlowStateStore, IFlowStateStoreStartupProbe
     where TContext : DbContext
 {
     private readonly ILogger<EFCoreFlowStateStore<TContext>>? _logger;
@@ -565,7 +565,10 @@ public sealed class EFCoreFlowStateStore<[DynamicallyAccessedMembers(Dynamically
     /// owned by a fresh scope. Never caches a context — <see cref="DbContext"/> is not thread-safe
     /// and this store is a singleton used by parallel flow executions.
     /// </summary>
-    private async ValueTask<ContextLease> LeaseContextAsync(CancellationToken cancellationToken)
+    private ValueTask<ContextLease> LeaseContextAsync(CancellationToken cancellationToken)
+        => LeaseContextAsync(checkMapping: true, cancellationToken);
+
+    private async ValueTask<ContextLease> LeaseContextAsync(bool checkMapping, CancellationToken cancellationToken)
     {
         var scope = _scopeFactory.CreateAsyncScope();
         try
@@ -577,7 +580,8 @@ public sealed class EFCoreFlowStateStore<[DynamicallyAccessedMembers(Dynamically
                 : scope.ServiceProvider.GetRequiredService<TContext>();
             try
             {
-                EnsureMapped(context);
+                if (checkMapping)
+                    EnsureMapped(context);
                 return new ContextLease(context, scope, ownsContext);
             }
             catch
@@ -594,16 +598,88 @@ public sealed class EFCoreFlowStateStore<[DynamicallyAccessedMembers(Dynamically
         }
     }
 
-    private void EnsureMapped(TContext context)
+    /// <summary>
+    /// The host-start half of <see cref="EnsureMapped"/>. The mapping check reads the model and
+    /// the provider name — no I/O — yet it used to run only inside the first operation's context
+    /// lease, and the flow starter publishes first and tolerates a store fault after the publish:
+    /// a context that does not map the ledger, or leaves flow_id on a case-folding collation,
+    /// accepted every start and dead-lettered every job. Asked here, it fails the host start.
+    /// <para>
+    /// Only the mapping refusal throws. Obtaining the context is the application's code (its
+    /// factory, its constructor) and may legitimately need what only a running host provides;
+    /// a failure there is logged and left to the first operation, which reports it as before.
+    /// </para>
+    /// </summary>
+    async Task IFlowStateStoreStartupProbe.VerifyConfigurationAsync(CancellationToken cancellationToken)
     {
         if (_modelChecked)
             return;
 
-        var entity = context.Model.FindEntityType(typeof(DurableFlowStateRecord))
-            ?? throw new InvalidOperationException(
-                $"'{typeof(TContext).Name}' does not map {nameof(DurableFlowStateRecord)}. Call " +
+        // A cancelled start is not a creation fault to swallow (the filter below would otherwise
+        // let whatever the factory threw escape in its place).
+        cancellationToken.ThrowIfCancellationRequested();
+        ContextLease lease;
+        try
+        {
+            lease = await LeaseContextAsync(checkMapping: false, cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (!cancellationToken.IsCancellationRequested)
+        {
+            SafeLog.Try((Logger: _logger, Error: ex, Context: typeof(TContext).Name), static state => state.Logger?.LogWarning(
+                state.Error,
+                "The EF Core durable-flow store could not create a '{Context}' while the host started; its ledger mapping is verified by the store's first operation instead.",
+                state.Context));
+            return;
+        }
+
+        await using (lease)
+        {
+            // Only the mapping REFUSAL fails the start: reading the model runs the application's
+            // own OnConfiguring/OnModelCreating, which may fail at host start for a reason the
+            // first operation does not share (a provider configured from a secret loaded later).
+            string? refusal;
+            try
+            {
+                refusal = FindMappingRefusal(lease.Context);
+            }
+            catch (Exception ex) when (!cancellationToken.IsCancellationRequested)
+            {
+                SafeLog.Try((Logger: _logger, Error: ex, Context: typeof(TContext).Name), static state => state.Logger?.LogWarning(
+                    state.Error,
+                    "The EF Core durable-flow store could not read the '{Context}' model while the host started; its ledger mapping is verified by the store's first operation instead.",
+                    state.Context));
+                return;
+            }
+
+            if (refusal is not null)
+                throw new InvalidOperationException(refusal);
+        }
+    }
+
+    private void EnsureMapped(TContext context)
+    {
+        if (FindMappingRefusal(context) is { } refusal)
+            throw new InvalidOperationException(refusal);
+    }
+
+    /// <summary>
+    /// Why the store refuses <paramref name="context"/>'s ledger mapping, or <c>null</c> when it
+    /// accepts it (latched). Reading the model also runs the application's own
+    /// <c>OnConfiguring</c>/<c>OnModelCreating</c>: a fault from those propagates as itself, which is
+    /// how the host-start probe tells it apart from a refusal.
+    /// </summary>
+    private string? FindMappingRefusal(TContext context)
+    {
+        if (_modelChecked)
+            return null;
+
+        var entity = context.Model.FindEntityType(typeof(DurableFlowStateRecord));
+        if (entity is null)
+        {
+            return $"'{typeof(TContext).Name}' does not map {nameof(DurableFlowStateRecord)}. Call " +
                 $"modelBuilder.{nameof(EFCoreDurableFlowModelBuilderExtensions.ConfigureAsyncResponseDurableFlows)}() " +
-                "in OnModelCreating and add a migration for the durable-flow state table.");
+                "in OnModelCreating and add a migration for the durable-flow state table.";
+        }
 
         // The flow_id column is a KEY the engine compares ordinally. This package owns no DDL, so
         // it cannot pin the collation itself — but it can refuse to run against a mapping that
@@ -616,19 +692,18 @@ public sealed class EFCoreFlowStateStore<[DynamicallyAccessedMembers(Dynamically
         if (FlowIdCollationRules.CaseFoldingProvider(context.Database.ProviderName) is not { } provider)
         {
             _modelChecked = true;
-            return;
+            return null;
         }
 
         var collation = entity.FindAnnotation(EFCoreDurableFlowModelBuilderExtensions.FlowIdCollationAnnotation)?.Value as string;
         if (string.IsNullOrWhiteSpace(collation))
         {
-            throw new InvalidOperationException(
-                $"'{typeof(TContext).Name}' maps {nameof(DurableFlowStateRecord)}.{nameof(DurableFlowStateRecord.FlowId)} without a " +
+            return $"'{typeof(TContext).Name}' maps {nameof(DurableFlowStateRecord)}.{nameof(DurableFlowStateRecord.FlowId)} without a " +
                 $"collation, and {provider.Name} defaults to a case-insensitive one. Flow ids are compared ordinally, so two ids " +
                 "differing only in case would collide on the primary key — the second flow fails to start and a load returns the " +
                 $"other run's state. Pass {nameof(AsyncResponseFlowIdCollations)}.{provider.ConstantName} to " +
                 $"{nameof(EFCoreDurableFlowModelBuilderExtensions.ConfigureAsyncResponseDurableFlows)}(flowIdCollation: …) and add a " +
-                "migration.");
+                "migration.";
         }
 
         // A declared collation is a claim, not a proof: "I chose one" and "I chose an ordinal one"
@@ -638,16 +713,16 @@ public sealed class EFCoreFlowStateStore<[DynamicallyAccessedMembers(Dynamically
         // folds accents. Only _BIN/_BIN2 (SQL Server) and _bin (MySQL) compare byte-wise.
         if (!provider.IsOrdinal(collation))
         {
-            throw new InvalidOperationException(
-                $"'{typeof(TContext).Name}' maps {nameof(DurableFlowStateRecord)}.{nameof(DurableFlowStateRecord.FlowId)} with the " +
+            return $"'{typeof(TContext).Name}' maps {nameof(DurableFlowStateRecord)}.{nameof(DurableFlowStateRecord.FlowId)} with the " +
                 $"collation '{collation}', which {provider.Name} does not compare byte-wise. Case sensitivity alone is not enough: a " +
                 "case-sensitive collation still folds accents or full-width forms, so two flow ids the library treats as distinct " +
                 "collide on the primary key — the second flow fails to start and a load returns the other run's state. Pass " +
                 $"{nameof(AsyncResponseFlowIdCollations)}.{provider.ConstantName} ('{provider.Recommended}') instead, or another " +
-                $"{provider.OrdinalDescription}, and add a migration.");
+                $"{provider.OrdinalDescription}, and add a migration.";
         }
 
         _modelChecked = true;
+        return null;
     }
 
     private readonly struct ContextLease : IAsyncDisposable

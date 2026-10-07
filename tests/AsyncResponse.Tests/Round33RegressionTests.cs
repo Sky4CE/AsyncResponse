@@ -79,14 +79,14 @@ public sealed class Round33RegressionTests
 
         var won = new OperationResult { Status = OperationStatus.Completed, Message = "won-before-the-lease-was-lost" };
         var triggered = new List<string>();
-        InvalidOperationException surfaced;
+        DurableFlowLeaseLostException surfaced;
 
         await using (var lease = await AcquireLeaseAsync(store, state.FlowId!))
         {
             var context = CreateContext(state, store, SubscriberReturning(Task.FromResult(won)), lease);
 
             // The takeover signal still propagates: this execution may not continue past the step.
-            surfaced = await Assert.ThrowsAsync<InvalidOperationException>(() => context.AwaitStepAsync<OperationResult>(
+            surfaced = await Assert.ThrowsAsync<DurableFlowLeaseLostException>(() => context.AwaitStepAsync<OperationResult>(
                 "remote",
                 correlationId =>
                 {

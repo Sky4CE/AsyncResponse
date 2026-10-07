@@ -33,4 +33,9 @@ internal sealed class SqlServerMessageDispatcher(
         unitNoun: "row",
         telemetryName: "sqlserver",
         timeProvider: timeProvider,
-        hostStopping: hostStopping);
+        hostStopping: hostStopping)
+{
+    /// <inheritdoc />
+    protected override bool IsTransientSettlementFault(Exception exception)
+        => AsyncResponse.Internal.SqlServerTransientFaults.IsTransient(exception);
+}

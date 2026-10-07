@@ -961,6 +961,11 @@ public class GooglePubSubSubscriberTests
         // The drain lapses on the stuck handler; only then is the client stopped and the held
         // deliveries handed back, none of them having run.
         clock.Advance(TimeSpan.FromSeconds(10));
+
+        // The stuck handler ignores its token, so the client stop (which, like the real SDK's,
+        // completes only once its handlers return) is abandoned at ShutdownTimeout (round 65).
+        await Eventually(() => client.StopCalls == 1 && clock.NextTimerDueAt is not null);
+        clock.Advance(TimeSpan.FromSeconds(5));
         await stopping.WaitAsync(TimeSpan.FromSeconds(10));
 
         Assert.Equal(1, client.StopCalls);
@@ -1043,6 +1048,10 @@ public class GooglePubSubSubscriberTests
         // 30 s − 12 s spent − 5 s for the client stop leaves 13 s, under the 20 s BackgroundDrainTimeout.
         Assert.Contains(logger.Entries, entry => entry.Message.Contains("waiting up to 00:00:13", StringComparison.Ordinal));
         clock.Advance(TimeSpan.FromSeconds(13));
+
+        // The parked handler never returns: the client stop is abandoned at ShutdownTimeout (round 65).
+        await Eventually(() => client.StopCalls == 1 && clock.NextTimerDueAt is not null);
+        clock.Advance(TimeSpan.FromSeconds(5));
         await stopping.WaitAsync(TimeSpan.FromSeconds(10));
         Assert.Equal(1, client.StopCalls);
     }
@@ -1982,9 +1991,18 @@ public class GooglePubSubSubscriberTests
             await Task.Delay(10, cts.Token);
     }
 
+    /// <summary>
+    /// Models the real SDK's stop (Google.Cloud.PubSub.V1 3.x <c>SubscriberClientImpl</c>): StopAsync
+    /// cancels the handlers' token, but its task — the same one StartAsync returned — completes only
+    /// once every handler the client started has returned. <c>ShutdownOptions.Timeout</c> decides
+    /// when the SDK cancels, never when the stop completes; a handler that ignores its token (the
+    /// ingress takes none) holds the stop. A fake that completed at once hid that.
+    /// </summary>
     private sealed class FakeSubscriberClient : IGooglePubSubSubscriberClient
     {
         private readonly TaskCompletionSource _run = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private readonly CancellationTokenSource _handlerCancellation = new();
+        private readonly List<Task> _running = [];
 
         public Func<PubsubMessage, CancellationToken, Task<SubscriberClient.Reply>>? Handler { get; private set; }
         public int StartCalls { get; private set; }
@@ -1994,7 +2012,15 @@ public class GooglePubSubSubscriberTests
         public Task StartAsync(Func<PubsubMessage, CancellationToken, Task<SubscriberClient.Reply>> handler)
         {
             StartCalls++;
-            Handler = handler;
+            Handler = (message, cancellationToken) =>
+            {
+                var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _handlerCancellation.Token);
+                var reply = handler(message, linked.Token);
+                lock (_running)
+                    _running.Add(reply);
+                _ = reply.ContinueWith(_ => linked.Dispose(), TaskScheduler.Default);
+                return reply;
+            };
             return _run.Task;
         }
 
@@ -2003,8 +2029,12 @@ public class GooglePubSubSubscriberTests
             StopCalls++;
             LastShutdownOptions = options;
             Stopped.TrySetResult();
-            _run.TrySetResult();
-            return Task.CompletedTask;
+            _handlerCancellation.Cancel();
+            Task[] running;
+            lock (_running)
+                running = [.. _running];
+            _ = Task.WhenAll(running).ContinueWith(_ => _run.TrySetResult(), TaskScheduler.Default);
+            return _run.Task.ContinueWith(static _ => { }, TaskScheduler.Default);
         }
 
         /// <summary>Completes when the client is stopped.</summary>

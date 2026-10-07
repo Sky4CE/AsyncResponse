@@ -183,6 +183,7 @@ public class AsyncResponseBuilderTests
     [Fact]
     public async Task For_WithoutCorrelationId_GeneratesOneAndSharesItWithAmbientContextAndTrigger()
     {
+        string? ambientInsideTrigger = null;
         string? subscribedWith = null;
         _subscriber
             .Setup(s => s.CreateResponseWaiter<OperationResult>(
@@ -197,13 +198,16 @@ public class AsyncResponseBuilderTests
             .WaitAsync(context =>
             {
                 triggeredWith = context.CorrelationId;
+                ambientInsideTrigger = AsyncResponseContext.CorrelationId;
                 return Task.CompletedTask;
             });
 
         Assert.False(string.IsNullOrWhiteSpace(subscribedWith));
         Assert.Equal(subscribedWith, triggeredWith);
-        // The generated id is also ambient, so outgoing requests built from context still correlate.
-        Assert.Equal(subscribedWith, AsyncResponseContext.CorrelationId);
+        // The generated id is ambient inside the trigger, so outgoing requests built from context
+        // still correlate — and only there (round 65): the caller's own ambient id is untouched.
+        Assert.Equal(subscribedWith, ambientInsideTrigger);
+        Assert.Null(AsyncResponseContext.CorrelationId);
     }
 
     [Fact]

@@ -475,10 +475,16 @@ public class RabbitMqDispatcherTests
         // Red-on-old: the failure-path NACK was the one unguarded settle. A closed channel has
         // already returned every un-ACKed delivery to the queue, so NACKing it throws into the
         // client's delivery callback — the requeue/reject decision silently lost, with no log.
+        // The channel dies UNDER the running handler: one already closed at delivery is never
+        // started at all (round 65 — the client's buffered tail of a dead channel).
         var logger = new ListLogger();
-        var channel = new FakeDispatcherChannel { IsOpen = false };
+        var channel = new FakeDispatcherChannel();
         await using var dispatcher = RabbitMqMessageDispatcher.Create(
-            (_, _) => throw new InvalidOperationException("handler boom"),
+            (_, _) =>
+            {
+                channel.IsOpen = false;
+                throw new InvalidOperationException("handler boom");
+            },
             new RabbitMqAsyncResponseOptions(),
             new RabbitMqSubscriberOptions { AckMode = RabbitMqAckMode.AckAfterHandlerCompletes },
             logger,
@@ -1032,6 +1038,10 @@ public class RabbitMqDispatcherTests
             "worker.q",
             RabbitMqSubscriberRole.Worker);
 
+        // Every subscriber attempt attaches its channel before it consumes; a delivery on a channel
+        // no live attempt attached is a dead channel's buffered tail and is never parked (round 65).
+        using var attached = dispatcher.AttachChannel(channel);
+
         // The gated worker holds m1; m2 fills the capacity-1 queue; m3 overflows.
         await dispatcher.HandleAsync(Delivery("m1", deliveryTag: 1), channel, CancellationToken.None);
         await dispatcher.HandleAsync(Delivery("m2", deliveryTag: 2), channel, CancellationToken.None);
@@ -1065,6 +1075,10 @@ public class RabbitMqDispatcherTests
             "worker.q",
             RabbitMqSubscriberRole.Worker);
 
+        // Every subscriber attempt attaches its channel before it consumes; a delivery on a channel
+        // no live attempt attached is a dead channel's buffered tail and is never parked (round 65).
+        using var attached = dispatcher.AttachChannel(channel);
+
         await dispatcher.HandleAsync(Delivery("m1", deliveryTag: 1), channel, CancellationToken.None);
         await dispatcher.HandleAsync(Delivery("m2", deliveryTag: 2), channel, CancellationToken.None);
         var overflow = dispatcher.HandleAsync(Delivery("m3", deliveryTag: 3), channel, CancellationToken.None);
@@ -1096,6 +1110,10 @@ public class RabbitMqDispatcherTests
             NullLogger.Instance,
             "worker.q",
             RabbitMqSubscriberRole.Worker);
+
+        // Every subscriber attempt attaches its channel before it consumes; a delivery on a channel
+        // no live attempt attached is a dead channel's buffered tail and is never parked (round 65).
+        using var attached = dispatcher.AttachChannel(channel);
 
         await dispatcher.HandleAsync(Delivery("m1", deliveryTag: 1), channel, CancellationToken.None);
         await dispatcher.HandleAsync(Delivery("m2", deliveryTag: 2), channel, CancellationToken.None);
@@ -2717,6 +2735,10 @@ public class RabbitMqDispatcherTests
             "worker.q",
             RabbitMqSubscriberRole.Worker,
             host);
+
+        // Every subscriber attempt attaches its channel before it consumes; a delivery on a channel
+        // no live attempt attached is a dead channel's buffered tail and is never parked (round 65).
+        using var attached = dispatcher.AttachChannel(channel);
 
         try
         {

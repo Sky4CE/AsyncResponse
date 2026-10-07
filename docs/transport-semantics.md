@@ -55,7 +55,7 @@ These hold for every transport in the matrix:
   this mirror, because a drain truncated by the host silently loses already-ACKed work. The check
   runs for early-ACK subscribers on every transport, and in both ack modes on Azure Service Bus,
   SQS and Google Pub/Sub (whose ack-after-handler stop also spends `ShutdownTimeout`). When
-  **both** subscribers use early ACK, NATS and the database transports sum both roles' spends: the
+  **both** subscribers use early ACK, Redis, NATS and the database transports sum both roles' spends: the
   host stops hosted services one after another (`HostOptions.ServicesStopConcurrently = false` by
   default), and hosted services registered after them spend from the same budget, which
   validation cannot see. Equality passes; set the mirror to `null` only when the budget is
@@ -262,6 +262,15 @@ are not repeated here except where a transport differs.
   ACK of a handler still running, so it must come second. A handler parked on an awaited
   durable-flow response is not interrupted by the host stop: unless its response arrives, it costs
   the drain its whole bound and is redelivered.
+- **The client stop is bounded by the package, not the SDK.** The SDK's `StopAsync` completes only
+  once every handler it started has returned — its `ShutdownOptions.Timeout` only decides when it
+  cancels their token, and the ingress takes none. The subscriber therefore waits at most
+  `ShutdownTimeout` for it and then abandons the stop with a Warning naming the handlers still
+  running; their messages were already handed back, so unlike SQS and Service Bus (which keep
+  renewing the lock until the handler ends) Pub/Sub may redeliver one to a peer while the
+  original handler keeps running for the rest of the process's life. Without the bound, one such
+  handler held the stop for the whole host budget and the hosted services stopped after it (the
+  worker subscriber, stopped after the response subscriber) got none.
 - **Deliveries arriving during the drain, and hand-backs, are held — not NACKed.** An immediate
   NACK would be redelivered straight back to the still-running stream, looping through the
   `DeadLetterPolicy`'s attempts. Held deliveries keep their flow-control slots, so the pull stalls
@@ -378,6 +387,14 @@ are not repeated here except where a transport differs.
   possibly while the abandoned handler still runs (a durable flow's lease makes that a no-op; a
   plain worker job must be idempotent); their retry ladders are cancelled and each eventual
   outcome is logged. A graceful stop is bounded by the host's shutdown budget instead.
+- **A dead-letter produce abandoned at its bound is unconfirmed, not failed.** Every dead-letter
+  produce is bounded (a quarter of `max.poll.interval.ms`, or the stop's reserve), but the bound
+  only ends the wait: librdkafka keeps a record it accepted queued until `message.timeout.ms`
+  (5 min by default) and may still deliver it. Such a burial is reported as unconfirmed — under
+  ack-after-handler the partition still stalls and the restart buries again, so the dead-letter
+  topic can hold two copies; under early ACK the log says the copy is unconfirmed instead of
+  "lost" (check the dead-letter topic before replaying from `OnBackgroundFailure`). The real
+  outcome is logged at Warning once librdkafka reports it.
 - **Publish retries are for transient errors only.** `Local_MsgTimedOut` (raised only after
   librdkafka already retried for `message.timeout.ms`), message/record-size and topic/cluster
   authorization errors fail the publish at once instead of burning `PublishMaxAttempts`.
@@ -443,7 +460,14 @@ are not repeated here except where a transport differs.
   the consumer and waits for the handler still running in its delivery callback — up to
   `BackgroundDrainTimeout`, shortened (not validated) to what `HostShutdownTimeout` leaves after
   the two `ShutdownTimeout` spends — so its ACK lands before the channel closes; deliveries the
-  client had already buffered are not started and are redelivered. Past the bound the close goes
+  client had already buffered are not started and are redelivered.
+- **A dead channel's buffered deliveries are never started.** RabbitMQ.Client keeps dispatching
+  the deliveries it had prefetched after a channel dies (a broker restart, a network blip,
+  `consumer_timeout`, a 406) while the broker has already requeued them all. Both ack modes check
+  the delivery's channel first — the client cancels each such delivery's token — and start and
+  settle nothing for it (Debug log), so a channel fault no longer runs up to `PrefetchCount − 1`
+  jobs twice. Under early ACK, a delivery parked on a full queue is handed back as soon as its
+  channel dies or its subscriber attempt has unwound. Past the bound the close goes
   ahead and the running delivery is redelivered. When `HostShutdownTimeout` leaves no wait at all
   (for example 10 s against two default 5 s spends) the subscriber says so once at startup
   (Information). A consumer cancel that fails or outlives `ShutdownTimeout` is logged and the stop
@@ -452,7 +476,12 @@ are not repeated here except where a transport differs.
 - **Shutdown budget.** Shutdown spends `ShutdownTimeout` twice — consumer cancel, then channel and
   connection close after the drain — and early-ACK validation sums both plus
   `BackgroundDrainTimeout` against `HostShutdownTimeout`. `ShutdownTimeout` must be positive and
-  timer-backed in both ack modes.
+  timer-backed in both ack modes. The closes are bounded by the package: RabbitMQ.Client ignores a
+  close's token while the channel or connection is open (the channel close waits its
+  `ContinuationTimeout`, 20 s by default; the connection close at least 30 s), so against an
+  unresponsive broker the closes are abandoned once one `ShutdownTimeout` has passed, with a
+  Warning, and the connection is aborted in the background. The publishing transport's dispose
+  bounds each close the same way.
 - **A host-stop hand-back comes back `redelivered`.** The channel close requeues the unacknowledged
   delivery with `redelivered` set — attempt 2 on the next host (unless `x-death` counts further).
   With `MaxDeliveryAttempts = 1` that is past the cap, so the redelivery is rejected before its
@@ -512,25 +541,39 @@ are not repeated here except where a transport differs.
   discard of an unparsable entry — instead of faulting the subscriber. Discarding an unparsable
   entry is a settlement and ignores cancellation. With `DeadLetterEnabled = false` a burial is only
   the `XACK`: the entry is dropped with no copy, logged at Error.
-- **`StreamMaxLength` (default `100000`) evicts unprocessed work.** Worker publishes append with
-  `XADD … MAXLEN ~ N`, and Redis trims by length alone, whatever the consumer group has read: past
-  the cap the oldest entries are deleted — including jobs never read and jobs pending in a
-  handler — with no dead-letter copy. On Redis 6.2 `XCLAIM` answers a trimmed-while-pending id with
-  a nil entry, which is ACKed by its pending id with a Warning (7.0+ drops such an id from the
-  pending list itself). Settlement is `XACK` only, so processed entries stay in the stream until
-  trimmed. Size the cap well above the deepest backlog an outage can build (throughput × longest
-  worker outage), or set `null` to disable trimming and bound the stream operationally. The library
-  trims only its own worker publishes; producers writing the **response** stream must apply
-  `XADD … MAXLEN ~` themselves.
+- **`StreamMaxLength` (default `100000`) is a capacity: a full worker stream refuses the publish,
+  it never evicts work** (NATS `Discard=New` parity). Settling a worker entry — handled,
+  dead-lettered, or ACKed at enqueue under early ACK — deletes it (`XACK` + `XDEL` in one script),
+  so the stream holds only unread jobs and jobs pending in a handler. With `StreamMaxLength = null`
+  nothing needs the room and settlement is only the `XACK`, so another consumer group reading the
+  worker stream keeps the entries it has not read yet. A publish that finds the
+  stream at capacity first drops whatever the worker group has already settled (entries an older
+  version only ACKed, or an operator ACKed) with `XTRIM … MINID` below both the group's
+  last-delivered id (read with `XINFO GROUPS`) and its oldest pending id (read with `XPENDING`
+  inside the script, atomically with the trim); when that frees nothing the script answers
+  `ASYNCRESPONSE_STREAM_FULL …`, which the publish retries within `PublishMaxAttempts` and then
+  throws as a `RedisServerException`. Until the worker group exists nothing counts as settled, so
+  the stream fills to the capacity and then refuses. Only the worker group is consulted: another
+  consumer group attached to the worker stream does not hold entries back. Earlier versions
+  appended with `XADD … MAXLEN ~ N`, which trimmed by length alone and deleted unread and pending
+  jobs (a durable flow's wake-up included) with no dead-letter copy; the tombstone handling below
+  remains only for entries trimmed or deleted outside the library. On Redis 6.2 `XCLAIM` answers a
+  trimmed-while-pending id with a nil entry, which is ACKed by its pending id with a Warning (7.0+
+  drops such an id from the pending list itself). `null` leaves the stream unbounded. The library
+  bounds only its own worker publishes; producers writing the **response** stream must apply
+  `XADD … MAXLEN ~` themselves, and the response ingress only ACKs (never deletes) its entries.
 - **Worker publishes are idempotent across their retry window.** `XADD` has no natural identity,
   so each publish runs one same-slot Lua script (`EVAL`/`EVALSHA` must be permitted by the ACL):
   it appends with `XADD` and only then writes a TTL-bound success marker
   (`{<worker stream>}:publish:<id>`, hash-tagged to the stream's cluster slot, TTL ≈ 2× the retry
-  window) holding the entry id. A failed append leaves no marker; a retry after a lost reply finds
-  the marker and appends nothing. The script uses the portable `MAXLEN` syntax (validated on Redis
-  and Valkey). Besides connection faults and timeouts, the retry covers the replies of a cluster in
-  transition — `TRYAGAIN`, `CLUSTERDOWN`, `LOADING`, `MASTERDOWN`, `READONLY` — which the server
-  raises before running anything; every other server error fails the publish at once. This is not
+  window) holding the entry id. A failed append — a full stream's refusal included — leaves no
+  marker; a retry after a lost reply finds the marker and appends nothing. The capacity check uses
+  `XLEN`, `XPENDING` and `XTRIM … MINID` (Redis 6.2+; validated on Redis 6.2, 7, 8, Valkey 8 and
+  Dragonfly), and the group's last-delivered id is read with `XINFO GROUPS` outside the script
+  (Dragonfly wedges the key on `XINFO` inside a script). Besides connection faults and timeouts,
+  the retry covers the replies of a cluster in transition — `TRYAGAIN`, `CLUSTERDOWN`, `LOADING`,
+  `MASTERDOWN`, `READONLY` — which the server raises before running anything, and the
+  `ASYNCRESPONSE_STREAM_FULL` refusal; every other server error fails the publish at once. This is not
   exactly-once execution: handlers must still tolerate redelivery.
 - **An acknowledged write is only as durable as your Redis deployment.** A worker publish (a flow
   wake-up included) returns once the primary has run the append script, and the Redis channel's
@@ -748,7 +791,11 @@ are not repeated here except where a transport differs.
   replica set's secondaries (or remove the arbiter) rather than lowering the write concern. Lease
   writes (claim, renew, NAK) and deletes (ack, burial, prune) use an explicit `w: 1`, keeping the
   inherited `journal`: rolling one back only makes the document claimable again, like a lapsed
-  lease.
+  lease. Index creation (`AutoCreateIndexes = true`) uses `w: 1` as well — so do the MongoDB
+  channel's and durable-flow store's: under `w: "majority"` even a `createIndexes` with nothing
+  to build waits for majority acknowledgement, so a host started while the set cannot reach a
+  majority failed every operation until the set recovered. Index DDL is idempotent; a build a
+  failover rolled back reruns at the next start.
 - **MongoDB claim order and indexes.** The claim takes documents in the claim index's own order
   (`queue, available_at, created_at`); immediate publishes stamp `available_at` with the server's
   `$$NOW`, so a NAKed or delayed document queues by when it became due and a claim walks the index
@@ -764,4 +811,8 @@ are not repeated here except where a transport differs.
   document, any mistyped field — is **dead-lettered on sight** (fenced by `lock_id`,
   payload/headers kept, reason in `AR-DeadLetter-Reason`) and the claim moves on. Foreign producers
   should write a `binData` UUID `_id` (subtype 4), a string `payload`, and the `[{k, v}]` header
-  array the transport itself writes.
+  array the transport itself writes. The document's instants (`created_at`, `available_at`, `locked_until`) are
+  always read and written as BSON dates, whatever `DateTime` serializer the host registered
+  globally (the MongoDB channel's documents are pinned the same way): under a host-wide `String`
+  representation or a host's own string serializer, every claimed job used to fail to map and was
+  dead-lettered unexecuted, and the channel's sweep never matched a stored response.

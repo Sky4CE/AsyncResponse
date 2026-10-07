@@ -51,6 +51,11 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
         _logger = logger;
         _lostSubscriberDispatcher = new LostSubscriberCallbackDispatcher(scopeFactory, propagation, logger, _timeProvider);
 
+        // The liveness probe's post-reconnect grace follows the connection's own reconnects (see
+        // ReconnectGrace). The registration lives as long as the client: both are container
+        // singletons, and disposing the client unhooks the connection events behind it.
+        _ = client.WatchReconnects(() => Volatile.Write(ref _reconnectedAt, _timeProvider.GetTimestamp()));
+
         // Recovery keys are not scoped by SubjectPrefix, so a prefix chosen to isolate a
         // deployment isolates its response subjects but not its registrations: every deployment
         // left on the default bucket shares one keyspace.
@@ -65,6 +70,31 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
                 _options.RecoveryBucket);
         }
     }
+
+    /// <summary>
+    /// Reports — once per channel — a wait that outlives its own registration. The registration is
+    /// saved once and never refreshed, and the KV bucket's <c>MaxAge</c> (= RecoveryStateExpiry,
+    /// fixed when the bucket was created) removes it then whatever expiry it carries, so the tail
+    /// of a longer wait has no recovery: a response landing there after the waiter's process died
+    /// finds no registration and is acknowledged and dropped. Warned rather than refused: a live
+    /// waiter still receives its response, and refusing broke durable-flow steps whose own timeout
+    /// (DefaultStepTimeout, an explicit step timeout) is longer than the expiry — they ran before,
+    /// losing only recovery of their tail.
+    /// </summary>
+    private void WarnIfWaitOutlivesRegistration(TimeSpan timeout)
+    {
+        if (timeout <= _options.RecoveryStateExpiry || Interlocked.Exchange(ref _warnedWaitOutlivesRegistration, 1) != 0)
+            return;
+
+        SafeLog.Try((Logger: _logger, Timeout: timeout, Expiry: _options.RecoveryStateExpiry), static s => s.Logger.LogWarning(
+            "A NATS channel wait with timeout {Timeout} outlives its recovery registration: the KV bucket's MaxAge ({RecoveryStateExpiry}, NatsAsyncResponseChannelOptions.RecoveryStateExpiry) " +
+            "removes it first, so a response arriving after that point for a waiter whose process died is dropped instead of recovered. Raise RecoveryStateExpiry (recreating the bucket) or shorten the timeout. " +
+            "Reported once per channel.",
+            s.Timeout,
+            s.Expiry));
+    }
+
+    private int _warnedWaitOutlivesRegistration;
 
     /// <summary>Longest excerpt of a remote failure message copied into the wait span's status.</summary>
     private const int MaxRemoteFailureStatusLength = 256;
@@ -143,6 +173,7 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
         // subscription and recovery state existed, leaking both — and zero used to slip through
         // on some channels entirely, insta-timing-out a fully registered waiter.
         AsyncResponseChannelOptions.EnsureWaiterTimeoutSupported(timeout.Value);
+        WarnIfWaitOutlivesRegistration(timeout.Value);
 
         var storedCorrelationId = correlationId;
         // Capture the subscribe-time ExecutionContext so app AsyncLocals (trace, principal, logging
@@ -1341,6 +1372,33 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
     // ---------------------------------------------------------------------------------------
     // IActiveSubscriberProbe
 
+    /// <summary>
+    /// How long a no-responders answer stays unknown after this process's connection came back
+    /// from a disconnection. The outage that dropped this connection — a server restart, a
+    /// network partition, a single-server deployment's upgrade — usually dropped the waiters'
+    /// connections too, and NATS.Net re-subscribes only once its own reconnect lands
+    /// (<c>ReconnectWaitMin</c> plus jitter per attempt, longer when the server comes back late).
+    /// The process that reconnects first — this one — then requests into a subject nobody has
+    /// re-subscribed yet and gets no responders: read as conclusive, that consumed a live waiter's
+    /// recovery registration (its recovery callback ran, and the waiter, back a moment later,
+    /// timed out as well — or, without callbacks, the response was dropped). The other clients'
+    /// reconnects cannot be observed from here, so the window is the Redis channel's failover
+    /// grace, 90 s; inside it a lost-subscriber publish throws and the response survives through
+    /// redelivery. A reconnect elsewhere that this connection never saw (one server of a cluster
+    /// restarted) is not covered: no client-side signal exists for it.
+    /// </summary>
+    internal static readonly TimeSpan ReconnectGrace = TimeSpan.FromSeconds(90);
+
+    // Timestamp (injected clock) of the last reconnect this connection reported; NoReconnect until then.
+    private long _reconnectedAt = NoReconnect;
+    private const long NoReconnect = long.MinValue;
+
+    private bool WithinReconnectGrace()
+    {
+        var reconnectedAt = Volatile.Read(ref _reconnectedAt);
+        return reconnectedAt != NoReconnect && _timeProvider.GetElapsedTime(reconnectedAt) < ReconnectGrace;
+    }
+
     /// <inheritdoc/>
     public async ValueTask<long> CountActiveSubscribersAsync(string correlationId, CancellationToken cancellationToken = default)
     {
@@ -1362,6 +1420,9 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
             return outcome switch
             {
                 NatsDeliveryOutcome.Replied => 1L,
+                // Definitive — unless this connection only just came back, when the waiter may not
+                // have re-subscribed yet (see ReconnectGrace).
+                NatsDeliveryOutcome.NoResponders when WithinReconnectGrace() => LogReconnectGrace(subject),
                 NatsDeliveryOutcome.NoResponders => 0L,
                 _ => -1L
             };
@@ -1378,6 +1439,16 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
             // registration stale during a transient probe outage.
             return -1L;
         }
+    }
+
+    private long LogReconnectGrace(string subject)
+    {
+        SafeLog.Try((_logger, subject), static s =>
+        {
+            if (s._logger.IsEnabled(LogLevel.Debug))
+                s._logger.LogDebug("NATS subscriber liveness probe for subject {Subject}: no responders, but the connection reconnected less than {Grace} ago and a waiter may still be re-subscribing, so the answer stays unknown.", s.subject, ReconnectGrace);
+        });
+        return -1L;
     }
 
     /// <summary>

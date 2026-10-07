@@ -33,7 +33,7 @@ public sealed class RedisTransportTests(BrokersBatchFixture fixture) : Integrati
                 try
                 {
                     return await adapter.StreamAddOnceAsync(stream, marker, TimeSpan.FromMinutes(1),
-                        [new NameValueEntry("payload", "work")], null, true, token);
+                        [new NameValueEntry("payload", "work")], null, "group", token);
                 }
                 catch (RedisServerException) when (lostReply)
                 {
@@ -45,7 +45,7 @@ public sealed class RedisTransportTests(BrokersBatchFixture fixture) : Integrati
 
             await db.KeyDeleteAsync(stream);
             Assert.False((await adapter.StreamAddOnceAsync(stream, marker, TimeSpan.FromMinutes(1),
-                [new NameValueEntry("payload", "work")], null, true, default)).IsNull);
+                [new NameValueEntry("payload", "work")], null, "group", default)).IsNull);
             Assert.Equal(1, await db.StreamLengthAsync(stream));
         }
         finally
@@ -57,7 +57,7 @@ public sealed class RedisTransportTests(BrokersBatchFixture fixture) : Integrati
     [Theory]
     [InlineData(false)]
     [InlineData(true)]
-    public async Task WorkerPublish_SuccessfulAppendWithLostReply_IsStoredOnlyOnce(bool approximate)
+    public async Task WorkerPublish_SuccessfulAppendWithLostReply_IsStoredOnlyOnce(bool capped)
     {
         using var connection = await ConnectionMultiplexer.ConnectAsync(Fixture.RedisConnectionString);
         var db = connection.GetDatabase();
@@ -70,7 +70,7 @@ public sealed class RedisTransportTests(BrokersBatchFixture fixture) : Integrati
             var result = await RedisTransportRetry.ExecuteAsync(async token =>
             {
                 var id = await adapter.StreamAddOnceAsync(stream, marker, TimeSpan.FromMinutes(1),
-                    [new NameValueEntry("payload", "unicode-雪")], 100, approximate, token);
+                    [new NameValueEntry("payload", "unicode-雪")], capped ? 100 : null, "group", token);
                 if (first) { first = false; throw new TimeoutException("Lost successful reply."); }
                 return id;
             }, 3, TimeSpan.FromMilliseconds(1), TimeSpan.FromMilliseconds(1), default);

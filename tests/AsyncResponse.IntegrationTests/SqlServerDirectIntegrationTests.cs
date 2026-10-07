@@ -92,7 +92,10 @@ public sealed class SqlServerDirectIntegrationTests(DataBatchFixture fixture) : 
             var channel = new SqlServerChannelSql(Options.Create(options));
             await channel.EnsureCreatedAsync();
 
-            await using var holder = new SqlConnection(options.ConnectionString);
+            // The channel opens with Enlist=false (round 65: its statements never join an ambient
+            // transaction), and SqlClient keys a pool by the whole connection string — so the
+            // holder must use the same effective string to hold the channel's one connection.
+            await using var holder = new SqlConnection(new SqlConnectionStringBuilder(options.ConnectionString) { Enlist = false }.ConnectionString);
             await holder.OpenAsync();
 
             var failure = await Assert.ThrowsAsync<TimeoutException>(() => channel.CountActiveSubscribersAsync("corr", CancellationToken.None));

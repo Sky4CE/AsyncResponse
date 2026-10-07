@@ -368,7 +368,7 @@ public class DurableFlowInProcessParkTests
         // Every later context call still reports the park, not a lost lease...
         await Assert.ThrowsAsync<DurableFlowSuspendedException>(() => context.StepAsync("after", () => Task.CompletedTask));
         // ...and nothing is checkpointed through the released lease.
-        Assert.Throws<InvalidOperationException>(() => lease.ThrowIfLost());
+        Assert.Throws<DurableFlowLeaseLostException>(() => lease.ThrowIfLost());
     }
 
     [Fact]

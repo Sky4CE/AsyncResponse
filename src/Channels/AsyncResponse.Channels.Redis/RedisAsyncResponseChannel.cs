@@ -320,7 +320,7 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
             if (!subscription.CleanupStarted)
             {
                 saveIssued = true;
-                await _recoveryStateStore.SaveAsync(correlationId, recoveryState, _options.RecoveryStateExpiry).ConfigureAwait(false);
+                await _recoveryStateStore.SaveAsync(correlationId, recoveryState, RegistrationExpiry(timeout.Value)).ConfigureAwait(false);
             }
 
             // Compensate only where a save was actually issued: a skipped save wrote nothing, and
@@ -422,6 +422,17 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
 
         return new RedisAsyncResponseWaiter<T>(subscription.ResponseTask, () => subscription.DrainThenCleanupAsync());
     }
+
+    /// <summary>
+    /// How long a waiter's registration is kept: <see cref="AsyncResponseChannelOptions.RecoveryStateExpiry"/>,
+    /// or the wait's own timeout when that is longer. The registration is saved once and never
+    /// refreshed, so with a timeout (explicit, or DefaultTimeout) past the expiry it lapsed while
+    /// the waiter was still live: a response landing in the tail of the wait after the waiter's
+    /// process died found no registration and was acknowledged and dropped. A Redis key's TTL
+    /// can be anything, so the registration simply outlives the wait instead.
+    /// </summary>
+    internal TimeSpan RegistrationExpiry(TimeSpan timeout)
+        => timeout > _options.RecoveryStateExpiry ? timeout : _options.RecoveryStateExpiry;
 
     /// <summary>
     /// Whether a delivery settled the wait: a result, or a fault other than the indeterminate one a
@@ -1388,6 +1399,28 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
     /// </summary>
     internal static readonly TimeSpan DisconnectedEndPointGrace = TimeSpan.FromSeconds(90);
 
+    /// <summary>
+    /// How long a zero stays unknown after an endpoint this process saw disconnect is back. The
+    /// restart (or failover behind one DNS name) that dropped this process's connection dropped
+    /// EVERY client's, the waiters' subscriptions included, and each client comes back on its own
+    /// reconnect schedule: StackExchange.Redis retries with a backoff of up to 10 s by default
+    /// (<c>ReconnectRetryPolicy</c>), a client whose socket died silently notices only at its next
+    /// heartbeat or keep-alive, and the subscription is re-issued only after that. A process that
+    /// reconnects first — this one — publishes into that gap and reads PUBLISH 0 and NUMSUB 0 from
+    /// a connected endpoint: read as conclusive, the zero consumed a live waiter's recovery
+    /// registration (the recovery callback ran, and the waiter, re-subscribed a moment later,
+    /// timed out as well — or, with no callbacks, the response was dropped). This process cannot
+    /// observe the other clients' reconnects, so the window is the failover grace's own 90 s,
+    /// counted from the restore, and with the same cost: inside it a lost-subscriber publish
+    /// throws and the response survives through redelivery. Only a restore that follows a
+    /// disconnection this process saw starts it — never the first connection.
+    /// </summary>
+    internal static readonly TimeSpan RestoredEndPointGrace = DisconnectedEndPointGrace;
+
+    // Per endpoint: the timestamp (injected clock) of the last restore that followed a
+    // disconnection this process saw. Pruned with _endPointDownSince.
+    private readonly ConcurrentDictionary<EndPoint, long> _endPointRestoredAt = new();
+
     // Per endpoint this process has seen connected: EndPointConnected while it is up, or the
     // timestamp (injected clock) of the ConnectionFailed that took it down, kept until its
     // ConnectionRestored — one continuous disconnection. Maintained by the multiplexer's events: a
@@ -1416,8 +1449,8 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
         // recorded, and that failover's grace measured from the blip — long expired, so excused at
         // once. A node connected by now is up: undo the record (from the value just written, so a
         // restore and a newer failure in between are never overwritten).
-        if (IsConnectedNow(endPoint))
-            _endPointDownSince.TryUpdate(endPoint, EndPointConnected, failedAt);
+        if (IsConnectedNow(endPoint) && _endPointDownSince.TryUpdate(endPoint, EndPointConnected, failedAt))
+            _endPointRestoredAt[endPoint] = _timeProvider.GetTimestamp(); // it failed and is back: a restore
     }
 
     /// <summary>Whether the multiplexer reports the endpoint connected now. Never throws; null-safe for a stand-in multiplexer.</summary>
@@ -1435,15 +1468,24 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
 
     private void OnConnectionRestored(object? sender, ConnectionFailedEventArgs e)
     {
-        if (e.ConnectionType == ConnectionType.Interactive && e.EndPoint is { } endPoint)
-            _endPointDownSince[endPoint] = EndPointConnected;
+        if (e.ConnectionType != ConnectionType.Interactive || e.EndPoint is not { } endPoint)
+            return;
+
+        // A restore ends the failover grace and starts the restored grace — but only after a
+        // disconnection this process recorded: StackExchange.Redis raises ConnectionRestored for
+        // the first connection too, and nobody else is reconnecting then.
+        var previous = _endPointDownSince.TryGetValue(endPoint, out var since) ? since : EndPointConnected;
+        _endPointDownSince[endPoint] = EndPointConnected;
+        if (previous != EndPointConnected)
+            _endPointRestoredAt[endPoint] = _timeProvider.GetTimestamp();
     }
 
     /// <inheritdoc/>
     /// <remarks>
     /// Returns the live subscriber count, or a negative value when liveness could not be
     /// established. A primary that answered with a failure keeps a zero unknown, and so does one
-    /// this process saw disconnect less than <see cref="DisconnectedEndPointGrace"/> ago. Past the
+    /// this process saw disconnect less than <see cref="DisconnectedEndPointGrace"/> ago, or saw
+    /// come back from a disconnection less than <see cref="RestoredEndPointGrace"/> ago. Past the
     /// grace, or for an endpoint this process never saw connected, the recovery scan's
     /// completeness rules decide: outside a cluster one answering primary is the whole answer (a
     /// failed-over deployment lists the old primary, disconnected, until it rejoins); in a
@@ -1474,6 +1516,8 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
         // measured to it: a reconnect landing during the awaits below must not erase the grace of
         // an endpoint this probe did not ask.
         var downSince = new long[endPoints.Length];
+        // The restore read with the same observation, for the endpoints that answer (see RestoredEndPointGrace).
+        var restoredSince = new long?[endPoints.Length];
         var now = _timeProvider.GetTimestamp();
         for (var i = 0; i < endPoints.Length; i++)
         {
@@ -1486,8 +1530,10 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
                 // handled after its restore, see OnConnectionFailed). Cleared only from the value
                 // read before this answer: a newer failure is recorded only from EndPointConnected,
                 // so it is never overwritten here.
-                if (recorded != EndPointConnected)
-                    _endPointDownSince.TryUpdate(endPoints[i], EndPointConnected, recorded);
+                if (recorded != EndPointConnected && _endPointDownSince.TryUpdate(endPoints[i], EndPointConnected, recorded))
+                    _endPointRestoredAt[endPoints[i]] = now; // seen back before its ConnectionRestored was handled
+                if (_endPointRestoredAt.TryGetValue(endPoints[i], out var restoredAt))
+                    restoredSince[i] = restoredAt;
                 counts[i] = ReadSubscriberCountAsync(servers[i], channel);
             }
             else
@@ -1496,7 +1542,7 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
             }
         }
 
-        if (_endPointDownSince.Count > endPoints.Length)
+        if (_endPointDownSince.Count > endPoints.Length || _endPointRestoredAt.Count > endPoints.Length)
             ForgetEndPointsNoLongerListed(endPoints);
 
         await Task.WhenAll(counts.OfType<Task<long?>>()).WaitAsync(cancellationToken).ConfigureAwait(false);
@@ -1506,6 +1552,7 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
         var primaryFailed = false;
         var clusterAnswered = false;
         EndPoint? withinGrace = null;
+        EndPoint? withinRestoredGrace = null;
         List<IServer>? answered = null;
         List<IServer>? disconnectedPrimaries = null;
         for (var i = 0; i < servers.Length; i++)
@@ -1532,6 +1579,8 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
                 (answered ??= []).Add(server);
                 primaryAnswered |= isPrimary;
                 clusterAnswered |= server.ServerType == ServerType.Cluster;
+                if (isPrimary && restoredSince[i] is { } restored && _timeProvider.GetElapsedTime(restored, now) < RestoredEndPointGrace)
+                    withinRestoredGrace ??= endPoints[i];
             }
             else
             {
@@ -1566,6 +1615,18 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
             return -1L;
         }
 
+        // A primary that came back moments ago answers for itself only: the other clients the
+        // same outage disconnected — the waiters among them — may not have re-subscribed yet.
+        if (withinRestoredGrace is not null)
+        {
+            SafeLog.Try(() => _logger.LogDebug(
+                "Redis subscriber liveness probe for channel {Channel}: {EndPoint} reconnected less than {Grace} ago; a waiter may still be re-subscribing, so the zero stays unknown.",
+                channel.ToString()!,
+                withinRestoredGrace,
+                RestoredEndPointGrace));
+            return -1L;
+        }
+
         // Every "primary" answered, or — outside a cluster — the unanswered ones are the
         // disconnected leftovers of a failover, which the multiplexer keeps listing (as it does
         // for the scan): one answering primary is the whole answer. Treating them as possible
@@ -1597,6 +1658,12 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
         {
             if (Array.IndexOf(endPoints, tracked) < 0)
                 _endPointDownSince.TryRemove(tracked, out _);
+        }
+
+        foreach (var tracked in _endPointRestoredAt.Keys)
+        {
+            if (Array.IndexOf(endPoints, tracked) < 0)
+                _endPointRestoredAt.TryRemove(tracked, out _);
         }
     }
 

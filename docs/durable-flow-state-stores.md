@@ -382,6 +382,22 @@ refuses all three, along with columns too narrow or too coarse to hold what the 
 duplicate-key error (`1062`) is confirmed as "this flow id exists" on the connection the create
 already holds, so concurrent identical starts never need a second pooled connection.
 
+The connection string must not set `UseAffectedRows=true`: it turns MySqlConnector's row counts
+from rows *matched* into rows *changed*, and an UPDATE that rewrites identical values (a lease
+renewal landing in the same microsecond) would read as a lost lease. The store refuses it from the
+string alone, **when the host starts** — not on the first operation, by which time `StartAsync` has
+already published and returned an id for a run that can never execute.
+
+**Ledger size.** A MySQL write is limited not by `longtext` (4 GB) but by the server's
+`max_allowed_packet` — 4 MB on MySQL 5.7, 16 MB on MariaDB, 64 MB on MySQL 8.0 — which the whole
+statement must fit, with the ledger's quotes and backslashes escaped (doubled). The store reads
+`@@max_allowed_packet` at host start (or, if the server does not answer then, when it first verifies
+its table) and from then on refuses a ledger whose escaped size exceeds it, less 64 KiB, with
+`FlowStateTooLargeException` — in addition to `MaxStateBytes` when you set one — instead of the
+server's opaque "packet bigger than 'max_allowed_packet'" error, which the executor would retry
+into the dead-letter queue. Raise the server variable, or keep large payloads out of flow state, if
+a ledger outgrows it.
+
 ### SQLite
 
 > The store sets `PRAGMA journal_mode=WAL` when it auto-creates the schema: concurrent flow
@@ -501,6 +517,10 @@ another AsyncResponse component misconfigured onto the same collection fails sta
   set with its secondary down fails writes instead of blocking them. A lapsed `wtimeout` fails the
   write as retriable even though the primary applied it; the revision and lease fences make the
   retry safe. Restore the secondary (or remove the arbiter) rather than lowering the write concern.
+- Index creation (`AutoCreateIndexes = true`) uses `w: 1`: under `w: "majority"` even a
+  `createIndexes` with nothing to build waits for majority acknowledgement, so a host started while
+  the set could not reach a majority failed every operation — reads included — until it recovered.
+  Index DDL is idempotent; a build a failover rolled back reruns at the next start.
 - Ordinary loads keep the registered read concern — primary reads see every write the store
   acknowledged, and the fences reject whatever a stale read would decide. `LoadCurrentAsync`
   (invariant 7 above) reads with **`linearizable`** read concern instead, because a primary deposed
@@ -748,10 +768,12 @@ Lazy-loading proxies (`UseLazyLoadingProxies()`) are fine. Change-tracking proxi
 Server and MySQL the database default is case-insensitive: two ids differing only in case become
 one primary key, so the second `StartAsync` fails as a duplicate and a load returns the other run's
 state. Pass the constant for your provider (`AsyncResponseFlowIdCollations.SqlServer` / `.MySql` /
-`.PostgreSql` / `.Sqlite`). On SQL Server and MySQL the store **fails at startup** if the mapping
-declares no collation or one that is not binary (`_BIN2` on SQL Server, `_bin` on MySQL) — a merely
-case-sensitive one still folds accents (`_CS_AI`) or full-width forms (any collation without
-`_WS`).
+`.PostgreSql` / `.Sqlite`). On SQL Server and MySQL the store **fails the host start** if the
+mapping declares no collation or one that is not binary (`_BIN2` on SQL Server, `_bin` on MySQL) — a
+merely case-sensitive one still folds accents (`_CS_AI`) or full-width forms (any collation without
+`_WS`). A context that does not map the ledger at all fails the start the same way. Both checks
+read only the model, so no database is contacted; a context that cannot be created while the host
+starts (a factory that needs a request scope) is logged and left to the store's first operation.
 
 ### Application-owned store
 

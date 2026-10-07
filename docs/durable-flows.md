@@ -343,19 +343,31 @@ Both are raised as `DurableFlowInterruptedException`, which derives from
 `OperationCanceledException`, so the usual filter excludes it along with caller-token
 cancellations. The checkpoints are intact and the work is about to be replayed; a hand-back is not
 a failed attempt (nothing is checkpointed over the ledger, no span is marked as an error), though
-observers still get `OnRunAttemptFailedAsync`:
+observers still get `OnRunAttemptFailedAsync`.
+
+The same goes for this attempt **losing the run**: its execution lease lapsed (a store outage, a
+GC or VM pause longer than the lease) or another worker took it over, or a checkpoint was refused
+because someone else wrote the ledger first (a lost-subscriber recovery, a failure signal, an
+operator suspending the run). That is raised as `DurableFlowLeaseLostException`. It derives from
+`InvalidOperationException` — what lease loss surfaced as before the type existed — so the
+`OperationCanceledException` filter does **not** exclude it on its own: name it too. Compensating
+on it runs the refund on a deposed worker, outside any step and fenced by nothing, while the
+takeover replays the charge (idempotently, returning the existing charge) and carries on as paid:
 
 ```csharp
 try
 {
     await flow.StepAsync("charge", () => _payments.ChargeAsync(order));
 }
-catch (Exception ex) when (ex is not OperationCanceledException)
+catch (Exception ex) when (ex is not (OperationCanceledException or DurableFlowLeaseLostException))
 {
     await flow.StepAsync("refund", () => _payments.RefundAsync(order));
     throw new DurableFlowFailedException("Charge failed; refunded.", ex);
 }
 ```
+
+A lost lease is sticky like an interruption — every later context call throws it again, so a
+swallowed one cannot checkpoint anything — and the executor never fails the run over it.
 
 The interruption is sticky: flow code that swallows it gets it again from its next context call,
 a body that returns after swallowing it is not marked completed, and converting it into another
@@ -382,16 +394,20 @@ try
         until: r => r.State is not DagRunState.Queued and not DagRunState.Running,
         timeout: TimeSpan.FromMinutes(30));
 }
-catch (Exception ex) when (ex is not OperationCanceledException)
+catch (Exception ex) when (ex is not (OperationCanceledException or DurableFlowLeaseLostException))
 {
     await flow.ReportProgressAsync($"lineage failed ({ex.Message}); continuing");
 }
 ```
 
 The filter matters: without it this also swallows the run parking and the host stopping
-(`DurableFlowInterruptedException`), turning a redeploy into "lineage failed". The step is
-recorded as faulted-not-completed and the flow moves on. If the run is later resumed,
-a faulted awaited step restarts fresh — which is what you want for a best-effort stage.
+(`DurableFlowInterruptedException`), turning a redeploy into "lineage failed", and a takeover
+(`DurableFlowLeaseLostException`). The step is recorded as faulted-not-completed and the flow
+moves on. If the run is later resumed, a faulted awaited step restarts fresh — which is what you
+want for a best-effort stage. The fault also retires the step's correlation id: a response or
+failure the remote side sends for it **after** the timeout — even one that reaches a registration
+left behind by a crashed or redeployed worker — is ignored, so a late failure cannot fail the run
+that already moved past the step, and a late success cannot rewrite the branch it took.
 
 **Subset runs.** "Only create the ticket this time" is an input flag and an early return — no
 pre-seeded state:
@@ -628,7 +644,12 @@ The API encodes the *checkpointed-flow pattern*, extracted from years of product
   at-least-once, idempotency-required contract. The failure callback is correlation-scoped:
   `IDurableFlowExecutor.FailAsync(flowId, exception, correlationId)` fails the run only while a
   step is still pending on that correlation id, so a late error for a superseded id is ignored;
-  the two-argument `FailAsync(flowId, exception)` is the unscoped operator form. The in-memory
+  the two-argument `FailAsync(flowId, exception)` is the unscoped operator form. A step that
+  **faulted** on the id (it timed out, or its wait failed) is no longer pending on it — the
+  breadcrumb stays in the ledger for diagnosis, but the step restarts fresh under a new id — so
+  neither a late failure nor a late response for it is applied: the run is not failed, and the
+  payload is not checkpointed into a step whose fault flow code may already have handled (a late
+  response still wakes a `Running` run, as any stale one does). The in-memory
   channel registers them too (covering waiter loss within one process and the simulated restarts
   of [AsyncResponse.Testing](testing.md)); durable channels extend the contract across real
   restarts.
@@ -650,9 +671,11 @@ The API encodes the *checkpointed-flow pattern*, extracted from years of product
   instant the lease lapses is still checkpointed through the lease-less compare-and-swap recovery
   uses, because the channel has already acked that payload and it exists nowhere else; the
   execution then stops as lease-lost and the redelivery replays from that checkpoint. That write
-  applies only while the step is still pending on the **same** correlation id and the run is
-  `Running` or `Suspended`; if a takeover already re-triggered the step under a new id or failed
-  the run, the stale response is discarded with a warning.
+  applies only while the step is still pending on the **same** correlation id (and has not faulted
+  on it) and the run is `Running` or `Suspended`; if a takeover already timed the step out,
+  re-triggered it under a new id or failed the run, the stale response is discarded with a
+  warning. Flow code sees a lost lease as `DurableFlowLeaseLostException` (see
+  [Compensation](#compensation)).
 
 ## Honest comparison with a dedicated workflow engine
 

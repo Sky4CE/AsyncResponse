@@ -118,6 +118,22 @@ internal sealed class DurableFlowContext : IDurableFlowContext
     private DateTime UtcNow => _timeProvider.GetUtcNow().UtcDateTime;
 
     /// <summary>
+    /// Whether <paramref name="step"/> is still waiting for the response to
+    /// <paramref name="correlationId"/> — the one test every writer that settles an awaited step
+    /// from OUTSIDE its execution applies (lost-subscriber recovery, the correlation-scoped failure
+    /// signal, a deposed holder's lease-less checkpoint). A step that faulted on that id is not: a
+    /// fault (a timeout, a failed trigger, a faulted wait) keeps the breadcrumb for diagnosis, but
+    /// the engine has given up on the id — the step restarts fresh under a new one — and flow code
+    /// may already have acted on the fault (the best-effort catch-and-continue pattern). A late
+    /// failure for it used to fail that run terminally, and a late response to complete the step
+    /// behind the flow's back, flipping the branch it had already taken on the next replay.
+    /// </summary>
+    internal static bool IsAwaitingResponse(FlowStepState step, string correlationId)
+        => !step.Completed
+            && !step.Faulted
+            && string.Equals(step.PendingCorrelationId, correlationId, StringComparison.Ordinal);
+
+    /// <summary>
     /// Invokes every registered execution observer. Observers run on the execution path by
     /// contract: an observer exception fails this execution attempt exactly like a step failure
     /// (AsyncResponse.Testing injects deterministic crashes through precisely this).
@@ -831,9 +847,14 @@ internal sealed class DurableFlowContext : IDurableFlowContext
 
             if (ancestor is null)
             {
-                _logger.LogWarning(
-                    "Flow {FlowId} parked for {Ttl} but ancestor flow {AncestorFlowId} has no state (expired or deleted); its chain keeps the current expiry.",
-                    FlowId, ttl, ancestorId);
+                // Guarded: this runs after this run's own sleep checkpoint, inside the walk whose
+                // failure abandons the park — a throwing logging provider turned "ancestor gone,
+                // the chain keeps its expiry" into an abandoned park and a retried delivery.
+                SafeLog.Try(
+                    (Logger: _logger, FlowId, Ttl: ttl, AncestorFlowId: ancestorId),
+                    static s => s.Logger.LogWarning(
+                        "Flow {FlowId} parked for {Ttl} but ancestor flow {AncestorFlowId} has no state (expired or deleted); its chain keeps the current expiry.",
+                        s.FlowId, s.Ttl, s.AncestorFlowId));
                 return null;
             }
 
@@ -870,9 +891,12 @@ internal sealed class DurableFlowContext : IDurableFlowContext
                     $"a concurrent write advanced the ancestor's revision on each of {attempt} attempts. The park is abandoned so the delivery retries it.");
             }
 
-            _logger.LogDebug(
-                "Flow {FlowId} lost the revision race extending ancestor flow {AncestorFlowId}'s ledger retention (attempt {Attempt}); re-reading it.",
-                FlowId, ancestorId, attempt);
+            // Guarded for the same reason as the gone-ancestor warning above.
+            SafeLog.Try(
+                (Logger: _logger, FlowId, AncestorFlowId: ancestorId, Attempt: attempt),
+                static s => s.Logger.LogDebug(
+                    "Flow {FlowId} lost the revision race extending ancestor flow {AncestorFlowId}'s ledger retention (attempt {Attempt}); re-reading it.",
+                    s.FlowId, s.AncestorFlowId, s.Attempt));
         }
     }
 
@@ -1026,7 +1050,12 @@ internal sealed class DurableFlowContext : IDurableFlowContext
                     _options.StateExpiry,
                     cancellationToken).ConfigureAwait(false))
             {
-                _logger.LogDebug("Flow {FlowId} started child flow {ChildFlowId} for step '{Step}'.", FlowId, childFlowId, name);
+                // Guarded: the child's ledger now exists. A throw here failed the attempt before the
+                // breadcrumb below was persisted; the replay recovers (it loads the child), but a
+                // persistent throw dead-lettered a parent whose child was created and never enqueued.
+                SafeLog.Try(
+                    (Logger: _logger, FlowId, ChildFlowId: childFlowId, Step: name),
+                    static s => s.Logger.LogDebug("Flow {FlowId} started child flow {ChildFlowId} for step '{Step}'.", s.FlowId, s.ChildFlowId, s.Step));
             }
             else
             {
@@ -1478,10 +1507,14 @@ internal sealed class DurableFlowContext : IDurableFlowContext
         }
         catch (Exception ex)
         {
-            _logger.LogWarning(
-                ex,
-                "Flow {FlowId} step '{Step}' could not re-read its checkpoint before re-attaching; continuing with the normal wait.",
-                FlowId, name);
+            // Guarded: best-effort means falling through to the normal wait — a throwing logging
+            // provider escaped this catch and failed the re-attach (or the deadline branch's fault).
+            SafeLog.Try(
+                (Logger: _logger, Error: ex, FlowId, Step: name),
+                static s => s.Logger.LogWarning(
+                    s.Error,
+                    "Flow {FlowId} step '{Step}' could not re-read its checkpoint before re-attaching; continuing with the normal wait.",
+                    s.FlowId, s.Step));
             return false;
         }
     }
@@ -1518,9 +1551,17 @@ internal sealed class DurableFlowContext : IDurableFlowContext
                 timeout).ConfigureAwait(false);
         }
 
-        _logger.LogDebug(
-            "Flow {FlowId} step '{Step}': the configured channel exposes no recoverable subscriber; lost-subscriber recovery is unavailable for this wait.",
-            FlowId, stepName);
+        SafeLog.Try(
+            (Logger: _logger, FlowId, Step: stepName),
+            static s =>
+            {
+                if (s.Logger.IsEnabled(LogLevel.Debug))
+                {
+                    s.Logger.LogDebug(
+                        "Flow {FlowId} step '{Step}': the configured channel exposes no recoverable subscriber; lost-subscriber recovery is unavailable for this wait.",
+                        s.FlowId, s.Step);
+                }
+            });
 
         return await _subscriber.CreateResponseWaiter(correlationId, until, timeout).ConfigureAwait(false);
     }
@@ -1727,9 +1768,13 @@ internal sealed class DurableFlowContext : IDurableFlowContext
                 // the two checks above (the memo is this parent step's own), so a different type
                 // name here is the child class renamed or moved since it finished — not an id
                 // collision — and failing the parent would throw that outcome away.
-                _logger.LogWarning(
-                    "Flow {FlowId} step '{Step}' requested child flow {ChildFlowId} as {RequestedFlowType}, but the completed child ran as {PersistedFlowType}; returning the completed child's memoized outcome.",
-                    FlowId, stepName, childFlowId, typeof(TFlow).FullName, AsyncResponseTypeResolution.DescribeForDiagnostics(child.FlowTypeName));
+                // Guarded: the memo is the settled outcome; a throwing logging provider must not turn
+                // returning it into a failed (and, persistently, dead-lettered) replay.
+                SafeLog.Try(
+                    (Logger: _logger, FlowId, Step: stepName, ChildFlowId: childFlowId, Requested: typeof(TFlow).FullName, child.FlowTypeName),
+                    static s => s.Logger.LogWarning(
+                        "Flow {FlowId} step '{Step}' requested child flow {ChildFlowId} as {RequestedFlowType}, but the completed child ran as {PersistedFlowType}; returning the completed child's memoized outcome.",
+                        s.FlowId, s.Step, s.ChildFlowId, s.Requested, AsyncResponseTypeResolution.DescribeForDiagnostics(s.FlowTypeName)));
                 return;
             }
 
@@ -1753,9 +1798,12 @@ internal sealed class DurableFlowContext : IDurableFlowContext
             // local step never re-reads its lambda, a timer never re-reads its delay. The child
             // finished (possibly weeks ago) and its outcome is settled; failing the PARENT
             // terminally over an input edit made since would throw that outcome away.
-            _logger.LogWarning(
-                "Flow {FlowId} step '{Step}' requested child flow {ChildFlowId} with a different input type or value than the completed child ran with; returning the completed child's memoized outcome.",
-                FlowId, stepName, childFlowId);
+            // Guarded like the type-name warning above.
+            SafeLog.Try(
+                (Logger: _logger, FlowId, Step: stepName, ChildFlowId: childFlowId),
+                static s => s.Logger.LogWarning(
+                    "Flow {FlowId} step '{Step}' requested child flow {ChildFlowId} with a different input type or value than the completed child ran with; returning the completed child's memoized outcome.",
+                    s.FlowId, s.Step, s.ChildFlowId));
             return;
         }
 
@@ -1900,11 +1948,13 @@ internal sealed class DurableFlowContext : IDurableFlowContext
                         return false;
                     }
 
-                    if (!string.Equals(current.PendingCorrelationId, correlationId, StringComparison.Ordinal))
+                    if (!IsAwaitingResponse(current, correlationId))
                     {
                         skipReason = current.PendingCorrelationId is null
                             ? "the step is no longer pending on any correlation id"
-                            : "the step is pending on a newer correlation id (a takeover re-triggered it)";
+                            : !string.Equals(current.PendingCorrelationId, correlationId, StringComparison.Ordinal)
+                                ? "the step is pending on a newer correlation id (a takeover re-triggered it)"
+                                : "the step faulted on this correlation id (a takeover timed it out), so it restarts fresh and flow code may already have acted on the fault";
                         return false;
                     }
 
@@ -2047,9 +2097,16 @@ internal sealed class DurableFlowContext : IDurableFlowContext
         if (options.EffectiveLedgerSizeWarningBytes is not { } threshold)
             return;
 
+        // Guarded here rather than by each caller: every caller runs this right after a durable
+        // write (a recovered or lease-less checkpoint) and before the work that must follow it —
+        // the step-completed event, the run's wake-up — which a throwing logging provider skipped.
         var size = FlowStateSize.Take(written);
         if (size >= NextLedgerWarningBand(threshold, sizeBefore))
-            LogLedgerLarge(logger, written, size, threshold);
+        {
+            SafeLog.Try(
+                (Logger: logger, State: written, Size: size, Threshold: threshold),
+                static s => LogLedgerLarge(s.Logger, s.State, s.Size, s.Threshold));
+        }
     }
 
     /// <summary>

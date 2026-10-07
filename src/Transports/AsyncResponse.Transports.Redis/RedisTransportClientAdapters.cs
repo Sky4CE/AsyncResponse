@@ -72,8 +72,15 @@ internal interface IRedisStreamDatabase
     /// attempt's append already committed. Publish retries ride on this: XADD has no natural
     /// identity (the entry id is server-generated), so a retry after an ambiguous timeout — the
     /// adapter abandons the in-flight command best-effort while the multiplexer keeps running
-    /// it — appended the same worker job twice. Carries a non-idempotent pass-through default so
-    /// out-of-package fakes keep compiling.
+    /// it — appended the same worker job twice.
+    /// <para>
+    /// <paramref name="maxLength"/> is a capacity, never an eviction: a stream already holding
+    /// that many entries first loses only the ones <paramref name="settlingGroup"/> has settled
+    /// (delivered and no longer pending), and when it is still full the append is REFUSED with a
+    /// server error starting with <see cref="RedisStreamDatabaseAdapter.StreamFullErrorCode"/>
+    /// (NATS Discard=New parity) — length-based trimming deleted jobs nobody had run. Carries a
+    /// non-idempotent, unbounded pass-through default so out-of-package fakes keep compiling.
+    /// </para>
     /// </summary>
     Task<RedisValue> StreamAddOnceAsync(
         RedisKey stream,
@@ -81,9 +88,23 @@ internal interface IRedisStreamDatabase
         TimeSpan dedupTtl,
         NameValueEntry[] values,
         long? maxLength,
-        bool useApproximateMaxLength,
+        RedisValue settlingGroup,
         CancellationToken cancellationToken)
-        => StreamAddAsync(stream, values, maxLength, useApproximateMaxLength, cancellationToken);
+        => StreamAddAsync(stream, values, maxLength: null, useApproximateMaxLength: false, cancellationToken);
+
+    /// <summary>
+    /// Settles a worker entry for good: XACK and XDEL in one server-side step, so a settled job
+    /// leaves the stream at once and the worker stream holds only unsettled work (NATS
+    /// work-queue retention parity) — <see cref="StreamAddOnceAsync"/>'s capacity counts entries,
+    /// and an ACKed entry left behind counted against it until a trim reached it. Returns the
+    /// XACK count. Carries an ACK-only default so out-of-package fakes keep compiling.
+    /// </summary>
+    Task<long> StreamAcknowledgeAndDeleteAsync(
+        RedisKey stream,
+        RedisValue groupName,
+        RedisValue messageId,
+        CancellationToken cancellationToken)
+        => StreamAcknowledgeAsync(stream, groupName, messageId, cancellationToken);
 
     /// <summary>
     /// Deletes <paramref name="consumerName"/> from the group only while it has no pending
@@ -102,9 +123,30 @@ internal interface IRedisStreamDatabase
 
 internal sealed class RedisStreamDatabaseAdapter(IDatabase _database, TimeSpan _operationTimeout) : IRedisStreamDatabase
 {
+    /// <summary>
+    /// Error code (the first word of the server error) the append script refuses a full worker
+    /// stream with. <see cref="RedisTransportRetry.IsTransient"/> retries it within the publish
+    /// budget — a worker settling one entry frees room — and then the publish fails with it.
+    /// </summary>
+    internal const string StreamFullErrorCode = "ASYNCRESPONSE_STREAM_FULL";
+
     // Redis MULTI/EXEC does not roll back a successful SET when XADD fails. Record the
     // success marker only AFTER XADD succeeds, in the same server-side operation.
-    internal const string AppendOnceScript = """
+    //
+    // ARGV: [1] marker TTL (ms), [2] capacity or '' (uncapped), [3] the settling group's
+    // last-delivered id or '' (not read yet: nothing is trimmed), [4] that group's name,
+    // [5..] the entry's field/value pairs.
+    //
+    // The capacity is enforced by REFUSAL, never by length trimming: `XADD … MAXLEN ~ N` trimmed
+    // by length alone, so past the cap it deleted jobs no consumer had read and jobs pending in a
+    // handler, with no dead-letter copy — a durable flow's wake-up included. Only a full stream
+    // pays anything: it first drops the entries the worker group has SETTLED — every id below
+    // both its last-delivered id (passed in, see StreamAddOnceAsync) and its oldest pending id
+    // (read here, atomically with the trim) — with `XTRIM … MINID` (Redis 6.2+), and refuses the
+    // append when that freed nothing. Settlement deletes its entry (StreamAcknowledgeAndDelete),
+    // so the trim only reaches entries settled without one (ACKed by an older version, or by an
+    // operator). Ids are compared as decimal strings: sequence numbers exceed a Lua double.
+    internal const string AppendOnceScript = $$"""
         local previous = redis.call('GET', KEYS[2])
         if previous then
             if previous == '' then
@@ -112,17 +154,46 @@ internal sealed class RedisStreamDatabaseAdapter(IDatabase _database, TimeSpan _
             end
             return false
         end
-        local command = {KEYS[1]}
         if ARGV[2] ~= '' then
-            table.insert(command, 'MAXLEN')
-            table.insert(command, ARGV[3])
-            table.insert(command, ARGV[2])
+            local capacity = tonumber(ARGV[2])
+            local length = redis.call('XLEN', KEYS[1])
+            if length >= capacity and ARGV[3] ~= '' then
+                local settledBelow = ARGV[3]
+                local pending = redis.call('XPENDING', KEYS[1], ARGV[4])
+                if pending[1] > 0 then
+                    local pm, ps = string.match(pending[2], '^(%d+)-(%d+)$')
+                    local sm, ss = string.match(settledBelow, '^(%d+)-(%d+)$')
+                    local earlier
+                    if #pm ~= #sm then earlier = #pm < #sm
+                    elseif pm ~= sm then earlier = pm < sm
+                    elseif #ps ~= #ss then earlier = #ps < #ss
+                    else earlier = ps < ss end
+                    if earlier then settledBelow = pending[2] end
+                end
+                redis.call('XTRIM', KEYS[1], 'MINID', settledBelow)
+                length = redis.call('XLEN', KEYS[1])
+            end
+            if length >= capacity then
+                return redis.error_reply('{{StreamFullErrorCode}} the worker stream holds ' .. length ..
+                    ' entries its consumer group has not settled (capacity ' .. capacity ..
+                    '); the publish was refused rather than evicting unprocessed jobs')
+            end
         end
-        table.insert(command, '*')
-        for i = 4, #ARGV do table.insert(command, ARGV[i]) end
+        local command = {KEYS[1], '*'}
+        for i = 5, #ARGV do table.insert(command, ARGV[i]) end
         local id = redis.call('XADD', unpack(command))
         redis.call('SET', KEYS[2], id, 'PX', ARGV[1])
         return id
+        """;
+
+    // XACK and XDEL as one step: an XDEL that could fail after its XACK would leave a settled
+    // entry counting against the capacity, and an XDEL before the XACK would leave a pending id
+    // with no entry (a nil XCLAIM tombstone). Unconditional XDEL: a 0 from XACK means the entry
+    // was already settled (an early-ACK re-ACK, a reclaim's duplicate), so deleting it is safe.
+    internal const string AcknowledgeAndDeleteScript = """
+        local acked = redis.call('XACK', KEYS[1], ARGV[1], ARGV[2])
+        redis.call('XDEL', KEYS[1], ARGV[2])
+        return acked
         """;
 
     // The pending check and the delete in one server-side step: a consumer that still owns
@@ -145,14 +216,11 @@ internal sealed class RedisStreamDatabaseAdapter(IDatabase _database, TimeSpan _
         // Call the classic overload (int? maxLength, no trim-mode parameter) so publishing emits plain
         // `XADD … MAXLEN ~ N` with no Redis 8 KEEPREF/DELREF/ACKED token. That keeps the transport
         // portable across Redis 8+, Valkey, and Dragonfly by construction — independent of whether the
-        // StackExchange.Redis version would otherwise fold KEEPREF into the wire form. (This path
-        // writes the dead-letter stream; worker publishes go through the append script below, with
-        // the same MAXLEN semantics.) MAXLEN trims by length alone, whatever the consumer group has
-        // read: an entry trimmed before any consumer read it vanishes without a trace, and one trimmed
-        // while still pending is lost too — Redis 6.2 answers its XCLAIM with a nil tombstone, which
-        // the claim loop ACKs by its pending id with a Warning, and 7+ drops it from the pending list
-        // silently. Neither path dead-letters it: the cap must sit above the deepest backlog the
-        // stream can build up (see RedisAsyncResponseTransportOptions.StreamMaxLength).
+        // StackExchange.Redis version would otherwise fold KEEPREF into the wire form. This path
+        // writes only the dead-letter stream, which nothing consumes: MAXLEN makes it a bounded
+        // evict-oldest archive. Worker publishes never go through it — MAXLEN trims by length
+        // alone, whatever the consumer group has read, so it deleted unread and pending jobs; the
+        // append script refuses a full worker stream instead.
         => WithCancellation(
             static (database, s) => database.StreamAddAsync(
                 s.stream,
@@ -176,25 +244,88 @@ internal sealed class RedisStreamDatabaseAdapter(IDatabase _database, TimeSpan _
         TimeSpan dedupTtl,
         NameValueEntry[] values,
         long? maxLength,
-        bool useApproximateMaxLength,
+        RedisValue settlingGroup,
         CancellationToken cancellationToken)
     {
         ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(dedupTtl, TimeSpan.Zero);
-        var args = new RedisValue[3 + values.Length * 2];
+        var args = new RedisValue[4 + values.Length * 2];
         args[0] = checked((long)Math.Ceiling(dedupTtl.TotalMilliseconds));
-        args[1] = ToInt32MaxLength(maxLength) is { } cap ? cap : RedisValue.EmptyString;
-        args[2] = useApproximateMaxLength ? "~" : "=";
+        args[1] = maxLength is { } capacity ? capacity : RedisValue.EmptyString;
+        args[2] = RedisValue.EmptyString;
+        args[3] = settlingGroup.IsNullOrEmpty ? RedisValue.EmptyString : settlingGroup;
         for (var i = 0; i < values.Length; i++)
         {
-            args[3 + i * 2] = values[i].Name;
-            args[4 + i * 2] = values[i].Value;
+            args[4 + i * 2] = values[i].Name;
+            args[5 + i * 2] = values[i].Value;
         }
 
-        return (RedisValue)await WithCancellation(
+        try
+        {
+            return await AppendOnceAsync(stream, dedupKey, args, cancellationToken).ConfigureAwait(false);
+        }
+        catch (RedisServerException full) when (IsStreamFull(full) && !settlingGroup.IsNullOrEmpty)
+        {
+            // Full: find what the worker group has settled and let the script drop exactly that
+            // before it decides again. The group's last-delivered id comes from XINFO GROUPS, read
+            // here and not in the script (Dragonfly wedges the key on XINFO inside a script); the
+            // script still reads the oldest pending id atomically with its trim. Safe across the
+            // two steps: an id below the last-delivered id and not pending is ACKed, and stays
+            // ACKed — a later read or claim never makes an id at or below it pending again. No
+            // group, no stream, or a group that has delivered nothing: nothing is settled, so the
+            // stream stays full and the refusal stands.
+            var lastDelivered = await ReadLastDeliveredIdAsync(stream, settlingGroup, cancellationToken).ConfigureAwait(false);
+            if (lastDelivered.IsNullOrEmpty)
+                throw;
+
+            args[2] = lastDelivered;
+            return await AppendOnceAsync(stream, dedupKey, args, cancellationToken).ConfigureAwait(false);
+        }
+    }
+
+    private async Task<RedisValue> AppendOnceAsync(RedisKey stream, RedisKey dedupKey, RedisValue[] args, CancellationToken cancellationToken)
+        => (RedisValue)await WithCancellation(
             static (database, s) => database.ScriptEvaluateAsync(AppendOnceScript, [s.stream, s.dedupKey], s.args),
             (stream, dedupKey, args),
             cancellationToken).ConfigureAwait(false);
+
+    private async Task<RedisValue> ReadLastDeliveredIdAsync(RedisKey stream, RedisValue groupName, CancellationToken cancellationToken)
+    {
+        StreamGroupInfo[] groups;
+        try
+        {
+            groups = await WithCancellation(
+                static (database, s) => database.StreamGroupInfoAsync(s),
+                stream,
+                cancellationToken).ConfigureAwait(false);
+        }
+        catch (RedisServerException)
+        {
+            return RedisValue.Null; // no such key: the full stream vanished meanwhile — retry decides
+        }
+
+        foreach (var group in groups)
+        {
+            if (group.Name == groupName.ToString())
+                return group.LastDeliveredId is { } id && id != "0-0" ? id : RedisValue.Null;
+        }
+
+        return RedisValue.Null;
     }
+
+    /// <summary>Whether <paramref name="exception"/> is the append script's full-stream refusal.</summary>
+    internal static bool IsStreamFull(RedisServerException exception)
+        => exception.Message.StartsWith(StreamFullErrorCode, StringComparison.Ordinal);
+
+    /// <summary>Runs the StreamAcknowledgeAndDeleteAsync operation.</summary>
+    public async Task<long> StreamAcknowledgeAndDeleteAsync(
+        RedisKey stream,
+        RedisValue groupName,
+        RedisValue messageId,
+        CancellationToken cancellationToken)
+        => (long)await WithCancellation(
+            static (database, s) => database.ScriptEvaluateAsync(AcknowledgeAndDeleteScript, [s.stream], [s.groupName, s.messageId]),
+            (stream, groupName, messageId),
+            cancellationToken).ConfigureAwait(false);
 
     /// <summary>Runs the TryDeleteIdleConsumerAsync operation.</summary>
     public async Task<bool> TryDeleteIdleConsumerAsync(
@@ -374,7 +505,10 @@ internal static class RedisTransportRetry
     /// LOADING, MASTERDOWN and READONLY (a failover in progress): the server raises them BEFORE
     /// running anything, and the append is keyed by its dedup marker, so a retry cannot apply it
     /// twice. Read as permanent, every publish in a migration or failover window failed at once.
-    /// Any other server error (WRONGTYPE, NOSCRIPT, OOM …) stays permanent.
+    /// The append script's full-stream refusal is retried too (NATS parity: JetStream answers a
+    /// full Discard=New work queue with a 503, which its publish retries): it is raised before
+    /// anything is appended, and a worker settling one entry is all it takes to clear it. Any
+    /// other server error (WRONGTYPE, NOSCRIPT, OOM …) stays permanent.
     /// </summary>
     public static bool IsTransient(Exception exception)
         => exception is RedisConnectionException
@@ -387,5 +521,6 @@ internal static class RedisTransportRetry
                     or RedisErrorKind.Loading
                     or RedisErrorKind.MasterDown
                     or RedisErrorKind.ReadOnly
-            };
+            }
+            || exception is RedisServerException server && RedisStreamDatabaseAdapter.IsStreamFull(server);
 }

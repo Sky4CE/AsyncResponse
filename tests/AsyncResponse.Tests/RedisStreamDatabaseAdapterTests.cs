@@ -165,7 +165,7 @@ public class RedisStreamDatabaseAdapterTests
         await Assert.ThrowsAnyAsync<OperationCanceledException>(() => adapter.StreamPendingMessagesAsync("stream", "group", 1, RedisValue.Null, null, null, 250, token));
         await Assert.ThrowsAnyAsync<OperationCanceledException>(() => adapter.StreamAcknowledgeAsync("stream", "group", "1-0", token));
         await Assert.ThrowsAnyAsync<OperationCanceledException>(() => adapter.StreamAddAsync("stream", [new NameValueEntry("payload", "{}")], null, true, token));
-        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => adapter.StreamAddOnceAsync("stream", "dedup", TimeSpan.FromMinutes(1), [new NameValueEntry("payload", "{}")], null, true, token));
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => adapter.StreamAddOnceAsync("stream", "dedup", TimeSpan.FromMinutes(1), [new NameValueEntry("payload", "{}")], null, "group", token));
         await Assert.ThrowsAnyAsync<OperationCanceledException>(() => adapter.StreamCreateConsumerGroupAsync("stream", "group", StreamPosition.Beginning, true, token));
         await Assert.ThrowsAnyAsync<OperationCanceledException>(() => adapter.TryDeleteIdleConsumerAsync("stream", "group", "consumer", token));
 

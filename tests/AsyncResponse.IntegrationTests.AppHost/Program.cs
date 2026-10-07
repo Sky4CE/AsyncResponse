@@ -156,6 +156,16 @@ IResourceBuilder<IResourceWithEnvironment> AddSutApp(string name, bool aotCapabl
 // share the redis docker-entrypoint.sh + *-server launch contract work through this override — Valkey
 // does. Dragonfly (different container entrypoint) and Garnet (no stream commands) are not drop-ins for
 // this harness and are validated separately (see docs/configuration.md#redis-compatible-servers).
+//
+// Every container image below is pinned by DIGEST, with its tag kept beside it for the reader:
+// `AddContainer(name, image, tag).WithImageSHA256(digest)` runs exactly `image@sha256:digest`. A tag
+// alone moved under the suite without a commit — `2022-latest` and `mongo:7` re-point on every
+// cumulative or patch release, the MongoDB claim semantics this suite pins are server behaviour, and
+// a pruned tag has already taken CI down once (the Pub/Sub emulator below). Each digest is the tag's
+// multi-arch INDEX digest, not one platform's, so the same pin pulls linux/amd64 on CI and
+// linux/arm64 on a developer's machine (mssql/server publishes amd64 only; its digest is that
+// manifest's). To bump one: `docker buildx imagetools inspect <image>:<tag>` and copy the top-level
+// "Digest:" line — the tag and the digest change in the same commit.
 IResourceBuilder<RedisResource> AddRedisContainer()
 {
     var redis = builder.AddRedis("redis");
@@ -164,6 +174,15 @@ IResourceBuilder<RedisResource> AddRedisContainer()
         if (Env("ASYNCRESPONSE_ITEST_REDIS_REGISTRY", "") is { Length: > 0 } redisRegistry)
             redis = redis.WithImageRegistry(redisRegistry);
         redis = redis.WithImage(redisImage, Env("ASYNCRESPONSE_ITEST_REDIS_TAG", "latest"));
+    }
+    else
+    {
+        // Aspire's default image (docker.io/library/redis). The tag is named here for the reader
+        // — Aspire runs image@sha256 once a digest is set and drops the tag — so this line says
+        // what the digest is even after an Aspire upgrade moves its own default tag. The
+        // compatibility matrix's override above chooses its own image and is not pinned.
+        redis = redis.WithImageTag("8.6")
+            .WithImageSHA256("2f07354308a997554f9d676888ca927ada1293c7c2154dd01ae77f57dd9c6d5f");
     }
 
     return redis;
@@ -215,6 +234,7 @@ if (string.Equals(Env("ASYNCRESPONSE_ITEST_PROFILE", ""), "redis-compat", String
 
 IResourceBuilder<ContainerResource> AddRabbitMqContainer()
     => builder.AddContainer("rabbitmq", "rabbitmq", "3.13-management")
+        .WithImageSHA256("e582c0bc7766f3342496d8485efb5a1df782b5ce3886ad017e2eaae442311f69")
         .WithEndpoint(targetPort: 5672, scheme: "tcp", name: "amqp")
         .WithEndpoint(targetPort: 15672, scheme: "http", name: "management");
 
@@ -224,21 +244,27 @@ IResourceBuilder<ContainerResource> AddRabbitMqContainer()
 // (see https://gcr.io/v2/google.com/cloudsdktool/google-cloud-cli/tags/list) when it happens again.
 IResourceBuilder<ContainerResource> AddPubSubContainer()
     => builder.AddContainer("pubsub", "gcr.io/google.com/cloudsdktool/google-cloud-cli", "583.0.0-emulators")
+    .WithImageSHA256("07e4b8c3075ca793552fcfaf4808f104ef155d7805d87ade8e01b440463be262")
     .WithArgs("gcloud", "beta", "emulators", "pubsub", "start", "--host-port=0.0.0.0:8085", $"--project={ProjectId}")
     .WithEndpoint(targetPort: 8085, scheme: "tcp", name: "pubsub");
 
 // `-js` enables JetStream, which the NATS channel's Key-Value recovery store and the NATS transport's
 // streams both require.
-// Pinned to a minor line, not `latest`: only NATS patch releases reach the suite without a commit.
 IResourceBuilder<ContainerResource> AddNatsContainer()
     => builder.AddContainer("nats", "nats", "2.15")
+        .WithImageSHA256("cd3fcd4ecdda44e3a66728a5334af0a959bc3979b32810e033d1c547241cd0f4")
         .WithArgs("-js")
         .WithEndpoint(targetPort: 4222, scheme: "tcp", name: "nats");
 
 // Single-broker KRaft Kafka (the Aspire integration uses the confluent-local image). One broker backs
 // both Kafka app variants; they isolate through distinct topics and consumer groups. This container
 // doubles as the roadmap's Redpanda-compatibility reference: everything speaks the Kafka protocol.
-IResourceBuilder<KafkaServerResource> AddKafkaContainer() => builder.AddKafka("kafka");
+// The tag (Aspire 13.5's default for docker.io/confluentinc/confluent-local) is named for the reader
+// only, as for Redis above: with a digest set, Aspire runs image@sha256 and drops the tag.
+IResourceBuilder<KafkaServerResource> AddKafkaContainer()
+    => builder.AddKafka("kafka")
+        .WithImageTag("8.2.0")
+        .WithImageSHA256("11b351dc22765780047a07b02d1f19a820bbdd3fae2cfe7ba4ef0d0a26b52248");
 
 // Two PostgreSQL app instances (default + early-ack) share this one server, each with its own Npgsql
 // pool. The image default max_connections=100 is exhausted under the load-test profile ("FATAL: sorry,
@@ -246,6 +272,7 @@ IResourceBuilder<KafkaServerResource> AddKafkaContainer() => builder.AddKafka("k
 // (2 apps x Maximum Pool Size=120 = 240) so neither the load test nor parallel integration apps starve.
 IResourceBuilder<ContainerResource> AddPostgresContainer()
     => builder.AddContainer("postgres", "postgres", "16-alpine")
+        .WithImageSHA256("721873c34ceb9f8d8fc265984940dc982404c105f19ad51be9fdc5970a6080ea")
         .WithEnvironment("POSTGRES_DB", "asyncresponse")
         .WithEnvironment("POSTGRES_PASSWORD", "postgres")
         .WithArgs("-c", "max_connections=400")
@@ -253,6 +280,7 @@ IResourceBuilder<ContainerResource> AddPostgresContainer()
 
 IResourceBuilder<ContainerResource> AddMySqlContainer()
     => builder.AddContainer("mysql", "mysql", "8.4")
+        .WithImageSHA256("6ea90827b1100f8f2ae306a539f86d2c264a26ed435a2a9f75551dd5c3aeb242")
         .WithEnvironment("MYSQL_DATABASE", "asyncresponse")
         .WithEnvironment("MYSQL_ROOT_PASSWORD", "mysql")
         .WithEndpoint(targetPort: 3306, scheme: "tcp", name: "mysql");
@@ -263,6 +291,7 @@ IResourceBuilder<ContainerResource> AddMySqlContainer()
 // chase the replica-set-advertised container hostname, which is unreachable from the host network.
 IResourceBuilder<ContainerResource> AddMongoDbContainer()
     => builder.AddContainer("mongodb", "mongo", "7")
+        .WithImageSHA256("1f995ad6fdb93244a1addab1b58f934a0bc2f5643c38e02f5e9d7f0c7d227a7b")
         .WithEntrypoint("bash")
         .WithArgs(
             "-c",
@@ -280,6 +309,7 @@ IResourceBuilder<ContainerResource> AddMongoDbContainer()
 // default Docker VM.
 IResourceBuilder<ContainerResource> AddOracleContainer()
     => builder.AddContainer("oracle", "gvenzl/oracle-free", "23-slim")
+        .WithImageSHA256("6d61d267a3b978c24c5ac1790e62e927416a0aec446bd86e4b3a1527562757bd")
         .WithEnvironment("ORACLE_PASSWORD", Env("ASYNCRESPONSE_ITEST_ORACLE_ADMIN_PASSWORD", "AsyncResponse12345"))
         .WithEnvironment("APP_USER", OracleAppUser)
         .WithEnvironment("APP_USER_PASSWORD", Env("ASYNCRESPONSE_ITEST_ORACLE_APP_PASSWORD", "AsyncResponse12345"))
@@ -290,6 +320,7 @@ IResourceBuilder<ContainerResource> AddOracleContainer()
 // Pinned to a dated release, not `vnext-latest` (moves every drop); bump to a newer non-`pre` vnext-EN* tag.
 IResourceBuilder<ContainerResource> AddCosmosContainer()
     => builder.AddContainer("cosmos", "mcr.microsoft.com/cosmosdb/linux/azure-cosmos-emulator", "vnext-EN20260907")
+        .WithImageSHA256("2db1f9e74c506bcf6fc347aa937aea1c00fa756061296a5a9efba530ce86ec02")
         .WithEnvironment("PROTOCOL", "https")
         .WithEndpoint(targetPort: 8081, scheme: "https", name: "gateway")
         .WithEndpoint(targetPort: 8080, scheme: "http", name: "health")
@@ -303,8 +334,12 @@ var sqlServerPassword = Env("ASYNCRESPONSE_ITEST_SQLSERVER_PASSWORD", "P@ssword1
 // MSSQL_MEMORY_LIMIT_MB: SQL Server grows its buffer pool to whatever the host allows and measured
 // 1,328 MiB. Two of these run in the suite (this one and the Service Bus emulator's), so capping
 // both keeps a batch from spending most of a Docker VM on database cache it never needs.
+// `2022-latest` re-points at every cumulative update; the digest is the one both SQL Servers run.
+const string SqlServer2022Digest = "4402d880dd4c34bfa7d8705e56a86cd6c88da80a1f6bbbe741f999e76264a090";
+
 IResourceBuilder<ContainerResource> AddSqlServerContainer()
     => builder.AddContainer("sqlserver", "mcr.microsoft.com/mssql/server", "2022-latest")
+        .WithImageSHA256(SqlServer2022Digest)
         .WithEnvironment("ACCEPT_EULA", "Y")
         .WithEnvironment("MSSQL_SA_PASSWORD", Env("ASYNCRESPONSE_ITEST_SQLSERVER_PASSWORD", "P@ssword12345"))
         .WithEnvironment("MSSQL_MEMORY_LIMIT_MB", Env("ASYNCRESPONSE_ITEST_SQLSERVER_MEMORY_MB", "1024"))
@@ -316,12 +351,14 @@ IResourceBuilder<ContainerResource> AddServiceBusContainer()
 {
     var serviceBusSqlPassword = Env("ASYNCRESPONSE_ITEST_SERVICEBUS_SQL_PASSWORD", "P@ssword12345");
     var serviceBusSql = builder.AddContainer("servicebus-sql", "mcr.microsoft.com/mssql/server", "2022-latest")
+        .WithImageSHA256(SqlServer2022Digest)
         .WithEnvironment("ACCEPT_EULA", "Y")
         .WithEnvironment("MSSQL_SA_PASSWORD", serviceBusSqlPassword)
         .WithEnvironment("MSSQL_MEMORY_LIMIT_MB", Env("ASYNCRESPONSE_ITEST_SQLSERVER_MEMORY_MB", "1024"));
     var serviceBusConfigPath = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "servicebus-emulator-config.json"));
     // Pinned to a release, not `latest` — which has already crossed a major version (1.x to 2.x).
     return builder.AddContainer("servicebus", "mcr.microsoft.com/azure-messaging/servicebus-emulator", "2.0.1")
+        .WithImageSHA256("5a96d893b245031740f7d46e0fe5ff282d24b78c4b7d761dd57590f3f010a9b3")
         .WithBindMount(serviceBusConfigPath, "/ServiceBus_Emulator/ConfigFiles/Config.json", isReadOnly: true)
         .WithEnvironment("SQL_SERVER", "servicebus-sql")
         .WithEnvironment("MSSQL_SA_PASSWORD", serviceBusSqlPassword)
@@ -339,6 +376,7 @@ IResourceBuilder<ContainerResource> AddServiceBusContainer()
 // CreateQueues option, so no config file or init script is needed.
 IResourceBuilder<ContainerResource> AddLocalStackContainer()
     => builder.AddContainer("localstack", "localstack/localstack", "3")
+        .WithImageSHA256("b279c01f4cfb8f985a482e4014cabc1e2697b9d7a6c8c8db2e40f4d9f93687c7")
         .WithEnvironment("SERVICES", "sqs,dynamodb")
         .WithEnvironment("EAGER_SERVICE_LOADING", "1")
         .WithEndpoint(targetPort: 4566, scheme: "http", name: "edge")

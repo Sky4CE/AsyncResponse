@@ -164,13 +164,28 @@ internal sealed class MongoDbChannelStore : IDisposable
             // deployment created under the same name with different options is replaced in place;
             // an equivalent index under another name — the one the AutoCreateIndexes = false
             // warning prescribes — is accepted (see MongoIndexes).
+            //
+            // The DDL rides w=1 handles (the transport's EnsureCreated does the same): createIndexes
+            // carries the handle's write concern, and under the bounded majority even a no-op one —
+            // every index already exists — waits for the set's last optime to reach a majority. On a
+            // set that cannot acknowledge majority (a primary-secondary-arbiter set with its
+            // secondary down) each attempt held the gate for the whole wtimeout and then threw, so a
+            // host that started during the degradation could not publish, subscribe, or register a
+            // single response — every operation runs this first, and _created never latched — while
+            // every write path behind it rides the lapse out by reading back what the primary
+            // applied. Index DDL is idempotent, and a build a failover rolled back reruns at the
+            // next start.
+            var primaryAcknowledged = MongoWriteConcerns.PrimaryAcknowledged(_database);
+            var recoveryIndexes = _recovery.WithWriteConcern(primaryAcknowledged);
+            var messageIndexes = _messages.WithWriteConcern(primaryAcknowledged);
+            var subscriberIndexes = _subscribers.WithWriteConcern(primaryAcknowledged);
             await CreateTtlIndexAsync(
-                _recovery,
+                recoveryIndexes,
                 Builders<MongoRecoveryStateDocument>.IndexKeys.Ascending(item => item.ExpiresAtUtc),
                 $"{_options.RecoveryStateCollection}_expires_idx",
                 cancellationToken).ConfigureAwait(false);
             await MongoIndexes.CreateOrAcceptEquivalentAsync(
-                _recovery,
+                recoveryIndexes,
                 new CreateIndexModel<MongoRecoveryStateDocument>(
                     Builders<MongoRecoveryStateDocument>.IndexKeys
                         .Ascending(item => item.CorrelationId)
@@ -180,12 +195,12 @@ internal sealed class MongoDbChannelStore : IDisposable
                 cancellationToken).ConfigureAwait(false);
 
             await CreateTtlIndexAsync(
-                _messages,
+                messageIndexes,
                 Builders<MongoChannelMessageDocument>.IndexKeys.Ascending(item => item.ExpiresAtUtc),
                 $"{_options.MessageCollection}_expires_idx",
                 cancellationToken).ConfigureAwait(false);
             await MongoIndexes.CreateOrAcceptEquivalentAsync(
-                _messages,
+                messageIndexes,
                 new CreateIndexModel<MongoChannelMessageDocument>(
                     Builders<MongoChannelMessageDocument>.IndexKeys
                         .Ascending(item => item.CorrelationId)
@@ -195,12 +210,12 @@ internal sealed class MongoDbChannelStore : IDisposable
                 cancellationToken).ConfigureAwait(false);
 
             await CreateTtlIndexAsync(
-                _subscribers,
+                subscriberIndexes,
                 Builders<MongoChannelSubscriberDocument>.IndexKeys.Ascending(item => item.ExpiresAtUtc),
                 $"{_options.SubscriberCollection}_expires_idx",
                 cancellationToken).ConfigureAwait(false);
             await MongoIndexes.CreateOrAcceptEquivalentAsync(
-                _subscribers,
+                subscriberIndexes,
                 new CreateIndexModel<MongoChannelSubscriberDocument>(
                     Builders<MongoChannelSubscriberDocument>.IndexKeys.Ascending(item => item.CorrelationId),
                     new CreateIndexOptions { Name = $"{_options.SubscriberCollection}_correlation_idx" }),
@@ -635,6 +650,31 @@ internal sealed class MongoDbChannelStore : IDisposable
         CancellationToken cancellationToken)
     {
         await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
+        var filter = BuildLoadMessagesFilter(correlationId, sinceUtc, afterCreatedAtUtc, afterId);
+        var documents = await _messages.Find(filter)
+            .Project(SweepProjection)
+            .Sort(Builders<MongoChannelMessageDocument>.Sort
+                .Ascending(item => item.CreatedAtUtc)
+                .Ascending(item => item.Id))
+            .Limit(batchSize)
+            .ToListAsync(cancellationToken).ConfigureAwait(false);
+        return ToMessages(documents);
+    }
+
+    /// <summary>
+    /// The sweep's filter: one correlation id's live messages created at or after
+    /// <paramref name="sinceUtc"/>, past the keyset cursor (<paramref name="afterCreatedAtUtc"/>,
+    /// <paramref name="afterId"/>) when there is one. The instants render through the members'
+    /// pinned serializer (<see cref="UtcBsonDateSerializer"/>) as BSON dates, the type the
+    /// <c>$$NOW</c>-stamped <c>created_at</c> holds — a comparison against any other BSON type
+    /// never matches.
+    /// </summary>
+    internal static FilterDefinition<MongoChannelMessageDocument> BuildLoadMessagesFilter(
+        string correlationId,
+        DateTimeOffset sinceUtc,
+        DateTimeOffset? afterCreatedAtUtc,
+        Guid? afterId)
+    {
         var filter = Builders<MongoChannelMessageDocument>.Filter.Eq(item => item.CorrelationId, correlationId)
                      & Builders<MongoChannelMessageDocument>.Filter.Gte(item => item.CreatedAtUtc, sinceUtc.UtcDateTime)
                      & NotExpiredOnServerClock<MongoChannelMessageDocument>();
@@ -648,14 +688,8 @@ internal sealed class MongoDbChannelStore : IDisposable
                     Builders<MongoChannelMessageDocument>.Filter.Eq(item => item.CreatedAtUtc, afterCreated),
                     Builders<MongoChannelMessageDocument>.Filter.Gt(item => item.Id, cursorId)));
         }
-        var documents = await _messages.Find(filter)
-            .Project(SweepProjection)
-            .Sort(Builders<MongoChannelMessageDocument>.Sort
-                .Ascending(item => item.CreatedAtUtc)
-                .Ascending(item => item.Id))
-            .Limit(batchSize)
-            .ToListAsync(cancellationToken).ConfigureAwait(false);
-        return ToMessages(documents);
+
+        return filter;
     }
 
     /// <summary>
@@ -1145,6 +1179,12 @@ internal sealed class MongoDbChannelStore : IDisposable
 /// next element a newer build adds would break older hosts mid rolling deploy — a claim that
 /// committed <c>acked_at</c> and then failed to deserialize its reply, a hydration read, a
 /// change-stream event. Unknown elements are ignored instead.
+/// <para>
+/// The instants are pinned to BSON dates (<see cref="UtcBsonDateSerializer"/>), whatever
+/// <see cref="DateTime"/> serializer the host registered globally: the server stamps them with
+/// <c>$$NOW</c>, so a date filter rendered through a host-wide String representation never matched
+/// (the sweep found no response), and a host's own string serializer threw on every read.
+/// </para>
 /// </remarks>
 [BsonIgnoreExtraElements]
 internal sealed class MongoRecoveryStateDocument
@@ -1164,9 +1204,11 @@ internal sealed class MongoRecoveryStateDocument
     public string StateJson { get; set; } = "";
 
     [BsonElement("expires_at")]
+    [BsonSerializer(typeof(UtcBsonDateSerializer))]
     public DateTime ExpiresAtUtc { get; set; }
 
     [BsonElement("registered_at")]
+    [BsonSerializer(typeof(UtcBsonDateSerializer))]
     public DateTime RegisteredAtUtc { get; set; }
 }
 
@@ -1176,6 +1218,12 @@ internal sealed class MongoRecoveryStateDocument
 /// next element a newer build adds would break older hosts mid rolling deploy — a claim that
 /// committed <c>acked_at</c> and then failed to deserialize its reply, a hydration read, a
 /// change-stream event. Unknown elements are ignored instead.
+/// <para>
+/// The instants are pinned to BSON dates (<see cref="UtcBsonDateSerializer"/>), whatever
+/// <see cref="DateTime"/> serializer the host registered globally: the server stamps them with
+/// <c>$$NOW</c>, so a date filter rendered through a host-wide String representation never matched
+/// (the sweep found no response), and a host's own string serializer threw on every read.
+/// </para>
 /// </remarks>
 [BsonIgnoreExtraElements]
 internal sealed class MongoChannelMessageDocument
@@ -1193,12 +1241,15 @@ internal sealed class MongoChannelMessageDocument
     public string? EnvelopeJson { get; set; } = "";
 
     [BsonElement("created_at")]
+    [BsonSerializer(typeof(UtcBsonDateSerializer))]
     public DateTime CreatedAtUtc { get; set; }
 
     [BsonElement("expires_at")]
+    [BsonSerializer(typeof(UtcBsonDateSerializer))]
     public DateTime ExpiresAtUtc { get; set; }
 
     [BsonElement("acked_at")]
+    [BsonSerializer(typeof(NullableUtcBsonDateSerializer))]
     public DateTime? AckedAtUtc { get; set; }
 
     [BsonElement("acked_seq")]
@@ -1214,6 +1265,12 @@ internal sealed class MongoChannelMessageDocument
 /// next element a newer build adds would break older hosts mid rolling deploy — a claim that
 /// committed <c>acked_at</c> and then failed to deserialize its reply, a hydration read, a
 /// change-stream event. Unknown elements are ignored instead.
+/// <para>
+/// The instants are pinned to BSON dates (<see cref="UtcBsonDateSerializer"/>), whatever
+/// <see cref="DateTime"/> serializer the host registered globally: the server stamps them with
+/// <c>$$NOW</c>, so a date filter rendered through a host-wide String representation never matched
+/// (the sweep found no response), and a host's own string serializer threw on every read.
+/// </para>
 /// </remarks>
 [BsonIgnoreExtraElements]
 internal sealed class MongoChannelSubscriberDocument
@@ -1233,5 +1290,6 @@ internal sealed class MongoChannelSubscriberDocument
     public string InstanceId { get; set; } = "";
 
     [BsonElement("expires_at")]
+    [BsonSerializer(typeof(UtcBsonDateSerializer))]
     public DateTime ExpiresAtUtc { get; set; }
 }

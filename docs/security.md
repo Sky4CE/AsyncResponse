@@ -34,6 +34,16 @@ What bounds that reach:
   redelivered to. The recovery path resolves the payload's type name before any callback is chosen,
   so no authorizer could stand in front of it. A name outside the limits is simply unresolvable,
   like a renamed type.
+- **Payload names are judged by their definition first.** Resolving a generic instantiation or an
+  array builds a new runtime type, which the runtime keeps for the life of the process (outside the
+  managed heap). A recovery row's payload type name is therefore refused *before* anything is
+  constructed when it names an array (never a payload) or an instantiation whose loaded generic
+  definition does not implement `IAsyncResponsePayload` — so a store writer cannot grow the process
+  by naming distinct instantiations of arbitrary loaded generics (``Dictionary`2`` over pairs of
+  loaded types). Residual: the type *arguments* of a genuine generic payload (`Envelope<T>`) are
+  not constrained — naming distinct arguments to it still constructs closed types, and its `T`
+  members are materialized from the stored JSON before any callback authorization. Prefer
+  non-generic payload types where the recovery store is shared with less-trusted writers.
 
 What you must do:
 
@@ -62,8 +72,12 @@ you register one, only the allowed (service, method) pairs are invokable by pers
 worker jobs; everything else is refused rather than executed. Authorization is **type-level** — you
 allow a service type, or supply a predicate over service and method names; it does **not** read
 per-method attributes. A type allowance admits only the type's ordinary methods: property and event
-accessors (`get_`/`set_`/`add_`/`remove_`) and `object`'s own members are never callback candidates,
-so a descriptor aimed at `set_ApiKey` on an allowed DI singleton is refused.
+accessors (`get_`/`set_`/`add_`/`remove_`), `object`'s own members, and disposal (the members of
+`IDisposable`/`IAsyncDisposable` and any parameterless `Dispose`/`DisposeAsync`) are never callback
+candidates, so a descriptor aimed at `set_ApiKey` or `Dispose` on an allowed DI singleton is refused.
+Every other public method is — including those an allowed interface inherits from its base
+interfaces, framework ones too, and, for an allowed class, those it inherits from its base classes.
+Allow narrow interfaces rather than implementation classes.
 
 ```csharp
 builder.Services.AddAsyncResponse()

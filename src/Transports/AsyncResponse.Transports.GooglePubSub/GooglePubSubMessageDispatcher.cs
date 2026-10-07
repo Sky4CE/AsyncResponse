@@ -169,6 +169,9 @@ internal abstract class GooglePubSubMessageDispatcher : IAsyncDisposable
     /// </summary>
     public virtual Task DrainInFlightAsync(TimeSpan budget, TimeProvider clock) => Task.CompletedTask;
 
+    /// <summary>Handlers running inside an SDK callback right now (for the stop's abandonment log).</summary>
+    internal virtual int InFlightCount => 0;
+
     /// <summary>
     /// Hands back (Nack) every delivery held for the client stop — since
     /// <see cref="DrainInFlightAsync"/> began, handed back by the flow engine, or (early ACK) taken
@@ -301,6 +304,9 @@ internal sealed class AwaitingGooglePubSubMessageDispatcher(
     private readonly TaskCompletionSource _drained = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private int _inFlight;
     private int _stopping;
+
+    /// <inheritdoc />
+    internal override int InFlightCount => Volatile.Read(ref _inFlight);
 
     /// <summary>Handles the delivered message.</summary>
     public override async Task<SubscriberClient.Reply> HandleAsync(
@@ -446,12 +452,14 @@ internal sealed class QueuedGooglePubSubMessageDispatcher : GooglePubSubMessageD
             .Select(workerIndex => Task.Run(() => RunWorkerAsync(workerIndex)))
             .ToArray();
 
-        Logger.LogInformation(
+        // Guarded: the workers are already running, so a throwing provider must not abort
+        // construction and leak them (SQS/RabbitMQ parity) — nor fault the subscriber at startup.
+        SafeLog.Try(() => Logger.LogInformation(
             "Created Pub/Sub ACK-after-enqueue dispatcher for {SubscriptionId} with {WorkerCount} worker(s), queue capacity {QueueCapacity}, drain timeout {DrainTimeout}.",
             _subscriptionId,
             subscriberOptions.BackgroundWorkerCount,
             subscriberOptions.BackgroundQueueCapacity,
-            _drainTimeout);
+            _drainTimeout));
     }
 
     internal int PendingCount => Volatile.Read(ref _pendingCount);

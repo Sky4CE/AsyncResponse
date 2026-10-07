@@ -48,7 +48,24 @@ internal sealed class ChannelSerialExecutor : IAsyncDisposable
             FullMode = BoundedChannelFullMode.Wait
         });
 
-        _readerLoop = Task.Run(DrainAsync);
+        // The drain loop outlives whoever happened to create the executor — a waiter, a
+        // same-process publisher, or a channel's dispatch loop — and serves every later item for
+        // the key, so it must not run inside that creator's ExecutionContext: it used to keep the
+        // creator's Activity, log scope and async-flow TransactionScope as ambient state for every
+        // item it ran, parenting later deliveries' database spans to an unrelated request and
+        // enlisting their store calls (delivery claims) in a transaction that could roll back
+        // after the response had been handed to its waiter. Items that need a caller's context
+        // carry it themselves (the channels' captured-context dispatch). SuppressFlow throws when
+        // flow is already suppressed — then there is nothing to suppress.
+        if (ExecutionContext.IsFlowSuppressed())
+        {
+            _readerLoop = Task.Run(DrainAsync);
+        }
+        else
+        {
+            using (ExecutionContext.SuppressFlow())
+                _readerLoop = Task.Run(DrainAsync);
+        }
     }
 
     /// <summary>

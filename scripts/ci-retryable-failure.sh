@@ -54,10 +54,20 @@ set -euo pipefail
 
 # Known hosted-runner infrastructure loss. "Fixture' threw in InitializeAsync" is a batch or matrix
 # fixture (the original *BatchFixture types and the cross-product shards' *Fixture types, which
-# carry no "Batch" infix) failing to boot its containers on a starved runner; "database is locked"
-# is SQLite on a slow runner disk during the EF Core storm tests (see those tests' own comments);
-# the last two are the runner itself going away.
-FLAKE_SIGNATURES="Fixture' threw in InitializeAsync|SQLite Error 5: 'database is locked'|lost communication with the server|The runner has received a shutdown signal"
+# carry no "Batch" infix) failing to boot its containers on a starved runner; the last two are the
+# runner itself going away. These explain a failure wherever they appear.
+FLAKE_SIGNATURES="Fixture' threw in InitializeAsync|lost communication with the server|The runner has received a shutdown signal"
+
+# A flake signature that explains ONLY the tests it was written for. "database is locked" is
+# SQLite on a slow runner disk during the EF Core storm tests (see those tests' own comments):
+# the EF Core store is provider-agnostic, so the SQLite busy timeout those tests run under is the
+# test's, not the product's. The same text from any other test is a product signal — the SQLite
+# flow store serializes its in-process writers precisely so that they never see SQLITE_BUSY, and a
+# regression of that guarantee prints exactly this string — so it explains a failed-test block
+# only when the block's test name matches SCOPED_FLAKE_TESTS, and never through the whole-log
+# fallback, which has no test name to check.
+SCOPED_FLAKE_SIGNATURE="SQLite Error 5: 'database is locked'"
+SCOPED_FLAKE_TESTS="(^|[.])EFCoreDurableFlowStateStoreTests[.]EFCoreStore_ConcurrentSaveLoadDeleteStorm_"
 
 # Evidence that a test EXECUTED and failed on its own merits: xunit.v3 assertion messages
 # ("Assert.Equal() Failure: …", "Assert.Fail(): …") and the assertion exception base type.
@@ -90,12 +100,15 @@ first_match() {
 # byte in a byte-oriented awk (mawk, the hosted runner's) and a different character altogether in
 # a UTF-8-aware one, while a literal is read under the same rules as the log it is compared with.
 classify_blocks() {
-  CI_REAL_RE="$REAL_FAILURE_SIGNATURES" CI_FLAKE_RE="$FLAKE_SIGNATURES" CI_BOM=$'\xEF\xBB\xBF' awk '
+  CI_REAL_RE="$REAL_FAILURE_SIGNATURES" CI_FLAKE_RE="$FLAKE_SIGNATURES" CI_SCOPED_RE="$SCOPED_FLAKE_SIGNATURE" \
+  CI_SCOPED_TESTS_RE="$SCOPED_FLAKE_TESTS" CI_BOM=$'\xEF\xBB\xBF' awk '
     BEGIN {
       esc = sprintf("%c", 27)
       ansi_re = esc "\\[[0-9;]*[A-Za-z]"
       real_re = ENVIRON["CI_REAL_RE"]
       flake_re = ENVIRON["CI_FLAKE_RE"]
+      scoped_re = ENVIRON["CI_SCOPED_RE"]
+      scoped_tests_re = ENVIRON["CI_SCOPED_TESTS_RE"]
       bom = ENVIRON["CI_BOM"]
     }
     function flush() {
@@ -159,6 +172,9 @@ classify_blocks() {
       if (block_first == "" && $0 ~ /[^[:space:]]/ && $0 !~ /^[[:space:]]*from [^[:space:]]+\.dll/) { block_first = $0; sub(/^[[:space:]]+/, "", block_first) }
       if (block_real == "" && match($0, real_re)) block_real = substr($0, RSTART, RLENGTH)
       if (block_flake == "" && match($0, flake_re)) block_flake = substr($0, RSTART, RLENGTH)
+      # The scoped signature counts only inside a block whose test it was written for; anywhere
+      # else the block stays unexplained, which is a real failure.
+      if (block_flake == "" && block_name ~ scoped_tests_re && match($0, scoped_re)) block_flake = substr($0, RSTART, RLENGTH)
     }
     END {
       flush()

@@ -5,6 +5,7 @@ global using DbSubscriberRole = AsyncResponse.Transports.MongoDB.MongoDbSubscrib
 global using DbTransportDelivery = AsyncResponse.Transports.MongoDB.MongoDbTransportDelivery;
 global using DbTransportOptions = AsyncResponse.Transports.MongoDB.MongoDbAsyncResponseTransportOptions;
 global using DbTransportOptionsValidator = AsyncResponse.Transports.MongoDB.MongoDbTransportOptionsValidator;
+using AsyncResponse.Internal;
 using Microsoft.Extensions.Logging;
 
 namespace AsyncResponse.Transports.MongoDB;
@@ -13,7 +14,8 @@ namespace AsyncResponse.Transports.MongoDB;
 /// Applies acknowledgement, redelivery, and dead-letter policy to MongoDB transport deliveries.
 /// All machinery lives in <see cref="DbMessageDispatcherBase"/> (shared source, compiled into this
 /// assembly); the global using aliases above bind the provider seam types, and this derivation
-/// supplies only the display strings rendered into logs and telemetry.
+/// supplies the display strings rendered into logs and telemetry and the driver's transient-fault
+/// classifier for settlement retries.
 /// </summary>
 internal sealed class MongoDbMessageDispatcher(
     Func<MongoDbTransportDelivery, CancellationToken, Task> handler,
@@ -33,4 +35,9 @@ internal sealed class MongoDbMessageDispatcher(
         unitNoun: "document",
         telemetryName: "mongodb",
         timeProvider: timeProvider,
-        hostStopping: hostStopping);
+        hostStopping: hostStopping)
+{
+    /// <inheritdoc />
+    protected override bool IsTransientSettlementFault(Exception exception)
+        => MongoTransientFaults.IsTransient(exception);
+}

@@ -206,6 +206,14 @@ internal abstract class DbAsyncResponseChannelBase :
         // on some channels entirely, insta-timing-out a fully registered waiter.
         AsyncResponseChannelOptions.EnsureWaiterTimeoutSupported(timeout.Value);
 
+        // The registration below is saved ONCE and never refreshed. Saved with RecoveryStateExpiry
+        // alone, a wait longer than the expiry (an explicit timeout, or DefaultTimeout above it)
+        // outlived its own registration: a response landing in the tail of the wait after this
+        // process died found no registration, so no recovery callback ran, and nothing said why.
+        // Every row carries its own expires_at, so the registration simply lasts as long as the
+        // wait instead (Redis parity; NATS, whose bucket MaxAge caps every entry, refuses).
+        var registrationExpiry = timeout.Value > _options.RecoveryStateExpiry ? timeout.Value : _options.RecoveryStateExpiry;
+
         // Refuse BEFORE any store round trip: EnsureCreatedAsync now validates manually managed
         // schemas over the network, and a disposed channel must fail with ObjectDisposedException,
         // not with whatever that connection attempt throws. EnsureListenerStarted below re-checks
@@ -297,7 +305,7 @@ internal abstract class DbAsyncResponseChannelBase :
             // In the reverse order a publisher could see the state, see no subscriber, and consume
             // the registration while this waiter is milliseconds from being live.
             await _store.UpsertSubscriberAsync(correlationId, registrationId, _instanceId, _options.SubscriberHeartbeatTimeout, CancellationToken.None).ConfigureAwait(false);
-            await _recoveryStateStore.SaveAsync(correlationId, recoveryState, _options.RecoveryStateExpiry).ConfigureAwait(false);
+            await _recoveryStateStore.SaveAsync(correlationId, recoveryState, registrationExpiry).ConfigureAwait(false);
 
             if (_logger.IsEnabled(LogLevel.Debug))
             {
@@ -790,6 +798,37 @@ internal abstract class DbAsyncResponseChannelBase :
         return floor < configured ? floor : configured;
     }
 
+    /// <summary>
+    /// Warns, once at construction, when a sweep cadence the provider relies on for cross-process
+    /// delivery is more than half of <c>DeliveryConfirmationTimeout</c>. A publisher in another
+    /// process waits that long for a waiter's process to claim its response and then claims it for
+    /// lost-subscriber recovery itself, so a sweep that may not come round in time routes a live
+    /// waiter's response to recovery while the waiter times out — silently, on a configuration the
+    /// validator accepts.
+    /// <para>
+    /// A warning, not a validation error: the relation is a probability, not a certainty (a
+    /// response published just before a sweep is still delivered), and a deliberately tiny
+    /// confirmation timeout that sends cross-process responses straight to recovery is a
+    /// configuration test suites — this repository's own included — use on purpose.
+    /// </para>
+    /// </summary>
+    /// <param name="knob">The options property that sets the cadence.</param>
+    /// <param name="interval">Its configured value.</param>
+    /// <param name="role">When that cadence carries delivery, for the message.</param>
+    private protected void WarnIfSweepCadenceOutrunsConfirmation(string knob, TimeSpan interval, string role)
+    {
+        if (interval.Ticks <= _options.DeliveryConfirmationTimeout.Ticks / 2)
+            return;
+
+        SafeLog.Try(
+            (Logger: _logger, Provider: _providerName, Knob: knob, Interval: interval, Timeout: _options.DeliveryConfirmationTimeout, Role: role),
+            static state => state.Logger.LogWarning(
+                "{Provider} channel: {Knob} ({Interval}) is more than half of DeliveryConfirmationTimeout ({DeliveryConfirmationTimeout}). {SweepRole} " +
+                "A response published from another process can then reach its delivery-confirmation deadline before a sweep visits it, and its " +
+                "publisher claims it for lost-subscriber recovery while its waiter is still live. Keep the interval well under the confirmation timeout.",
+                state.Provider, state.Knob, state.Interval, state.Timeout, state.Role));
+    }
+
     /// <summary>The longest reconnect backoff of a wake listener (the PostgreSQL <c>LISTEN</c> loop, the MongoDB change-stream loop).</summary>
     private protected static readonly TimeSpan WakeListenerMaxRetryDelay = TimeSpan.FromSeconds(5);
 
@@ -829,10 +868,36 @@ internal abstract class DbAsyncResponseChannelBase :
             var listenerCts = new CancellationTokenSource();
             _listenerCts = listenerCts;
             _dispatchToken = listenerCts.Token;
-            _listenTask = StartWakeListener(listenerCts.Token);
-            _dispatchTask = Task.Run(() => DispatchLoopAsync(listenerCts.Token));
-            _heartbeatTask = Task.Run(() => HeartbeatLoopAsync(listenerCts.Token));
+
+            // The loops are process-wide infrastructure serving every correlation id, but they are
+            // started lazily from INSIDE the first CreateResponseWaiter call, and Task.Run captures
+            // the caller's ExecutionContext. They used to run forever as that one request: every
+            // poll, heartbeat and LISTEN round parented to its long-finished Activity (one trace
+            // grew by thousands of database spans an hour), every loop warning carrying its log
+            // scope, and — when that first waiter was created inside an async-flow
+            // TransactionScope — the loops' connections enlisted in the caller's transaction while
+            // it was open (on SQL Server a second concurrent enlistment promotes to a distributed
+            // transaction, which .NET supports on Windows only). Started with flow suppressed, they
+            // run in the default context like any hosted loop. (SuppressFlow throws when flow is
+            // already suppressed — then there is nothing to suppress.)
+            if (ExecutionContext.IsFlowSuppressed())
+            {
+                StartLoops(listenerCts.Token);
+            }
+            else
+            {
+                using (ExecutionContext.SuppressFlow())
+                    StartLoops(listenerCts.Token);
+            }
         }
+    }
+
+    // Called under _listenerGate, synchronously, by EnsureListenerStarted alone.
+    private void StartLoops(CancellationToken cancellationToken)
+    {
+        _listenTask = StartWakeListener(cancellationToken);
+        _dispatchTask = Task.Run(() => DispatchLoopAsync(cancellationToken));
+        _heartbeatTask = Task.Run(() => HeartbeatLoopAsync(cancellationToken));
     }
 
     // The REAL clock, deliberately — here, in the dispatch loop's poll and rescan delays, in the

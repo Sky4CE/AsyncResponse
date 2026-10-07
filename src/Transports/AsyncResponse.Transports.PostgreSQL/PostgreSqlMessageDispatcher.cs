@@ -33,4 +33,9 @@ internal sealed class PostgreSqlMessageDispatcher(
         unitNoun: "row",
         telemetryName: "postgresql",
         timeProvider: timeProvider,
-        hostStopping: hostStopping);
+        hostStopping: hostStopping)
+{
+    /// <inheritdoc />
+    protected override bool IsTransientSettlementFault(Exception exception)
+        => AsyncResponse.Internal.PostgreSqlTransientFaults.IsTransient(exception);
+}

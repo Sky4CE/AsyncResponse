@@ -284,11 +284,13 @@ internal sealed class LostSubscriberCallbackDispatcher(
     /// the ingress burning its own retry ladder on an earlier sibling's failure and then escalating
     /// through <c>SetException</c>, which re-invokes the very failure callback that just gave up.
     /// Any other transient failure is wrapped for the same redelivery path. Only an entirely
-    /// deterministic set is rethrown raw — a resume that can never be wired up — and the ingress
-    /// escalates that through <c>SetException</c> on the first attempt: it excludes
-    /// <see cref="IsPermanentCallbackFailure"/> from its retry ladder, since no later attempt can
-    /// succeed. (The exception route never reaches this with a deterministic failure: its failure
-    /// callback's deterministic faults are logged and acknowledged where they happen.)
+    /// deterministic set is rethrown raw, and no bundled route produces one any more: a resume
+    /// that can never be wired up is settled on its own registration's failure callback
+    /// (<see cref="DispatchResumeFaultToFailureCallback"/>), and a failure callback's deterministic
+    /// faults are logged and acknowledged where they happen. The raw rethrow is a backstop; the
+    /// ingress would escalate it through <c>SetException</c> on the first attempt (it excludes
+    /// <see cref="IsPermanentCallbackFailure"/> from its retry ladder) — the whole-id escalation
+    /// that failed a KeepWaiting sibling when a resume fault still took this path.
     /// </summary>
     private static void ThrowUnsettled(List<ExceptionDispatchInfo> failures, string correlationId)
     {
@@ -489,17 +491,25 @@ internal sealed class LostSubscriberCallbackDispatcher(
             SafeLog.Try((Logger: _logger, Channel: channel), static state => state.Logger.LogWarning(
                 "No subscribers for channel {Channel}; invoking resume callback.", state.Channel));
 
-            var invocation = ReflectionExtensions.ResolveCallback(
-                recoveryState.ResumeCallback,
-                payload: callbackPayload,
-                exception: null,
-                correlationId: recoveryState.CorrelationId
-            );
+            try
+            {
+                var invocation = ReflectionExtensions.ResolveCallback(
+                    recoveryState.ResumeCallback,
+                    payload: callbackPayload,
+                    exception: null,
+                    correlationId: recoveryState.CorrelationId
+                );
 
-            // The outer fan-out settlement wraps transient failures for transport redelivery,
-            // including a single failed resume. Infrastructure failure must not become a
-            // business-failure callback. This catch only marks the activity before rethrowing.
-            await InvokeAsync(invocation, recoveryState.Context).ConfigureAwait(false);
+                // The outer fan-out settlement wraps transient failures for transport redelivery,
+                // including a single failed resume. Infrastructure failure must not become a
+                // business-failure callback. The outer catch only marks the activity before
+                // rethrowing.
+                await InvokeAsync(invocation, recoveryState.Context).ConfigureAwait(false);
+            }
+            catch (Exception resumeFault) when (IsPermanentCallbackFailure(resumeFault))
+            {
+                return await DispatchResumeFaultToFailureCallback(recoveryState, callbackPayload, resumeFault, channel, activity).ConfigureAwait(false);
+            }
 
             // The callback ran: a throwing logging provider must not report it as failed (the
             // registration would stay armed and the redelivery would invoke it again).
@@ -622,12 +632,60 @@ internal sealed class LostSubscriberCallbackDispatcher(
     }
 
     /// <summary>
+    /// Settles a resume that can never be wired up (<see cref="IsPermanentCallbackFailure"/>:
+    /// unauthorized, unresolvable, malformed, not registered, no longer binding) on THIS
+    /// registration: its own failure callback receives the fault (and the materialized payload),
+    /// under the same ladder and settlement as every other failure-callback invocation, and a
+    /// successful invocation consumes the registration.
+    /// <para>
+    /// Before this the fault was rethrown out of the fan-out and the broker ingress escalated it
+    /// through <c>SetException</c> for the whole correlation id. With one registration that is the
+    /// same outcome; with several it was not: the escalation reloaded EVERY registration of the id
+    /// and invoked their failure callbacks too — including a sibling whose payload had just
+    /// classified as <see cref="RecoveryAction.KeepWaiting"/>, a flow still running remotely, which
+    /// was failed and deleted, leaving its real terminal response with nothing to route against.
+    /// A direct <c>SetResponse</c> caller was handed the internal fault type as well.
+    /// </para>
+    /// </summary>
+    private async Task<LostSubscriberDispatchResult> DispatchResumeFaultToFailureCallback(
+        RecoveryState recoveryState,
+        object? callbackPayload,
+        Exception resumeFault,
+        string channel,
+        Activity? activity)
+    {
+        AsyncResponseDiagnostics.SetError(activity, resumeFault);
+
+        if (recoveryState.FailureCallback == null)
+        {
+            // Nothing to fail the flow through: the same answer the SetException escalation gave
+            // (no failure callback — warn, keep the registration, acknowledge), said at Error
+            // with the fault, because a resume that cannot be wired up is a misconfiguration.
+            SafeLog.Try((Logger: _logger, Error: resumeFault, Channel: channel), static state => state.Logger.LogError(
+                state.Error,
+                "Resume callback for channel {Channel} cannot be invoked (deterministic fault) and no failure callback is registered; the message is acknowledged and the registration stays for the watchdog.",
+                state.Channel));
+            activity?.SetTag("asyncresponse.recovery.callback_invoked", false);
+            return new LostSubscriberDispatchResult(RecoveryAction.Resume, false);
+        }
+
+        SafeLog.Try((Logger: _logger, Error: resumeFault, Channel: channel), static state => state.Logger.LogError(
+            state.Error,
+            "Resume callback for channel {Channel} cannot be invoked (deterministic fault); routing the response to the registration's failure callback.",
+            state.Channel));
+
+        var invoked = await InvokeFailureCallbackAsync(recoveryState, callbackPayload, resumeFault, channel, activity).ConfigureAwait(false);
+        activity?.SetTag("asyncresponse.recovery.callback_invoked", invoked);
+        return new LostSubscriberDispatchResult(RecoveryAction.Resume, invoked);
+    }
+
+    /// <summary>
     /// Invokes <paramref name="recoveryState"/>'s failure callback and settles the outcome — the
-    /// one policy BOTH failure routes share (a response that declined to resume, and an exception
-    /// envelope). Returns <c>true</c> once the callback ran; <c>false</c> for a deterministic
-    /// fault, which is logged and acknowledged with the registration kept for the watchdog; and
-    /// throws <see cref="RecoveryCallbackFailedException"/> when a transient fault outlasted the
-    /// in-process ladder, so the transport redelivers.
+    /// one policy every failure route shares (a response that declined to resume, an exception
+    /// envelope, a resume that can never be wired up). Returns <c>true</c> once the callback ran;
+    /// <c>false</c> for a deterministic fault, which is logged and acknowledged with the
+    /// registration kept for the watchdog; and throws <see cref="RecoveryCallbackFailedException"/>
+    /// when a transient fault outlasted the in-process ladder, so the transport redelivers.
     /// </summary>
     private async Task<bool> InvokeFailureCallbackAsync(
         RecoveryState recoveryState,
@@ -724,8 +782,9 @@ internal sealed class LostSubscriberCallbackDispatcher(
     /// the callback BODY is never classified here, whatever its type: a handler that throws
     /// <see cref="InvalidOperationException"/> for a transient reason is ordinary application code
     /// and keeps the full retry ladder, which is why the marker type exists rather than a plain
-    /// <c>is InvalidOperationException</c> test. The broker ingress consults the same predicate to
-    /// escalate such a fault without its own retry ladder.
+    /// <c>is InvalidOperationException</c> test. A resume failing this way is routed to its own
+    /// registration's failure callback; the broker ingress consults the same predicate to skip its
+    /// retry ladder for such a fault should one still reach it.
     /// </para>
     /// </summary>
     internal static bool IsPermanentCallbackFailure(Exception exception)

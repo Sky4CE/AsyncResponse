@@ -5,8 +5,8 @@ name: Auto-retry failed jobs
 # jobs" in the UI, pressed automatically — but ONLY when every failed job is provably an
 # infrastructure flake. Two gates, applied from the FIRST re-run on (an unconditional first re-run
 # gave an intermittently failing product bug — a lease race, a timing defect, a watchdog — a free
-# second chance to land green on main, and publish.yml relies on main's check as the reviewed
-# gate):
+# second chance to land green on main, and publish.yml publishes a commit only once its CI run on
+# main concluded success, re-runs included — main itself takes direct pushes and gates nothing):
 #   1. every failed job's log must match a known infrastructure signature, and
 #   2. no failed job's log may contain an executed-test assertion failure or a build error — a
 #      fixture-boot flake alongside a genuine assertion failure in the same job is a real

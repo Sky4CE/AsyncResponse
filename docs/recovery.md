@@ -208,9 +208,14 @@ endpoint) sees the same exception and should answer the remote system with a ret
 unauthorized or unresolvable target, a malformed persisted descriptor (null parameter list, null
 entry, null or blank name), a method that no longer binds, or a persisted argument that no longer
 converts to its parameter type (e.g. a payload that could not be materialized as the registered
-type). The kept registration is what the watchdog surfaces. Through the broker ingress, a
-deterministic *resume* fault escalates to the failure callback at once, skipping the ingress's retry
-ladder.
+type). The kept registration is what the watchdog surfaces. A deterministic *resume* fault is
+settled on that registration alone: its own failure callback runs at once (no retry ladder) and
+receives the fault and the materialized payload, and a successful invocation consumes the
+registration. Other registrations of the same correlation id are untouched — a sibling whose
+payload classified as `KeepWaiting` stays armed. (Before this the fault was rethrown and the broker
+ingress escalated it through `SetException` for the whole correlation id, which also failed and
+deleted every sibling registration.) With no failure callback the fault is logged at Error and the
+registration kept.
 
 ### When the stored registrations cannot be read
 
@@ -277,7 +282,8 @@ waiter — flows that are probably stuck. By default it first scans 5 minutes af
 one store, set `Watchdog.Enabled = false` in all but one so scans and warnings aren't duplicated.
 
 `AddAsyncResponseRecoveryCheck()` surfaces the cached findings on your health endpoint, with stats
-and the offending correlation ids:
+and the offending correlation ids (at most ten; each id and payload type name is store-written
+text, so it is reported bounded and with control characters escaped, as the watchdog logs it):
 
 ```csharp
 builder.Services.AddHealthChecks()
@@ -351,7 +357,7 @@ fails fails the scan. `Watchdog.ProbeConcurrency` governs the liveness-probe pha
 Recovery state lives in the durable channel's store and survives a redeploy:
 
 - **Redis** — keys under `KeyPrefix`, one per correlation id holding its registrations. Each
-  registration carries its own `RecoveryStateExpiry` (7 days default) stamped at save time, and the
+  registration carries its own `RecoveryStateExpiry` (7 days default; the wait's timeout when that is longer) stamped at save time, and the
   key's TTL tracks the longest-remaining one, so a fresh registration can neither keep a dead sibling
   recoverable nor truncate a longer-lived one. The TTL is rounded **up** to whole milliseconds
   (Redis's expiry precision). Updates are optimistic (transaction-conditioned compare-and-set with
@@ -371,6 +377,16 @@ Recovery state lives in the durable channel's store and survives a redeploy:
     waiter can take longer than the grace to follow. The clock starts at the multiplexer's
     `ConnectionFailed` and resets when the endpoint is seen connected again. An endpoint this
     process never saw connected gets no grace.
+  - A primary-flagged endpoint that came back from a disconnection this process saw keeps its own
+    zero **unknown for 90 seconds** after the restore. The outage that dropped this process's
+    connection (a restart, a patch, a failover behind one DNS name) dropped every client's,
+    and each re-subscribes on its own reconnect schedule (StackExchange.Redis backs off up to 10 s
+    between attempts by default; a client whose socket died silently notices only at its next
+    keep-alive). The process that reconnects first would otherwise publish into that gap, read
+    `PUBLISH 0` and `NUMSUB 0`, and consume a live waiter's registration: the recovery callback
+    ran and the waiter, back a moment later, timed out as well. The first connection starts no
+    grace. A waiter-only blip (only the waiter's connection dropped) is invisible to the publisher
+    and not covered.
   - Past the grace, outside a cluster one answering primary is the whole answer. In a cluster, with
     a primary-flagged endpoint disconnected, the `CLUSTER NODES` table is read and disconnected
     endpoints are excused only when every slot owner it lists answered. Without the table, an
@@ -405,6 +421,17 @@ Recovery state lives in the durable channel's store and survives a redeploy:
   `DeliveryConfirmationTimeout` counts as delivered and never reaches recovery — including one sent
   to a waiter whose host died without closing its connection, until the server drops that stale
   subscription at its ping timeout (see [configuration.md](configuration.md#channel-options)).
+  For **90 seconds after this process's connection reconnects** (never after the first connect),
+  "no responders" is unprobeable too: the outage that dropped this connection usually dropped the
+  waiters' connections as well, and NATS.Net re-subscribes only once its own reconnect lands, so a
+  publisher back first would otherwise consume a live waiter's registration. A lost-subscriber
+  publish inside the window throws and the response survives through the transport's redelivery
+  (the budget note above applies). One server of a cluster restarting while this process stays
+  connected elsewhere gives no client-side signal, so that case is not covered. A waiter timeout
+  longer than `RecoveryStateExpiry` outlives its registration (the bucket's `MaxAge` removes it
+  first), so the tail of such a wait has no recovery; the wait still runs, and the channel logs a
+  warning the first time it sees one. Raise `RecoveryStateExpiry` (recreating the bucket) to cover
+  long waits, including durable-flow steps whose `DefaultStepTimeout` is longer.
 - **PostgreSQL** — `RecoveryStateTable` (default `asyncresponse_recovery_state`), one row per waiter
   registration; rows expire by `expires_at` and are pruned opportunistically during channel
   operations.
@@ -551,9 +578,10 @@ response but cannot publish its resume job: the registration survives, and redel
 missing wake-up without repeating the completed remote step.
 
 Classification examines every failed sibling: a transient failure preserves redelivery even when a
-deterministic failure came first. Deterministic binding/authorization failures are not wrapped —
-after partial success they are logged and the registration is retained for the watchdog; if every
-callback fails deterministically, the original exception follows the ingress's exception routing. A
+deterministic failure came first. Deterministic binding/authorization failures are not wrapped: a
+resume target that cannot be wired up is routed to its own registration's failure callback (see
+above), and a failure callback that cannot be wired up is logged with its registration retained for
+the watchdog — either way the message is acknowledged as far as that registration is concerned. A
 failure callback that exhausted its own retry ladder keeps its `RecoveryCallbackFailedException` and
 attempt count.
 

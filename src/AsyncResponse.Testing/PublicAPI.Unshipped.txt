@@ -91,3 +91,5 @@ static readonly AsyncResponse.Testing.VirtualTimeProvider.DefaultStartTime -> Sy
 ~override AsyncResponse.Testing.FlowProbeEvent.ToString() -> string
 AsyncResponse.Testing.AsyncResponseTestHarnessOptions.AbandonLingeringExecutionsOnRestart.get -> bool
 AsyncResponse.Testing.AsyncResponseTestHarnessOptions.AbandonLingeringExecutionsOnRestart.set -> void
+AsyncResponse.Testing.AsyncResponseTestHarnessOptions.MaxStateBytes.get -> long?
+AsyncResponse.Testing.AsyncResponseTestHarnessOptions.MaxStateBytes.set -> void

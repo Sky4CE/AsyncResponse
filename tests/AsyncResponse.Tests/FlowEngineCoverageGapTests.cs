@@ -101,7 +101,7 @@ public sealed class FlowEngineCoverageGapTests
         await using var lease = new FlowExecutionLease(store.Object, "gap-rejected", "lease", LongLease, NullLogger.Instance, new VirtualTimeProvider());
         var cause = new InvalidOperationException("recorded failure");
 
-        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => lease.SaveAsync(new FlowState { FlowId = "gap-rejected", Revision = 1 }, TimeSpan.FromMinutes(1), cause: cause));
+        var ex = await Assert.ThrowsAsync<DurableFlowLeaseLostException>(() => lease.SaveAsync(new FlowState { FlowId = "gap-rejected", Revision = 1 }, TimeSpan.FromMinutes(1), cause: cause));
 
         Assert.Contains("no longer held", ex.Message, StringComparison.Ordinal);
         Assert.Same(cause, ex.InnerException);

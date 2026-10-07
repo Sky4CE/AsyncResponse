@@ -61,8 +61,15 @@ public sealed class MySqlDurableFlowOptions : DurableFlowOptions, IFlowStateSize
 
     /// <summary>
     /// Maximum serialized flow-state size in bytes accepted by writes; oversized ledgers fail fast
-    /// with an actionable error instead of an opaque provider error. Default: <c>null</c>
-    /// (unlimited — <c>longtext</c> holds up to 4 GB), settable as an operator budget.
+    /// with <see cref="FlowStateTooLargeException"/> instead of an opaque provider error.
+    /// Default: <c>null</c> — no operator budget, but never unbounded: the real ceiling of a
+    /// MySQL write is not the 4 GB a <c>longtext</c> can hold but the server's
+    /// <c>max_allowed_packet</c> (4 MB on MySQL 5.7, 16 MB on MariaDB, 64 MB on MySQL 8.0), which
+    /// the whole INSERT/UPDATE statement must fit — with the ledger's quotes and backslashes
+    /// escaped. The store reads <c>@@max_allowed_packet</c> once (at host start, or when it first
+    /// verifies its table) and from then on also refuses a ledger whose ESCAPED size exceeds it,
+    /// less 64 KiB for the rest of the statement. Without that check such a write failed with a
+    /// packet or connection error every redelivery, naming neither the ledger nor its size.
     /// </summary>
     public long? MaxStateBytes { get; set; }
 
@@ -70,15 +77,54 @@ public sealed class MySqlDurableFlowOptions : DurableFlowOptions, IFlowStateSize
     public void Validate()
     {
         DurableFlowStoreShared.ValidateConnectionString(ConnectionString, nameof(MySqlDurableFlowOptions));
+        RejectUseAffectedRows(ConnectionString!);
         DurableFlowStoreShared.ValidateIdentifier(TableName, $"{nameof(MySqlDurableFlowOptions)}.{nameof(TableName)}", "MySQL", identifierCap: 64);
         DurableFlowStoreShared.ValidateMaxStateBytes(MaxStateBytes, nameof(MySqlDurableFlowOptions));
         DurableFlowStoreShared.ValidateLedgerWarningBelowCap(this, MaxStateBytes, nameof(MySqlDurableFlowOptions));
         DurableFlowStoreShared.ValidatePruneBudget(PruneBudget, nameof(MySqlDurableFlowOptions));
     }
+
+    /// <summary>
+    /// Row-count semantics guard: lease renewal and update fencing treat ExecuteNonQuery's result
+    /// as ROWS MATCHED, MySqlConnector's default (UseAffectedRows=false). With UseAffectedRows=true
+    /// the result becomes rows CHANGED, so an UPDATE that rewrites identical values (a renewal
+    /// landing in the same microsecond as the stored expiry, a stalled clock) reports 0 and a
+    /// healthy execution aborts as "lease lost" — sporadic and unattributable from logs.
+    /// <para>
+    /// Decided from the connection string alone, so it runs here — in the constructor, which the
+    /// startup validator calls at host start — and not on the store's first operation, where it
+    /// used to: the flow starter publishes first and tolerates a store fault after the publish,
+    /// so every start was accepted, returned its id, and dead-lettered in the workers.
+    /// </para>
+    /// </summary>
+    private static void RejectUseAffectedRows(string connectionString)
+    {
+        MySqlConnectionStringBuilder builder;
+        try
+        {
+            builder = new MySqlConnectionStringBuilder(connectionString);
+        }
+        catch (ArgumentException ex)
+        {
+            // MySqlConnector names the offending keyword; the string itself (credentials and
+            // all) is never echoed.
+            throw new InvalidOperationException(
+                $"{nameof(MySqlDurableFlowOptions)}.{nameof(ConnectionString)} is not a valid MySqlConnector connection string: {ex.Message}", ex);
+        }
+
+        if (builder.UseAffectedRows)
+        {
+            throw new InvalidOperationException(
+                $"{nameof(MySqlDurableFlowOptions)}.{nameof(ConnectionString)} sets UseAffectedRows=true, " +
+                "which switches ExecuteNonQuery from rows-MATCHED to rows-CHANGED semantics and silently breaks this store's " +
+                "lease renewal and update fencing. Remove UseAffectedRows from the connection string; the MySqlConnector " +
+                "default (false) is required.");
+        }
+    }
 }
 
 /// <summary>MySQL/MariaDB implementation of <see cref="IFlowStateStore"/>.</summary>
-public sealed class MySqlFlowStateStore : IFlowStateStore
+public sealed class MySqlFlowStateStore : IFlowStateStore, IFlowStateStoreStartupProbe
 {
     private readonly ILogger<MySqlFlowStateStore>? _logger;
 
@@ -95,6 +141,94 @@ public sealed class MySqlFlowStateStore : IFlowStateStore
     private readonly SemaphoreSlim _ensureGate = new(1, 1);
     private long _lastPruneTicks;
     private volatile bool _created;
+
+    /// <summary>
+    /// The escaped ledger bytes a write can carry under the server's <c>max_allowed_packet</c>
+    /// (<see cref="PacketLedgerBudget"/>), learned at host start or on the first schema
+    /// verification; 0 until then, or when the server would not say. Read and written through
+    /// <see cref="Volatile"/>.
+    /// </summary>
+    private long _packetLedgerBudget;
+
+    /// <summary>
+    /// Bytes of every statement kept free for everything but the ledger: the statement text, the
+    /// flow id (up to 400 characters, four UTF-8 bytes each, escaped), the lease id and the
+    /// protocol framing. A few KiB in practice; 64 KiB leaves room for all of it.
+    /// </summary>
+    internal const long PacketStatementHeadroomBytes = 64 * 1024;
+
+    /// <summary>
+    /// The bytes one INSERT or UPDATE can spend on the ledger under <paramref name="maxAllowedPacket"/>,
+    /// measured the way it travels (<see cref="EscapedLedgerBytes"/>). 0 when the packet leaves no
+    /// room at all (no check is applied then; the server's own error stands).
+    /// </summary>
+    internal static long PacketLedgerBudget(long maxAllowedPacket)
+        => maxAllowedPacket > PacketStatementHeadroomBytes ? maxAllowedPacket - PacketStatementHeadroomBytes : 0;
+
+    /// <summary>
+    /// The size <paramref name="stateJson"/> occupies in the statement: MySqlConnector sends an
+    /// unprepared command's parameters inline, escaped, so every quote and backslash is doubled
+    /// (a JSON ledger is full of backslashes — a step result is JSON inside a JSON string). The
+    /// exact count, not a worst-case bound: halving the budget instead refused ledgers that fit,
+    /// including in-flight runs that had been checkpointing fine under the same server.
+    /// </summary>
+    internal static long EscapedLedgerBytes(string stateJson)
+    {
+        long escapes = 0;
+        foreach (var c in stateJson)
+        {
+            if (c is '\'' or '\\')
+                escapes++;
+        }
+
+        return System.Text.Encoding.UTF8.GetByteCount(stateJson) + escapes;
+    }
+
+    /// <summary>
+    /// Learns <see cref="PacketLedgerBudget"/> while the host starts, so the starter's pre-publish
+    /// check (<see cref="ValidateCreate"/>) already applies it to the first start in the process —
+    /// learned only by the first schema verification, an oversized first start published and then
+    /// failed in the worker. Refuses nothing: a server that is briefly unreachable, or will not
+    /// say, leaves the budget to the first schema verification (see
+    /// <see cref="IFlowStateStoreStartupProbe"/>), bounded so it cannot hold the start.
+    /// </summary>
+    async Task IFlowStateStoreStartupProbe.VerifyConfigurationAsync(CancellationToken cancellationToken)
+    {
+        if (Volatile.Read(ref _packetLedgerBudget) != 0)
+            return;
+
+        cancellationToken.ThrowIfCancellationRequested();
+        using var bounded = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        bounded.CancelAfter(StartupProbeTimeout);
+        try
+        {
+            await using var connection = await OpenConnectionAsync(bounded.Token).ConfigureAwait(false);
+            var budget = await ReadPacketLedgerBudgetAsync(connection, bounded.Token).ConfigureAwait(false);
+            if (budget > 0)
+                Interlocked.CompareExchange(ref _packetLedgerBudget, budget, 0);
+        }
+        catch (Exception ex) when (!cancellationToken.IsCancellationRequested)
+        {
+            SafeLog.Try((Logger: _logger, Error: ex), static state => state.Logger?.LogDebug(
+                state.Error,
+                "The MySQL durable-flow store could not read @@max_allowed_packet while the host started; it is read when the store first verifies its table."));
+        }
+    }
+
+    /// <summary>How long the host-start packet read may take before it is left to the first operation.</summary>
+    internal static readonly TimeSpan StartupProbeTimeout = TimeSpan.FromSeconds(5);
+
+    /// <summary>Refuses a ledger that cannot fit the server's packet, by name and size, before any I/O.</summary>
+    private void EnsureFitsPacket(string flowId, string stateJson)
+    {
+        var budget = Volatile.Read(ref _packetLedgerBudget);
+        if (budget <= 0)
+            return;
+
+        var size = EscapedLedgerBytes(stateJson);
+        if (size > budget)
+            throw new FlowStateTooLargeException(flowId, size, budget, "MySQL");
+    }
 
     public MySqlFlowStateStore(IOptions<MySqlDurableFlowOptions> options, ILogger<MySqlFlowStateStore>? logger = null)
     {
@@ -124,15 +258,18 @@ public sealed class MySqlFlowStateStore : IFlowStateStore
     public void ValidateCreate(string flowId, FlowState state, TimeSpan ttl)
     {
         DurableFlowStoreShared.ValidateCreate(flowId, state, ttl);
-        if (_options.MaxStateBytes is not null)
-            _ = DurableFlowStoreShared.PreflightBounded(flowId, state, _options.MaxStateBytes, "MySQL");
+        if (_options.MaxStateBytes is not null || Volatile.Read(ref _packetLedgerBudget) > 0)
+            EnsureFitsPacket(flowId, DurableFlowStoreShared.PreflightBounded(flowId, state, _options.MaxStateBytes, "MySQL"));
     }
 
     public async Task<bool> TryCreateAsync(string flowId, FlowState state, TimeSpan ttl, CancellationToken cancellationToken = default)
     {
         DurableFlowStoreShared.ValidateCreate(flowId, state, ttl);
-        var stateJson = DurableFlowStoreShared.SerializeBounded(flowId, state, _options.MaxStateBytes, "MySQL");
+        // Schema first: the first verification is what learns the packet-derived cap the
+        // serialization below enforces (see MaxStateBytes).
         await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
+        var stateJson = DurableFlowStoreShared.SerializeBounded(flowId, state, _options.MaxStateBytes, "MySQL");
+        EnsureFitsPacket(flowId, stateJson);
         if (DurableFlowStoreShared.ShouldPrune(ref _lastPruneTicks, _options.PruneInterval))
             await DurableFlowStoreShared.PruneQuietlyAsync(() => PruneExpiredAsync(cancellationToken), _options.PruneBudget, "MySQL", _logger, cancellationToken).ConfigureAwait(false);
 
@@ -266,8 +403,9 @@ public sealed class MySqlFlowStateStore : IFlowStateStore
         CancellationToken cancellationToken = default)
     {
         DurableFlowStoreShared.ValidateUpdate(flowId, state, expectedRevision, ttl);
-        var stateJson = DurableFlowStoreShared.SerializeBounded(flowId, state, _options.MaxStateBytes, "MySQL");
         await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
+        var stateJson = DurableFlowStoreShared.SerializeBounded(flowId, state, _options.MaxStateBytes, "MySQL");
+        EnsureFitsPacket(flowId, stateJson);
 
         await using var connection = await OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         await using var command = connection.CreateCommand();
@@ -374,24 +512,12 @@ public sealed class MySqlFlowStateStore : IFlowStateStore
             if (_created)
                 return;
 
-            // Row-count semantics guard: lease renewal and update fencing treat ExecuteNonQuery's
-            // result as ROWS MATCHED, MySqlConnector's default (UseAffectedRows=false). With
-            // UseAffectedRows=true the result becomes rows CHANGED, so an UPDATE that rewrites
-            // identical values (a renewal landing in the same microsecond as the stored expiry, a
-            // stalled clock) reports 0 and a healthy execution aborts as "lease lost" — sporadic
-            // and unattributable from logs. Every other silently-breaking property (charset,
-            // collation, column shape, keys) fails startup in VerifyFlowTableAsync below; the
-            // connection string gets the same treatment.
-            if (new MySqlConnectionStringBuilder(_options.ConnectionString!).UseAffectedRows)
-            {
-                throw new InvalidOperationException(
-                    $"{nameof(MySqlDurableFlowOptions)}.{nameof(MySqlDurableFlowOptions.ConnectionString)} sets UseAffectedRows=true, " +
-                    "which switches ExecuteNonQuery from rows-MATCHED to rows-CHANGED semantics and silently breaks this store's " +
-                    "lease renewal and update fencing. Remove UseAffectedRows from the connection string; the MySqlConnector " +
-                    "default (false) is required.");
-            }
-
+            // (UseAffectedRows=true, the connection-string half of these checks, is refused by
+            // MySqlDurableFlowOptions.Validate in the constructor — at host start.)
             await using var connection = await OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
+            if (Volatile.Read(ref _packetLedgerBudget) == 0)
+                Volatile.Write(ref _packetLedgerBudget, await ReadPacketLedgerBudgetAsync(connection, cancellationToken).ConfigureAwait(false));
+
             if (_options.AutoCreateSchema)
             {
                 await using var command = connection.CreateCommand();
@@ -420,6 +546,30 @@ public sealed class MySqlFlowStateStore : IFlowStateStore
         finally
         {
             _ensureGate.Release();
+        }
+    }
+
+    /// <summary>
+    /// Reads <c>@@max_allowed_packet</c> (the session value, which is the global value at connect
+    /// time) and turns it into <see cref="PacketLedgerBudget"/>. A server or proxy that will not
+    /// answer leaves the store uncapped — exactly as it was before the cap existed — rather than
+    /// failing every operation over a guard.
+    /// </summary>
+    private async Task<long> ReadPacketLedgerBudgetAsync(MySqlConnection connection, CancellationToken cancellationToken)
+    {
+        try
+        {
+            await using var command = connection.CreateCommand();
+            command.CommandText = "SELECT @@max_allowed_packet;";
+            var value = await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false);
+            return value is null or DBNull ? 0 : PacketLedgerBudget(Convert.ToInt64(value, System.Globalization.CultureInfo.InvariantCulture));
+        }
+        catch (MySqlException ex)
+        {
+            SafeLog.Try((Logger: _logger, Error: ex), static state => state.Logger?.LogWarning(
+                state.Error,
+                "The MySQL durable-flow store could not read @@max_allowed_packet; ledgers are held only to MaxStateBytes, and one above the server's packet limit fails with the server's own error."));
+            return 0;
         }
     }
 
@@ -734,8 +884,8 @@ public sealed class MySqlFlowStateStore : IFlowStateStore
 
     // Row-count semantics: this store's lease renewal (and update fencing) treats
     // ExecuteNonQuery's result as ROWS MATCHED, which is MySqlConnector's default
-    // (UseAffectedRows=false). EnsureCreatedAsync rejects a connection string that sets
-    // UseAffectedRows=true before any of those UPDATEs can run.
+    // (UseAffectedRows=false). MySqlDurableFlowOptions.Validate (the constructor, so host start)
+    // rejects a connection string that sets UseAffectedRows=true before any of those UPDATEs can run.
     private Task<MySqlConnection> OpenConnectionAsync(CancellationToken cancellationToken)
         => DurableFlowStoreShared.OpenConnectionAsync<MySqlConnection>(_options.ConnectionString, cancellationToken);
 

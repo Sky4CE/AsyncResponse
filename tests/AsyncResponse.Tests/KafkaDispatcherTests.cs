@@ -1219,19 +1219,24 @@ public class KafkaDispatcherTests
                 MaxDeliveryAttempts = 0,
                 PollTimeout = TimeSpan.FromMilliseconds(10),
                 DetachHandlerAfter = TimeSpan.FromMilliseconds(50),
-                MaxPollInterval = TimeSpan.FromMilliseconds(400)
+                // 4 s, so the 1 s bound cannot lapse before the first produce even starts on a
+                // loaded 2-core runner (the cancellation would then surface instead of the
+                // unconfirmed burial); the 5 s wait below still proves the produce was bounded.
+                MaxPollInterval = TimeSpan.FromSeconds(4)
             },
             NullLogger.Instance,
             Topic,
             Group,
             KafkaSubscriberRole.Worker);
 
-        await Assert.ThrowsAsync<KafkaDeadLetterPublishFailedException>(() => dispatcher.DiscardUnprocessableAsync(
+        var failed = await Assert.ThrowsAsync<KafkaDeadLetterPublishFailedException>(() => dispatcher.DiscardUnprocessableAsync(
             KafkaTestData.Message(Topic, offset: 4, payload: ""),
             new InvalidDataException("no payload"),
             CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(5)));
 
-        Assert.True(producer.SawCancellation);
+        // The bound ends the WAIT, not the produce (round 65): librdkafka keeps an accepted record
+        // queued until message.timeout.ms, so the burial is reported unconfirmed, not failed.
+        Assert.IsType<KafkaDeadLetterUnconfirmedException>(failed.InnerException);
     }
 
     [Fact]
@@ -1265,8 +1270,6 @@ public class KafkaDispatcherTests
     /// <summary>A producer whose publish never completes until its token is cancelled.</summary>
     private sealed class HangingKafkaProducerClient : IKafkaProducerClient
     {
-        public bool SawCancellation { get; private set; }
-
         public async Task<KafkaPublishResult> PublishAsync(
             string topic,
             string? key,
@@ -1274,16 +1277,7 @@ public class KafkaDispatcherTests
             IReadOnlyList<KafkaTransportHeader> headers,
             CancellationToken cancellationToken)
         {
-            try
-            {
-                await Task.Delay(Timeout.Infinite, cancellationToken);
-            }
-            catch (OperationCanceledException)
-            {
-                SawCancellation = true;
-                throw;
-            }
-
+            await Task.Delay(Timeout.Infinite, cancellationToken);
             throw new InvalidOperationException("unreachable");
         }
 
@@ -2206,7 +2200,9 @@ public class KafkaDispatcherTests
         // consumer actually ran with and got it evicted: the storm the budget exists to prevent.
         var producer = new HangingKafkaProducerClient();
         var options = KafkaTestData.NewOptions();
-        options.ConfigureConsumer = config => config.MaxPollIntervalMs = 400;
+        // 4 s (bound 1 s, against the option's 75 s): wide enough that the bound cannot lapse
+        // before the first produce starts on a loaded runner, narrow enough for the 5 s wait.
+        options.ConfigureConsumer = config => config.MaxPollIntervalMs = 4000;
         await using var dispatcher = KafkaMessageDispatcher.Create(
             (_, _) => Task.CompletedTask,
             new FakeKafkaConsumerClient(),
@@ -2223,12 +2219,14 @@ public class KafkaDispatcherTests
             Group,
             KafkaSubscriberRole.Worker);
 
-        await Assert.ThrowsAsync<KafkaDeadLetterPublishFailedException>(() => dispatcher.DiscardUnprocessableAsync(
+        var failed = await Assert.ThrowsAsync<KafkaDeadLetterPublishFailedException>(() => dispatcher.DiscardUnprocessableAsync(
             KafkaTestData.Message(Topic, offset: 4, payload: ""),
             new InvalidDataException("no payload"),
             CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(5)));
 
-        Assert.True(producer.SawCancellation);
+        // The bound ends the WAIT, not the produce (round 65): librdkafka keeps an accepted record
+        // queued until message.timeout.ms, so the burial is reported unconfirmed, not failed.
+        Assert.IsType<KafkaDeadLetterUnconfirmedException>(failed.InnerException);
     }
 
     [Fact]

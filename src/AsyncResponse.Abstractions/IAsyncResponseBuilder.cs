@@ -27,9 +27,12 @@ public interface IAsyncResponseBuilder
     IAsyncResponseAttachedBuilder<T> For<T>(string correlationId) where T : IAsyncResponsePayload;
 
     /// <summary>
-    /// Begins configuring an async-response waiter with a freshly generated correlation id,
-    /// created through <see cref="AsyncResponseContext.CreateCorrelationId"/> so it is also
-    /// available ambiently to the outgoing request. Combine with
+    /// Begins configuring an async-response waiter with a freshly generated correlation id
+    /// (<see cref="AsyncResponseContext.GenerateCorrelationId"/>). The id is ambient
+    /// (<see cref="AsyncResponseContext.CorrelationId"/>) inside the trigger only, where the
+    /// outgoing request is built; the caller's own ambient id is left untouched, before and after
+    /// the wait, so a worker handler that awaits a nested request still enqueues its follow-up
+    /// work under its own job's correlation id. Combine with
     /// <see cref="IAsyncResponseTriggeredBuilder{T}.WaitAsync(Func{AsyncResponseRequestContext, Task})"/>
     /// so simple flows never handle the correlation id themselves:
     /// <c>builder.For&lt;T&gt;().WaitAsync(context =&gt; SendRequest(context.CorrelationId))</c>.

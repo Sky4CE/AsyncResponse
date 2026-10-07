@@ -112,7 +112,7 @@ internal sealed class PostgreSqlChannelSql
             // and latched the retry-after window — fails here instead of starting the next one.
             _ddl.ThrowIfBackingOff();
 
-            await using var connection = await _dataSource.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
+            await using var connection = await OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
 
             // The transport's round-43 hardening (PostgreSqlDdlGuard), applied here. Every DDL
             // transaction bounds its lock waits — the advisory key's first — with a lock_timeout:
@@ -353,7 +353,7 @@ internal sealed class PostgreSqlChannelSql
             if (_created)
                 return;
 
-            await using var connection = await _dataSource.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
+            await using var connection = await OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
             bool hasColumn;
             bool hasSequence;
             // The probe's command and reader are scoped so they are disposed before the relation
@@ -408,7 +408,7 @@ internal sealed class PostgreSqlChannelSql
     public async Task SaveRecoveryStateAsync(string correlationId, RecoveryState state, TimeSpan ttl, CancellationToken cancellationToken)
     {
         await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
-        await using var connection = await _dataSource.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
+        await using var connection = await OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         await using var command = connection.CreateCommand();
         command.CommandText =
             $"""
@@ -432,7 +432,7 @@ internal sealed class PostgreSqlChannelSql
         if (ShouldPrune(ref _lastRecoveryPruneTicks))
             await PruneExpiredRecoveryAsync(correlationId, cancellationToken).ConfigureAwait(false);
 
-        await using var connection = await _dataSource.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
+        await using var connection = await OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         await using var command = connection.CreateCommand();
         command.CommandText =
             $"""
@@ -453,7 +453,7 @@ internal sealed class PostgreSqlChannelSql
     public async Task<bool> DeleteRecoveryStateAsync(string correlationId, Guid registrationId, CancellationToken cancellationToken)
     {
         await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
-        await using var connection = await _dataSource.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
+        await using var connection = await OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         await using var command = connection.CreateCommand();
         command.CommandText = $"DELETE FROM {RecoveryTable} WHERE correlation_id = @correlation_id AND registration_id = @registration_id;";
         command.Parameters.AddWithValue("correlation_id", correlationId);
@@ -466,7 +466,7 @@ internal sealed class PostgreSqlChannelSql
         await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
         await PruneExpiredRecoveryAsync(null, cancellationToken).ConfigureAwait(false);
 
-        await using var connection = await _dataSource.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
+        await using var connection = await OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         await using var command = connection.CreateCommand();
         command.CommandText =
             $"""
@@ -504,7 +504,7 @@ internal sealed class PostgreSqlChannelSql
         if (ShouldPrune(ref _lastMessagePruneTicks))
             await PruneExpiredMessagesAsync(cancellationToken).ConfigureAwait(false);
 
-        await using var connection = await _dataSource.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
+        await using var connection = await OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         await using var command = connection.CreateCommand();
         // Single statement: the final SELECT both fires the NOTIFY exactly once and returns the
         // fresh row's server-stamped created_at via RETURNING — NULL when the idempotent insert
@@ -573,7 +573,7 @@ internal sealed class PostgreSqlChannelSql
         CancellationToken cancellationToken)
     {
         await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
-        await using var connection = await _dataSource.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
+        await using var connection = await OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         await using var command = connection.CreateCommand();
         // The envelope travels only for rows nobody has acknowledged yet. Acknowledged rows are
         // the consumed history the sweep re-reads on every tick (they stay in the result set so a
@@ -619,7 +619,7 @@ internal sealed class PostgreSqlChannelSql
             return [];
 
         await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
-        await using var connection = await _dataSource.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
+        await using var connection = await OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         await using var command = connection.CreateCommand();
         command.CommandText =
             $"""
@@ -660,7 +660,7 @@ internal sealed class PostgreSqlChannelSql
     public async Task<bool> TryClaimForDeliveryAsync(Guid messageId, CancellationToken cancellationToken)
     {
         await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
-        await using var connection = await _dataSource.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
+        await using var connection = await OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         await using var command = connection.CreateCommand();
         // The sequence is stamped ONLY when this same update transitions acked_at from null (SET
         // expressions read the pre-update row): a row acked by a pre-sequence build must stay
@@ -690,7 +690,7 @@ internal sealed class PostgreSqlChannelSql
     public async Task<bool> TryClaimForRecoveryAsync(Guid messageId, CancellationToken cancellationToken)
     {
         await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
-        await using var connection = await _dataSource.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
+        await using var connection = await OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         await using var command = connection.CreateCommand();
         command.CommandText =
             $"""
@@ -712,7 +712,7 @@ internal sealed class PostgreSqlChannelSql
     public async Task<(DateTimeOffset ServerTimeUtc, long StartSeq)> GetSubscriptionStartAsync(CancellationToken cancellationToken)
     {
         await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
-        await using var connection = await _dataSource.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
+        await using var connection = await OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         await using var command = connection.CreateCommand();
         command.CommandText = $"SELECT now(), nextval('{AckSequence}');";
         await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
@@ -724,7 +724,7 @@ internal sealed class PostgreSqlChannelSql
     public async Task<DateTimeOffset> GetServerTimeUtcAsync(CancellationToken cancellationToken)
     {
         await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
-        await using var connection = await _dataSource.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
+        await using var connection = await OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         await using var command = connection.CreateCommand();
         command.CommandText = "SELECT now();";
         var result = await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false);
@@ -739,7 +739,7 @@ internal sealed class PostgreSqlChannelSql
     public async Task<bool> IsMessageAcknowledgedAsync(Guid messageId, CancellationToken cancellationToken)
     {
         await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
-        await using var connection = await _dataSource.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
+        await using var connection = await OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         await using var command = connection.CreateCommand();
         command.CommandText = $"SELECT acked_at IS NOT NULL FROM {MessageTable} WHERE id = @id AND expires_at > now();";
         command.Parameters.AddWithValue("id", messageId);
@@ -753,7 +753,7 @@ internal sealed class PostgreSqlChannelSql
         if (ShouldPrune(ref _lastSubscriberPruneTicks))
             await PruneExpiredSubscribersAsync(cancellationToken).ConfigureAwait(false);
 
-        await using var connection = await _dataSource.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
+        await using var connection = await OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         await using var command = connection.CreateCommand();
         command.CommandText =
             $"""
@@ -780,7 +780,7 @@ internal sealed class PostgreSqlChannelSql
             return;
 
         await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
-        await using var connection = await _dataSource.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
+        await using var connection = await OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         await using var command = connection.CreateCommand();
 
         // UPSERT rather than a bare UPDATE: the caller only heartbeats registrations that are live
@@ -815,7 +815,7 @@ internal sealed class PostgreSqlChannelSql
     public async Task DeleteSubscriberAsync(string correlationId, Guid registrationId, CancellationToken cancellationToken)
     {
         await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
-        await using var connection = await _dataSource.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
+        await using var connection = await OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         await using var command = connection.CreateCommand();
         command.CommandText = $"DELETE FROM {SubscriberTable} WHERE correlation_id = @correlation_id AND registration_id = @registration_id;";
         command.Parameters.AddWithValue("correlation_id", correlationId);
@@ -829,7 +829,7 @@ internal sealed class PostgreSqlChannelSql
         if (ShouldPrune(ref _lastSubscriberPruneTicks))
             await PruneExpiredSubscribersAsync(cancellationToken).ConfigureAwait(false);
 
-        await using var connection = await _dataSource.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
+        await using var connection = await OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         await using var command = connection.CreateCommand();
         command.CommandText =
             $"""
@@ -851,7 +851,7 @@ internal sealed class PostgreSqlChannelSql
     {
         await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
         // Not `await using`: the release below owns disposal, and may finish it after this returns.
-        var connection = await _dataSource.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
+        var connection = await OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         var listening = false;
         var probe = new ListenProbe();
         try
@@ -1014,7 +1014,7 @@ internal sealed class PostgreSqlChannelSql
 
     private async Task<int> PruneExpiredRecoveryBatchAsync(string? correlationId, CancellationToken cancellationToken)
     {
-        await using var connection = await _dataSource.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
+        await using var connection = await OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         await using var command = connection.CreateCommand();
         command.CommandText = correlationId is null
             ? ExpiredPruneSql(RecoveryTable)
@@ -1046,7 +1046,7 @@ internal sealed class PostgreSqlChannelSql
 
     private async Task<int> PruneExpiredBatchAsync(string table, CancellationToken cancellationToken)
     {
-        await using var connection = await _dataSource.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
+        await using var connection = await OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         await using var command = connection.CreateCommand();
         command.CommandText = ExpiredPruneSql(table);
         return await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
@@ -1058,6 +1058,41 @@ internal sealed class PostgreSqlChannelSql
     /// </summary>
     internal static string ExpiredPruneSql(string table)
         => $"DELETE FROM {table} WHERE ctid IN (SELECT ctid FROM {table} WHERE expires_at <= now() LIMIT {OpportunisticPrune.BatchSize});";
+
+    /// <summary>
+    /// Opens a connection that never enlists in an ambient <see cref="System.Transactions.Transaction"/>.
+    /// <para>
+    /// Every channel statement is its own autocommit by design: a delivery claim, a recovery
+    /// claim, a subscriber row and a published response must be visible to other processes the
+    /// moment they run, and the publish protocol (insert, then wait for another process to claim
+    /// it) cannot work inside a transaction that only commits later. The data source is the
+    /// application's (shared, so its <c>Enlist</c> setting is not ours to change), and Npgsql
+    /// enlists a connection opened while a <see cref="System.Transactions.TransactionScope"/> is
+    /// current — which used to put a response published inside a unit-of-work scope, or the
+    /// registration of a waiter created inside one, into the caller's transaction: invisible to
+    /// other processes until commit (so a live waiter's response was claimed for recovery by its
+    /// own publisher), and undone by a rollback after the waiter had already been handed the
+    /// response. Enlistment happens only when the connection opens, so suppressing the ambient
+    /// transaction for the open alone keeps every later command on it out of the transaction.
+    /// </para>
+    /// </summary>
+    private ValueTask<NpgsqlConnection> OpenConnectionAsync(CancellationToken cancellationToken)
+    {
+        if (System.Transactions.Transaction.Current is null)
+            return _dataSource.OpenConnectionAsync(cancellationToken);
+
+        return OpenOutsideAmbientTransactionAsync(cancellationToken);
+    }
+
+    private async ValueTask<NpgsqlConnection> OpenOutsideAmbientTransactionAsync(CancellationToken cancellationToken)
+    {
+        // Async-flow suppression, disposed in this same method: it hides the caller's transaction
+        // from the open (whichever thread its continuation lands on) and nothing outside it.
+        using var suppress = new System.Transactions.TransactionScope(
+            System.Transactions.TransactionScopeOption.Suppress,
+            System.Transactions.TransactionScopeAsyncFlowOption.Enabled);
+        return await _dataSource.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
+    }
 
     public static void ValidateIdentifier(string? value, string name)
     {

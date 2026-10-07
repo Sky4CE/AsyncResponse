@@ -50,7 +50,7 @@ public sealed class Round34RegressionTests
         await using (var lease = await AcquireLeaseAsync(store, state.FlowId!))
         {
             var context = CreateContext(state, store, SubscriberReturning(Task.FromResult(stale)), lease);
-            var surfaced = await Assert.ThrowsAsync<InvalidOperationException>(() => context.AwaitStepAsync<OperationResult>(
+            var surfaced = await Assert.ThrowsAnyAsync<InvalidOperationException>(() => context.AwaitStepAsync<OperationResult>(
                 "remote",
                 _ => Task.CompletedTask));
             Assert.Contains("lost its execution lease", surfaced.Message, StringComparison.Ordinal);
@@ -86,7 +86,7 @@ public sealed class Round34RegressionTests
         await using (var lease = await AcquireLeaseAsync(store, state.FlowId!))
         {
             var context = CreateContext(state, store, SubscriberReturning(Task.FromResult(stale)), lease);
-            await Assert.ThrowsAsync<InvalidOperationException>(() => context.AwaitStepAsync<OperationResult>("remote", _ => Task.CompletedTask));
+            await Assert.ThrowsAnyAsync<InvalidOperationException>(() => context.AwaitStepAsync<OperationResult>("remote", _ => Task.CompletedTask));
         }
 
         var persisted = await store.LoadAsync(state.FlowId!);
@@ -131,7 +131,7 @@ public sealed class Round34RegressionTests
                 lease,
                 observers: [observer.Object]);
 
-            var surfaced = await Assert.ThrowsAsync<InvalidOperationException>(() => context.AwaitStepAsync<OperationResult>("remote", _ => Task.CompletedTask));
+            var surfaced = await Assert.ThrowsAnyAsync<InvalidOperationException>(() => context.AwaitStepAsync<OperationResult>("remote", _ => Task.CompletedTask));
             Assert.Contains("lost its execution lease", surfaced.Message, StringComparison.Ordinal);
         }
 
@@ -173,7 +173,7 @@ public sealed class Round34RegressionTests
                 lease,
                 observers: [observer.Object]);
 
-            var surfaced = await Assert.ThrowsAsync<InvalidOperationException>(() => context.AwaitStepAsync<OperationResult>("remote", _ => Task.CompletedTask));
+            var surfaced = await Assert.ThrowsAnyAsync<InvalidOperationException>(() => context.AwaitStepAsync<OperationResult>("remote", _ => Task.CompletedTask));
             Assert.Contains("lost its execution lease", surfaced.Message, StringComparison.Ordinal);
         }
 
@@ -215,7 +215,7 @@ public sealed class Round34RegressionTests
                 lease,
                 observers: [observer.Object]);
 
-            var surfaced = await Assert.ThrowsAsync<InvalidOperationException>(() => context.AwaitStepAsync<OperationResult>("remote", _ => Task.CompletedTask));
+            var surfaced = await Assert.ThrowsAnyAsync<InvalidOperationException>(() => context.AwaitStepAsync<OperationResult>("remote", _ => Task.CompletedTask));
             Assert.DoesNotContain("Logger provider failed", surfaced.Message, StringComparison.Ordinal);
             Assert.Contains("lost its execution lease", surfaced.Message, StringComparison.Ordinal);
         }
@@ -258,7 +258,7 @@ public sealed class Round34RegressionTests
                 lease,
                 observers: [observer.Object]);
 
-            await Assert.ThrowsAsync<InvalidOperationException>(() => context.AwaitStepAsync<OperationResult>("remote", _ => Task.CompletedTask));
+            await Assert.ThrowsAnyAsync<InvalidOperationException>(() => context.AwaitStepAsync<OperationResult>("remote", _ => Task.CompletedTask));
         }
 
         Assert.Equal(1, store.Takeovers);

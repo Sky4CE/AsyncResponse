@@ -228,34 +228,49 @@ public sealed class RabbitMqWorkerTransport : IWorkerTransport, IWorkerTransport
         {
             _disposed = true;
 
+            // Each close is bounded app-side by ShutdownTimeout: the client ignores the token while
+            // the channel or connection is still open (RabbitMqBoundedClose), so an unresponsive
+            // broker held this dispose ~50 s. A lapsed close is abandoned, and the connection is
+            // aborted and then disposed in the background.
+            var lapsed = false;
             if (_channel is not null)
             {
                 using var cts = new CancellationTokenSource(_options.ShutdownTimeout);
                 try
                 {
-                    await _channel.CloseAsync(cts.Token).ConfigureAwait(false);
+                    lapsed = !await RabbitMqBoundedClose.WithinAsync(_channel.CloseAsync(cts.Token), _options.ShutdownTimeout).ConfigureAwait(false);
                 }
                 catch
                 {
                     // Best effort: the channel may already be closed by broker-side shutdown.
                 }
 
-                await _channel.DisposeAsync().ConfigureAwait(false);
+                if (!lapsed)
+                    await _channel.DisposeAsync().ConfigureAwait(false);
             }
 
             if (_connection is not null)
             {
-                using var cts = new CancellationTokenSource(_options.ShutdownTimeout);
-                try
+                if (!lapsed)
                 {
-                    await _connection.CloseAsync(_options.ShutdownTimeout, cts.Token).ConfigureAwait(false);
-                }
-                catch
-                {
-                    // Best effort.
+                    using var cts = new CancellationTokenSource(_options.ShutdownTimeout);
+                    try
+                    {
+                        lapsed = !await RabbitMqBoundedClose.WithinAsync(
+                            _connection.CloseAsync(_options.ShutdownTimeout, cts.Token),
+                            _options.ShutdownTimeout).ConfigureAwait(false);
+                    }
+                    catch
+                    {
+                        // Best effort.
+                    }
                 }
 
-                await _connection.DisposeAsync().ConfigureAwait(false);
+                // The abort closes the connection's channels with it, a lapsed channel included.
+                if (lapsed)
+                    RabbitMqBoundedClose.AbortInBackground(_connection, disposeAfter: true);
+                else
+                    await _connection.DisposeAsync().ConfigureAwait(false);
             }
         }
         finally

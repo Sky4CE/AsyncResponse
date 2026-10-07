@@ -400,3 +400,7 @@ static AsyncResponse.FlowLeaseObservation.Unheld.get -> AsyncResponse.FlowLeaseO
 AsyncResponse.RecoveryStateUnconfirmedException
 AsyncResponse.RecoveryStateUnconfirmedException.CorrelationId.get -> string?
 AsyncResponse.RecoveryStateUnconfirmedException.RecoveryStateUnconfirmedException(string? correlationId, System.Exception! innerException) -> void
+AsyncResponse.DurableFlowLeaseLostException
+AsyncResponse.DurableFlowLeaseLostException.DurableFlowLeaseLostException(string! flowId, string! message) -> void
+AsyncResponse.DurableFlowLeaseLostException.DurableFlowLeaseLostException(string! flowId, string! message, System.Exception? innerException) -> void
+AsyncResponse.DurableFlowLeaseLostException.FlowId.get -> string!

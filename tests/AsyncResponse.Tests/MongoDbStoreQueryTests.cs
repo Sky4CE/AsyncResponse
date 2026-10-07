@@ -52,8 +52,7 @@ public sealed class MongoDbStoreQueryTests
     {
         var rendered = Render(MongoDbTransportStore.BuildQueueWatchPipeline("worker"));
 
-        var stage = Assert.Single(rendered);
-        var conditions = stage["$match"]["$and"].AsBsonArray;
+        var conditions = rendered[0]["$match"]["$and"].AsBsonArray;
         Assert.Contains(conditions, condition => condition.AsBsonDocument.Contains("operationType") && condition["operationType"] == "insert");
         Assert.Contains(conditions, condition => condition.AsBsonDocument.Contains("fullDocument.queue") && condition["fullDocument.queue"] == "worker");
     }

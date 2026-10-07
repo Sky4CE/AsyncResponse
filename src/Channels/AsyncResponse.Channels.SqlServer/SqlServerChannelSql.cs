@@ -44,7 +44,20 @@ internal sealed class SqlServerChannelSql
         _options = options.Value;
         _logger = logger;
         _options.Validate();
-        _connectionString = _options.ConnectionString!;
+
+        // Enlist=false, whatever the configured string says: every channel statement is its own
+        // autocommit by design. A delivery claim, a recovery claim, a subscriber row and a published
+        // response must be visible to other processes the moment they run, and the publish
+        // protocol (insert, then wait for another process to claim it) cannot work inside a
+        // transaction that only commits later. SqlClient's default enlists a connection opened
+        // while a System.Transactions scope is current, which put a response published inside a
+        // unit-of-work scope into the caller's transaction — invisible to other processes until
+        // commit (its own publisher then claimed it for recovery under the live waiter, and under
+        // locking READ COMMITTED the waiter's sweep blocked on the uncommitted row), and undone by
+        // a rollback after the waiter had been handed it — and enlisted a second, concurrent
+        // channel connection in the same scope, which promotes to a distributed transaction that
+        // .NET supports on Windows only.
+        _connectionString = new SqlConnectionStringBuilder(_options.ConnectionString) { Enlist = false }.ConnectionString;
 
         Schema = Quote(_options.SchemaName);
         RecoveryTable = $"{Schema}.{Quote(_options.RecoveryStateTable)}";

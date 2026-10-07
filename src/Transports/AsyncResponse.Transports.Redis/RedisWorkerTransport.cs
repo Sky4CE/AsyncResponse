@@ -10,8 +10,10 @@ namespace AsyncResponse.Transports.Redis;
 /// </summary>
 /// <remarks>
 /// Redis Streams provide durable queueing and consumer-group acknowledgement. Publishing uses XADD
-/// with optional approximate trimming, and transient Redis failures are retried with bounded
-/// exponential backoff before the exception is returned to the caller.
+/// bounded by <see cref="RedisAsyncResponseTransportOptions.StreamMaxLength"/> — a full stream
+/// refuses the publish instead of evicting unprocessed jobs — and transient Redis failures (a full
+/// stream included) are retried with bounded exponential backoff before the exception is returned
+/// to the caller.
 /// </remarks>
 public sealed class RedisWorkerTransport : IWorkerTransport
 {
@@ -98,7 +100,9 @@ public sealed class RedisWorkerTransport : IWorkerTransport
                     _publishDedupTtl,
                     fields,
                     _options.StreamMaxLength,
-                    _options.UseApproximateStreamTrimming,
+                    // The group whose settled entries a full stream may drop: the worker
+                    // subscriber's. Nothing it has not settled is ever removed.
+                    _options.WorkerConsumerGroup,
                     token),
                 _options.PublishMaxAttempts,
                 _options.PublishRetryBaseDelay,

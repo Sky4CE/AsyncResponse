@@ -697,7 +697,7 @@ public class DurableFlowTests
         }
         else
         {
-            var abandoned = await Assert.ThrowsAsync<InvalidOperationException>(() => charge);
+            var abandoned = await Assert.ThrowsAsync<DurableFlowLeaseLostException>(() => charge);
             Assert.Contains("cancelled mid-write", abandoned.Message, StringComparison.Ordinal);
             Assert.Equal(0, sideEffects);
             Assert.True(lease.IsLost);
@@ -731,7 +731,7 @@ public class DurableFlowTests
 
         // The executor's failure-path save after it is refused before it can settle and write.
         state.LastMessage = failed.Message;
-        await Assert.ThrowsAsync<InvalidOperationException>(() => lease.SaveAsync(state, TimeSpan.FromMinutes(5), cause: failed));
+        await Assert.ThrowsAsync<DurableFlowLeaseLostException>(() => lease.SaveAsync(state, TimeSpan.FromMinutes(5), cause: failed));
         Assert.Equal(1, store.CurrentLoads);
         var persisted = (await store.LoadAsync(state.FlowId!))!;
         Assert.Equal(FlowRunStatus.Running, persisted.Status);
@@ -1434,7 +1434,7 @@ public class DurableFlowTests
 
         Assert.True(await store.TryDeleteAsync("gone-flow"));
 
-        var ex = await Assert.ThrowsAsync<InvalidOperationException>(
+        var ex = await Assert.ThrowsAsync<DurableFlowLeaseLostException>(
             () => lease.SaveAsync(state, TimeSpan.FromMinutes(5)));
 
         Assert.Contains("gone", ex.Message, StringComparison.Ordinal);
@@ -1458,7 +1458,7 @@ public class DurableFlowTests
         Assert.True(await store.TryUpdateAsync("conflict-flow", concurrent, concurrentRevision, TimeSpan.FromMinutes(5)));
 
         var cause = new TimeoutException("step wait failed");
-        var ex = await Assert.ThrowsAsync<InvalidOperationException>(
+        var ex = await Assert.ThrowsAsync<DurableFlowLeaseLostException>(
             () => lease.SaveAsync(state, TimeSpan.FromMinutes(5), cause: cause));
 
         Assert.Contains("concurrent write advanced the ledger", ex.Message, StringComparison.Ordinal);

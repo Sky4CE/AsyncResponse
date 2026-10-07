@@ -12,6 +12,18 @@ internal static class SqsOptionsValidator
         Required(options.CorrelationIdAttribute, nameof(options.CorrelationIdAttribute));
         Required(options.DefaultReplyTargetName, nameof(options.DefaultReplyTargetName));
 
+        // Half a static credential pair fell back to the ambient AWS credential chain (env,
+        // profile, instance or pod role) without a word: the process authenticated as a different
+        // principal than configured — failing later with an AccessDenied that hid the cause, or
+        // silently working with another role's permissions. Names the options, never the values.
+        if (string.IsNullOrWhiteSpace(options.AccessKey) != string.IsNullOrWhiteSpace(options.SecretKey))
+        {
+            throw new InvalidOperationException(
+                $"{nameof(SqsAsyncResponseOptions)}.{(string.IsNullOrWhiteSpace(options.AccessKey) ? nameof(options.SecretKey) : nameof(options.AccessKey))} is set but " +
+                $"{nameof(SqsAsyncResponseOptions)}.{(string.IsNullOrWhiteSpace(options.AccessKey) ? nameof(options.AccessKey) : nameof(options.SecretKey))} is not: " +
+                $"set both {nameof(options.AccessKey)} and {nameof(options.SecretKey)} for static credentials, or neither to use the AWS SDK's default credential chain.");
+        }
+
         // Every correlated publish writes this attribute name, and SQS rejects a SendMessage with
         // an invalid one — non-retryably — so a name it can never accept failed every correlated
         // publish (and every external responder told to use it) after a clean startup.

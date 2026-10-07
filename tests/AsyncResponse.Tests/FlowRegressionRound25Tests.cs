@@ -121,6 +121,13 @@ public sealed class FlowRegressionRound25Tests
 
         public override DateTimeOffset GetUtcNow() => new(Interlocked.Read(ref _ticks), TimeSpan.Zero);
 
+        // The monotonic clock moves with it, as both do through a real pause: the execution lease
+        // measures its term as elapsed timestamps (round 65), and a fake that only moved the wall
+        // clock modelled a pause no process can have.
+        public override long GetTimestamp() => Interlocked.Read(ref _ticks);
+
+        public override long TimestampFrequency => TimeSpan.TicksPerSecond;
+
         public void Advance(TimeSpan by) => Interlocked.Add(ref _ticks, by.Ticks);
     }
 
@@ -210,7 +217,7 @@ public sealed class FlowRegressionRound25Tests
         // loop is parked on a real-time delay, like a frozen process).
         clock.Advance(options.ExecutionLeaseDuration + TimeSpan.FromSeconds(1));
 
-        var ex = Assert.Throws<InvalidOperationException>(() => lease.ThrowIfLost());
+        var ex = Assert.Throws<DurableFlowLeaseLostException>(() => lease.ThrowIfLost());
         Assert.Contains("lost its execution lease", ex.Message, StringComparison.Ordinal);
         Assert.True(lease.LostToken.IsCancellationRequested);
     }

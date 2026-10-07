@@ -49,6 +49,13 @@ jobs:
       - name: CI retry classifier self-test
         run: ./scripts/tests/ci-retryable-failure.test.sh
 
+      # publish.yml's release gate (scripts/require-ci-success.sh) decides from this workflow's
+      # own runs whether a commit may be published; its fixtures — a red run, a cancelled one, a
+      # run of another commit or event, a run still in progress, an unreadable API answer — run
+      # here against a stub gh, so an edit cannot silently turn the gate into a pass.
+      - name: Release gate self-test
+        run: bash scripts/tests/require-ci-success.test.sh
+
       # Coverage runs through coverlet rather than MTP's `--coverage` flag or `dotnet-coverage`:
       # pre-instrumenting with `dotnet-coverage instrument` discards condition data, so the published
       # report measured zero branches, and the only Microsoft mode that keeps it on linux-x64 is the
@@ -99,6 +106,13 @@ jobs:
         # Solution-level pack: every non-src project sets IsPackable=false, so this packs exactly
         # the shipped src/** packages without a hand-maintained list.
         run: dotnet pack AsyncResponse.slnx --configuration Release --no-build -o ./artifacts
+
+      # The exact-version sibling pins (src/Directory.Build.targets) hang on a PRIVATE NuGet pack
+      # target; an SDK that renames it packs open ">= x" ranges again, and nothing else notices —
+      # a consumer's mixed install is then only a NU1608 restore WARNING. Checked on every push,
+      # not first at release time.
+      - name: Verify sibling package dependencies are pinned
+        run: bash scripts/verify-package-dependencies.sh ./artifacts
 
       - name: Upload packages as build artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

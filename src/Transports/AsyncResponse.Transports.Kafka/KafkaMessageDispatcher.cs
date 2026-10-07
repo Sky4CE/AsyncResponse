@@ -52,9 +52,12 @@ internal sealed class KafkaDeadLetterPublishFailedException(string topic, int pa
 
     /// <summary>What lets a partition stalled on a failed burial advance again, for the error text.</summary>
     internal static string StallRemedy(Exception deadLetterException)
-        => deadLetterException is KafkaDeadLetterTooLargeException
-            ? $"raise the producer's message.max.bytes through {nameof(KafkaAsyncResponseTransportOptions)}.{nameof(KafkaAsyncResponseTransportOptions.ConfigureProducer)} (the dead-letter copy cannot fit it)"
-            : "fix the dead-letter topic";
+        => deadLetterException switch
+        {
+            KafkaDeadLetterTooLargeException => $"raise the producer's message.max.bytes through {nameof(KafkaAsyncResponseTransportOptions)}.{nameof(KafkaAsyncResponseTransportOptions.ConfigureProducer)} (the dead-letter copy cannot fit it)",
+            KafkaDeadLetterUnconfirmedException => "make the dead-letter topic answer within the bound (this copy is only unconfirmed: librdkafka may still deliver it, and the retried burial then leaves a second one)",
+            _ => "fix the dead-letter topic"
+        };
 }
 
 /// <summary>
@@ -73,6 +76,21 @@ internal sealed class KafkaDeadLetterTooLargeException(string topic, int partiti
 {
     public long RequiredBytes { get; } = requiredBytes;
     public int MessageMaxBytes { get; } = messageMaxBytes;
+}
+
+/// <summary>
+/// A dead-letter produce was still awaiting librdkafka's delivery report when its bound lapsed.
+/// librdkafka keeps the record queued (and retried) until <c>message.timeout.ms</c>, so the copy may
+/// still land: the burial is neither confirmed nor known to have failed. Its real outcome is
+/// logged once librdkafka reports it.
+/// </summary>
+internal sealed class KafkaDeadLetterUnconfirmedException(string topic, int partition, long offset, string deadLetterTopic, Exception innerException)
+    : Exception(
+        $"The dead-letter copy of Kafka message {topic}[{partition}]@{offset} was not confirmed within its bound: librdkafka may still deliver it " +
+        $"to '{deadLetterTopic}' (it keeps the record queued until message.timeout.ms), and its outcome is logged once known.",
+        innerException)
+{
+    public string DeadLetterTopic { get; } = deadLetterTopic;
 }
 
 internal abstract class KafkaMessageDispatcher : IAsyncDisposable
@@ -284,11 +302,32 @@ internal abstract class KafkaMessageDispatcher : IAsyncDisposable
 
                 // Kafka subscribers spend only the background drain at shutdown; the poll loop
                 // stops with the host token and the consumer close is not separately bounded.
+                // The worker and response subscribers are two hosted services that the host stops
+                // ONE AFTER THE OTHER inside one budget, so with both roles in early ACK their
+                // drains are summed (NATS/Redis/PostgreSQL/SQL Server/MongoDB parity): each drain
+                // validated alone let two 20 s drains pass against 30 s, and the second was cut off
+                // with its already-committed entries still queued.
+                var drain = ($"{optionPath}.{nameof(KafkaSubscriberOptions.BackgroundDrainTimeout)}", subscriberOptions.BackgroundDrainTimeout);
+                var (other, otherPath) = role is KafkaSubscriberRole.Worker
+                    ? (transportOptions.ResponseSubscriber, $"{nameof(KafkaAsyncResponseTransportOptions)}.{nameof(KafkaAsyncResponseTransportOptions.ResponseSubscriber)}")
+                    : (transportOptions.WorkerSubscriber, $"{nameof(KafkaAsyncResponseTransportOptions)}.{nameof(KafkaAsyncResponseTransportOptions.WorkerSubscriber)}");
+                (string, TimeSpan)[] components;
+                if (other is { AckMode: KafkaAckMode.AckAfterEnqueue } && !ReferenceEquals(other, subscriberOptions))
+                {
+                    // Checked first, so the sum below only ever adds timer-backed values.
+                    AsyncResponseChannelOptions.EnsureTimerBacked(other.BackgroundDrainTimeout, otherPath, nameof(KafkaSubscriberOptions.BackgroundDrainTimeout));
+                    components = [drain, ($"{otherPath}.{nameof(KafkaSubscriberOptions.BackgroundDrainTimeout)}", other.BackgroundDrainTimeout)];
+                }
+                else
+                {
+                    components = [drain];
+                }
+
                 ShutdownBudgetValidator.Validate(
                     "Kafka",
                     $"{nameof(KafkaAsyncResponseTransportOptions)}.{nameof(KafkaAsyncResponseTransportOptions.HostShutdownTimeout)}",
                     transportOptions.HostShutdownTimeout,
-                    ($"{optionPath}.{nameof(KafkaSubscriberOptions.BackgroundDrainTimeout)}", subscriberOptions.BackgroundDrainTimeout));
+                    components);
 
                 return;
 
@@ -786,19 +825,93 @@ internal abstract class KafkaMessageDispatcher : IAsyncDisposable
         using var pollBudget = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         pollBudget.CancelAfter(TimeSpan.FromTicks(_maxPollInterval.Ticks / 4));
 
-        await KafkaTransportRetry.ExecuteAsync(
-            token => _producer.PublishAsync(
-                _topics.DeadLetterTopicFor(sourceTopic),
-                correlationId,
-                payload,
-                headers,
-                token),
-            TransportOptions.PublishMaxAttempts,
-            TransportOptions.PublishRetryBaseDelay,
-            TransportOptions.PublishRetryMaxDelay,
-            pollBudget.Token).ConfigureAwait(false);
+        // The bound only stops the WAIT: librdkafka keeps a record it already accepted queued (and
+        // retried) until message.timeout.ms — 5 min by default, past this bound — and may still
+        // deliver it. Cancelling the produce itself only cancelled our handle on its delivery
+        // report, so a copy that landed late was reported as a failed burial: an ack-after-handler
+        // restart buried it a second time, and an early-ACK stop logged a loss for a message that
+        // had a copy. The produce now runs untokened and only the wait is bounded; a produce still
+        // pending at the bound is reported as unconfirmed, and its real outcome is logged once
+        // librdkafka reports it.
+        var deadLetterTopic = _topics.DeadLetterTopicFor(sourceTopic);
+        Task<KafkaPublishResult>? unconfirmed = null;
+        try
+        {
+            await KafkaTransportRetry.ExecuteAsync(
+                async token =>
+                {
+                    // Never hand librdkafka a record once the bound has lapsed: untokened, it would
+                    // be produced with nothing left to wait for its report.
+                    token.ThrowIfCancellationRequested();
+                    var produce = _producer.PublishAsync(deadLetterTopic, correlationId, payload, headers, CancellationToken.None);
+                    try
+                    {
+                        return await produce.WaitAsync(token).ConfigureAwait(false);
+                    }
+                    catch (OperationCanceledException) when (token.IsCancellationRequested && !produce.IsCompleted)
+                    {
+                        unconfirmed = produce;
+                        throw;
+                    }
+                },
+                TransportOptions.PublishMaxAttempts,
+                TransportOptions.PublishRetryBaseDelay,
+                TransportOptions.PublishRetryMaxDelay,
+                pollBudget.Token).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException canceled) when (unconfirmed is { } pending)
+        {
+            ReportLateDeadLetterOutcome(pending, sourceTopic, partition, offset, deadLetterTopic);
+            throw new KafkaDeadLetterUnconfirmedException(sourceTopic, partition, offset, deadLetterTopic, canceled);
+        }
+
         return true;
     }
+
+    /// <summary>
+    /// Logs the outcome of a dead-letter produce whose wait was abandoned at its bound, once
+    /// librdkafka reports it: the earlier report said "unconfirmed", and an operator replaying the
+    /// message needs to know whether a copy exists after all. Never throws.
+    /// </summary>
+    private void ReportLateDeadLetterOutcome(
+        Task<KafkaPublishResult> pending,
+        string sourceTopic,
+        int partition,
+        long offset,
+        string deadLetterTopic)
+        => _ = pending.ContinueWith(
+            static (produce, boxed) =>
+            {
+                var (logger, sourceTopic, partition, offset, deadLetterTopic) = ((ILogger, string, int, long, string))boxed!;
+                SafeLog.Try((Logger: logger, Produce: produce, SourceTopic: sourceTopic, Partition: partition, Offset: offset, DeadLetterTopic: deadLetterTopic), static state =>
+                {
+                    if (state.Produce.Status == TaskStatus.RanToCompletion)
+                    {
+                        state.Logger.LogWarning(
+                            "The unconfirmed dead-letter copy of Kafka message {Topic}[{Partition}]@{Offset} was delivered after all, to {DeadLetterTopic}[{DeadLetterPartition}]@{DeadLetterOffset}.",
+                            state.SourceTopic,
+                            state.Partition,
+                            state.Offset,
+                            state.Produce.Result.Topic,
+                            state.Produce.Result.Partition,
+                            state.Produce.Result.Offset);
+                    }
+                    else
+                    {
+                        state.Logger.LogWarning(
+                            state.Produce.Exception?.GetBaseException(),
+                            "The unconfirmed dead-letter copy of Kafka message {Topic}[{Partition}]@{Offset} was not delivered to {DeadLetterTopic}.",
+                            state.SourceTopic,
+                            state.Partition,
+                            state.Offset,
+                            state.DeadLetterTopic);
+                    }
+                });
+            },
+            (Logger, sourceTopic, partition, offset, deadLetterTopic),
+            CancellationToken.None,
+            TaskContinuationOptions.ExecuteSynchronously,
+            TaskScheduler.Default);
 
     /// <summary>
     /// Reports an already-committed message through <see cref="KafkaSubscriberOptions.OnBackgroundFailure"/>;
@@ -1915,10 +2028,10 @@ internal sealed class QueuedKafkaMessageDispatcher : KafkaMessageDispatcher
     /// <summary>The dead-letter copy of an unstarted message the lapse caught, then the log of what was actually written.</summary>
     private async Task RecordLapsedAsync(KafkaDelivery delivery, Exception lapsed, CancellationToken cancellationToken)
     {
-        var copied = await TryDeadLetterAfterCommitAsync(delivery, lapsed, "drain_budget_lapsed_after_commit", 0, cancellationToken).ConfigureAwait(false);
-        SafeLog.Try((Logger, Delivery: delivery, Copied: copied, NoCopy: NoCopyReason), static state =>
+        var copy = await TryDeadLetterAfterCommitAsync(delivery, lapsed, "drain_budget_lapsed_after_commit", 0, cancellationToken).ConfigureAwait(false);
+        SafeLog.Try((Logger, Delivery: delivery, Copy: copy, NoCopy: NoCopyOutcome(copy, "message")), static state =>
         {
-            if (state.Copied)
+            if (state.Copy == DeadLetterCopy.Written)
             {
                 state.Logger.LogWarning(
                     "Kafka background handler for already-committed message {Topic}[{Partition}]@{Offset} was not started: the drain budget had lapsed. Dead-lettered a copy (drain_budget_lapsed_after_commit); surfacing via OnBackgroundFailure.",
@@ -1928,8 +2041,9 @@ internal sealed class QueuedKafkaMessageDispatcher : KafkaMessageDispatcher
             }
             else
             {
-                state.Logger.LogError(
-                    "Kafka background handler for already-committed message {Topic}[{Partition}]@{Offset} was not started: the drain budget had lapsed, and {NoCopy}, so the message is lost unless OnBackgroundFailure records it.",
+                state.Logger.Log(
+                    state.Copy == DeadLetterCopy.Unconfirmed ? LogLevel.Warning : LogLevel.Error,
+                    "Kafka background handler for already-committed message {Topic}[{Partition}]@{Offset} was not started: the drain budget had lapsed, and {NoCopy}.",
                     state.Delivery.Topic,
                     state.Delivery.Partition,
                     state.Delivery.Offset,
@@ -1944,11 +2058,35 @@ internal sealed class QueuedKafkaMessageDispatcher : KafkaMessageDispatcher
         : "no dead-letter destination is configured";
 
     /// <summary>
+    /// What a log says about an already-committed <paramref name="what"/> (message, wake-up) left
+    /// without a confirmed dead-letter copy: lost when none was written; when the produce was only
+    /// abandoned at its bound, unconfirmed — librdkafka may still deliver it, so "lost" would send
+    /// an operator replaying from OnBackgroundFailure into a duplicate.
+    /// </summary>
+    private string NoCopyOutcome(DeadLetterCopy copy, string what)
+        => copy == DeadLetterCopy.Unconfirmed
+            ? $"its dead-letter copy is unconfirmed — the produce was abandoned at its bound and librdkafka may still deliver it (its outcome is logged once known) — so check the dead-letter topic before replaying the {what} from OnBackgroundFailure"
+            : $"{NoCopyReason}, so the {what} is lost unless OnBackgroundFailure records it";
+
+    /// <summary>What a best-effort burial of an already-committed message left behind.</summary>
+    private enum DeadLetterCopy
+    {
+        /// <summary>No copy: dead-lettering is disabled, or the produce failed.</summary>
+        None,
+
+        /// <summary>The copy was written.</summary>
+        Written,
+
+        /// <summary>The produce was abandoned at its bound and may still be delivered.</summary>
+        Unconfirmed
+    }
+
+    /// <summary>
     /// Best-effort burial of an already-committed message: a failure is only logged (the offset is
     /// committed either way). Returns whether a copy was written — never with dead-lettering
-    /// disabled — so the caller's log claims only what exists.
+    /// disabled — or is unconfirmed, so the caller's log claims only what exists.
     /// </summary>
-    private async Task<bool> TryDeadLetterAfterCommitAsync(
+    private async Task<DeadLetterCopy> TryDeadLetterAfterCommitAsync(
         KafkaDelivery delivery,
         Exception exception,
         string reason,
@@ -1957,7 +2095,14 @@ internal sealed class QueuedKafkaMessageDispatcher : KafkaMessageDispatcher
     {
         try
         {
-            return await DeadLetterAsync(delivery, exception, reason, attempts, cancellationToken).ConfigureAwait(false);
+            return await DeadLetterAsync(delivery, exception, reason, attempts, cancellationToken).ConfigureAwait(false)
+                ? DeadLetterCopy.Written
+                : DeadLetterCopy.None;
+        }
+        catch (KafkaDeadLetterUnconfirmedException)
+        {
+            // Not a failure, not a copy: the caller's log says which.
+            return DeadLetterCopy.Unconfirmed;
         }
         catch (Exception deadLetterException)
         {
@@ -1967,7 +2112,7 @@ internal sealed class QueuedKafkaMessageDispatcher : KafkaMessageDispatcher
                 state.Delivery.Topic,
                 state.Delivery.Partition,
                 state.Delivery.Offset));
-            return false;
+            return DeadLetterCopy.None;
         }
     }
 
@@ -2002,10 +2147,10 @@ internal sealed class QueuedKafkaMessageDispatcher : KafkaMessageDispatcher
                 // so bury it AND surface the drop through OnBackgroundFailure — an unstarted entry
                 // is dead-lettered on this same lapse, and one that already failed once has at
                 // least as much reason to leave a record. The copy first, then the callback.
-                var copied = await TryDeadLetterAfterCommitAsync(delivery, ex, "drain_budget_lapsed_after_commit", 0, CancellationToken.None).ConfigureAwait(false);
-                SafeLog.Try((Logger, Delivery: delivery, Copied: copied, NoCopy: NoCopyReason), static state =>
+                var copy = await TryDeadLetterAfterCommitAsync(delivery, ex, "drain_budget_lapsed_after_commit", 0, CancellationToken.None).ConfigureAwait(false);
+                SafeLog.Try((Logger, Delivery: delivery, Copy: copy, NoCopy: NoCopyOutcome(copy, "message")), static state =>
                 {
-                    if (state.Copied)
+                    if (state.Copy == DeadLetterCopy.Written)
                     {
                         state.Logger.LogWarning(
                             "Kafka background handler for already-committed message {Topic}[{Partition}]@{Offset} was canceled during dispatcher shutdown; dead-lettered a copy (drain_budget_lapsed_after_commit), surfacing via OnBackgroundFailure.",
@@ -2015,8 +2160,9 @@ internal sealed class QueuedKafkaMessageDispatcher : KafkaMessageDispatcher
                     }
                     else
                     {
-                        state.Logger.LogError(
-                            "Kafka background handler for already-committed message {Topic}[{Partition}]@{Offset} was canceled during dispatcher shutdown, and {NoCopy}, so the message is lost unless OnBackgroundFailure records it.",
+                        state.Logger.Log(
+                            state.Copy == DeadLetterCopy.Unconfirmed ? LogLevel.Warning : LogLevel.Error,
+                            "Kafka background handler for already-committed message {Topic}[{Partition}]@{Offset} was canceled during dispatcher shutdown, and {NoCopy}.",
                             state.Delivery.Topic,
                             state.Delivery.Partition,
                             state.Delivery.Offset,
@@ -2079,10 +2225,10 @@ internal sealed class QueuedKafkaMessageDispatcher : KafkaMessageDispatcher
                     // early ACK can never redeliver, and the flow's checkpoints make a replay of
                     // the copy safe. With no copy written (dead-lettering disabled, or the produce
                     // failed) the wake-up is lost: that is an Error, and the log must not claim a copy.
-                    var handedBackCopied = await TryDeadLetterAfterCommitAsync(delivery, ex, "handed_back_after_commit", attempt, CancellationToken.None).ConfigureAwait(false);
-                    SafeLog.Try((Logger, Error: ex, Delivery: delivery, Copied: handedBackCopied, NoCopy: NoCopyReason), static state =>
+                    var handedBackCopy = await TryDeadLetterAfterCommitAsync(delivery, ex, "handed_back_after_commit", attempt, CancellationToken.None).ConfigureAwait(false);
+                    SafeLog.Try((Logger, Error: ex, Delivery: delivery, Copy: handedBackCopy, NoCopy: NoCopyOutcome(handedBackCopy, "wake-up")), static state =>
                     {
-                        if (state.Copied)
+                        if (state.Copy == DeadLetterCopy.Written)
                         {
                             state.Logger.LogWarning(
                                 state.Error,
@@ -2093,9 +2239,10 @@ internal sealed class QueuedKafkaMessageDispatcher : KafkaMessageDispatcher
                         }
                         else
                         {
-                            state.Logger.LogError(
+                            state.Logger.Log(
+                                state.Copy == DeadLetterCopy.Unconfirmed ? LogLevel.Warning : LogLevel.Error,
                                 state.Error,
-                                "Kafka background handler for already-committed message {Topic}[{Partition}]@{Offset} was handed back because the host is stopping; its offset is already committed and {NoCopy}, so the wake-up is lost unless OnBackgroundFailure records it (resume the flow explicitly).",
+                                "Kafka background handler for already-committed message {Topic}[{Partition}]@{Offset} was handed back because the host is stopping; its offset is already committed and {NoCopy} (resume the flow explicitly).",
                                 state.Delivery.Topic,
                                 state.Delivery.Partition,
                                 state.Delivery.Offset,
@@ -2109,8 +2256,8 @@ internal sealed class QueuedKafkaMessageDispatcher : KafkaMessageDispatcher
 
                 if (MaxDeliveryAttempts <= 0 || ReachedDeliveryAttempts(attempt))
                 {
-                    var failedCopied = await TryDeadLetterAfterCommitAsync(delivery, ex, "background_handler_failed_after_commit", attempt, CancellationToken.None).ConfigureAwait(false);
-                    SafeLog.Try((Logger, Error: ex, Delivery: delivery, Attempts: attempt, Copied: failedCopied, NoCopy: NoCopyReason), static state => state.Logger.LogError(
+                    var failedCopy = await TryDeadLetterAfterCommitAsync(delivery, ex, "background_handler_failed_after_commit", attempt, CancellationToken.None).ConfigureAwait(false);
+                    SafeLog.Try((Logger, Error: ex, Delivery: delivery, Attempts: attempt, Copied: failedCopy == DeadLetterCopy.Written, NoCopy: NoCopyOutcome(failedCopy, "message")), static state => state.Logger.LogError(
                         state.Error,
                         "Kafka background handler failed for already-committed message {Topic}[{Partition}]@{Offset} after {Attempts} attempt(s); {Outcome}.",
                         state.Delivery.Topic,
@@ -2119,7 +2266,7 @@ internal sealed class QueuedKafkaMessageDispatcher : KafkaMessageDispatcher
                         state.Attempts,
                         state.Copied
                             ? "dead-lettered a copy (background_handler_failed_after_commit)"
-                            : $"{state.NoCopy}, so the message is lost unless OnBackgroundFailure records it"));
+                            : state.NoCopy));
                     await NotifyBackgroundFailureAsync(delivery, ex).ConfigureAwait(false);
                     return;
                 }
