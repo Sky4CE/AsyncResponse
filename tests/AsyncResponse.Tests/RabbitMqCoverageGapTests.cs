@@ -4,7 +4,6 @@ using Microsoft.Extensions.Options;
 using Moq;
 using RabbitMQ.Client;
 using System.Collections.Concurrent;
-using System.Diagnostics;
 using System.Text;
 using Xunit;
 
@@ -538,12 +537,13 @@ public class RabbitMqCoverageGapTests
     }
 
     [Fact]
-    public async Task Queued_DeadLetterBuildFailure_IsReported_AndTheWorkerKeepsDrainingTheQueue()
+    public async Task Queued_DeadLetterFailure_IsReported_AndTheWorkerKeepsDrainingTheQueue()
     {
-        // A handler exception whose Message getter throws is user code the burial reads while it
-        // builds the dead-letter headers. That used to escape the worker loop: the worker died, and
-        // every already-ACKed delivery queued behind it was never run, copied or reported. The burial
-        // is best-effort (Kafka parity) — the failure is still reported, and the next delivery runs.
+        // A burial that throws used to escape the worker loop: the worker died, and every
+        // already-ACKed delivery queued behind it was never run, copied or reported. The burial is
+        // best-effort (Kafka parity) — the failure is still reported, and the next delivery runs.
+        // (This test used a throwing exception Message getter as the fault; since round 67 the
+        // headers fall back to the type name, so the dead-letter publish itself fails here.)
         var logger = new GapLogger();
         var reported = new TaskCompletionSource<RabbitMqBackgroundFailureContext>(TaskCreationOptions.RunContinuationsAsynchronously);
         var secondRan = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -557,7 +557,7 @@ public class RabbitMqCoverageGapTests
             (delivery, _) =>
             {
                 if (delivery.DeliveryTag == 1)
-                    throw new MessageThrowsWhileDeadLetteringException();
+                    throw new ArgumentException("handler boom");
                 secondRan.TrySetResult();
                 return Task.CompletedTask;
             },
@@ -566,18 +566,18 @@ public class RabbitMqCoverageGapTests
             logger,
             "worker.q",
             RabbitMqSubscriberRole.Worker);
-        var channel = new GapChannel();
+        var channel = new GapChannel { OnPublish = static (_, _) => throw new InvalidOperationException("dead-letter publish boom") };
 
         await dispatcher.HandleAsync(Delivery("m1", deliveryTag: 1), channel, CancellationToken.None);
         await dispatcher.HandleAsync(Delivery("m2", deliveryTag: 2), channel, CancellationToken.None);
 
         var failure = await reported.Task.WaitAsync(Wait);
         Assert.Equal(1UL, failure.DeliveryTag);
-        Assert.IsType<MessageThrowsWhileDeadLetteringException>(failure.Exception);
+        Assert.IsType<ArgumentException>(failure.Exception);
         await secondRan.Task.WaitAsync(Wait);
         await dispatcher.DisposeAsync().AsTask().WaitAsync(Wait);
 
-        Assert.Empty(channel.Publishes); // no copy could be built, so none is claimed
+        Assert.Empty(channel.Publishes); // the copy's publish failed, so none is claimed
         Assert.Contains(logger.Entries, e => e.Level == LogLevel.Error
             && e.Message.Contains("Failed to dead-letter already-ACKed RabbitMQ delivery 1", StringComparison.Ordinal)
             && e.Exception is InvalidOperationException);
@@ -788,13 +788,6 @@ public class RabbitMqCoverageGapTests
     /// dispatcher builds its dead-letter copy (read anywhere else — a trace span's status, say — it
     /// is an ordinary message), so the test does not depend on whether an activity listener is on.
     /// </summary>
-    private sealed class MessageThrowsWhileDeadLetteringException : Exception
-    {
-        public override string Message
-            => new StackTrace().ToString().Contains("TryDeadLetterAlreadyAcked", StringComparison.Ordinal)
-                ? throw new InvalidOperationException("Message getter boom")
-                : "handler boom";
-    }
 
     private sealed class GapChannel : IRabbitMqChannel
     {

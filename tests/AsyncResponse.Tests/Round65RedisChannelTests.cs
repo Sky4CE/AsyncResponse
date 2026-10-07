@@ -57,6 +57,36 @@ public sealed class Round65RedisChannelTests
     }
 
     /// <summary>
+    /// Round 67 (R2-01): a blip's restore handled AFTER the next real failure (separate work items)
+    /// must not erase that failure's grace: the node is down, so the stale restore is ignored.
+    /// </summary>
+    [Fact]
+    public async Task Redis_StaleRestoreHandledAfterANewerFailure_KeepsTheFailoverGrace()
+    {
+        // The old primary (the helper's) and a promoted node that answers zero.
+        var (multiplexer, server, _, _) = RedisMultiplexer();
+        var promotedEndPoint = new IPEndPoint(IPAddress.Parse("10.0.0.2"), 6379);
+        var promoted = new Mock<IServer>();
+        promoted.SetupGet(s => s.IsConnected).Returns(true);
+        promoted.SetupGet(s => s.ServerType).Returns(ServerType.Standalone);
+        promoted.SetupGet(s => s.EndPoint).Returns(promotedEndPoint);
+        promoted.Setup(s => s.SubscriptionSubscriberCountAsync(It.IsAny<StackExchange.Redis.RedisChannel>(), It.IsAny<CommandFlags>()))
+            .ReturnsAsync(0L);
+        multiplexer.Setup(m => m.GetEndPoints(It.IsAny<bool>())).Returns([server.Object.EndPoint!, promotedEndPoint]);
+        multiplexer.Setup(m => m.GetServer(promotedEndPoint, It.IsAny<object?>())).Returns(promoted.Object);
+        var clock = new VirtualTimeProvider();
+        var channel = RedisChannel(multiplexer, Mock.Of<IRecoveryStateStore>(), clock);
+
+        server.SetupGet(s => s.IsConnected).Returns(false);
+        RaiseRedis(multiplexer, server, restored: false); // blip failure
+        clock.Advance(TimeSpan.FromSeconds(5));
+        RaiseRedis(multiplexer, server, restored: false); // the real failover's failure: already down, keeps the first time
+        RaiseRedis(multiplexer, server, restored: true);  // the blip's restore, handled late: the node is down again
+
+        Assert.Equal(-1, await channel.CountActiveSubscribersAsync("corr"));
+    }
+
+    /// <summary>
     /// The end-to-end consequence: inside the window a lost-subscriber publish throws (the ingress
     /// retries and the transport redelivers) instead of settling on "no live waiter". Pre-fix the
     /// publish returned normally — the response, with this callback-less registration, dropped.

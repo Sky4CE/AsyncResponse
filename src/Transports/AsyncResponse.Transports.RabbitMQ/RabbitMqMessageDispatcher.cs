@@ -218,7 +218,10 @@ internal abstract class RabbitMqMessageDispatcher : IAsyncDisposable
     /// <summary>
     /// Builds the properties for a dead-letter copy of <paramref name="delivery"/>: the original
     /// headers plus the <c>AR-DeadLetter-*</c> forensic headers. A <paramref name="reasonCode"/>
-    /// leads the reason header (<c>code: message</c>).
+    /// leads the reason header (<c>code: message</c>). The message falls back to the exception's
+    /// type name when its <c>Message</c> getter throws, on every path: on the park path a throw read
+    /// as a failed park and looped, and on the early-ACK burial path it lost the only copy of an
+    /// already-ACKed delivery.
     /// </summary>
     protected BasicProperties BuildDeadLetterProperties(RabbitMqDelivery delivery, Exception exception, string? reasonCode = null)
     {
@@ -231,7 +234,8 @@ internal abstract class RabbitMqMessageDispatcher : IAsyncDisposable
 
         // Surrogate-aware cut (see PortableText.TruncateWellFormed): a fixed-index slice through a
         // non-BMP character left a lone high surrogate in a header the client encodes as UTF-8.
-        var reason = reasonCode is null ? exception.Message : $"{reasonCode}: {exception.Message}";
+        var message = AsyncResponseDiagnostics.SafeDescription(exception, exception.GetType().Name);
+        var reason = reasonCode is null ? message : $"{reasonCode}: {message}";
         headers["AR-DeadLetter-Reason"] = PortableText.TruncateWellFormed(reason, MaxDeadLetterReasonLength);
         headers[DeadLetterSourceQueueHeader] = _queue;
         headers["AR-DeadLetter-Role"] = _role.ToString();
@@ -909,8 +913,9 @@ internal sealed class AwaitingRabbitMqMessageDispatcher : RabbitMqMessageDispatc
         CancellationToken subscriberCancellationToken)
     {
         // A closed channel already requeued every un-ACKed delivery; it comes back with the same
-        // x-death count and parks on its next attempt.
-        if (!channel.IsOpen)
+        // x-death count and parks on its next attempt. An automatically recovered channel object
+        // reports open again, so the delivery's own token decides too.
+        if (DeliveryChannelGone(delivery, channel))
             return;
 
         var parkQueue = ParkDestination;

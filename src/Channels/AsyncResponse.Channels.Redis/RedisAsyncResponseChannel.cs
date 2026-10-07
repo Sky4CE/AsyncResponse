@@ -1474,6 +1474,13 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
         // A restore ends the failover grace and starts the restored grace — but only after a
         // disconnection this process recorded: StackExchange.Redis raises ConnectionRestored for
         // the first connection too, and nobody else is reconnecting then.
+        //
+        // The events run on separate work items, so this restore can be handled after a newer
+        // failure of the same node (a flap): a node that is down now is not restored, and erasing
+        // its "down since" would drop the failover's grace. The newer failure's own restore ends it.
+        if (!IsConnectedNow(endPoint))
+            return;
+
         var previous = _endPointDownSince.TryGetValue(endPoint, out var since) ? since : EndPointConnected;
         _endPointDownSince[endPoint] = EndPointConnected;
         if (previous != EndPointConnected)

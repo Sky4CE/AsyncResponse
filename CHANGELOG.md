@@ -136,6 +136,15 @@ work that has landed on `main` but not yet shipped. Security reporters credited 
   - *NATS channel.* A throwing logging provider no longer replaces the retryable "found no
     responders twice" liveness-contradiction exception or skips its span tag, nor the "could not be
     probed" outcome of a subscriber probe that faulted.
+- **Round-67 review (2026-10-08, second pass over the round-66 fixes): a stale reconnect no longer
+  ends the Redis failover grace, and RabbitMQ's park-at-cap path closes two gaps.**
+  - *Redis channel.* A `ConnectionRestored` for an earlier blip that is handled after a newer
+    failure of the same node no longer marks that node connected, so the failover grace the newer
+    failure started still covers the liveness probe.
+  - *RabbitMQ.* Parking a delivery at the attempt cap skips a recovered channel object whose
+    delivery token was cancelled (the round-65 "channel gone" check had not reached that path), and
+    a handler exception whose `Message` getter throws no longer fails the dead-letter properties —
+    on the park path or on the early-ACK burial, where it lost the only copy of an ACKed job.
 - **Round-61 review (2026-09-30, re-review of every file changed since `1fc2b20`): a Cosmos DB ledger
   no longer disappears up to a second before it expires, and three documentation gaps are closed.**
   - *Durable flows — Cosmos DB.* Cosmos counts a document's TTL from `_ts`, which it truncates to

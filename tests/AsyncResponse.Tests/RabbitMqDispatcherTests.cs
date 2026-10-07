@@ -416,6 +416,45 @@ public class RabbitMqDispatcherTests
     }
 
     [Fact]
+    public async Task Enqueue_BackgroundHandlerFails_WithAThrowingMessageGetter_StillDeadLetters()
+    {
+        // Round 67 (critic): the early-ACK burial built the dead-letter headers from the handler
+        // exception's Message unguarded, so a throwing getter failed the copy — and the delivery,
+        // already ACKed, was lost. The NATS and Redis siblings fall back to the type name.
+        var channel = new FakeDispatcherChannel();
+        var dispatcher = RabbitMqMessageDispatcher.Create(
+            (_, _) => throw new ThrowingMessageException(),
+            new RabbitMqAsyncResponseOptions { DeadLetterExchange = "dlx" },
+            EnqueueSubscriber(workers: 1, capacity: 8),
+            NullLogger.Instance,
+            "worker.q",
+            RabbitMqSubscriberRole.Worker);
+
+        try
+        {
+            await dispatcher.HandleAsync(
+                Delivery("poison-payload", new BasicProperties { CorrelationId = "cid-dlx-msg" }, routingKey: "worker.route", deliveryTag: 92),
+                channel,
+                CancellationToken.None);
+
+            var guard = TimeProvider.System.GetUtcNow() + TimeSpan.FromSeconds(10);
+            while (channel.Publishes.Count == 0)
+            {
+                Assert.True(TimeProvider.System.GetUtcNow() < guard, "the failed background delivery was never dead-lettered");
+                await Task.Delay(TimeSpan.FromMilliseconds(5));
+            }
+
+            var publish = Assert.Single(channel.Publishes);
+            Assert.Equal("dlx", publish.Exchange);
+            Assert.Equal(nameof(ThrowingMessageException), Assert.IsType<string>(publish.Properties.Headers!["AR-DeadLetter-Reason"]));
+        }
+        finally
+        {
+            await dispatcher.DisposeAsync();
+        }
+    }
+
+    [Fact]
     public async Task Enqueue_BackgroundHandlerFails_WithoutADeadLetterExchange_OnlyLogsAndNotifies()
     {
         // No DLX configured: the pre-fix behavior (log + OnBackgroundFailure) is still the whole
@@ -2859,6 +2898,75 @@ public class RabbitMqDispatcherTests
             Assert.True(TimeProvider.System.GetUtcNow() < guard, "the expected publishes never happened");
             await Task.Delay(TimeSpan.FromMilliseconds(5));
         }
+    }
+
+    private static BasicProperties AtCapDeath(string correlationId)
+        => new()
+        {
+            CorrelationId = correlationId,
+            Headers = new Dictionary<string, object?>
+            {
+                ["x-death"] = new List<object?> { new Dictionary<string, object?> { ["count"] = 2L } }
+            }
+        };
+
+    /// <summary>
+    /// Round 67 (R2-02): a handler at the cap fails after its channel died and auto-recovered (the
+    /// object reports open again, the delivery's token is cancelled): the broker already requeued the
+    /// original, so a park copy would be a duplicate once the redelivery parks again.
+    /// </summary>
+    [Fact]
+    public async Task Awaiting_AtCapWithXDeath_OnARecoveredChannelObject_ParksNothing()
+    {
+        using var gone = new CancellationTokenSource();
+        var channel = new FakeDispatcherChannel();
+        await using var dispatcher = RabbitMqMessageDispatcher.Create(
+            (_, _) =>
+            {
+                gone.Cancel();
+                throw new InvalidOperationException("handler boom");
+            },
+            new RabbitMqAsyncResponseOptions { DeadLetterExchange = "dlx", DeadLetterQueue = "parked" },
+            new RabbitMqSubscriberOptions { MaxDeliveryAttempts = 3 },
+            NullLogger.Instance,
+            "worker.q",
+            RabbitMqSubscriberRole.Worker);
+
+        var delivery = Delivery("poison", AtCapDeath("cid-gone"), deliveryTag: 72) with { CancellationToken = gone.Token };
+        await dispatcher.HandleAsync(delivery, channel, CancellationToken.None);
+
+        Assert.Empty(channel.Publishes);
+        Assert.Empty(channel.Acks);
+    }
+
+    /// <summary>
+    /// Round 67 (R2-03): an exception whose <c>Message</c> getter throws must not read as a failed
+    /// park (backoff + requeue + the handler re-run, forever).
+    /// </summary>
+    [Fact]
+    public async Task Awaiting_AtCapWithXDeath_HandlerExceptionWithThrowingMessage_StillParks()
+    {
+        var channel = new FakeDispatcherChannel();
+        await using var dispatcher = RabbitMqMessageDispatcher.Create(
+            (_, _) => throw new ThrowingMessageException(),
+            new RabbitMqAsyncResponseOptions { DeadLetterExchange = "dlx", DeadLetterQueue = "parked" },
+            new RabbitMqSubscriberOptions { MaxDeliveryAttempts = 3 },
+            NullLogger.Instance,
+            "worker.q",
+            RabbitMqSubscriberRole.Worker);
+
+        await dispatcher.HandleAsync(Delivery("poison", AtCapDeath("cid-msg"), deliveryTag: 73), channel, CancellationToken.None)
+            .WaitAsync(TimeSpan.FromSeconds(10));
+
+        var parked = Assert.Single(channel.Publishes);
+        Assert.Equal("parked", parked.RoutingKey);
+        Assert.Equal([73UL], channel.Acks);
+        Assert.Empty(channel.Nacks);
+    }
+
+    private sealed class ThrowingMessageException : Exception
+    {
+        public override string Message => throw new InvalidOperationException("message getter boom");
     }
 
     private static RabbitMqDelivery Delivery(
