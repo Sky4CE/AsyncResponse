@@ -778,10 +778,10 @@ internal sealed class DurableFlowContext : IDurableFlowContext
                 // Logged with the chain context, then rethrown AS IS: the park is abandoned with
                 // nothing published, the delivery retries, and the store's own exception type
                 // stays visible to whoever classifies it upstream.
-                _logger.LogWarning(
+                SafeLog.Try(() => _logger.LogWarning(
                     ex,
                     "Flow {FlowId} could not extend ancestor flow {AncestorFlowId}'s ledger retention for its {Ttl} park; abandoning the park (no wake-up is published) so the delivery retries it.",
-                    FlowId, ancestorId, ttl);
+                    FlowId, ancestorId, ttl));
                 throw;
             }
         }
@@ -1205,12 +1205,17 @@ internal sealed class DurableFlowContext : IDurableFlowContext
                 if (waitWindow is { } replayWindow)
                     await SaveForSleepAsync(checkpoint.AwaitDeadlineUtc ?? UtcNow.Add(replayWindow), cancellationToken).ConfigureAwait(false);
 
-                if (_logger.IsEnabled(LogLevel.Debug))
-                {
-                    _logger.LogDebug(
-                        "Flow {FlowId} step '{Step}' re-attaching to in-flight correlationId {CorrelationId}.",
-                        FlowId, name, correlationId);
-                }
+                SafeLog.Try(
+                    (Logger: _logger, FlowId, Step: name, CorrelationId: correlationId),
+                    static s =>
+                    {
+                        if (s.Logger.IsEnabled(LogLevel.Debug))
+                        {
+                            s.Logger.LogDebug(
+                                "Flow {FlowId} step '{Step}' re-attaching to in-flight correlationId {CorrelationId}.",
+                                s.FlowId, s.Step, s.CorrelationId);
+                        }
+                    });
             }
 
             await NotifyStepAsync(static (o, e) => o.OnStepWaitingAsync(e), name, DurableFlowStepKind.Awaited, correlationId).ConfigureAwait(false);
@@ -1365,13 +1370,15 @@ internal sealed class DurableFlowContext : IDurableFlowContext
             return;
         }
 
-        _logger.LogWarning(
+        SafeLog.Try(
+            (Logger: _logger, FlowId, Step: name, WaitWindow: waitWindow, Ceiling: ceiling, Budget: budget),
+            static s => s.Logger.LogWarning(
             "Flow {FlowId} step '{Step}' waits in process for up to {WaitWindow} for its response, but the worker transport redelivers a job held longer than {InFlightCeiling} even while its handler is alive (in-process budget: {Budget}). Awaited steps are not handed over to a fresh delivery the way timers are, so a response slower than that is awaited under a delivery the broker has already handed to another consumer. Keep the step's timeout within the budget, raise the broker's ceiling, or poll with a durable timer between shorter awaited steps.",
-            FlowId,
-            name,
-            waitWindow?.ToString() ?? "an unbounded time",
-            ceiling,
-            budget);
+            s.FlowId,
+            s.Step,
+            s.WaitWindow?.ToString() ?? "an unbounded time",
+            s.Ceiling,
+            s.Budget));
     }
 
     /// <summary>
@@ -1815,8 +1822,14 @@ internal sealed class DurableFlowContext : IDurableFlowContext
         MarkStepReturned(name);
         await SaveAsync(cancellationToken).ConfigureAwait(false);
 
-        if (_logger.IsEnabled(LogLevel.Debug))
-            _logger.LogDebug("Flow {FlowId} step '{Step}' completed.", FlowId, name);
+        // Stateful static form: a capturing lambda would allocate its closure on every completion.
+        SafeLog.Try(
+            (Logger: _logger, FlowId, Step: name),
+            static s =>
+            {
+                if (s.Logger.IsEnabled(LogLevel.Debug))
+                    s.Logger.LogDebug("Flow {FlowId} step '{Step}' completed.", s.FlowId, s.Step);
+            });
 
         if (notify)
             await NotifyStepAsync(static (o, e) => o.OnStepCompletedAsync(e), name, kind, correlationId, step.WakeAtUtc).ConfigureAwait(false);
@@ -2069,11 +2082,14 @@ internal sealed class DurableFlowContext : IDurableFlowContext
         if (size < _nextLedgerSizeWarning)
             return;
 
-        LogLedgerLarge(_logger, _state, size, _options.EffectiveLedgerSizeWarningBytes);
-
+        // Advance first and log guarded: this runs after the durable write, so a throwing logging
+        // provider must neither fail the committed save nor re-warn (and re-throw) on every later one.
         // Next warning at the next doubling of the CURRENT size (a single huge result may have
         // skipped several thresholds at once), saturating instead of overflowing.
         _nextLedgerSizeWarning = size > long.MaxValue / 2 ? long.MaxValue - 1 : size * 2;
+        SafeLog.Try(
+            (Logger: _logger, State: _state, Size: size, Threshold: _options.EffectiveLedgerSizeWarningBytes),
+            static s => LogLedgerLarge(s.Logger, s.State, s.Size, s.Threshold));
     }
 
     private static void LogLedgerLarge(ILogger logger, FlowState state, long estimate, long? threshold)

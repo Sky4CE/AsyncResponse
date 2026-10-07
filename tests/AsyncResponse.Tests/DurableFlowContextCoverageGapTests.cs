@@ -242,6 +242,50 @@ public sealed class DurableFlowContextCoverageGapTests
         Assert.True(setup.State.Steps!["remote"].Completed);
     }
 
+    /// <summary>A transport that advertises a broker in-flight ceiling.</summary>
+    private sealed class CeilingTransport : RecordingTransport, IWorkerTransportInFlightLimit
+    {
+        public TimeSpan? MaxInFlightDuration => TimeSpan.FromMinutes(10);
+    }
+
+    [Fact]
+    public async Task AReattachInsideItsWindow_StillTakesTheResponse_WhenTheReattachDebugLogThrows()
+    {
+        var logger = new RecordingThrowingLogger<DurableFlowContext> { ThrowOnMessageContaining = "re-attaching to in-flight" };
+        await using var setup = await StartAsync(
+            "gap-reattach-logger-throws",
+            state => PendingOn(state, "cid-gap-logger", VirtualTimeProvider.DefaultStartTime.UtcDateTime.AddHours(1)),
+            logger: logger);
+
+        var awaiting = setup.Context.AwaitStepAsync<OperationResult>("remote", _ => throw new InvalidOperationException("a re-attach never re-sends"));
+        await setup.Provider.GetRequiredService<IAsyncResponsePublisher>()
+            .SetResponse(new OperationResult { Status = OperationStatus.Completed, Message = "late but live" }, "cid-gap-logger");
+
+        var result = await awaiting.WaitAsync(TimeSpan.FromSeconds(30));
+        Assert.Equal("late but live", result.Message);
+    }
+
+    [Fact]
+    public async Task AnAwaitedStep_WaitingPastTheInFlightCeiling_StillWaits_WhenTheCeilingWarningThrows()
+    {
+        var logger = new RecordingThrowingLogger<DurableFlowContext> { ThrowOnMessageContaining = "waits in process for up to" };
+        await using var setup = await StartAsync("gap-ceiling-logger-throws", transport: new CeilingTransport(), logger: logger);
+        var publisher = setup.Provider.GetRequiredService<IAsyncResponsePublisher>();
+
+        string? sent = null;
+        var awaiting = setup.Context.AwaitStepAsync<OperationResult>(
+            "remote", correlationId => { sent = correlationId; return Task.CompletedTask; }, TimeSpan.FromHours(1));
+        // The waiter is registered before the trigger runs, so the response cannot be missed.
+        while (Volatile.Read(ref sent) is null && !awaiting.IsCompleted)
+            await Task.Yield();
+        if (awaiting.IsCompleted)
+            await awaiting; // surfaces a fault before the trigger instead of spinning forever
+        await publisher.SetResponse(new OperationResult { Status = OperationStatus.Completed, Message = "answered" }, sent!);
+        var result = await awaiting.WaitAsync(TimeSpan.FromSeconds(30));
+
+        Assert.Equal("answered", result.Message);
+    }
+
     // ---------------------------------------------------------------------------------------
     // Step names, ledger warning bands
     // ---------------------------------------------------------------------------------------

@@ -31,6 +31,14 @@ work that has landed on `main` but not yet shipped. Security reporters credited 
   pointing at a consumed id, and the checkpoint's own warning and error logs could replace the
   lost-lease signal that hands the flow to its takeover. These log calls are now guarded like the
   engine's other failure paths.
+- **Round-64 review (2026-10-07): a throwing logging provider no longer fails a committed
+  checkpoint.** The ledger-size warning and the step-completed debug line both ran after the
+  durable save, so a provider that threw there failed a step whose result was already persisted
+  (and the warning band never advanced, so every later save repeated it); the store-outage log in
+  the ancestor-retention extension could replace the store's own exception that the caller
+  classifies; and an awaited step's re-attach debug line and its in-flight-ceiling warning, both
+  logged after its wait was checkpointed (and, for the warning, after the request was sent),
+  faulted the step. All of these are now guarded.
 - **Round-61 review (2026-09-30, re-review of every file changed since `1fc2b20`): a Cosmos DB ledger
   no longer disappears up to a second before it expires, and three documentation gaps are closed.**
   - *Durable flows — Cosmos DB.* Cosmos counts a document's TTL from `_ts`, which it truncates to

@@ -684,4 +684,73 @@ public sealed class Round36RegressionTests
         store.ReleaseGate.SetResult();
         await Task.Delay(20);
     }
+
+    // ---------------------------------------------------------------------------------------------
+    // Fixpoint r2 (R2-01..03): log lines after a durable write, or on a rethrow path, were
+    // unguarded, so a throwing logging provider turned a committed write into a failure.
+
+    private static async Task<(DurableFlowContext Context, FlowExecutionLease Lease, ServiceProvider Provider)> LoggerThrowContextAsync(
+        string id, string? throwOn, DurableFlowOptions options, Action<FlowState>? seed = null)
+    {
+        var clock = new VirtualTimeProvider();
+        var transport = new CapturingDelayedTransport();
+        var provider = BuildContextProvider(transport, clock);
+        var store = provider.GetRequiredService<IFlowStateStore>();
+        var state = State(id);
+        seed?.Invoke(state);
+        Assert.True(await store.TryCreateAsync(id, state, TimeSpan.FromMinutes(5)));
+        var lease = await DurableFlowContextTestSupport.AcquireAsync(store, id, options, clock);
+        var logger = new RecordingThrowingLogger<DurableFlowContext> { ThrowOnMessageContaining = throwOn };
+        return (CreateContext(provider, state, store, lease, options, clock, transport, logger), lease, provider);
+    }
+
+    [Fact]
+    public async Task Step_WhoseCheckpointCrossesTheLedgerWarning_Completes_WhenTheLoggerThrows()
+    {
+        var options = new DurableFlowOptions { LedgerSizeWarningBytes = 512 };
+        var (context, lease, provider) = await LoggerThrowContextAsync(
+            "r2-ledger-warn", "LedgerSizeWarningBytes threshold", options,
+            state => state.InputJson = JsonSerializer.Serialize(new string('x', 1300)));
+        await using (provider)
+        await using (lease)
+        {
+            var result = await context.StepAsync("big", () => Task.FromResult(7));
+            Assert.Equal(7, result);
+        }
+    }
+
+    [Fact]
+    public async Task Step_Completes_WhenTheCompletionDebugLogThrows()
+    {
+        var (context, lease, provider) = await LoggerThrowContextAsync("r2-step-debug", "' completed.", new DurableFlowOptions());
+        await using (provider)
+        await using (lease)
+        {
+            var result = await context.StepAsync("s", () => Task.FromResult(9));
+            Assert.Equal(9, result);
+        }
+    }
+
+    [Fact]
+    public async Task AncestorExtension_StoreOutage_RethrowsTheStoresException_WhenTheLoggerThrows()
+    {
+        var clock = new VirtualTimeProvider();
+        var transport = new CapturingDelayedTransport();
+        await using var provider = BuildContextProvider(transport, clock);
+        var inner = provider.GetRequiredService<IFlowStateStore>();
+        var store = new FaultingFlowStateStore(inner) { FailAncestorUpdates = "r2-root" };
+        var root = State("r2-root");
+        root.Steps = new Dictionary<string, FlowStepState>(StringComparer.Ordinal) { ["child"] = new() { ChildFlowId = "r2-root:child" } };
+        var child = State("r2-root:child", "r2-root");
+        child.ParentStepName = "child";
+        Assert.True(await inner.TryCreateAsync("r2-root", root, TimeSpan.FromMinutes(1)));
+        Assert.True(await inner.TryCreateAsync("r2-root:child", child, TimeSpan.FromMinutes(1)));
+        var logger = new RecordingThrowingLogger<DurableFlowContext> { ThrowOnMessageContaining = "could not extend ancestor" };
+
+        await using var lease = (await FlowStateConcurrency.TryAcquireExecutionLeaseAsync(store, child.FlowId!, ShortLedgerOptions, NullLogger.Instance, clock))!;
+        var context = CreateContext(provider, child, store, lease, ShortLedgerOptions, clock, transport, logger);
+
+        await Assert.ThrowsAsync<TimeoutException>(() => context.DelayAsync("long-wait", TimeSpan.FromHours(1)));
+        Assert.Equal(0, transport.Count);
+    }
 }
