@@ -20,6 +20,7 @@
     <PackageReference Include="Aspire.Hosting.AppHost" />
     <PackageReference Include="Aspire.Hosting.Kafka" />
     <PackageReference Include="Aspire.Hosting.Redis" />
+    <PackageReference Include="Confluent.Kafka" />
     <PackageReference Include="MessagePack" />
   </ItemGroup>
 
